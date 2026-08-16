@@ -792,6 +792,15 @@ class Agent:
         #  环境画像（工具链有无 + 网络区域）：启动时探测一次即静态，
         #  让模型在选型阶段就避开"缺 git 的机器选 Git 路线"这类死路
         prompt += envprobe.block()
+        #  自扩展指南（"文档即能力"）：扩展格式不靠模型的训练记忆——指南随包
+        #  分发，这里只放绝对路径，要用时现读全文。路径在会话内静态，
+        #  不破坏前缀缓存；文件缺失（罕见的裁剪安装）就整段不提。
+        extending_doc = Path(__file__).parent / "docs" / "extending.md"
+        if extending_doc.is_file():
+            prompt += (
+                "\n\n要为小羽本身新增能力（技能 SKILL.md、工具插件、MCP server、hooks）时，"
+                f"先完整阅读随包分发的扩展指南再动手：{extending_doc}"
+            )
         prompt += self._project_instructions()
         prompt += skills.index_block(
             self.skills, max_tokens=int(self.config.context_limit * self._SKILL_BUDGET_RATIO)
@@ -1948,6 +1957,21 @@ class Agent:
                 #  schema，之后 context_tokens 只需估算这个位置之后新增的部分
                 if prompt_tokens > 0:
                     self._anchor = (prompt_tokens, self._request_len)
+                    #  静默溢出检测（GLM 系实测有此行为）：个别服务端在输入超窗时
+                    #  不报错，而是悄悄截断输入再正常作答——usage 里的 prompt_tokens
+                    #  反而是唯一的现场证据。回答可能基于被截断的上下文，必须让
+                    #  用户知道；上下文本身由锚点记账在下一步触发自动压缩自愈，
+                    #  这里只告警不改流程。
+                    if prompt_tokens > self.config.context_limit:
+                        self.sink.emit(
+                            Notice(
+                                f"[警告] 服务端报告输入 {prompt_tokens} tok，已超过 "
+                                f"{route.model} 的上下文窗口（{self.config.context_limit}）——"
+                                "这轮回答可能基于被服务端静默截断的历史，结论请多校验；"
+                                "接下来会自动压缩上下文",
+                                "warn",
+                            )
+                        )
             #  chat 协议的 chunk 上没有这个属性，getattr 取到 None——
             #  内核不需要知道自己在跟哪种协议说话
             if items := getattr(chunk, "reasoning", None):
