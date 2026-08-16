@@ -248,6 +248,38 @@ class TestPlainSink(unittest.TestCase):
         self.assertIn("deepseek-v4-pro", out)
         self.assertIn("思考中", out)
 
+    def test_osc133_anchors_only_on_terminal(self) -> None:
+        """assistant 正文块的 OSC 133 锚点：终端里首尾各一次、成对收束；
+        管道里一个字节都不该有（零宽标记进文件也是污染）。"""
+        from xiaoyu.render import OSC133_TEXT_END, OSC133_TEXT_START
+
+        class TtyBuffer(io.StringIO):
+            def isatty(self) -> bool:
+                return True
+
+        #  管道：无锚点
+        sink = PlainSink()
+        out = self.render(sink, TextDelta("正文")) + self.render(sink, TextEnd())
+        self.assertNotIn("\x1b]133", out)
+
+        #  终端：块首 A 一次（多个 delta 不重复），块尾 B/C 收束
+        sink = PlainSink()
+        buffer = TtyBuffer()
+        with contextlib.redirect_stdout(buffer):
+            sink.emit(TextDelta("第一段"))
+            sink.emit(TextDelta("第二段"))
+            sink.emit(TextEnd())
+        out = buffer.getvalue()
+        self.assertEqual(out.count(OSC133_TEXT_START), 1)
+        self.assertEqual(out.count(OSC133_TEXT_END), 1)
+        self.assertTrue(out.startswith(OSC133_TEXT_START))
+        #  下一个正文块重新开锚（每段回复都是独立的导航块）
+        buffer2 = TtyBuffer()
+        with contextlib.redirect_stdout(buffer2):
+            sink.emit(TextDelta("下一块"))
+            sink.emit(TextEnd())
+        self.assertEqual(buffer2.getvalue().count(OSC133_TEXT_START), 1)
+
     def test_new_lifecycle_events_render_nothing_in_plain(self) -> None:
         """running/denied 是给活区和 headless 准备的，明文渲染保持原有输出不变。"""
         sink = PlainSink()

@@ -144,6 +144,15 @@ def replay_transcript(
     return emitted
 
 
+#  OSC 133 语义锚点：assistant 正文块的首尾打零宽标记（A=块起点，B/C=正文收束）。
+#  识别 shell integration 协议的终端（iTerm2/Kitty/WezTerm/Ghostty）会把每段
+#  回复当成一个可导航的"提示块"——跳上一条回复、选中整段输出都是终端白送的。
+#  纯文本直出 scrollback 的架构下这是零成本增强；只在 stdout 是终端时发，
+#  管道/CI 里是纯污染。
+OSC133_TEXT_START = "\x1b]133;A\x07"
+OSC133_TEXT_END = "\x1b]133;B\x07\x1b]133;C\x07"
+
+
 class PlainSink:
     """明文终端渲染。verbose=False 对应 quiet 子 agent：不刷正文、不画计划，
     但工具调用行照常打印（配合 indent 显示子 agent 在干什么）。"""
@@ -154,6 +163,8 @@ class PlainSink:
     def __init__(self, indent: str = "", verbose: bool = True) -> None:
         self.indent = indent
         self.verbose = verbose
+        #  当前正文块是否已打开 OSC 133 锚点（TextEnd 负责收束配对）
+        self._osc133_open = False
         #  按事件类型分发；不认识的事件（将来新增的）静默忽略——
         #  旧前端遇到新事件不该崩，这是事件协议的向后兼容底线
         self._handlers: dict[type, Callable[[Any], None]] = {
@@ -186,10 +197,17 @@ class PlainSink:
 
     def _text_delta(self, event: TextDelta) -> None:
         if self.verbose:
+            if not self._osc133_open and sys.stdout.isatty():
+                #  正文块起点的零宽锚点，每块只打一次（终态在 _text_end 收束）
+                print(end=OSC133_TEXT_START)
+                self._osc133_open = True
             print(event.text, end="", flush=True)
 
     def _text_end(self, event: TextEnd) -> None:
         if self.verbose:
+            if self._osc133_open:
+                print(end=OSC133_TEXT_END)
+                self._osc133_open = False
             print()
 
     def _tool_pending(self, event: ToolPending) -> None:

@@ -110,6 +110,7 @@ from .events import (
     UIEvent,
 )
 from .permissions import Permissions, parse_rule, suggest_allow_rule
+from . import render
 from .render import args_preview
 
 #  计划状态的显示符号与 render.PlainSink 保持一致；样式一律走 theme 的语义 token
@@ -791,6 +792,9 @@ class RichSink:
         self.request_timeout: int | None = None
         self._status: Any | None = None
         self._ro_counts: dict[str, int] = {}
+        #  当前正文块是否已打开 OSC 133 锚点（TextEnd 负责收束配对），
+        #  语义与 PlainSink 对齐，见 render.OSC133_TEXT_START 的注释
+        self._osc133_open = False
         self._handlers = {
             RequestStarted: self._request_started,
             RequestEnded: self._request_ended,
@@ -876,12 +880,19 @@ class RichSink:
         self._flush_ro_group()
         if not self.verbose:
             return
+        if not self._osc133_open and self.console.is_terminal:
+            #  正文块起点的零宽锚点：终端把每段回复当可导航的"提示块"
+            print(end=render.OSC133_TEXT_START)
+            self._osc133_open = True
         #  流式分片直出，绕过 rich（它按行工作，逐分片 print 会插换行）
         print(event.text, end="", flush=True)
 
     def _text_end(self, event: TextEnd) -> None:
         self._flush_ro_group()
         if self.verbose:
+            if self._osc133_open:
+                print(end=render.OSC133_TEXT_END)
+                self._osc133_open = False
             print()
 
     def _tool_pending(self, event: ToolPending) -> None:
