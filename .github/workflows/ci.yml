@@ -1,0 +1,77 @@
+# CI：三平台 × 3.11/3.14 全矩阵，每次 push/PR 都跑。
+# 测试全部不打网络（eval 需要真实模型，不进 CI）。
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+  #  release.yml 把本 workflow 当一个 job 调起来，publish 再 needs 它——
+  #  跨 workflow 没法用 needs，只有 workflow_call 这一条正路。
+  #  ⚠️ 别再把 tags: ["v*"] 加回 push：那会让推 tag 时全矩阵跑两遍
+  #  （直接触发一次 + 被 release 调一次），白跑一整轮。
+  workflow_call:
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      #  公开仓 Actions 免费，全矩阵每次都跑。私有仓时代曾因配额计费（macOS ×10）
+      #  把日常收成 windows-only、全矩阵只在发版/手动时跑；2026-08-14 转公开后放开。
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        python: ["3.11", "3.14"]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Linux：装 bubblewrap，让沙箱真内核用例在 Linux 上真跑而非跳过
+        if: runner.os == 'Linux'
+        #  Ubuntu 24.04 起 AppArmor 默认限制 unprivileged user namespace，
+        #  bwrap 跑不起来时测试会经 available() 探针优雅跳过——这里放开限制
+        #  是为了让它们真跑；|| true 兜底老内核没有这个 sysctl 的情况
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -yq bubblewrap
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
+      - name: 安装（含锁定依赖 + tui 可选依赖，让 TUI 测试三平台都真跑而非跳过）
+        run: pip install -e '.[tui]'
+      - name: 单元测试
+        #  ⚠️ `-v` + 无缓冲 + 步骤级超时，三样都是为了「红了要能查」，别删：
+        #  2026-08-12 本机出现过三次 `errors=12`（跑了 24 分钟，干净跑只要 35 秒），
+        #  因为输出被 `-q`/`tail` 吃掉，连是哪 12 个用例都无从得知——白红三次，
+        #  事后五种受控条件都复现不出来，线索就此断了。
+        #  `-v` 在每个用例**开始前**打出它的名字：万一挂住，日志最后一行就是
+        #  卡住的那个。PYTHONUNBUFFERED 是让这句话成立的前提——输出重定向到
+        #  管道时 Python 默认整块缓冲，挂住的那一刻恰恰什么都还没落盘。
+        #  timeout-minutes 给 25 倍余量：挂住时限时失败，好过占满 6 小时默认
+        #  上限之后仍然不知道卡在哪。
+        timeout-minutes: 15
+        env:
+          PYTHONUNBUFFERED: "1"
+        run: python -m unittest discover -s tests -t . -v
+
+  build:
+    #  打包验证：wheel/sdist 能构建、元数据合法、敏感信息零泄漏
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+      - run: pip install build twine
+      - run: python -m build
+      - run: twine check dist/*
+      - name: 敏感信息扫描（发布物里不允许出现密钥特征）
+        #  只扫通用密钥特征。内部专有词表不能写进公开 workflow——那本身就是泄漏，
+        #  域名/路径类扫描在本地发布流程里做。
+        run: |
+          mkdir /tmp/audit && tar -xzf dist/*.tar.gz -C /tmp/audit
+          if grep -rniE "sk-[a-zA-Z0-9]{16}|sbp_[a-z0-9]{8}|AKIA[A-Z0-9]{8}|BEGIN [A-Z ]*PRIVATE KEY" /tmp/audit; then
+            echo "::error::发布物含密钥特征，拒绝通过"
+            exit 1
+          fi

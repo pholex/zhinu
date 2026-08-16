@@ -1,0 +1,65 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+# PyPI 上 `xiaoyu` 已被占用，发布名用 xiaoyu-agent；导入名和命令仍是 xiaoyu / xy。
+name = "xiaoyu-agent"
+# 版本号单一来源：xiaoyu/__init__.py 的 __version__（--version 也读它）
+dynamic = ["version"]
+description = "小羽 — a harness coding agent"
+readme = "README.md"
+# MIT（2026-08-16 定，单一开发者阶段；有外部贡献者再议是否换协议）。
+# PEP 639 SPDX 字符串形式：table 形式已被新 setuptools 弃用
+license = "MIT"
+license-files = ["LICENSE"]
+requires-python = ">=3.11"
+# 精确锁版本（供应链纪律）：范围声明会让 PyPI 上被投毒的
+# 新版本无需审查自动进入用户机器。升级 = 有意改这一行并重跑测试。
+dependencies = [
+    "openai==2.52.0",
+    #  Anthropic Messages 协议直连（xiaoyu/messages.py）。与 openai 同为
+    #  Stainless 生成、共享 httpx 传输，锁版本纪律相同
+    "anthropic==0.121.0",
+    #  bash 语法白名单解析（权限判定用）：解析失败/缺包时代码自动回退字符串黑名单，
+    #  所以两个包即使某平台没有 wheel 也不致命
+    "tree-sitter>=0.22",
+    "tree-sitter-bash>=0.21",
+]
+
+[project.optional-dependencies]
+# TUI 前端（输入补全/跨会话历史/底部状态栏/富文本确认框）。
+# 可选：缺包时自动退回明文 REPL。同主依赖一样精确锁版本；
+# rich 不用 15.x——刚发的大版本先观望，14 线是成熟尾版。
+tui = [
+    "prompt_toolkit==3.0.53",
+    "rich==14.3.4",
+]
+# 可选：browser 工具的引擎。装完还需跑一次 `playwright install chromium`
+# 下载浏览器内核；没装 playwright 时 browser 工具经 check_fn 自动隐藏。
+browser = [
+    "playwright==1.62.0",
+]
+
+[project.urls]
+Repository = "https://github.com/pholex/zhinu"
+Issues = "https://github.com/pholex/zhinu/issues"
+
+[project.scripts]
+xiaoyu = "xiaoyu.cli:main"
+xy = "xiaoyu.cli:main"
+# 与包同名的别名：uvx 默认跑「与包同名的 console script」，ACP registry 的
+# uvx 分发（uvx xiaoyu-agent --acp）靠它一跑即中，无需 --from
+xiaoyu-agent = "xiaoyu.cli:main"
+xiaoyu-eval = "xiaoyu.evals.runner:main"
+
+[tool.setuptools]
+packages = ["xiaoyu", "xiaoyu.evals"]
+
+[tool.setuptools.dynamic]
+version = {attr = "xiaoyu.__version__"}
+
+# models.example.json 是 models.py 找不到本机数据时的兜底（按包路径读取），
+# 必须随包分发；models.local.json 是本机私有数据，不入库也不进 wheel/sdist。
+[tool.setuptools.package-data]
+"xiaoyu.evals" = ["models.example.json"]

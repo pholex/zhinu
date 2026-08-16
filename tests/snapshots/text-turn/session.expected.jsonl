@@ -1,0 +1,4 @@
+{"ts": "<ts>", "event": "meta", "format": 2, "version": "<version>", "model": "snapshot-model", "workspace": "<tmp>/ws", "started_at": "<ts>"}
+{"ts": "<ts>", "role": "user", "content": "打个招呼"}
+{"ts": "<ts>", "role": "assistant", "content": "你好！我是小羽。"}
+{"ts": "<ts>", "event": "exit", "reason": "normal"}

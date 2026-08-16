@@ -1,0 +1,6 @@
+{"kind": "request.started", "model": "snapshot-model"}
+{"kind": "text.delta", "text": "你好！"}
+{"kind": "text.delta", "text": "我是小羽。"}
+{"kind": "text.end"}
+{"kind": "request.ended"}
+{"kind": "result", "result": "你好！我是小羽。", "usage": {"turns": 1, "prompt_tokens": 120, "completion_tokens": 8, "by_model": {"_scripted/snapshot-model": {"calls": 1, "prompt_tokens": 120, "completion_tokens": 8}}}, "model": "snapshot-model", "session_log": "<session_log>"}

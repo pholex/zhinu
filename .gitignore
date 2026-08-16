@@ -1,0 +1,26 @@
+.venv/
+__pycache__/
+*.pyc
+*.egg-info/
+build/
+dist/
+*.bak
+.DS_Store
+
+# 含密钥，绝不提交（.env.example 是可提交的模板）
+.env
+.env.local
+
+# codegraph 本地索引（codegraph init 生成）
+.codegraph/
+
+# 内部研讨笔记，只在本机留存
+docs/internal/
+
+# eval 的本机候选模型/单价（照 models.example.json 复制而来）与跑分产物
+xiaoyu/evals/models.local.json
+xiaoyu-eval-results/
+
+# 本机 agent 配置（别只靠用户全局 gitignore 挡，换台机器就漏了）
+.claude/settings.local.json
+.claude/scheduled_tasks.lock

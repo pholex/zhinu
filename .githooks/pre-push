@@ -1,0 +1,12 @@
+#!/bin/sh
+# 本地 CI 兜底：push 前跑全部单元测试（~3 秒，全部不打网络）。
+# 启用：git config core.hooksPath .githooks
+set -e
+cd "$(git rev-parse --show-toplevel)"
+if [ -x .venv/bin/python ]; then
+    PY=.venv/bin/python
+else
+    PY=python3
+fi
+echo "[pre-push] 运行单元测试…"
+"$PY" -m unittest discover -s tests -t .

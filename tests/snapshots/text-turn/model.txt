@@ -1,0 +1,4 @@
+# 纯文本一轮（pin 场景：钉住完整 system prompt / tool schemas）
+text: "你好！"
+text: "我是小羽。"
+usage: {"prompt_tokens": 120, "completion_tokens": 8}

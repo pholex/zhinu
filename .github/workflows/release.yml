@@ -1,0 +1,44 @@
+# 发布：推 v* tag 跑完整 CI，全绿才构建并发布到 PyPI。
+#
+# 鉴权走 PyPI Trusted Publishing（OIDC，无需长期 token）：
+# 先在 https://pypi.org/manage/project/xiaoyu-agent/settings/publishing/
+# 添加 GitHub 仓库为 trusted publisher（workflow 名填 release.yml），
+# 之后 `git push origin vX.Y.Z` 即完成发布。
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+
+jobs:
+  #  发版前必须过 CI。这一层是 2026-08-12 补的：在那之前 release 与 ci 是两个
+  #  互不相干的 workflow，tag 一推就发、CI 红不红都拦不住——v0.29.0 就是这么
+  #  带着两个红着的 Windows job 发上 PyPI 的，Windows 上"拖文件进终端"整个
+  #  功能是死的，没人拦。
+  test:
+    uses: ./.github/workflows/ci.yml
+
+  publish:
+    needs: test
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      id-token: write  # Trusted Publishing 需要
+      contents: read
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+      - name: 版本一致性检查（tag 必须等于 __version__）
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          version=$(python -c "import xiaoyu; print(xiaoyu.__version__)")
+          if [ "$tag" != "$version" ]; then
+            echo "::error::tag v$tag 与 __version__ $version 不一致"
+            exit 1
+          fi
+      #  只发 wheel 不发 sdist：发 PyPI 只为让用户一行 pip 装上，wheel 不带
+      #  tests/experiments 等杂项；要看源码去 GitHub 项目页。
+      - run: pip install build && python -m build --wheel
+      - uses: pypa/gh-action-pypi-publish@release/v1

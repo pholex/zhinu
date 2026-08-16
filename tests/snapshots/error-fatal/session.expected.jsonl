@@ -1,0 +1,4 @@
+{"ts": "<ts>", "event": "meta", "format": 2, "version": "<version>", "model": "snapshot-model", "workspace": "<tmp>/ws", "started_at": "<ts>"}
+{"ts": "<ts>", "role": "user", "content": "撞一个致命错误"}
+{"ts": "<ts>", "event": "error", "error": "RuntimeError: 上游炸了"}
+{"ts": "<ts>", "event": "exit", "reason": "normal"}

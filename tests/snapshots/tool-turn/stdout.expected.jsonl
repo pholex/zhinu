@@ -1,0 +1,10 @@
+{"kind": "request.started", "model": "snapshot-model"}
+{"kind": "request.ended"}
+{"kind": "tool.pending", "name": "bash", "args": {"command": "echo snapshot-ok"}}
+{"kind": "tool.running", "name": "bash", "args": {"command": "echo snapshot-ok"}}
+{"kind": "tool.completed", "name": "bash", "output": "exit_status: 0\nstdout:\nsnapshot-ok", "ok": true, "seconds": 0}
+{"kind": "request.started", "model": "snapshot-model"}
+{"kind": "text.delta", "text": "命令输出 snapshot-ok，完成。"}
+{"kind": "text.end"}
+{"kind": "request.ended"}
+{"kind": "result", "result": "命令输出 snapshot-ok，完成。", "usage": {"turns": 2, "prompt_tokens": 340, "completion_tokens": 32, "by_model": {"_scripted/snapshot-model": {"calls": 2, "prompt_tokens": 340, "completion_tokens": 32}}}, "model": "snapshot-model", "session_log": "<session_log>"}

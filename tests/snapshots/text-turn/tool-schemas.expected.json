@@ -1,0 +1,254 @@
+[
+  {
+    "function": {
+      "description": "读取文本文件内容。路径相对当前工作区解析。大文件可以用 offset（起始行号，从 1 开始）和 limit（最多读多少行）只读一段。注意：只读了一段的文件不算「读过」，覆盖或改动它之前仍需完整读一遍。修改任何文件之前必须先完整读它。",
+      "name": "read_file",
+      "parameters": {
+        "properties": {
+          "limit": {
+            "description": "最多读多少行；省略表示读到结尾",
+            "type": "integer"
+          },
+          "offset": {
+            "description": "起始行号，从 1 开始；省略表示从头读",
+            "type": "integer"
+          },
+          "path": {
+            "description": "文件路径",
+            "type": "string"
+          }
+        },
+        "required": [
+          "path"
+        ],
+        "type": "object"
+      }
+    },
+    "type": "function"
+  },
+  {
+    "function": {
+      "description": "把完整内容写入文件（整文件覆盖，不是补丁）。只在新建文件或需要全量重写时用；改动已有文件的局部请用 str_replace。覆盖已有文件前必须先用 read_file 读过它。父目录不存在会自动创建。",
+      "name": "write_file",
+      "parameters": {
+        "properties": {
+          "__tool_use_purpose": {
+            "description": "用一句话说明这次调用的目的（会展示在用户的确认提示里）",
+            "type": "string"
+          },
+          "content": {
+            "description": "文件的完整新内容",
+            "type": "string"
+          },
+          "path": {
+            "description": "文件路径",
+            "type": "string"
+          }
+        },
+        "required": [
+          "path",
+          "content"
+        ],
+        "type": "object"
+      }
+    },
+    "type": "function"
+  },
+  {
+    "function": {
+      "description": "把文件里的一段文本精确替换成另一段——修改已有文件的首选工具。调用前必须先用 read_file 读过该文件。old_str 必须与文件内容逐字符完全一致（含缩进和空行），并且在整个文件里只能出现一次；如果不唯一，就把上下文往外扩几行直到唯一。删除代码就把 new_str 设为空字符串。",
+      "name": "str_replace",
+      "parameters": {
+        "properties": {
+          "__tool_use_purpose": {
+            "description": "用一句话说明这次调用的目的（会展示在用户的确认提示里）",
+            "type": "string"
+          },
+          "new_str": {
+            "description": "替换成的新文本，留空表示删除",
+            "type": "string"
+          },
+          "old_str": {
+            "description": "要被替换掉的原文，必须逐字符精确且在文件中唯一",
+            "type": "string"
+          },
+          "path": {
+            "description": "文件路径",
+            "type": "string"
+          }
+        },
+        "required": [
+          "path",
+          "old_str",
+          "new_str"
+        ],
+        "type": "object"
+      }
+    },
+    "type": "function"
+  },
+  {
+    "function": {
+      "description": "在工作区里按正则搜索文本，返回 路径:行号: 内容。找符号定义、找调用点、找配置项都用它。可用 glob 限定文件类型（如 *.py）。这是只读操作。",
+      "name": "grep",
+      "parameters": {
+        "properties": {
+          "glob": {
+            "description": "文件名 glob 过滤，如 *.py；省略表示不过滤",
+            "type": "string"
+          },
+          "max_matches": {
+            "description": "最多返回多少条，默认 200；结果被截断时会提示总数",
+            "type": "integer"
+          },
+          "path": {
+            "description": "搜索起点，默认工作区根目录",
+            "type": "string"
+          },
+          "pattern": {
+            "description": "正则表达式",
+            "type": "string"
+          }
+        },
+        "required": [
+          "pattern"
+        ],
+        "type": "object"
+      }
+    },
+    "type": "function"
+  },
+  {
+    "function": {
+      "description": "列出工作区里的文件（可用 glob 过滤，如 **/*.py）。摸清项目结构时用它，比 bash ls 更干净：自动跳过 .git、node_modules、__pycache__ 等噪声目录。这是只读操作。",
+      "name": "list_files",
+      "parameters": {
+        "properties": {
+          "limit": {
+            "description": "最多列多少个，默认 300",
+            "type": "integer"
+          },
+          "path": {
+            "description": "起点，默认工作区根目录",
+            "type": "string"
+          },
+          "pattern": {
+            "description": "glob 模式，默认 **/*",
+            "type": "string"
+          }
+        },
+        "required": [],
+        "type": "object"
+      }
+    },
+    "type": "function"
+  },
+  {
+    "function": {
+      "description": "在工作区目录下执行 shell 命令，返回合并后的 stdout/stderr 和退出码。命令已经在工作区根目录下执行，不需要自己 cd 过去。用它来查找文件、跑测试、跑构建、查 git 状态。需要用户在浏览器完成的交互式认证命令（OAuth device flow、登录扫码）不要阻塞干等：先用能立即返回的方式发起并拿到授权链接，把链接展示给用户，等用户确认完成后再查状态。长时间运行的命令（dev server、长构建、部署后的收敛等待）用 run_in_background=true：立即返回 task id，完成时会在后续工具结果里收到通知——不要轮询、不要 sleep 干等，也不要在命令末尾自己加 &。{{shell_note}}",
+      "name": "bash",
+      "parameters": {
+        "properties": {
+          "__tool_use_purpose": {
+            "description": "用一句话说明这次调用的目的（会展示在用户的确认提示里）",
+            "type": "string"
+          },
+          "command": {
+            "description": "要执行的命令",
+            "type": "string"
+          },
+          "run_in_background": {
+            "description": "true = 后台运行：立即返回 task id，命令继续跑，完成时自动通知你。用 task_output 查看输出、kill_task 终止",
+            "type": "boolean"
+          },
+          "timeout": {
+            "description": "超时秒数，默认 120。超时的命令会被终止，已产生的输出仍会返回给你；预计耗时长的命令（完整测试、构建）请显式调大。后台任务默认不受超时约束，显式给了才生效",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "command"
+        ],
+        "type": "object"
+      }
+    },
+    "type": "function"
+  },
+  {
+    "function": {
+      "description": "启动一个后台观察进程：命令的 stdout 每输出一行就是一个事件，会自动送达给你，进程退出即结束观察。适用：盯 CI 状态、tail 日志、轮询外部条件。**输出量纪律**：每一行都会打进你的上下文，脚本只应输出关键事件（如 DONE / FAILED），管道过滤用 grep --line-buffered（裸 grep 会整块缓冲，事件迟到几分钟）。输出太快会被限流，持续刷屏会被自动终止。",
+      "name": "monitor",
+      "parameters": {
+        "properties": {
+          "__tool_use_purpose": {
+            "description": "用一句话说明这次调用的目的（会展示在用户的确认提示里）",
+            "type": "string"
+          },
+          "command": {
+            "description": "观察脚本/命令。每行 stdout 是一个事件，退出即结束",
+            "type": "string"
+          },
+          "description": {
+            "description": "在观察什么（每条事件通知都会带上这句话）",
+            "type": "string"
+          },
+          "timeout": {
+            "description": "最长观察秒数，默认 36000（10 小时）",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "command",
+          "description"
+        ],
+        "type": "object"
+      }
+    },
+    "type": "function"
+  },
+  {
+    "function": {
+      "description": "更新任务计划（全量替换）。传入完整的步骤列表，每步带 step 文本与 status 状态；explanation 可选，只在计划本身变更时说明原因。同一时刻最多一条 in_progress。",
+      "name": "update_plan",
+      "parameters": {
+        "properties": {
+          "explanation": {
+            "description": "本次计划变更的原因；照常推进时省略",
+            "type": "string"
+          },
+          "plan": {
+            "description": "完整的步骤列表（全量替换，不是追加）",
+            "items": {
+              "properties": {
+                "status": {
+                  "description": "步骤状态",
+                  "enum": [
+                    "pending",
+                    "in_progress",
+                    "completed"
+                  ],
+                  "type": "string"
+                },
+                "step": {
+                  "description": "一句话步骤，不超过 12 个字",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "step",
+                "status"
+              ],
+              "type": "object"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "plan"
+        ],
+        "type": "object"
+      }
+    },
+    "type": "function"
+  }
+]

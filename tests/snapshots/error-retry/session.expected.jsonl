@@ -1,0 +1,4 @@
+{"ts": "<ts>", "event": "meta", "format": 2, "version": "<version>", "model": "snapshot-model", "workspace": "<tmp>/ws", "started_at": "<ts>"}
+{"ts": "<ts>", "role": "user", "content": "试试限流恢复"}
+{"ts": "<ts>", "role": "assistant", "content": "恢复了。"}
+{"ts": "<ts>", "event": "exit", "reason": "normal"}

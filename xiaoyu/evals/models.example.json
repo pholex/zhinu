@@ -1,0 +1,8 @@
+{
+  "_note": "eval 候选模型与单价（USD / token）。复制成同目录 models.local.json 后按你的端点填写，或用 XIAOYU_EVAL_MODELS 指向任意路径；本文件是找不到上述两者时的兜底示例。",
+  "models": [
+    {"name": "example-small", "family": "Example", "note": "最便宜的一档", "in": 1.5e-7, "out": 3.0e-7},
+    {"name": "example-medium", "family": "Example", "note": "", "in": 3.0e-6, "out": 1.5e-5},
+    {"name": "example-large", "family": "Example", "note": "最强，也最贵", "in": 1.0e-5, "out": 5.0e-5}
+  ]
+}

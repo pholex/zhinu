@@ -1,0 +1,560 @@
+"""声明式 subagent（TOML 声明 + 工具挂载，按小羽体量收敛）。
+
+用户放一个 TOML 就多一个可委托的子 agent，不用写代码：
+
+    #  <用户配置目录>/agents/tester.toml 或 <工作区>/.xiaoyu/agents/tester.toml
+    description = "写并跑单元测试的子 agent"     # 必填：也是给模型看的工具说明
+    system_prompt = "你是测试工程师……工作区根目录：{workspace}"   # 必填
+    tools = ["read_file", "grep", "list_files", "write_file", "bash"]
+    capability_mode = "read-write"               # 可省：粗粒度档位，与 tools 二选一或叠加
+    isolation = "worktree"                       # 可省：默认在独立 git worktree 里跑
+    mcp = ["github"]                             # 可省：继承父会话的哪些 MCP server
+    model = "deepseek-v4-pro"                    # 可省：默认随主模型
+    max_iterations = 30                          # 可省：默认 20
+
+挂载后模型看到一个与 explore 同形态的工具，委托即在子上下文里跑完、只把
+结论带回主上下文——省上下文的收益与 explore 相同。
+
+四个旋钮（按同步架构裁剪）：
+
+- **capability_mode**（spec 字段 + 调用参数）：read-only / read-write /
+  execute / all 四档粗粒度工具白名单。tools 与它至少给一个；都给取交集。
+  调用参数只能**收紧**不能放宽（spec 值是天花板，交集取下界：不可比的
+  read-write ∧ execute 保守降到 read-only）。
+- **isolation**（spec 字段 + 调用参数，调用参数优先）：worktree = 从主仓
+  HEAD 建 detached git worktree，子 agent 的 workspace/sandbox 全指过去；
+  跑完没改动自动删，有改动保留并把路径写进结论。创建失败 fail-open 退回
+  主工作区（告警不中断）。见 worktree.py 模块说明。
+- **resume_from**（调用参数）：上次结论尾部给出的句柄，恢复那次委托的完整
+  上下文继续干（transcript 续用、system 头按当前 spec 重渲染、模型钉死
+  上次的）。全链路 fail-closed：找不到 / spec 不符 / 上下文超窗口 80% 都
+  直接报错，绝不悄悄退化成全新子 agent（与 worktree 的 fail-open 相反，
+  这个不对称是刻意设计）。记录纯内存、上限 16 条滚动淘汰。
+- **mcp / mcp_except**（仅 spec 字段，作者可控、模型不可控）：
+  `"none"`（默认）/ `"all"` /
+  `["名单"]`（named）/ `mcp_except = ["排除"]`（except）。server 级粒度，
+  继承的是父会话**已连上**的 server 视图，不重复拉进程；子 agent 经
+  search_tool / use_tool 触达，use_tool 照常走父级审批。capability_mode
+  不裁 MCP（两维刻意正交：档位若连 MCP 一起裁，会与继承声明互相打脸；
+  安全由审批兜底）。
+
+刻意收敛与安全边界：
+- 不做 `extend` 继承 / Jinja 模板 / import path 装载工具——个人工具用不上
+  这些层次；工具只能从内置七件里点名（插件工具不进 spec：它们的审批语义
+  由各自通道管理，spec 白名单不该成为第二条挂载路径）；
+- **权限不因声明而放大**：有效工具集 ⊆ 只读三件且不继承 MCP → 子 agent
+  免确认（同 explore）；否则复用**父级的 approver 与 permissions**——确认
+  框照弹、deny 规则照拦（bypass-immune 语义穿透到子 agent）。所以工作区级
+  spec 是安全的：它能声明的最大权限=用户逐次批准的权限，clone 一个仓库
+  不会静默多出任何放行；
+- 子 agent 不再挂 explore 与声明式 agent（不套娃）、不挂技能/插件。
+
+`XIAOYU_ENABLE_AGENTS=0` 一键关闭。
+"""
+
+from __future__ import annotations
+
+import copy
+import re
+import tomllib
+import uuid
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any
+
+from . import tokens, ui, worktree
+from .config import Config, user_config_dir
+from .events import Notice, UISink
+from .tools import Tool, Toolbox
+
+#  spec 可点名的工具全集：内置七件。update_plan/skill/web_search/explore 是
+#  Agent 级条件挂载，不在 Toolbox(only=...) 的可选集合里
+ALLOWED_TOOLS = (*Toolbox.READONLY, "write_file", "str_replace", "bash", "browser")
+
+#  能力档位 → 允许的工具（白名单方向，不做黑名单）：
+#  read-write 无执行、execute 无写文件（browser 有页面副作用，归 execute 档）
+CAPABILITY_TOOLS: dict[str, frozenset[str]] = {
+    "read-only": frozenset(Toolbox.READONLY),
+    "read-write": frozenset((*Toolbox.READONLY, "write_file", "str_replace")),
+    "execute": frozenset((*Toolbox.READONLY, "bash", "browser")),
+    "all": frozenset(ALLOWED_TOOLS),
+}
+
+_NAME_RE = re.compile(r"^[a-z][a-z0-9_]{1,31}$")
+_DEFAULT_ITERATIONS = 20
+MAX_ANSWER_CHARS = 4000
+#  resume 记录的滚动上限与"transcript 不得超过窗口多少"的闸（80%）
+MAX_RUNS = 16
+_SAFE_RESUME_RATIO = 0.8
+
+#  模型乱填参数的哨兵值：一律当"没给"
+_SENTINELS = {"", "null", "undefined", "nil"}
+
+
+def normalize_capability(value: Any) -> str | None:
+    """宽进的 alias 容错：kebab/snake/camel/大小写都认。不认识返回 None。"""
+    text = re.sub(r"[-_\s]", "", str(value or "").strip().lower())
+    return {
+        "readonly": "read-only",
+        "readwrite": "read-write",
+        "execute": "execute",
+        "all": "all",
+    }.get(text)
+
+
+def intersect_capabilities(a: str | None, b: str | None) -> str | None:
+    """交集取下界。
+
+    all 是单位元、read-only 是吸收元；read-write 与 execute 不可比，
+    交集保守降到 read-only——这不是偏序格，是刻意的下确界。
+    """
+    if a is None:
+        return b
+    if b is None:
+        return a
+    if a == "all":
+        return b
+    if b == "all":
+        return a
+    if a == b:
+        return a
+    return "read-only"
+
+
+def _clean_param(value: Any) -> str | None:
+    """调用参数消毒：剥引号、去空白，哨兵值一律当没给。"""
+    text = str(value if value is not None else "").strip().strip("\"'`").strip()
+    return None if text.lower() in _SENTINELS else text
+
+
+@dataclass(frozen=True)
+class AgentSpec:
+    name: str
+    description: str
+    system_prompt: str
+    tools: tuple[str, ...]
+    model: str = ""  # 空 = 随主模型
+    max_iterations: int = _DEFAULT_ITERATIONS
+    capability_mode: str = ""  # 空 = 不设天花板（tools 白名单即是全部约束）
+    isolation: str = ""  # "" | "worktree"（spec 级默认，调用参数可覆盖）
+    mcp_mode: str = "none"  # none | all | named | except
+    mcp_servers: tuple[str, ...] = ()
+    source: str = ""  # user | workspace（显示用）
+
+    @property
+    def readonly(self) -> bool:
+        return set(self.tools) <= set(Toolbox.READONLY) and self.mcp_mode == "none"
+
+
+@dataclass
+class SubagentRun:
+    """一次委托的存档（resume_from 的取值来源）。纯内存，会话结束即弃。"""
+
+    id: str
+    spec_name: str
+    model: str
+    messages: list[dict[str, Any]] = field(default_factory=list)
+    #  跑完保留下来的 worktree（没隔离/已删则 None），resume 时原地复用
+    worktree: Path | None = None
+
+
+def spec_dirs(workspace: Path) -> list[tuple[Path, str]]:
+    return [
+        (user_config_dir() / "agents", "user"),
+        (workspace / ".xiaoyu" / "agents", "workspace"),
+    ]
+
+
+def load_agent_specs(workspace: Path) -> tuple[list[AgentSpec], list[str]]:
+    """扫描两级 agents/ 目录。坏 spec 跳过并记问题；同名后见者（工作区级）跳过。"""
+    specs: list[AgentSpec] = []
+    problems: list[str] = []
+    seen: set[str] = set()
+    for directory, source in spec_dirs(workspace):
+        if not directory.is_dir():
+            continue
+        for path in sorted(directory.glob("*.toml")):
+            spec, issues = _parse_spec(path, source)
+            problems.extend(issues)
+            if spec is None:
+                continue
+            if spec.name in seen:
+                problems.append(f"{path.name}: 与已加载的 {spec.name} 同名，跳过（用户级优先）")
+                continue
+            seen.add(spec.name)
+            specs.append(spec)
+    return specs, problems
+
+
+def _parse_mcp(data: dict[str, Any]) -> tuple[str, tuple[str, ...]] | str:
+    """mcp / mcp_except 两个键 → (mode, servers)。出错返回问题描述字符串。"""
+    raw_mcp = data.get("mcp")
+    raw_except = data.get("mcp_except")
+    if raw_except is not None:
+        if not isinstance(raw_except, list):
+            return "mcp_except 必须是 server 名列表"
+        #  mcp="all" + mcp_except 是自然写法；mcp 给了别的值就矛盾了
+        if raw_mcp not in (None, "all"):
+            return "mcp_except 只能单用或与 mcp = \"all\" 搭配"
+        return "except", tuple(str(item) for item in raw_except)
+    if raw_mcp is None:
+        return "none", ()
+    if isinstance(raw_mcp, str):
+        low = raw_mcp.strip().lower()
+        if low == "all":
+            return "all", ()
+        if low in ("none", ""):
+            return "none", ()
+        return f"mcp 不认识 {raw_mcp!r}（可选 \"all\" / \"none\" / server 名列表）"
+    if isinstance(raw_mcp, list):
+        #  空列表 = 全空池，合法——等价 none 但不报错
+        return "named", tuple(str(item) for item in raw_mcp)
+    return "mcp 必须是 \"all\" / \"none\" 或 server 名列表"
+
+
+def _parse_spec(path: Path, source: str) -> tuple[AgentSpec | None, list[str]]:
+    name = path.stem
+    if not _NAME_RE.match(name):
+        return None, [f"{path.name}: 文件名须为小写字母/数字/下划线（2-32 字符）"]
+    try:
+        data = tomllib.loads(path.read_text(encoding="utf-8", errors="replace"))
+    except (OSError, tomllib.TOMLDecodeError) as exc:
+        return None, [f"{path.name}: 解析失败：{exc}"]
+    description = str(data.get("description", "")).strip()
+    system_prompt = str(data.get("system_prompt", "")).strip()
+    if not description or not system_prompt:
+        return None, [f"{path.name}: description / system_prompt 必填"]
+    #  能力档位（spec 级天花板）
+    raw_mode = str(data.get("capability_mode", "") or "").strip()
+    mode = ""
+    if raw_mode:
+        normalized = normalize_capability(raw_mode)
+        if normalized is None:
+            return None, [
+                f"{path.name}: capability_mode 不认识 {raw_mode!r}"
+                "（可选 read-only / read-write / execute / all）"
+            ]
+        mode = normalized
+    #  工具集：tools 与 capability_mode 至少给一个；都给取交集
+    raw_tools = data.get("tools")
+    if raw_tools is None:
+        if not mode:
+            return None, [f"{path.name}: tools 与 capability_mode 至少给一个"]
+        tools = tuple(tool for tool in ALLOWED_TOOLS if tool in CAPABILITY_TOOLS[mode])
+    else:
+        if not isinstance(raw_tools, list) or not raw_tools:
+            return None, [f"{path.name}: tools 必须是非空工具名列表"]
+        tools = tuple(str(item) for item in raw_tools)
+        if unknown := [tool for tool in tools if tool not in ALLOWED_TOOLS]:
+            return None, [
+                f"{path.name}: 工具不在可选集合里：{', '.join(unknown)}"
+                f"（可选：{', '.join(ALLOWED_TOOLS)}）"
+            ]
+        if mode:
+            tools = tuple(tool for tool in tools if tool in CAPABILITY_TOOLS[mode])
+            if not tools:
+                return None, [f"{path.name}: tools 与 capability_mode={mode} 的交集为空"]
+    #  隔离（spec 级默认）
+    raw_iso = str(data.get("isolation", "") or "").strip().lower().replace("_", "-")
+    if raw_iso in ("", "none"):
+        isolation = ""
+    elif raw_iso in ("worktree", "work-tree"):
+        isolation = "worktree"
+    else:
+        return None, [f"{path.name}: isolation 只能是 none 或 worktree"]
+    #  MCP 继承
+    parsed_mcp = _parse_mcp(data)
+    if isinstance(parsed_mcp, str):
+        return None, [f"{path.name}: {parsed_mcp}"]
+    mcp_mode, mcp_servers = parsed_mcp
+    try:
+        iterations = int(data.get("max_iterations", _DEFAULT_ITERATIONS))
+    except (TypeError, ValueError):
+        iterations = _DEFAULT_ITERATIONS
+    return (
+        AgentSpec(
+            name=name,
+            description=description,
+            system_prompt=system_prompt,
+            tools=tools,
+            model=str(data.get("model", "") or ""),
+            max_iterations=max(1, min(iterations, 100)),
+            capability_mode=mode,
+            isolation=isolation,
+            mcp_mode=mcp_mode,
+            mcp_servers=mcp_servers,
+            source=source,
+        ),
+        [],
+    )
+
+
+def make_subagent_tool(
+    spec: AgentSpec,
+    config: Config,
+    registry: Any,
+    usage: Any,
+    sink: UISink,
+    approver: Any,
+    permissions: Any,
+    runs: dict[str, SubagentRun] | None = None,
+    mcp_manager: Any = None,
+) -> Tool:
+    """spec → 可挂载的工具。结构与 explore.make_explore_tool 同构：
+    usage/registry 传父级的（同一本账、client 复用），sink 走 quiet_child 派生。
+
+    runs 是跨 spec 共享的 resume 存档（agent.py 挂载时给同一个 dict，让
+    resume 句柄在存档里全局唯一）；mcp_manager 是父级 Toolbox 的 manager，
+    spec 声明了 mcp 继承才用到。
+    """
+    store: dict[str, SubagentRun] = runs if runs is not None else {}
+
+    def run(
+        task: str,
+        capability_mode: str | None = None,
+        isolation: str | None = None,
+        resume_from: str | None = None,
+    ) -> str:
+        from .agent import Agent
+        from .mcp import McpView
+
+        #  -- 能力档位：调用参数 ∧ spec 天花板（spec.tools 已在解析期扣过天花板，
+        #     这里只需再扣一次调用参数收紧的部分） --
+        requested = _clean_param(capability_mode)
+        req_mode: str | None = None
+        if requested is not None:
+            req_mode = normalize_capability(requested)
+            if req_mode is None:
+                return (
+                    f"ERROR: capability_mode 只能是 read-only / read-write / "
+                    f"execute / all，不认识 {requested!r}。"
+                )
+        mode = intersect_capabilities(req_mode, spec.capability_mode or None)
+        tools_list = (
+            spec.tools
+            if mode is None
+            else tuple(tool for tool in spec.tools if tool in CAPABILITY_TOOLS[mode])
+        )
+        if not tools_list:
+            return (
+                f"ERROR: capability_mode={mode} 收紧后 {spec.name} 没有可用工具了，"
+                "放宽档位或不传这个参数。"
+            )
+
+        #  -- resume：全链路 fail-closed，任何一步不对就报错，绝不退化成全新子 agent --
+        record: SubagentRun | None = None
+        rid = _clean_param(resume_from)
+        if rid is not None:
+            record = store.get(rid)
+            if record is None:
+                return (
+                    f"ERROR: 找不到 resume_from={rid!r} 对应的子 agent 记录"
+                    "（可能已被滚动淘汰，或 ID 写错——句柄在上次结论的尾部）。"
+                )
+            if record.spec_name != spec.name:
+                return (
+                    f"ERROR: {rid} 是 {record.spec_name} 的运行记录，"
+                    f"不能用 {spec.name} 恢复（换对工具再调）。"
+                )
+            if len(record.messages) < 2:
+                return f"ERROR: {rid} 的存档是空的，无法恢复。"
+            estimated = tokens.estimate_messages(record.messages)
+            if estimated >= int(config.context_limit * _SAFE_RESUME_RATIO):
+                return (
+                    f"ERROR: {rid} 的上下文约 {estimated} tok，超过窗口的 "
+                    f"{int(_SAFE_RESUME_RATIO * 100)}%，无法恢复——把任务拆小重新委托。"
+                )
+
+        #  -- workspace 与 worktree：resume 复用上次的（没了就退回主工作区，
+        #     isolation 参数此时忽略）；新开则按 参数 > spec 默认 决定是否隔离，
+        #     创建失败 fail-open --
+        workdir = config.workspace
+        created: Path | None = None
+        inherited_wt: Path | None = None
+        notes: list[str] = []
+        if record is not None:
+            if record.worktree is not None:
+                if record.worktree.is_dir():
+                    workdir = record.worktree
+                    inherited_wt = record.worktree
+                else:
+                    notes.append("上次的 worktree 已不存在，这次在主工作区跑")
+        else:
+            iso_param = _clean_param(isolation)
+            #  与 spec 解析同一套 alias 容错：大小写 / 下划线都认
+            iso_value = (
+                iso_param if iso_param is not None else (spec.isolation or "none")
+            ).lower().replace("_", "-")
+            if iso_value not in ("none", "worktree", "work-tree"):
+                return f"ERROR: isolation 只能是 none 或 worktree，不认识 {iso_value!r}。"
+            if iso_value != "none":
+                try:
+                    created = worktree.create(config.workspace, spec.name)
+                    workdir = created
+                except worktree.WorktreeError as exc:
+                    sink.emit(
+                        Notice(f"  ⚠ {spec.name} worktree 隔离失败，退回主工作区：{exc}", "warn")
+                    )
+                    notes.append(f"worktree 隔离失败（{exc}），实际在主工作区跑")
+
+        #  -- MCP 继承（server 级视图，不拉新进程；作者声明才有） --
+        mcp_view = (
+            McpView(mcp_manager, spec.mcp_mode, spec.mcp_servers)
+            if mcp_manager is not None and spec.mcp_mode != "none"
+            else None
+        )
+
+        #  resume 钉死上次的模型（spec/主模型中途换了也不动摇——上下文是按它长的）
+        model = record.model if record is not None else (spec.model or config.model)
+        #  免确认只给"纯只读且无 MCP"的有效集合；否则父级审批穿透
+        readonly_run = set(tools_list) <= set(Toolbox.READONLY) and mcp_view is None
+        sub_config = Config(
+            base_url=config.base_url,
+            model=model,
+            summary_model=config.summary_model,
+            explore_model=config.explore_model,
+            workspace=workdir,
+            max_iterations=spec.max_iterations,
+            max_tool_output=config.max_tool_output,
+            context_limit_override=config.context_limit_override,
+            compact_at=config.compact_at,
+            keep_recent=config.keep_recent,
+            request_timeout=config.request_timeout,
+            extra_env=config.extra_env,
+            bash_timeout=config.bash_timeout,
+            sandbox=config.sandbox,
+            sandbox_network=config.sandbox_network,
+            auto_approve=readonly_run or config.auto_approve,
+            mcp_tool_search=config.mcp_tool_search,
+            enable_explore=False,
+            enable_web_search=False,
+            enable_skills=False,
+            enable_plan=False,
+            enable_plugins=False,
+            enable_mcp=False,
+            enable_hooks=False,
+            enable_agents=False,
+        )
+        label = "恢复" if record is not None else "委托"
+        sink.emit(Notice(f"  🤖 {spec.name}（{model}）{label}：{ui.preview(task, 90)}"))
+        child_maker = getattr(sink, "quiet_child", None)
+        sub_agent = Agent(
+            sub_config,
+            Toolbox(sub_config, only=list(tools_list), mcp_view=mcp_view),
+            usage=usage,
+            registry=registry,
+            quiet=True,
+            allow_explore=False,
+            #  权限不因声明放大：写/执行/MCP 复用父级审批；deny 规则（含
+            #  read_file 路径类）对只读子集同样穿透——permissions 一律传父级的
+            approver=None if readonly_run else approver,
+            permissions=permissions,
+            sink=child_maker() if callable(child_maker) else None,
+        )
+        system_text = spec.system_prompt.format(workspace=workdir)
+        if record is not None:
+            #  transcript 续用、system 头按当前 spec 重渲染（body 继承，
+            #  head 以现在的定义为准）
+            sub_agent.messages = copy.deepcopy(record.messages)
+            sub_agent.messages[0] = {"role": "system", "content": system_text}
+        else:
+            sub_agent.messages[0]["content"] = system_text
+        failure = ""
+        try:
+            sub_agent.send(task)
+        except Exception as exc:  # noqa: BLE001 - 委托失败不该打断主流程
+            failure = f"{type(exc).__name__}: {exc}"
+
+        #  -- worktree 收尾：本次新建的，干净就删、有改动就保留报路径；
+        #     resume 复用的一律保留 --
+        kept = inherited_wt
+        if created is not None:
+            if worktree.dirty(created):
+                kept = created
+            else:
+                worktree.remove(config.workspace, created)
+                kept = None
+
+        #  -- 存档（失败的也记：从 failed 恢复继续修是 resume 的正当用法） --
+        run_id = uuid.uuid4().hex[:8]
+        store[run_id] = SubagentRun(
+            id=run_id,
+            spec_name=spec.name,
+            model=model,
+            messages=copy.deepcopy(sub_agent.messages),
+            worktree=kept,
+        )
+        while len(store) > MAX_RUNS:
+            store.pop(next(iter(store)))
+
+        #  resume 句柄写进返回文本：只放结构化
+        #  字段模型学不会用，写在眼前才会形成"多阶段委托"的用法
+        footer_lines = [
+            f"resume_from: {run_id}"
+            f"（要在这个子 agent 的上下文上继续，调 {spec.name} 时带上它）"
+        ]
+        if kept is not None:
+            footer_lines.append(
+                f"改动在独立 worktree：{kept}（主工作区未动；"
+                "用 git -C 该路径 diff 查看，确认后 git apply 取回）"
+            )
+        footer_lines.extend(notes)
+        footer = "\n".join(footer_lines)
+        if failure:
+            return f"ERROR: 子 agent {spec.name} 失败（{failure}）。\n{footer}"
+        answer = sub_agent.last_assistant_text()
+        sink.emit(Notice(f"  🤖 {spec.name} 完成：{len(sub_agent.trace)} 次工具调用"))
+        if not answer:
+            return f"子 agent {spec.name} 没有给出结论（可能是轮次用尽）。\n{footer}"
+        if len(answer) > MAX_ANSWER_CHARS:
+            answer = answer[:MAX_ANSWER_CHARS] + "\n…（结论过长已截断）"
+        return (
+            f"[{spec.name} 子 agent 的结论（{model}，{len(sub_agent.trace)} 次工具调用）]\n"
+            f"{answer}\n\n{footer}"
+        )
+
+    isolation_hint = "默认在独立 worktree 里跑" if spec.isolation == "worktree" else ""
+    mcp_hint = f"MCP：{spec.mcp_mode}" if spec.mcp_mode != "none" else ""
+    extras = "；".join(part for part in (isolation_hint, mcp_hint) if part)
+    return Tool(
+        name=spec.name,
+        description=(
+            f"{spec.description}（子 agent，工具：{', '.join(spec.tools)}"
+            + (f"；{extras}" if extras else "")
+            + "；任务在独立上下文里完成，只把结论带回来。task 要自包含："
+            "它看不到当前对话，背景信息要写全。）"
+        ),
+        parameters={
+            "type": "object",
+            "properties": {
+                "task": {"type": "string", "description": "交给子 agent 的完整任务描述"},
+                "capability_mode": {
+                    "type": "string",
+                    "enum": ["read-only", "read-write", "execute", "all"],
+                    "description": (
+                        "收紧本次委托的工具档位（只能比 spec 更严，不能放宽；"
+                        "read-write 与 execute 相交会降到 read-only）"
+                    ),
+                },
+                "isolation": {
+                    "type": "string",
+                    "enum": ["none", "worktree"],
+                    "description": (
+                        "worktree = 在主仓 HEAD 的独立 git worktree 里跑，改动不落"
+                        "主工作区（注意：未提交的本地改动它看不到）；覆盖 spec 默认"
+                    ),
+                },
+                "resume_from": {
+                    "type": "string",
+                    "description": (
+                        "上次结论尾部给出的 resume_from 句柄：继承那次委托的完整"
+                        "上下文继续干（同一个子 agent 才能恢复；此时 isolation 忽略）"
+                    ),
+                },
+            },
+            "required": ["task"],
+        },
+        handler=run,
+        #  委托本身不需要确认：只读子集天然安全，写/执行/MCP 子集逐工具照常确认
+        requires_approval=False,
+    )
