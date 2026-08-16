@@ -13,6 +13,7 @@ import contextlib
 import io
 import json
 import unittest
+from unittest import mock
 
 from xiaoyu.events import (
     Notice,
@@ -81,6 +82,40 @@ class TestAgentEmitsSinkEvents(AgentTestCase):
         self.assertTrue(completed.ok)
         self.assertIn("def add", completed.output)
         self.assertGreaterEqual(completed.seconds, 0.0)
+
+    def test_interrupt_midstream_still_closes_text_segment(self) -> None:
+        """事件序列在失败路径上也要完整闭合：delta… → text.end → ended。
+        缺发 TextEnd 时明文 sink 少收尾换行、OSC 133 锚点悬空、
+        ACP 的正文段没有边界——消费者不该为失败路径写补偿逻辑。"""
+
+        def interrupted_stream():
+            yield chunk(content="说了半截")
+            raise KeyboardInterrupt
+
+        recorder = RecordingSink()
+        agent = self.build([interrupted_stream()], sink=recorder)
+        with contextlib.redirect_stdout(io.StringIO()), self.assertRaises(KeyboardInterrupt):
+            agent.send("hi")
+        self.assertEqual(
+            recorder.kinds(),
+            ["request.started", "text.delta", "text.end", "request.ended"],
+        )
+
+    def test_tool_exception_still_emits_terminal_state(self) -> None:
+        """running 已发就必须有终态（Ctrl-C 最常打在长命令执行中）：
+        否则 ACP client 的 tool_call 永远停在 in_progress。"""
+        first = [chunk(tool_calls=[call_fragment(0, "c1", "bash", '{"command": "sleep 999"}')])]
+        recorder = RecordingSink()
+        agent = self.build([first], sink=recorder)
+        with mock.patch.object(
+            agent.toolbox, "run", side_effect=KeyboardInterrupt
+        ), contextlib.redirect_stdout(io.StringIO()), self.assertRaises(KeyboardInterrupt):
+            agent.send("跑个长命令")
+        tool_kinds = [k for k in recorder.kinds() if k.startswith("tool.")]
+        self.assertEqual(tool_kinds, ["tool.pending", "tool.running", "tool.completed"])
+        completed = next(e for e in recorder.events if e.kind == "tool.completed")
+        self.assertFalse(completed.ok)
+        self.assertIn("中断", completed.output)
 
     def test_denied_by_rule_is_terminal_state(self) -> None:
         """deny 规则命中：pending 之后终态是 denied(by=rule)，不出现 running。"""

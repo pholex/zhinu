@@ -1880,10 +1880,6 @@ class Agent:
         try:
             stream = route.client.chat.completions.create(**request)
             self._consume_stream(route, stream, content_parts, pending, reasoning)
-            #  正文段在请求内部闭合：事件流读起来是规整的嵌套
-            #  started → delta… → text.end → ended
-            if content_parts:
-                self.sink.emit(TextEnd())
         except (KeyboardInterrupt, Interrupted):
             #  Ctrl-C 打在流式中途，或宿主调了 interrupt()：已经说出的半截话也要
             #  入历史，否则整轮凭空消失，用户看到过的内容模型自己却"不记得"。
@@ -1898,6 +1894,12 @@ class Agent:
                 )
             raise
         finally:
+            #  正文段在请求内部闭合，且**任何路径**上都要闭合：
+            #  started → delta… → text.end → ended。中断/异常时缺发 TextEnd，
+            #  明文 sink 少收尾换行、OSC 133 锚点悬空、ACP 的正文段没有边界——
+            #  事件消费者不该为失败路径写补偿逻辑。
+            if content_parts:
+                self.sink.emit(TextEnd())
             self.sink.emit(RequestEnded())
 
         message: dict[str, Any] = {
@@ -2171,7 +2173,22 @@ class Agent:
         #  completed|denied，每个 pending 恰好一个终态——将来活区 spinner 靠它不悬空）
         self.sink.emit(ToolRunning(name, args))
         started = time.monotonic()
-        output = self.toolbox.run(name, args)
+        try:
+            output = self.toolbox.run(name, args)
+        except BaseException as exc:
+            #  终态承诺覆盖异常路径（Ctrl-C 最常打在长命令执行中）：running 已发
+            #  就必须给终态，否则 TUI spinner 靠带外清扫、ACP client 的 tool_call
+            #  永远停在 in_progress。历史侧的 tool 配对由 close_open_tool_calls
+            #  兜底，这里只管事件面。
+            self.sink.emit(
+                ToolCompleted(
+                    name,
+                    output=f"[执行被中断/异常：{type(exc).__name__}]",
+                    ok=False,
+                    seconds=time.monotonic() - started,
+                )
+            )
+            raise
         elapsed = time.monotonic() - started
         #  「宣称完成」护栏的证据计数：只有真的跑过命令/操作过浏览器，
         #  验证类计划步骤才谈得上"验证过"
