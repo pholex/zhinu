@@ -825,14 +825,24 @@ class TestRunningLine(unittest.TestCase):
             self.assertNotIn(tip, text)
 
     def test_medium_runs_teach(self) -> None:
-        """等待时间当教学位：轮播的内容来自按键绑定表，不是另立的文案。"""
-        from xiaoyu import keys
+        """等待时间当教学位：按键类来自绑定表，非按键类在 _EXTRA_TIPS 补充。"""
+        from xiaoyu import keys, tui
 
         seen = {self.render(elapsed) for elapsed in (5, 13, 21, 29)}
-        rotation = keys.tips()
+        rotation = [*keys.tips(), *tui._EXTRA_TIPS]
         self.assertTrue(any(tip in text for text in seen for tip in rotation))
         #  确实在轮换，不是卡在同一条
         self.assertGreater(len(seen), 1)
+
+    def test_rotation_reaches_every_tip_across_runs(self) -> None:
+        """起点逐实例推进：单次窗口只够三四条，跨运行必须把整张表轮完
+        ——否则表尾的提示（XIAOYU_MODE 一类）永远见不了天日。"""
+        from xiaoyu import keys, tui
+
+        rotation = [*keys.tips(), *tui._EXTRA_TIPS]
+        seen = {self.render(5.0) for _ in range(len(rotation))}
+        for tip in rotation:
+            self.assertTrue(any(tip in text for text in seen), tip)
 
     def test_long_runs_report_the_timeout_budget(self) -> None:
         """跑久了，用户要判断的是"还该不该等"——能回答这个的是剩余预算。"""

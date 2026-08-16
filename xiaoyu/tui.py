@@ -66,6 +66,7 @@ from __future__ import annotations
 
 import contextlib
 import difflib
+import itertools
 import os
 import re
 import subprocess
@@ -221,6 +222,17 @@ _IMAGE_REF = re.compile(r"\[图片 #(\d+)[^\]]*\]")
 _IMAGE_REF_TAIL = re.compile(r"\[图片 #\d+[^\]]*\]$")
 
 
+#  非按键类的轮播补充：收录标准与 keys.tips() 相同（"不主动说就没人会发现"），
+#  但主题不是键位、进不了按键绑定表，在这里独立维护。保持短句。
+_EXTRA_TIPS = (
+    "常用 auto 档？xiaoyu config --set XIAOYU_MODE=auto 设为个人默认",
+)
+
+#  轮播起点逐实例推进：单次运行的展示窗口（_QUIET→_LONG）只够放三四条，
+#  恒从表头开始的话表尾的提示永远轮不到——12+ 条里只有前 4 条见过天日
+_TIP_START = itertools.count()
+
+
 class _RunningLine:
     """活区 spinner 的文案：rich 的刷新线程每帧重新渲染它，耗时随之跳动。
 
@@ -229,9 +241,11 @@ class _RunningLine:
     - 前 `_QUIET` 秒只报名字和耗时。绝大多数工具一闪而过，在那半秒里插花活
       纯属打扰；
     - 之后开始轮播上手提示，把等待时间变成教学位——Ctrl-O、@、# 这些功能
-      没人会主动去发现，而这正是用户闲着盯屏幕的时刻。提示取自按键绑定表；
-    - 超过 `_LONG` 秒改报"已跑多久 / 上限多久"。gemini 那条"长时间没有输出
-      就提示"在这里不成立（工具是同步执行、结果一次性返回的，执行期间本就
+      没人会主动去发现，而这正是用户闲着盯屏幕的时刻。按键类提示取自
+      按键绑定表，非按键类（环境变量一类）在 _EXTRA_TIPS 补充；起点
+      逐实例推进（_TIP_START），跨运行轮完整张表；
+    - 超过 `_LONG` 秒改报"已跑多久 / 上限多久"。"长时间没有输出就另行提示"
+      的思路在这里不成立（工具是同步执行、结果一次性返回的，执行期间本就
       没有输出），但它想解决的问题——用户不知道该不该继续等——是真的。
       对 bash 来说，剩余的超时预算才是能回答这个问题的信息。
     """
@@ -244,6 +258,8 @@ class _RunningLine:
         self.name = name
         self.timeout = timeout
         self.verb = verb
+        #  见 _TIP_START：跨运行把整张提示表轮完，而不是每次都从头四条开始
+        self._tip_start = next(_TIP_START)
         self.started = time.monotonic()
 
     def __rich__(self) -> Text:
@@ -259,10 +275,10 @@ class _RunningLine:
             return f"{budget}Ctrl-C 中断"
         if elapsed < self._QUIET:
             return "Ctrl-C 中断"
-        rotation = keys.tips()
+        rotation = [*keys.tips(), *_EXTRA_TIPS]
         if not rotation:
             return "Ctrl-C 中断"
-        index = int((elapsed - self._QUIET) // self._CYCLE) % len(rotation)
+        index = (self._tip_start + int((elapsed - self._QUIET) // self._CYCLE)) % len(rotation)
         return rotation[index]
 
 
