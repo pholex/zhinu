@@ -198,12 +198,18 @@ class ToolFlowTest(AcpCase):
         session_id = self.new_session(acp)
         self.prompt(acp, session_id, "干活")
         permission, before = acp.read_until(self.is_permission)
-        #  审批请求带工具语境与两个标准选项
+        #  审批请求带工具语境与四个选项（与 TUI 确认框同一套语义；
+        #  会话档没有专属 kind，借 allow_always 渲染、optionId 承载真义）
         params = permission["params"]
         self.assertEqual(params["sessionId"], session_id)
         self.assertEqual(params["toolCall"]["kind"], "execute")
         self.assertEqual(
-            [o["kind"] for o in params["options"]], ["allow_once", "reject_once"]
+            [o["optionId"] for o in params["options"]],
+            ["allow-once", "allow-session", "allow-always", "reject-once"],
+        )
+        self.assertEqual(
+            [o["kind"] for o in params["options"]],
+            ["allow_once", "allow_always", "allow_always", "reject_once"],
         )
         #  审批前已有 pending 的 tool_call 声明
         pending = [u for u in self.updates(before) if u.get("sessionUpdate") == "tool_call"]
@@ -275,6 +281,63 @@ class ToolFlowTest(AcpCase):
         self.assertEqual(
             (self.workspace / "新文件.txt").read_text(encoding="utf-8"), "第一行\n"
         )
+
+
+class ApprovalScopeTest(AcpCase):
+    """审批的会话授权与持久规则（TUI 确认框语义的协议面）。"""
+
+    _TWO_CALLS = (
+        'tool_call: {"name": "bash", "arguments": {"command": "echo 第一次"}}\n'
+        "---\n"
+        'tool_call: {"name": "bash", "arguments": {"command": "echo 第二次"}}\n'
+        "---\n"
+        "text: 完成\n"
+    )
+
+    def run_with_choice(self, option_id: str) -> tuple[dict, list[dict]]:
+        acp = self.start_acp(self._TWO_CALLS)
+        session_id = self.new_session(acp)
+        self.prompt(acp, session_id, "连跑两条")
+        permission, _ = acp.read_until(self.is_permission)
+        acp.send(
+            {"jsonrpc": "2.0", "id": permission["id"],
+             "result": {"outcome": {"outcome": "selected", "optionId": option_id}}}
+        )
+        return acp.read_until(self.is_response("p1"))
+
+    def counts(self, messages: list[dict]) -> tuple[int, int]:
+        prompts = sum(1 for m in messages if self.is_permission(m))
+        done = sum(
+            1 for u in self.updates(messages)
+            if u.get("sessionUpdate") == "tool_call_update" and u.get("status") == "completed"
+        )
+        return prompts, done
+
+    def test_allow_session_suppresses_further_prompts(self):
+        response, skipped = self.run_with_choice("allow-session")
+        self.assertEqual(response["result"]["stopReason"], "end_turn")
+        prompts, done = self.counts(skipped)
+        #  第一问授了会话档：第二条同名工具直接跑，不再弹审批
+        self.assertEqual(prompts, 0)  # skipped 里只剩第二条的（应为零次新审批）
+        self.assertEqual(done, 2)
+        thoughts = " ".join(
+            u["content"]["text"] for u in self.updates(skipped)
+            if u.get("sessionUpdate") == "agent_thought_chunk"
+        )
+        self.assertIn("不再逐次确认", thoughts)
+
+    def test_allow_always_writes_rule_effective_immediately(self):
+        response, skipped = self.run_with_choice("allow-always")
+        self.assertEqual(response["result"]["stopReason"], "end_turn")
+        prompts, done = self.counts(skipped)
+        self.assertEqual(prompts, 0)
+        self.assertEqual(done, 2)
+        thoughts = " ".join(
+            u["content"]["text"] for u in self.updates(skipped)
+            if u.get("sessionUpdate") == "agent_thought_chunk"
+        )
+        self.assertIn("已写入", thoughts)
+        self.assertIn("bash(echo *)", thoughts)
 
 
 class CancelTest(AcpCase):

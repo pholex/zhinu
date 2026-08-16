@@ -78,9 +78,16 @@ sink，不经协议层，所以不需要任何自定义扩展方法；可选能�
                                 发 current_mode_update 把 client 的模式选择器扳回
                                 真实状态；session/load 跟随旧会话最后生效的模式
                                 （与模型选择同一纪律，last_mode 留痕）。
-    session/request_permission  审批桥：allow-once / reject-once 两个选项。
-                                回包缺失/畸形/outcome=cancelled 一律 fail closed
-                                按拒绝（与 wire、嵌入面同一条纪律）。
+    session/request_permission  审批桥，选项与 TUI 确认框同一套语义：允许一次 /
+                                本会话内该工具都允许 / 总是允许（能推导出安全
+                                规则才出现，选中即写入持久规则）/ 拒绝。协议
+                                没有"会话作用域"的选项 kind——会话档借最接近
+                                的 allow_always 渲染，真实语义由 optionId 承载、
+                                回程按 id 还原。持久规则的安全禁令（不许覆盖
+                                任意代码执行入口）照常生效，被拒时降级为仅本
+                                次允许并在 thought 轨道说明。回包缺失/畸形/
+                                outcome=cancelled 一律 fail closed 按拒绝
+                                （与 wire、嵌入面同一条纪律）。
     fs/read_text_file           只读哨兵（client 声明了 readTextFile 才用）：
                                 编辑类调用走到审批点时读一次 client（编辑器
                                 缓冲区）视角的文件内容，与磁盘不一致=用户有
@@ -126,6 +133,7 @@ from typing import Any, Callable, TextIO
 
 from . import __version__, media, modes
 from .config import MissingConfig, load_dotenv, user_env_path
+from .permissions import suggest_allow_rule
 from .providers import UnknownModel
 from .agent import SYNTHETIC_USER_TEXTS, Agent, Allow, Deny, Interrupted
 from .events import (
@@ -1266,6 +1274,32 @@ class AcpServer:
             if conflict:
                 return Deny(conflict)
         call_id = session.sink.current_call_id(name) if session else None
+        #  能推导出"范围恰好覆盖这类调用"的安全规则才给"总是允许"选项
+        #  （与 TUI 确认框同一判据）；推不出只是少一个选项
+        rule = (
+            suggest_allow_rule(name, args, session.agent.permissions.workspace)
+            if session is not None
+            else None
+        )
+        options: list[dict[str, Any]] = [
+            {"optionId": "allow-once", "name": "允许", "kind": "allow_once"},
+            #  协议没有"会话作用域"的 kind：借最接近的 allow_always 渲染，
+            #  真实语义由 optionId 承载、回程按 id 还原
+            {
+                "optionId": "allow-session",
+                "name": f"本会话内 {name} 都允许",
+                "kind": "allow_always",
+            },
+        ]
+        if rule is not None:
+            options.append(
+                {
+                    "optionId": "allow-always",
+                    "name": f"总是允许（写入规则 {rule}）",
+                    "kind": "allow_always",
+                }
+            )
+        options.append({"optionId": "reject-once", "name": "拒绝", "kind": "reject_once"})
         self._request_seq += 1
         req_id = f"srv-{self._request_seq}"
         event = threading.Event()
@@ -1288,17 +1322,54 @@ class AcpServer:
                 "params": {
                     "sessionId": session_id,
                     "toolCall": tool_call,
-                    "options": [
-                        {"optionId": "allow-once", "name": "允许", "kind": "allow_once"},
-                        {"optionId": "reject-once", "name": "拒绝", "kind": "reject_once"},
-                    ],
+                    "options": options,
                 },
             }
         )
         while not event.wait(0.2):
             if self._closed:
                 return Deny("acp 连接已关闭，无人审批")
-        return _verdict_from(slot.get("result"))
+        return self._resolve_verdict(session, name, rule, slot.get("result"))
+
+    def _resolve_verdict(
+        self,
+        session: "_Session | None",
+        name: str,
+        rule: Any,
+        payload: Any,
+    ) -> Allow | Deny:
+        """审批回包 → Allow/Deny，含会话授权与持久规则的落地。
+        看不懂的一律 fail closed 按拒绝。"""
+        if not isinstance(payload, dict):
+            return Deny("acp client 返回了无法解析的审批结果")
+        outcome = payload.get("outcome")
+        if not isinstance(outcome, dict):
+            return Deny("acp client 的 outcome 不是对象")
+        kind = outcome.get("outcome")
+        if kind == "cancelled":
+            return Deny(str(payload.get("_reason", "") or "客户端取消了审批"))
+        if kind != "selected":
+            return Deny("acp client 返回了未知的 outcome")
+        option = outcome.get("optionId")
+        if option == "allow-once":
+            return Allow()
+        if option == "allow-session" and session is not None:
+            session.agent.permissions.grant_session(name)
+            session.sink.emit(
+                Notice(f"[本会话内 {name} 不再逐次确认（/perm 可查看）]", "info")
+            )
+            return Allow()
+        if option == "allow-always" and session is not None and rule is not None:
+            try:
+                path = session.agent.permissions.add_persistent(rule)
+            except ValueError as exc:
+                #  持久 allow 的安全禁令照常生效。用户的意图明确是放行，
+                #  本次照批，只是规则不落盘——差别要说出来，不能静默
+                session.sink.emit(Notice(f"[规则未写入：{exc}；已仅允许本次]", "warn"))
+                return Allow()
+            session.sink.emit(Notice(f"[已写入 {path}：{rule}]", "info"))
+            return Allow()
+        return Deny("用户拒绝了本次调用")
 
     def _resolve_pending(self, message: dict[str, Any]) -> None:
         req_id = message.get("id")
@@ -1309,7 +1380,7 @@ class AcpServer:
         event, slot = entry
         if "result" in message:
             slot["result"] = message["result"]
-        #  error 响应或缺 result：slot 留空，_verdict_from(None) fail closed
+        #  error 响应或缺 result：slot 留空，_resolve_verdict(None) fail closed
         event.set()
 
     # ---------- 收尾 ----------
@@ -1325,18 +1396,3 @@ class AcpServer:
             self._turn.join(timeout=10.0)
 
 
-def _verdict_from(payload: Any) -> Allow | Deny:
-    """client 的 requestPermission 回包 → Allow/Deny。看不懂的一律 fail closed。"""
-    if not isinstance(payload, dict):
-        return Deny("acp client 返回了无法解析的审批结果")
-    outcome = payload.get("outcome")
-    if not isinstance(outcome, dict):
-        return Deny("acp client 的 outcome 不是对象")
-    kind = outcome.get("outcome")
-    if kind == "selected":
-        if outcome.get("optionId") == "allow-once":
-            return Allow()
-        return Deny("用户拒绝了本次调用")
-    if kind == "cancelled":
-        return Deny(str(payload.get("_reason", "") or "客户端取消了审批"))
-    return Deny("acp client 返回了未知的 outcome")
