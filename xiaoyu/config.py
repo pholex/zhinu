@@ -355,6 +355,11 @@ class Config:
             cfg.enable_web_search = flag.strip().lower() not in ("0", "false", "no", "off")
         if backend := os.environ.get("XIAOYU_SEARCH_PROVIDER", "").strip():
             cfg.search_provider = backend
+        #  个人默认交互模式（default/auto/plan）。命令行 --mode 经 overrides
+        #  在后面覆盖它；写错的值由 Agent 侧 modes.get 归一回默认档（配置
+        #  写错不炸主循环的既有纪律），这里不重复校验
+        if mode := os.environ.get("XIAOYU_MODE", "").strip():
+            cfg.mode = mode
         if (flag := os.environ.get("XIAOYU_ENABLE_BROWSER")) is not None:
             cfg.enable_browser = flag.strip().lower() not in ("0", "false", "no", "off")
         if (flag := os.environ.get("XIAOYU_ENABLE_PLUGINS")) is not None:

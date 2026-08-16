@@ -423,5 +423,24 @@ class VersionFlagTest(unittest.TestCase):
         self.assertEqual(out.getvalue().strip(), f"xiaoyu {xiaoyu.__version__}")
 
 
+class ModeEnvTest(unittest.TestCase):
+    """XIAOYU_MODE：个人默认交互模式（写进用户级 .env 即永久生效）。
+    命令行 --mode 经 overrides 必须压过它；写错的值由 Agent 侧 modes.get
+    归一回默认档，这里只保证原样透传不校验。"""
+
+    def test_env_sets_personal_default(self) -> None:
+        with mock.patch.dict(os.environ, {"XIAOYU_MODE": "auto"}):
+            self.assertEqual(config.Config.from_env(workspace=Path.cwd()).mode, "auto")
+
+    def test_cli_override_beats_env(self) -> None:
+        with mock.patch.dict(os.environ, {"XIAOYU_MODE": "auto"}):
+            cfg = config.Config.from_env(workspace=Path.cwd(), mode="plan")
+        self.assertEqual(cfg.mode, "plan")
+
+    def test_blank_env_keeps_builtin_default(self) -> None:
+        with mock.patch.dict(os.environ, {"XIAOYU_MODE": "  "}):
+            self.assertEqual(config.Config.from_env(workspace=Path.cwd()).mode, "default")
+
+
 if __name__ == "__main__":
     unittest.main()
