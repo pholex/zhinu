@@ -1,0 +1,19 @@
+#!/bin/sh
+# commit message 内容检查：pre-commit 只扫暂存的新增行，提交说明是它的盲区——
+# 这里用同一份本机词表把 message 也筛一遍（词表位置与缺失行为同 pre-commit）。
+# 确认误报要跳过一次：XIAOYU_SKIP_SENSITIVE=1 git commit …
+# 启用：git config core.hooksPath .githooks（与 pre-commit 同一开关）
+[ "$XIAOYU_SKIP_SENSITIVE" = "1" ] && exit 0
+patterns="$HOME/.agents/sensitive-patterns/zhinu-block.txt"
+if [ ! -f "$patterns" ]; then
+    echo "[commit-msg] 警告：词表 $patterns 不存在，本次跳过内容检查" >&2
+    exit 0
+fi
+hits=$(grep -i -E -f "$patterns" "$1" | grep -v '^#' || true)
+if [ -n "$hits" ]; then
+    echo "[commit-msg] 拒绝提交：提交说明命中检查词表——" >&2
+    printf '%s\n' "$hits" | head -10 | sed 's/^/    /' >&2
+    echo "[commit-msg] 请改写措辞（设计理由自立陈述）；确认误报：XIAOYU_SKIP_SENSITIVE=1 跳过本次。" >&2
+    exit 1
+fi
+exit 0
