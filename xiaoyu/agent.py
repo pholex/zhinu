@@ -362,16 +362,17 @@ def collect_project_docs(
     return kept
 
 
-def _auth_worth_another_provider(
+def _worth_another_provider(
     verdict: errors.Verdict, chain: list[Route], index: int
 ) -> bool:
-    """鉴权失败时，链上后面还有**别家** provider 就值得再试一次。
+    """鉴权失败/额度耗尽时，链上后面还有**别家** provider 就值得再试一次。
 
-    同一家换个模型名解决不了鉴权问题，但换一家可以：直连 key 过期 / 额度用光时，
-    网关兜底正是这个功能存在的理由。别的不可重试错误（fatal）不走这条路——
-    那是请求本身有问题，换谁都一样，还会把 bug 掩盖成"所有模型都失败"。
+    这两类同一家换个模型名解决不了（key 一家一把、额度是账户级的），但换一家
+    可以：直连 key 过期 / 额度用光时，网关兜底正是这个功能存在的理由。别的
+    不可重试错误（fatal）不走这条路——那是请求本身有问题，换谁都一样，
+    还会把 bug 掩盖成"所有模型都失败"。
     """
-    if verdict.kind != "auth":
+    if verdict.kind not in ("auth", "quota"):
         return False
     current = chain[index].provider
     return any(route.provider != current for route in chain[index + 1 :])
@@ -1772,11 +1773,12 @@ class Agent:
             except Exception as exc:  # noqa: BLE001 - 分类器决定要不要换模型
                 verdict = classify(exc)
                 #  瞬时故障（限流/超时/5xx）值得换；上下文超限该压缩不该换。
-                #  鉴权错误：同一家换了也一样，但**换一家值得试**——直连 key 过期/额度
-                #  用光时，网关兜底正是这个功能存在的理由。所以只在还有别家可试时放行。
+                #  鉴权失败/额度耗尽：同一家换了也一样，但**换一家值得试**——直连
+                #  key 过期/额度用光时，网关兜底正是这个功能存在的理由。
+                #  所以只在还有别家可试时放行。
                 if verdict.should_compact:
                     raise
-                if not verdict.retryable and not _auth_worth_another_provider(
+                if not verdict.retryable and not _worth_another_provider(
                     verdict, chain, index
                 ):
                     raise

@@ -23,7 +23,7 @@ class Verdict:
 
 #  classify 可能给出的全部分类。新增分类必须同步进这里——
 #  tests/test_errors.py 会遍历断言每一类都可构造、hint 非空、展示路径不炸。
-ALL_KINDS = ("rate_limit", "transient", "context_overflow", "auth", "fatal")
+ALL_KINDS = ("rate_limit", "transient", "context_overflow", "quota", "auth", "fatal")
 
 
 #  上下文超限的报错各家措辞不一（LiteLLM 还会转写），按关键词兜底识别
@@ -34,6 +34,26 @@ _CONTEXT_MARKERS = (
     "too many tokens",
     "prompt is too long",
     "input is too long",
+)
+
+#  长得像上下文超限、实为限流的文案：Bedrock 的 ThrottlingException 原文是
+#  "Too many tokens, please wait before trying again"，会撞上 _CONTEXT_MARKERS
+#  的 "too many tokens"——误判成超限会触发一次无意义的压缩。这类必须先于
+#  超限判定按限流处理。
+_THROTTLE_NOT_OVERFLOW = ("too many tokens, please wait",)
+
+#  额度/配额耗尽：多以 429 或 RateLimitError 的皮出现，但和限流本质不同——
+#  限流等一等就过去，额度用尽等多久都没用，重试只是白挨。得先于限流判定拦下。
+#  措辞来源：openai 的 insufficient_quota、LiteLLM 的 budget 系（llm 网关按
+#  $/月 限额，这条链路真实存在）。按实测补充，别泛化到裸 "quota"/"budget"
+#  单词——太宽会把正常业务文案误伤进来。
+_QUOTA_MARKERS = (
+    "insufficient_quota",
+    "insufficient quota",
+    "exceeded your current quota",
+    "monthly usage limit",
+    "budget has been exceeded",
+    "out of budget",
 )
 
 
@@ -55,6 +75,14 @@ def classify(exc: Exception) -> Verdict:
     ):
         return Verdict("auth", False, False, "鉴权失败，请检查 XIAOYU_API_KEY 和端点")
 
+    if any(marker in text for marker in _QUOTA_MARKERS):
+        #  额度耗尽：同一路重试无解，但降级链上换一家值得试（agent.py 放行）
+        return Verdict("quota", False, False, "额度/配额已用尽（重试无用，充值或 /model 换路由）")
+
+    if any(marker in text for marker in _THROTTLE_NOT_OVERFLOW):
+        #  Bedrock 式"tokens 措辞的限流"：先于超限判定拦下，绝不触发压缩
+        return Verdict("rate_limit", True, False, "限流")
+
     if any(marker in text for marker in _CONTEXT_MARKERS):
         #  上下文超限：压缩后值得立刻重试
         return Verdict("context_overflow", True, True, "上下文超限，压缩后重试")
@@ -63,6 +91,7 @@ def classify(exc: Exception) -> Verdict:
         isinstance(exc, openai.RateLimitError)
         or status == 429
         or "rate limit" in text
+        or "throttl" in text  # AWS 系措辞：ThrottlingException / throttled
         or "429" in text
     ):
         return Verdict("rate_limit", True, False, "限流")

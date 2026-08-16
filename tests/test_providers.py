@@ -494,6 +494,20 @@ class TestCrossProviderFallback(ProviderTestCase):
         self.assertEqual(agent.last_assistant_text(), "网关顶上")
         self.assertEqual(len(gateway.completions.calls), 1)
 
+    def test_quota_exhausted_direct_falls_to_gateway(self) -> None:
+        """直连额度用尽（quota，非限流）：同家重试无解，跨家兜底该顶上，
+        且不该在直连上退避重试——额度等不来。"""
+        quota = openai.RateLimitError(
+            "You exceeded your current quota, please check your plan and billing details.",
+            response=_response(429),
+            body=None,
+        )
+        agent, gateway = self.build([quota], [[chunk(content="网关顶上")]])
+        self._run(agent)
+        self.assertEqual(agent.last_assistant_text(), "网关顶上")
+        #  直连只被打了一次（无退避重试），网关一次成功
+        self.assertEqual(len(gateway.completions.calls), 1)
+
     def test_auth_failure_on_last_provider_still_raises(self) -> None:
         """没有别家可试时鉴权错误照旧直接抛——那是配置问题，不该假装在恢复。"""
         dead = openai.AuthenticationError("401", response=_response(401), body=None)
