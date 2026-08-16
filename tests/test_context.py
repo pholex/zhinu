@@ -9,6 +9,7 @@ from xiaoyu.compaction import (
     CONTEXT_PREFIX,
     MIN_SUMMARY_CHARS,
     Compactor,
+    anchor_index,
     collect_user_voice,
     is_degenerate_summary,
     render,
@@ -589,6 +590,77 @@ class TestSummaryGuards(unittest.TestCase):
         head_text = compacted[1]["content"]
         #  整条头部消息里只有拼装时加的那一个活标记
         self.assertEqual(head_text.count(CONTEXT_PREFIX), 1)
+
+
+class TestAnchorIndex(unittest.TestCase):
+    """机械锚点索引：摘要可以释义，逐字标识符不许丢——正则收割、零模型调用。"""
+
+    def test_harvests_each_kind_verbatim(self) -> None:
+        messages = [
+            {
+                "role": "assistant",
+                "content": "看 src/app/main.py 和 https://example.com/x?a=1，提交 deadbee1234，工单 #4567",
+                "tool_calls": [
+                    {"id": "c1", "function": {"name": "read_file",
+                                              "arguments": '{"path": "docs/guide/setup.md"}'}}
+                ],
+            },
+            {"role": "tool", "tool_call_id": "c1", "content": "TypeError: bad thing"},
+        ]
+        block = anchor_index(messages)
+        for needle in (
+            "src/app/main.py", "https://example.com/x?a=1", "deadbee1234",
+            "#4567", "TypeError", "docs/guide/setup.md",
+        ):
+            self.assertIn(needle, block)
+
+    def test_dedup_and_per_kind_cap(self) -> None:
+        content = "a/b.py " * 50 + " ".join(f"pkg{i}/mod{i}.py" for i in range(40))
+        block = anchor_index([{"role": "user", "content": content}])
+        self.assertEqual(block.count("a/b.py"), 1)  # 去重
+        (paths_line,) = [line for line in block.splitlines() if line.startswith("路径")]
+        self.assertLessEqual(len(paths_line.split("  ")), 15)  # 每类封顶
+        self.assertLessEqual(len(block), 1201)  # 总量封顶
+
+    def test_empty_when_nothing_found(self) -> None:
+        self.assertEqual(anchor_index([{"role": "user", "content": "你好，改一下逻辑"}]), "")
+
+    def test_pure_digit_runs_are_not_commits(self) -> None:
+        block = anchor_index([{"role": "user", "content": "数字 12345678 不是提交号"}])
+        self.assertNotIn("提交", block)
+
+    def test_compact_appends_index_after_summary(self) -> None:
+        compactor = Compactor(
+            context_limit=1000, compact_at=0.7, keep_recent=5,
+            summarizer=lambda _t, _p: "摘要",
+        )
+        original = conversation()
+        original[3]["content"] = "读了 src/calc/impl.py\n" + "填充 " * 400
+        messages, _ = compactor.compact(original)
+        content = messages[1]["content"]
+        self.assertIn("【索引】", content)
+        self.assertIn("src/calc/impl.py", content)
+        #  索引排在分界标记之后（属于摘要块，而不是原始任务的一部分）
+        self.assertGreater(content.index("【索引】"), content.index(CONTEXT_PREFIX))
+
+
+class TestCompactSkipsTinyRegion(unittest.TestCase):
+    def test_small_region_skips_before_summary_call(self) -> None:
+        """可压区间比摘要固定开销还小：直接跳过，摘要调用一次都不花。"""
+        calls: list[int] = []
+
+        def summarizer(_t: str, _p: list) -> str:
+            calls.append(1)
+            return "摘要"
+
+        compactor = Compactor(
+            context_limit=100_000, compact_at=0.7, keep_recent=2, summarizer=summarizer
+        )
+        messages = conversation()
+        out, note = compactor.compact(messages)
+        self.assertEqual(out, messages)
+        self.assertIn("跳过", note)
+        self.assertEqual(calls, [])
 
 
 if __name__ == "__main__":

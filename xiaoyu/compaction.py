@@ -12,6 +12,7 @@
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from typing import Any, Callable
 
@@ -152,6 +153,55 @@ def microcompact(
         cleared += 1
         saved += len(content) - len(stub)
     return result, cleared, saved
+
+
+# ---------- 机械锚点索引（摘要旁的逐字标识符备份） ----------
+
+#  摘要是有损的，而最容易被摘要"释义"掉的恰是必须逐字才有用的标识符：
+#  文件路径、提交号、URL、错误类名、工单编号。这一节用纯正则从被压原文里
+#  机械收割（零模型调用、零释义风险），作为有界索引附在摘要旁——后续轮次
+#  要"找回当时那个文件/那次提交"时，逐字锚点还在。
+_ANCHOR_PATTERNS: tuple[tuple[str, str], ...] = (
+    #  带目录分隔的相对/绝对路径（要求至少一层目录，裸文件名不收：噪声太大）
+    ("路径", r"(?:~/|\.{1,2}/|/)?[\w.\-]+(?:/[\w.\-]+)+"),
+    ("URL", r"https?://[^\s)\"'>\]]+"),
+    #  7~40 位十六进制且至少含一个字母：排除纯数字串误报
+    ("提交", r"\b(?=[0-9a-f]*[a-f])[0-9a-f]{7,40}\b"),
+    ("编号", r"#\d{2,}"),
+    ("错误", r"\b[A-Z][A-Za-z]{2,}(?:Error|Exception|Warning)\b"),
+)
+_ANCHORS_PER_KIND = 15
+_ANCHORS_CHAR_CAP = 1200
+
+
+def anchor_index(messages: list[dict[str, Any]]) -> str:
+    """被压区的逐字标识符索引；一个都没收到返回空串。
+
+    扫描消息正文与 tool_calls 参数（路径最常出现在调用参数里）。
+    每类去重保序、各限 15 条，总量封顶 1200 字符——索引是保险不是转录，
+    超限宁可截断。
+    """
+    pieces: list[str] = []
+    for message in messages:
+        pieces.append(media.text_of(message.get("content")))
+        for call in message.get("tool_calls") or []:
+            function = call.get("function") or {}
+            pieces.append(str(function.get("arguments") or ""))
+    text = "\n".join(pieces)
+    lines: list[str] = []
+    for label, pattern in _ANCHOR_PATTERNS:
+        found: list[str] = []
+        for match in re.findall(pattern, text):
+            if match not in found:
+                found.append(match)
+                if len(found) >= _ANCHORS_PER_KIND:
+                    break
+        if found:
+            lines.append(f"{label}: {'  '.join(found)}")
+    block = "\n".join(lines)
+    if len(block) > _ANCHORS_CHAR_CAP:
+        block = block[:_ANCHORS_CHAR_CAP] + "…"
+    return block
 
 
 def split_head(content: str) -> tuple[str, str]:
@@ -340,6 +390,17 @@ class Compactor:
         older = messages[head_end:cut]
         before = tokens.estimate_messages(messages)
 
+        #  不划算早退：摘要正文 + 分界标记 + 原话备份 + 锚点索引自身就有固定
+        #  开销，可压区间比这个量级还小时，十有八九落进后面"反而更大"的放弃
+        #  路径——那就别花这次注定白费的摘要调用。阈值随窗口缩放（2%）并
+        #  封顶：小窗口按比例、大窗口不至于把明明可压的区间也拦掉。
+        region = tokens.estimate_messages(older)
+        floor = min(2_000, int(self.context_limit * 0.02))
+        if region <= floor:
+            return messages, (
+                f"跳过：可压区间仅约 {region} tok，低于摘要固定开销的量级（{floor}）"
+            )
+
         original, previous_summary = (
             split_head(media.text_of(messages[1].get("content"))) if has_task else ("", "")
         )
@@ -376,8 +437,16 @@ class Compactor:
             if self.user_voice_tokens > 0
             else ""
         )
+        #  逐字锚点索引附在摘要后：摘要可以释义，索引不许（机械提取）。
+        #  它也一并过消毒——原文里万一含分界标记，不能借索引复活
+        anchors = anchor_index(older)
+        if anchors:
+            anchors = (
+                "\n\n【索引】以下标识符逐字取自被压缩的原文（机械提取，未经改写）：\n"
+                + sanitize_summary(anchors)
+            )
         #  消毒后再拼分界标记：正文里复读的标记被打断，split_head 永远只认这里拼的这一个
-        summary_block = CONTEXT_PREFIX + sanitize_summary(summary.strip()) + voice
+        summary_block = CONTEXT_PREFIX + sanitize_summary(summary.strip()) + anchors + voice
         if has_task:
             head = {"role": "user", "content": f"{original}\n\n{summary_block}"}
         else:
