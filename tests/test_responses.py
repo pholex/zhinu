@@ -511,6 +511,34 @@ class TestReasoningPassthrough(unittest.TestCase):
             [{"role": "assistant", "content": "算好了"}],
         )
 
+    def test_reasoning_is_dropped_when_the_provider_changed(self) -> None:
+        """降级链让同名模型跑在两家上（直连 vs 网关）：signature 是服务侧
+        私有状态，跨家回放属于喂错东西。provider 对不上整段跳过；
+        旧会话存量（无 provider 标签）在真实路由上同样按不匹配处理。"""
+        tagged = {
+            "role": "assistant",
+            "content": "算好了",
+            REASONING_KEY: {"model": "gpt-5.6-sol", "provider": "openai", "items": [self.ITEM]},
+        }
+        #  同家回放、跨家丢弃
+        self.assertEqual(
+            to_input([dict(tagged)], "gpt-5.6-sol", "openai")[0].get("type"), "reasoning"
+        )
+        self.assertEqual(
+            to_input([dict(tagged)], "gpt-5.6-sol", "gateway"),
+            [{"role": "assistant", "content": "算好了"}],
+        )
+        #  存量无标签 + 真实路由 → 丢
+        legacy = {
+            "role": "assistant",
+            "content": "算好了",
+            REASONING_KEY: {"model": "gpt-5.6-sol", "items": [self.ITEM]},
+        }
+        self.assertEqual(
+            to_input([legacy], "gpt-5.6-sol", "openai"),
+            [{"role": "assistant", "content": "算好了"}],
+        )
+
     def test_reasoning_survives_the_transport_not_just_to_input(self) -> None:
         """回归：净化若跑在翻译之前，`_reasoning` 会被当私有键摘掉——回传当场失效，
         且不报任何错，只是悄悄变慢变贵。这条断言走完整条 create 路径。"""

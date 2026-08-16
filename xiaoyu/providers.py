@@ -413,6 +413,7 @@ class Registry:
                         provider.responses_models,
                         provider.anthropic_models,
                         factory,
+                        provider=name,
                     )
                 )
         return self._clients[name]

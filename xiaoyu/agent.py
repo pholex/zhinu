@@ -1908,9 +1908,15 @@ class Agent:
             message["tool_calls"] = [pending[index] for index in sorted(pending)]
         if reasoning:
             #  挂在消息上（不另起边表）：压缩丢消息时它跟着走、落盘时跟着存，
-            #  没有需要"记得同步清理"的地方。记下产出它的模型——加密串是模型侧的
-            #  私有状态，/model 切了之后不能再往回塞。出网前统一被摘掉
-            message[REASONING_KEY] = {"model": route.model, "items": reasoning}
+            #  没有需要"记得同步清理"的地方。记下产出它的 provider+model——
+            #  加密串是模型/服务侧的私有状态，/model 切了不能往回塞；降级链让
+            #  同名模型跑在两家上（直连 vs 网关），跨家回放同样过不了校验。
+            #  出网前统一被摘掉
+            message[REASONING_KEY] = {
+                "model": route.model,
+                "provider": route.provider,
+                "items": reasoning,
+            }
         return message
 
     def _consume_stream(
