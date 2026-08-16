@@ -340,6 +340,27 @@ class TestInterruptRecovery(AgentTestCase):
                 self.assertEqual(roles[index + 1], "tool")
 
 
+# ---------- 自扩展指南（"文档即能力"） ----------
+
+
+class TestExtendingDoc(AgentTestCase):
+    def test_doc_ships_with_package_and_prompt_points_to_it(self) -> None:
+        """扩展格式不靠模型的训练记忆：指南随包分发，system prompt 只放
+        绝对路径。文件必须真实存在（打包漏了这里当场红），提示里给的
+        必须是它的完整路径（模型要能直接 read_file）。"""
+        import xiaoyu
+
+        doc = Path(xiaoyu.__file__).parent / "docs" / "extending.md"
+        self.assertTrue(doc.is_file(), "扩展指南没随包带上")
+        content = doc.read_text(encoding="utf-8")
+        #  四条通道都要覆盖（漏一条，模型对那条就只能瞎猜）
+        for keyword in ("SKILL.md", "xiaoyu.tools", "mcpServers", "hooks.toml"):
+            self.assertIn(keyword, content)
+        agent = self.build([])
+        self.assertIn(str(doc), agent.messages[0]["content"])
+        self.assertIn("扩展指南", agent.messages[0]["content"])
+
+
 # ---------- 项目级指令文件 ----------
 
 

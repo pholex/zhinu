@@ -63,3 +63,6 @@ version = {attr = "xiaoyu.__version__"}
 # 必须随包分发；models.local.json 是本机私有数据，不入库也不进 wheel/sdist。
 [tool.setuptools.package-data]
 "xiaoyu.evals" = ["models.example.json"]
+# 扩展指南随包分发（"文档即能力"）：system prompt 里只放它的绝对路径，
+# 模型要给小羽写技能/插件时现读——扩展格式不该靠训练记忆
+xiaoyu = ["docs/*.md"]

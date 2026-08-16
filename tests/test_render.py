@@ -117,6 +117,25 @@ class TestAgentEmitsSinkEvents(AgentTestCase):
         self.assertFalse(completed.ok)
         self.assertIn("中断", completed.output)
 
+    def test_silent_overflow_warns_user(self) -> None:
+        """静默溢出（GLM 系实测行为）：服务端输入超窗不报错、悄悄截断后正常
+        作答，usage 的 prompt_tokens 是唯一现场证据。回答可能基于被截断的
+        历史，必须告警；上下文由锚点记账在下一步自动压缩自愈，不改流程。"""
+        recorder = RecordingSink()
+        agent = self.build([[chunk(content="答"), usage_chunk(999, 10)]], sink=recorder)
+        agent.config.context_limit = 500
+        with contextlib.redirect_stdout(io.StringIO()):
+            agent.send("hi")
+        warnings = [e for e in recorder.events if e.kind == "notice" and "静默截断" in e.text]
+        self.assertEqual(len(warnings), 1)
+        #  正常量级不告警
+        recorder2 = RecordingSink()
+        agent2 = self.build([[chunk(content="答"), usage_chunk(100, 10)]], sink=recorder2)
+        agent2.config.context_limit = 500
+        with contextlib.redirect_stdout(io.StringIO()):
+            agent2.send("hi")
+        self.assertFalse([e for e in recorder2.events if e.kind == "notice" and "静默截断" in e.text])
+
     def test_denied_by_rule_is_terminal_state(self) -> None:
         """deny 规则命中：pending 之后终态是 denied(by=rule)，不出现 running。"""
         from xiaoyu.permissions import Permissions, parse_rule

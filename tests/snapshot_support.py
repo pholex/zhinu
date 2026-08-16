@@ -43,11 +43,15 @@ def _scrub_machine_bits(text: str, tmp: str) -> str:
     from xiaoyu import envprobe
     from xiaoyu.tools import _platform_shell_note
 
+    import xiaoyu
+
     replacements = [
         #  工作区路径用平台原生分隔符拼（Windows 上是 tmp\ws），posix 形态兜底
         (str(Path(tmp) / "ws"), "{{cwd}}"),
         (f"{tmp}/ws", "{{cwd}}"),
         (tmp, "{{tmp}}"),
+        #  扩展指南的绝对路径随安装位置变（site-packages / 源码树），token 化
+        (str(Path(xiaoyu.__file__).parent / "docs" / "extending.md"), "{{extending_doc}}"),
         (envprobe.block(), "\n{{envprobe}}\n"),
         (f"{platform.system()} {platform.release()} ({platform.machine()})", "{{platform}}"),
         (_platform_shell_note(), "{{shell_note}}"),
