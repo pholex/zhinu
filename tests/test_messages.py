@@ -607,6 +607,52 @@ class TestReasoningReplay(unittest.TestCase):
             request["messages"][0]["content"], [{"type": "text", "text": "算好了"}]
         )
 
+    def test_thinking_dropped_when_provider_changed(self) -> None:
+        """降级链让同名模型跑在两家上（直连 vs 网关）：signature 是服务侧
+        私有状态，跨家回放过不了校验。provider 对不上也要丢。"""
+        message = {
+            "role": "assistant",
+            "content": "算好了",
+            REASONING_KEY: {
+                "model": "claude-opus-5",
+                "provider": "anthropic",
+                "items": [dict(THINKING_ITEM)],
+            },
+        }
+        #  同家：照常回放
+        request = msgs.to_request(
+            "claude-opus-5", [dict(message)], None, False, {}, provider="anthropic"
+        )
+        self.assertEqual(request["messages"][0]["content"][0]["type"], "thinking")
+        #  跨家（同名模型走网关）：整段跳过
+        request = msgs.to_request(
+            "claude-opus-5", [dict(message)], None, False, {}, provider="gateway"
+        )
+        self.assertEqual(
+            request["messages"][0]["content"], [{"type": "text", "text": "算好了"}]
+        )
+
+    def test_legacy_reasoning_without_provider_tag_is_dropped_on_real_route(self) -> None:
+        """旧会话存量 reasoning 没有 provider 标签：真实路由（provider 非空）上
+        按不匹配处理——丢 reasoning 永远无害，跨家回放才是事故。"""
+        request = msgs.to_request(
+            "claude-opus-5",
+            [
+                {
+                    "role": "assistant",
+                    "content": "算好了",
+                    REASONING_KEY: {"model": "claude-opus-5", "items": [dict(THINKING_ITEM)]},
+                }
+            ],
+            None,
+            False,
+            {},
+            provider="anthropic",
+        )
+        self.assertEqual(
+            request["messages"][0]["content"], [{"type": "text", "text": "算好了"}]
+        )
+
 
 class TestDuckClient(unittest.TestCase):
     def test_stream_call_translates_request_and_response(self) -> None:

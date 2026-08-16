@@ -129,16 +129,21 @@ def _to_blocks(content: Any) -> list[dict[str, Any]]:
     return blocks
 
 
-def _assistant_blocks(message: dict[str, Any], model: str) -> list[dict[str, Any]]:
+def _assistant_blocks(
+    message: dict[str, Any], model: str, provider: str = ""
+) -> list[dict[str, Any]]:
     """assistant 消息 → content blocks，顺序是硬要求：thinking 在最前
     （服务端要求 thinking 先于它引出的 text/tool_use），然后正文，然后工具调用。
 
-    thinking 回放只认**产出它的同一型号**（signature 是模型侧私有状态），
-    且必须原样引用存储的 dict——重建/改字段都会过不了服务端校验。
+    thinking 回放只认**产出它的同一路由**（provider+model 都对上才回）：
+    signature 是模型/服务侧私有状态，切模型不能回放；同名模型跑在两家上
+    （直连 vs 网关兜底）跨家回放同样过不了校验。且必须原样引用存储的
+    dict——重建/改字段都会过不了服务端校验。旧会话存量无 provider 标签，
+    按不匹配处理（丢 reasoning 无害）。
     """
     blocks: list[dict[str, Any]] = []
     reasoning = message.get(REASONING_KEY) or {}
-    if reasoning.get("model") == model:
+    if reasoning.get("model") == model and (reasoning.get("provider") or "") == provider:
         blocks.extend(reasoning.get("items") or [])
     content = message.get("content")
     if isinstance(content, str):
@@ -160,7 +165,9 @@ def _assistant_blocks(message: dict[str, Any], model: str) -> list[dict[str, Any
     return blocks
 
 
-def _to_messages(messages: list[dict[str, Any]], model: str) -> list[dict[str, Any]]:
+def _to_messages(
+    messages: list[dict[str, Any]], model: str, provider: str = ""
+) -> list[dict[str, Any]]:
     """（已摘掉 system 的）消息列表 → Messages 形态。
 
     关键差异：`role: tool` 在 Messages 里是 user 消息中的 tool_result block，
@@ -189,7 +196,7 @@ def _to_messages(messages: list[dict[str, Any]], model: str) -> list[dict[str, A
             continue
         previous_was_tool = False
         if role == "assistant":
-            if blocks := _assistant_blocks(message, model):
+            if blocks := _assistant_blocks(message, model, provider):
                 converted.append({"role": "assistant", "content": blocks})
             continue
         #  user：纯字符串直通（最省，也合法）；部件列表逐个翻译
@@ -245,11 +252,12 @@ def to_request(
     tools: list[dict[str, Any]] | None,
     stream: bool,
     extra: dict[str, Any],
+    provider: str = "",
 ) -> dict[str, Any]:
     """拼出 anthropic client.messages.create 的完整参数（stream 除外，
     由调用方作为独立实参传入，与 responses 一路的形态一致）。"""
     system_text, rest = _split_system(messages)
-    converted = _to_messages(rest, model)
+    converted = _to_messages(rest, model, provider)
     _apply_tail_cache(converted)
 
     passthrough = {k: v for k, v in extra.items() if k not in _DROPPED_PARAMS}

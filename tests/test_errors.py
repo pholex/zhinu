@@ -71,6 +71,43 @@ class ClassifyTest(unittest.TestCase):
         self.assertEqual(verdict.kind, "fatal")
         self.assertFalse(verdict.retryable)
 
+    def test_bedrock_throttle_text_is_rate_limit_not_overflow(self):
+        """Bedrock 限流原文带 "Too many tokens" 字样，撞 _CONTEXT_MARKERS——
+        误判成超限会触发一次无意义的压缩。钉住：这是限流，不许压缩。"""
+        for exc in (
+            RuntimeError("ThrottlingException: Too many tokens, please wait before trying again."),
+            openai.RateLimitError(
+                "Too many tokens, please wait before trying again.",
+                response=_response(429),
+                body=None,
+            ),
+        ):
+            verdict = classify(exc)
+            self.assertEqual(verdict.kind, "rate_limit", exc)
+            self.assertFalse(verdict.should_compact, exc)
+
+    def test_throttling_wording_is_rate_limit(self):
+        #  AWS 系措辞不带 "rate limit"/"429"，靠 throttl 词根兜底
+        verdict = classify(RuntimeError("ThrottlingException: Rate exceeded"))
+        self.assertEqual(verdict.kind, "rate_limit")
+
+    def test_quota_exhaustion_is_not_retryable(self):
+        """额度用尽常披着 429/RateLimitError 的皮——限流等得起，额度等不来。
+        误判成可重试限流会无限退避白挨。钉住：不可重试、不压缩。"""
+        for exc in (
+            openai.RateLimitError(
+                "You exceeded your current quota, please check your plan and billing details.",
+                response=_response(429),
+                body=None,
+            ),
+            RuntimeError("Budget has been exceeded! Current cost: 10.4; Max budget: 10.0"),
+            RuntimeError("insufficient_quota"),
+        ):
+            verdict = classify(exc)
+            self.assertEqual(verdict.kind, "quota", exc)
+            self.assertFalse(verdict.retryable, exc)
+            self.assertFalse(verdict.should_compact, exc)
+
 
 class _DuckStatusError(Exception):
     """anthropic SDK 异常的最小鸭子型：同为 Stainless 生成，带 status_code 与
@@ -146,6 +183,11 @@ class AllKindsTest(unittest.TestCase):
             "transient": openai.APITimeoutError(request=httpx.Request("POST", "http://unused")),
             "context_overflow": openai.BadRequestError(
                 "prompt is too long", response=_response(400), body=None
+            ),
+            "quota": openai.RateLimitError(
+                "You exceeded your current quota, please check your plan and billing details.",
+                response=_response(429),
+                body=None,
             ),
             "auth": openai.AuthenticationError("bad key", response=_response(401), body=None),
             "fatal": ValueError("奇怪的错"),
@@ -293,6 +335,23 @@ class FallbackChainTest(AgentTestCase):
         agent = self.build(script)
         with mock.patch("xiaoyu.agent.time.sleep"), self.assertRaises(openai.RateLimitError):
             agent.send("hi")
+        self.assertEqual(agent.config.model, "main-model")
+
+    def test_quota_does_not_switch_within_same_provider(self):
+        """额度是账户级的：同一家换个模型名照样没额度，空转一轮还误导用户。
+        （换**另一家**该顶上——那条在 test_providers.py 的网关兜底套件里。）"""
+        self.config.fallback_models = ["backup-model"]
+        quota = openai.RateLimitError(
+            "You exceeded your current quota, please check your plan and billing details.",
+            response=_response(429),
+            body=None,
+        )
+        script = [quota]
+        agent = self.build(script)
+        with self.assertRaises(openai.RateLimitError):
+            agent.send("hi")
+        #  一次都不该重试、也不该碰备用模型
+        self.assertEqual(len(self.client.completions.script), 0)
         self.assertEqual(agent.config.model, "main-model")
 
 

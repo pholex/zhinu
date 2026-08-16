@@ -160,6 +160,21 @@ class SummaryInstructionTest(unittest.TestCase):
         self.assertIn("代价不对等", SUMMARY_INSTRUCTION)
         self.assertIn("宁可短，不可编", SUMMARY_INSTRUCTION)
 
+    def test_update_mode_declared_in_both_prompts(self):
+        """迭代压缩的增量更新指令：旧摘要要"保留并更新"而不是再压一遍——
+        没有这段时多次压缩是双重有损（摘要的摘要），事实会逐轮蒸发。
+        两条腿（渲染转写 / 前缀重放）都必须带。"""
+        from xiaoyu.compaction import PREFIX_SUMMARY_INSTRUCTION
+
+        for prompt in (SUMMARY_INSTRUCTION, PREFIX_SUMMARY_INSTRUCTION):
+            self.assertIn("持续维护的状态文档", prompt)
+            self.assertIn("增量更新", prompt)
+            self.assertIn("确已失效的条目才可以删", prompt)
+        #  各自引用的"上一轮摘要"定位方式要和真实输入形态对上：
+        #  渲染转写腿用【此前的压缩摘要】节标签，前缀重放腿用分界标记原文开头
+        self.assertIn("此前的压缩摘要", SUMMARY_INSTRUCTION)
+        self.assertIn("以下是另一个模型对本会话早期内容做的交接摘要", PREFIX_SUMMARY_INSTRUCTION)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -76,7 +76,9 @@ def strip_private(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
 # ---------- 请求方向：chat completions → Responses ----------
 
 
-def to_input(messages: list[dict[str, Any]], model: str = "") -> list[dict[str, Any]]:
+def to_input(
+    messages: list[dict[str, Any]], model: str = "", provider: str = ""
+) -> list[dict[str, Any]]:
     """messages → Responses 的 input 列表。
 
     形态差异只有四处，其余角色原样透传：
@@ -87,15 +89,18 @@ def to_input(messages: list[dict[str, Any]], model: str = "") -> list[dict[str, 
     4. `_reasoning` 里的 reasoning item 还原到**这条消息的最前面**——服务端要求
        reasoning item 排在它引出的 message / function_call 之前，顺序反了就不认。
 
-    reasoning 只在**产出它的那个模型**上回放（`model` 对不上就整段跳过）：
-    加密串是模型侧的私有状态，`/model` 切了模型再塞回去属于喂错东西。
+    reasoning 只在**产出它的那条路由**上回放（provider+model 都对上才回，
+    任一对不上整段跳过）：加密串是模型/服务侧的私有状态，`/model` 切了模型
+    不能塞回去；降级链让**同名模型跑在两家上**（直连 vs 网关），跨家回放
+    同样是喂错东西。旧会话的存量 reasoning 没有 provider 标签，按不匹配
+    处理（安全方向：丢 reasoning 永远无害，只是少省一点）。
     """
     items: list[dict[str, Any]] = []
     for message in messages:
         role = message.get("role")
         content = message.get("content")
         reasoning = message.get(REASONING_KEY) or {}
-        if reasoning.get("model") == model:
+        if reasoning.get("model") == model and (reasoning.get("provider") or "") == provider:
             items.extend(reasoning.get("items") or [])
         if role == "tool":
             items.append(
@@ -185,6 +190,7 @@ def to_request(
     messages: list[dict[str, Any]],
     tools: list[dict[str, Any]] | None,
     extra: dict[str, Any],
+    provider: str = "",
 ) -> dict[str, Any]:
     """拼出 responses.create 的完整参数。
 
@@ -193,7 +199,7 @@ def to_request(
     """
     request: dict[str, Any] = {
         "model": model,
-        "input": to_input(messages, model),
+        "input": to_input(messages, model, provider),
         "store": False,
         "include": _REASONING_INCLUDE,
     }
@@ -388,12 +394,16 @@ class _Completions:
         speaks_responses: Any,
         speaks_anthropic: Any,
         anthropic_client: Any,
+        provider: str = "",
     ) -> None:
         self._inner = inner
         self._speaks_responses = speaks_responses
         self._speaks_anthropic = speaks_anthropic
         #  零参 callable：懒构造并缓存（见 Transport.anthropic_client）
         self._anthropic_client = anthropic_client
+        #  本传输层所属的 provider：reasoning 回放判定要用（provider+model
+        #  都对上才回，见 to_input 的注释）
+        self._provider = provider
 
     def create(
         self,
@@ -414,7 +424,7 @@ class _Completions:
             #  私有键没有出口。懒 import：不配 Claude 直连的进程不付这份成本
             from . import messages as anthro
 
-            request = anthro.to_request(model, messages, tools, stream, extra)
+            request = anthro.to_request(model, messages, tools, stream, extra, self._provider)
             client = self._anthropic_client()
             if not stream:
                 return anthro.to_completion(client.messages.create(**request))
@@ -427,7 +437,7 @@ class _Completions:
         #  它的净化是结构性的——to_input 逐字段重建 item，私有键根本没有出口。
         #  stream_options 只有 include_usage 一个用途，Responses 的 usage 一定随
         #  response.completed 回来，不需要开关；吃掉即可
-        request = to_request(model, messages, tools, extra)
+        request = to_request(model, messages, tools, extra, self._provider)
         if not stream:
             return to_completion(self._inner.responses.create(**request))
         return stream_chunks(iter(self._inner.responses.create(stream=True, **request)))
@@ -460,9 +470,10 @@ class _Chat:
         speaks_responses: Any,
         speaks_anthropic: Any,
         anthropic_client: Any,
+        provider: str = "",
     ) -> None:
         self.completions = _Completions(
-            inner, speaks_responses, speaks_anthropic, anthropic_client
+            inner, speaks_responses, speaks_anthropic, anthropic_client, provider
         )
 
 
@@ -487,6 +498,7 @@ class Transport:
         responses_models: tuple[str, ...] = (),
         anthropic_models: tuple[str, ...] = (),
         anthropic_factory: Any = None,
+        provider: str = "",
     ) -> None:
         self._inner = inner
         self.responses_models = tuple(responses_models)
@@ -494,7 +506,7 @@ class Transport:
         self._anthropic_factory = anthropic_factory
         self._anthropic: Any = None
         self.chat = _Chat(
-            inner, self.speaks_responses, self.speaks_anthropic, self.anthropic_client
+            inner, self.speaks_responses, self.speaks_anthropic, self.anthropic_client, provider
         )
 
     def speaks_responses(self, model: str) -> bool:
@@ -539,5 +551,6 @@ def wrap(
     responses_models: tuple[str, ...],
     anthropic_models: tuple[str, ...] = (),
     anthropic_factory: Any = None,
+    provider: str = "",
 ) -> Transport:
-    return Transport(client, responses_models, anthropic_models, anthropic_factory)
+    return Transport(client, responses_models, anthropic_models, anthropic_factory, provider)

@@ -362,16 +362,17 @@ def collect_project_docs(
     return kept
 
 
-def _auth_worth_another_provider(
+def _worth_another_provider(
     verdict: errors.Verdict, chain: list[Route], index: int
 ) -> bool:
-    """鉴权失败时，链上后面还有**别家** provider 就值得再试一次。
+    """鉴权失败/额度耗尽时，链上后面还有**别家** provider 就值得再试一次。
 
-    同一家换个模型名解决不了鉴权问题，但换一家可以：直连 key 过期 / 额度用光时，
-    网关兜底正是这个功能存在的理由。别的不可重试错误（fatal）不走这条路——
-    那是请求本身有问题，换谁都一样，还会把 bug 掩盖成"所有模型都失败"。
+    这两类同一家换个模型名解决不了（key 一家一把、额度是账户级的），但换一家
+    可以：直连 key 过期 / 额度用光时，网关兜底正是这个功能存在的理由。别的
+    不可重试错误（fatal）不走这条路——那是请求本身有问题，换谁都一样，
+    还会把 bug 掩盖成"所有模型都失败"。
     """
-    if verdict.kind != "auth":
+    if verdict.kind not in ("auth", "quota"):
         return False
     current = chain[index].provider
     return any(route.provider != current for route in chain[index + 1 :])
@@ -1772,11 +1773,12 @@ class Agent:
             except Exception as exc:  # noqa: BLE001 - 分类器决定要不要换模型
                 verdict = classify(exc)
                 #  瞬时故障（限流/超时/5xx）值得换；上下文超限该压缩不该换。
-                #  鉴权错误：同一家换了也一样，但**换一家值得试**——直连 key 过期/额度
-                #  用光时，网关兜底正是这个功能存在的理由。所以只在还有别家可试时放行。
+                #  鉴权失败/额度耗尽：同一家换了也一样，但**换一家值得试**——直连
+                #  key 过期/额度用光时，网关兜底正是这个功能存在的理由。
+                #  所以只在还有别家可试时放行。
                 if verdict.should_compact:
                     raise
-                if not verdict.retryable and not _auth_worth_another_provider(
+                if not verdict.retryable and not _worth_another_provider(
                     verdict, chain, index
                 ):
                     raise
@@ -1878,10 +1880,6 @@ class Agent:
         try:
             stream = route.client.chat.completions.create(**request)
             self._consume_stream(route, stream, content_parts, pending, reasoning)
-            #  正文段在请求内部闭合：事件流读起来是规整的嵌套
-            #  started → delta… → text.end → ended
-            if content_parts:
-                self.sink.emit(TextEnd())
         except (KeyboardInterrupt, Interrupted):
             #  Ctrl-C 打在流式中途，或宿主调了 interrupt()：已经说出的半截话也要
             #  入历史，否则整轮凭空消失，用户看到过的内容模型自己却"不记得"。
@@ -1896,6 +1894,12 @@ class Agent:
                 )
             raise
         finally:
+            #  正文段在请求内部闭合，且**任何路径**上都要闭合：
+            #  started → delta… → text.end → ended。中断/异常时缺发 TextEnd，
+            #  明文 sink 少收尾换行、OSC 133 锚点悬空、ACP 的正文段没有边界——
+            #  事件消费者不该为失败路径写补偿逻辑。
+            if content_parts:
+                self.sink.emit(TextEnd())
             self.sink.emit(RequestEnded())
 
         message: dict[str, Any] = {
@@ -1906,9 +1910,15 @@ class Agent:
             message["tool_calls"] = [pending[index] for index in sorted(pending)]
         if reasoning:
             #  挂在消息上（不另起边表）：压缩丢消息时它跟着走、落盘时跟着存，
-            #  没有需要"记得同步清理"的地方。记下产出它的模型——加密串是模型侧的
-            #  私有状态，/model 切了之后不能再往回塞。出网前统一被摘掉
-            message[REASONING_KEY] = {"model": route.model, "items": reasoning}
+            #  没有需要"记得同步清理"的地方。记下产出它的 provider+model——
+            #  加密串是模型/服务侧的私有状态，/model 切了不能往回塞；降级链让
+            #  同名模型跑在两家上（直连 vs 网关），跨家回放同样过不了校验。
+            #  出网前统一被摘掉
+            message[REASONING_KEY] = {
+                "model": route.model,
+                "provider": route.provider,
+                "items": reasoning,
+            }
         return message
 
     def _consume_stream(
@@ -2163,7 +2173,22 @@ class Agent:
         #  completed|denied，每个 pending 恰好一个终态——将来活区 spinner 靠它不悬空）
         self.sink.emit(ToolRunning(name, args))
         started = time.monotonic()
-        output = self.toolbox.run(name, args)
+        try:
+            output = self.toolbox.run(name, args)
+        except BaseException as exc:
+            #  终态承诺覆盖异常路径（Ctrl-C 最常打在长命令执行中）：running 已发
+            #  就必须给终态，否则 TUI spinner 靠带外清扫、ACP client 的 tool_call
+            #  永远停在 in_progress。历史侧的 tool 配对由 close_open_tool_calls
+            #  兜底，这里只管事件面。
+            self.sink.emit(
+                ToolCompleted(
+                    name,
+                    output=f"[执行被中断/异常：{type(exc).__name__}]",
+                    ok=False,
+                    seconds=time.monotonic() - started,
+                )
+            )
+            raise
         elapsed = time.monotonic() - started
         #  「宣称完成」护栏的证据计数：只有真的跑过命令/操作过浏览器，
         #  验证类计划步骤才谈得上"验证过"
