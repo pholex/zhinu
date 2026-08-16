@@ -886,6 +886,62 @@ def _normalize_schema(node: Any) -> Any:
         node["type"] = "object"
     if isinstance(node.get("required"), list) and isinstance(properties, dict):
         node["required"] = [name for name in node["required"] if name in properties]
+    node = _collapse_const_union(node)
+    return node
+
+
+#  const 折叠时 Python 类型 → JSON Schema 类型名。bool 必须排在 int 之前判断
+#  （Python 里 bool 是 int 子类，顺序反了 true/false 会被并进整数枚举）
+_CONST_TYPES: tuple[tuple[type, str], ...] = (
+    (bool, "boolean"),
+    (int, "integer"),
+    (float, "number"),
+    (str, "string"),
+)
+
+
+def _collapse_const_union(node: dict[str, Any]) -> dict[str, Any]:
+    """anyOf 全是同型纯 const 时折叠成 enum。
+
+    某些语言生态的 server 把闭集枚举生成为
+    `{"anyOf": [{"const": "red"}, {"const": "green"}]}`，而严格校验的端点
+    对这种形态要么拒绝要么误处理，property 级 `enum` 才是通行形态。
+    只在**每个非 null 分支都是同一 primitive 类型的纯 const**（分支里除
+    const 外只有注解类键）时才折叠；单个 {"type":"null"} 分支容忍并丢弃
+    ——与上面 type 数组折叠丢 null 的既有取舍一致（运行期报错好过注册期
+    整个 tools 数组 400）。混合 union 原样穿透。分支序保序。
+    """
+    branches = node.get("anyOf")
+    if not isinstance(branches, list) or not branches:
+        return node
+    values: list[Any] = []
+    kind: str | None = None
+    for branch in branches:
+        if not isinstance(branch, dict):
+            return node
+        if branch.get("type") == "null" and "const" not in branch:
+            continue  # 可空标记：容忍并丢弃
+        if "const" not in branch:
+            return node
+        value = branch["const"]
+        for py_type, name in _CONST_TYPES:
+            if isinstance(value, py_type):
+                if kind is None:
+                    kind = name
+                elif kind != name:
+                    return node  # 跨类型混合：不折叠
+                break
+        else:
+            return node  # 非 primitive const（对象/数组/None）：不折叠
+        #  同型才走到这里，True==1 跨型撞值的坑已被 kind 检查挡在门外
+        if value not in values:
+            values.append(value)
+    if kind is None or not values:
+        return node
+    node = dict(node)
+    del node["anyOf"]
+    node["type"] = kind
+    node["enum"] = values
     return node
 
 

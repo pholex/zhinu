@@ -379,6 +379,42 @@ class NormalizeSchemaTest(unittest.TestCase):
         mcp._normalize_schema(original)
         self.assertEqual(original, snapshot)
 
+    def test_const_union_collapses_to_enum(self):
+        #  闭集枚举被某些生态生成为 anyOf-const，严格端点会拒；折叠成 enum，
+        #  分支序保留、节点自身的注解键不动
+        out = mcp._normalize_schema(
+            {
+                "type": "object",
+                "properties": {
+                    "color": {
+                        "description": "颜色",
+                        "anyOf": [{"const": "red"}, {"const": "green"}, {"const": "red"}],
+                    }
+                },
+            }
+        )
+        color = out["properties"]["color"]
+        self.assertNotIn("anyOf", color)
+        self.assertEqual(color["type"], "string")
+        self.assertEqual(color["enum"], ["red", "green"])  # 保序 + 去重
+        self.assertEqual(color["description"], "颜色")
+
+    def test_const_union_tolerates_single_null_branch(self):
+        out = mcp._normalize_schema(
+            {"anyOf": [{"const": 1}, {"const": 2}, {"type": "null"}]}
+        )
+        self.assertEqual(out["enum"], [1, 2])
+        self.assertEqual(out["type"], "integer")
+
+    def test_mixed_type_or_non_const_unions_pass_through(self):
+        #  bool 是 int 子类：true/false 绝不并进整数枚举
+        mixed = {"anyOf": [{"const": True}, {"const": 1}]}
+        self.assertIn("anyOf", mcp._normalize_schema(mixed))
+        hybrid = {"anyOf": [{"const": "a"}, {"type": "string"}]}
+        self.assertIn("anyOf", mcp._normalize_schema(hybrid))
+        objects = {"anyOf": [{"const": {"k": 1}}, {"const": {"k": 2}}]}
+        self.assertIn("anyOf", mcp._normalize_schema(objects))
+
 
 class CircuitBreakerTest(unittest.TestCase):
     def make_server(self) -> mcp.McpServer:
