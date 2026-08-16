@@ -842,6 +842,13 @@ class AcpServer:
     # ---------- 主循环 ----------
 
     def serve(self) -> int:
+        #  stdout 接管：协议流的唯一写口是 _send（走构造时捕获的 self._stdout）。
+        #  服务期间把 sys.stdout 指到 stderr——进程内任何漏网的 print（插件、
+        #  hook、第三方库的调试输出）都不再能污染 JSON-RPC 流。这类污染的
+        #  症状是 client 侧"解析失败/会话卡死"，离病因（某个 print）极远，
+        #  堵在出口比逐处排查便宜。诊断输出照旧可读：只是换到了 stderr。
+        original_stdout = sys.stdout
+        sys.stdout = sys.stderr
         try:
             for raw in self._stdin:
                 line = raw.strip()
@@ -864,6 +871,7 @@ class AcpServer:
         except KeyboardInterrupt:
             pass
         finally:
+            sys.stdout = original_stdout
             self._shutdown()
         return 0
 

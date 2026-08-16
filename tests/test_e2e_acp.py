@@ -1142,5 +1142,41 @@ class AuthTest(AcpCase):
         self.assertEqual(response["result"], {})
 
 
+class StdoutGuardTest(unittest.TestCase):
+    """serve 期间的 stdout 接管：进程内漏网的 print（插件/hook/三方库）不能
+    污染 JSON-RPC 流——症状是 client 解析失败/会话卡死，离病因极远。
+    协议写口只有 _send（构造时捕获的 stdout），其余一律改道 stderr。"""
+
+    def test_stray_print_is_diverted_and_stdout_restored(self) -> None:
+        import contextlib
+        import io
+
+        from xiaoyu.acp import AcpServer
+
+        protocol_out = io.StringIO()
+
+        class ProbeStdin:
+            """迭代开始（= serve 已接管）时模拟一次漏网 print。"""
+
+            def __iter__(self):
+                print("漏网的诊断输出")
+                return iter(('{"bad json',))  # 顺带触发一次真实的协议写（_fail）
+
+        before = sys.stdout
+        stderr_buffer = io.StringIO()
+        server = AcpServer(agent_factory=None, stdin=ProbeStdin(), stdout=protocol_out)
+        with contextlib.redirect_stderr(stderr_buffer):
+            server.serve()
+
+        #  漏网 print 落在 stderr，不在协议流里
+        self.assertIn("漏网的诊断输出", stderr_buffer.getvalue())
+        self.assertNotIn("漏网", protocol_out.getvalue())
+        #  协议流里只有合法 JSON 行（_fail 的 PARSE_ERROR 响应）
+        for line in protocol_out.getvalue().splitlines():
+            json.loads(line)
+        #  serve 退出后 sys.stdout 原样恢复
+        self.assertIs(sys.stdout, before)
+
+
 if __name__ == "__main__":
     unittest.main()
