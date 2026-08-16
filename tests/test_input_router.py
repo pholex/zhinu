@@ -35,6 +35,13 @@ class TestClassifyInput(unittest.TestCase):
             ("#note", "memo", "note"),
             ("### 多个井号也认", "memo", "多个井号也认"),
             ("修个 bug", "send", "修个 bug"),
+            #  贴进来的绝对路径不是命令（用户反馈的真实误伤：整行只有一个 PDF 路径）
+            ("/Users/me/Documents/简历 final.pdf", "send", "/Users/me/Documents/简历 final.pdf"),
+            ("/etc/hosts 是什么", "send", "/etc/hosts 是什么"),
+            ("/v2.0 的接口呢", "send", "/v2.0 的接口呢"),
+            #  真敲错的命令仍走 slash（handle_slash 报未知，保住可发现性）
+            ("/halp", "slash", "/halp"),
+            ("/skill:deploy 参数", "slash", "/skill:deploy 参数"),
             ("注意！这句是中文感叹号开头之外的普通话", "send", "注意！这句是中文感叹号开头之外的普通话"),
             ("句中有 !ls 不算前缀", "send", "句中有 !ls 不算前缀"),
         ]

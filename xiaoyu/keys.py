@@ -18,6 +18,7 @@ Ctrl-R 反向搜索）或由 REPL 循环实现（Ctrl-C 两连退出），本表
 
 from __future__ import annotations
 
+import re
 import sys
 from dataclasses import dataclass
 
@@ -177,13 +178,25 @@ _USAGE_HINTS = {
 }
 
 
+#  命令名的形状：/ + 字母开头的单 token（/help、/mcp、/skill:name）。
+#  不含第二个 / 或点号——贴进输入行的绝对路径（/Users/…/简历.pdf）和
+#  "/etc/hosts 是什么"这类开头像命令的话，都不该被当成命令吃掉。
+_SLASH_COMMAND_SHAPE = re.compile(r"^/[A-Za-z][A-Za-z0-9_:-]*$")
+
+
 def classify_input(line: str) -> InputAction:
     """所有前端的提交路由单点：一行输入 → 本地动作或发给模型。"""
     line = line.strip()
     if not line:
         return InputAction("empty")
     if line.startswith("/"):
-        return InputAction("slash", line)
+        head = line.split(None, 1)[0]
+        #  路径形态（首 token 带第二个 / 或点号等）按普通输入发给模型，
+        #  而不是报"未知命令"——ACP 侧 match_command 早有同款豁免，这里对齐。
+        #  真敲错的命令（/halp）仍走 slash 报未知，保住可发现性。
+        if head == "/" or _SLASH_COMMAND_SHAPE.match(head):
+            return InputAction("slash", line)
+        return InputAction("send", line)
     if line.startswith("!"):
         command = line[1:].strip()
         if not command:
