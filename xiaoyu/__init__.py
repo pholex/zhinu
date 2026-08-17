@@ -3,4 +3,4 @@
 Weaving code, connecting dots, and showing you the best harness architecture.
 """
 
-__version__ = "0.31.6"
+__version__ = "0.31.7"
