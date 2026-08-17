@@ -114,15 +114,35 @@ def create_branch(workspace: Path, branch: str, prefix: str, base: str) -> Path:
 
 
 def dirty(path: Path) -> bool:
-    """worktree 里有没有改动（含未跟踪文件）。查不出来按有改动算——
-    宁可多留一个目录，不能把没看过的改动删了。"""
+    """worktree 里有没有改动（含未跟踪文件与**已提交但无分支引用**的提交）。
+    查不出来按有改动算——宁可多留一个目录，不能把没看过的改动删了。
+
+    第二道检查针对"子 agent 在 detached worktree 里 git commit 收尾"的
+    形态：porcelain 是干净的，但 HEAD 不属于任何分支——此时删 worktree
+    等于把成果丢进只有 fsck 能捞的深渊。分支型 worktree（宸枢 mission）
+    的提交都在分支上，不受影响，照常判干净可删。
+    """
     try:
         result = _run_git(["status", "--porcelain"], cwd=path)
     except (OSError, subprocess.TimeoutExpired):
         return True
     if result.returncode != 0:
         return True
-    return bool(result.stdout.strip())
+    if result.stdout.strip():
+        return True
+    try:
+        contains = _run_git(
+            ["branch", "--contains", "HEAD", "--format=%(refname)"], cwd=path
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return True
+    if contains.returncode != 0:
+        return True
+    #  detached HEAD 自身会被列成一行 "(no branch)" 伪条目——只认真分支
+    branches = [
+        line for line in contains.stdout.splitlines() if line.strip().startswith("refs/")
+    ]
+    return not branches
 
 
 def remove(workspace: Path, path: Path) -> None:
