@@ -2,6 +2,10 @@
 
 把小羽接给**工作流编排器**——n8n、Dify、或者你自己的调度服务。
 
+> 消费方是 LangChain / LangGraph 这类 **MCP client**？serve
+> 同时在 `/mcp` 挂着 MCP server 面（同一会话层的第二张脸），见
+> [docs/mcp-server.md](mcp-server.md)。
+
 这是与 `--acp`（编辑器）、`--wire`（自家外壳）并列的第三条协议面，区别只在驱动方是谁。
 内核不因为它改形态：TUI/CLI 仍然是进程内直驱 `Agent`，serve 只是外挂一层适配。
 
@@ -236,6 +240,7 @@ n8n 的 HTTP Request 节点默认超时是 300s，够 long-poll 的 60s 上限�
 | GET · POST | `/session/{id}/permissions` | 挂起的审批 · 回决定 |
 | POST | `/session/{id}/abort` | 打断这一轮（不杀会话） |
 | POST | `/session/{id}/steer` | 向进行中的一轮插话（会话空闲时 `409`） |
+| POST | `/mcp` | 同一会话层的 MCP server 面（[docs/mcp-server.md](mcp-server.md)，`--no-mcp` 可关） |
 
 ## 并发与限额
 

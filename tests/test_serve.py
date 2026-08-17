@@ -53,6 +53,7 @@ class ServeCase(unittest.TestCase):
 
     approval: str = "ask"
     token: str = ""
+    mcp: bool = True
 
     def setUp(self) -> None:
         self._tmpdir = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
@@ -86,6 +87,7 @@ class ServeCase(unittest.TestCase):
             approval=self.approval,
             #  审批超时压到秒级：用例要能在可接受的时间里验到 fail-closed
             approval_timeout=3.0,
+            mcp=self.mcp,
         )
         client = TestClient(create_app(cfg))
         client.__enter__()
