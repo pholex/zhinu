@@ -1,4 +1,5 @@
-"""宸枢（chenshu）：编排总控模式——织造总枢坐镇其上，统御众羽协同推进巨型工程。
+"""宸枢（chenshu）：统筹织造模式（Sovereign-Weave）——总枢坐镇其上，规划、
+分派、监督、汇总，统御众羽协同推进巨型工程。
 
 宸=帝居/北极所在，枢=天枢/中枢。主 agent 化身唯一的"宸枢"（塔），把一个
 仓库的大工程拆成 scope 互不重叠的 mission，为每个 mission 起一个跑在
@@ -1287,7 +1288,7 @@ def make_tower_tools(runtime: ChenshuRuntime) -> list[Tool]:
     return [
         _tool(
             "chenshu_init",
-            "启动宸枢模式（编排总控）：把大工程拆成 scope 互不重叠的 mission，"
+            "启动宸枢（统筹织造模式）：总枢规划、分派、监督、汇总——把大工程拆成 scope 互不重叠的 mission，"
             "每个 mission 在独立 git 分支 worktree 里由 worker 并行推进，评审过闸后"
             "合回主干。适合跨多个子系统、需要隔离与评审的大活；小活用七襄或单发委托。"
             "需要 git 仓库且至少一个 commit。重入=收养已有工作区（mission 保留）。",
