@@ -24,6 +24,7 @@ serve 是**跑在别处的编排器**（HTTP，一对多、可跨机、可轮询
     POST   /session/{id}/permissions      回一个审批决定（放行/拒绝/改写参数）
     POST   /session/{id}/abort            打断当前这一轮（不杀会话）
     POST   /session/{id}/steer            向进行中的一轮插话
+    POST   /mcp                           同一会话层的 MCP server 面（见 serve_mcp.py）
 
 为什么同步与异步两个 prompt 端点都要有：coding agent 一轮动辄几分钟，编排器
 的 HTTP 节点普遍有超时上限（n8n/Dify 默认都在分钟级），同步端点在短任务上
@@ -143,6 +144,9 @@ class ServeConfig:
     #  能同时跑的会话数 = 工作线程池大小。审批期间线程是被占着的（approver 就地
     #  阻塞），所以这个数同时也是"能同时挂起等审批的会话数"上限。
     max_sessions: int = DEFAULT_MAX_SESSIONS
+    #  要不要挂 /mcp（MCP server 面，见 serve_mcp.py）。与 REST 共享会话层，
+    #  默认开着；`--no-mcp` 关掉后 serve 退回纯 REST。
+    mcp: bool = True
 
 
 @dataclass
@@ -544,6 +548,35 @@ def create_app(cfg: ServeConfig):  # noqa: C901 - 路由表天然长，拆开反
             raise HTTPException(status_code=400, detail=f"工作区不存在：{candidate}")
         return candidate
 
+    def make_session(workspace: str = "", model: str = "", mode: str = "") -> _Session:
+        """装配一个会话并登记进注册表。REST 的 POST /session 与 MCP 的 xiaoyu
+        工具共用这一个装配口——两张脸建出的会话必须一模一样，包括 approver 与
+        sink 的构造期注入（见 build_agent 的 docstring）。"""
+        target = resolve_workspace(workspace)
+        session_id = f"sess-{uuid.uuid4().hex[:16]}"
+        local = replace(cfg, model=model or cfg.model, mode=mode or cfg.mode)
+        ref = _SessionRef()
+        try:
+            agent = build_agent(session_id, target, local, ref)
+        except MissingConfig as exc:
+            #  503 而不是 500：这不是 bug，是服务端没配 provider，运维动作明确
+            raise HTTPException(status_code=503, detail=f"未配置 provider：{exc}") from exc
+        session = _Session(session_id, agent, target, local)
+        #  绑定后 approver / sink 才真正生效。绑定前不可能有一轮在跑（会话还没
+        #  返回给调用方），所以这个窗口安全——但 approver 仍 fail closed 兜底
+        ref.bind(session, asyncio.get_running_loop())
+        sessions[session_id] = session
+        return session
+
+    def close_session(session: _Session) -> None:
+        """摘除一个会话：先打断，再把挂着的审批放掉（否则工作线程堵到
+        approval_timeout），最后出注册表。REST DELETE 与 MCP xiaoyu_close 共用。"""
+        session.async_agent.interrupt()
+        for request in session.snapshot_pending():
+            request.verdict = Deny("会话已被关闭")
+            request.done.set()
+        sessions.pop(session.id, None)
+
     async def start_turn(session: _Session, text: str) -> asyncio.Task:
         """开一轮。已经在跑就 409——同步架构下同一 Agent 一次只能跑一轮，
         默默排队会让编排器以为自己的第二次提交立刻生效了。"""
@@ -609,21 +642,7 @@ def create_app(cfg: ServeConfig):  # noqa: C901 - 路由表天然长，拆开反
         model: str = Body(default="", embed=True, description="模型名，缺省跟随服务端配置"),
         mode: str = Body(default="", embed=True, description="default / auto / plan"),
     ) -> dict[str, Any]:
-        target = resolve_workspace(workspace)
-        session_id = f"sess-{uuid.uuid4().hex[:16]}"
-        local = replace(cfg, model=model or cfg.model, mode=mode or cfg.mode)
-        ref = _SessionRef()
-        try:
-            agent = build_agent(session_id, target, local, ref)
-        except MissingConfig as exc:
-            #  503 而不是 500：这不是 bug，是服务端没配 provider，运维动作明确
-            raise HTTPException(status_code=503, detail=f"未配置 provider：{exc}") from exc
-        session = _Session(session_id, agent, target, local)
-        #  绑定后 approver / sink 才真正生效。绑定前不可能有一轮在跑（会话还没
-        #  返回给调用方），所以这个窗口安全——但 approver 仍 fail closed 兜底
-        ref.bind(session, asyncio.get_running_loop())
-        sessions[session_id] = session
-        return session.info_dict()
+        return make_session(workspace=workspace, model=model, mode=mode).info_dict()
 
     @app.get(
         "/session",
@@ -653,12 +672,7 @@ def create_app(cfg: ServeConfig):  # noqa: C901 - 路由表天然长，拆开反
         operation_id="close_session",
     )
     async def session_delete(session_id: str) -> dict[str, Any]:
-        session = pick(session_id)
-        session.async_agent.interrupt()
-        for request in session.snapshot_pending():
-            request.verdict = Deny("会话已被关闭")
-            request.done.set()
-        sessions.pop(session_id, None)
+        close_session(pick(session_id))
         return {"session_id": session_id, "closed": True}
 
     @app.post(
@@ -871,6 +885,22 @@ def create_app(cfg: ServeConfig):  # noqa: C901 - 路由表天然长，拆开反
             )
         session.async_agent.steer(text)
         return {"session_id": session_id, "steered": True}
+
+    if cfg.mcp:
+        #  MCP server 面：同一会话层的第二张脸（LangChain / LangGraph 经
+        #  langchain-mcp-adapters、其它 MCP client 从这儿进来）。
+        #  钩子清单就是两张脸的共享契约面，别宽于此（见 serve_mcp.mount_mcp）。
+        from .serve_mcp import mount_mcp
+
+        mount_mcp(
+            app,
+            cfg,
+            sessions=sessions,
+            make_session=make_session,
+            start_turn=start_turn,
+            close_session=close_session,
+            guard=guard,
+        )
 
     return app
 

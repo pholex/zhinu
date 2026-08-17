@@ -1144,6 +1144,12 @@ def serve_command(argv: list[str]) -> int:
         "所以它同时是'能同时挂起等审批的会话数'上限，默认 32",
     )
     parser.add_argument(
+        "--no-mcp",
+        dest="mcp",
+        action="store_false",
+        help="不挂 /mcp（MCP server 面，给 LangChain/LangGraph 等 MCP client 用；默认挂）",
+    )
+    parser.add_argument(
         "--print-openapi",
         action="store_true",
         help="把 OpenAPI schema 打到 stdout 后退出（贴给 Dify 自定义工具用），不起服务",
@@ -1177,13 +1183,15 @@ def serve_command(argv: list[str]) -> int:
         approval=args.approval,
         approval_timeout=args.approval_timeout,
         max_sessions=max(1, args.max_sessions),
+        mcp=args.mcp,
     )
     try:
         if args.print_openapi:
             return print_openapi(cfg, args.public_url)
         if args.host in ("127.0.0.1", "::1", "localhost") or args.token:
             print(ui.success(f"xiaoyu serve → http://{args.host}:{args.port}  (root: {root})"))
-            print(ui.secondary("  文档 /docs · schema /openapi.json · Ctrl+C 停"))
+            extra = " · MCP /mcp" if args.mcp else ""
+            print(ui.secondary(f"  文档 /docs · schema /openapi.json{extra} · Ctrl+C 停"))
         return serve(cfg)
     except ServeUnavailable:
         print(
