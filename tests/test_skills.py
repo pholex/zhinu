@@ -158,12 +158,24 @@ class ScanTest(unittest.TestCase):
         self.assertEqual(skills.index_block([]), "")
 
     def test_index_description_capped(self):
-        #  索引只用于发现，冗长描述常驻浪费上下文——超过 250 字符截断
-        write_skill(self.primary, "long", "name: long\ndescription: " + "细" * 400)
+        """单条描述的硬上限是挡失控极端值的兜底，不设预算时也生效。"""
+        overlong = "细" * (skills.DESCRIPTION_CAP + 200)
+        write_skill(self.primary, "long", "name: long\ndescription: " + overlong)
         block = skills.index_block(skills.scan_skills())
         line = next(row for row in block.splitlines() if row.startswith("- long"))
-        self.assertLess(len(line), 300)
+        self.assertLessEqual(len(line), len("- long: ") + skills.DESCRIPTION_CAP + 1)
         self.assertTrue(line.endswith("…"))
+
+    def test_index_keeps_long_descriptions_when_budget_allows(self):
+        """预算宽裕时不该再砍描述：控总量归预算，硬上限只挡极端值。
+
+        砍在描述末尾丢掉的往往正是路由信息（"什么时候别用这个技能"这类反向
+        边界常写在最后），而那恰恰是索引最该保住的东西。
+        """
+        description = "描述" * 200  # 400 字，远超旧的 250 上限、仍在硬上限内
+        write_skill(self.primary, "verbose", f"name: verbose\ndescription: {description}")
+        block = skills.index_block(skills.scan_skills(), max_tokens=100_000)
+        self.assertIn(description, block)
 
     def _write_bulk(self, count: int, description_chars: int = 100) -> list[skills.Skill]:
         for index in range(count):
