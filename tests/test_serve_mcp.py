@@ -342,6 +342,12 @@ class TestTransportGuards(McpCase):
         client = self.start("text: 无所谓\n")
         self.assertNotIn("/mcp", client.get("/openapi.json").json()["paths"])
 
+    def test_docs_description_still_mentions_mcp(self):
+        #  路由表里不列 ≠ 文档页不提：/docs 的读者是人，完全不提的话
+        #  人会以为这个服务只有 REST 一张脸
+        client = self.start("text: 无所谓\n")
+        self.assertIn("/mcp", client.get("/openapi.json").json()["info"]["description"])
+
 
 class TestMcpToken(McpCase):
     token = "s3cr3t"
@@ -360,6 +366,11 @@ class TestMcpDisabled(McpCase):
         self.start("text: 无所谓\n")
         response = self.rpc({"jsonrpc": "2.0", "id": 1, "method": "ping"})
         self.assertEqual(response.status_code, 404)
+
+    def test_no_mcp_keeps_it_out_of_the_docs_description(self):
+        #  关掉的脸不该出现在文档描述里——照着描述去打 /mcp 只会拿到 404
+        client = self.start("text: 无所谓\n")
+        self.assertNotIn("/mcp", client.get("/openapi.json").json()["info"]["description"])
 
 
 if __name__ == "__main__":

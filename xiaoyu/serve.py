@@ -501,6 +501,18 @@ def create_app(cfg: ServeConfig):  # noqa: C901 - 路由表天然长，拆开反
             "把小羽（coding agent）接给工作流编排器（n8n / Dify / 自研调度）的 HTTP 面。"
             "长任务用 prompt_async + status 轮询；需要人工放行的工具调用会让 status 停在 "
             "running/waiting_for_approval，回 POST /session/{id}/permissions 放行。"
+            #  MCP 面只在描述里提、不进下方路由表（include_in_schema=False）：
+            #  这份 schema 会被 Dify/n8n 整份导入当 REST 工具清单，但 /docs 的
+            #  读者是人——完全不提，人会以为这个服务只有 REST 一张脸。
+            + (
+                "\n\n本服务同时在 `POST /mcp` 挂着 **MCP server 面**（agent 级三工具 "
+                "xiaoyu / xiaoyu_reply / xiaoyu_close，streamable HTTP；LangChain / LangGraph "
+                "经 langchain-mcp-adapters 即插即用，`--no-mcp` 可关）。它是 JSON-RPC 端点，"
+                "刻意不列进下方路由表——这份 schema 是给 Dify / n8n 导入的 REST 工具清单。"
+                "详见 docs/mcp-server.md。"
+                if cfg.mcp
+                else ""
+            )
         ),
     )
 
