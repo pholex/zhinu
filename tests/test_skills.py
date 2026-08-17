@@ -193,7 +193,7 @@ class ScanTest(unittest.TestCase):
         for index in range(20):
             self.assertIn(f"skill{index:02d}", block)
         self.assertIn("已截短", block)
-        self.assertNotIn("超出索引预算未列出", block)
+        self.assertNotIn("未列出", block)
         #  描述确实被截了：没有哪一条还留着完整的 100 个字
         self.assertNotIn("活" * 100, block)
 
@@ -217,9 +217,12 @@ class ScanTest(unittest.TestCase):
         block = skills.index_block(found, max_tokens=150)
         self.assertLessEqual(tokens.estimate_text(block), 150)
         self.assertIn("skill00", block)
-        self.assertIn("超出索引预算未列出", block)
+        self.assertIn("未列出", block)
         #  丢弃路径上留下来的是光名字，不带描述
         self.assertNotIn("- skill00: ", block)
+        #  提示必须点明"描述被略去"：不说，模型会把这些当成本来就没写描述的
+        #  技能，从而认定它们不相关——那等于列了名字也白列
+        self.assertIn("描述", block)
 
     def test_index_budget_covers_the_trailing_note(self):
         """尾部提示行自己也要计入预算，不能靠它超支。

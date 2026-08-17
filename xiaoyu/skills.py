@@ -162,7 +162,10 @@ _SHORTENED_NOTE = "- （预算所限，以上部分描述已截短；技能一�
 
 
 def _omitted_note(count: int) -> str:
-    return f"- …还有 {count} 个技能超出索引预算未列出（/skills 可查看全部）"
+    #  这条只在第 3 级出现，那时每一行都只剩光名字——不点明"描述已全部略去"，
+    #  模型会把它们当成本来就没写描述的技能。
+    #  这行本身也在跟技能名抢这点预算，能短则短。
+    return f"- …预算耗尽：描述全略去，另有 {count} 个技能名未列出（/skills 看全部）"
 
 
 def _render(name: str, description: str) -> str:
@@ -190,9 +193,10 @@ def index_block(skills: list[Skill], max_tokens: int | None = None) -> str:
 
     任何一级降级都不影响 /skills 和 skill 工具：它们看的是完整技能表。
 
-    下限：表头 + 尾部提示 + 一个光名字（约 90 token）压不下去。max_tokens
-    比这还小时照样输出这个最小块——技能表整块消失比略微超支糟得多。按 2%
-    比例算，只有上下文窗口小于 ~5k 才会踩到，现实中不存在。
+    下限：表头 45 + 尾部提示 30~40 + 至少一个技能名 ≈ **92 token** 压不下去
+    （随机压测过，≥92 的预算不超支）。max_tokens 比这还小时照样输出这个最小
+    块——技能表整块消失比略微超支糟得多。按 2% 比例算，只有上下文窗口小于
+    ~5k 才会踩到，现实中不存在。
     """
     if not skills:
         return ""
@@ -220,19 +224,21 @@ def _allocate(entries: list[tuple[str, str]], budget: int | None) -> tuple[list[
     if budget is None or sum(_line_cost(line) for line in full) <= budget:
         return full, None
 
-    #  放不下就一定会带一行提示——先把它的开销从预算里扣掉，别让提示本身超支。
-    #  两种提示取贵的那个：这时还不知道会降到第 2 级还是第 3 级。
-    reserve = max(_line_cost(_SHORTENED_NOTE), _line_cost(_omitted_note(len(entries))))
-    budget = max(budget - reserve, 0)
-
+    #  放不下就一定会带一行提示，它的开销要先从预算里扣掉——别让提示本身超支。
+    #  两级各扣各的那条（下面 shortened / budget 两处）：统一按较贵的一条预留，
+    #  会让常见的第 2 级白白少掉几 token。
+    #
     #  每行的固定开销按带分隔符和换行的 "- name: \n" 算（真渲染成光名字时只会
     #  更省），描述的边际成本才是水填充要分配的东西。
     costs = [tokens.estimate_prefix_costs(f"- {name}: \n", description) for name, description in entries]
     base = sum(row[0] for row in costs)
-    if base <= budget:
-        return _waterfill(entries, costs, budget - base), _SHORTENED_NOTE
+    shortened = max(budget - _line_cost(_SHORTENED_NOTE), 0)
+    if base <= shortened:
+        return _waterfill(entries, costs, shortened - base), _SHORTENED_NOTE
 
-    #  第 3 级：光名字也塞不下，能列几个列几个（至少留一个，否则索引形同虚设）
+    #  第 3 级：光名字也塞不下，能列几个列几个（至少留一个，否则索引形同虚设）。
+    #  提示行的字数随丢弃个数变，按"全丢"预留是上界。
+    budget = max(budget - _line_cost(_omitted_note(len(entries))), 0)
     lines: list[str] = []
     spent = 0
     for (name, _), row in zip(entries, costs):
@@ -248,8 +254,12 @@ def _waterfill(
 ) -> list[str]:
     """剩余额度逐字符轮流分给各条描述，直到谁都再多要一个字符都超支。
 
-    轮流（而不是按顺序装满）是关键：技能表按名字排序，顺序装满等于让字母序
-    靠前的技能吃光预算。
+    轮流（而不是按顺序装满）是关键：技能表的顺序是"按来源分组、组内按文件名
+    排序"（见 scan_skills），顺序装满等于让排在前面那个来源的技能吃光预算。
+
+    分配只看 token 边际成本，所以同样字数下 ASCII 描述比中文描述便宜、能拿到
+    更多字符——这是对的，它们本来就更省。顺序确定、无随机，索引在会话内稳定
+    （system prompt 是 prompt cache 的前缀，抖一下就全废）。
     """
     taken = [0] * len(entries)
     while True:

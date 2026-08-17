@@ -90,6 +90,32 @@ class TestEstimate(unittest.TestCase):
         long = tokens.estimate_text("def add(a, b): return a + b" * 10)
         self.assertGreater(long, short)
 
+    def test_prefix_costs_match_estimate_text(self) -> None:
+        """estimate_prefix_costs 的存在理由就是"等价于逐前缀调 estimate_text，
+        但只扫一遍"。这个等式一旦破（比如日后只改了其中一边的成本公式），
+        skills 的水填充会按错误的边际成本分预算，而且不会报错——只会悄悄超支
+        或少给。所以等价性必须由断言守住，不能靠"看起来一样"。
+        """
+        for head, body in (
+            ("", ""),
+            ("", "abc"),
+            ("- name: \n", ""),
+            ("- name: \n", "纯中文描述内容"),
+            ("- some-skill: \n", "mixed 中英 description with_underscores 和标点，…"),
+            ("x", "a" * 200),
+            ("前缀", "活" * 120),
+        ):
+            costs = tokens.estimate_prefix_costs(head, body)
+            self.assertEqual(len(costs), len(body) + 1)
+            for index in range(len(body) + 1):
+                with self.subTest(head=head, index=index):
+                    self.assertEqual(costs[index], tokens.estimate_text(head + body[:index]))
+
+    def test_prefix_costs_are_non_decreasing(self) -> None:
+        """水填充假设"多给一个字符不会更便宜"：delta 为负会让预算凭空回涨。"""
+        costs = tokens.estimate_prefix_costs("- s: \n", "mixed 中英 描述 abc…" * 8)
+        self.assertTrue(all(a <= b for a, b in zip(costs, costs[1:])))
+
     def test_tool_calls_are_counted(self) -> None:
         plain = {"role": "assistant", "content": "hi"}
         with_calls = {
