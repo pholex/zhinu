@@ -1072,6 +1072,105 @@ def update_command(argv: list[str]) -> int:
     return 0
 
 
+def serve_command(argv: list[str]) -> int:
+    """`xiaoyu serve`：HTTP API server（见 serve.py 模块 docstring）。
+
+    与 `--acp` / `--wire` 并列的第三条协议面，驱动方是工作流编排器
+    （n8n / Dify / 自研调度）。fastapi/uvicorn 是可选额外，缺包只影响这条命令。
+    """
+    from .serve import ServeConfig, ServeUnavailable, print_openapi, serve
+
+    parser = argparse.ArgumentParser(
+        prog="xiaoyu serve",
+        description="起 HTTP API server，把小羽接给工作流编排器（n8n / Dify / 自研调度）。",
+    )
+    parser.add_argument("--host", default="127.0.0.1", help="监听地址，默认只绑回环")
+    parser.add_argument("--port", type=int, default=8420, help="监听端口，默认 8420")
+    parser.add_argument(
+        "--workspace",
+        help="root 工作区，默认当前目录。会话只能落在它或它的子目录里",
+    )
+    parser.add_argument(
+        "--token",
+        default=os.environ.get("XIAOYU_SERVE_TOKEN", ""),
+        help="Bearer token（也可用 XIAOYU_SERVE_TOKEN）。绑非回环地址时必填",
+    )
+    parser.add_argument("--model", help="默认模型名，会话可覆盖")
+    parser.add_argument("--base-url", dest="base_url", help="OpenAI 兼容端点")
+    parser.add_argument("--mode", choices=modes.CYCLE, help="默认交互模式，会话可覆盖")
+    parser.add_argument(
+        "--approval",
+        choices=("ask", "allow_all"),
+        default="ask",
+        help="ask=需要放行的工具调用挂起等 /permissions（默认）；allow_all=等价 --yolo，无人值守但没有闸门",
+    )
+    parser.add_argument(
+        "--approval-timeout",
+        type=float,
+        default=300.0,
+        help="审批等多久算超时（秒）。超时按拒绝处理，默认 300",
+    )
+    parser.add_argument(
+        "--max-sessions",
+        dest="max_sessions",
+        type=int,
+        default=32,
+        help="能同时跑的会话数（= 工作线程池大小）。等审批期间线程也被占着，"
+        "所以它同时是'能同时挂起等审批的会话数'上限，默认 32",
+    )
+    parser.add_argument(
+        "--print-openapi",
+        action="store_true",
+        help="把 OpenAPI schema 打到 stdout 后退出（贴给 Dify 自定义工具用），不起服务",
+    )
+    parser.add_argument(
+        "--public-url",
+        dest="public_url",
+        default="",
+        help="写进 schema servers 的地址。编排器在容器里时必填"
+        "（Docker Desktop 常用 http://host.docker.internal:8420）",
+    )
+    args = parser.parse_args(argv)
+
+    root = (Path(args.workspace).expanduser() if args.workspace else Path.cwd()).resolve()
+    if not root.is_dir():
+        print(ui.error(f"工作区不存在：{root}"), file=sys.stderr)
+        return 2
+    #  与主命令同一道门，且必须在 load_dotenv 之前：工作区 .env 是被门管的对象。
+    #  服务端不可能弹窗问人，所以非交互判定（headless 纪律，与 --acp 一致）
+    trust = resolve_folder_trust(root, grant=False, interactive=False)
+    load_dotenv(None, untrusted_dir=None if trust.trusted else root)
+
+    cfg = ServeConfig(
+        root=root,
+        host=args.host,
+        port=args.port,
+        token=args.token,
+        model=args.model or "",
+        base_url=args.base_url or "",
+        mode=args.mode or "",
+        approval=args.approval,
+        approval_timeout=args.approval_timeout,
+        max_sessions=max(1, args.max_sessions),
+    )
+    try:
+        if args.print_openapi:
+            return print_openapi(cfg, args.public_url)
+        if args.host in ("127.0.0.1", "::1", "localhost") or args.token:
+            print(ui.success(f"xiaoyu serve → http://{args.host}:{args.port}  (root: {root})"))
+            print(ui.secondary("  文档 /docs · schema /openapi.json · Ctrl+C 停"))
+        return serve(cfg)
+    except ServeUnavailable:
+        print(
+            ui.error("serve 需要 fastapi 和 uvicorn，当前环境没装。"),
+            file=sys.stderr,
+        )
+        print('  pip install "xiaoyu-agent[serve]"', file=sys.stderr)
+        return 2
+    except KeyboardInterrupt:
+        return 130
+
+
 def uninstall_command(argv: list[str]) -> int:
     """卸载小羽：pip uninstall 本体 + 收拾装完之后留下的东西。
 
@@ -2065,6 +2164,8 @@ def main(argv: list[str] | None = None) -> int:
         return send_command(argv[1:])
     if argv and argv[0] == "mcp":
         return mcp_command(argv[1:])
+    if argv and argv[0] == "serve":
+        return serve_command(argv[1:])
     if argv and argv[0] in ("plugin", "plugins"):
         return plugin_command(argv[1:])
     if argv and argv[0] == "terminal-setup":

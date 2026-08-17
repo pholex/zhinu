@@ -115,4 +115,5 @@ auto 档**放行的依据是沙箱，不是信任**——沙箱不可用时自�
 - **插件包**：`xiaoyu plugin add aws/agent-toolkit-for-aws --name aws-core` 一行装齐技能 + MCP 声明，`plugin update` 拉新。认 [agent-plugins.org](https://agent-plugins.org) 的跨客户端 bundle 格式，社区已有的包直接能用；MCP 声明默认不装，摊出命令行问过才写
 - **多会话并行**：一个终端跑长任务，另一个终端 `xiaoyu send <会话名> "..."` 递话，对方在下个步骤边界收进上下文；模型自己也会用——直接说"看看还有哪些会话""让 api-1 帮我查一下"，发信前问你一次
 - **可嵌入**：`xiaoyu.embedding` 的 `AsyncAgent` 把 agent 当执行引擎嵌进你自己的进程（异步审批、事件流、会话复用）；跨语言用 `--wire` 的 stdio JSON-RPC
+- **可编排**：`xiaoyu serve` 起 HTTP API，n8n / Dify / 自研调度直接驱动（异步提交 + 状态轮询 + 事件游标，需要放行的工具调用挂起等 HTTP 回决定）。OpenAPI schema 由代码生成，贴给 Dify 自定义工具即用——见 [docs/http-api.md](docs/http-api.md)
 - **浏览器**：推荐挂 chrome-devtools MCP；内置 `[browser]` 是纯 pip 的兜底，`playwright install chromium` 后即用
