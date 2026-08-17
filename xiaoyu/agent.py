@@ -535,6 +535,9 @@ class Agent:
                 )
         #  SKILL.md 技能：启动时扫描一次，索引要写进 system prompt，必须先于它构建
         self.skills = skills.scan_skills() if config.enable_skills else []
+        #  来源目录指纹：轮首差量检测（_refresh_skills）靠它把"无变化"的轮次
+        #  压到几次 stat，不必每轮重读全部 frontmatter
+        self._skills_fingerprint = skills.sources_fingerprint() if config.enable_skills else ()
         #  本会话已加载过的技能名：重复加载时给模型提示，省一轮全文
         self._loaded_skills: set[str] = set()
         #  自上次 update_plan 以来的执行类工具（bash/browser）调用数：
@@ -736,14 +739,16 @@ class Agent:
                         mcp_manager=getattr(self.toolbox, "mcp_manager", None),
                     )
                 )
-        #  skill 工具：正文按需加载（渐进披露）。没有技能时 check_fn 让它不进 schemas。
-        if self.skills and self.toolbox.get("skill") is None:
+        #  skill 工具：正文按需加载（渐进披露）。注册与否看开关而不是"当前有没有
+        #  技能"——技能可以在会话中途落盘（模型自写/外部安装），启动时零技能不等于
+        #  永远零技能；没有技能的时刻由 check_fn 把它挡在 schemas 外。
+        if config.enable_skills and self.toolbox.get("skill") is None:
             self.toolbox.register(
                 Tool(
                     name="skill",
                     description=(
-                        "加载一个技能的完整说明（SKILL.md 正文）。可用技能列表见系统提示，"
-                        "加载后按说明执行。"
+                        "加载一个技能的完整说明（SKILL.md 正文）。可用技能列表见系统提示；"
+                        "会话中途新落盘的技能也能按名加载（未命中会重扫磁盘），加载后按说明执行。"
                     ),
                     parameters={
                         "type": "object",
@@ -1062,27 +1067,102 @@ class Agent:
         )
 
     def _load_skill(self, name: str) -> str:
-        for skill in self.skills:
-            if skill.name == name:
-                body = skills.load_skill_body(skill)
-                if body.startswith("ERROR:"):
-                    return body
-                #  基准目录必须随正文给出：技能正文里的相对路径（references/…、
-                #  ../共享文档）模型无从知道相对谁——真实会话里模型猜错目录后，
-                #  又花二十分钟递归搜盘才找到真实位置。
-                header = (
-                    f"[技能目录：{skill.path.parent}。"
-                    "正文中的相对路径都以此目录为基准。]\n\n"
-                )
-                if name in self._loaded_skills:
-                    header = (
-                        "[提示] 本会话已加载过该技能，若内容还在上下文里无需重复加载。"
-                        "以下是完整内容（供上下文被压缩后重取）。\n\n"
-                    ) + header
-                self._loaded_skills.add(name)
-                return header + body
-        known = ", ".join(skill.name for skill in self.skills) or "（无）"
-        return f"ERROR: 没有名为 {name!r} 的技能。可用：{known}"
+        found = next((item for item in self.skills if item.name == name), None)
+        if found is None and self.config.enable_skills:
+            #  未命中先重扫磁盘再判死刑：技能可能是**本轮**刚落盘的（模型自己
+            #  写的），轮首的 _refresh_skills 看不到轮内的新文件。skill 工具
+            #  以磁盘为真，索引只是快照。
+            self.skills = skills.scan_skills()
+            self._skills_fingerprint = skills.sources_fingerprint()
+            found = next((item for item in self.skills if item.name == name), None)
+        if found is None:
+            known = ", ".join(skill.name for skill in self.skills) or "（无）"
+            return f"ERROR: 没有名为 {name!r} 的技能。可用：{known}"
+        body = skills.load_skill_body(found)
+        if body.startswith("ERROR:"):
+            return body
+        #  基准目录必须随正文给出：技能正文里的相对路径（references/…、
+        #  ../共享文档）模型无从知道相对谁——真实会话里模型猜错目录后，
+        #  又花二十分钟递归搜盘才找到真实位置。
+        header = (
+            f"[技能目录：{found.path.parent}。"
+            "正文中的相对路径都以此目录为基准。]\n\n"
+        )
+        if name in self._loaded_skills:
+            header = (
+                "[提示] 本会话已加载过该技能，若内容还在上下文里无需重复加载。"
+                "以下是完整内容（供上下文被压缩后重取）。\n\n"
+            ) + header
+        self._loaded_skills.add(name)
+        return header + body
+
+    #  轮首注入的技能更新提示里，单条描述最多带这么多字符——它是"让模型能选中"
+    #  的路由信息，不是完整说明（完整说明归 skill 工具），别让一条长描述吃掉半轮上下文。
+    _REFRESH_DESC_CAP = 200
+
+    def _refresh_skills(self) -> None:
+        """轮首差量检测：技能目录有增删时更新会话内快照，并向对话尾部注入一条
+        `[系统提示]`，让模型**当轮**就看见新技能。
+
+        刻意不重建 system prompt：索引是 prompt cache 的前缀资产，抖一下整段
+        前缀作废——那个成本只归显式的 reload_skills 付。检测本身只 stat 来源
+        目录（增删技能必然改父目录 mtime，见 skills.sources_fingerprint），
+        无变化的轮次零文件读取。
+        """
+        if not self.config.enable_skills:
+            return
+        fingerprint = skills.sources_fingerprint()
+        if fingerprint == self._skills_fingerprint:
+            return
+        self._skills_fingerprint = fingerprint
+        fresh = skills.scan_skills()
+        old_names = {item.name for item in self.skills}
+        new_names = {item.name for item in fresh}
+        self.skills = fresh
+        added, removed = sorted(new_names - old_names), sorted(old_names - new_names)
+        if not added and not removed:
+            return  # 目录动了但索引没变（如技能内的资源文件增删），不必打扰模型
+        parts = []
+        if added:
+            by_name = {item.name: item for item in fresh}
+            listed = "；".join(
+                f"{name}（{(by_name[name].description or '无描述')[: self._REFRESH_DESC_CAP]}）"
+                for name in added
+            )
+            parts.append(f"新增 {listed}")
+        if removed:
+            parts.append(f"移除 {'、'.join(removed)}")
+        note = (
+            "[系统提示] 技能目录有更新——"
+            + "；".join(parts)
+            + "。新增技能本会话即可用 skill 工具按名加载；system prompt 里的索引"
+            "下次会话才刷新，与本条不一致时以本条为准。不必回应本条。"
+        )
+        self._record({"role": "user", "content": note})
+        #  压缩与 turn_starts 都不能把这条当用户原话（[系统提示] 前缀是离线侧
+        #  的兜底判据，这里再进会话内集合，双保险与 plan mode 注入同一纪律）
+        self.compactor.synthetic_user_texts |= {note}
+        self.sink.emit(
+            Notice(f"[技能目录已更新：+{len(added)} / -{len(removed)}，模型本轮可见]", "info")
+        )
+
+    def reload_skills(self) -> tuple[list[str], list[str]]:
+        """全量重扫技能并重建 system prompt 里的索引。返回 (新增名, 移除名)。
+
+        显式动作（/skills reload、嵌入宿主调用）：system prompt 一变，prompt
+        cache 前缀整段作废，这个成本只应由明确要它的人付——轮首的被动通道
+        （_refresh_skills）只更新快照 + 注入提示，不动 system prompt。
+        """
+        old_names = {item.name for item in self.skills}
+        if self.config.enable_skills:
+            self.skills = skills.scan_skills()
+            self._skills_fingerprint = skills.sources_fingerprint()
+        else:
+            self.skills = []
+            self._skills_fingerprint = ()
+        new_names = {item.name for item in self.skills}
+        self.messages[0] = {"role": "system", "content": self._system_prompt()}
+        return sorted(new_names - old_names), sorted(old_names - new_names)
 
     def reset(self) -> None:
         """清空对话，保留 system prompt。
@@ -1091,8 +1171,13 @@ class Agent:
         数周）下这几项不清就是泄漏或错乱：trace 无界增长吃内存；_loaded_skills
         残留会让技能在新会话里返回"已加载过"的存根而模型根本没见过全文
         （全文随历史清掉了）；打转计数/验证证据跨会话残留会误触发护栏。
+
+        system prompt 这里**重建**而不是原样保留：reset 后 prompt cache 反正
+        从头计，重建零额外成本，还能把会话中途更新过的技能快照（_refresh_skills）
+        转正进索引——常驻嵌入场景 recycle 一次就该拿到当前的技能表。
+        静态部分（人格/环境/项目指令）逐字重建结果相同，行为不变。
         """
-        self.messages = self.messages[:1]
+        self.messages = [{"role": "system", "content": self._system_prompt()}]
         self._anchor = None
         self.plan = []
         #  plan 档必须跟着清：它的规则是以 user 消息注入历史的，历史一空模型就
@@ -1380,6 +1465,9 @@ class Agent:
         #  信箱不在丢弃之列：别人趁我发呆投进来的消息，时间上确实排在本轮
         #  输入之前，先入历史即是正确顺序
         self._consume_inbox()
+        #  技能差量检测也在用户输入入历史之前：新技能的提示排在本轮输入前面，
+        #  模型读到任务时已经知道有哪些新家伙可用
+        self._refresh_skills()
         #  UserPromptSubmit hook：block 则本轮不发生（不入历史、不调模型）
         if self.hook_engine is not None and self.hook_engine.has("UserPromptSubmit"):
             from .hooks import clip

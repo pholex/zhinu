@@ -326,6 +326,124 @@ class AgentSkillIntegrationTest(unittest.TestCase):
         self.assertNotIn("greet", agent.messages[0]["content"])
 
 
+class DynamicSkillsTest(unittest.TestCase):
+    """会话中途的技能动态性：未命中重扫、轮首差量注入、显式 reload、reset 转正。
+
+    三条通道各管一段（改语义前先对齐这张分工表）：
+    - skill 工具未命中重扫 → 覆盖**本轮**刚落盘的技能（模型自己写的）
+    - _refresh_skills（轮首）→ 覆盖**轮间**外部装入/删除，注入 [系统提示] 不动 system prompt
+    - reload_skills（显式）→ 重建 system prompt 索引，prompt cache 成本由要它的人付
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name) / "skills"
+        self.root.mkdir(parents=True)
+        patcher = mock.patch.object(
+            skills, "skill_sources", return_value=[skills.SkillSource(self.root)]
+        )
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def build_agent(self):
+        from xiaoyu.agent import Agent
+        from xiaoyu.config import Config
+        from xiaoyu.providers import Registry
+        from xiaoyu.tools import Toolbox
+
+        config = Config(
+            base_url="http://unused",
+            model="m",
+            workspace=Path(self.tmp.name),
+            enable_explore=False,
+        )
+        return Agent(config, Toolbox(config), registry=Registry.for_client(object()))
+
+    def test_skill_tool_rescans_on_miss(self):
+        """本轮刚落盘的技能必须能按名加载——索引只是快照，磁盘才是真相。
+
+        起步给一个技能：零技能时 check_fn 会把 skill 工具整个挡在 schemas 与
+        执行之外（那是另一条已接受的边界——轮内写**第一个**技能要等下一轮
+        转正，模型刚写完的内容本来就在它上下文里，无需加载）。
+        """
+        write_skill(self.root, "seed", "name: seed\ndescription: 起步就有")
+        agent = self.build_agent()
+        write_skill(self.root, "fresh", "name: fresh\ndescription: 新落盘", body="现学现用")
+        result = agent.toolbox.run("skill", {"name": "fresh"})
+        self.assertNotIn("ERROR", result)
+        self.assertTrue(result.endswith("现学现用"))
+        #  重扫顺带更新了快照：后续未命中报错里能列出它
+        self.assertIn("fresh", [item.name for item in agent.skills])
+
+    def test_skill_tool_registered_even_with_zero_skills(self):
+        """注册看开关不看当下有无技能：启动时零技能 ≠ 永远零技能。
+        没有技能的时刻由 check_fn 挡在 schemas 外。"""
+        agent = self.build_agent()
+        self.assertIsNotNone(agent.toolbox.get("skill"))
+        self.assertNotIn("skill", [s["function"]["name"] for s in agent.toolbox.schemas()])
+        write_skill(self.root, "one", "name: one\ndescription: d")
+        agent._refresh_skills()
+        self.assertIn("skill", [s["function"]["name"] for s in agent.toolbox.schemas()])
+
+    def test_refresh_injects_note_without_touching_system_prompt(self):
+        agent = self.build_agent()
+        system_before = agent.messages[0]["content"]
+        write_skill(self.root, "newbie", "name: newbie\ndescription: 会话中途装入")
+        agent._refresh_skills()
+        #  system prompt（cache 前缀）纹丝不动
+        self.assertEqual(agent.messages[0]["content"], system_before)
+        note = agent.messages[-1]
+        self.assertEqual(note["role"], "user")
+        self.assertTrue(note["content"].startswith("[系统提示]"), note["content"])
+        self.assertIn("newbie", note["content"])
+        self.assertIn("会话中途装入", note["content"])
+        #  压缩侧不能把注入当用户原话
+        self.assertIn(note["content"], agent.compactor.synthetic_user_texts)
+
+    def test_refresh_reports_removals_too(self):
+        write_skill(self.root, "gone", "name: gone\ndescription: d")
+        agent = self.build_agent()
+        import shutil
+
+        shutil.rmtree(self.root / "gone")
+        agent._refresh_skills()
+        self.assertIn("移除 gone", agent.messages[-1]["content"])
+        self.assertEqual(agent.skills, [])
+
+    def test_refresh_is_quiet_when_nothing_changed(self):
+        """指纹相同的轮次零重扫零注入——这是每轮都跑的路径，必须近乎免费。"""
+        write_skill(self.root, "still", "name: still\ndescription: d")
+        agent = self.build_agent()
+        before = len(agent.messages)
+        with mock.patch.object(skills, "scan_skills") as scan:
+            agent._refresh_skills()
+        scan.assert_not_called()
+        self.assertEqual(len(agent.messages), before)
+
+    def test_reload_rebuilds_index_and_reports_diff(self):
+        write_skill(self.root, "old", "name: old\ndescription: 旧的")
+        agent = self.build_agent()
+        self.assertIn("- old:", agent.messages[0]["content"])
+        import shutil
+
+        shutil.rmtree(self.root / "old")
+        write_skill(self.root, "new", "name: new\ndescription: 新的")
+        added, removed = agent.reload_skills()
+        self.assertEqual((added, removed), (["new"], ["old"]))
+        self.assertIn("- new: 新的", agent.messages[0]["content"])
+        self.assertNotIn("- old:", agent.messages[0]["content"])
+
+    def test_reset_promotes_session_skills_into_index(self):
+        """reset 后 cache 反正从头计：中途出现的技能应转正进重建的索引。"""
+        agent = self.build_agent()
+        write_skill(self.root, "late", "name: late\ndescription: 中途来的")
+        agent._refresh_skills()
+        self.assertNotIn("- late:", agent.messages[0]["content"])  # 会话内不动前缀
+        agent.reset()
+        self.assertIn("- late: 中途来的", agent.messages[0]["content"])
+
+
 class CheckFnTest(unittest.TestCase):
     """工具可用性探测：check_fn 为 False 时不进 schemas、拒绝执行。"""
 

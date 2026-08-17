@@ -59,7 +59,7 @@ SLASH_COMMANDS: dict[str, str] = {
     "/tools": "列出已注册的工具",
     "/tasks": "后台任务列表（run_in_background 的命令 / monitor）",
     "/mcp": "MCP server 状态；/mcp approve <名> 批准变更工具",
-    "/skills": "列出可用技能（SKILL.md，含插件包带来的）",
+    "/skills": "列出可用技能；/skills reload 重扫磁盘并刷新索引",
     "/model": "查看或切换模型（/model 名字）",
     "/usage": "本次会话的 token 统计",
     "/context": "当前上下文占用与压缩状态",
@@ -2772,14 +2772,28 @@ def handle_slash(agent: Agent, line: str, select: Any = None) -> bool:
             else:
                 print(ui.secondary("  " + manager.describe().replace("\n", "\n  ")))
     elif command == "/skills":
-        if not agent.skills:
-            print(ui.secondary("  没有发现技能。放到 ~/.agents/skills/<名字>/SKILL.md 即可被识别，"))
-            print(ui.secondary("  或用 xiaoyu plugin add <owner/repo> 装一个插件包"))
-        for skill in agent.skills:
-            #  插件技能标出来源：名字里虽然带了包名前缀，但"这是装来的、能 update"
-            #  和"这是我自己写的"是两回事
-            origin = ui.secondary(f"  [插件 {skill.plugin}]") if skill.plugin else ""
-            print(f"  {skill.name}  {ui.secondary(skill.description or str(skill.path))}{origin}")
+        if rest and rest[0] == "reload":
+            #  显式全量刷新：重扫磁盘 + 重建 system prompt 索引。cache 前缀因此
+            #  作废一次（下轮全价），这是用户主动要的，明说即可。被动通道
+            #  （轮首差量检测）平时已自动跟进增删，这条给"想立刻看到索引"的人
+            added, removed = agent.reload_skills()
+            if not added and not removed:
+                print(ui.secondary(f"  索引无变化（共 {len(agent.skills)} 个技能）"))
+            else:
+                if added:
+                    print(ui.secondary(f"  新增：{'、'.join(added)}"))
+                if removed:
+                    print(ui.secondary(f"  移除：{'、'.join(removed)}"))
+                print(ui.secondary("  索引已重建（本轮 prompt cache 前缀作废，下一轮起重新累积）"))
+        else:
+            if not agent.skills:
+                print(ui.secondary("  没有发现技能。放到 ~/.agents/skills/<名字>/SKILL.md 即可被识别，"))
+                print(ui.secondary("  或用 xiaoyu plugin add <owner/repo> 装一个插件包"))
+            for skill in agent.skills:
+                #  插件技能标出来源：名字里虽然带了包名前缀，但"这是装来的、能 update"
+                #  和"这是我自己写的"是两回事
+                origin = ui.secondary(f"  [插件 {skill.plugin}]") if skill.plugin else ""
+                print(f"  {skill.name}  {ui.secondary(skill.description or str(skill.path))}{origin}")
     elif command == "/model":
         if rest:
             agent.switch_model(rest[0])

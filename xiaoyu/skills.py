@@ -61,6 +61,25 @@ def skill_sources() -> list[SkillSource]:
     return sources
 
 
+def sources_fingerprint() -> tuple:
+    """扫描来源目录的轻量指纹（路径 + 命名空间 + mtime）。
+
+    给轮首的技能差量检测用：技能的**增删**表现为来源目录下子目录的增删，
+    必然改变父目录 mtime——所以无变化的轮次只花几次 stat，零文件读取。
+    局限（可接受）：原地编辑已有 SKILL.md 不动父目录 mtime，改 name/description
+    要 /skills reload 或下次会话才反映到索引——正文本来就是 skill 工具现读的，
+    不受影响。
+    """
+    rows = []
+    for source in skill_sources():
+        try:
+            mtime = source.directory.stat().st_mtime_ns
+        except OSError:
+            mtime = None
+        rows.append((str(source.directory), source.plugin, mtime))
+    return tuple(rows)
+
+
 def parse_frontmatter(text: str) -> dict[str, str]:
     """提取首个 --- 块里的平铺 key: value。不是合法 frontmatter 就返回空。"""
     lines = text.splitlines()
