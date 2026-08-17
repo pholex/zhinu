@@ -1099,5 +1099,110 @@ class TestEscalationApproval(AgentTestCase):
         self.assertEqual(asked, [], "--yolo 下普通 bash 不该弹确认")
 
 
+class TestCrystallizeNudge(AgentTestCase):
+    """收尾轻推：反复整写同一文件 + 反复执行的解题迭代，收尾时请模型评估沉淀。
+
+    阈值刻意保守（同一文件 write_file ≥3 且 bash ≥3）：宁可漏推不可唠叨——
+    常规开发（str_replace 精修、少量整写）不该被问"要不要沉淀"。
+    """
+
+    def iteration_step(self, index: int, path: str = "scratch.py"):
+        """一步"整写脚本 + 跑一遍"——解题迭代的最小单元。"""
+        return [
+            chunk(
+                tool_calls=[
+                    call_fragment(
+                        0,
+                        f"w{index}",
+                        "write_file",
+                        json.dumps({"path": path, "content": f"print({index})\n"}),
+                    ),
+                    call_fragment(
+                        1, f"b{index}", "bash", json.dumps({"command": "echo run"})
+                    ),
+                ]
+            )
+        ]
+
+    def nudge_messages(self, agent: Agent) -> list[dict]:
+        from xiaoyu.agent import CRYSTALLIZE_NUDGE
+
+        return [
+            m
+            for m in agent.messages
+            if m.get("role") == "user" and m.get("content") == CRYSTALLIZE_NUDGE
+        ]
+
+    def test_iterative_solving_gets_nudged_once(self) -> None:
+        script = [
+            self.iteration_step(1),
+            self.iteration_step(2),
+            self.iteration_step(3),
+            [chunk(content="问题解决了")],
+            [chunk(content="无需沉淀")],
+        ]
+        agent = self.build(script)
+        with contextlib.redirect_stdout(io.StringIO()):
+            agent.send("修好这个脚本")
+        self.assertEqual(len(self.nudge_messages(agent)), 1)
+        #  轻推排在首次收尾正文之后，模型的答复是本轮最后一条
+        self.assertEqual(agent.messages[-1]["role"], "assistant")
+        self.assertEqual(agent.messages[-1]["content"], "无需沉淀")
+        self.assertEqual(self.client.completions.script, [], "轻推该恰好多跑一步")
+
+    def test_below_threshold_stays_quiet(self) -> None:
+        #  两轮整写：正常"建文件 + 改一处"的形态，不该被问
+        script = [
+            self.iteration_step(1),
+            self.iteration_step(2),
+            [chunk(content="好了")],
+        ]
+        agent = self.build(script)
+        with contextlib.redirect_stdout(io.StringIO()):
+            agent.send("小改一下")
+        self.assertEqual(self.nudge_messages(agent), [])
+        self.assertEqual(self.client.completions.script, [])
+
+    def test_scattered_writes_do_not_count_as_iteration(self) -> None:
+        #  三个不同文件各写一次 + 跑三次 = 常规多文件开发，不是解题迭代
+        script = [
+            self.iteration_step(1, "a.py"),
+            self.iteration_step(2, "b.py"),
+            self.iteration_step(3, "c.py"),
+            [chunk(content="改完了")],
+        ]
+        agent = self.build(script)
+        with contextlib.redirect_stdout(io.StringIO()):
+            agent.send("三个文件各改一处")
+        self.assertEqual(self.nudge_messages(agent), [])
+
+    def test_nudges_at_most_once_per_session(self) -> None:
+        turn = [
+            self.iteration_step(1),
+            self.iteration_step(2),
+            self.iteration_step(3),
+        ]
+        script = [
+            *turn,
+            [chunk(content="第一轮解决")],
+            [chunk(content="无需沉淀")],
+            *turn,
+            [chunk(content="第二轮解决")],  # 同样的迭代特征，但不再追问
+        ]
+        agent = self.build(script)
+        with contextlib.redirect_stdout(io.StringIO()):
+            agent.send("修一次")
+            agent.send("再修一次")
+        self.assertEqual(len(self.nudge_messages(agent)), 1)
+        self.assertEqual(self.client.completions.script, [])
+
+    def test_nudge_text_is_synthetic(self) -> None:
+        #  注入文案必须进 SYNTHETIC_USER_TEXTS：压缩不当用户原话、fork 不当轮次开头
+        from xiaoyu.agent import CRYSTALLIZE_NUDGE, SYNTHETIC_USER_TEXTS
+
+        self.assertIn(CRYSTALLIZE_NUDGE, SYNTHETIC_USER_TEXTS)
+        self.assertTrue(CRYSTALLIZE_NUDGE.startswith("[系统提示]"))
+
+
 if __name__ == "__main__":
     unittest.main()

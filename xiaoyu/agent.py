@@ -247,6 +247,17 @@ WRAPUP_INSTRUCTION = """已达到本轮工具调用次数上限，请立刻停�
 2. 进行到哪一步、还剩什么没做
 3. 建议用户下一步怎么做（继续让你做？手动处理？换个思路？）"""
 
+#  收尾轻推（固化流水线的最后一环）：本轮呈现"反复整写同一文件 + 反复执行"的
+#  解题迭代特征时，请模型评估要不要把解法沉淀下去。只提议、不动手——沉淀与否
+#  由用户拍板（持久记忆须人工确认的纪律），一次性脚本与常规开发不该被固化。
+CRYSTALLIZE_NUDGE = (
+    "[系统提示] 本轮为解决问题反复改写并执行了同一份代码。若这个刚验证过的解法"
+    "对今后的类似任务有复用价值，请在两三句话内提议把它沉淀为技能（SKILL.md）"
+    "或 playbook：说明沉淀什么、大致放哪，等用户拍板，不要自行动手写入；"
+    "若只是一次性脚本或项目常规开发，回一句「无需沉淀」即可。不要调用工具，"
+    "也不必重复已给出的结论。"
+)
+
 #  plan mode（只读规划态）下
 #  允许的工具白名单。deny-by-default：不在名单里的（bash/write_file/str_replace/
 #  browser/MCP/插件工具）一律拦——MCP 工具即使"看起来只读"也可能有副作用，宁可误拦。
@@ -299,7 +310,13 @@ def wrap_interjection(text: str) -> str:
 #  进自己的 Compactor 集合；turn_starts 另有"[系统提示] 前缀即跳过"的兜底
 #  （session_log.turn_starts），离线场景（fork 列轮次）不依赖会话态也能排除。
 SYNTHETIC_USER_TEXTS = frozenset(
-    {WRAPUP_INSTRUCTION, EMPTY_REPLY_NUDGE, PLAN_MODE_ENTER_NOTE, PLAN_MODE_LEAVE_NOTE}
+    {
+        WRAPUP_INSTRUCTION,
+        EMPTY_REPLY_NUDGE,
+        PLAN_MODE_ENTER_NOTE,
+        PLAN_MODE_LEAVE_NOTE,
+        CRYSTALLIZE_NUDGE,
+    }
 )
 
 
@@ -543,6 +560,13 @@ class Agent:
         #  自上次 update_plan 以来的执行类工具（bash/browser）调用数：
         #  「宣称完成」护栏靠它判断验证类步骤是否真的验证过
         self._exec_evidence = 0
+        #  收尾轻推（CRYSTALLIZE_NUDGE）的解题迭代特征，按轮归零：
+        #  同一路径被 write_file 整写的次数（str_replace 刻意不算——精修是常规
+        #  开发的形态，整写重来才像草稿脚本迭代）+ 本轮 bash 执行数。
+        self._turn_write_counts: dict[str, int] = {}
+        self._turn_script_runs = 0
+        #  每会话最多推一次，免得每个大活收尾都被唠叨
+        self._crystallize_nudged = False
         self.messages: list[dict[str, Any]] = [{"role": "system", "content": self._system_prompt()}]
         #  token 记账锚点（服务端 usage 是权威值，本地只估算它之后新增的
         #  部分，误差不随会话累积）：(权威 prompt_tokens, 当时的消息条数)。
@@ -1096,6 +1120,35 @@ class Agent:
         self._loaded_skills.add(name)
         return header + body
 
+    #  收尾轻推的迭代阈值：同一文件被整写 ≥3 次（首写 + 至少两轮返工才算真迭代，
+    #  "建文件 + 改一处"够不着）且本轮 bash ≥3 次（写了要跑过才叫验证过的解法）。
+    #  宁可漏推不可唠叨：这俩阈值偏保守是刻意的。
+    _CRYSTALLIZE_REWRITES = 3
+    _CRYSTALLIZE_RUNS = 3
+
+    def _maybe_nudge_crystallize(self) -> bool:
+        """收尾轻推（固化流水线的最后一环）：本轮出现"反复整写同一文件 + 反复
+        执行"的解题迭代特征时，注入 CRYSTALLIZE_NUDGE 请模型评估要不要把解法
+        沉淀为技能 / playbook，返回 True 让主循环再跑一步。
+
+        只提议、不动手：沉淀与否由用户拍板——自动沉淀会把偶然跑通的解法固化成
+        "经验"，与"持久记忆须人工确认"的纪律冲突。每会话最多推一次。
+        """
+        if self._crystallize_nudged:
+            return False
+        if self._turn_script_runs < self._CRYSTALLIZE_RUNS:
+            return False
+        if not any(
+            count >= self._CRYSTALLIZE_REWRITES for count in self._turn_write_counts.values()
+        ):
+            return False
+        self._crystallize_nudged = True
+        self._record({"role": "user", "content": CRYSTALLIZE_NUDGE})
+        self.sink.emit(
+            Notice("[检测到反复改写并执行的解题过程，已请模型评估是否值得沉淀]", "info")
+        )
+        return True
+
     #  轮首注入的技能更新提示里，单条描述最多带这么多字符——它是"让模型能选中"
     #  的路由信息，不是完整说明（完整说明归 skill 工具），别让一条长描述吃掉半轮上下文。
     _REFRESH_DESC_CAP = 200
@@ -1195,6 +1248,10 @@ class Agent:
             store.drop_all()
         self.trace.clear()
         self._loaded_skills.clear()
+        #  收尾轻推的"每会话一次"随会话重置——recycle 后的新对话有自己的一次机会
+        self._crystallize_nudged = False
+        self._turn_write_counts.clear()
+        self._turn_script_runs = 0
         self._last_call_key = None
         self._call_repeats = 0
         self._exec_evidence = 0
@@ -1468,6 +1525,9 @@ class Agent:
         #  技能差量检测也在用户输入入历史之前：新技能的提示排在本轮输入前面，
         #  模型读到任务时已经知道有哪些新家伙可用
         self._refresh_skills()
+        #  解题迭代特征按轮归零：跨轮累计会把两次不相干的小改凑成一次"迭代"
+        self._turn_write_counts.clear()
+        self._turn_script_runs = 0
         #  UserPromptSubmit hook：block 则本轮不发生（不入历史、不调模型）
         if self.hook_engine is not None and self.hook_engine.has("UserPromptSubmit"):
             from .hooks import clip
@@ -1515,6 +1575,10 @@ class Agent:
                                 {"role": "user", "content": f"[hook 反馈] {decision.reason}"}
                             )
                             continue
+                    #  收尾轻推排在 Stop hook 之后：hook 顶回去续跑的轮次还没
+                    #  真正收尾，等它真结束时这里自然会再走到
+                    if self._maybe_nudge_crystallize():
+                        continue
                     return
                 #  空回复护栏：content 空且没有工具调用。静默 return 会让整轮
                 #  无声结束——用户看不到任何输出，也不知道该不该继续等。
@@ -2307,6 +2371,13 @@ class Agent:
         #  验证类计划步骤才谈得上"验证过"
         if name in ("bash", "browser"):
             self._exec_evidence += 1
+        #  收尾轻推的解题迭代特征（阈值判定见 _maybe_nudge_crystallize）
+        if name == "bash":
+            self._turn_script_runs += 1
+        elif name == "write_file":
+            path = str(args.get("path") or "")
+            if path:
+                self._turn_write_counts[path] = self._turn_write_counts.get(path, 0) + 1
         if note:
             output += f"\n\n（用户批准这次调用时附加了指示，请照此执行：{note}）"
         if repeats >= self._REPEAT_WARN:
