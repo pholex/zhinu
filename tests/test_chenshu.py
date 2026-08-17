@@ -115,6 +115,10 @@ class ChenshuCase(AgentTestCase):
 
     def init_repo(self):
         git(self.root, "init", "-q", "-b", "main")
+        #  仓库级 git 身份：CI runner 没有全局身份，worker 的 bash commit 与
+        #  runtime.merge 的 merge commit 都要用（worktree 共享仓库级配置）
+        git(self.root, "config", "user.email", "t@t")
+        git(self.root, "config", "user.name", "t")
         (self.root / "src").mkdir(exist_ok=True)
         (self.root / "src" / "a.py").write_text("a = 1\n", encoding="utf-8")
         git(self.root, "add", "-A")
@@ -304,6 +308,16 @@ class MergeGateTest(ChenshuCase):
         out = self.runtime.merge("M2")
         self.assertIn("survey", out)
         self.assertEqual(self.runtime.mission("M2").status, "merged")
+
+    def test_empty_diff_blocks(self):
+        """分支零改动（worker 没 commit 的典型形态）不许静默合并。"""
+        wt = worktree_mod.create_branch(self.root, self.mission.branch, "t", "main")
+        self.mission.worktree = str(wt)
+        self.runtime.submit_review("chenshu", "M1", "clean", "看过了")
+        with self.assertRaises(ChenshuError) as ctx:
+            self.runtime.merge("M1")
+        self.assertIn("没有任何已提交改动", str(ctx.exception))
+        self.assertEqual(self.runtime.mission("M1").status, "pending")
 
     def test_review_round_numbering(self):
         self.commit_on_branch("src/new.py")

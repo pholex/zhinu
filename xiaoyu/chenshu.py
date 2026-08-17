@@ -652,6 +652,15 @@ class ChenshuRuntime:
                     "ERROR: scope 检查失败（git diff 非零退出）——拒绝合并，稍后重试。"
                 )
             files = [line for line in diff_result.stdout.splitlines() if line.strip()]
+            #  build 分支空 diff = worker 多半没 commit（CI 上 git 身份缺失时
+            #  commit 静默失败就是这个形态）。静默合并会把失败掩盖成成功
+            if not files:
+                self.log(TOWER, "merge.blocked", mission=mission.id, reason="empty-diff")
+                raise ChenshuError(
+                    f"ERROR: {mission.branch} 相对 {self.base_branch} 没有任何已提交"
+                    "改动——worker 是否忘了 git commit？确认确实无代码可交付，"
+                    "就把 mission 标 completed 后直接 teardown，merge 只收有改动的分支。"
+                )
             offenders = [f for f in files if not scope_match(f, mission.scope)]
             if offenders:
                 self.log(TOWER, "merge.blocked", mission=mission.id, reason="out-of-scope")
@@ -669,12 +678,20 @@ class ChenshuRuntime:
             if result.returncode != 0:
                 #  冲突现场必须清理干净，否则主 checkout 卡在合并中态
                 _git(["merge", "--abort"], root)
-                self.log(TOWER, "merge.blocked", mission=mission.id, reason="conflict")
-                raise ChenshuError(
-                    "ERROR: 合并冲突，已回滚（scope 不相交时不该发生——多半是别的"
-                    " mission 先合入了公共文件）。让 owner 在 worktree 里 rebase "
-                    f"{self.base_branch} 解冲突、提交、重评审后再合。"
-                )
+                combined = f"{result.stdout}\n{result.stderr}"
+                #  只有真冲突才给"rebase 解冲突"的指引；其它失败（git 身份缺失、
+                #  钩子拒绝……）要把 git 的原话摆出来，别拿冲突剧本误导
+                if "CONFLICT" in combined:
+                    self.log(TOWER, "merge.blocked", mission=mission.id, reason="conflict")
+                    raise ChenshuError(
+                        "ERROR: 合并冲突，已回滚（scope 不相交时不该发生——多半是别的"
+                        " mission 先合入了公共文件）。让 owner 在 worktree 里 rebase "
+                        f"{self.base_branch} 解冲突、提交、重评审后再合。"
+                    )
+                tail = combined.strip().splitlines()
+                detail = tail[-1] if tail else f"exit {result.returncode}"
+                self.log(TOWER, "merge.blocked", mission=mission.id, reason="merge-failed")
+                raise ChenshuError(f"ERROR: git merge 失败（{detail}），已回滚——处理后重试。")
             mission.status = "merged"
             self._save()
             self.log(TOWER, "merge", mission=mission.id, tip=tip[:10], files=len(files))
