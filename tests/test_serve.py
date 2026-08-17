@@ -377,6 +377,145 @@ class TestAllowAll(ServeCase):
         self.assertTrue((self.root / "直写.txt").exists())
 
 
+class TestConstructionTimeInjection(ServeCase):
+    """approver / sink 必须在 `Agent(...)` 构造时就位，不能构造完再回填。
+
+    这是本模块最容易犯又最难看出的错：`Agent.__init__` 把这两样**按值捕获**
+    进 explore / web_search / 子 agent 的工具闭包，回填 `agent.approver` /
+    `agent.sink` 只改父 Agent 的属性，闭包里攥着的还是构造时那个值。
+    曾经的后果：`--approval ask` 档下**子 agent 里的 bash/write_file 完全不经
+    审批**（拿到的是 Agent 缺省的 `lambda: True`），且 explore / web_search /
+    子 agent 的事件全进黑洞 sink。所以这里直接盯 `build_agent` 的产物。
+    """
+
+    def test_build_agent_wires_both_at_construction(self):
+        from xiaoyu.serve import (
+            ServeConfig,
+            _BridgeSink,
+            _HttpApprover,
+            _SessionRef,
+            build_agent,
+        )
+
+        self.start("text: 无所谓\n")
+        ref = _SessionRef()
+        agent = build_agent("sess-probe", self.root, ServeConfig(root=self.root), ref)
+        #  不是 Agent.__init__ 那个"永远批准"的缺省 lambda
+        self.assertIsInstance(agent.approver, _HttpApprover)
+        self.assertIsInstance(agent.sink, _BridgeSink)
+
+    def test_unbound_approver_fails_closed(self):
+        #  绑定前不该有工具在跑；真跑到了也必须拒绝，绝不能因"还没就绪"放行
+        from xiaoyu.serve import _HttpApprover, _SessionRef
+        from xiaoyu.agent import Deny
+
+        verdict = _HttpApprover(_SessionRef())("bash", {"command": "rm -rf /"})
+        self.assertIsInstance(verdict, Deny)
+
+    def test_bridge_sink_reaches_the_event_buffer(self):
+        """被闭包捕获的 sink 要真能把事件送进缓冲区，且是从工作线程送的。"""
+        import asyncio as _asyncio
+
+        from xiaoyu.events import Notice
+        from xiaoyu.serve import ServeConfig, _BridgeSink, _Session, _SessionRef
+
+        self.start("text: 无所谓\n")
+        cfg = ServeConfig(root=self.root)
+
+        async def scenario():
+            ref = _SessionRef()
+            sink = _BridgeSink(ref)
+            #  emit 在绑定前必须静默无害，不能崩在工具里
+            sink.emit(Notice("绑定前", "info"))
+            session = _Session("sess-x", _StubAgent(), self.root, cfg)
+            ref.bind(session, _asyncio.get_running_loop())
+            #  从真的另一个线程发（explore / 子 agent 就是这么跑的）
+            await _asyncio.to_thread(sink.emit, Notice("来自工作线程", "info"))
+            #  call_soon_threadsafe 是排进循环的，让它跑一拍
+            await _asyncio.sleep(0.05)
+            return [item.get("text") for item in session.events]
+
+        texts = _asyncio.run(scenario())
+        self.assertEqual(texts, ["来自工作线程"])
+
+
+class _StubAgent:
+    """`_Session` 只用到 config/context_tokens，构造真 Agent 太重。"""
+
+    class _Cfg:
+        model = "stub"
+        mode = "default"
+
+    config = _Cfg()
+
+    def context_tokens(self) -> int:
+        return 0
+
+
+class TestReviewFixes(ServeCase):
+    """针对复查发现的其余几条的回归。"""
+
+    def test_nested_args_are_truncated_too(self):
+        #  最大的负载在 args 这个 dict 里（write_file 的 content），
+        #  只截顶层等于把最该防的那块原样留在内存里
+        big = "x" * 60000
+        self.start(
+            'tool_call: {"name": "write_file", "arguments": {"path": "big.txt", "content": "%s"}}\n'
+            "---\ntext: 好\n" % big
+        )
+        session_id = self.new_session(mode="auto")
+        self.client.post(
+            f"/session/{session_id}/prompt", json={"text": "写"}, headers=self.headers()
+        )
+        pending = [
+            item for item in self.events(session_id, limit=2000) if item["kind"] == "tool.pending"
+        ]
+        self.assertEqual(len(pending), 1)
+        content = pending[0]["args"]["content"]
+        self.assertLess(len(content), len(big))
+        self.assertIn("已截断", content)
+
+    def test_steer_on_idle_session_is_409(self):
+        #  Agent._turn() 开头就 drain_steers()，空闲时入队的插话会被丢弃。
+        #  回 200 等于骗调用方说话已送到
+        self.start("text: 无所谓\n")
+        session_id = self.new_session()
+        response = self.client.post(
+            f"/session/{session_id}/steer", json={"text": "补充一句"}, headers=self.headers()
+        )
+        self.assertEqual(response.status_code, 409, response.text)
+
+    def test_events_description_names_the_real_cursor_field(self):
+        #  Dify/n8n 用户是照生成的 schema 写客户端的；描述里写错字段名，
+        #  他们会读到 undefined 然后原地重复轮询
+        client = self.start("text: 无所谓\n")
+        spec = client.get("/openapi.json").json()
+        text = spec["paths"]["/session/{session_id}/events"]["get"]["description"]
+        self.assertIn("`next`", text)
+        self.assertNotIn("next_seq", text)
+
+
+class TestNonAsciiToken(ServeCase):
+    """运维把 token 配成非 ASCII 时，服务不能整个塌成 500。
+
+    `hmac.compare_digest(str, str)` 遇非 ASCII 直接抛 TypeError——那会让**每一个**
+    请求（含带正确 token 的）返回 500，且错误信息完全指不到"token 配错了"上。
+    改比 bytes 之后，行为退化成干净的 401。
+
+    注意：非 ASCII 的 token 本来就送不进来（HTTP header 不是 UTF-8 通道，httpx
+    这类客户端直接拒绝编码），所以这种配置终归是不可用的——但**不可用要表现成
+    401 而不是 500**，运维才可能顺着"认证失败"查到自己的 token 上。
+    """
+
+    token = "令牌-秘密"
+
+    def test_non_ascii_token_degrades_to_401_not_500(self):
+        client = self.start("text: 无所谓\n")
+        for headers in ({}, {"X-Xiaoyu-Token": "wrong"}, {"Authorization": "Bearer wrong"}):
+            response = client.post("/session", json={}, headers=headers)
+            self.assertEqual(response.status_code, 401, f"{headers} → {response.text}")
+
+
 class TestGuards(ServeCase):
     def test_workspace_must_stay_inside_root(self):
         self.start("text: 无所谓\n")

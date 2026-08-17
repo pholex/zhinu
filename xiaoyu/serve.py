@@ -113,6 +113,9 @@ MAX_WAIT = 60.0
 POLL_SLICE = 1.0
 #  多久没字节可发就打一条心跳注释（nginx 默认 60s 掐读超时，取它的一半）。
 HEARTBEAT = 30.0
+#  同时能跑的会话数（= 工作线程池大小，见 create_app 的 lifespan）。默认线程池
+#  是 min(32, cpu+4)，而审批期间线程被占着，那个隐形上限会让超出的会话静默饿死。
+DEFAULT_MAX_SESSIONS = 32
 
 
 class ServeUnavailable(RuntimeError):
@@ -137,6 +140,9 @@ class ServeConfig:
     append_system_prompt: str = ""
     buffer_limit: int = DEFAULT_BUFFER
     max_field: int = DEFAULT_MAX_FIELD
+    #  能同时跑的会话数 = 工作线程池大小。审批期间线程是被占着的（approver 就地
+    #  阻塞），所以这个数同时也是"能同时挂起等审批的会话数"上限。
+    max_sessions: int = DEFAULT_MAX_SESSIONS
 
 
 @dataclass
@@ -167,12 +173,87 @@ def _clip(value: Any, limit: int) -> tuple[Any, bool, int]:
     return value, False, 0
 
 
+def _clip_deep(value: Any, limit: int) -> Any:
+    """递归截断嵌套结构里的超长字符串。
+
+    只截顶层是不够的：`tool.pending` / `tool.running` / `permission.requested`
+    最大的负载在 **`args` 这个 dict 里**（`write_file` 的 content 可以是 MB
+    级），只看顶层等于把最该防的那一块原样留在了内存里。截断处就地换成
+    带 `…（已截断，共 N 字符）` 的字符串——嵌套结构里没法像顶层那样另起
+    `*_truncated` 兄弟字段，把事实写进值本身，消费方一眼看得见。
+    """
+    if isinstance(value, str):
+        if len(value) > limit:
+            return f"{value[:limit]}…（已截断，共 {len(value)} 字符）"
+        return value
+    if isinstance(value, dict):
+        return {key: _clip_deep(item, limit) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_clip_deep(item, limit) for item in value]
+    return value
+
+
+class _SessionRef:
+    """先于 `Agent` 创建、随后 `bind()` 的间接层。**这不是花活，是必须的。**
+
+    `Agent.__init__` 把 `approver` 与 `sink` **按值捕获**进 explore /
+    web_search / 子 agent 的工具闭包（`agent.py:563/570/733`
+    → `agents.py:450`）。所以构造完再回填 `agent.approver` / `agent.sink`
+    **到不了那些闭包**——回填只改了父 Agent 的属性，闭包里还攥着构造时那个值。
+    两个后果都是实打实的：
+
+    - 回填 approver：子 agent 拿到的是 `Agent.__init__` 的缺省
+      `lambda name, args: True`，于是 `--approval ask` 档下**子 agent 里的
+      bash/write_file 完全不经审批**，也不出现在 /permissions 和事件流里。
+      审批闸门在这条路上等于没有。
+    - 回填 sink：explore / web_search / 子 agent 的事件全进黑洞 sink，
+      编排侧看到的是"两分钟一个事件都没有"，与卡死无法区分。
+
+    解法就是让这两样**在构造时就是最终对象**：先造这个 ref，把
+    `_HttpApprover(ref)` / `_BridgeSink(ref)` 传进 `Agent(...)`，`_Session`
+    造好后再 `bind()`。绑定前不可能有任何一轮在跑，所以这个窗口是安全的。
+    （`AsyncAgent.stream()` 另外会把 `agent.sink` 临时换成自己的事件桥，那管
+    的是主循环；被闭包攥住的是这里的 `_BridgeSink`，两条路都通向同一个缓冲区。）
+    """
+
+    def __init__(self) -> None:
+        self.session: "_Session | None" = None
+        self.loop: asyncio.AbstractEventLoop | None = None
+
+    def bind(self, session: "_Session", loop: asyncio.AbstractEventLoop) -> None:
+        self.session = session
+        self.loop = loop
+
+
+class _BridgeSink:
+    """工具闭包捕获的 sink：把事件搬进会话缓冲区。
+
+    被 explore / web_search / 子 agent 在**工作线程**里调用，所以必须经
+    `call_soon_threadsafe` 转交，不能直接动缓冲区。
+    """
+
+    def __init__(self, ref: _SessionRef) -> None:
+        self._ref = ref
+
+    def emit(self, event: UIEvent) -> None:
+        session, loop = self._ref.session, self._ref.loop
+        if session is None or loop is None:
+            return  # 绑定前不可能有事件；真有也只能丢，不能崩在工具里
+        loop.call_soon_threadsafe(session.publish_event, event)
+
+
 class _Session:
     """一个会话：AsyncAgent + 状态机 + 事件缓冲 + 挂起的审批。
 
-    所有 `publish_*` / 状态变更都必须在事件循环线程上做（唯一的例外来源是
-    工作线程里的 approver，它经 `call_soon_threadsafe` 转交）——这样缓冲区
-    与游标不需要额外加锁。
+    事件缓冲与状态只在事件循环线程上改（工作线程来的一律经
+    `call_soon_threadsafe` 转交），所以那部分不需要锁。
+
+    `pending` 是唯一的例外：审批的登记/摘除发生在**工作线程**（approver 就地
+    阻塞在那儿），而 /status、/permissions、abort、`_drive` 收尾都在事件循环上
+    遍历它。裸 dict 会在"一边 pop 一边迭代"时抛
+    `RuntimeError: dictionary changed size during iteration`——打在 /status
+    这个编排器每几百毫秒就要打一次的端点上。所以它单独配一把锁，读一律走
+    `snapshot_pending()` 取快照。
     """
 
     def __init__(self, session_id: str, agent: Agent, workspace: Path, cfg: ServeConfig) -> None:
@@ -198,7 +279,26 @@ class _Session:
         self._tick = asyncio.Event()
 
         self.pending: dict[str, _Pending] = {}
+        self._pending_lock = threading.Lock()
         self._task: asyncio.Task | None = None
+
+    # ---------- 挂起的审批（跨线程，一律走这三个口） ----------
+
+    def add_pending(self, request: _Pending) -> None:
+        with self._pending_lock:
+            self.pending[request.id] = request
+
+    def drop_pending(self, request_id: str) -> None:
+        with self._pending_lock:
+            self.pending.pop(request_id, None)
+
+    def snapshot_pending(self) -> list[_Pending]:
+        with self._pending_lock:
+            return list(self.pending.values())
+
+    def take_pending(self, request_id: str) -> "_Pending | None":
+        with self._pending_lock:
+            return self.pending.get(request_id)
 
     # ---------- 事件缓冲 ----------
 
@@ -206,8 +306,10 @@ class _Session:
         limit = self.cfg.max_field
         clipped: dict[str, Any] = {}
         for key, value in payload.items():
+            #  顶层字符串额外挂 *_truncated / *_chars 兄弟字段（消费方好判断）；
+            #  嵌套结构走 _clip_deep，把截断事实写进值本身
             value, cut, original = _clip(value, limit)
-            clipped[key] = value
+            clipped[key] = value if cut else _clip_deep(value, limit)
             if cut:
                 clipped[f"{key}_truncated"] = True
                 clipped[f"{key}_chars"] = original
@@ -255,7 +357,7 @@ class _Session:
             "busy": self.busy,
             "error": self.error,
             "turns": self.turns,
-            "pending_approvals": [item.to_dict() for item in self.pending.values()],
+            "pending_approvals": [item.to_dict() for item in self.snapshot_pending()],
             "next_seq": self.next_seq,
             "first_seq": self.first_seq,
             "dropped_events": self.dropped,
@@ -292,36 +394,40 @@ class _HttpApprover:
     超时 / 会话被关都按拒绝收场——安全闸门宁可多拦一次，不能在故障时静默放行。
     """
 
-    def __init__(self, session: _Session, loop: asyncio.AbstractEventLoop) -> None:
-        self._session = session
-        self._loop = loop
+    def __init__(self, ref: _SessionRef) -> None:
+        self._ref = ref
 
     def __call__(self, name: str, args: dict[str, Any]) -> Any:
-        session = self._session
+        session, loop = self._ref.session, self._ref.loop
+        if session is None or loop is None:
+            #  绑定前不可能有工具在跑；真跑到了也必须 fail closed，
+            #  绝不能因为"还没绑好"就放行
+            return Deny("会话尚未就绪，已自动拒绝")
         if session.cfg.approval == "allow_all":
             return True
         request = _Pending(id=uuid.uuid4().hex[:12], name=name, args=args, created_at=time.time())
         #  先落进 pending 再通知：GET /permissions 与事件谁先到都能看到这一条
-        session.pending[request.id] = request
-        self._loop.call_soon_threadsafe(session.mark_waiting, request)
+        session.add_pending(request)
+        loop.call_soon_threadsafe(session.mark_waiting, request)
         got = request.done.wait(timeout=session.cfg.approval_timeout)
-        session.pending.pop(request.id, None)
+        session.drop_pending(request.id)
         if not got:
-            self._loop.call_soon_threadsafe(session.mark_resolved, request.id, "timeout")
+            loop.call_soon_threadsafe(session.mark_resolved, request.id, "timeout")
             return Deny(
                 f"审批超时（{session.cfg.approval_timeout:g}s 内没有收到 "
                 f"POST /session/{session.id}/permissions 的决定），已自动拒绝"
             )
-        self._loop.call_soon_threadsafe(session.mark_resolved, request.id, "resolved")
+        loop.call_soon_threadsafe(session.mark_resolved, request.id, "resolved")
         return request.verdict
 
 
-def build_agent(session_id: str, workspace: Path, cfg: ServeConfig) -> Agent:
+def build_agent(session_id: str, workspace: Path, cfg: ServeConfig, ref: _SessionRef) -> Agent:
     """现配一个 Agent（装配顺序照 acp_main 的工厂，两条协议面保持同源）。
 
-    approver 不在这里注入：它需要 `_Session` 的引用，而 `_Session` 又要先有
-    Agent 才能构造。绕开这个鸡生蛋的办法是构造完再回填 `agent.approver`——
-    此刻还没有任何一轮在跑，回填是安全的。
+    approver 与 sink **必须在这里就是最终对象**（经 `_SessionRef` 间接绑定），
+    不能构造完再回填——`Agent.__init__` 会把这两样按值捕获进 explore /
+    web_search / 子 agent 的工具闭包，回填到不了那里。理由与后果见
+    `_SessionRef` 的 docstring；`cli.py` 与 `acp.py` 的工厂也都是构造时注入。
     """
     trusted = folder_trust.evaluate(workspace, interactive=False).verdict == "trusted"
     config = Config.from_env(
@@ -340,17 +446,14 @@ def build_agent(session_id: str, workspace: Path, cfg: ServeConfig) -> Agent:
     return Agent(
         config,
         Toolbox(config),
+        approver=_HttpApprover(ref),
         session_log=session_log,
         permissions=permissions,
-        #  sink 不注入：stream() 会把它临时换成事件桥，事件全部经那条路进缓冲区。
-        #  这里给个吞掉一切的 sink，免得 PlainSink 把正文打到服务端 stdout 上。
-        sink=_NullSink(),
+        #  主循环的事件由 AsyncAgent.stream() 的临时事件桥接走；这个 sink 是给
+        #  被闭包捕获的那批（explore / web_search / 子 agent）用的，同样进缓冲区。
+        #  不能给 NullSink——那批工具的事件会整段消失，编排侧看不出它在干活。
+        sink=_BridgeSink(ref),
     )
-
-
-class _NullSink:
-    def emit(self, event: UIEvent) -> None:  # noqa: D102 - 协议方法，无行为
-        return None
 
 
 def create_app(cfg: ServeConfig):  # noqa: C901 - 路由表天然长，拆开反而更难读
@@ -363,7 +466,31 @@ def create_app(cfg: ServeConfig):  # noqa: C901 - 路由表天然长，拆开反
 
     sessions: dict[str, _Session] = {}
 
+    @contextlib.asynccontextmanager
+    async def lifespan(_app):
+        """把 `asyncio.to_thread` 的默认线程池换成按并发会话数定的那个。
+
+        `AsyncAgent.send/stream` 经 `to_thread` 跑一轮，用的是默认
+        `ThreadPoolExecutor`（`min(32, cpu+4)`，常见机器上就 12 条）。而
+        `_HttpApprover` **会占着工作线程**等审批（默认 300s）。于是十来个会话
+        卡在 waiting_for_approval，第 13 个 `prompt_async` 照样回 202、
+        `/status` 照样报 running/working，但 `_drive` 根本没开始跑——没有事件、
+        没有进度，与"模型卡死"完全无法区分，最长闷五分钟。
+        一个"一对多"的服务不能有这种隐形天花板，所以显式按 max_sessions 配。
+        """
+        from concurrent.futures import ThreadPoolExecutor
+
+        pool = ThreadPoolExecutor(
+            max_workers=cfg.max_sessions, thread_name_prefix="xiaoyu-serve"
+        )
+        asyncio.get_running_loop().set_default_executor(pool)
+        try:
+            yield
+        finally:
+            pool.shutdown(wait=False, cancel_futures=True)
+
     app = FastAPI(
+        lifespan=lifespan,
         title="xiaoyu HTTP API",
         version=__import__("xiaoyu").__version__,
         description=(
@@ -382,8 +509,12 @@ def create_app(cfg: ServeConfig):  # noqa: C901 - 路由表天然长，拆开反
         if not cfg.token:
             return
         offered = x_xiaoyu_token or authorization.removeprefix("Bearer ").strip()
-        #  常数时间比较：token 是长期凭据，别把它的前缀通过响应时间漏出去
-        if not hmac.compare_digest(offered, cfg.token):
+        #  常数时间比较：token 是长期凭据，别把它的前缀通过响应时间漏出去。
+        #  **必须比 bytes**：starlette 按 latin-1 解 header，而
+        #  compare_digest(str, str) 遇非 ASCII 直接抛 TypeError——那会让
+        #  非 ASCII 的 token 整个服务不可用（每个请求 500），也让任何带非 ASCII
+        #  Authorization 头的请求收到 500 而不是干净的 401。
+        if not hmac.compare_digest(offered.encode("utf-8"), cfg.token.encode("utf-8")):
             raise HTTPException(status_code=401, detail="token 不对或缺失")
 
     guard = [Depends(require_token)]
@@ -450,7 +581,7 @@ def create_app(cfg: ServeConfig):  # noqa: C901 - 路由表天然长，拆开反
             session.busy = False
             #  会话若在跑的过程中被 DELETE，挂起的审批要有人收尸，否则工作线程
             #  一直阻塞到 approval_timeout。这里统一兜底放拒绝。
-            for request in list(session.pending.values()):
+            for request in session.snapshot_pending():
                 request.verdict = Deny("会话已结束")
                 request.done.set()
 
@@ -481,13 +612,16 @@ def create_app(cfg: ServeConfig):  # noqa: C901 - 路由表天然长，拆开反
         target = resolve_workspace(workspace)
         session_id = f"sess-{uuid.uuid4().hex[:16]}"
         local = replace(cfg, model=model or cfg.model, mode=mode or cfg.mode)
+        ref = _SessionRef()
         try:
-            agent = build_agent(session_id, target, local)
+            agent = build_agent(session_id, target, local, ref)
         except MissingConfig as exc:
             #  503 而不是 500：这不是 bug，是服务端没配 provider，运维动作明确
             raise HTTPException(status_code=503, detail=f"未配置 provider：{exc}") from exc
         session = _Session(session_id, agent, target, local)
-        agent.approver = _HttpApprover(session, asyncio.get_running_loop())
+        #  绑定后 approver / sink 才真正生效。绑定前不可能有一轮在跑（会话还没
+        #  返回给调用方），所以这个窗口安全——但 approver 仍 fail closed 兜底
+        ref.bind(session, asyncio.get_running_loop())
         sessions[session_id] = session
         return session.info_dict()
 
@@ -521,7 +655,7 @@ def create_app(cfg: ServeConfig):  # noqa: C901 - 路由表天然长，拆开反
     async def session_delete(session_id: str) -> dict[str, Any]:
         session = pick(session_id)
         session.async_agent.interrupt()
-        for request in list(session.pending.values()):
+        for request in session.snapshot_pending():
             request.verdict = Deny("会话已被关闭")
             request.done.set()
         sessions.pop(session_id, None)
@@ -581,7 +715,7 @@ def create_app(cfg: ServeConfig):  # noqa: C901 - 路由表天然长，拆开反
         summary="拉事件（游标 + long-poll）",
         operation_id="get_events",
         description=(
-            "从 from 开始拉；返回的 next_seq 就是下次的 from。wait>0 时没有新事件会挂起"
+            "从 from 开始拉；返回的 `next` 就是下次的 from。wait>0 时没有新事件会挂起"
             "等待，最长 60s——给不方便消费 SSE 的编排器（n8n HTTP 节点、Dify）用。"
         ),
         tags=["events"],
@@ -615,6 +749,8 @@ def create_app(cfg: ServeConfig):  # noqa: C901 - 路由表天然长，拆开反
             "follow=true（默认）常驻推送，会话关掉或客户端断开才结束——编辑器/看板用。"
             "follow=false 只把当前这一轮推完就关流：调用方不必自己想办法中断连接，"
             "适合'提交一轮 → 跟完 → 收工'的一次性消费方。"
+            "⚠️ follow=false 要在**提交 prompt 之后**开——会话空闲且没有新事件时它"
+            "立刻关流，先开会拿到一个空流（200 但零事件）。"
         ),
         tags=["events"],
         dependencies=guard,
@@ -661,7 +797,7 @@ def create_app(cfg: ServeConfig):  # noqa: C901 - 路由表天然长，拆开反
     )
     async def permissions_list(session_id: str) -> dict[str, Any]:
         session = pick(session_id)
-        return {"pending": [item.to_dict() for item in session.pending.values()]}
+        return {"pending": [item.to_dict() for item in session.snapshot_pending()]}
 
     @app.post(
         "/session/{session_id}/permissions",
@@ -682,7 +818,7 @@ def create_app(cfg: ServeConfig):  # noqa: C901 - 路由表天然长，拆开反
         updated_args: dict[str, Any] | None = Body(default=None, embed=True),
     ) -> dict[str, Any]:
         session = pick(session_id)
-        request = session.pending.get(request_id)
+        request = session.take_pending(request_id)
         if request is None:
             raise HTTPException(status_code=404, detail=f"没有挂起的审批 {request_id!r}（可能已超时）")
         if decision not in ("allow", "deny"):
@@ -705,7 +841,7 @@ def create_app(cfg: ServeConfig):  # noqa: C901 - 路由表天然长，拆开反
         session.async_agent.interrupt()
         #  打断时挂着审批的话，工作线程还堵在 Event 上——先把它放掉，
         #  否则 interrupt 要等到 approval_timeout 才生效
-        for request in list(session.pending.values()):
+        for request in session.snapshot_pending():
             request.verdict = Deny("本轮已被 abort")
             request.done.set()
         return {"session_id": session_id, "aborted": True}
@@ -714,7 +850,11 @@ def create_app(cfg: ServeConfig):  # noqa: C901 - 路由表天然长，拆开反
         "/session/{session_id}/steer",
         summary="向进行中的一轮插话",
         operation_id="steer",
-        description="不打断，模型在下一个 step 边界看到这句话再继续。",
+        description=(
+            "不打断，模型在下一个 step 边界看到这句话再继续。"
+            "会话空闲时回 409——空闲期入队的插话会在下一轮开头被 drain 掉，"
+            "回 200 等于骗调用方说话已送到。"
+        ),
         tags=["run"],
         dependencies=guard,
     )
@@ -723,6 +863,12 @@ def create_app(cfg: ServeConfig):  # noqa: C901 - 路由表天然长，拆开反
         text: str = Body(embed=True),
     ) -> dict[str, Any]:
         session = pick(session_id)
+        #  Agent._turn() 开头就 drain_steers()，空闲时入队的插话下一轮开头即被
+        #  丢弃。回 200 会让编排器以为这句话进了上下文——响亮地 409，别装成功
+        if not session.busy:
+            raise HTTPException(
+                status_code=409, detail="会话空闲，没有正在进行的一轮可插话（改用 /prompt）"
+            )
         session.async_agent.steer(text)
         return {"session_id": session_id, "steered": True}
 

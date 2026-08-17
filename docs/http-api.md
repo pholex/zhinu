@@ -71,6 +71,8 @@ GET /session/{id}/events/stream?from=1&follow=false   # 推完这一轮就关流
 ```
 
 `follow=false` 是给"提交一轮 → 跟完 → 收工"的一次性消费方用的：不必自己想办法中断连接。
+**注意顺序**：它必须在**提交 prompt 之后**开——会话空闲且没有新事件时它立刻关流，
+先开会拿到一个空流（200 但零事件）。
 
 事件的 `kind` 与 TUI / `--output-format stream-json` 完全同一套词汇
 （`text.delta`、`tool.pending`、`tool.completed`、`run.completed`…），
@@ -233,7 +235,17 @@ n8n 的 HTTP Request 节点默认超时是 300s，够 long-poll 的 60s 上限�
 | GET | `/session/{id}/events/stream` | 同一份事件流的 SSE |
 | GET · POST | `/session/{id}/permissions` | 挂起的审批 · 回决定 |
 | POST | `/session/{id}/abort` | 打断这一轮（不杀会话） |
-| POST | `/session/{id}/steer` | 向进行中的一轮插话 |
+| POST | `/session/{id}/steer` | 向进行中的一轮插话（会话空闲时 `409`） |
 
-一个会话同一时刻只跑一轮（同步内核的既有约束），忙时再提交回 `409`——
-静默排队会让编排器以为第二次提交立刻生效了。
+## 并发与限额
+
+- **一个会话同一时刻只跑一轮**（同步内核的既有约束），忙时再提交回 `409`——
+  静默排队会让编排器以为第二次提交立刻生效了。
+- **同时能跑的会话数由 `--max-sessions` 定（默认 32）**，它就是工作线程池大小。
+  ⚠️ **等审批期间线程也被占着**，所以它同时是"能同时挂起等审批的会话数"上限。
+  超出之后新提交的轮次会排队等线程——`/status` 仍报 `running`，但实际没开始跑。
+  会话数多、审批又慢的场景把它调大。
+- `steer` 只在会话 `busy` 时有意义：空闲期入队的插话会在下一轮开头被 drain 掉，
+  所以空闲时直接回 `409` 而不是假装成功。
+- **会话不会自动回收**：`DELETE /session/{id}` 是唯一的释放口。长跑的服务要自己
+  在编排流程末尾调它，否则会话（含完整消息历史与事件缓冲）会一直占着内存。

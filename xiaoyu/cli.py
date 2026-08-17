@@ -1111,6 +1111,14 @@ def serve_command(argv: list[str]) -> int:
         help="审批等多久算超时（秒）。超时按拒绝处理，默认 300",
     )
     parser.add_argument(
+        "--max-sessions",
+        dest="max_sessions",
+        type=int,
+        default=32,
+        help="能同时跑的会话数（= 工作线程池大小）。等审批期间线程也被占着，"
+        "所以它同时是'能同时挂起等审批的会话数'上限，默认 32",
+    )
+    parser.add_argument(
         "--print-openapi",
         action="store_true",
         help="把 OpenAPI schema 打到 stdout 后退出（贴给 Dify 自定义工具用），不起服务",
@@ -1143,6 +1151,7 @@ def serve_command(argv: list[str]) -> int:
         mode=args.mode or "",
         approval=args.approval,
         approval_timeout=args.approval_timeout,
+        max_sessions=max(1, args.max_sessions),
     )
     try:
         if args.print_openapi:
