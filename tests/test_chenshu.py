@@ -28,7 +28,7 @@ from xiaoyu.chenshu import (
 )
 from xiaoyu.providers import Registry
 from xiaoyu.render import PlainSink
-from xiaoyu.sandbox import _worktree_git_common
+from xiaoyu.sandbox import _worktree_git_paths
 
 from .test_agent_paths import AgentTestCase, FakeClient, call_fragment, chunk
 
@@ -62,14 +62,29 @@ class ScopeSemanticsTest(unittest.TestCase):
         #  空干 = 整仓，保守判冲突
         self.assertTrue(scopes_conflict("**", "src/"))
 
+    def test_nontrailing_glob_conflicts_by_stem(self):
+        """非尾随通配符（src/**/*.py）的根干是 src——与 src/ 下任何 scope 冲突。
+        评审抓出的双向失效回归：plan 侧不许放过重叠。"""
+        self.assertTrue(scopes_conflict("src/**/*.py", "src/utils/"))
+        self.assertTrue(scopes_conflict("src/a*", "src/abc/"))
+        #  顶层裸 glob 根干为空 = 整仓 → 冲突
+        self.assertTrue(scopes_conflict("*.py", "docs/"))
+
     def test_scope_match_forms(self):
         patterns = ("src/api/", "docs/*.md", "Makefile")
         self.assertTrue(scope_match("src/api/a.py", patterns))
         self.assertTrue(scope_match("docs/readme.md", patterns))
         self.assertTrue(scope_match("Makefile", patterns))
         self.assertFalse(scope_match("src/web/b.py", patterns))
-        self.assertFalse(scope_match("docs/sub/x.md", ("docs/*.md",)) and False or
-                         scope_match("other.txt", patterns))
+        self.assertFalse(scope_match("other.txt", patterns))
+
+    def test_nontrailing_glob_matches_by_stem(self):
+        """merge 侧与 plan 侧同一个根干：src/**/*.py 保留的是 src 子树，
+        src/x.py 必须命中（评审抓出的误拒回归）。"""
+        self.assertTrue(scope_match("src/x.py", ("src/**/*.py",)))
+        self.assertTrue(scope_match("src/deep/y.py", ("src/**/*.py",)))
+        #  docs/*.md 的根干是 docs：整个 docs 子树都算它的（与 plan 保留一致）
+        self.assertTrue(scope_match("docs/sub/x.md", ("docs/*.md",)))
 
 
 class ChenshuCase(AgentTestCase):
@@ -322,7 +337,7 @@ class WriteGuardTest(unittest.TestCase):
 
 
 class SandboxWorktreePointerTest(unittest.TestCase):
-    def test_pointer_parsed(self):
+    def test_pointer_parsed_to_minimal_set(self):
         import tempfile
 
         with tempfile.TemporaryDirectory() as tmp:
@@ -332,15 +347,22 @@ class SandboxWorktreePointerTest(unittest.TestCase):
             linked = root / "linked"
             linked.mkdir()
             (linked / ".git").write_text(f"gitdir: {main_git}\n", encoding="utf-8")
-            self.assertEqual(_worktree_git_common(linked), root / "repo" / ".git")
+            paths = _worktree_git_paths(linked)
+            common = root / "repo" / ".git"
+            self.assertEqual(
+                paths,
+                [main_git, common / "objects", common / "refs", common / "logs"],
+            )
+            #  hooks 与 config 绝不可写：能写 .git/hooks 就是沙箱逃逸
+            self.assertNotIn(common, paths)
 
-    def test_normal_repo_none(self):
+    def test_normal_repo_empty(self):
         import tempfile
 
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             (root / ".git").mkdir()
-            self.assertIsNone(_worktree_git_common(root))
+            self.assertEqual(_worktree_git_paths(root), [])
 
 
 @unittest.skipUnless(HAS_GIT, "机器上没有 git")
@@ -411,6 +433,95 @@ class WorkerEndToEndTest(ChenshuCase):
             runtime.spawn("bee", "worker")
         with self.assertRaises(ChenshuError):
             runtime.spawn("hawk", "reviewer")  # 缺 review_target
+
+    def test_reserved_names_rejected(self):
+        self.init_repo()
+        runtime = self.make_runtime([])
+        runtime.init()
+        runtime.plan([{"title": "a", "scope": ["src/"]}])
+        for reserved in ("chenshu", "all"):
+            with self.assertRaises(ChenshuError) as ctx:
+                runtime.spawn(reserved, "worker", mission_id="M1")
+            self.assertIn("保留名", str(ctx.exception))
+
+    def test_cjk_titles_get_unique_branches(self):
+        self.init_repo()
+        runtime = self.make_runtime([])
+        runtime.init()
+        runtime.plan([
+            {"title": "改文档", "scope": ["docs/"]},
+            {"title": "改测试", "scope": ["tests/"]},
+        ])
+        branches = [m.branch for m in runtime.missions]
+        self.assertEqual(len(set(branches)), 2, f"分支撞名：{branches}")
+        self.assertTrue(all(b.startswith("feat/m") for b in branches))
+
+    def test_retired_member_can_respawn_and_reassign(self):
+        """重启收养后：原名不带 resume 直接重 spawn；换名接管退役 owner 的
+        mission 也放行（评审抓出的三路死锁回归）。"""
+        self.init_repo()
+        script = [text_turn(LONG), text_turn(LONG)]
+        runtime = self.make_runtime(script)
+        runtime.init()
+        runtime.plan([{"title": "a", "scope": ["src/"]}])
+        from xiaoyu.chenshu import Member
+
+        with runtime.lock:
+            runtime.members.append(
+                Member(name="w1", kind="worker", mission_id="M1", status="retired")
+            )
+            runtime.missions[0].owner = "w1"
+            runtime.missions[0].status = "active"
+        with contextlib.redirect_stdout(io.StringIO()):
+            out = runtime.spawn("w2", "worker", mission_id="M1")  # 换名接管
+        self.assertIn("w2", out)
+        self.wait_done_generic(runtime, "w2")
+        #  原名重 spawn（w1 已退役、mission 已归 w2——用另一个 mission 验证原名路径）
+        runtime.plan([{"title": "b", "scope": ["docs/"]}])
+        with runtime.lock:
+            runtime.members.append(
+                Member(name="w3", kind="worker", mission_id="", status="retired")
+            )
+        with contextlib.redirect_stdout(io.StringIO()):
+            out = runtime.spawn("w3", "worker", mission_id="M2")
+        self.assertIn("w3", out)
+        self.wait_done_generic(runtime, "w3")
+
+    def wait_done_generic(self, runtime, name, timeout: float = 30.0):
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            thread = runtime._threads.get(name)
+            if thread is not None and not thread.is_alive():
+                return
+            time.sleep(0.05)
+        self.fail(f"{name} 没有在 {timeout}s 内收工")
+
+    def test_merge_diff_failure_is_fail_closed(self):
+        self.init_repo()
+        runtime = self.make_runtime([])
+        runtime.init()
+        runtime.plan([{"title": "a", "scope": ["src/"]}])
+        mission = runtime.missions[0]
+        wt = worktree_mod.create_branch(self.root, mission.branch, "t", "main")
+        (wt / "src" / "n.py").parent.mkdir(exist_ok=True)
+        (wt / "src" / "n.py").write_text("x\n", encoding="utf-8")
+        git(wt, "add", "-A")
+        git(wt, "commit", "-qm", "n")
+        runtime.submit_review("chenshu", "M1", "clean", "看过了")
+        import xiaoyu.chenshu as chenshu_mod
+
+        real_git = chenshu_mod._git
+
+        def flaky(args, cwd):
+            if args[0] == "diff":
+                raise subprocess.TimeoutExpired(cmd="git diff", timeout=1)
+            return real_git(args, cwd)
+
+        with mock.patch.object(chenshu_mod, "_git", side_effect=flaky):
+            with self.assertRaises(ChenshuError) as ctx:
+                runtime.merge("M1")
+        self.assertIn("scope 检查失败", str(ctx.exception))
+        self.assertEqual(runtime.mission("M1").status, "pending")
 
 
 if __name__ == "__main__":

@@ -97,9 +97,26 @@ def _git_out(args: list[str], cwd: Path) -> str | None:
 
 
 def _scope_stem(pattern: str) -> str:
-    """glob 的"根干"：src/**、src/*、src/ 都归一成 src。空干=整仓，拒绝。"""
-    stem = pattern.strip().rstrip("*").rstrip("/")
-    return stem.strip("/")
+    """scope 的"根干"：**第一个通配符之前**的目录/文件路径。
+
+    src/**、src/*.py、src/**/*.py、src/ 都归一成 src。scope 的所有权语义
+    统一按根干子树算——plan 的不相交检查与 merge 的命中检查用同一个根干，
+    两道闸才不会各说各话（通配尾巴只是写法，不参与所有权判定）。
+    空干=整仓，拒绝。
+    """
+    text = pattern.strip()
+    cut = len(text)
+    for index, ch in enumerate(text):
+        if ch in "*?[":
+            cut = index
+            break
+    had_glob = cut < len(text)
+    text = text[:cut]
+    #  通配符紧贴的最后一段是半截文件名（src/a* → "src/a"），所有权退到父目录；
+    #  截口恰好在 "/" 上（src/**/*.py → "src/"）则最后一段是完整目录，不退
+    if had_glob and text and not text.endswith("/"):
+        text = text.rpartition("/")[0]
+    return text.strip("/")
 
 
 def scopes_conflict(a: str, b: str) -> bool:
@@ -111,8 +128,11 @@ def scopes_conflict(a: str, b: str) -> bool:
 
 
 def scope_match(path: str, patterns: tuple[str, ...]) -> bool:
-    """diff 文件是否命中 mission scope。三种写法都认：目录前缀
-    （src/ 或 src）、glob（src/**/*.py）、精确文件名。"""
+    """diff 文件是否命中 mission scope。
+
+    所有权按根干子树（与 scopes_conflict 同一个 _scope_stem——plan 保留了
+    什么，merge 就放行什么）；fnmatch 只作附加放行，不作收紧。
+    """
     for pattern in patterns:
         pat = pattern.strip()
         stem = _scope_stem(pat)
@@ -396,12 +416,14 @@ class ChenshuRuntime:
                 for dep in deps:
                     if dep not in known and dep not in {m.id for m in new}:
                         raise ChenshuError(f"ERROR: 「{title}」的依赖 {dep} 不是已知 mission。")
+                #  分支名带 mission id 保证唯一：纯中文标题 slug 化后全都退化成
+                #  同一个兜底词，撞名会让第二个 mission 永远起不来
                 mission = Mission(
                     id=mid,
                     title=title,
                     kind=kind,
                     scope=scope,
-                    branch=f"feat/{_slugify(title)}" if kind == "build" else "",
+                    branch=f"feat/{mid.lower()}-{_slugify(title)}" if kind == "build" else "",
                     deps=deps,
                 )
                 if kind == "build":
@@ -519,15 +541,18 @@ class ChenshuRuntime:
             raise ChenshuError(f"ERROR: 分支 {mission.branch} 不存在或读不到 tip。")
         directory = self.root / "reviews"
         directory.mkdir(parents=True, exist_ok=True)
-        #  轮次自动编号（模型无法伪造）；提交时盖当前 tip——分支一动 clean 作废
-        existing = len(list(directory.glob(f"{mission.id}-r*.md")))
-        round_no = existing + 1
-        (directory / f"{mission.id}-r{round_no}.md").write_text(
-            f"---\ntarget: {mission.id}\nbranch: {mission.branch}\nround: {round_no}\n"
-            f"verdict: {verdict}\nreviewed_commit: {tip}\nreviewer: {caller}\n"
-            f"reviewed_at: {_now_iso()}\n---\n\n{summary}\n",
-            encoding="utf-8",
-        )
+        #  轮次自动编号（模型无法伪造）；提交时盖当前 tip——分支一动 clean 作废。
+        #  数数+落盘要在锁内：并发评审各自数出同一轮次会互相覆盖，
+        #  clean 盖掉 p1 的话已知有问题的分支就能过闸
+        with self.lock:
+            existing = len(list(directory.glob(f"{mission.id}-r*.md")))
+            round_no = existing + 1
+            (directory / f"{mission.id}-r{round_no}.md").write_text(
+                f"---\ntarget: {mission.id}\nbranch: {mission.branch}\nround: {round_no}\n"
+                f"verdict: {verdict}\nreviewed_commit: {tip}\nreviewer: {caller}\n"
+                f"reviewed_at: {_now_iso()}\n---\n\n{summary}\n",
+                encoding="utf-8",
+            )
         self.log(caller, "review.write", target=mission.id, round=round_no, verdict=verdict)
         return (
             f"第 {round_no} 轮评审已记录：{verdict}（盖 commit {tip[:10]}）。"
@@ -609,10 +634,24 @@ class ChenshuRuntime:
                     "ERROR: 评审盖的 commit 与分支当前 tip 不一致（评审后又有新提交）"
                     "——重新评审后再合。"
                 )
-            files_raw = _git_out(
-                ["diff", "--name-only", f"{self.base_branch}...{mission.branch}"], root
-            )
-            files = [line for line in (files_raw or "").splitlines() if line.strip()]
+            #  scope 检查的输入必须真拿到：git 超时/报错时绝不 fail-open——
+            #  一个被文档承诺"代码强制"的闸，静默退化成 no-op 比没有更糟
+            try:
+                diff_result = _git(
+                    ["diff", "--name-only", f"{self.base_branch}...{mission.branch}"],
+                    root,
+                )
+            except (OSError, subprocess.TimeoutExpired) as exc:
+                self.log(TOWER, "merge.blocked", mission=mission.id, reason="diff-failed")
+                raise ChenshuError(
+                    f"ERROR: scope 检查失败（git diff 出错：{exc}）——拒绝合并，稍后重试。"
+                ) from exc
+            if diff_result.returncode != 0:
+                self.log(TOWER, "merge.blocked", mission=mission.id, reason="diff-failed")
+                raise ChenshuError(
+                    "ERROR: scope 检查失败（git diff 非零退出）——拒绝合并，稍后重试。"
+                )
+            files = [line for line in diff_result.stdout.splitlines() if line.strip()]
             offenders = [f for f in files if not scope_match(f, mission.scope)]
             if offenders:
                 self.log(TOWER, "merge.blocked", mission=mission.id, reason="out-of-scope")
@@ -676,6 +715,10 @@ class ChenshuRuntime:
         self._require_active()
         if not _NAME_RE.match(name or ""):
             raise ChenshuError("ERROR: name 须为小写字母开头的 2-32 位标识。")
+        #  保留名：chenshu 是塔的身份（caller==TOWER 是全部特权检查的钥匙），
+        #  all 是广播地址——成员顶用这两个名字等于伪造身份/劫持广播
+        if name in (TOWER, BROADCAST):
+            raise ChenshuError(f"ERROR: {name!r} 是保留名（塔/广播地址），换一个。")
         if kind not in ("worker", "reviewer"):
             raise ChenshuError("ERROR: kind 只能是 worker 或 reviewer。")
         with self.lock:
@@ -683,7 +726,9 @@ class ChenshuRuntime:
             thread = self._threads.get(name)
             if thread is not None and thread.is_alive():
                 raise ChenshuError(f"ERROR: {name} 还在跑——同名成员不能并存。")
-            if existing is not None and not resume:
+            #  退役成员（重启收养后的常态）原名直接重 spawn：init 的提示就是
+            #  这么承诺的，不能反手要求一个不存在的存档
+            if existing is not None and not resume and existing.status != "retired":
                 raise ChenshuError(
                     f"ERROR: {name} 已在花名册（状态 {existing.status}）。要在它的"
                     "上下文上继续，传 resume=true；要新人换个名字。"
@@ -706,10 +751,14 @@ class ChenshuRuntime:
                 if mission.status == "merged":
                     raise ChenshuError(f"ERROR: {mission.id} 已合并，无活可干。")
                 if mission.owner and mission.owner != name:
-                    raise ChenshuError(
-                        f"ERROR: {mission.id} 已由 {mission.owner} 认领——"
-                        "要换人先 spawn 同名 resume，或重新 plan。"
-                    )
+                    #  在册且没退役的 owner 才挡人；退役/失踪的 owner（重启收养后）
+                    #  允许直接换人接管，否则 mission 永久卡死
+                    owner_member = self.member(mission.owner)
+                    if owner_member is not None and owner_member.status != "retired":
+                        raise ChenshuError(
+                            f"ERROR: {mission.id} 已由 {mission.owner} 认领——"
+                            "要换人先 spawn 同名 resume，或重新 plan。"
+                        )
             else:
                 if self._mission_by_ref(review_target) is None:
                     raise ChenshuError("ERROR: reviewer 必须带有效的 review_target（mission id/分支）。")
@@ -1029,6 +1078,8 @@ class ChenshuRuntime:
 
     def teardown(self, force: bool = False) -> str:
         self._require_active()
+        #  三段式：锁内叫停 → **锁外** join（worker 的收尾 finally 也要抢这把
+        #  锁存档，持锁 join 必然把每个 join 干等满超时）→ 锁内清理
         with self.lock:
             live = [name for name, t in self._threads.items() if t.is_alive()]
             if live and not force:
@@ -1036,13 +1087,17 @@ class ChenshuRuntime:
                     f"ERROR: 还有成员在跑：{', '.join(live)}——chenshu_wait 等收工，"
                     "或确认要硬停就 force=true。"
                 )
-            if live:
-                for name in live:
-                    agent = self._agents.get(name)
-                    if agent is not None:
-                        agent.interrupt()
-                for name in live:
-                    self._threads[name].join(timeout=10)
+            for name in live:
+                agent = self._agents.get(name)
+                if agent is not None:
+                    agent.interrupt()
+        for name in live:
+            self._threads[name].join(timeout=10)
+        with self.lock:
+            still_alive = {
+                m.owner for m in self.missions
+                if m.owner and (t := self._threads.get(m.owner)) is not None and t.is_alive()
+            }
             kept: list[str] = []
             removed = 0
             for mission in self.missions:
@@ -1050,6 +1105,11 @@ class ChenshuRuntime:
                     continue
                 path = Path(mission.worktree)
                 if not path.is_dir():
+                    continue
+                #  join 超时还活着的 worker 可能正在这个目录里写——绝不抽地毯
+                if mission.owner in still_alive:
+                    kept.append(f"{mission.id} → {path}（{mission.owner} 仍未停稳，保留）")
+                    self.log(TOWER, "worktree.keep", mission=mission.id)
                     continue
                 if worktree.dirty(path) and not force:
                     kept.append(f"{mission.id} → {path}（有未提交改动，保留）")

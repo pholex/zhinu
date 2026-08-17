@@ -170,10 +170,16 @@ class RunStore(dict):
     def __init__(self) -> None:
         super().__init__()
         self.lock = threading.Lock()
+        #  滚动淘汰上限。qixiang 会按批量大小抬高它——64 项的批出 64 个
+        #  resume 句柄，16 格的存档转一圈就把报告里大半句柄变成死链
+        self.capacity = MAX_RUNS
 
 
 #  普通 dict 存档的兜底锁（测试直传 dict；单线程场景锁开销可忽略）
 _FALLBACK_STORE_LOCK = threading.Lock()
+
+#  git worktree add 的进程内串行化（并发创建争仓库锁必败，见 execute_delegation）
+_WORKTREE_CREATE_LOCK = threading.Lock()
 
 
 def _store_lock(store: dict) -> threading.Lock:
@@ -349,6 +355,7 @@ def execute_delegation(
     resume_from: str | None = None,
     child_sink: Any = None,
     on_agent: Callable[[Any], None] | None = None,
+    require_isolation: bool = False,
 ) -> DelegationResult:
     """跑一次委托的执行核心（单发 subagent 工具与 qixiang 批量共用）。
 
@@ -446,9 +453,22 @@ def execute_delegation(
             )
         if iso_value != "none":
             try:
-                created = worktree.create(config.workspace, spec.name)
+                #  创建加锁：并发批量委托同时 git worktree add 会互相争
+                #  仓库级锁文件而失败——串行化创建，运行不受影响
+                with _WORKTREE_CREATE_LOCK:
+                    created = worktree.create(config.workspace, spec.name)
                 workdir = created
             except worktree.WorktreeError as exc:
+                #  单发委托 fail-open（退主工作区继续，隔离是锦上添花）；
+                #  批量委托 fail-closed（require_isolation）——N 个写者同时
+                #  退回主工作区并行写，正是强制隔离要防的事故本身
+                if require_isolation:
+                    return DelegationResult(
+                        error=(
+                            f"ERROR: worktree 隔离创建失败（{exc}），该项未执行"
+                            "——批量并行写不允许退回主工作区。"
+                        )
+                    )
                 sink.emit(
                     Notice(f"  ⚠ {spec.name} worktree 隔离失败，退回主工作区：{exc}", "warn")
                 )
@@ -546,7 +566,8 @@ def execute_delegation(
             messages=copy.deepcopy(sub_agent.messages),
             worktree=kept,
         )
-        while len(store) > MAX_RUNS:
+        limit = max(MAX_RUNS, int(getattr(store, "capacity", MAX_RUNS)))
+        while len(store) > limit:
             store.pop(next(iter(store)))
 
     if not failure:

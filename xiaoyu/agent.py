@@ -450,6 +450,18 @@ class Usage:
                 for model, entry in sorted(self.by_model.items())
             ]
 
+    def snapshot(self) -> dict[str, tuple[int, int, int]]:
+        """线程安全的对外快照：{模型: (calls, prompt, completion)}。
+
+        宿主/评测要遍历用量一律走这里，不要直接迭代 by_model——宸枢/七襄的
+        工作线程可能跨轮存活，另一头的 add() 会让裸迭代炸
+        RuntimeError(dictionary changed size)。
+        """
+        return {
+            model: (calls, prompt, completion)
+            for model, calls, prompt, completion in self._snapshot()
+        }
+
     def to_dict(self) -> dict[str, Any]:
         """结构化形态：--output-format json / stream-json 的 usage 字段。"""
         snapshot = self._snapshot()

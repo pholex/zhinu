@@ -159,6 +159,38 @@ class FanOutTest(QixiangTestCase):
         self.assertIn("补全后的完整交接", result)
         self.assertNotIn("--- 1/2 完成 · 甲\n太短", result)
 
+    def test_continuation_keeps_capability_mode(self):
+        """追问轮不许丢档位收紧：read-only 批里被追问的子 agent 试图 write_file
+        必须仍然写不进（评审抓出的越权回归）。"""
+        script = [
+            text_turn("太短"),  # 触发追问
+            #  追问轮里模型试图写文件——档位若继承，write_file 不在工具箱里
+            tool_turn("w1", "write_file", {"path": "sneak.txt", "content": "x"}),
+            text_turn("写不了，补交接 " + LONG),
+            text_turn("乙 " + LONG),
+        ]
+        tool = self.make_tool([WRITER], script)
+        result = self.call(
+            tool, spec="writer", prompt_template="改 {{item}}", items=["甲", "乙"],
+            capability_mode="read-only", isolation="none",
+        )
+        self.assertIn("完成 2", result)
+        self.assertFalse((self.root / "sneak.txt").exists(), "追问轮拿回了写权限")
+
+    def test_store_capacity_scales_with_batch(self):
+        """批内的 resume 句柄不许被滚动淘汰成死链。"""
+        script = [text_turn(f"第{n}项 " + LONG) for n in range(3)]
+        tool = self.make_tool([READER], script)
+        with mock.patch("xiaoyu.agents.MAX_RUNS", 2):
+            result = self.call(
+                tool, spec="reader", prompt_template="查 {{item}}",
+                items=["a", "b", "c"],
+            )
+        ids = re.findall(r"resume_from: ([0-9a-f]{8})", result)
+        self.assertEqual(len(ids), 3)
+        for rid in ids:
+            self.assertIn(rid, self.runs, "报告里的句柄已被淘汰成死链")
+
     def test_batch_resume_inherits_transcript(self):
         first = self.make_tool([READER], [text_turn("首轮 " + LONG), text_turn("次轮 " + LONG)])
         report = self.call(

@@ -220,6 +220,10 @@ def make_qixiang_tool(
         concurrency = max(1, min(int(config.qixiang_concurrency), 16))
         timeout_s = max(0, int(config.qixiang_task_timeout))
         per_item_cap = max(_PER_ITEM_FLOOR, _REPORT_BUDGET // len(states))
+        #  存档容量按批量抬高（本项 + 追问各占一格），报告里的 resume 句柄
+        #  才不会在批内就被滚动淘汰成死链
+        if hasattr(runs, "capacity"):
+            runs.capacity = max(int(runs.capacity), 2 * len(states) + 8)
 
         cancel_event = threading.Event()
         live: dict[int, Any] = {}
@@ -251,6 +255,8 @@ def make_qixiang_tool(
                     resume_from=state.resume_from,
                     child_sink=_NullSink(),
                     on_agent=register,
+                    #  批量并行写不许退回主工作区（worktree 建不出来=该项不执行）
+                    require_isolation=iso_value == "worktree",
                 )
                 #  min-summary 质量闸：结论太短就借 resume 通道追问一轮。
                 #  失败/超时/取消不追（追不动或没意义）
@@ -262,10 +268,13 @@ def make_qixiang_tool(
                     and not cancel_event.is_set()
                     and not state.timed_out
                 ):
+                    #  追问轮必须继承本批的档位收紧：丢掉 capability_mode 会让
+                    #  续跑的同一会话拿回 spec 全量工具，越过调用方的显式约束
                     follow = execute_delegation(
                         target, config, registry, usage, sink, locked_approver,
                         permissions, runs, mcp_manager,
                         task=_CONTINUATION_TASK,
+                        capability_mode=capability_mode,
                         resume_from=result.run_id,
                         child_sink=_NullSink(),
                         on_agent=register,
@@ -319,9 +328,11 @@ def make_qixiang_tool(
                             state.started_at is not None
                             and state.result is None
                             and not state.crash
-                            and not state.timed_out
                             and now - state.started_at > timeout_s
                         ):
+                            #  每个 tick 都补一次中断（不只首次）：中断信号可能
+                            #  落在两代 agent 之间（本轮刚收尾、追问轮刚接手），
+                            #  只发一次会让换代后的 agent 无界跑下去
                             state.timed_out = True
                             with live_lock:
                                 agent = live.get(state.index)
