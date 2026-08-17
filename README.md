@@ -24,9 +24,10 @@
 ## 安装
 
 ```bash
-pip install "xiaoyu-agent[tui]"   # [tui]：补全 / 历史 / 粘贴折叠 / 贴图 / diff 高亮
-xiaoyu update                     # 升级
-xiaoyu uninstall                  # 卸载；--purge 连配置目录一起删
+pip install "xiaoyu-agent[tui]"        # [tui]：补全 / 历史 / 粘贴折叠 / 贴图 / diff 高亮
+pip install "xiaoyu-agent[tui,serve]"  # 还要 HTTP API（n8n / Dify 编排）就带上 [serve]
+xiaoyu update                          # 升级（已装 serve 时自动一并升级）
+xiaoyu uninstall                       # 卸载；--purge 连配置目录一起删
 ```
 
 ## 配置
