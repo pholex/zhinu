@@ -414,50 +414,72 @@ class Usage:
     """
 
     by_model: dict[str, ModelUsage] = field(default_factory=dict)
+    #  qixiang/宸枢的工作线程与主线程共用同一本账：add 是读-改-写、
+    #  属性读要遍历 dict，都得锁护（compare/repr 排除：锁不参与相等性）
+    _lock: threading.Lock = field(
+        default_factory=threading.Lock, init=False, repr=False, compare=False
+    )
 
     def add(self, model: str, prompt: int, completion: int) -> None:
-        entry = self.by_model.setdefault(model, ModelUsage())
-        entry.prompt_tokens += prompt
-        entry.completion_tokens += completion
-        entry.calls += 1
+        with self._lock:
+            entry = self.by_model.setdefault(model, ModelUsage())
+            entry.prompt_tokens += prompt
+            entry.completion_tokens += completion
+            entry.calls += 1
 
     @property
     def prompt_tokens(self) -> int:
-        return sum(entry.prompt_tokens for entry in self.by_model.values())
+        with self._lock:
+            return sum(entry.prompt_tokens for entry in self.by_model.values())
 
     @property
     def completion_tokens(self) -> int:
-        return sum(entry.completion_tokens for entry in self.by_model.values())
+        with self._lock:
+            return sum(entry.completion_tokens for entry in self.by_model.values())
 
     @property
     def turns(self) -> int:
-        return sum(entry.calls for entry in self.by_model.values())
+        with self._lock:
+            return sum(entry.calls for entry in self.by_model.values())
+
+    def _snapshot(self) -> list[tuple[str, int, int, int]]:
+        """锁内取快照（锁不可重入，聚合方法不能边持锁边调属性）。"""
+        with self._lock:
+            return [
+                (model, entry.calls, entry.prompt_tokens, entry.completion_tokens)
+                for model, entry in sorted(self.by_model.items())
+            ]
 
     def to_dict(self) -> dict[str, Any]:
         """结构化形态：--output-format json / stream-json 的 usage 字段。"""
+        snapshot = self._snapshot()
         return {
-            "turns": self.turns,
-            "prompt_tokens": self.prompt_tokens,
-            "completion_tokens": self.completion_tokens,
+            "turns": sum(calls for _, calls, _, _ in snapshot),
+            "prompt_tokens": sum(prompt for _, _, prompt, _ in snapshot),
+            "completion_tokens": sum(completion for _, _, _, completion in snapshot),
             "by_model": {
                 model: {
-                    "calls": entry.calls,
-                    "prompt_tokens": entry.prompt_tokens,
-                    "completion_tokens": entry.completion_tokens,
+                    "calls": calls,
+                    "prompt_tokens": prompt,
+                    "completion_tokens": completion,
                 }
-                for model, entry in sorted(self.by_model.items())
+                for model, calls, prompt, completion in snapshot
             },
         }
 
     def __str__(self) -> str:
-        if not self.by_model:
+        snapshot = self._snapshot()
+        if not snapshot:
             return "还没有调用记录"
+        total_calls = sum(calls for _, calls, _, _ in snapshot)
+        total_prompt = sum(prompt for _, _, prompt, _ in snapshot)
+        total_completion = sum(completion for _, _, _, completion in snapshot)
         lines = [
-            f"{self.turns} 次模型调用 · in {self.prompt_tokens} tok / out {self.completion_tokens} tok"
+            f"{total_calls} 次模型调用 · in {total_prompt} tok / out {total_completion} tok"
         ]
-        for model, entry in sorted(self.by_model.items()):
+        for model, calls, prompt, completion in snapshot:
             lines.append(
-                f"  {model}: {entry.calls} 次 · in {entry.prompt_tokens} / out {entry.completion_tokens}"
+                f"  {model}: {calls} 次 · in {prompt} / out {completion}"
             )
         return "\n".join(lines)
 
@@ -742,13 +764,15 @@ class Agent:
         #  声明式 subagent（agents/*.toml）：挂成与 explore
         #  同形态的委托工具。allow_explore 兼作"不套娃"闸门——子 agent 不再挂
         if allow_explore and config.enable_agents:
-            from .agents import load_agent_specs, make_subagent_tool
+            from .agents import RunStore, load_agent_specs, make_subagent_tool
 
             agent_specs, spec_problems = load_agent_specs(config.workspace)
             for problem in spec_problems:
                 self.sink.emit(Notice(f"[agents/：{problem}]", "warn"))
-            #  resume 存档跨 spec 共享一本：句柄全局唯一，spec 归属在记录里查
-            subagent_runs: dict[str, Any] = {}
+            #  resume 存档跨 spec 共享一本：句柄全局唯一，spec 归属在记录里查。
+            #  RunStore 自带锁——七襄的批量委托在工作线程里并发存档
+            subagent_runs = RunStore()
+            mounted_specs = []
             for spec in agent_specs:
                 if self.toolbox.get(spec.name) is not None:
                     self.sink.emit(
@@ -760,6 +784,20 @@ class Agent:
                         spec, config, self.registry, self.usage, self.sink,
                         self.approver, self.permissions,
                         runs=subagent_runs,
+                        mcp_manager=getattr(self.toolbox, "mcp_manager", None),
+                    )
+                )
+                mounted_specs.append(spec)
+            #  七襄（批量并行委托）：有可扇出的 spec 才挂——没有 spec 时工具
+            #  本身没有任何合法调用，进 schemas 纯属噪音
+            if mounted_specs and self.toolbox.get("qixiang") is None:
+                from .qixiang import make_qixiang_tool
+
+                self.toolbox.register(
+                    make_qixiang_tool(
+                        mounted_specs, config, self.registry, self.usage,
+                        self.sink, self.approver, self.permissions,
+                        subagent_runs,
                         mcp_manager=getattr(self.toolbox, "mcp_manager", None),
                     )
                 )
