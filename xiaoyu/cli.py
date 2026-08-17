@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import atexit
 import contextlib
+import importlib.util
 import json
 import locale
 import os
@@ -93,7 +94,7 @@ def build_parser() -> argparse.ArgumentParser:
             "xiaoyu plugin add|list|update|remove  装卸插件包（skills + MCP，"
             "详见 xiaoyu plugin --help）；"
             "xiaoyu terminal-setup  给 VS Code 系编辑器配 Shift+Enter 换行；"
-            "xiaoyu update  升级到最新版（未装 TUI 时自动补上）；"
+            "xiaoyu update  升级到最新版（未装 TUI 时自动补上；已装 serve 时一并升级）；"
             "xiaoyu uninstall  卸载（--purge 连配置目录一起删）"
         ),
     )
@@ -921,6 +922,21 @@ def _tui_available() -> bool:
     return True
 
 
+def _serve_available() -> bool:
+    """装没装 [serve] 可选依赖（fastapi + uvicorn）。update 用它决定要不要把
+    serve 一并升级：serve 锁精确版本，只升本体会把已 opt-in 的用户无声留在
+    旧 pin 上（0.31.6 就动过 pin）。用 find_spec 不真 import——fastapi 一
+    import 就是几百毫秒，这里只需要"在不在"。
+
+    和 _tui_available 一样是"可导入"启发式：fastapi 也可能是同环境里别的项目
+    装的，这时多带 [serve] 会把它钉到我们的 pin 上——与本体锁版本是同一套
+    取舍，接受。
+    """
+    return all(
+        importlib.util.find_spec(name) is not None for name in ("fastapi", "uvicorn")
+    )
+
+
 #  自己动不了自己时给的兜底命令：不经 xiaoyu.exe 就没有自锁
 _WINDOWS_MANUAL_UPGRADE = "python -m pip install --upgrade xiaoyu-agent"
 _WINDOWS_MANUAL_UNINSTALL = "python -m pip uninstall xiaoyu-agent"
@@ -1016,7 +1032,8 @@ def update_command(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(
         prog="xiaoyu update",
         description="升级小羽到最新版（pip install --upgrade）；"
-        "未装 TUI 增强界面时自动带上 [tui] 可选依赖",
+        "未装 TUI 增强界面时自动带上 [tui] 可选依赖，"
+        "已装 serve（HTTP API）时一并升级其锁定依赖",
     )
     parser.parse_args(argv)
 
@@ -1029,9 +1046,17 @@ def update_command(argv: list[str]) -> int:
         print(ui.secondary("  uv 安装的话：  uv tool upgrade xiaoyu-agent"))
         return 1
 
-    spec = "xiaoyu-agent" if _tui_available() else "xiaoyu-agent[tui]"
-    if spec != "xiaoyu-agent":
+    #  tui 与 serve 的方向刻意相反：tui 缺了才补（默认体验人人该有）；serve
+    #  装了才跟（opt-in 的少数派，但已 opt-in 就得跟上新 pin）。browser 有意
+    #  不跟——playwright 换版本还得重跑 playwright install，别替用户做主。
+    extras = []
+    if not _tui_available():
+        extras.append("tui")
         print(ui.secondary("未检测到 TUI 增强界面（补全/历史/粘贴折叠），本次升级一并安装"))
+    if _serve_available():
+        extras.append("serve")
+        print(ui.secondary("检测到 serve（HTTP API）依赖，一并升级到本版锁定版本"))
+    spec = "xiaoyu-agent" + (f"[{','.join(extras)}]" if extras else "")
     print(ui.secondary(f"当前 xiaoyu {__version__}，执行 pip install --upgrade {spec}"))
     if _defer_pip_to_detached("update", spec):
         print(ui.secondary("Windows 不让程序覆盖正在运行的自己，升级改在本进程退出后继续。"))
