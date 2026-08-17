@@ -28,8 +28,6 @@ spec 并行执行，全部收束后按**输入顺序**聚合成一份 report 带
 from __future__ import annotations
 
 import threading
-import time
-from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from dataclasses import dataclass
 from typing import Any
 
@@ -43,6 +41,7 @@ from .agents import (
 )
 from .config import Config
 from .events import Notice, UISink
+from .fanout import Attempt, run_attempts
 from .tools import Tool
 
 #  一批最多多少项（新建 + resume 合计）。单机直连场景 64 已远超实际并发
@@ -50,8 +49,7 @@ from .tools import Tool
 MAX_ITEMS = 64
 #  没有 resume 时至少两项：单个任务直接用同名 subagent 工具，不必过七襄
 MIN_NEW_ITEMS = 2
-#  短结论追问阈值与提示：批量模式下父 agent 无法逐个便宜追问，
-#  收束前把太短的交接补全一轮（200 字符以下基本不可能是完整交接）
+#  短结论追问阈值（引擎默认值的本地绑定：测试可 patch 本模块的这个名字）
 MIN_ANSWER_CHARS = 200
 _CONTINUATION_TASK = (
     "你上一条结论太简短。父 agent 只能看到你的最后一条消息，它就是全部交接。"
@@ -59,8 +57,6 @@ _CONTINUATION_TASK = (
     "遗留事项或不确定点。"
 )
 _PLACEHOLDER = "{{item}}"
-#  首波错峰：第 i 个并发槽位延后 i*0.3s 起步，避免同一瞬间打满 provider
-_STAGGER_SECONDS = 0.3
 #  报告的总结论预算（字符）：按项数均分，下限保住可读性
 _REPORT_BUDGET = 24_000
 _PER_ITEM_FLOOR = 600
@@ -226,27 +222,10 @@ def make_qixiang_tool(
         if hasattr(runs, "capacity"):
             runs.capacity = max(int(runs.capacity), 2 * len(states) + 8)
 
-        cancel_event = threading.Event()
-        live: dict[int, Any] = {}
-        live_lock = threading.Lock()
-
-        def runner(state: _ItemState) -> None:
-            #  首波错峰起步；等待期间被取消就直接放弃（排队不消耗超时）
-            delay = state.index * _STAGGER_SECONDS if state.index < concurrency else 0.0
-            if delay and cancel_event.wait(delay):
-                state.never_started = True
-                return
-            if cancel_event.is_set():
-                state.never_started = True
-                return
-            state.started_at = time.monotonic()
-
-            def register(agent: Any) -> None:
-                with live_lock:
-                    live[state.index] = agent
-
-            try:
-                result = execute_delegation(
+        #  并发调度收归共享引擎（fanout.py）：错峰/超时巡检/中止保全只写一处
+        def make_primary(state: _ItemState) -> Any:
+            def primary(register: Any) -> DelegationResult:
+                return execute_delegation(
                     target, config, registry, usage, sink, locked_approver,
                     permissions, runs, mcp_manager,
                     task=state.task,
@@ -259,39 +238,45 @@ def make_qixiang_tool(
                     #  批量并行写不许退回主工作区（worktree 建不出来=该项不执行）
                     require_isolation=iso_value == "worktree",
                 )
-                #  min-summary 质量闸：结论太短就借 resume 通道追问一轮。
-                #  失败/超时/取消不追（追不动或没意义）
-                if (
-                    not result.error
-                    and not result.failure
-                    and result.answer
-                    and len(result.answer) < MIN_ANSWER_CHARS
-                    and not cancel_event.is_set()
-                    and not state.timed_out
-                ):
-                    #  追问轮必须继承本批的档位收紧：丢掉 capability_mode 会让
-                    #  续跑的同一会话拿回 spec 全量工具，越过调用方的显式约束
-                    follow = execute_delegation(
-                        target, config, registry, usage, sink, locked_approver,
-                        permissions, runs, mcp_manager,
-                        task=_CONTINUATION_TASK,
-                        capability_mode=capability_mode,
-                        resume_from=result.run_id,
-                        child_sink=_NullSink(),
-                        on_agent=register,
-                    )
-                    if (
-                        not follow.error
-                        and not follow.failure
-                        and len(follow.answer) > len(result.answer)
-                    ):
-                        result = follow
-                state.result = result
-            except BaseException as exc:  # noqa: BLE001 - 单项炸了不拖垮整批
-                state.crash = f"{type(exc).__name__}: {exc}"
-            finally:
-                with live_lock:
-                    live.pop(state.index, None)
+
+            return primary
+
+        def follow_up(run_id: str, register: Any) -> DelegationResult:
+            #  追问轮一律收紧到 read-only：它只要一份更完整的交接，不需要写；
+            #  且首轮的干净 worktree 已被回收，resume 会落回主工作区——
+            #  带着写工具续跑等于绕过「绝不退回主工作区并行写」的硬保证
+            return execute_delegation(
+                target, config, registry, usage, sink, locked_approver,
+                permissions, runs, mcp_manager,
+                task=_CONTINUATION_TASK,
+                capability_mode="read-only",
+                resume_from=run_id,
+                child_sink=_NullSink(),
+                on_agent=register,
+            )
+
+        attempts = [
+            Attempt(index=state.index, primary=make_primary(state), follow_up=follow_up)
+            for state in states
+        ]
+
+        def copy_back(state: _ItemState, attempt: Attempt) -> None:
+            state.result = attempt.result
+            state.crash = attempt.crash
+            state.timed_out = attempt.timed_out
+            state.never_started = attempt.never_started
+
+        def on_settled(attempt: Attempt, settled: int, total_n: int) -> None:
+            state = states[attempt.index]
+            copy_back(state, attempt)
+            status = _status_of(state, cancelled=False)
+            mark = {"completed": "✓", "failed": "✗"}.get(status, "⊘")
+            sink.emit(
+                Notice(
+                    f"  🕸 七襄 {settled}/{total_n} {mark} "
+                    f"{ui.preview(state.label, 60)}"
+                )
+            )
 
         sink.emit(
             Notice(
@@ -300,57 +285,15 @@ def make_qixiang_tool(
                 + "）"
             )
         )
-        pool = ThreadPoolExecutor(
-            max_workers=concurrency, thread_name_prefix="qixiang"
+        run_attempts(
+            attempts,
+            concurrency=concurrency,
+            timeout_s=timeout_s,
+            min_answer_chars=MIN_ANSWER_CHARS,
+            on_settled=on_settled,
         )
-        futures = {pool.submit(runner, state): state for state in states}
-        done_count = 0
-        try:
-            pending = set(futures)
-            while pending:
-                finished, pending = wait(pending, timeout=1.0, return_when=FIRST_COMPLETED)
-                for future in finished:
-                    done_count += 1
-                    state = futures[future]
-                    status = _status_of(state, cancelled=False)
-                    mark = {"completed": "✓", "failed": "✗"}.get(status, "⊘")
-                    sink.emit(
-                        Notice(
-                            f"  🕸 七襄 {done_count}/{len(states)} {mark} "
-                            f"{ui.preview(state.label, 60)}"
-                        )
-                    )
-                #  超时巡检：从**实际启动**起算，中断该项的活 agent。
-                #  中断后 runner 的 send 抛 Interrupted → 归入 aborted
-                if timeout_s:
-                    now = time.monotonic()
-                    for state in states:
-                        if (
-                            state.started_at is not None
-                            and state.result is None
-                            and not state.crash
-                            and now - state.started_at > timeout_s
-                        ):
-                            #  每个 tick 都补一次中断（不只首次）：中断信号可能
-                            #  落在两代 agent 之间（本轮刚收尾、追问轮刚接手），
-                            #  只发一次会让换代后的 agent 无界跑下去
-                            state.timed_out = True
-                            with live_lock:
-                                agent = live.get(state.index)
-                            if agent is not None:
-                                agent.interrupt()
-            pool.shutdown(wait=True)
-        except BaseException:
-            #  用户中止（Ctrl-C）/父层异常：叫停所有在飞的子 agent，等一小段
-            #  让存档落地（resume 句柄因此仍然有效），然后把中断继续往上抛——
-            #  报告文本丢了没关系，存档在，用户随时可以批量续跑
-            cancel_event.set()
-            with live_lock:
-                for agent in live.values():
-                    agent.interrupt()
-            wait(set(futures), timeout=10)
-            pool.shutdown(wait=False, cancel_futures=True)
-            raise
+        for state, attempt in zip(states, attempts):
+            copy_back(state, attempt)
 
         #  ---------- 聚合 report：输入顺序，与完成先后无关 ----------
         counts = {"completed": 0, "failed": 0, "aborted": 0, "error": 0}
