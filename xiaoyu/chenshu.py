@@ -730,6 +730,8 @@ class ChenshuRuntime:
                             "兜底，隔离是硬前提。"
                         ) from exc
                     mission.worktree = str(workdir)
+            if kind == "worker" and mission is not None:
+                #  survey 也登记认领：不建 worktree，但双重指派守卫要能生效
                 mission.status = "active"
                 mission.owner = name
             if existing is None:
