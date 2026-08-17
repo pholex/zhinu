@@ -105,37 +105,103 @@ curl -X POST $BASE/session/$SID/permissions -H "$AUTH" -H 'content-type: applica
 
 ---
 
-## 接 n8n
+## ⚠️ 先解决网络：编排器多半在容器里
 
-n8n 自托管的话其实两条路都行：
+**这是接入时最常翻车的一步。** Dify 和 n8n 通常跑在 Docker 里，容器里的
+`127.0.0.1` 指的是**容器自己**，不是你的机器。默认的 `xiaoyu serve` 只绑回环，
+容器**连不上**。
 
-- **HTTP Request 节点** → 打 `prompt_async`，再用 Wait + HTTP Request 轮询 `status`
-- **Execute Command 节点** → 直接 `xiaoyu "..." --output-format json`，不用起服务
+所以给编排器用时要这样起：
 
-任务短、只要个结果，Execute Command 更省事；要看中间进度、要跨机、要多个工作流共享
-同一个会话，才值得起 serve。
+```bash
+xiaoyu serve --host 0.0.0.0 --token "$(openssl rand -hex 16)" --workspace ~/code/myrepo
+```
+
+（绑非回环地址时 token 是强制的，不给直接拒绝启动。）
+
+然后编排器那边填的地址是：
+
+| 编排器所在 | 填什么 |
+|---|---|
+| Docker Desktop（macOS / Windows） | `http://host.docker.internal:8420` |
+| Linux 上的 Docker | `http://172.17.0.1:8420`（docker0 网关，用 `ip addr show docker0` 确认） |
+| 与 xiaoyu 同一台裸机 | `http://127.0.0.1:8420` |
+| 另一台机器 | `http://<那台机器的 IP>:8420`，且**前面放反代 + TLS** |
 
 ## 接 Dify
 
 Dify 的 Code 节点跑在沙箱里起不了子进程，所以**必须走 HTTP**。
 
+**1. 导出 schema**（`--public-url` 必须填 Dify 真正能访问到的地址）：
+
 ```bash
-xiaoyu serve --print-openapi > xiaoyu.json
+xiaoyu serve --print-openapi --public-url http://host.docker.internal:8420 > xiaoyu.json
 ```
 
-把这份贴进 Dify 的**自定义工具**（导入 OpenAPI schema），鉴权选 API Key /
-Bearer，填 `--token` 的值。schema 是从代码生成的，改了端点重导一次就同步，
-不会像手写的那样漂。
+**2. 导入**：Dify →「工具」→「自定义」→「创建自定义工具」→ 粘贴 `xiaoyu.json` →
+鉴权方式选 **API Key**，Header 名 `Authorization`，值 `Bearer <你的 token>`。
 
-工作流形态建议：
+导进去会得到 14 个工具，名字就是 `operationId`：
 
 ```
-[开始] → [HTTP: POST /session]        拿 session_id
-       → [HTTP: POST .../prompt_async] 提交
-       → [循环: HTTP GET .../status]   直到 status != running
-       → [条件: detail == waiting_for_approval] → 走人工审批分支
-       → [HTTP: GET .../events]        取正文与工具轨迹
+create_session  prompt  prompt_async  get_status  get_events
+respond_permission  list_permissions  abort  steer  close_session  …
 ```
+
+**3. 工作流形态**：
+
+```
+[开始] → [工具 create_session]        拿 session_id
+       → [工具 prompt_async]          提交，立刻返回
+       → [循环 ↺]
+            [工具 get_status]
+            [条件] status == "running" → 继续循环
+                   detail == "waiting_for_approval" → 走人工审批分支 → respond_permission
+       → [工具 get_events]            取正文与工具轨迹
+       → [结束]
+```
+
+Agent 节点里直接挂这些工具也行——但**建议只给它 `prompt` / `get_status` / `get_events`**，
+别把 `respond_permission` 给模型，否则它会自己给自己放行，审批闸门就白设了。
+
+## 接 n8n
+
+n8n 自托管的话有两条路，**先想清楚要哪条**：
+
+**A. Execute Command 节点（不用起服务）** —— 任务短、只要个结果时最省事：
+
+```bash
+xiaoyu "修复 src/foo.py 的类型错误并跑测试" --workspace /data/repo --mode auto --output-format json
+```
+
+前提：n8n 容器里得装上 xiaoyu 和 provider key。
+
+**B. HTTP Request 节点（走 serve）** —— 要看中间进度、要跨机、要多个工作流共享
+同一个会话时用：
+
+```
+[HTTP Request] POST http://host.docker.internal:8420/session
+               Header: Authorization: Bearer <token>
+               Body:   {"workspace": "myrepo", "mode": "auto"}
+               → 取 {{ $json.session_id }}
+
+[HTTP Request] POST .../session/{{ $json.session_id }}/prompt_async
+               Body: {"text": "{{ $json.task }}"}
+
+[Wait 10s] → [HTTP Request] GET .../session/{{ ... }}/status
+           → [IF] {{ $json.status }} == "running" → 回到 Wait
+                  {{ $json.detail }} == "waiting_for_approval" → 审批分支
+
+[HTTP Request] GET .../session/{{ ... }}/events?from=1&limit=500
+```
+
+轮询那一环用 `?wait=20` 的 long-poll 端点更省资源，比固定 Wait 节点响应更快：
+
+```
+GET .../events?from={{ $json.next }}&wait=20
+```
+
+n8n 的 HTTP Request 节点默认超时是 300s，够 long-poll 的 60s 上限用。
 
 ---
 

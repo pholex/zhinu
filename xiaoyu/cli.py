@@ -1115,6 +1115,13 @@ def serve_command(argv: list[str]) -> int:
         action="store_true",
         help="把 OpenAPI schema 打到 stdout 后退出（贴给 Dify 自定义工具用），不起服务",
     )
+    parser.add_argument(
+        "--public-url",
+        dest="public_url",
+        default="",
+        help="写进 schema servers 的地址。编排器在容器里时必填"
+        "（Docker Desktop 常用 http://host.docker.internal:8420）",
+    )
     args = parser.parse_args(argv)
 
     root = (Path(args.workspace).expanduser() if args.workspace else Path.cwd()).resolve()
@@ -1139,7 +1146,7 @@ def serve_command(argv: list[str]) -> int:
     )
     try:
         if args.print_openapi:
-            return print_openapi(cfg)
+            return print_openapi(cfg, args.public_url)
         if args.host in ("127.0.0.1", "::1", "localhost") or args.token:
             print(ui.success(f"xiaoyu serve → http://{args.host}:{args.port}  (root: {root})"))
             print(ui.secondary("  文档 /docs · schema /openapi.json · Ctrl+C 停"))

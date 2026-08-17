@@ -456,7 +456,7 @@ def create_app(cfg: ServeConfig):  # noqa: C901 - 路由表天然长，拆开反
 
     # ---------- 路由 ----------
 
-    @app.get("/health", summary="存活探针", tags=["system"])
+    @app.get("/health", summary="存活探针", tags=["system"], operation_id="health")
     async def health() -> dict[str, Any]:
         return {
             "ok": True,
@@ -466,7 +466,13 @@ def create_app(cfg: ServeConfig):  # noqa: C901 - 路由表天然长，拆开反
             "approval": cfg.approval,
         }
 
-    @app.post("/session", summary="新建会话", tags=["session"], dependencies=guard)
+    @app.post(
+        "/session",
+        summary="新建会话",
+        tags=["session"],
+        dependencies=guard,
+        operation_id="create_session",
+    )
     async def session_create(
         workspace: str = Body(default="", embed=True, description="工作区路径，须在 root 之内；缺省用 root"),
         model: str = Body(default="", embed=True, description="模型名，缺省跟随服务端配置"),
@@ -485,15 +491,33 @@ def create_app(cfg: ServeConfig):  # noqa: C901 - 路由表天然长，拆开反
         sessions[session_id] = session
         return session.info_dict()
 
-    @app.get("/session", summary="列出会话", tags=["session"], dependencies=guard)
+    @app.get(
+        "/session",
+        summary="列出会话",
+        tags=["session"],
+        dependencies=guard,
+        operation_id="list_sessions",
+    )
     async def session_list() -> dict[str, Any]:
         return {"sessions": [item.info_dict() for item in sessions.values()]}
 
-    @app.get("/session/{session_id}", summary="会话详情", tags=["session"], dependencies=guard)
+    @app.get(
+        "/session/{session_id}",
+        summary="会话详情",
+        tags=["session"],
+        dependencies=guard,
+        operation_id="get_session",
+    )
     async def session_get(session_id: str) -> dict[str, Any]:
         return pick(session_id).info_dict()
 
-    @app.delete("/session/{session_id}", summary="关闭会话", tags=["session"], dependencies=guard)
+    @app.delete(
+        "/session/{session_id}",
+        summary="关闭会话",
+        tags=["session"],
+        dependencies=guard,
+        operation_id="close_session",
+    )
     async def session_delete(session_id: str) -> dict[str, Any]:
         session = pick(session_id)
         session.async_agent.interrupt()
@@ -506,6 +530,7 @@ def create_app(cfg: ServeConfig):  # noqa: C901 - 路由表天然长，拆开反
     @app.post(
         "/session/{session_id}/prompt",
         summary="跑一轮（同步等结果）",
+        operation_id="prompt",
         description="适合几十秒内能跑完的任务；长任务用 prompt_async，否则会撞上调用方的 HTTP 超时。",
         tags=["run"],
         dependencies=guard,
@@ -522,6 +547,7 @@ def create_app(cfg: ServeConfig):  # noqa: C901 - 路由表天然长，拆开反
     @app.post(
         "/session/{session_id}/prompt_async",
         summary="跑一轮（立刻返回）",
+        operation_id="prompt_async",
         description="接受后立刻返回 202；用 GET /status 轮询，或 GET /events 拉进度。",
         status_code=202,
         tags=["run"],
@@ -538,6 +564,7 @@ def create_app(cfg: ServeConfig):  # noqa: C901 - 路由表天然长，拆开反
     @app.get(
         "/session/{session_id}/status",
         summary="轮询状态",
+        operation_id="get_status",
         description=(
             "status: idle / running / error；detail: working / waiting_for_approval / "
             "finished / interrupted / failed。waiting_for_approval 表示卡在等人放行，"
@@ -552,6 +579,7 @@ def create_app(cfg: ServeConfig):  # noqa: C901 - 路由表天然长，拆开反
     @app.get(
         "/session/{session_id}/events",
         summary="拉事件（游标 + long-poll）",
+        operation_id="get_events",
         description=(
             "从 from 开始拉；返回的 next_seq 就是下次的 from。wait>0 时没有新事件会挂起"
             "等待，最长 60s——给不方便消费 SSE 的编排器（n8n HTTP 节点、Dify）用。"
@@ -582,6 +610,7 @@ def create_app(cfg: ServeConfig):  # noqa: C901 - 路由表天然长，拆开反
     @app.get(
         "/session/{session_id}/events/stream",
         summary="事件流（SSE）",
+        operation_id="stream_events",
         description=(
             "follow=true（默认）常驻推送，会话关掉或客户端断开才结束——编辑器/看板用。"
             "follow=false 只把当前这一轮推完就关流：调用方不必自己想办法中断连接，"
@@ -626,6 +655,7 @@ def create_app(cfg: ServeConfig):  # noqa: C901 - 路由表天然长，拆开反
     @app.get(
         "/session/{session_id}/permissions",
         summary="挂起的审批",
+        operation_id="list_permissions",
         tags=["approval"],
         dependencies=guard,
     )
@@ -636,6 +666,7 @@ def create_app(cfg: ServeConfig):  # noqa: C901 - 路由表天然长，拆开反
     @app.post(
         "/session/{session_id}/permissions",
         summary="回一个审批决定",
+        operation_id="respond_permission",
         description=(
             "decision=allow 放行；deny 拒绝（reason 会原文回灌给模型，等于改指令）；"
             "updated_args 非空时整体替换本次调用参数再执行（宿主'包一层再放行'的通道）。"
@@ -662,7 +693,13 @@ def create_app(cfg: ServeConfig):  # noqa: C901 - 路由表天然长，拆开反
         request.done.set()
         return {"request_id": request_id, "decision": decision}
 
-    @app.post("/session/{session_id}/abort", summary="打断当前这一轮", tags=["run"], dependencies=guard)
+    @app.post(
+        "/session/{session_id}/abort",
+        summary="打断当前这一轮",
+        tags=["run"],
+        dependencies=guard,
+        operation_id="abort",
+    )
     async def session_abort(session_id: str) -> dict[str, Any]:
         session = pick(session_id)
         session.async_agent.interrupt()
@@ -676,6 +713,7 @@ def create_app(cfg: ServeConfig):  # noqa: C901 - 路由表天然长，拆开反
     @app.post(
         "/session/{session_id}/steer",
         summary="向进行中的一轮插话",
+        operation_id="steer",
         description="不打断，模型在下一个 step 边界看到这句话再继续。",
         tags=["run"],
         dependencies=guard,
@@ -711,9 +749,28 @@ def serve(cfg: ServeConfig) -> int:
     return 0
 
 
-def print_openapi(cfg: ServeConfig) -> int:
-    """把 OpenAPI schema 打到 stdout —— Dify 自定义工具直接贴这份。"""
+def print_openapi(cfg: ServeConfig, public_url: str = "") -> int:
+    """把 OpenAPI schema 打到 stdout —— Dify 自定义工具直接贴这份。
+
+    必须带 `servers`：Dify / n8n 的 OpenAPI 导入器要从这里取 base URL，缺了
+    它们只能拿到相对路径，导进去也发不出请求。FastAPI 默认不生成这一段
+    （它假设调用方就在同一个 origin 下），所以这里显式补。
+
+    `public_url` 缺省按监听地址推。**编排器多半跑在容器里**，那时 127.0.0.1
+    是容器自己而不是本机——所以推出来是回环地址时额外打一行提示，别让人
+    照抄一个在 Dify 里必然连不上的地址。
+    """
     app = create_app(cfg)
-    json.dump(app.openapi(), sys.stdout, ensure_ascii=False, indent=2)
+    schema = app.openapi()
+    url = public_url or f"http://{cfg.host}:{cfg.port}"
+    schema["servers"] = [{"url": url, "description": "xiaoyu serve"}]
+    if not public_url and cfg.host in ("127.0.0.1", "::1", "localhost", "0.0.0.0"):
+        print(
+            f"提示：schema 里的 servers 填的是 {url}。若 Dify / n8n 跑在容器里，"
+            "这个地址指向的是容器自己——请用 --public-url 指定它们真正能访问到的地址"
+            "（Docker Desktop 上通常是 http://host.docker.internal:%d）。" % cfg.port,
+            file=sys.stderr,
+        )
+    json.dump(schema, sys.stdout, ensure_ascii=False, indent=2)
     sys.stdout.write("\n")
     return 0

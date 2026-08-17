@@ -441,6 +441,50 @@ class TestOpenApi(ServeCase):
         ):
             self.assertIn(path, paths)
 
+    def test_operation_ids_are_hand_named(self):
+        """operationId 是 Dify 里显示的工具名，不能是 FastAPI 自动拼的长串。
+
+        默认会生成 `session_prompt_async_session__session_id__prompt_async_post`
+        这种——人在工作流 UI 里选不动，模型做工具选择也更难。
+        """
+        client = self.start("text: 无所谓\n")
+        paths = client.get("/openapi.json").json()["paths"]
+        ids = {op["operationId"] for methods in paths.values() for op in methods.values()}
+        self.assertIn("prompt_async", ids)
+        self.assertIn("create_session", ids)
+        self.assertIn("respond_permission", ids)
+        self.assertIn("get_status", ids)
+        #  自动生成的那种一律不许出现（判据：带路径参数拼进来的双下划线）
+        self.assertEqual([name for name in ids if "__" in name], [])
+
+    def test_print_openapi_fills_in_servers(self):
+        """没有 servers，Dify/n8n 的导入器拿不到 base URL，导进去发不出请求。"""
+        from xiaoyu.serve import ServeConfig, print_openapi
+
+        import contextlib
+        import io
+        import json as _json
+
+        cfg = ServeConfig(root=self.root, host="127.0.0.1", port=8420)
+        buffer = io.StringIO()
+        with contextlib.redirect_stdout(buffer), contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(print_openapi(cfg, "http://host.docker.internal:8420"), 0)
+        schema = _json.loads(buffer.getvalue())
+        self.assertEqual(schema["servers"][0]["url"], "http://host.docker.internal:8420")
+
+    def test_loopback_servers_warns_on_stderr(self):
+        #  容器里的 127.0.0.1 是容器自己——照抄必然连不上，得提醒
+        from xiaoyu.serve import ServeConfig, print_openapi
+
+        import contextlib
+        import io
+
+        cfg = ServeConfig(root=self.root)
+        err = io.StringIO()
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(err):
+            print_openapi(cfg)
+        self.assertIn("--public-url", err.getvalue())
+
 
 if __name__ == "__main__":
     unittest.main()
