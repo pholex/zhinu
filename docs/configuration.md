@@ -87,8 +87,8 @@ XIAOYU_API_KEY=<key>
 | `XIAOYU_MCP_TOOL_SEARCH` | MCP 工具检索模式（默认开：工具不进 schema，`search_tool` 检索 + `use_tool` 调用；`0` = 回到全量注册） |
 | `XIAOYU_FOLDER_TRUST` | 工作区信任门（默认开，见[安全](security.md)；只认真实环境变量与用户级 `.env`） |
 | `XIAOYU_ENABLE_HOOKS` | 用户级 `hooks.toml` 生命周期钩子 |
-| `XIAOYU_ENABLE_AGENTS` | 声明式 subagent（`agents/*.toml`）与七襄批量委托（见[多 agent 协同](multi-agent.md)） |
-| `XIAOYU_ENABLE_CHENSHU` | 宸枢编排总控模式（见[多 agent 协同](multi-agent.md)） |
+| `XIAOYU_ENABLE_AGENTS` | 声明式 subagent（`agents/*.toml`）与七襄并行织造模式（见[多 agent 协同](multi-agent.md)） |
+| `XIAOYU_ENABLE_CHENSHU` | 宸枢统筹织造模式（见[多 agent 协同](multi-agent.md)） |
 | `XIAOYU_ENABLE_PEERS` | 跨会话消息（`--yolo` 下默认关，见[安全](security.md)） |
 
 ### 沙箱与界面

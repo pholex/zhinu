@@ -1,4 +1,5 @@
-"""七襄（qixiang）：批量并行委托——召集多个子 agent 横向并行、分区同步织造。
+"""七襄（qixiang）：并行织造模式（Parallel-Weave）——召集多名织手横向并行、
+分区同步织造。
 
 典出《诗经·小雅·大东》「跂彼织女，终日七襄」。把同构且互不依赖的一批
 子任务（prompt_template + items 逐项展开）扇出给同一个声明式 subagent
@@ -419,7 +420,7 @@ def make_qixiang_tool(
     return Tool(
         name="qixiang",
         description=(
-            "七襄：把一批**同构且互不依赖**的子任务并行扇出给同一个子 agent，"
+            "七襄（并行织造模式）：把一批**同构且互不依赖**的子任务并行扇出给同一个子 agent，"
             "全部完成后返回按输入顺序聚合的 report（每项含结论与 resume 句柄）。"
             "用法：prompt_template 写共同任务模板（含 {{item}} 占位符），items "
             "逐项填充；resume 参数批量续跑之前的委托。适合批量迁移/批量审查/"
