@@ -241,11 +241,11 @@ def _allocate(entries: list[tuple[str, str]], budget: int | None) -> tuple[list[
 
     #  第 3 级：光名字也塞不下，能列几个列几个（至少留一个，否则索引形同虚设）。
     #  提示行的字数随丢弃个数变，按"全丢"预留是上界。
-    budget = max(budget - _line_cost(_omitted_note(len(entries))), 0)
+    omitted = max(budget - _line_cost(_omitted_note(len(entries))), 0)
     lines: list[str] = []
     spent = 0
     for (name, _), row in zip(entries, costs):
-        if spent + row[0] > budget and lines:
+        if spent + row[0] > omitted and lines:
             break
         lines.append(_render(name, ""))
         spent += row[0]
