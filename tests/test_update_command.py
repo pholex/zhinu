@@ -3,6 +3,7 @@
 锁住这些事：
 1. pip 不存在（pipx/uv tool 环境）时不硬跑，给出替代命令并返回 1；
 2. 未装 TUI 可选依赖 → 升级 spec 自动带上 [tui]；已装 → 只升本体；
+   serve 方向相反：装了 fastapi+uvicorn 才带 [serve]（跟上新 pin），没装不塞；
 3. spec 必须作为独立 argv 传给 sys.executable -m pip（不经 shell，无引号问题）；
 4. pip 失败向上返回 1，成功后用新解释器读版本号播报；
 5. 从 Windows 启动器 exe 跑起来时，pip **不在本进程里执行**——它锁着自己，
@@ -29,6 +30,14 @@ def _run(argv: list[str]) -> tuple[int, str]:
     with contextlib.redirect_stdout(out), contextlib.redirect_stderr(out):
         code = cli.update_command(argv)
     return code, out.getvalue()
+
+
+@contextlib.contextmanager
+def _extras(tui: bool = True, serve: bool = False):
+    """把两个可选依赖探测都钉住——测试环境里装没装 fastapi 不该影响断言。"""
+    with mock.patch.object(cli, "_tui_available", return_value=tui), \
+            mock.patch.object(cli, "_serve_available", return_value=serve):
+        yield
 
 
 @contextlib.contextmanager
@@ -80,7 +89,7 @@ class UpdateCommandTest(unittest.TestCase):
             return SimpleNamespace(returncode=0, stdout="9.9.9\n")
 
         with mock.patch.object(cli.subprocess, "run", side_effect=fake_run), \
-                mock.patch.object(cli, "_tui_available", return_value=False):
+                _extras(tui=False):
             code, output = _run([])
         self.assertEqual(code, 0)
         #  spec 是独立 argv 元素、带 [tui]、由本解释器的 pip 执行
@@ -98,7 +107,7 @@ class UpdateCommandTest(unittest.TestCase):
             return SimpleNamespace(returncode=0, stdout="9.9.9\n")
 
         with mock.patch.object(cli.subprocess, "run", side_effect=fake_run), \
-                mock.patch.object(cli, "_tui_available", return_value=True):
+                _extras():
             code, output = _run([])
         self.assertEqual(code, 0)
         self.assertIn(
@@ -107,13 +116,44 @@ class UpdateCommandTest(unittest.TestCase):
         )
         self.assertIn("9.9.9", output)  # 新版本号来自新解释器的读数
 
+    def test_serve_extra_follows_when_installed(self):
+        """已装 fastapi+uvicorn 的环境升级要带 [serve]——不带的话锁版本升了
+        本体也跟不上（0.31.6 动过 serve 的 pin，老用户会无声留在旧版）。"""
+        calls = []
+
+        def fake_run(argv, **kwargs):
+            calls.append(argv)
+            return SimpleNamespace(returncode=0, stdout="9.9.9\n")
+
+        with mock.patch.object(cli.subprocess, "run", side_effect=fake_run), \
+                _extras(serve=True):
+            code, output = _run([])
+        self.assertEqual(code, 0)
+        self.assertIn(
+            [sys.executable, "-m", "pip", "install", "--upgrade", "xiaoyu-agent[serve]"],
+            calls,
+        )
+        self.assertIn("serve", output)
+
+    def test_tui_and_serve_extras_combine(self):
+        def fake_run(argv, **kwargs):
+            return SimpleNamespace(returncode=0, stdout="9.9.9\n")
+
+        with mock.patch.object(
+            cli.subprocess, "run", side_effect=fake_run
+        ) as run, _extras(tui=False, serve=True):
+            code, _ = _run([])
+        self.assertEqual(code, 0)
+        specs = [c.args[0][-1] for c in run.call_args_list if "install" in c.args[0]]
+        self.assertEqual(specs, ["xiaoyu-agent[tui,serve]"])
+
     def test_pip_failure_returns_one(self):
         def fake_run(argv, **kwargs):
             returncode = 1 if "install" in argv else 0
             return SimpleNamespace(returncode=returncode, stdout="")
 
         with mock.patch.object(cli.subprocess, "run", side_effect=fake_run), \
-                mock.patch.object(cli, "_tui_available", return_value=True):
+                _extras():
             code, output = _run([])
         self.assertEqual(code, 1)
         self.assertIn("升级失败", output)
@@ -124,7 +164,7 @@ class UpdateCommandTest(unittest.TestCase):
             with mock.patch.object(
                 cli.subprocess, "run", side_effect=_probe_ok
             ) as run, mock.patch.object(cli.subprocess, "Popen") as popen, \
-                    mock.patch.object(cli, "_tui_available", return_value=True):
+                    _extras():
                 code, output = _run([])
 
         self.assertEqual(code, 0)
@@ -159,7 +199,7 @@ class UpdateCommandTest(unittest.TestCase):
         with _fake_windows_launcher():
             with mock.patch.object(cli.subprocess, "run", side_effect=_probe_ok), \
                     mock.patch.object(cli.subprocess, "Popen") as popen, \
-                    mock.patch.object(cli, "_tui_available", return_value=True):
+                    _extras():
                 _run([])
         flags = popen.call_args.kwargs["creationflags"]
         self.assertEqual(flags, getattr(cli.subprocess, "CREATE_NEW_PROCESS_GROUP", 0))
@@ -178,7 +218,7 @@ class UpdateCommandTest(unittest.TestCase):
         with _fake_windows_launcher():
             with mock.patch.object(cli.subprocess, "run", side_effect=fake_run), \
                     mock.patch.object(cli.subprocess, "Popen") as popen, \
-                    mock.patch.object(cli, "_tui_available", return_value=True):
+                    _extras():
                 code, _ = _run([])
         popen.assert_not_called()
         self.assertEqual(code, 0)
@@ -198,7 +238,7 @@ class UpdateCommandTest(unittest.TestCase):
             with mock.patch.object(cli.subprocess, "run", side_effect=fake_run), \
                     mock.patch.object(
                         cli.subprocess, "Popen", side_effect=OSError("nope")
-                    ), mock.patch.object(cli, "_tui_available", return_value=True):
+                    ), _extras():
                 code, output = _run([])
         self.assertEqual(code, 0)
         self.assertIn(
@@ -235,7 +275,7 @@ class UpdateCommandTest(unittest.TestCase):
         with mock.patch.object(cli.os, "name", "nt"), \
                 mock.patch.object(cli.sys, "argv", ["-m", "update"]), \
                 mock.patch.object(cli.subprocess, "run", side_effect=fake_run), \
-                mock.patch.object(cli, "_tui_available", return_value=True):
+                _extras():
             code, output = _run([])
         self.assertEqual(code, 1)
         self.assertIn(cli._WINDOWS_MANUAL_UPGRADE, output)
