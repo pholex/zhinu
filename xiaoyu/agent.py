@@ -813,6 +813,18 @@ class Agent:
                         mcp_manager=getattr(self.toolbox, "mcp_manager", None),
                     )
                 )
+            #  斗巧（竞争织造）：与七襄同闸——有可扇出的 spec 才有参赛者
+            if mounted_specs and self.toolbox.get("douqiao") is None:
+                from .douqiao import make_douqiao_tool
+
+                self.toolbox.register(
+                    make_douqiao_tool(
+                        mounted_specs, config, self.registry, self.usage,
+                        self.sink, self.approver, self.permissions,
+                        subagent_runs,
+                        mcp_manager=getattr(self.toolbox, "mcp_manager", None),
+                    )
+                )
         #  宸枢（编排总控模式）：init 常驻 schema，其余工具在 active 后经
         #  check_fn 浮现。与 allow_explore 同闸（成员不再挂宸枢，不套娃）
         if allow_explore and config.enable_chenshu and self.toolbox.get("chenshu_init") is None:

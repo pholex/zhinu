@@ -356,6 +356,7 @@ def execute_delegation(
     child_sink: Any = None,
     on_agent: Callable[[Any], None] | None = None,
     require_isolation: bool = False,
+    model_override: str | None = None,
 ) -> DelegationResult:
     """跑一次委托的执行核心（单发 subagent 工具与 qixiang 批量共用）。
 
@@ -481,8 +482,13 @@ def execute_delegation(
         else None
     )
 
-    #  resume 钉死上次的模型（spec/主模型中途换了也不动摇——上下文是按它长的）
-    model = record.model if record is not None else (spec.model or config.model)
+    #  resume 钉死上次的模型（spec/主模型中途换了也不动摇——上下文是按它长的）；
+    #  新开时 model_override（斗巧的异构竞争席位）> spec 声明 > 主模型
+    model = (
+        record.model
+        if record is not None
+        else (model_override or spec.model or config.model)
+    )
     #  免确认只给"纯只读且无 MCP"的有效集合；否则父级审批穿透
     readonly_run = set(tools_list) <= set(Toolbox.READONLY) and mcp_view is None
     sub_config = Config(
