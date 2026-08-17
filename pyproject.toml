@@ -43,9 +43,12 @@ browser = [
 # 可选：`xiaoyu serve` 的 HTTP API（给 n8n / Dify 这类编排器用）。
 # 只影响这一条命令，缺包时 serve 报一句怎么装就退出。选 fastapi 是为了让
 # OpenAPI schema 由代码生成（Dify 自定义工具吃它），手写的会随代码漂移。
+#  ⚠️ 锁版本要查 PyPI 现状再填，别凭印象——0.31.5 首发时锁的 fastapi==0.121.2
+#  是 2025-11 的版本，落后九个月约 20 个 minor。锁版本的目的是"有意识地选一个
+#  审查过的版本"，钉一个旧的等于把目的反过来做。
 serve = [
-    "fastapi==0.121.2",
-    "uvicorn==0.41.0",
+    "fastapi==0.141.1",
+    "uvicorn==0.52.3",
 ]
 
 [project.urls]
