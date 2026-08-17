@@ -185,6 +185,28 @@ def available() -> bool:
     return False
 
 
+def _worktree_git_common(workspace: Path) -> Path | None:
+    """workspace 若是 linked worktree，返回主仓的 .git 目录；否则 None。
+
+    指针文件形如 `gitdir: /主仓/.git/worktrees/<名>`，公共目录取其上两级。
+    """
+    pointer = workspace / ".git"
+    if not pointer.is_file():
+        return None
+    try:
+        raw = pointer.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return None
+    for line in raw.splitlines():
+        if line.startswith("gitdir:"):
+            gitdir = Path(line.split(":", 1)[1].strip())
+            if not gitdir.is_absolute():
+                gitdir = workspace / gitdir
+            common = gitdir.parent.parent
+            return common if common.name == ".git" else None
+    return None
+
+
 def default_writable_roots(workspace: Path) -> list[Path]:
     """默认可写根目录：工作区 + 临时目录 + 常见构建缓存。
 
@@ -193,6 +215,12 @@ def default_writable_roots(workspace: Path) -> list[Path]:
     用户数据，放开的代价远小于"这功能天天坏"。
     """
     roots = [workspace, Path("/tmp"), Path("/private/tmp"), Path("/var/tmp")]
+    #  workspace 是 linked worktree（.git 为指针文件）时，git 的真实写路径在
+    #  主仓 .git 下（对象库/refs/worktrees/<n>/index）——不放开则 worktree 里
+    #  git add/commit 必败（子 agent 隔离与宸枢 mission 分支都靠它）。放开的
+    #  只是 git 元数据目录，主工作区的文件本身仍不可写。
+    if (common := _worktree_git_common(workspace)) is not None:
+        roots.append(common)
     if tmpdir := os.environ.get("TMPDIR"):
         roots.append(Path(tmpdir))
     #  Linux 桌面会话的 /run/user/<uid>：dbus / keyring / 各种 socket 都在这，
