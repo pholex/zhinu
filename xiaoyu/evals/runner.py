@@ -121,8 +121,8 @@ def run_case(case: Case, model: str, base_url: str | None, verbose: bool) -> dic
         #  算出来的成本会是 $0 —— 那是假的，必须标成"未知"而不是"免费"。
         "usage_reported": reported_usage,
         "usage_by_model": {
-            name: {"calls": entry.calls, "in": entry.prompt_tokens, "out": entry.completion_tokens}
-            for name, entry in agent.usage.by_model.items()
+            name: {"calls": calls, "in": prompt, "out": completion}
+            for name, (calls, prompt, completion) in agent.usage.snapshot().items()
         },
         "cost": (
             model_registry.cost(model, agent.usage.prompt_tokens, agent.usage.completion_tokens)

@@ -18,6 +18,7 @@ DeepSeek 官方名（deepseek-v4-pro / deepseek-v4-flash）和网关侧完全一
 from __future__ import annotations
 
 import os
+import threading
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -256,8 +257,13 @@ class Registry:
             raise MissingConfig(NO_PROVIDER_HINT)
         self.providers = providers
         self._timeout = timeout
-        #  预置 client（测试注入假 client 用）；其余按需惰性构造并缓存
+        #  预置 client（测试注入假 client 用）；其余按需惰性构造并缓存。
+        #  惰性构造上锁：qixiang 的工作线程可能同时首访同一家 provider，
+        #  竞态下 ScriptedClient（e2e 进程内单例队列）会被建出两份，
+        #  "总共调了几次模型"的断言就假了——普通 OpenAI client 重复构造
+        #  虽无害，也一并锁掉图个确定性。
         self._clients: dict[str, Any] = dict(clients or {})
+        self._client_lock = threading.Lock()
         #  remote_models 探测到的通配 provider 清单（会话级）：补全候选用。
         #  逐键补全不能做网络请求，所以只有探测过一次之后才补得出网关模型
         self._remote_cache: dict[str, list[str]] = {}
@@ -374,49 +380,55 @@ class Registry:
         否则两层叠加，用户看到的"第 1/2 次重试"是假的。
         """
         if name not in self._clients:
-            provider = self.get(name)
-            if provider is None:  # pragma: no cover - 只可能是内部调用写错
-                raise UnknownModel(f"未注册的 provider：{name}")
-            if name == SCRIPTED_PROVIDER:
-                #  确定性 e2e 桩：进程内单例队列（主循环/摘要/explore 共用），
-                #  "总共调了几次模型"因此可断言
-                from .scripted import ScriptedClient
-
-                self._clients[name] = ScriptedClient.from_file(
-                    os.environ[SCRIPTED_ENV].strip()
-                )
-            else:
-                #  一律包一层 Transport（responses.py）：它是唯一的出网口，
-                #  按型号分派协议、并摘掉内核私有键。包在缓存内侧，
-                #  所有拿到这个 client 的地方看到的都是同一只。
-                #  anthropic client 走懒工厂：不碰 Claude 直连就不构造、不 import
-                factory = None
-                if provider.anthropic_models:
-
-                    def factory(p: Provider = provider, t: float = self._timeout) -> Any:
-                        from . import messages
-
-                        return messages.client(p.base_url, p.api_key, t)
-
-                #  snapshot 录制（XIAOYU_SNAPSHOT_RECORD）包在最外侧：录到的
-                #  是传输层抹平协议差异之后、内核实际消费的 chunk 面
-                from .snapshot import maybe_record
-
-                self._clients[name] = maybe_record(
-                    wrap_transport(
-                        OpenAI(
-                            base_url=provider.base_url,
-                            api_key=provider.api_key,
-                            timeout=self._timeout,
-                            max_retries=0,
-                        ),
-                        provider.responses_models,
-                        provider.anthropic_models,
-                        factory,
-                        provider=name,
-                    )
-                )
+            with self._client_lock:
+                if name not in self._clients:
+                    self._build_client(name)
         return self._clients[name]
+
+    def _build_client(self, name: str) -> None:
+        """构造并缓存一家 provider 的 client（仅 client() 持锁调用）。"""
+        provider = self.get(name)
+        if provider is None:  # pragma: no cover - 只可能是内部调用写错
+            raise UnknownModel(f"未注册的 provider：{name}")
+        if name == SCRIPTED_PROVIDER:
+            #  确定性 e2e 桩：进程内单例队列（主循环/摘要/explore 共用），
+            #  "总共调了几次模型"因此可断言
+            from .scripted import ScriptedClient
+
+            self._clients[name] = ScriptedClient.from_file(
+                os.environ[SCRIPTED_ENV].strip()
+            )
+            return
+        #  一律包一层 Transport（responses.py）：它是唯一的出网口，
+        #  按型号分派协议、并摘掉内核私有键。包在缓存内侧，
+        #  所有拿到这个 client 的地方看到的都是同一只。
+        #  anthropic client 走懒工厂：不碰 Claude 直连就不构造、不 import
+        factory = None
+        if provider.anthropic_models:
+
+            def factory(p: Provider = provider, t: float = self._timeout) -> Any:
+                from . import messages
+
+                return messages.client(p.base_url, p.api_key, t)
+
+        #  snapshot 录制（XIAOYU_SNAPSHOT_RECORD）包在最外侧：录到的
+        #  是传输层抹平协议差异之后、内核实际消费的 chunk 面
+        from .snapshot import maybe_record
+
+        self._clients[name] = maybe_record(
+            wrap_transport(
+                OpenAI(
+                    base_url=provider.base_url,
+                    api_key=provider.api_key,
+                    timeout=self._timeout,
+                    max_retries=0,
+                ),
+                provider.responses_models,
+                provider.anthropic_models,
+                factory,
+                provider=name,
+            )
+        )
 
     #  —— 展示 ——
 

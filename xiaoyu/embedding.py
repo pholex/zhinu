@@ -127,10 +127,9 @@ def measured_send(agent: Agent, user_input: str | list[dict[str, Any]]) -> RunRe
     那是宿主自己的主动动作，不该再以异常的形式弹回宿主；真正的错误
     （网络、配置、bug）照常抛出。
     """
-    before = {
-        model: (entry.calls, entry.prompt_tokens, entry.completion_tokens)
-        for model, entry in agent.usage.by_model.items()
-    }
+    #  锁内快照：宸枢的 worker 线程可跨轮存活，裸迭代 by_model 会撞上
+    #  另一头的 add()（dictionary changed size）
+    before = agent.usage.snapshot()
     #  text 只在本轮新增的消息里取：本轮若以空回复收场（护栏路径），
     #  last_assistant_text() 会翻出上一轮的交付文本——把旧话当新交付发给
     #  用户是嵌入宿主最不该踩的坑
@@ -145,12 +144,12 @@ def measured_send(agent: Agent, user_input: str | list[dict[str, Any]]) -> RunRe
 
     by_model: dict[str, dict[str, int]] = {}
     turns = prompt = completion = 0
-    for model, entry in agent.usage.by_model.items():
+    for model, (calls, prompt_toks, completion_toks) in agent.usage.snapshot().items():
         base = before.get(model, (0, 0, 0))
         delta = (
-            entry.calls - base[0],
-            entry.prompt_tokens - base[1],
-            entry.completion_tokens - base[2],
+            calls - base[0],
+            prompt_toks - base[1],
+            completion_toks - base[2],
         )
         if any(delta):
             by_model[model] = {

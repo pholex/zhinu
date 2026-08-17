@@ -56,11 +56,12 @@ from __future__ import annotations
 
 import copy
 import re
+import threading
 import tomllib
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from . import tokens, ui, worktree
 from .config import Config, user_config_dir
@@ -156,6 +157,54 @@ class SubagentRun:
     messages: list[dict[str, Any]] = field(default_factory=list)
     #  跑完保留下来的 worktree（没隔离/已删则 None），resume 时原地复用
     worktree: Path | None = None
+
+
+class RunStore(dict):
+    """SubagentRun 存档 + 并发锁。
+
+    qixiang 的批量委托在工作线程里并发存档，dict 的滚动淘汰（读-改-写）
+    需要锁护。做成 dict 子类：既有调用方/测试传普通 dict 也能跑
+    （此时退回模块级兜底锁，见 _FALLBACK_STORE_LOCK）。
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.lock = threading.Lock()
+        #  滚动淘汰上限。qixiang 会按批量大小抬高它——64 项的批出 64 个
+        #  resume 句柄，16 格的存档转一圈就把报告里大半句柄变成死链
+        self.capacity = MAX_RUNS
+
+
+#  普通 dict 存档的兜底锁（测试直传 dict；单线程场景锁开销可忽略）
+_FALLBACK_STORE_LOCK = threading.Lock()
+
+#  git worktree add 的进程内串行化（并发创建争仓库锁必败，见 execute_delegation）
+_WORKTREE_CREATE_LOCK = threading.Lock()
+
+
+def _store_lock(store: dict) -> threading.Lock:
+    lock = getattr(store, "lock", None)
+    return lock if isinstance(lock, type(_FALLBACK_STORE_LOCK)) else _FALLBACK_STORE_LOCK
+
+
+@dataclass
+class DelegationResult:
+    """一次委托的结构化结果（单发工具的格式化与 qixiang 的批量汇总共用）。
+
+    error 与 failure 的区分沿袭原有语义：error = 参数/前置校验失败，**没有
+    任何执行发生**、无存档；failure = 子 agent 执行中抛异常，**已存档**、
+    可 resume 续跑修复。
+    """
+
+    error: str = ""
+    failure: str = ""
+    answer: str = ""
+    run_id: str = ""
+    model: str = ""
+    tool_calls: int = 0
+    worktree: Path | None = None
+    notes: list[str] = field(default_factory=list)
+    resumed: bool = False
 
 
 def spec_dirs(workspace: Path) -> list[tuple[Path, str]]:
@@ -289,6 +338,252 @@ def _parse_spec(path: Path, source: str) -> tuple[AgentSpec | None, list[str]]:
     )
 
 
+def execute_delegation(
+    spec: AgentSpec,
+    config: Config,
+    registry: Any,
+    usage: Any,
+    sink: UISink,
+    approver: Any,
+    permissions: Any,
+    store: dict[str, SubagentRun],
+    mcp_manager: Any = None,
+    *,
+    task: str,
+    capability_mode: str | None = None,
+    isolation: str | None = None,
+    resume_from: str | None = None,
+    child_sink: Any = None,
+    on_agent: Callable[[Any], None] | None = None,
+    require_isolation: bool = False,
+) -> DelegationResult:
+    """跑一次委托的执行核心（单发 subagent 工具与 qixiang 批量共用）。
+
+    线程安全：存档读写走 `_store_lock`，可在工作线程里并发调用（usage/registry
+    也是共享的，各自内部保证并发安全）。child_sink 显式传入时覆盖
+    `sink.quiet_child` 派生（qixiang 传静默 sink 压住批量运行时的工具刷屏）；
+    on_agent 在子 Agent 构造后立刻回调（qixiang 用它拿到活句柄做超时/中断）。
+    """
+    from .agent import Agent
+    from .mcp import McpView
+
+    lock = _store_lock(store)
+
+    #  -- 能力档位：调用参数 ∧ spec 天花板（spec.tools 已在解析期扣过天花板，
+    #     这里只需再扣一次调用参数收紧的部分） --
+    requested = _clean_param(capability_mode)
+    req_mode: str | None = None
+    if requested is not None:
+        req_mode = normalize_capability(requested)
+        if req_mode is None:
+            return DelegationResult(
+                error=(
+                    f"ERROR: capability_mode 只能是 read-only / read-write / "
+                    f"execute / all，不认识 {requested!r}。"
+                )
+            )
+    mode = intersect_capabilities(req_mode, spec.capability_mode or None)
+    tools_list = (
+        spec.tools
+        if mode is None
+        else tuple(tool for tool in spec.tools if tool in CAPABILITY_TOOLS[mode])
+    )
+    if not tools_list:
+        return DelegationResult(
+            error=(
+                f"ERROR: capability_mode={mode} 收紧后 {spec.name} 没有可用工具了，"
+                "放宽档位或不传这个参数。"
+            )
+        )
+
+    #  -- resume：全链路 fail-closed，任何一步不对就报错，绝不退化成全新子 agent --
+    record: SubagentRun | None = None
+    rid = _clean_param(resume_from)
+    if rid is not None:
+        with lock:
+            record = store.get(rid)
+        if record is None:
+            return DelegationResult(
+                error=(
+                    f"ERROR: 找不到 resume_from={rid!r} 对应的子 agent 记录"
+                    "（可能已被滚动淘汰，或 ID 写错——句柄在上次结论的尾部）。"
+                )
+            )
+        if record.spec_name != spec.name:
+            return DelegationResult(
+                error=(
+                    f"ERROR: {rid} 是 {record.spec_name} 的运行记录，"
+                    f"不能用 {spec.name} 恢复（换对工具再调）。"
+                )
+            )
+        if len(record.messages) < 2:
+            return DelegationResult(error=f"ERROR: {rid} 的存档是空的，无法恢复。")
+        estimated = tokens.estimate_messages(record.messages)
+        if estimated >= int(config.context_limit * _SAFE_RESUME_RATIO):
+            return DelegationResult(
+                error=(
+                    f"ERROR: {rid} 的上下文约 {estimated} tok，超过窗口的 "
+                    f"{int(_SAFE_RESUME_RATIO * 100)}%，无法恢复——把任务拆小重新委托。"
+                )
+            )
+
+    #  -- workspace 与 worktree：resume 复用上次的（没了就退回主工作区，
+    #     isolation 参数此时忽略）；新开则按 参数 > spec 默认 决定是否隔离，
+    #     创建失败 fail-open --
+    workdir = config.workspace
+    created: Path | None = None
+    inherited_wt: Path | None = None
+    notes: list[str] = []
+    if record is not None:
+        if record.worktree is not None:
+            if record.worktree.is_dir():
+                workdir = record.worktree
+                inherited_wt = record.worktree
+            else:
+                notes.append("上次的 worktree 已不存在，这次在主工作区跑")
+    else:
+        iso_param = _clean_param(isolation)
+        #  与 spec 解析同一套 alias 容错：大小写 / 下划线都认
+        iso_value = (
+            iso_param if iso_param is not None else (spec.isolation or "none")
+        ).lower().replace("_", "-")
+        if iso_value not in ("none", "worktree", "work-tree"):
+            return DelegationResult(
+                error=f"ERROR: isolation 只能是 none 或 worktree，不认识 {iso_value!r}。"
+            )
+        if iso_value != "none":
+            try:
+                #  创建加锁：并发批量委托同时 git worktree add 会互相争
+                #  仓库级锁文件而失败——串行化创建，运行不受影响
+                with _WORKTREE_CREATE_LOCK:
+                    created = worktree.create(config.workspace, spec.name)
+                workdir = created
+            except worktree.WorktreeError as exc:
+                #  单发委托 fail-open（退主工作区继续，隔离是锦上添花）；
+                #  批量委托 fail-closed（require_isolation）——N 个写者同时
+                #  退回主工作区并行写，正是强制隔离要防的事故本身
+                if require_isolation:
+                    return DelegationResult(
+                        error=(
+                            f"ERROR: worktree 隔离创建失败（{exc}），该项未执行"
+                            "——批量并行写不允许退回主工作区。"
+                        )
+                    )
+                sink.emit(
+                    Notice(f"  ⚠ {spec.name} worktree 隔离失败，退回主工作区：{exc}", "warn")
+                )
+                notes.append(f"worktree 隔离失败（{exc}），实际在主工作区跑")
+
+    #  -- MCP 继承（server 级视图，不拉新进程；作者声明才有） --
+    mcp_view = (
+        McpView(mcp_manager, spec.mcp_mode, spec.mcp_servers)
+        if mcp_manager is not None and spec.mcp_mode != "none"
+        else None
+    )
+
+    #  resume 钉死上次的模型（spec/主模型中途换了也不动摇——上下文是按它长的）
+    model = record.model if record is not None else (spec.model or config.model)
+    #  免确认只给"纯只读且无 MCP"的有效集合；否则父级审批穿透
+    readonly_run = set(tools_list) <= set(Toolbox.READONLY) and mcp_view is None
+    sub_config = Config(
+        base_url=config.base_url,
+        model=model,
+        summary_model=config.summary_model,
+        explore_model=config.explore_model,
+        workspace=workdir,
+        max_iterations=spec.max_iterations,
+        max_tool_output=config.max_tool_output,
+        context_limit_override=config.context_limit_override,
+        compact_at=config.compact_at,
+        keep_recent=config.keep_recent,
+        request_timeout=config.request_timeout,
+        extra_env=config.extra_env,
+        bash_timeout=config.bash_timeout,
+        sandbox=config.sandbox,
+        sandbox_network=config.sandbox_network,
+        auto_approve=readonly_run or config.auto_approve,
+        mcp_tool_search=config.mcp_tool_search,
+        enable_explore=False,
+        enable_web_search=False,
+        enable_skills=False,
+        enable_plan=False,
+        enable_plugins=False,
+        enable_mcp=False,
+        enable_hooks=False,
+        enable_agents=False,
+    )
+    label = "恢复" if record is not None else "委托"
+    sink.emit(Notice(f"  🤖 {spec.name}（{model}）{label}：{ui.preview(task, 90)}"))
+    if child_sink is None:
+        child_maker = getattr(sink, "quiet_child", None)
+        child_sink = child_maker() if callable(child_maker) else None
+    sub_agent = Agent(
+        sub_config,
+        Toolbox(sub_config, only=list(tools_list), mcp_view=mcp_view),
+        usage=usage,
+        registry=registry,
+        quiet=True,
+        allow_explore=False,
+        #  权限不因声明放大：写/执行/MCP 复用父级审批；deny 规则（含
+        #  read_file 路径类）对只读子集同样穿透——permissions 一律传父级的
+        approver=None if readonly_run else approver,
+        permissions=permissions,
+        sink=child_sink,
+    )
+    if on_agent is not None:
+        on_agent(sub_agent)
+    system_text = spec.system_prompt.format(workspace=workdir)
+    if record is not None:
+        #  transcript 续用、system 头按当前 spec 重渲染（body 继承，
+        #  head 以现在的定义为准）
+        sub_agent.messages = copy.deepcopy(record.messages)
+        sub_agent.messages[0] = {"role": "system", "content": system_text}
+    else:
+        sub_agent.messages[0]["content"] = system_text
+    failure = ""
+    try:
+        sub_agent.send(task)
+    except Exception as exc:  # noqa: BLE001 - 委托失败不该打断主流程
+        failure = f"{type(exc).__name__}: {exc}"
+
+    #  -- worktree 收尾：本次新建的，干净就删、有改动就保留报路径；
+    #     resume 复用的一律保留 --
+    kept = inherited_wt
+    if created is not None:
+        if worktree.dirty(created):
+            kept = created
+        else:
+            worktree.remove(config.workspace, created)
+            kept = None
+
+    #  -- 存档（失败的也记：从 failed 恢复继续修是 resume 的正当用法） --
+    run_id = uuid.uuid4().hex[:8]
+    with lock:
+        store[run_id] = SubagentRun(
+            id=run_id,
+            spec_name=spec.name,
+            model=model,
+            messages=copy.deepcopy(sub_agent.messages),
+            worktree=kept,
+        )
+        limit = max(MAX_RUNS, int(getattr(store, "capacity", MAX_RUNS)))
+        while len(store) > limit:
+            store.pop(next(iter(store)))
+
+    if not failure:
+        sink.emit(Notice(f"  🤖 {spec.name} 完成：{len(sub_agent.trace)} 次工具调用"))
+    return DelegationResult(
+        failure=failure,
+        answer=sub_agent.last_assistant_text(),
+        run_id=run_id,
+        model=model,
+        tool_calls=len(sub_agent.trace),
+        worktree=kept,
+        notes=notes,
+        resumed=record is not None,
+    )
+
+
 def make_subagent_tool(
     spec: AgentSpec,
     config: Config,
@@ -303,9 +598,10 @@ def make_subagent_tool(
     """spec → 可挂载的工具。结构与 explore.make_explore_tool 同构：
     usage/registry 传父级的（同一本账、client 复用），sink 走 quiet_child 派生。
 
-    runs 是跨 spec 共享的 resume 存档（agent.py 挂载时给同一个 dict，让
-    resume 句柄在存档里全局唯一）；mcp_manager 是父级 Toolbox 的 manager，
-    spec 声明了 mcp 继承才用到。
+    runs 是跨 spec 共享的 resume 存档（agent.py 挂载时给同一个 dict/RunStore，
+    让 resume 句柄在存档里全局唯一）；mcp_manager 是父级 Toolbox 的 manager，
+    spec 声明了 mcp 继承才用到。执行核心在 execute_delegation（与 qixiang
+    批量共用），这里只负责把结构化结果排版成模型可读的文本。
     """
     store: dict[str, SubagentRun] = runs if runs is not None else {}
 
@@ -315,201 +611,37 @@ def make_subagent_tool(
         isolation: str | None = None,
         resume_from: str | None = None,
     ) -> str:
-        from .agent import Agent
-        from .mcp import McpView
-
-        #  -- 能力档位：调用参数 ∧ spec 天花板（spec.tools 已在解析期扣过天花板，
-        #     这里只需再扣一次调用参数收紧的部分） --
-        requested = _clean_param(capability_mode)
-        req_mode: str | None = None
-        if requested is not None:
-            req_mode = normalize_capability(requested)
-            if req_mode is None:
-                return (
-                    f"ERROR: capability_mode 只能是 read-only / read-write / "
-                    f"execute / all，不认识 {requested!r}。"
-                )
-        mode = intersect_capabilities(req_mode, spec.capability_mode or None)
-        tools_list = (
-            spec.tools
-            if mode is None
-            else tuple(tool for tool in spec.tools if tool in CAPABILITY_TOOLS[mode])
+        result = execute_delegation(
+            spec, config, registry, usage, sink, approver, permissions,
+            store, mcp_manager,
+            task=task, capability_mode=capability_mode,
+            isolation=isolation, resume_from=resume_from,
         )
-        if not tools_list:
-            return (
-                f"ERROR: capability_mode={mode} 收紧后 {spec.name} 没有可用工具了，"
-                "放宽档位或不传这个参数。"
-            )
-
-        #  -- resume：全链路 fail-closed，任何一步不对就报错，绝不退化成全新子 agent --
-        record: SubagentRun | None = None
-        rid = _clean_param(resume_from)
-        if rid is not None:
-            record = store.get(rid)
-            if record is None:
-                return (
-                    f"ERROR: 找不到 resume_from={rid!r} 对应的子 agent 记录"
-                    "（可能已被滚动淘汰，或 ID 写错——句柄在上次结论的尾部）。"
-                )
-            if record.spec_name != spec.name:
-                return (
-                    f"ERROR: {rid} 是 {record.spec_name} 的运行记录，"
-                    f"不能用 {spec.name} 恢复（换对工具再调）。"
-                )
-            if len(record.messages) < 2:
-                return f"ERROR: {rid} 的存档是空的，无法恢复。"
-            estimated = tokens.estimate_messages(record.messages)
-            if estimated >= int(config.context_limit * _SAFE_RESUME_RATIO):
-                return (
-                    f"ERROR: {rid} 的上下文约 {estimated} tok，超过窗口的 "
-                    f"{int(_SAFE_RESUME_RATIO * 100)}%，无法恢复——把任务拆小重新委托。"
-                )
-
-        #  -- workspace 与 worktree：resume 复用上次的（没了就退回主工作区，
-        #     isolation 参数此时忽略）；新开则按 参数 > spec 默认 决定是否隔离，
-        #     创建失败 fail-open --
-        workdir = config.workspace
-        created: Path | None = None
-        inherited_wt: Path | None = None
-        notes: list[str] = []
-        if record is not None:
-            if record.worktree is not None:
-                if record.worktree.is_dir():
-                    workdir = record.worktree
-                    inherited_wt = record.worktree
-                else:
-                    notes.append("上次的 worktree 已不存在，这次在主工作区跑")
-        else:
-            iso_param = _clean_param(isolation)
-            #  与 spec 解析同一套 alias 容错：大小写 / 下划线都认
-            iso_value = (
-                iso_param if iso_param is not None else (spec.isolation or "none")
-            ).lower().replace("_", "-")
-            if iso_value not in ("none", "worktree", "work-tree"):
-                return f"ERROR: isolation 只能是 none 或 worktree，不认识 {iso_value!r}。"
-            if iso_value != "none":
-                try:
-                    created = worktree.create(config.workspace, spec.name)
-                    workdir = created
-                except worktree.WorktreeError as exc:
-                    sink.emit(
-                        Notice(f"  ⚠ {spec.name} worktree 隔离失败，退回主工作区：{exc}", "warn")
-                    )
-                    notes.append(f"worktree 隔离失败（{exc}），实际在主工作区跑")
-
-        #  -- MCP 继承（server 级视图，不拉新进程；作者声明才有） --
-        mcp_view = (
-            McpView(mcp_manager, spec.mcp_mode, spec.mcp_servers)
-            if mcp_manager is not None and spec.mcp_mode != "none"
-            else None
-        )
-
-        #  resume 钉死上次的模型（spec/主模型中途换了也不动摇——上下文是按它长的）
-        model = record.model if record is not None else (spec.model or config.model)
-        #  免确认只给"纯只读且无 MCP"的有效集合；否则父级审批穿透
-        readonly_run = set(tools_list) <= set(Toolbox.READONLY) and mcp_view is None
-        sub_config = Config(
-            base_url=config.base_url,
-            model=model,
-            summary_model=config.summary_model,
-            explore_model=config.explore_model,
-            workspace=workdir,
-            max_iterations=spec.max_iterations,
-            max_tool_output=config.max_tool_output,
-            context_limit_override=config.context_limit_override,
-            compact_at=config.compact_at,
-            keep_recent=config.keep_recent,
-            request_timeout=config.request_timeout,
-            extra_env=config.extra_env,
-            bash_timeout=config.bash_timeout,
-            sandbox=config.sandbox,
-            sandbox_network=config.sandbox_network,
-            auto_approve=readonly_run or config.auto_approve,
-            mcp_tool_search=config.mcp_tool_search,
-            enable_explore=False,
-            enable_web_search=False,
-            enable_skills=False,
-            enable_plan=False,
-            enable_plugins=False,
-            enable_mcp=False,
-            enable_hooks=False,
-            enable_agents=False,
-        )
-        label = "恢复" if record is not None else "委托"
-        sink.emit(Notice(f"  🤖 {spec.name}（{model}）{label}：{ui.preview(task, 90)}"))
-        child_maker = getattr(sink, "quiet_child", None)
-        sub_agent = Agent(
-            sub_config,
-            Toolbox(sub_config, only=list(tools_list), mcp_view=mcp_view),
-            usage=usage,
-            registry=registry,
-            quiet=True,
-            allow_explore=False,
-            #  权限不因声明放大：写/执行/MCP 复用父级审批；deny 规则（含
-            #  read_file 路径类）对只读子集同样穿透——permissions 一律传父级的
-            approver=None if readonly_run else approver,
-            permissions=permissions,
-            sink=child_maker() if callable(child_maker) else None,
-        )
-        system_text = spec.system_prompt.format(workspace=workdir)
-        if record is not None:
-            #  transcript 续用、system 头按当前 spec 重渲染（body 继承，
-            #  head 以现在的定义为准）
-            sub_agent.messages = copy.deepcopy(record.messages)
-            sub_agent.messages[0] = {"role": "system", "content": system_text}
-        else:
-            sub_agent.messages[0]["content"] = system_text
-        failure = ""
-        try:
-            sub_agent.send(task)
-        except Exception as exc:  # noqa: BLE001 - 委托失败不该打断主流程
-            failure = f"{type(exc).__name__}: {exc}"
-
-        #  -- worktree 收尾：本次新建的，干净就删、有改动就保留报路径；
-        #     resume 复用的一律保留 --
-        kept = inherited_wt
-        if created is not None:
-            if worktree.dirty(created):
-                kept = created
-            else:
-                worktree.remove(config.workspace, created)
-                kept = None
-
-        #  -- 存档（失败的也记：从 failed 恢复继续修是 resume 的正当用法） --
-        run_id = uuid.uuid4().hex[:8]
-        store[run_id] = SubagentRun(
-            id=run_id,
-            spec_name=spec.name,
-            model=model,
-            messages=copy.deepcopy(sub_agent.messages),
-            worktree=kept,
-        )
-        while len(store) > MAX_RUNS:
-            store.pop(next(iter(store)))
+        if result.error:
+            return result.error
 
         #  resume 句柄写进返回文本：只放结构化
         #  字段模型学不会用，写在眼前才会形成"多阶段委托"的用法
         footer_lines = [
-            f"resume_from: {run_id}"
+            f"resume_from: {result.run_id}"
             f"（要在这个子 agent 的上下文上继续，调 {spec.name} 时带上它）"
         ]
-        if kept is not None:
+        if result.worktree is not None:
             footer_lines.append(
-                f"改动在独立 worktree：{kept}（主工作区未动；"
+                f"改动在独立 worktree：{result.worktree}（主工作区未动；"
                 "用 git -C 该路径 diff 查看，确认后 git apply 取回）"
             )
-        footer_lines.extend(notes)
+        footer_lines.extend(result.notes)
         footer = "\n".join(footer_lines)
-        if failure:
-            return f"ERROR: 子 agent {spec.name} 失败（{failure}）。\n{footer}"
-        answer = sub_agent.last_assistant_text()
-        sink.emit(Notice(f"  🤖 {spec.name} 完成：{len(sub_agent.trace)} 次工具调用"))
+        if result.failure:
+            return f"ERROR: 子 agent {spec.name} 失败（{result.failure}）。\n{footer}"
+        answer = result.answer
         if not answer:
             return f"子 agent {spec.name} 没有给出结论（可能是轮次用尽）。\n{footer}"
         if len(answer) > MAX_ANSWER_CHARS:
             answer = answer[:MAX_ANSWER_CHARS] + "\n…（结论过长已截断）"
         return (
-            f"[{spec.name} 子 agent 的结论（{model}，{len(sub_agent.trace)} 次工具调用）]\n"
+            f"[{spec.name} 子 agent 的结论（{result.model}，{result.tool_calls} 次工具调用）]\n"
             f"{answer}\n\n{footer}"
         )
 

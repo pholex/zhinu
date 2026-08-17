@@ -77,6 +77,42 @@ def create(workspace: Path, prefix: str) -> Path:
     return path
 
 
+def create_branch(workspace: Path, branch: str, prefix: str, base: str) -> Path:
+    """在配置目录下建**挂在命名分支上**的 worktree（宸枢的 mission 隔离用）。
+
+    与 create() 的差别只在分支形态：mission 的改动要经 `git merge --no-ff`
+    收回主干，必须长在真实分支上，detached HEAD 合并不回来。分支已存在
+    （崩溃后重建 worktree）就直接复用，否则从 base 新建。
+    """
+    root = git_root(workspace)
+    if root is None:
+        raise WorktreeError(f"{workspace} 不在 git 仓库里")
+    if shutil.which("git") is None:
+        raise WorktreeError("找不到 git 命令")
+    slug = f"{root.name}-{hashlib.sha256(str(root).encode('utf-8')).hexdigest()[:8]}"
+    path = user_config_dir() / "worktrees" / slug / f"{prefix}-{uuid.uuid4().hex[:6]}"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    exists = (
+        _run_git(["rev-parse", "--verify", "--quiet", f"refs/heads/{branch}"], cwd=root).returncode
+        == 0
+    )
+    args = (
+        ["worktree", "add", str(path), branch]
+        if exists
+        else ["worktree", "add", "-b", branch, str(path), base]
+    )
+    try:
+        result = _run_git(args, cwd=root)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise WorktreeError(f"git worktree add 失败：{exc}") from exc
+    if result.returncode != 0:
+        tail = (result.stderr or result.stdout).strip().splitlines()
+        raise WorktreeError(
+            f"git worktree add 失败：{tail[-1] if tail else 'exit ' + str(result.returncode)}"
+        )
+    return path
+
+
 def dirty(path: Path) -> bool:
     """worktree 里有没有改动（含未跟踪文件）。查不出来按有改动算——
     宁可多留一个目录，不能把没看过的改动删了。"""

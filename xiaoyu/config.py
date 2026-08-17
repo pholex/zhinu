@@ -257,6 +257,16 @@ class Config:
     #  是否加载声明式 subagent（agents/*.toml，见 agents.py；工作区级安全——
     #  spec 能声明的最大权限=用户逐次批准的权限，见该模块 docstring）。
     enable_agents: bool = True
+    #  七襄（qixiang，批量并行委托）的并发上限。默认 4：单机直连场景的保守值
+    #  （上限式并发，不做自适应爬坡——理由见 qixiang.py docstring）。
+    qixiang_concurrency: int = 4
+    #  七襄单项任务的墙钟超时（秒，从实际启动起算，排队不计）。0 = 不限时，
+    #  项的运行时长由 spec 的 max_iterations 自然封顶。
+    qixiang_task_timeout: int = 0
+    #  是否挂载宸枢（chenshu，编排总控模式，见 chenshu.py）。
+    enable_chenshu: bool = True
+    #  宸枢同时在跑的成员上限（worker + reviewer 合计）。
+    chenshu_max_workers: int = 4
     #  是否登记进本机会话表、并接收其它会话投来的消息（见 peers.py）。
     #  只在交互模式生效。**--yolo 下默认关闭**：无人值守 + 可被本机任意进程
     #  投喂指令，两者叠加才是真风险；要开就显式 XIAOYU_ENABLE_PEERS=1。
@@ -372,6 +382,17 @@ class Config:
             cfg.mcp_tool_search = flag.strip().lower() not in ("0", "false", "no", "off")
         if (flag := os.environ.get("XIAOYU_ENABLE_AGENTS")) is not None:
             cfg.enable_agents = flag.strip().lower() not in ("0", "false", "no", "off")
+        if raw := os.environ.get("XIAOYU_QIXIANG_CONCURRENCY"):
+            with contextlib.suppress(ValueError):
+                cfg.qixiang_concurrency = max(1, min(int(raw), 16))
+        if raw := os.environ.get("XIAOYU_QIXIANG_TIMEOUT"):
+            with contextlib.suppress(ValueError):
+                cfg.qixiang_task_timeout = max(0, int(raw))
+        if (flag := os.environ.get("XIAOYU_ENABLE_CHENSHU")) is not None:
+            cfg.enable_chenshu = flag.strip().lower() not in ("0", "false", "no", "off")
+        if raw := os.environ.get("XIAOYU_CHENSHU_MAX_WORKERS"):
+            with contextlib.suppress(ValueError):
+                cfg.chenshu_max_workers = max(1, min(int(raw), 16))
         peers_flag = os.environ.get("XIAOYU_ENABLE_PEERS")
         if peers_flag is not None:
             cfg.enable_peers = peers_flag.strip().lower() not in ("0", "false", "no", "off")
