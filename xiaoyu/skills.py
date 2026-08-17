@@ -156,31 +156,113 @@ def load_skill_body(skill: Skill) -> str:
 DESCRIPTION_CAP = 250
 
 
+#  预算不够时的说明。技能全在、只是描述变短——不说清楚，模型会把截断的
+#  描述当成技能的全部能力，从而漏掉本该匹配上的技能。
+_SHORTENED_NOTE = "- （预算所限，以上部分描述已截短；技能一个不少，要用哪个先用 skill 工具读完整说明）"
+
+
+def _omitted_note(count: int) -> str:
+    return f"- …还有 {count} 个技能超出索引预算未列出（/skills 可查看全部）"
+
+
+def _render(name: str, description: str) -> str:
+    return f"- {name}: {description}" if description else f"- {name}"
+
+
+def _line_cost(line: str) -> int:
+    """一行的成本要含它后面的换行符：行是 "\\n".join 起来的，不记账就会
+    系统性超支（每行漏 1 个字符，几十行就是好几个 token）。"""
+    return tokens.estimate_text(line + "\n")
+
+
 def index_block(skills: list[Skill], max_tokens: int | None = None) -> str:
     """拼进 system prompt 的技能索引。空列表返回空串。
 
-    max_tokens 是整个索引块的估算 token 预算（调用方一般给上下文窗口的
-    1%）：技能装得再多，
-    常驻开销也被封顶；超预算的技能不进索引，但 /skills 和 skill 工具仍可用。
+    max_tokens 是整个索引块的估算 token 预算（调用方给上下文窗口的 2%）。
+    超预算时**分三级降级，技能名尽最大努力保住**——索引的唯一作用是让模型
+    "看见"某个技能存在，整条丢掉等于这个技能静默失效（装了却永不被选中），
+    这比多花几百 token 糟得多：
+
+    1. 全量放得下 → 全放；
+    2. 放不下、但"只列名字"放得下 → 剩余额度**逐字符轮流**分给各条描述，
+       谁也不能独吞（否则前几个技能吃光预算，后面全成光名字）；
+    3. 连名字都放不下 → 才开始丢，尾部折叠成一行提示。
+
+    任何一级降级都不影响 /skills 和 skill 工具：它们看的是完整技能表。
+
+    下限：表头 + 尾部提示 + 一个光名字（约 90 token）压不下去。max_tokens
+    比这还小时照样输出这个最小块——技能表整块消失比略微超支糟得多。按 2%
+    比例算，只有上下文窗口小于 ~5k 才会踩到，现实中不存在。
     """
     if not skills:
         return ""
-    lines = [
+    header = [
         "",
         "可用技能（当任务和某个技能的描述匹配时，先用 skill 工具加载它的完整说明，再按说明执行）：",
     ]
-    spent = sum(tokens.estimate_text(line) for line in lines)
-    shown = 0
+    entries: list[tuple[str, str]] = []
     for skill in skills:
         description = skill.description or "（无描述）"
         if len(description) > DESCRIPTION_CAP:
             description = description[:DESCRIPTION_CAP] + "…"
-        line = f"- {skill.name}: {description}"
-        cost = tokens.estimate_text(line)
-        if max_tokens is not None and spent + cost > max_tokens and shown > 0:
-            lines.append(f"- …还有 {len(skills) - shown} 个技能超出索引预算未列出（/skills 可查看全部）")
+        entries.append((skill.name, description))
+
+    budget = None
+    if max_tokens is not None:
+        budget = max(max_tokens - sum(_line_cost(line) for line in header), 0)
+    lines, note = _allocate(entries, budget)
+    return "\n".join(header + lines + ([note] if note else []))
+
+
+def _allocate(entries: list[tuple[str, str]], budget: int | None) -> tuple[list[str], str | None]:
+    """按预算把 entries 渲染成索引行。返回 (行, 尾部提示或 None)。"""
+    full = [_render(name, description) for name, description in entries]
+    if budget is None or sum(_line_cost(line) for line in full) <= budget:
+        return full, None
+
+    #  放不下就一定会带一行提示——先把它的开销从预算里扣掉，别让提示本身超支。
+    #  两种提示取贵的那个：这时还不知道会降到第 2 级还是第 3 级。
+    reserve = max(_line_cost(_SHORTENED_NOTE), _line_cost(_omitted_note(len(entries))))
+    budget = max(budget - reserve, 0)
+
+    #  每行的固定开销按带分隔符和换行的 "- name: \n" 算（真渲染成光名字时只会
+    #  更省），描述的边际成本才是水填充要分配的东西。
+    costs = [tokens.estimate_prefix_costs(f"- {name}: \n", description) for name, description in entries]
+    base = sum(row[0] for row in costs)
+    if base <= budget:
+        return _waterfill(entries, costs, budget - base), _SHORTENED_NOTE
+
+    #  第 3 级：光名字也塞不下，能列几个列几个（至少留一个，否则索引形同虚设）
+    lines: list[str] = []
+    spent = 0
+    for (name, _), row in zip(entries, costs):
+        if spent + row[0] > budget and lines:
             break
-        lines.append(line)
-        spent += cost
-        shown += 1
-    return "\n".join(lines)
+        lines.append(_render(name, ""))
+        spent += row[0]
+    return lines, _omitted_note(len(entries) - len(lines))
+
+
+def _waterfill(
+    entries: list[tuple[str, str]], costs: list[list[int]], spare: int
+) -> list[str]:
+    """剩余额度逐字符轮流分给各条描述，直到谁都再多要一个字符都超支。
+
+    轮流（而不是按顺序装满）是关键：技能表按名字排序，顺序装满等于让字母序
+    靠前的技能吃光预算。
+    """
+    taken = [0] * len(entries)
+    while True:
+        progressed = False
+        for index, row in enumerate(costs):
+            if taken[index] >= len(row) - 1:
+                continue
+            delta = row[taken[index] + 1] - row[taken[index]]
+            if delta <= spare:
+                taken[index] += 1
+                spare -= delta
+                progressed = True
+        if not progressed:
+            break
+    #  截短处不补省略号：补了就得为它再记账，而"描述被截短"已由尾部提示统一说明。
+    return [_render(name, description[:count]) for (name, description), count in zip(entries, taken)]

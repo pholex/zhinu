@@ -10,7 +10,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from xiaoyu import skills
+from xiaoyu import skills, tokens
 from xiaoyu.tools import Tool
 
 
@@ -165,21 +165,82 @@ class ScanTest(unittest.TestCase):
         self.assertLess(len(line), 300)
         self.assertTrue(line.endswith("…"))
 
-    def test_index_respects_token_budget(self):
-        for index in range(20):
+    def _write_bulk(self, count: int, description_chars: int = 100) -> list[skills.Skill]:
+        for index in range(count):
             write_skill(
                 self.primary,
                 f"skill{index:02d}",
-                f"name: skill{index:02d}\ndescription: " + "活" * 100,
+                f"name: skill{index:02d}\ndescription: " + "活" * description_chars,
             )
-        found = skills.scan_skills()
-        #  预算很小：只装得下前几个，尾部折叠成一行提示
+        return skills.scan_skills()
+
+    def test_index_respects_token_budget(self):
+        found = self._write_bulk(20)
         block = skills.index_block(found, max_tokens=500)
+        self.assertLessEqual(tokens.estimate_text(block), 500)
+        #  不设预算则全部列出，且明显更长
+        self.assertLess(len(block), len(skills.index_block(found)))
+        self.assertIn("skill19", skills.index_block(found))
+
+    def test_index_shortens_descriptions_before_dropping_skills(self):
+        """第 2 级降级：预算不够时截短描述，技能名一个都不能少。
+
+        整条丢掉 = 该技能对模型静默失效（装了却永远不被选中），
+        比多花 token 糟得多——这是这个预算机制存在的意义所在。
+        """
+        found = self._write_bulk(20)
+        block = skills.index_block(found, max_tokens=500)
+        for index in range(20):
+            self.assertIn(f"skill{index:02d}", block)
+        self.assertIn("已截短", block)
+        self.assertNotIn("超出索引预算未列出", block)
+        #  描述确实被截了：没有哪一条还留着完整的 100 个字
+        self.assertNotIn("活" * 100, block)
+
+    def test_index_waterfill_is_fair(self):
+        """剩余额度轮流分：不能让排在前面的技能吃光预算、后面全成光名字。"""
+        found = self._write_bulk(20)
+        block = skills.index_block(found, max_tokens=500)
+        widths = [
+            len(row.split(": ", 1)[1]) if ": " in row else 0
+            for row in block.splitlines()
+            if row.startswith("- skill")
+        ]
+        self.assertEqual(len(widths), 20)
+        #  轮流分配下每条描述长度最多差一个字符
+        self.assertLessEqual(max(widths) - min(widths), 1)
+        self.assertGreater(min(widths), 0)
+
+    def test_index_drops_only_when_names_alone_overflow(self):
+        """第 3 级降级：光名字也塞不下时才丢，并折叠成一行提示。"""
+        found = self._write_bulk(60)
+        block = skills.index_block(found, max_tokens=150)
+        self.assertLessEqual(tokens.estimate_text(block), 150)
         self.assertIn("skill00", block)
         self.assertIn("超出索引预算未列出", block)
-        self.assertLess(len(block), len(skills.index_block(found)))
-        #  不设预算则全部列出
-        self.assertIn("skill19", skills.index_block(found))
+        #  丢弃路径上留下来的是光名字，不带描述
+        self.assertNotIn("- skill00: ", block)
+
+    def test_index_budget_covers_the_trailing_note(self):
+        """尾部提示行自己也要计入预算，不能靠它超支。
+
+        换行符同理：行是 "\\n".join 起来的，每行漏记 1 个字符、几十行就超支。
+        """
+        found = self._write_bulk(30)
+        for budget in (100, 200, 600, 1500):
+            with self.subTest(budget=budget):
+                block = skills.index_block(found, max_tokens=budget)
+                self.assertLessEqual(tokens.estimate_text(block), budget)
+
+    def test_index_never_vanishes_below_its_floor(self):
+        """预算小于索引块的物理下限（表头+提示+一个名字）时超支也要出块。
+
+        技能表整块消失 = 所有技能对模型静默失效，比略微超支糟得多。
+        """
+        found = self._write_bulk(60)
+        block = skills.index_block(found, max_tokens=1)
+        self.assertIn("skill 工具", block)
+        self.assertIn("skill00", block)
 
 
 class AgentSkillIntegrationTest(unittest.TestCase):

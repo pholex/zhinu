@@ -768,8 +768,9 @@ class Agent:
     _PROJECT_DOC_NAMES = ("AGENTS.md", "XIAOYU.md", "CLAUDE.md")
     #  指令文件的字符上限：它常驻每一轮请求，不能无限大
     _PROJECT_DOC_CAP = 12_000
-    #  技能索引占上下文窗口的预算比例
-    _SKILL_BUDGET_RATIO = 0.01
+    #  技能索引占上下文窗口的预算比例。超预算不是丢技能而是逐字符截短描述
+    #  （见 skills.index_block），所以这个比例只影响描述的详略、不影响技能可见性。
+    _SKILL_BUDGET_RATIO = 0.02
 
     def _system_prompt(self) -> str:
         """组装 system prompt。

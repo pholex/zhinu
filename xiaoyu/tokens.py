@@ -38,11 +38,34 @@ def _is_cjk(char: str) -> bool:
     return any(low <= code <= high for low, high in _CJK_RANGES)
 
 
+def _cost(cjk: int, length: int) -> int:
+    """字符统计 → token 估算。成本公式只此一处，逐字符前缀版也走它。"""
+    if length == 0:
+        return 0
+    return int(cjk + (length - cjk) / _CHARS_PER_TOKEN) + 1
+
+
 def estimate_text(text: str | None) -> int:
     if not text:
         return 0
-    cjk = sum(1 for char in text if _is_cjk(char))
-    return int(cjk + (len(text) - cjk) / _CHARS_PER_TOKEN) + 1
+    return _cost(sum(1 for char in text if _is_cjk(char)), len(text))
+
+
+def estimate_prefix_costs(head: str, body: str) -> list[int]:
+    """`[cost(head), cost(head+body[:1]), …, cost(head+body)]`，长度 len(body)+1。
+
+    等价于对每个前缀调一次 estimate_text，但只扫一遍 body：按字符 granularity
+    分配预算（skills.index_block 的水填充）时逐次 estimate_text 是 O(n²)。
+    """
+    cjk = sum(1 for char in head if _is_cjk(char))
+    length = len(head)
+    costs = [_cost(cjk, length)]
+    for char in body:
+        length += 1
+        if _is_cjk(char):
+            cjk += 1
+        costs.append(_cost(cjk, length))
+    return costs
 
 
 def estimate_content(content: Any) -> int:
