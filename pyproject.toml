@@ -40,6 +40,13 @@ tui = [
 browser = [
     "playwright==1.62.0",
 ]
+# 可选：`xiaoyu serve` 的 HTTP API（给 n8n / Dify 这类编排器用）。
+# 只影响这一条命令，缺包时 serve 报一句怎么装就退出。选 fastapi 是为了让
+# OpenAPI schema 由代码生成（Dify 自定义工具吃它），手写的会随代码漂移。
+serve = [
+    "fastapi==0.121.2",
+    "uvicorn==0.41.0",
+]
 
 [project.urls]
 Repository = "https://github.com/pholex/zhinu"
