@@ -505,6 +505,8 @@ class Toolbox:
         #  - 嵌入宿主自建 manager（按宿主声明的 server 清单构造 ServerSpec +
         #    McpManager）后经此接线——server 生命周期归调用方，admission /
         #    OSV 闸在 server 启动层照常执行，不因注入而绕过。
+        #  enable_mcp 只 gate 配置发现分支：显式注入=宿主明确要，开关不拦
+        #  （宿主要关就别传 view，两个旋钮不叠加）。
         #  受限子集（only）没有 view 时也不 launch。
         self._mcp: Any
         if mcp_view is not None:
