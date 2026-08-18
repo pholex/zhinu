@@ -107,7 +107,7 @@ douqiao(
 ## 宸枢：统筹织造模式（Sovereign-Weave Mode）
 
 `chenshu_init` 启动（需要 git 仓库且至少一个 commit）。主 agent 化身唯一
-的编排者（塔），工作流：
+的编排者（总枢），工作流：
 
 1. **chenshu_plan** 把目标拆成 mission：`build` 必须给 `scope`（目录/glob，
    **两两不相交**，共享文件归属唯一一个 mission）；`survey` 是只读调研；
@@ -123,8 +123,8 @@ douqiao(
 协议由代码而非提示词强制：
 
 - **通信**：成员之间 `chenshu_send` / `chenshu_inbox` 点对点或广播直连
-  （塔是协调者不是内容中继）；scope 外的发现用 `chenshu_finding` 归档，
-  由塔分派——**发现不等于授权**，worker 越出自己 worktree 的写操作会被
+  （总枢是协调者不是内容中继）；scope 外的发现用 `chenshu_finding` 归档，
+  由总枢分派——**发现不等于授权**，worker 越出自己 worktree 的写操作会被
   审批层直接拒绝。
 - **merge 五道闸**：deps 已合 → 有评审且最新一轮 `clean` → 评审盖的
   commit 等于分支当前 tip（**分支一动 clean 自动作废**）→ diff 文件全部

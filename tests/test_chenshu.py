@@ -204,7 +204,7 @@ class CommsTest(ChenshuCase):
     def test_read_filters_by_caller(self):
         self.runtime.send("w1", "w2", "点对点", "只有 w2 能看")
         self.runtime.send("w2", "all", "广播", "所有人可见")
-        self.runtime.send("w1", "chenshu", "升级", "给塔")
+        self.runtime.send("w1", "chenshu", "升级", "给总枢")
         w2_view = self.runtime.read_inbox("w2")
         self.assertIn("点对点", w2_view)
         self.assertIn("广播", w2_view)

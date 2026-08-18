@@ -1,7 +1,7 @@
 """宸枢（chenshu）：统筹织造模式（Sovereign-Weave）——总枢坐镇其上，规划、
 分派、监督、汇总，统御众羽协同推进巨型工程。
 
-宸=帝居/北极所在，枢=天枢/中枢。主 agent 化身唯一的"宸枢"（塔），把一个
+宸=帝居/北极所在，枢=天枢/中枢。主 agent 化身唯一的"宸枢"（总枢），把一个
 仓库的大工程拆成 scope 互不重叠的 mission，为每个 mission 起一个跑在
 **独立 git 分支 worktree** 里的 worker，评审通过、依赖齐备后经唯一的
 merge 闸收回主干。与七襄（qixiang，一次性批量扇出）的分工：七襄是
@@ -18,8 +18,8 @@ merge 闸收回主干。与七襄（qixiang，一次性批量扇出）的分工�
   全部命中 mission scope → 主 checkout 必须停在 base 分支上。
   被挡下的合并也写日志：拒绝是一个带理由的决策。
 
-同步架构的适配（与"塔挂起等唤醒"的事件驱动形态的刻意分叉）：
-- worker 在工作线程里跑，完成时进事件队列 + 搭通知轨道；塔用
+同步架构的适配（与"编排者挂起等唤醒"的事件驱动形态的刻意分叉）：
+- worker 在工作线程里跑，完成时进事件队列 + 搭通知轨道；总枢用
   **chenshu_wait**（有界阻塞，默认 300s）显式等下一个事件，而不是结束
   回合等外部唤醒——xiaoyu 的回合由用户驱动，没有自续回合的机制，
   显式等待是同步回路里的正确形态。
@@ -53,7 +53,7 @@ from .config import Config
 from .events import Notice, UISink
 from .tools import Tool, Toolbox
 
-TOWER = "chenshu"
+CHENSHU = "chenshu"
 BROADCAST = "all"
 MISSION_KINDS = ("build", "survey")
 #  worker 工具集（比声明式 subagent 的 20 轮宽裕：mission 是大活）
@@ -121,7 +121,7 @@ def _scope_stem(pattern: str) -> str:
 
 
 def scopes_conflict(a: str, b: str) -> bool:
-    """保守判定：根干相等或互为路径前缀即冲突（宁可误报逼塔拆细）。"""
+    """保守判定：根干相等或互为路径前缀即冲突（宁可误报逼总枢拆细）。"""
     sa, sb = _scope_stem(a), _scope_stem(b)
     if not sa or not sb:
         return True
@@ -170,7 +170,7 @@ class Member:
     mission_id: str = ""
     review_target: str = ""
     status: str = "running"  # running | done | failed | retired
-    #  完成后的交接摘要（塔在 wait/status 里看）
+    #  完成后的交接摘要（总枢在 wait/status 里看）
     handoff: str = ""
 
 
@@ -326,7 +326,7 @@ class ChenshuRuntime:
             retired: list[str] = []
             if adopted:
                 #  收养：mission/worktree/审计全保留；线程不跨进程，
-                #  花名册里还挂着 running 的一律退役，由塔重新 spawn
+                #  花名册里还挂着 running 的一律退役，由总枢重新 spawn
                 for member in self.members:
                     if member.status == "running":
                         member.status = "retired"
@@ -336,7 +336,7 @@ class ChenshuRuntime:
             self._exclude_from_git(root)
             self.active = True
             self._save()
-            self.log(TOWER, "adopt" if adopted else "init", base=self.base_branch)
+            self.log(CHENSHU, "adopt" if adopted else "init", base=self.base_branch)
         lines = [
             f"宸枢已启动。base 分支：{self.base_branch}，协议目录：{self.root}",
             "工作流：chenshu_plan 拆 mission（scope 两两不相交）→ chenshu_spawn "
@@ -433,7 +433,7 @@ class ChenshuRuntime:
             self.missions.extend(new)
             self._save()
             for mission in new:
-                self.log(TOWER, "plan", mission=mission.id, kind=mission.kind, title=mission.title)
+                self.log(CHENSHU, "plan", mission=mission.id, kind=mission.kind, title=mission.title)
         lines = [f"已登记 {len(new)} 个 mission："]
         for mission in new:
             lines.append(
@@ -453,7 +453,7 @@ class ChenshuRuntime:
 
     def send(self, sender: str, to: str, subject: str, body: str) -> str:
         self._require_active()
-        names = {m.name for m in self.members} | {TOWER, BROADCAST}
+        names = {m.name for m in self.members} | {CHENSHU, BROADCAST}
         if to not in names:
             raise ChenshuError(
                 f"ERROR: 收件人 {to!r} 不在花名册里。可选：{', '.join(sorted(names))}"
@@ -481,7 +481,7 @@ class ChenshuRuntime:
             meta, body = _parse_front(path)
             to = meta.get("to", "")
             #  读时过滤而非消费：没有已读标记，"处理过没有"靠调用方自己的上下文
-            if caller != TOWER and to not in (caller, BROADCAST):
+            if caller != CHENSHU and to not in (caller, BROADCAST):
                 continue
             entries.append(
                 (meta.get("sent_at", ""), meta.get("from", "?"), to,
@@ -509,11 +509,11 @@ class ChenshuRuntime:
         (directory / name).write_text(
             f"---\nfrom: {sender}\ntype: {kind}\n{mission_note}filed_at: {_now_iso()}\n---\n\n"
             f"# {title}\n\n{body}\n\n## 为什么没有直接修\n"
-            "发现者的 scope 不含此处；越界改动会破坏 scope 隔离，故归档待塔分派。\n",
+            "发现者的 scope 不含此处；越界改动会破坏 scope 隔离，故归档待总枢分派。\n",
             encoding="utf-8",
         )
         self.log(sender, "finding.file", type=kind, title=ui.preview(title, 60))
-        return "已归档。塔会决定：分派给现有 mission / 新开 mission / 进 backlog。"
+        return "已归档。总枢会决定：分派给现有 mission / 新开 mission / 进 backlog。"
 
     # ---------- review ----------
 
@@ -523,13 +523,13 @@ class ChenshuRuntime:
         if mission is None or not mission.branch:
             raise ChenshuError(f"ERROR: {target!r} 不是任何 build mission 的 id/分支。")
         member = self.member(caller)
-        allowed = caller == TOWER or (
+        allowed = caller == CHENSHU or (
             member is not None
             and member.kind == "reviewer"
             and member.review_target in (mission.id, mission.branch)
         )
         if not allowed:
-            raise ChenshuError("ERROR: 只有被指派到该目标的 reviewer（或塔）能提交评审。")
+            raise ChenshuError("ERROR: 只有被指派到该目标的 reviewer（或总枢）能提交评审。")
         verdict = verdict.strip().lower()
         if verdict != "clean" and not re.match(r"^p[12]-\d+", verdict):
             raise ChenshuError(
@@ -588,7 +588,7 @@ class ChenshuRuntime:
                 if (d := self.mission(dep)) is None or d.status != "merged"
             ]
             if unmet:
-                self.log(TOWER, "merge.blocked", mission=mission.id, reason="deps-unmerged")
+                self.log(CHENSHU, "merge.blocked", mission=mission.id, reason="deps-unmerged")
                 raise ChenshuError(
                     f"ERROR: 依赖未合并：{', '.join(unmet)}——按 deps 顺序先合它们。"
                 )
@@ -596,20 +596,20 @@ class ChenshuRuntime:
             if mission.kind == "survey":
                 mission.status = "merged"
                 self._save()
-                self.log(TOWER, "merge.noop", mission=mission.id)
+                self.log(CHENSHU, "merge.noop", mission=mission.id)
                 return f"{mission.id} 是 survey，无代码可合，已标记完结。"
             root = worktree.git_root(self.config.workspace)
             assert root is not None
             current = _git_out(["branch", "--show-current"], root)
             if current != self.base_branch:
-                self.log(TOWER, "merge.blocked", mission=mission.id, reason="base-mismatch")
+                self.log(CHENSHU, "merge.blocked", mission=mission.id, reason="base-mismatch")
                 raise ChenshuError(
                     f"ERROR: 主 checkout 在 {current or 'detached HEAD'}，不在 base"
                     f"（{self.base_branch}）上——切回去再合，否则合并落不到正确的分支。"
                 )
             owner_thread = self._threads.get(mission.owner)
             if owner_thread is not None and owner_thread.is_alive():
-                self.log(TOWER, "merge.blocked", mission=mission.id, reason="worker-running")
+                self.log(CHENSHU, "merge.blocked", mission=mission.id, reason="worker-running")
                 raise ChenshuError(
                     f"ERROR: {mission.owner} 还在跑——chenshu_wait 等它收工再合。"
                 )
@@ -618,19 +618,19 @@ class ChenshuRuntime:
                 raise ChenshuError(f"ERROR: 分支 {mission.branch} 不存在。")
             review = self.latest_review(mission)
             if review is None:
-                self.log(TOWER, "merge.blocked", mission=mission.id, reason="no-review")
+                self.log(CHENSHU, "merge.blocked", mission=mission.id, reason="no-review")
                 raise ChenshuError(
                     f"ERROR: {mission.id} 还没有任何评审——spawn 一个 reviewer"
                     f"（review_target={mission.id}）先过闸。"
                 )
             if review.get("verdict") != "clean":
-                self.log(TOWER, "merge.blocked", mission=mission.id, reason="not-clean")
+                self.log(CHENSHU, "merge.blocked", mission=mission.id, reason="not-clean")
                 raise ChenshuError(
                     f"ERROR: 最新一轮评审是 {review.get('verdict')}（第 "
                     f"{review.get('round')} 轮）——先修复并重评到 clean。"
                 )
             if review.get("reviewed_commit") != tip:
-                self.log(TOWER, "merge.blocked", mission=mission.id, reason="tip-moved")
+                self.log(CHENSHU, "merge.blocked", mission=mission.id, reason="tip-moved")
                 raise ChenshuError(
                     "ERROR: 评审盖的 commit 与分支当前 tip 不一致（评审后又有新提交）"
                     "——重新评审后再合。"
@@ -643,12 +643,12 @@ class ChenshuRuntime:
                     root,
                 )
             except (OSError, subprocess.TimeoutExpired) as exc:
-                self.log(TOWER, "merge.blocked", mission=mission.id, reason="diff-failed")
+                self.log(CHENSHU, "merge.blocked", mission=mission.id, reason="diff-failed")
                 raise ChenshuError(
                     f"ERROR: scope 检查失败（git diff 出错：{exc}）——拒绝合并，稍后重试。"
                 ) from exc
             if diff_result.returncode != 0:
-                self.log(TOWER, "merge.blocked", mission=mission.id, reason="diff-failed")
+                self.log(CHENSHU, "merge.blocked", mission=mission.id, reason="diff-failed")
                 raise ChenshuError(
                     "ERROR: scope 检查失败（git diff 非零退出）——拒绝合并，稍后重试。"
                 )
@@ -656,7 +656,7 @@ class ChenshuRuntime:
             #  build 分支空 diff = worker 多半没 commit（CI 上 git 身份缺失时
             #  commit 静默失败就是这个形态）。静默合并会把失败掩盖成成功
             if not files:
-                self.log(TOWER, "merge.blocked", mission=mission.id, reason="empty-diff")
+                self.log(CHENSHU, "merge.blocked", mission=mission.id, reason="empty-diff")
                 raise ChenshuError(
                     f"ERROR: {mission.branch} 相对 {self.base_branch} 没有任何已提交"
                     "改动——worker 是否忘了 git commit？确认确实无代码可交付，"
@@ -664,7 +664,7 @@ class ChenshuRuntime:
                 )
             offenders = [f for f in files if not scope_match(f, mission.scope)]
             if offenders:
-                self.log(TOWER, "merge.blocked", mission=mission.id, reason="out-of-scope")
+                self.log(CHENSHU, "merge.blocked", mission=mission.id, reason="out-of-scope")
                 raise ChenshuError(
                     "ERROR: 改动越出 mission scope：" + ", ".join(offenders[:10])
                     + ("…" if len(offenders) > 10 else "")
@@ -683,7 +683,7 @@ class ChenshuRuntime:
                 #  只有真冲突才给"rebase 解冲突"的指引；其它失败（git 身份缺失、
                 #  钩子拒绝……）要把 git 的原话摆出来，别拿冲突剧本误导
                 if "CONFLICT" in combined:
-                    self.log(TOWER, "merge.blocked", mission=mission.id, reason="conflict")
+                    self.log(CHENSHU, "merge.blocked", mission=mission.id, reason="conflict")
                     raise ChenshuError(
                         "ERROR: 合并冲突，已回滚（scope 不相交时不该发生——多半是别的"
                         " mission 先合入了公共文件）。让 owner 在 worktree 里 rebase "
@@ -691,11 +691,11 @@ class ChenshuRuntime:
                     )
                 tail = combined.strip().splitlines()
                 detail = tail[-1] if tail else f"exit {result.returncode}"
-                self.log(TOWER, "merge.blocked", mission=mission.id, reason="merge-failed")
+                self.log(CHENSHU, "merge.blocked", mission=mission.id, reason="merge-failed")
                 raise ChenshuError(f"ERROR: git merge 失败（{detail}），已回滚——处理后重试。")
             mission.status = "merged"
             self._save()
-            self.log(TOWER, "merge", mission=mission.id, tip=tip[:10], files=len(files))
+            self.log(CHENSHU, "merge", mission=mission.id, tip=tip[:10], files=len(files))
             #  合并后提醒：其它未合分支若碰了同一批文件，rebase 后 tip 会动，
             #  评审闸自动强制它们重评
             merged_set = set(files)
@@ -733,10 +733,10 @@ class ChenshuRuntime:
         self._require_active()
         if not _NAME_RE.match(name or ""):
             raise ChenshuError("ERROR: name 须为小写字母开头的 2-32 位标识。")
-        #  保留名：chenshu 是塔的身份（caller==TOWER 是全部特权检查的钥匙），
+        #  保留名：chenshu 是总枢的身份（caller==CHENSHU 是全部特权检查的钥匙），
         #  all 是广播地址——成员顶用这两个名字等于伪造身份/劫持广播
-        if name in (TOWER, BROADCAST):
-            raise ChenshuError(f"ERROR: {name!r} 是保留名（塔/广播地址），换一个。")
+        if name in (CHENSHU, BROADCAST):
+            raise ChenshuError(f"ERROR: {name!r} 是保留名（总枢/广播地址），换一个。")
         if kind not in ("worker", "reviewer"):
             raise ChenshuError("ERROR: kind 只能是 worker 或 reviewer。")
         with self.lock:
@@ -810,7 +810,7 @@ class ChenshuRuntime:
                 existing.status = "running"
                 existing.handoff = ""
             self._save()
-            self.log(TOWER, "spawn", name=name, kind=kind,
+            self.log(CHENSHU, "spawn", name=name, kind=kind,
                      target=mission.id if mission else review_target, resume=resume)
 
         briefing = self._briefing(name, kind, mission, review_target, instructions)
@@ -839,7 +839,7 @@ class ChenshuRuntime:
         review_target: str,
         instructions: str,
     ) -> str:
-        """briefing 由代码组装，塔只能通过 instructions 追加——协议段不给改。"""
+        """briefing 由代码组装，总枢只能通过 instructions 追加——协议段不给改。"""
         extra = f"\n补充指示：\n{instructions}\n" if instructions.strip() else ""
         if kind == "reviewer":
             target = self._mission_by_ref(review_target)
@@ -852,7 +852,7 @@ class ChenshuRuntime:
                 "评审优先级：安全 → 数据完整性 → 性能 → 错误处理 → 代码质量。\n"
                 "收尾两步缺一不可：1) chenshu_review 提交结论（clean 或 p1-N/p2-N，"
                 "正文列出每个问题的位置与理由）；2) chenshu_send 把结论通知作者"
-                "（不知道作者就发给 chenshu）。\n"
+                "（不知道作者就发给 chenshu（总枢））。\n"
                 "你无法直接与用户对话；一切沟通走 chenshu_send。" + extra
             )
         assert mission is not None
@@ -872,7 +872,7 @@ class ChenshuRuntime:
             f"（基于 {self.base_branch}）。\n"
             f"你的 scope：{scope}。write_file/str_replace 出了 worktree 会被直接拒绝；"
             "scope 之外发现的问题用 chenshu_finding 归档，绝不顺手修。\n"
-            "与其他成员/塔沟通走 chenshu_send / chenshu_inbox；"
+            "与其他成员/总枢沟通走 chenshu_send / chenshu_inbox；"
             "任务清单与状态走 chenshu_mission（只能改自己这条）。\n"
             "完成四步：1) bash 里 git add -A && git commit（不 commit 等于没干）；"
             "2) chenshu_mission 标记 status=completed；3) chenshu_send 给 chenshu 发"
@@ -944,7 +944,7 @@ class ChenshuRuntime:
                 self._agents[name] = agent
             system = (
                 f"你是「{name}」，宸枢舰队的{'评审员' if kind == 'reviewer' else '执行成员'}。"
-                "所有 user 消息来自编排方（塔）。你无法与最终用户对话；最后一条消息"
+                "所有 user 消息来自编排方（总枢）。你无法与最终用户对话；最后一条消息"
                 "就是你的全部交接，务必自包含。工作区根目录：{workspace}"
             ).format(workspace=workdir)
             if seed:
@@ -953,7 +953,7 @@ class ChenshuRuntime:
             else:
                 agent.messages[0]["content"] = system
             agent.send(briefing.replace("{workspace}", str(workdir)))
-        except Exception as exc:  # noqa: BLE001 - worker 崩溃不拖垮塔
+        except Exception as exc:  # noqa: BLE001 - worker 崩溃不拖垮总枢
             failure = f"{type(exc).__name__}: {exc}"
         finally:
             handoff = ""
@@ -998,7 +998,7 @@ class ChenshuRuntime:
             )
         return "事件：\n" + "\n---\n".join(collected)
 
-    # ---------- mission 视图/更新（worker 与塔共用） ----------
+    # ---------- mission 视图/更新（worker 与总枢共用） ----------
 
     def mission_view(self, caller: str, mission_id: str = "", patch: dict[str, Any] | None = None) -> str:
         self._require_active()
@@ -1010,8 +1010,8 @@ class ChenshuRuntime:
             if mission is None:
                 raise ChenshuError(f"ERROR: 找不到 mission {mission_id!r}。")
             if patch:
-                #  worker 只能改自己的；owner/scope 只有塔能动
-                if caller != TOWER and (member is None or member.mission_id != mission.id):
+                #  worker 只能改自己的；owner/scope 只有总枢能动
+                if caller != CHENSHU and (member is None or member.mission_id != mission.id):
                     raise ChenshuError("ERROR: 只能更新自己负责的 mission。")
                 status = str(patch.get("status", "")).strip()
                 if status:
@@ -1022,10 +1022,10 @@ class ChenshuRuntime:
                 if note:
                     mission.notes.append(note)
                 if "scope" in patch:
-                    if caller != TOWER:
-                        raise ChenshuError("ERROR: scope 只有塔能改。")
+                    if caller != CHENSHU:
+                        raise ChenshuError("ERROR: scope 只有总枢能改。")
                     mission.scope = tuple(str(s).strip() for s in patch["scope"] if str(s).strip())
-                    self.log(TOWER, "mission.scope", mission=mission.id, scope=";".join(mission.scope))
+                    self.log(CHENSHU, "mission.scope", mission=mission.id, scope=";".join(mission.scope))
                 self._save()
                 if status or note:
                     self.log(caller, "mission.update", mission=mission.id,
@@ -1127,18 +1127,18 @@ class ChenshuRuntime:
                 #  join 超时还活着的 worker 可能正在这个目录里写——绝不抽地毯
                 if mission.owner in still_alive:
                     kept.append(f"{mission.id} → {path}（{mission.owner} 仍未停稳，保留）")
-                    self.log(TOWER, "worktree.keep", mission=mission.id)
+                    self.log(CHENSHU, "worktree.keep", mission=mission.id)
                     continue
                 if worktree.dirty(path) and not force:
                     kept.append(f"{mission.id} → {path}（有未提交改动，保留）")
-                    self.log(TOWER, "worktree.keep", mission=mission.id)
+                    self.log(CHENSHU, "worktree.keep", mission=mission.id)
                     continue
                 worktree.remove(self.config.workspace, path)
                 mission.worktree = ""
                 removed += 1
             self.active = False
             self._save()
-            self.log(TOWER, "teardown", removed=removed, kept=len(kept))
+            self.log(CHENSHU, "teardown", removed=removed, kept=len(kept))
         lines = [f"宸枢已收枢：清理 {removed} 个 worktree。分支与 {self.root} 下的审计轨迹保留。"]
         lines += kept
         return "\n".join(lines)
@@ -1187,7 +1187,7 @@ def _write_guard(workdir: Path) -> Callable[[str, dict[str, Any]], Any]:
             if not inside:
                 return Deny(
                     f"越界写：{raw} 不在你的 worktree（{workdir}）内。"
-                    "scope 外的问题用 chenshu_finding 归档，由塔分派。"
+                    "scope 外的问题用 chenshu_finding 归档，由总枢分派。"
                 )
         return True
 
@@ -1228,7 +1228,7 @@ def make_member_tools(runtime: ChenshuRuntime, name: str, reviewer: bool) -> lis
     tools = [
         _tool(
             "chenshu_send",
-            "给舰队成员/塔发一条消息（to 可为成员名、chenshu=塔、all=广播）。",
+            "给舰队成员/总枢发一条消息（to 可为成员名、chenshu=总枢、all=广播）。",
             {"type": "object", "properties": {
                 "to": {"type": "string"}, "subject": {"type": "string"},
                 "body": {"type": "string"}},
@@ -1281,7 +1281,7 @@ def make_member_tools(runtime: ChenshuRuntime, name: str, reviewer: bool) -> lis
     return tools
 
 
-def make_tower_tools(runtime: ChenshuRuntime) -> list[Tool]:
+def make_chenshu_tools(runtime: ChenshuRuntime) -> list[Tool]:
     """挂到主 agent 上的宸枢全家：init 常驻，其余 check_fn 门控在 active 后出现。"""
     active = lambda: runtime.active  # noqa: E731
 
@@ -1368,22 +1368,22 @@ def make_tower_tools(runtime: ChenshuRuntime) -> list[Tool]:
             _wrap(lambda force=False: runtime.teardown(bool(force))),
             check_fn=active,
         ),
-        #  塔也是通信参与者：同一套 comms，身份绑定为 chenshu
+        #  总枢也是通信参与者：同一套 comms，身份绑定为 chenshu
         _tool(
             "chenshu_send",
-            "给舰队成员发消息（to=成员名或 all 广播）。塔是协调者不是内容中继：让成员互相直连。",
+            "给舰队成员发消息（to=成员名或 all 广播）。总枢是协调者不是内容中继：让成员互相直连。",
             {"type": "object", "properties": {
                 "to": {"type": "string"}, "subject": {"type": "string"},
                 "body": {"type": "string"}},
              "required": ["to", "subject", "body"]},
-            _wrap(lambda to, subject, body: runtime.send(TOWER, to, subject, body)),
+            _wrap(lambda to, subject, body: runtime.send(CHENSHU, to, subject, body)),
             check_fn=active,
         ),
         _tool(
             "chenshu_inbox",
-            "读全部信件（塔可见所有人的往来，倒序，最多 20 条）。",
+            "读全部信件（总枢可见所有人的往来，倒序，最多 20 条）。",
             {"type": "object", "properties": {}, "required": []},
-            _wrap(lambda: runtime.read_inbox(TOWER)),
+            _wrap(lambda: runtime.read_inbox(CHENSHU)),
             check_fn=active,
         ),
         _tool(
@@ -1396,21 +1396,21 @@ def make_tower_tools(runtime: ChenshuRuntime) -> list[Tool]:
                 "scope": {"type": "array", "items": {"type": "string"}}},
              "required": ["mission_id"]},
             _wrap(lambda mission_id, status="", note="", scope=None: runtime.mission_view(
-                TOWER, mission_id,
+                CHENSHU, mission_id,
                 {k: v for k, v in (("status", status), ("note", note),
                                    ("scope", scope)) if v} or None)),
             check_fn=active,
         ),
         _tool(
             "chenshu_review",
-            "塔亲自提交评审（通常应 spawn reviewer 评审，塔不评自己编排的代码；"
+            "总枢亲自提交评审（通常应 spawn reviewer 评审，总枢不评自己编排的代码；"
             "此通道留给例外情况）。",
             {"type": "object", "properties": {
                 "target": {"type": "string"}, "verdict": {"type": "string"},
                 "summary": {"type": "string"}},
              "required": ["target", "verdict", "summary"]},
             _wrap(lambda target, verdict, summary: runtime.submit_review(
-                TOWER, target, verdict, summary)),
+                CHENSHU, target, verdict, summary)),
             check_fn=active,
         ),
     ]
