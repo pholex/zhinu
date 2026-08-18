@@ -448,6 +448,18 @@ class McpInheritanceTest(AgentTestCase):
         #  被筛掉的 server 调不到
         self.assertIn("ERROR", box._use_tool("mcp__internal__secrets", {}))
 
+    def test_full_toolbox_honors_explicit_view(self):
+        #  嵌入宿主的注入面：完整工具箱（only=None）显式传 view 时用它，
+        #  替代（而非合并）配置发现——不落 mcp.json 也能挂宿主声明的 server
+        view = McpView(self.manager, "all")
+        box = Toolbox(self.config, mcp_view=view)
+        self.assertIs(box._mcp, view)
+        names = box.names()
+        self.assertIn("search_tool", names)
+        self.assertIn("bash", names)  # 完整工具箱：内置工具照常在
+        #  经视图能调到 server 工具（宿主注入的清单真实可用）
+        self.assertIn("ok", box._use_tool("mcp__github__issues", {}))
+
     def test_restricted_toolbox_without_view_has_no_mcp(self):
         box = Toolbox(self.config, only=["read_file"])
         self.assertNotIn("search_tool", box.names())
