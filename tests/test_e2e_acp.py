@@ -192,6 +192,96 @@ class PromptTest(AcpCase):
         acp.read_until(self.is_response("p1"))
 
 
+class ConcurrentSessionTest(AcpCase):
+    """轮按 session 并行：BUSY 是会话级约束，不是进程级。
+
+    scripted 桩按 Agent 各持一份脚本队列（Registry 是 per-Agent 的），
+    所以两个 session 各自从头消费同一份脚本；编排用审批阻塞钉死确定性：
+    A 阻塞在审批上时驱动 B 整轮跑完，归属靠审批请求里的 sessionId 区分。
+    """
+
+    def second_session(self, acp: WireProcess) -> str:
+        acp.send(
+            {"jsonrpc": "2.0", "id": "new-b", "method": "session/new",
+             "params": {"cwd": str(self.workspace)}}
+        )
+        response, _ = acp.read_until(self.is_response("new-b"))
+        return response["result"]["sessionId"]
+
+    @staticmethod
+    def is_permission_for(session_id: str):
+        return (
+            lambda m: m.get("method") == "session/request_permission"
+            and m["params"]["sessionId"] == session_id
+        )
+
+    def test_other_session_prompts_while_one_is_busy(self):
+        acp = self.start_acp(_TOOL_SCRIPT)
+        session_a = self.new_session(acp)
+        session_b = self.second_session(acp)
+        #  A 消费自己的第 1 轮后阻塞在审批上
+        self.prompt(acp, session_a, "干活", req_id="pa")
+        permission_a, _ = acp.read_until(self.is_permission_for(session_a))
+        #  B 在 A 阻塞期间照常开轮：旧行为这里直接 -32001，新行为走到 B 自己的审批
+        self.prompt(acp, session_b, "干活", req_id="pb")
+        permission_b, _ = acp.read_until(self.is_permission_for(session_b))
+        #  放行 B：A 仍阻塞，B 却能整轮跑完
+        acp.send(
+            {"jsonrpc": "2.0", "id": permission_b["id"],
+             "result": {"outcome": {"outcome": "selected", "optionId": "allow-once"}}}
+        )
+        response, skipped = acp.read_until(self.is_response("pb"))
+        self.assertNotIn("error", response)
+        self.assertEqual(response["result"]["stopReason"], "end_turn")
+        chunks = [
+            m["params"]["update"]["content"]["text"]
+            for m in skipped
+            if m.get("method") == "session/update"
+            and m["params"]["update"].get("sessionUpdate") == "agent_message_chunk"
+            and m["params"]["sessionId"] == session_b
+        ]
+        self.assertEqual("".join(chunks), "完成")
+        #  再放行 A：迟到的放行照常收尾，两轮互不相扰
+        acp.send(
+            {"jsonrpc": "2.0", "id": permission_a["id"],
+             "result": {"outcome": {"outcome": "selected", "optionId": "allow-once"}}}
+        )
+        response, _ = acp.read_until(self.is_response("pa"))
+        self.assertEqual(response["result"]["stopReason"], "end_turn")
+
+    def test_cancel_scopes_to_own_session(self):
+        script = (
+            'tool_call: {"name": "bash", "arguments": {"command": "echo A"}}\n'
+            "---\n"
+            "text: A收尾\n"
+        )
+        acp = self.start_acp(script)
+        session_a = self.new_session(acp)
+        session_b = self.second_session(acp)
+        self.prompt(acp, session_a, "干活", req_id="pa")
+        permission, _ = acp.read_until(self.is_permission)
+        #  取消空闲的 B：no-op，且不得替 A 解决挂起审批
+        acp.send(
+            {"jsonrpc": "2.0", "method": "session/cancel",
+             "params": {"sessionId": session_b}}
+        )
+        acp.send(
+            {"jsonrpc": "2.0", "id": permission["id"],
+             "result": {"outcome": {"outcome": "selected", "optionId": "allow-once"}}}
+        )
+        response, skipped = acp.read_until(self.is_response("pa"))
+        self.assertEqual(response["result"]["stopReason"], "end_turn")
+        #  审批若被 B 的 cancel 错误解决，工具会以 denied（failed）终态——
+        #  这里必须是 completed，证明放行真实生效
+        statuses = [
+            u.get("status")
+            for u in self.updates(skipped)
+            if u.get("sessionUpdate") == "tool_call_update" and "status" in u
+        ]
+        self.assertIn("completed", statuses)
+        self.assertNotIn("failed", statuses)
+
+
 class ToolFlowTest(AcpCase):
     def test_allow_maps_three_states(self):
         acp = self.start_acp(_TOOL_SCRIPT)

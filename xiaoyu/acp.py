@@ -36,7 +36,9 @@ sink，不经协议层，所以不需要任何自定义扩展方法；可选能�
                                 目录自然放行）。client 随请求带的 mcpServers
                                 v1 不接（小羽有自己的 MCP 配置面），stderr 提示。
     session/prompt              工作线程跑一轮；UIEvent → session/update 流。
-                                同一时刻只跑一轮（同步架构），忙时回 -32001。
+                                会话内同一时刻只跑一轮（同步架构的约束是
+                                会话级的），本会话忙时回 -32001；不同会话的
+                                轮各自起线程并行推进。
                                 以 /命令 开头且命中广告过的命令时不进模型：
                                 当场执行、输出走 agent_message_chunk，也不入
                                 对话历史（REPL 斜杠命令同款——前端层动作，
@@ -116,8 +118,11 @@ sink，不经协议层，所以不需要任何自定义扩展方法；可选能�
 不发事件——ACP 侧的悬空 tool_call 由本层在轮末统一置 failed，不留转圈图标。
 
 线程模型与 wire.py 同款（全同步、无 asyncio）：主线程读 stdin 分发；prompt
-在工作线程跑 agent.send()；审批在工作线程阻塞在 threading.Event 上；stdout
-写入全部过同一把锁。EOF：挂起审批按拒绝解决、打断当前轮、等线程收尾。
+每会话一条工作线程跑 agent.send()（会话内单轮、会话间并行——serve/fanout
+早已如此，这里只是拉齐）；审批在各自工作线程阻塞在 threading.Event 上，
+挂起表按 request id 键控天然多路复用、按 sessionId 记归属（cancel 只解决
+自己会话的挂起项）；stdout 写入全部过同一把锁。EOF：全部挂起审批按拒绝
+解决、打断所有在跑的轮、共享预算等线程收尾。
 """
 
 from __future__ import annotations
@@ -126,6 +131,7 @@ import base64
 import json
 import sys
 import threading
+import time
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
@@ -783,9 +789,15 @@ class _Session:
         self.sink = sink
         self.workspace = workspace  # 相对路径归一用（哨兵、diff 同一基准）
         self.cancelled = False  # 本轮是否收到过 session/cancel（决定 stopReason）
+        #  本会话的当前轮工作线程；turn 状态只在主线程（stdin 分发循环）读写，
+        #  会话内同一时刻只有一轮
+        self.turn: threading.Thread | None = None
         #  client 下拉框当前显示的模型：轮末与 config.model 对账，粘性降级
         #  （_stream_with_recovery 改 config.model）后发 config_option_update 校正
         self.advertised_model = agent.config.model
+
+    def turn_active(self) -> bool:
+        return self.turn is not None and self.turn.is_alive()
 
 
 #  工厂签名：cli 侧负责 Config/Permissions/SessionLog 装配，本层只管协议。
@@ -799,7 +811,9 @@ AgentFactory = Callable[[Path, Any, AcpSink, str, bool], tuple[Agent, list[dict[
 
 class AcpServer:
     """stdio JSON-RPC server。一个进程多 session（每 session 一个 Agent），
-    但同一时刻只跑一轮——同步架构的既有约束，忙时回 BUSY。"""
+    轮按 session 并行：会话内同一时刻只跑一轮（同步架构的约束是会话级的），
+    本会话忙时回 BUSY；不同会话的轮在各自工作线程同时推进——Zed 开两个
+    project、或"一进程 demux 多会话"的 client 都靠这个。"""
 
     def __init__(
         self,
@@ -812,11 +826,11 @@ class AcpServer:
         self._stdout = stdout or sys.stdout
         self._write_lock = threading.Lock()
         self._sessions: dict[str, _Session] = {}
-        self._turn: threading.Thread | None = None
-        self._turn_session: _Session | None = None
-        #  挂起的 server→client 审批：id → (Event, 结果槽)
-        self._pending: dict[str, tuple[threading.Event, dict[str, Any]]] = {}
+        #  挂起的 server→client 审批：id → (Event, 结果槽, 所属 sessionId)。
+        #  归属必须记：cancel 只解决自己会话的挂起项，不能替别的会话拒审批
+        self._pending: dict[str, tuple[threading.Event, dict[str, Any], str]] = {}
         self._pending_lock = threading.Lock()
+        #  server→client 请求的 id 序号：多个会话的工作线程并发取号，锁内自增
         self._request_seq = 0
         self._closed = False
         self._mcp_note_shown = False
@@ -1019,12 +1033,7 @@ class AcpServer:
             self._fail(req_id, INVALID_PARAMS, "sessionId 不能为空")
             return
         existing = self._sessions.get(session_id)
-        if (
-            existing is not None
-            and existing is self._turn_session
-            and self._turn is not None
-            and self._turn.is_alive()
-        ):
+        if existing is not None and existing.turn_active():
             #  同一 id 正在跑轮还要重载：拒掉，不能从正在写日志的会话脚下抽文件
             self._fail(req_id, BUSY, "该会话本轮进行中，不能重载")
             return
@@ -1067,11 +1076,7 @@ class AcpServer:
         if not isinstance(value, str) or not value.strip():
             self._fail(req_id, INVALID_PARAMS, "value 需要非空模型名")
             return
-        if (
-            self._turn is not None
-            and self._turn.is_alive()
-            and self._turn_session is session
-        ):
+        if session.turn_active():
             #  跑轮期间 config.model 归降级链（粘性写在工作线程），主线程不抢
             self._fail(req_id, BUSY, "本轮进行中不能切模型（等本轮结束或 session/cancel）")
             return
@@ -1097,11 +1102,7 @@ class AcpServer:
                 f"未知 modeId {mode_id!r}（可用：{'、'.join(modes.CYCLE)}）",
             )
             return
-        if (
-            self._turn is not None
-            and self._turn.is_alive()
-            and self._turn_session is session
-        ):
+        if session.turn_active():
             #  set_mode 会往历史注入 plan 进出说明，不能与工作线程抢 messages
             self._fail(req_id, BUSY, "本轮进行中不能切模式（等本轮结束或 session/cancel）")
             return
@@ -1120,15 +1121,17 @@ class AcpServer:
         if isinstance(content, str) and not content.strip():
             self._fail(req_id, INVALID_PARAMS, "prompt 需要非空内容")
             return
-        if self._turn is not None and self._turn.is_alive():
-            self._fail(req_id, BUSY, "已有一轮在进行中（可 session/cancel 打断）")
+        if session.turn_active():
+            self._fail(req_id, BUSY, "该会话已有一轮在进行中（可 session/cancel 打断）")
             return
         session.cancelled = False
-        self._turn_session = session
-        self._turn = threading.Thread(
-            target=self._run_turn, args=(req_id, session, content), daemon=True, name="acp-turn"
+        session.turn = threading.Thread(
+            target=self._run_turn,
+            args=(req_id, session, content),
+            daemon=True,
+            name=f"acp-turn-{session.session_id}",
         )
-        self._turn.start()
+        session.turn.start()
 
     def _run_turn(
         self, req_id: Any, session: _Session, content: str | list[dict[str, Any]]
@@ -1183,21 +1186,43 @@ class AcpServer:
 
     def _handle_cancel(self, params: dict[str, Any]) -> None:
         session = self._sessions.get(str(params.get("sessionId", "")))
-        #  取消未知/空闲 session 是静默 no-op；但挂起审批必须解决，
-        #  否则工作线程永远阻塞在 Event 上
-        if session is not None and session is self._turn_session:
+        #  取消未知/空闲 session 是静默 no-op。挂起审批必须解决（否则该会话的
+        #  工作线程永远阻塞在 Event 上），但只解决本会话的——别的会话的审批
+        #  各归各轮，不能被替死
+        if session is None:
+            return
+        if session.turn_active():
             session.cancelled = True
-        self._deny_pending("用户取消了本轮")
-        if session is not None:
-            session.agent.interrupt()
+        self._deny_pending("用户取消了本轮", session_id=session.session_id)
+        session.agent.interrupt()
 
-    def _deny_pending(self, reason: str) -> None:
+    def _deny_pending(self, reason: str, session_id: str | None = None) -> None:
+        """挂起审批按 cancelled 解决。session_id=None 解决全部（EOF/收尾），
+        否则只解决该会话名下的（session/cancel 的作用域）。"""
         with self._pending_lock:
-            pending = list(self._pending.values())
-            self._pending.clear()
-        for event, slot in pending:
+            if session_id is None:
+                pending = list(self._pending.values())
+                self._pending.clear()
+            else:
+                matched = [
+                    key for key, entry in self._pending.items() if entry[2] == session_id
+                ]
+                pending = [self._pending.pop(key) for key in matched]
+        for event, slot, _owner in pending:
             slot["result"] = {"outcome": {"outcome": "cancelled"}, "_reason": reason}
             event.set()
+
+    def _register_pending(
+        self, session_id: str
+    ) -> tuple[str, threading.Event, dict[str, Any]]:
+        """登记一个 server→client 请求：锁内取号+挂表，多会话工作线程并发安全。"""
+        event = threading.Event()
+        slot: dict[str, Any] = {}
+        with self._pending_lock:
+            self._request_seq += 1
+            req_id = f"srv-{self._request_seq}"
+            self._pending[req_id] = (event, slot, session_id)
+        return req_id, event, slot
 
     # ---------- server → client（fs 只读哨兵） ----------
 
@@ -1210,12 +1235,7 @@ class AcpServer:
         """
         if not self._client_fs_read or self._closed:
             return None
-        self._request_seq += 1
-        req_id = f"srv-{self._request_seq}"
-        event = threading.Event()
-        slot: dict[str, Any] = {}
-        with self._pending_lock:
-            self._pending[req_id] = (event, slot)
+        req_id, event, slot = self._register_pending(session_id)
         self._send(
             {
                 "jsonrpc": "2.0",
@@ -1308,12 +1328,7 @@ class AcpServer:
                 }
             )
         options.append({"optionId": "reject-once", "name": "拒绝", "kind": "reject_once"})
-        self._request_seq += 1
-        req_id = f"srv-{self._request_seq}"
-        event = threading.Event()
-        slot: dict[str, Any] = {}
-        with self._pending_lock:
-            self._pending[req_id] = (event, slot)
+        req_id, event, slot = self._register_pending(session_id)
         tool_call: dict[str, Any] = {
             "title": _tool_title(name, args),
             "kind": _TOOL_KINDS.get(name, "other"),
@@ -1385,7 +1400,7 @@ class AcpServer:
             entry = self._pending.pop(str(req_id), None)
         if entry is None:
             return  # 迟到/重复的响应：cancel 或 shutdown 已替它做了决定
-        event, slot = entry
+        event, slot, _owner = entry
         if "result" in message:
             slot["result"] = message["result"]
         #  error 响应或缺 result：slot 留空，_resolve_verdict(None) fail closed
@@ -1396,11 +1411,15 @@ class AcpServer:
     def _shutdown(self) -> None:
         self._closed = True
         self._deny_pending("acp 连接已关闭")
-        session = self._turn_session
-        if session is not None:
-            session.cancelled = True
-            session.agent.interrupt()
-        if self._turn is not None:
-            self._turn.join(timeout=10.0)
+        turns: list[threading.Thread] = []
+        for session in self._sessions.values():
+            if session.turn_active():
+                session.cancelled = True
+                session.agent.interrupt()
+                turns.append(session.turn)  # type: ignore[arg-type]  # turn_active 保证非 None
+        #  共享一个 10s 预算：N 个会话不叠加成 N×10s 的退出等待
+        deadline = time.monotonic() + 10.0
+        for turn in turns:
+            turn.join(timeout=max(0.0, deadline - time.monotonic()))
 
 
