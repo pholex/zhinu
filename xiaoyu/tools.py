@@ -499,13 +499,20 @@ class Toolbox:
         #  检索、use_tool 调用——工具集会话内稳定，prompt cache 不再被中途连上
         #  的 server 作废。XIAOYU_MCP_TOOL_SEARCH=0 回到旧的全量注册
         #  （就绪后经 _absorb_mcp 追加在最尾部，append-only）。
-        #  受限子集（only）自己不 launch：子 agent 要 MCP 只能经 mcp_view
-        #  继承父级 manager 的筛选视图（spec 的 mcp 字段，见 agents.py）——
-        #  绝不按子 workspace（可能是 worktree）再拉一批进程。
-        if only is None:
-            self._mcp: Any = mcp.launch(config) if config.enable_mcp else None
-        else:
+        #  显式传入的 mcp_view 一律优先于配置发现（替代而非合并）：
+        #  - 子 agent 继承父级 manager 的筛选视图（spec 的 mcp 字段，见
+        #    agents.py）——绝不按子 workspace（可能是 worktree）再拉一批进程；
+        #  - 嵌入宿主自建 manager（按宿主声明的 server 清单构造 ServerSpec +
+        #    McpManager）后经此接线——server 生命周期归调用方，admission /
+        #    OSV 闸在 server 启动层照常执行，不因注入而绕过。
+        #  受限子集（only）没有 view 时也不 launch。
+        self._mcp: Any
+        if mcp_view is not None:
             self._mcp = mcp_view
+        elif only is None:
+            self._mcp = mcp.launch(config) if config.enable_mcp else None
+        else:
+            self._mcp = None
         self._mcp_search = self._mcp is not None and config.mcp_tool_search
         #  MCP server 上线公告的投递通道（Agent 注入 notify；None = 不公告，
         #  等注入后第一次组装 schemas 时补发）。已公告：server → 工具集指纹。
