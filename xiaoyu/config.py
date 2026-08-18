@@ -244,7 +244,8 @@ class Config:
     #  explore 子 agent 与 eval 关掉：受限子集用不上，且要保持行为确定。
     enable_plugins: bool = True
     #  是否挂载 mcp.json 里声明的 MCP server 工具（后台懒加载，见 mcp.py）。
-    #  explore 子 agent 与 eval 关掉，理由同插件。
+    #  explore 子 agent 与 eval 关掉，理由同插件。只 gate 配置发现：宿主给
+    #  Toolbox 显式注入的 mcp_view 不受它约束（显式注入=明确要）。
     enable_mcp: bool = True
     #  是否加载用户级 hooks.toml 生命周期钩子（见 hooks.py；只认用户级不认
     #  工作区级——hook 是任意代码执行，仓库级配置等于 clone 即种命令）。
