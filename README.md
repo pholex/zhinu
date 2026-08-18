@@ -119,3 +119,7 @@ auto 档**放行的依据是沙箱，不是信任**——沙箱不可用时自�
 - **可嵌入**：`xiaoyu.embedding` 的 `AsyncAgent` 把 agent 当执行引擎嵌进你自己的进程（异步审批、事件流、会话复用）；跨语言用 `--wire` 的 stdio JSON-RPC
 - **可编排**：`xiaoyu serve` 起 HTTP API，n8n / Dify / 自研调度直接驱动（异步提交 + 状态轮询 + 事件游标，需要放行的工具调用挂起等 HTTP 回决定）。OpenAPI schema 由代码生成，贴给 Dify 自定义工具即用——见 [docs/http-api.md](docs/http-api.md)。同一服务还在 `/mcp` 挂着 **agent 级 MCP server**（`xiaoyu` / `xiaoyu_reply` / `xiaoyu_close` 三工具，streamable HTTP），LangChain / LangGraph 经官方 `langchain-mcp-adapters` 即插即用，其它 MCP client 同理——见 [docs/mcp-server.md](docs/mcp-server.md)
 - **浏览器**：推荐挂 chrome-devtools MCP；内置 `[browser]` 是纯 pip 的兜底，`playwright install chromium` 后即用
+
+---
+
+<p align="center"><sub>天羽织造 · 凤凰出品<br>woven by Xiaoyu · a Pholex (凤凰) production</sub></p>
