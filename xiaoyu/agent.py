@@ -828,13 +828,13 @@ class Agent:
         #  宸枢（编排总控模式）：init 常驻 schema，其余工具在 active 后经
         #  check_fn 浮现。与 allow_explore 同闸（成员不再挂宸枢，不套娃）
         if allow_explore and config.enable_chenshu and self.toolbox.get("chenshu_init") is None:
-            from .chenshu import ChenshuRuntime, make_tower_tools
+            from .chenshu import ChenshuRuntime, make_chenshu_tools
 
             self.chenshu = ChenshuRuntime(
                 config, self.registry, self.usage, self.sink,
                 self.permissions, notify=self.notify,
             )
-            for tool in make_tower_tools(self.chenshu):
+            for tool in make_chenshu_tools(self.chenshu):
                 if self.toolbox.get(tool.name) is None:
                     self.toolbox.register(tool)
         #  skill 工具：正文按需加载（渐进披露）。注册与否看开关而不是"当前有没有
