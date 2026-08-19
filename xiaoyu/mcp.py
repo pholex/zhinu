@@ -1474,7 +1474,11 @@ class McpManager:
         return parts
 
     def wait_ready(self, timeout: float) -> None:
-        """等所有 server 出结果（就绪或失败），最多等 timeout 秒。测试/一次性模式用。"""
+        """等所有 server 出结果（就绪或失败），最多等 timeout 秒。
+
+        通用等待面（不只是测试/一次性模式用）：嵌入宿主自建 manager 后要等
+        工具清单齐了再开工，用它，别照 loading() 自己写轮询——真发生过。
+        """
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
             with self._lock:

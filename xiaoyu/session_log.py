@@ -18,8 +18,11 @@
 
 from __future__ import annotations
 
+import atexit
+import contextlib
 import json
 import os
+import signal
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -153,6 +156,69 @@ class SessionLog:
         except OSError:
             #  磁盘满/权限问题不能影响会话，停写即可
             self._broken = True
+
+
+# ---------- 退出事件：进程级钩子 ----------
+
+
+#  在册的会话日志，按**日志文件**索引（不是按会话对象）。覆盖登记的理由见
+#  install_exit_logging 的 docstring。
+_exit_logs: dict[Path, SessionLog] = {}
+_exit_hooks_installed = False
+
+
+def _close_registered(reason: str) -> None:
+    """关掉在册的全部日志，用同一个 reason。close 幂等，重复触发无害。"""
+    for log in list(_exit_logs.values()):
+        log.close(reason)
+
+
+def install_exit_logging(log: SessionLog | None) -> None:
+    """把会话日志挂上进程级退出钩子，退出时给它落一条 exit 事件。
+
+    可记录：正常退出（atexit）、SIGTERM / SIGHUP（POSIX 的 kill、关终端窗口）、
+    SIGBREAK（Windows Ctrl-Break）。不可记录：断电、kill -9、Windows 直接
+    关闭终端窗口——约定为「文件末尾没有 exit 事件 = 异常终止」（见模块
+    docstring），事后拿到用户日志可据此区分"模型没答"和"进程死了"。
+
+    **钩子全进程只装一次，触发时用同一个 reason 关掉在册全部**：多会话进程
+    （acp / serve）里每建一个会话就 register 一次 atexit、重装一遍信号处理器
+    的话，信号处理器的闭包只认最后装的那个 log——SIGTERM 到达时只有最后一个
+    会话被记成 signal:SIGTERM，其余在随后的 atexit 里被记成 normal。判据本身
+    不破（close 幂等，不会写重），坏的是 reason：真实结局是被信号打断，日志
+    里却写着正常退出，而 reason 正是事后区分"进程被掐"和"用户自己退"的依据。
+
+    **按日志文件覆盖登记**（而不是无脑 add）：session/load 会在同一个文件上
+    新建 SessionLog 并把旧的挤掉（acp.py 的 _sessions 直接覆盖），被挤掉的
+    对象此后再也不会被写。两个都留在册里的话，退出时同一文件会写出两条
+    exit 事件、第一条落在 reload 之后那段对话的**前面**——判据就从"末尾有
+    没有 exit"劣化成"末尾这条是不是最后一条"，比没有钩子更难读。
+    """
+    global _exit_hooks_installed
+    if log is None:
+        return
+    _exit_logs[log.path] = log
+    if _exit_hooks_installed:
+        return
+    _exit_hooks_installed = True
+    atexit.register(_close_registered, "normal")
+
+    def _on_signal(signum: int, frame: Any) -> None:
+        try:
+            name = signal.Signals(signum).name
+        except ValueError:
+            name = str(signum)
+        _close_registered(f"signal:{name}")
+        #  记完照常退出：128+signum 是 shell 的信号退出码约定
+        raise SystemExit(128 + signum)
+
+    for name in ("SIGTERM", "SIGHUP", "SIGBREAK"):
+        sig = getattr(signal, name, None)
+        if sig is None:
+            continue
+        #  非主线程 / 受限环境注册不了就算了，不能影响启动
+        with contextlib.suppress(ValueError, OSError, RuntimeError):
+            signal.signal(sig, _on_signal)
 
 
 # ---------- resume：列出与重放 ----------

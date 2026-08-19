@@ -9,6 +9,8 @@ stopReason=cancelled 收尾。传输驱动复用 wire e2e 的 WireProcess（都�
 from __future__ import annotations
 
 import json
+import os
+import signal
 import subprocess
 import sys
 import unittest
@@ -1264,6 +1266,122 @@ class AuthTest(AcpCase):
                   "params": {"methodId": "config-wizard"}})
         response, _ = acp.read_until(self.is_response("a1"))
         self.assertEqual(response["result"], {})
+
+
+class ExitLoggingTest(AcpCase):
+    """进程级退出钩子（session_log.install_exit_logging）的三条回归。
+
+    退出事件是事后诊断的唯一依据：reason 说明"进程是怎么没的"，而
+    「文件末尾没有 exit 事件 = 异常终止」是判据本身。acp 是长期多会话
+    进程，每会话装一套钩子的老写法在这三条上都会给出错误答案。
+    """
+
+    def session_files(self) -> list[Path]:
+        """本次测试的临时家目录下所有会话文件（env_for 把配置目录圈在 tmp 里）。"""
+        return sorted(Path(self.tmp).rglob("*.jsonl"))
+
+    @staticmethod
+    def exit_reasons(path: Path) -> list[str]:
+        return [
+            record.get("reason", "")
+            for line in path.read_text(encoding="utf-8").splitlines()
+            if (record := json.loads(line)).get("event") == "exit"
+        ]
+
+    @unittest.skipIf(os.name == "nt", "Windows 的 terminate 不走信号处理器")
+    def test_sigterm_marks_every_session_not_just_the_last(self):
+        #  老写法：信号处理器闭包只认最后装的那个 log，第一个会话在随后的
+        #  atexit 里被记成 normal——被信号掐掉的会话在日志里冒充正常退出
+        acp = self.start_acp("text: ok\n")
+        first = self.new_session(acp)
+        second = self.new_session(acp)
+        self.assertNotEqual(first, second)
+        acp.proc.send_signal(signal.SIGTERM)
+        acp.proc.wait(timeout=15)
+        files = self.session_files()
+        self.assertEqual(len(files), 2, files)
+        for path in files:
+            self.assertEqual(self.exit_reasons(path), ["signal:SIGTERM"], path)
+
+    def test_client_disconnect_is_recorded_as_disconnect(self):
+        #  client EOF 不经任何别的收尾，_shutdown 不落 exit 的话只能等 atexit
+        #  记成 normal——断连与用户主动退出就分不开了
+        acp = self.start_acp("text: ok\n")
+        self.new_session(acp)
+        acp.close()
+        files = self.session_files()
+        self.assertEqual(len(files), 1, files)
+        self.assertEqual(self.exit_reasons(files[0]), ["disconnect"])
+
+    def test_reloaded_session_writes_exactly_one_exit(self):
+        #  session/load 在同一个文件上新建 SessionLog 并把旧的挤掉。注册表按
+        #  文件覆盖登记，所以退出时只写一条；无脑 add 的话会写两条，且第一条
+        #  落在 reload 之后那段对话的前面——判据从"末尾有没有"变成"末尾是不是"
+        acp = self.start_acp("text: ok\n")
+        session_id = self.new_session(acp)
+        acp.send(
+            {"jsonrpc": "2.0", "id": "load", "method": "session/load",
+             "params": {"sessionId": session_id, "cwd": str(self.workspace), "mcpServers": []}}
+        )
+        acp.read_until(self.is_response("load"))
+        acp.close()
+        files = self.session_files()
+        self.assertEqual(len(files), 1, files)
+        self.assertEqual(self.exit_reasons(files[0]), ["disconnect"])
+
+
+class AgentAccessTest(unittest.TestCase):
+    """AcpServer.agent_for：嵌入宿主拿活 Agent 的访问面（steer 等没有协议面
+    的内核能力靠它落到对应会话上）。在 serve 跑着的时候查，不是查残留状态。"""
+
+    def test_agent_for_resolves_live_session_and_none_otherwise(self) -> None:
+        import io
+
+        from xiaoyu.acp import AcpServer
+
+        class StubAgent:
+            """够 session/new 回包用的最小面：模型选择器 + 模式表 + 日志位。"""
+
+            mode = "default"
+            session_log = None
+            config = type("C", (), {"model": "stub-model"})()
+
+            def switchable_models(self) -> list[str]:
+                return ["stub-model"]
+
+            def sandbox_ready(self) -> bool:
+                return False
+
+        stub = StubAgent()
+        out = io.StringIO()
+        seen: dict[str, Any] = {}
+
+        def lines():
+            yield json.dumps(
+                {"jsonrpc": "2.0", "id": "init", "method": "initialize",
+                 "params": {"protocolVersion": 1}}
+            )
+            yield json.dumps(
+                {"jsonrpc": "2.0", "id": "new", "method": "session/new",
+                 "params": {"cwd": str(Path.cwd())}}
+            )
+            #  取到这一行时 session/new 已处理完（主循环逐行同步），协议流里
+            #  已有 sessionId——趁 serve 还活着查访问面
+            session_id = next(
+                record["result"]["sessionId"]
+                for line in out.getvalue().splitlines()
+                if (record := json.loads(line)).get("id") == "new"
+            )
+            seen["live"] = server.agent_for(session_id)
+            seen["unknown"] = server.agent_for("sess-never-existed")
+
+        server = AcpServer(
+            agent_factory=lambda *args: (stub, []), stdin=lines(), stdout=out
+        )
+        server.serve()
+
+        self.assertIs(seen["live"], stub)
+        self.assertIsNone(seen["unknown"])
 
 
 class StdoutGuardTest(unittest.TestCase):

@@ -137,9 +137,19 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, TextIO
 
-from . import __version__, media, modes
-from .config import MissingConfig, load_dotenv, user_env_path
-from .permissions import suggest_allow_rule
+from . import __version__, folder_trust, mcp, media, modes
+from .config import Config, MissingConfig, load_dotenv, user_env_path
+from .permissions import Permissions, suggest_allow_rule
+from .session_log import (
+    SessionLog,
+    check_session_id,
+    find_named,
+    install_exit_logging,
+    last_mode,
+    last_model,
+    open_named,
+)
+from .tools import Toolbox
 from .providers import UnknownModel
 from .agent import SYNTHETIC_USER_TEXTS, Agent, Allow, Deny, Interrupted
 from .events import (
@@ -809,6 +819,105 @@ class _Session:
 AgentFactory = Callable[[Path, Any, AcpSink, str, bool], tuple[Agent, list[dict[str, Any]]]]
 
 
+def build_agent_factory(
+    *,
+    model: str | None = None,
+    base_url: str | None = None,
+    append_system_prompt: str | None = None,
+    auto_approve: bool | None = None,
+    mode: str | None = None,
+    sandbox: bool | None = None,
+    sandbox_network: bool | None = None,
+    mcp_view: "mcp.McpView | None" = None,
+) -> AgentFactory:
+    """造一个 AcpServer 要的 agent 工厂：每 session 现配 Config/Permissions/SessionLog。
+
+    ACP 的工作区随 session/new 的 cwd 来（编辑器一个项目一个 session），所以
+    Agent 不在启动期装配，而是给 server 一个工厂。这条装配链原本只长在
+    `cli.acp_main` 里，嵌入宿主（自己起 AcpServer、注入自己的 stdin/stdout 或
+    工具箱）想复用只能整段抄——抄一次就漂一次，实测漏抄 install_exit_logging
+    是第一个真实案例。所以它在这里公开，CLI 自己也走这一份。
+
+    参数即 CLI 那几个旗标的库面等价物；**空值一律等于"不覆盖"**：
+    `Config.from_env` 的 overrides 是 `if value is not None` 才 setattr，所以
+    空串会真的把模型名覆盖成空。这里把 "" 归一成 None，宿主传哪种都安全。
+
+    mcp_view：宿主自带 MCP 清单时传进来，替代（而非合并）配置发现——
+    见 tools.Toolbox 的同名参数。不传就走配置发现，与 CLI 行为一致。
+
+    folder trust 按信任表非交互判定（headless 纪律）：TUI 里 --trust 过的目录
+    自然放行，没记录的不吃工作区级 .mcp.json/permissions/.env，也绝不在协议
+    通道上发问。
+    """
+
+    def build_agent(
+        workspace: Path, approver: Any, sink: AcpSink, session_name: str, create: bool
+    ) -> tuple[Agent, list[dict[str, Any]]]:
+        trusted = folder_trust.evaluate(workspace, interactive=False).verdict == "trusted"
+        config = Config.from_env(
+            workspace=workspace,
+            model=model or None,
+            base_url=base_url or None,
+            auto_approve=auto_approve or None,
+            mode=mode or None,
+            sandbox=sandbox,
+            sandbox_network=sandbox_network,
+            append_system_prompt=append_system_prompt or None,
+            workspace_trusted=trusted,
+        )
+        permissions = Permissions.load(config.workspace, include_workspace=trusted)
+        #  ACP sessionId 即命名会话名（sess-<hex> 天然过 check_session_id）：
+        #  session/load 靠它跨进程找回同一个文件。create 时名字是新造的 uuid，
+        #  不可能撞上已有会话；load 则必须找得到——open_named 的"无则建"语义
+        #  在这里是错的（静默用空会话冒充旧会话），所以先 find_named 把关。
+        history: list[dict[str, Any]] = []
+        follow_mode = ""
+        if create:
+            session_log = SessionLog.create(
+                config.model, str(config.workspace), session_id=session_name
+            )
+        else:
+            try:
+                #  client 给的名字要进文件名 glob，先过与 --session-id 同一道闸；
+                #  不合规的名字必然不是本 agent 发的 id，按"未知会话"处理
+                check_session_id(session_name)
+            except ValueError as exc:
+                raise LookupError(f"非法 sessionId {session_name!r}：{exc}") from exc
+            path = find_named(session_name, str(config.workspace))
+            if path is None:
+                raise LookupError(
+                    f"未知 sessionId {session_name!r}（本工作区没有对应的会话记录）"
+                )
+            #  恢复时优先跟随旧会话最后生效的模型（/model、下拉框、粘性降级的
+            #  留痕都算），而不是本次启动的默认/--model——在 open_named 之前
+            #  覆盖，reopened 事件记下的就是跟随后的模型。读不出来保持现配置。
+            if recorded := last_model(path):
+                config.model = recorded
+            #  模式同一纪律：历史里可能带着 plan 进出说明，模式不跟上，
+            #  模型以为在规划态而关卡全开（或反过来）。restore 之后 adopt
+            follow_mode = last_mode(path)
+            session_log, history = open_named(
+                session_name, config.model, str(config.workspace)
+            )
+        agent = Agent(
+            config,
+            Toolbox(config, mcp_view=mcp_view),
+            approver=approver,
+            session_log=session_log,
+            permissions=permissions,
+            sink=sink,
+        )
+        if history:
+            #  与 --session-id 续写同款：copy=False，接上下文但不把历史再抄一遍
+            agent.restore(history, copy=False)
+        if follow_mode:
+            agent.adopt_mode(follow_mode)
+        install_exit_logging(session_log)
+        return agent, history
+
+    return build_agent
+
+
 class AcpServer:
     """stdio JSON-RPC server。一个进程多 session（每 session 一个 Agent），
     轮按 session 并行：会话内同一时刻只跑一轮（同步架构的约束是会话级的），
@@ -836,6 +945,26 @@ class AcpServer:
         self._mcp_note_shown = False
         #  initialize 时 client 声明的 fs.readTextFile：未保存缓冲区哨兵的开关
         self._client_fs_read = False
+
+    # ---------- 嵌入宿主的访问面 ----------
+
+    def agent_for(self, session_id: str) -> Agent | None:
+        """按 sessionId 取活着的 Agent，没有就 None。
+
+        给嵌入宿主用：内核有些能力没有 ACP 协议面——`Agent.steer`（线程安全的
+        轮内插话）就是，规范里没有对应方法。宿主在协议之外的通道上收到这类
+        指令时，要能落到对应会话的 Agent 上。
+
+        为什么是访问面而不是在协议里自造 `_session/steer`：方言要两边都实现、
+        且会被误当成标准面（models/set_model 那次的教训），而访问面只是把内核
+        已有能力交出去，谁需要谁在自己那层翻译——与"宿主方言全留在宿主那层"
+        同一条分界线。
+
+        返回的是活对象：会话被 session/load 顶替后旧 Agent 就不在册了，
+        宿主每次现取，别缓存。
+        """
+        session = self._sessions.get(session_id)
+        return session.agent if session is not None else None
 
     # ---------- 出站 ----------
 
@@ -1421,5 +1550,12 @@ class AcpServer:
         deadline = time.monotonic() + 10.0
         for turn in turns:
             turn.join(timeout=max(0.0, deadline - time.monotonic()))
+        #  client 断开（EOF）不经任何别的收尾，日志此前只能等 atexit 记成
+        #  normal——disconnect 更接近真相。放在 join 之后：轮还在跑就落 exit
+        #  的话，后面的消息会写到 exit 事件的下面。close 幂等，atexit 再关一次
+        #  是 no-op（进程级钩子见 session_log.install_exit_logging）。
+        for session in self._sessions.values():
+            if session.agent.session_log is not None:
+                session.agent.session_log.close("disconnect")
 
 

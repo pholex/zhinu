@@ -4,14 +4,12 @@ from __future__ import annotations
 
 import argparse
 import atexit
-import contextlib
 import importlib.util
 import json
 import locale
 import os
 import re
 import shutil
-import signal
 import subprocess
 import sys
 import time
@@ -26,9 +24,7 @@ from .session_log import (
     SessionInfo,
     SessionLog,
     check_session_id,
-    find_named,
-    last_mode,
-    last_model,
+    install_exit_logging,
     list_sessions,
     load_messages,
     open_named,
@@ -2106,36 +2102,6 @@ def open_session(config: Config, session_id: str | None) -> tuple[SessionLog, li
     return open_named(name, config.model, str(config.workspace))
 
 
-def install_exit_logging(log: SessionLog | None) -> None:
-    """给可记录的退出路径在会话日志里落一条 exit 事件。
-
-    可记录：正常退出（atexit）、SIGTERM / SIGHUP（POSIX 的 kill、关终端窗口）、
-    SIGBREAK（Windows Ctrl-Break）。不可记录：断电、kill -9、Windows 直接
-    关闭终端窗口——约定为「文件末尾没有 exit 事件 = 异常终止」（见 session_log
-    模块 docstring），事后拿到用户日志可据此区分"模型没答"和"进程死了"。
-    """
-    if log is None:
-        return
-    atexit.register(log.close, "normal")
-
-    def _on_signal(signum: int, frame: Any) -> None:
-        try:
-            name = signal.Signals(signum).name
-        except ValueError:
-            name = str(signum)
-        log.close(f"signal:{name}")
-        #  记完照常退出：128+signum 是 shell 的信号退出码约定
-        raise SystemExit(128 + signum)
-
-    for name in ("SIGTERM", "SIGHUP", "SIGBREAK"):
-        sig = getattr(signal, name, None)
-        if sig is None:
-            continue
-        #  非主线程 / 受限环境注册不了就算了，不能影响启动
-        with contextlib.suppress(ValueError, OSError, RuntimeError):
-            signal.signal(sig, _on_signal)
-
-
 def warn_if_home_workspace(workspace: Path) -> None:
     """工作区是用户主目录时提醒一句：产物会直接撒在主目录里。
 
@@ -2376,84 +2342,27 @@ def acp_main(args: argparse.Namespace) -> int:
     """`xiaoyu acp` / `--acp` 入口：Agent Client Protocol server（见 acp.py 模块 docstring）。
 
     与 wire 的结构差异：ACP 的工作区随 session/new 的 cwd 来（编辑器一个
-    项目一个 session），所以 Agent 不在启动期装配，而是给 server 一个工厂
-    ——每个 session 现配 Config/Permissions/SessionLog。folder trust 按
-    信任表非交互判定（headless 纪律）：TUI 里 --trust 过的目录自然放行，
-    没记录的不吃工作区级配置，也绝不在协议通道上发问。
+    项目一个 session），所以 Agent 不在启动期装配，而是给 server 一个工厂。
+    工厂本身在 acp.build_agent_factory——嵌入宿主与 CLI 共用同一份装配链，
+    这里只负责把命令行旗标翻成它的参数。
     """
-    from . import folder_trust
-    from .acp import AcpServer, AcpSink
+    from .acp import AcpServer, build_agent_factory
 
     if prompt_words(args):
         print(ui.error("acp 模式不接受命令行指令（用协议里的 session/prompt）"), file=sys.stderr)
         return 2
 
-    def build_agent(
-        workspace: Path, approver: Any, sink: "AcpSink", session_name: str, create: bool
-    ) -> tuple[Agent, list[dict[str, Any]]]:
-        trusted = folder_trust.evaluate(workspace, interactive=False).verdict == "trusted"
-        config = Config.from_env(
-            workspace=workspace,
+    return AcpServer(
+        build_agent_factory(
             model=args.model,
             base_url=args.base_url,
+            append_system_prompt=args.append_system_prompt,
             auto_approve=args.yolo or None,
             mode=args.mode,
             sandbox=args.sandbox,
             sandbox_network=args.sandbox_network,
-            append_system_prompt=args.append_system_prompt,
-            workspace_trusted=trusted,
         )
-        permissions = Permissions.load(config.workspace, include_workspace=trusted)
-        #  ACP sessionId 即命名会话名（sess-<hex> 天然过 check_session_id）：
-        #  session/load 靠它跨进程找回同一个文件。create 时名字是新造的 uuid，
-        #  不可能撞上已有会话；load 则必须找得到——open_named 的"无则建"语义
-        #  在这里是错的（静默用空会话冒充旧会话），所以先 find_named 把关。
-        history: list[dict[str, Any]] = []
-        follow_mode = ""
-        if create:
-            session_log = SessionLog.create(
-                config.model, str(config.workspace), session_id=session_name
-            )
-        else:
-            try:
-                #  client 给的名字要进文件名 glob，先过与 --session-id 同一道闸；
-                #  不合规的名字必然不是本 agent 发的 id，按"未知会话"处理
-                check_session_id(session_name)
-            except ValueError as exc:
-                raise LookupError(f"非法 sessionId {session_name!r}：{exc}") from exc
-            path = find_named(session_name, str(config.workspace))
-            if path is None:
-                raise LookupError(
-                    f"未知 sessionId {session_name!r}（本工作区没有对应的会话记录）"
-                )
-            #  恢复时优先跟随旧会话最后生效的模型（/model、下拉框、粘性降级的
-            #  留痕都算），而不是本次启动的默认/--model——在 open_named 之前
-            #  覆盖，reopened 事件记下的就是跟随后的模型。读不出来保持现配置。
-            if recorded := last_model(path):
-                config.model = recorded
-            #  模式同一纪律：历史里可能带着 plan 进出说明，模式不跟上，
-            #  模型以为在规划态而关卡全开（或反过来）。restore 之后 adopt
-            follow_mode = last_mode(path)
-            session_log, history = open_named(
-                session_name, config.model, str(config.workspace)
-            )
-        agent = Agent(
-            config,
-            Toolbox(config),
-            approver=approver,
-            session_log=session_log,
-            permissions=permissions,
-            sink=sink,
-        )
-        if history:
-            #  与 --session-id 续写同款：copy=False，接上下文但不把历史再抄一遍
-            agent.restore(history, copy=False)
-        if follow_mode:
-            agent.adopt_mode(follow_mode)
-        install_exit_logging(session_log)
-        return agent, history
-
-    return AcpServer(build_agent).serve()
+    ).serve()
 
 
 def run_once(agent: Agent, prompt: str, output_format: str = "text") -> int:
