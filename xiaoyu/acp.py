@@ -970,8 +970,11 @@ def resolve_mcp_view(
             f"acp：本机 MCP 已关闭（enable_mcp=false），忽略 client 下发的 {count} 条 server"
         )
     manager = mcp.launch(config, extra_specs=mcp_servers)
-    if manager is None:
-        return None, f"acp：client 下发的 {count} 条 server 没有一条起得来"
+    if manager is None:  # pragma: no cover - 带 extra_specs 时 launch 恒有返回
+        #  空清单也会给出空 manager（见 launch_specs 的 docstring）。真走到这里
+        #  只可能是将来把那条约定改坏了——别编一句"server 起不来"糊过去，那会
+        #  把内部错误伪装成用户的配置问题。
+        return None, "acp：MCP 视图构造失败（内部错误，请报 issue）"
     return mcp.McpView(manager, "all"), ""
 
 
