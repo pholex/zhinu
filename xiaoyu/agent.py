@@ -546,16 +546,25 @@ class Agent:
         #  <system-reminder> 搭在下一条工具结果尾部顺路送达，模型不用轮询、
         #  角色交替与 tool_calls 配对两个不变量都不动。面向嵌入宿主
         #  （后台任务完成、外部状态变化）；带 key 的通知记入已报集合防重。
-        self._notify_queue: queue.Queue[tuple[str, str]] = queue.Queue()
+        #  待送达的系统通知：(key, text, wake)。wake=False 的只搭便车，不为
+        #  它自己在 step 边界多跑一步（理由见 notify）。用列表+锁而不是
+        #  Queue：补投点必须先看队里有没有 wake 项再决定取不取，
+        #  Queue 没有"不取就看"的办法。
+        self._notify_queue: list[tuple[str, str, bool]] = []
+        self._notify_lock = threading.Lock()
         self._notified_keys: set[str] = set()
         #  后台任务（bash run_in_background / monitor）的完成与事件通知直接挂
         #  通知轨道——notify 线程安全（队列），watcher 线程可直接调。
         #  hasattr 兜底：嵌入宿主可能注入自定义 Toolbox 形态。
         if hasattr(self.toolbox, "tasks"):
             self.toolbox.tasks.notify = self.notify
-        #  MCP 检索模式的 server 上线公告走同一条轨道（tools._announce_mcp）
+        #  MCP 检索模式的 server 上线公告走同一条轨道（tools._announce_mcp），
+        #  但**不唤醒**：模型已经在给收尾正文时，为一条"某某 server 上线了"
+        #  强制再跑一步，模型会把同一个问题再答一遍（client 端拼成一条，
+        #  表现为答案重复）。公告不值这一步，信息也不丢——留在队列里搭下一条
+        #  工具结果的便车。这条轨道只有公告在用，所以在接线处一次定性。
         if hasattr(self.toolbox, "notify_hook"):
-            self.toolbox.notify_hook = self.notify
+            self.toolbox.notify_hook = lambda text, key="": self.notify(text, key, wake=False)
         #  跨会话信箱（可选，由 CLI 注入；见 peers.py）。消费点与 steer 完全重合——
         #  轮次开始 + 每个 step 边界，不新增任何注入时机。
         self.peer = peer
@@ -1423,7 +1432,7 @@ class Agent:
             except queue.Empty:
                 return items
 
-    def notify(self, text: str, key: str = "") -> None:
+    def notify(self, text: str, key: str = "", wake: bool = True) -> None:
         """投递一条系统通知（线程安全），搭下一条工具结果的 <system-reminder> 送达。
 
         与 steer 的分工：steer 是"用户的话"（以 user 消息入历史），notify 是
@@ -1431,23 +1440,36 @@ class Agent:
         送达时机：下一次工具结果的尾部；模型正在收尾正文时则在 step 边界以独立
         消息补投并强制再跑一步。turn 开始不丢弃（事件已经发生，丢了就凭空消失，
         与信箱同一纪律）。同一 key 的通知整个会话只送达一次（防宿主重复投递）。
+
+        wake=False = "捎带送达"：**绝不为这一条自己多跑一步**，只在已经要跑的
+        step（有插话/信箱消息要消费）或下一条工具结果上搭便车。用于"发生了但
+        不必打断"的公告——典型是 MCP server 上线。为什么要这档：模型给完收尾
+        正文后被强制再跑一步，它会把同一个问题再答一遍，client 端把两段拼成
+        一条，用户看到的就是答案重复。信息不丢（留在队列里），丢的只是那一步。
         """
         if text.strip():
-            self._notify_queue.put((key.strip(), text.strip()))
+            with self._notify_lock:
+                self._notify_queue.append((key.strip(), text.strip(), wake))
 
-    def _drain_notifications(self) -> list[str]:
-        """取走待送达的通知并登记已报 key（只在会话自己的执行线程里调用）。"""
+    def _drain_notifications(self, wake_only: bool = False) -> list[str]:
+        """取走待送达的通知并登记已报 key（只在会话自己的执行线程里调用）。
+
+        wake_only=True：队里没有 wake 项时一条都不取，全留着搭下一次工具结果
+        的便车（补投点用这个模式——那里"取到东西"等于"多跑一步"）。有 wake 项
+        则整队取走：这一步反正要跑，捎带把不唤醒的也送到最省。
+        """
+        with self._notify_lock:
+            if wake_only and not any(wake for _, _, wake in self._notify_queue):
+                return []
+            pending, self._notify_queue = self._notify_queue, []
         items: list[str] = []
-        while True:
-            try:
-                key, text = self._notify_queue.get_nowait()
-            except queue.Empty:
-                return items
+        for key, text, _ in pending:
             if key:
                 if key in self._notified_keys:
                     continue
                 self._notified_keys.add(key)
             items.append(text)
+        return items
 
     def _consume_inbox(self, midturn: bool = False) -> bool:
         """跨会话消息的消费点：与 steer 同一批边界，同样逐条入历史。
@@ -1487,7 +1509,9 @@ class Agent:
             if self.session_log:
                 self.session_log.event("steer")
             consumed = True
-        for note in self._drain_notifications():
+        #  wake_only 跟着 consumed 走：插话/信箱已经让这一步非跑不可时，
+        #  捎带把不唤醒的通知也送了；否则只有 wake 项才值得多跑一步。
+        for note in self._drain_notifications(wake_only=not consumed):
             self._record(
                 {"role": "user", "content": f"<system-reminder>\n{note}\n</system-reminder>"}
             )
