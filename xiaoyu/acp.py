@@ -34,7 +34,10 @@ sink，不经协议层，所以不需要任何自定义扩展方法；可选能�
                                 不吃工作区级 .mcp.json/permissions/.env（门的
                                 纪律与 headless 一致，在 TUI 里 --trust 过的
                                 目录自然放行）。client 随请求带的 mcpServers
-                                v1 不接（小羽有自己的 MCP 配置面），stderr 提示。
+                                接：与配置发现合并、同名 client 优先、session
+                                作用域不落盘、${VAR} 不兑现、照过准入闸；只收
+                                stdio（http/sse 由 mcpCapabilities 门控，未声明），
+                                跳过的条目一律 stderr 出声，不静默少几个工具。
     session/prompt              工作线程跑一轮；UIEvent → session/update 流。
                                 会话内同一时刻只跑一轮（同步架构的约束是
                                 会话级的），本会话忙时回 -32001；不同会话的
@@ -62,15 +65,23 @@ sink，不经协议层，所以不需要任何自定义扩展方法；可选能�
                                 （user_message_chunk / agent_message_chunk /
                                 工具对）之后才回包。找不到的 sessionId 回
                                 INVALID_PARAMS——绝不静默新建一个空会话冒充。
-    session/set_config_option   模型切换（TUI `/model <名字>` 的协议面）。
-                                session/new 随包声明 configOptions：一项
-                                category="model" 的 select，候选=switchable_models()
-                                ——Zed 见到它就画模型下拉框。切换=改 config.model
-                                （与 TUI 同一动作，粘性）；该 session 正在跑的
-                                轮里不切（回 BUSY——避免与降级链的粘性写打架）。
-                                粘性降级改了模型时，轮末发 config_option_update
-                                把下拉框校正回真实状态。
+    session/set_config_option   模型与模式切换。session/new 随包声明
+                                configOptions 两项：category="model"（候选=
+                                switchable_models()）与 category="mode"（三档
+                                交互模式，与下面 modes 那条面同一张表）——两个
+                                category 都是 v1 stable 保留的语义标签。
+                                模型切换=改 config.model（与 TUI 同一动作，粘性）；
+                                该 session 正在跑的轮里不切（回 BUSY——避免与
+                                降级链的粘性写打架）。粘性降级改了模型时，轮末发
+                                config_option_update 把下拉框校正回真实状态。
+                                模式**故意两条面都发**：把 modes 挪作他用的宿主
+                                （拿它当 agent 选择器的就有）会让三档模式整个
+                                不可达，这条是它够不到的备用出口。
     session/set_mode            交互模式切换（TUI Shift+Tab / /mode 的协议面）。
+                                与 set_config_option(mode) 是同一个动作的两条面：
+                                谁发起谁由响应确认，另一条面收到回声校正
+                                （config_option_update / current_mode_update），
+                                同一会话里两个选择器不会显示成不同模式。
                                 session/new、session/load 回包带 modes（三档=
                                 modes.MODES 那张表，auto 档描述按本机沙箱现状取
                                 诚实版本——下拉框里就写明白，不骗人）。该 session
@@ -128,6 +139,7 @@ sink，不经协议层，所以不需要任何自定义扩展方法；可选能�
 from __future__ import annotations
 
 import base64
+import inspect
 import json
 import sys
 import threading
@@ -137,7 +149,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, TextIO
 
-from . import __version__, folder_trust, mcp, media, modes
+from . import __version__, folder_trust, mcp, mcp_guard, media, modes
 from .config import Config, MissingConfig, load_dotenv, user_env_path
 from .permissions import Permissions, suggest_allow_rule
 from .session_log import (
@@ -235,12 +247,20 @@ def _tool_title(name: str, args: dict[str, Any]) -> str:
 def config_options(agent: Agent) -> list[dict[str, Any]]:
     """session/new 与 set_config_option 回包里的 configOptions。
 
-    只有一项：模型选择（category="model"，Zed 据此画模型下拉框并把
-    model_config 类的旋钮聚拢在旁边——小羽暂时没有后者）。候选与 TUI
-    `/model` 的 Tab 补全同源（switchable_models：合并清单 + 全限定名 +
-    降级链 + 网关探测缓存），不做现场网络探测——session/new 在启动热路径上。
-    当前模型不在候选里（用户 --model 点了个清单外的名字）也要列进去：
+    两项：模型选择（category="model"）与交互模式（category="mode"）。两个
+    category 都是 v1 stable 明文保留的语义标签（"Model selector"/"Session mode
+    selector"），不是自造——client 据此决定图标/快捷键/摆放位置。
+
+    模型：候选与 TUI `/model` 的 Tab 补全同源（switchable_models：合并清单 +
+    全限定名 + 降级链 + 网关探测缓存），不做现场网络探测——session/new 在启动
+    热路径上。当前模型不在候选里（用户 --model 点了个清单外的名字）也要列进去：
     currentValue 必须是 options 的合法成员，否则 client 的下拉框没法定位。
+
+    模式：与 modes 字段（SessionModeState）同一张表，**故意两处都发**。规范
+    两条面都有，而 client 只认自己那条：把 modes 挪作他用的宿主（拿它当 agent
+    选择器的就有）会让三档交互模式整个不可达，configOptions 这条是它够不到的
+    备用出口。两条面的一致性由切换后互相回声保证（见 _handle_set_mode /
+    _handle_set_config_option）。
     """
     current = agent.config.model
     names: list[str] = []
@@ -255,7 +275,31 @@ def config_options(agent: Agent) -> list[dict[str, Any]]:
             "type": "select",
             "currentValue": current,
             "options": [{"value": name, "name": name} for name in names],
-        }
+        },
+        {
+            "id": "mode",
+            "name": "模式",
+            "category": "mode",
+            "type": "select",
+            "currentValue": agent.mode,
+            "options": [
+                {"value": name, "name": label, "description": desc}
+                for name, label, desc in _mode_entries(agent)
+            ],
+        },
+    ]
+
+
+def _mode_entries(agent: Agent) -> list[tuple[str, str, str]]:
+    """(id, 显示名, 描述) 三元组，modes 与 configOptions 两处共用一份。
+
+    auto 档的描述按本机沙箱现状取 modes.desc 的诚实版本：沙箱不可用时
+    "命令自动放行"是假的，不能让下拉框替我们撒谎。
+    """
+    ready = agent.sandbox_ready()
+    return [
+        (item.name, item.label, modes.desc(item.name, sandbox_ready=ready))
+        for item in modes.MODES
     ]
 
 
@@ -267,16 +311,11 @@ def mode_state(agent: Agent) -> dict[str, Any]:
     的 description 按本机沙箱现状取 modes.desc 的诚实版本：沙箱不可用时
     "命令自动放行"是假的，不能让下拉框替我们撒谎。
     """
-    ready = agent.sandbox_ready()
     return {
         "currentModeId": agent.mode,
         "availableModes": [
-            {
-                "id": item.name,
-                "name": item.label,
-                "description": modes.desc(item.name, sandbox_ready=ready),
-            }
-            for item in modes.MODES
+            {"id": name, "name": label, "description": desc}
+            for name, label, desc in _mode_entries(agent)
         ],
     }
 
@@ -816,7 +855,63 @@ class _Session:
 #  create=True 新建同名命名会话（历史必空）；False 找回既有会话并 restore 好
 #  agent（copy=False 续写原文件），找不到抛 LookupError——本层映射成
 #  INVALID_PARAMS，其余异常一律 INTERNAL_ERROR。
+def client_server_specs(raw: Any) -> tuple[list["mcp.ServerSpec"], list[str]]:
+    """session/new 里 client 下发的 mcpServers → ServerSpec 列表 + 跳过说明。
+
+    这些 server 是**用户在编辑器里亲手配的**（不是仓库文件里躺着的），所以
+    folder trust 那道门不管它——那道门防的是"clone 即拉起进程"。但准入闸照过：
+    mcp_guard.admission_violation 判的是"这条命令像不像攻击"，与来源无关。
+
+    四条刻意的边界（评审定死，别放宽）：
+    ① **session 作用域、绝不落盘**：不写进任何 .mcp.json，关掉编辑器就没了；
+    ② **同名以 client 为准**（合并在 mcp.launch 里做）；
+    ③ **`${VAR}` 不兑现**：配置文件里的占位符是小羽自己的约定，client 下发的
+       值是编辑器已经算好的最终值——再展开一次等于拿本进程环境去改写用户
+       在编辑器里看到的东西；
+    ④ **只收 stdio**：http/sse 由 initialize 的 mcpCapabilities 门控，我们没
+       声明，规范上 client 就不该发；真发了也跳过并说明，不静默忽略。
+    """
+    specs: list[mcp.ServerSpec] = []
+    skipped: list[str] = []
+    for item in raw if isinstance(raw, list) else []:
+        if not isinstance(item, dict):
+            continue
+        name = str(item.get("name", "") or "").strip()
+        kind = str(item.get("type", "") or "stdio")
+        if kind != "stdio":
+            skipped.append(f"{name or '(未命名)'}：{kind} 传输未声明（只支持 stdio）")
+            continue
+        command = str(item.get("command", "") or "").strip()
+        if not name or not command:
+            skipped.append(f"{name or '(未命名)'}：缺 name 或 command")
+            continue
+        args = [str(a) for a in item.get("args") or [] if isinstance(a, (str, int, float))]
+        #  规范里 env 是 [{name, value}] 数组，不是对象——照抄成字典会静默丢掉全部
+        #  环境变量（server 起来了但连不上后端，最难查的那种失败）
+        env = {
+            str(entry["name"]): str(entry.get("value", ""))
+            for entry in item.get("env") or []
+            if isinstance(entry, dict) and entry.get("name")
+        }
+        if reason := mcp_guard.admission_violation(command, args, env):
+            skipped.append(f"{name}：被安全规则拦截（{reason}）")
+            continue
+        specs.append(mcp.ServerSpec(name=name, command=command, args=args, env=env))
+    return specs, skipped
+
+
 AgentFactory = Callable[[Path, Any, AcpSink, str, bool], tuple[Agent, list[dict[str, Any]]]]
+
+
+def _factory_takes_servers(factory: Any) -> bool:
+    """工厂是否接受 mcp_servers 关键字（收不到就当它是 0.34.0 时代的旧签名）。"""
+    try:
+        params = inspect.signature(factory).parameters
+    except (TypeError, ValueError):  # C 实现/不可内省的可调用对象
+        return False
+    if any(p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values()):
+        return True
+    return "mcp_servers" in params
 
 
 def build_agent_factory(
@@ -845,13 +940,23 @@ def build_agent_factory(
     mcp_view：宿主自带 MCP 清单时传进来，替代（而非合并）配置发现——
     见 tools.Toolbox 的同名参数。不传就走配置发现，与 CLI 行为一致。
 
+    工厂返回的函数额外收一个 mcp_servers（AcpServer 把 client 随 session/new
+    下发的清单传进来，见 client_server_specs）：与配置发现合并、同名 client
+    优先。宿主显式传了 mcp_view 时以宿主为准，client 那份忽略——两个"替代
+    配置发现"的注入面叠在一起没有合理语义，宿主离用户意图更近。
+
     folder trust 按信任表非交互判定（headless 纪律）：TUI 里 --trust 过的目录
     自然放行，没记录的不吃工作区级 .mcp.json/permissions/.env，也绝不在协议
     通道上发问。
     """
 
     def build_agent(
-        workspace: Path, approver: Any, sink: AcpSink, session_name: str, create: bool
+        workspace: Path,
+        approver: Any,
+        sink: AcpSink,
+        session_name: str,
+        create: bool,
+        mcp_servers: "list[mcp.ServerSpec] | None" = None,
     ) -> tuple[Agent, list[dict[str, Any]]]:
         trusted = folder_trust.evaluate(workspace, interactive=False).verdict == "trusted"
         config = Config.from_env(
@@ -899,9 +1004,26 @@ def build_agent_factory(
             session_log, history = open_named(
                 session_name, config.model, str(config.workspace)
             )
+        view = mcp_view
+        if mcp_servers and view is None:
+            if config.enable_mcp:
+                #  client 下发的 server 与配置发现合并（同名 client 优先），
+                #  一起装进一个 manager——合并在 mcp.launch 里做，这里只接线。
+                #  manager 登记进 at-exit 清扫（launch_specs），进程退出有人收尸。
+                manager = mcp.launch(config, extra_specs=mcp_servers)
+                view = mcp.McpView(manager, "all") if manager is not None else None
+            else:
+                #  enable_mcp 是本机操作者的总闸。宿主显式传 view 时它不拦
+                #  （那是宿主程序自己的决定），但协议对端不该有权重新打开一个
+                #  被本机关掉的子系统——这两者不是一回事。
+                print(
+                    "acp：本机 MCP 已关闭（enable_mcp=false），"
+                    f"忽略 client 下发的 {len(mcp_servers)} 条 server",
+                    file=sys.stderr,
+                )
         agent = Agent(
             config,
-            Toolbox(config, mcp_view=mcp_view),
+            Toolbox(config, mcp_view=view),
             approver=approver,
             session_log=session_log,
             permissions=permissions,
@@ -931,6 +1053,10 @@ class AcpServer:
         stdout: TextIO | None = None,
     ) -> None:
         self._factory = agent_factory
+        #  工厂能不能接 client 下发的 server 清单：构造期探一次，别每次 try/except
+        #  （工厂内部真抛 TypeError 会被误读成签名不符）。旧签名的自建工厂
+        #  （嵌入宿主 0.34.0 时代写的那种）照常工作，只是收不到 client 的清单。
+        self._factory_takes_servers = _factory_takes_servers(agent_factory)
         self._stdin = stdin or sys.stdin
         self._stdout = stdout or sys.stdout
         self._write_lock = threading.Lock()
@@ -1086,17 +1212,15 @@ class AcpServer:
         if not workspace.is_dir():
             self._fail(req_id, INVALID_PARAMS, f"工作区不存在：{workspace}")
             return None
-        if params.get("mcpServers") and not self._mcp_note_shown:
-            self._mcp_note_shown = True
-            print(
-                "acp：client 随会话下发的 mcpServers 暂不接入，"
-                "MCP 集成请配置小羽自己的 .mcp.json / mcp 子命令",
-                file=sys.stderr,
-            )
         return workspace
 
     def _build_session(
-        self, req_id: Any, workspace: Path, session_id: str, create: bool
+        self,
+        req_id: Any,
+        workspace: Path,
+        session_id: str,
+        create: bool,
+        client_servers: "list[mcp.ServerSpec] | None" = None,
     ) -> "_Session | None":
         """装配一个 session（新建或找回）并登记；失败已回错误、返回 None。"""
         sink = AcpSink(self, session_id, workspace)
@@ -1104,15 +1228,30 @@ class AcpServer:
         def approver(name: str, args: dict[str, Any]) -> Allow | Deny:
             return self._request_permission(session_id, name, args)
 
+        extra: dict[str, Any] = {}
+        if client_servers:
+            if self._factory_takes_servers:
+                extra["mcp_servers"] = client_servers
+            elif not self._mcp_note_shown:
+                self._mcp_note_shown = True
+                print(
+                    "acp：当前 agent 工厂不接 client 下发的 mcpServers，"
+                    f"本次忽略 {len(client_servers)} 条",
+                    file=sys.stderr,
+                )
         try:
             try:
-                agent, history = self._factory(workspace, approver, sink, session_id, create)
+                agent, history = self._factory(
+                    workspace, approver, sink, session_id, create, **extra
+                )
             except MissingConfig:
                 #  向导可能刚在别的终端跑完而本进程环境还是旧的：补读用户级
                 #  .env（setdefault）再试一次；仍缺配置才回 auth_required——
                 #  client 见到它就引导用户走 authMethods 里的 terminal 向导
                 load_dotenv(explicit=user_env_path())
-                agent, history = self._factory(workspace, approver, sink, session_id, create)
+                agent, history = self._factory(
+                    workspace, approver, sink, session_id, create, **extra
+                )
         except UnknownModel as exc:
             #  provider 配好了、模型名解析不了：不是认证问题，别把用户往向导上引
             self._fail(req_id, INTERNAL_ERROR, str(exc))
@@ -1140,7 +1279,10 @@ class AcpServer:
         if workspace is None:
             return
         session_id = f"sess-{uuid.uuid4().hex[:16]}"
-        session = self._build_session(req_id, workspace, session_id, create=True)
+        session = self._build_session(
+            req_id, workspace, session_id, create=True,
+            client_servers=self._client_servers(params),
+        )
         if session is None:
             return
         self._respond(
@@ -1166,7 +1308,10 @@ class AcpServer:
             #  同一 id 正在跑轮还要重载：拒掉，不能从正在写日志的会话脚下抽文件
             self._fail(req_id, BUSY, "该会话本轮进行中，不能重载")
             return
-        session = self._build_session(req_id, workspace, session_id, create=False)
+        session = self._build_session(
+            req_id, workspace, session_id, create=False,
+            client_servers=self._client_servers(params),
+        )
         if session is None:
             return
         #  Zed 从 load 回包里读 selectors 与 modes（与 session/new 同款），照给
@@ -1178,6 +1323,17 @@ class AcpServer:
             },
         )
         self._advertise_commands(session_id)
+
+    def _client_servers(self, params: dict[str, Any]) -> "list[mcp.ServerSpec]":
+        """client 随 session/new、session/load 下发的 mcpServers。
+
+        跳过的条目一律打 stderr：静默少几个 server 的表现是"某个工具就是不
+        存在"，离病因极远——正是这条协议面最该防的失败形态。
+        """
+        specs, skipped = client_server_specs(params.get("mcpServers"))
+        for note in skipped:
+            print(f"acp：client 下发的 MCP server 跳过 —— {note}", file=sys.stderr)
+        return specs
 
     def _advertise_commands(self, session_id: str) -> None:
         """session 建好后广告斜杠命令（notification，跟在回包之后）。
@@ -1198,12 +1354,16 @@ class AcpServer:
         if session is None:
             self._fail(req_id, INVALID_PARAMS, "未知 sessionId（先 session/new）")
             return
-        if str(params.get("configId", "")) != "model":
-            self._fail(req_id, INVALID_PARAMS, "未知 configId（只有 model）")
+        config_id = str(params.get("configId", ""))
+        if config_id not in ("model", "mode"):
+            self._fail(req_id, INVALID_PARAMS, "未知 configId（可用：model、mode）")
             return
         value = params.get("value")
         if not isinstance(value, str) or not value.strip():
-            self._fail(req_id, INVALID_PARAMS, "value 需要非空模型名")
+            self._fail(req_id, INVALID_PARAMS, "value 需要非空字符串")
+            return
+        if config_id == "mode":
+            self._set_mode_via(req_id, session, value.strip(), config_face=True)
             return
         if session.turn_active():
             #  跑轮期间 config.model 归降级链（粘性写在工作线程），主线程不抢
@@ -1221,24 +1381,57 @@ class AcpServer:
         if session is None:
             self._fail(req_id, INVALID_PARAMS, "未知 sessionId（先 session/new）")
             return
-        mode_id = str(params.get("modeId", "") or "")
+        self._set_mode_via(
+            req_id, session, str(params.get("modeId", "") or ""), config_face=False
+        )
+
+    def _set_mode_via(
+        self, req_id: Any, session: _Session, mode_id: str, config_face: bool
+    ) -> None:
+        """切模式的唯一动作，session/set_mode 与 set_config_option(mode) 共用。
+
+        两条协议面对同一状态，所以**改完要给另一条面发回声**：client 发起的
+        那条由响应确认（不回声，否则等于替它复述），另一条面上的选择器若不
+        校正就会停在旧值——同一个会话里两个选择器显示不同模式，比没有第二条
+        面更糟。config_face 就是用来分辨"哪条面是发起方"的。
+        """
         if mode_id not in modes.BY_NAME:
             #  刻意不走 modes.get 的"不认识退回默认档"：那是配置读取的容错，
             #  协议面收到未知 id 该明说，静默切去默认档等于换了个模式冒充
             self._fail(
                 req_id,
                 INVALID_PARAMS,
-                f"未知 modeId {mode_id!r}（可用：{'、'.join(modes.CYCLE)}）",
+                f"未知模式 {mode_id!r}（可用：{'、'.join(modes.CYCLE)}）",
             )
             return
         if session.turn_active():
-            #  set_mode 会往历史注入 plan 进出说明，不能与工作线程抢 messages
+            #  切模式会往历史注入 plan 进出说明，不能与工作线程抢 messages
             self._fail(req_id, BUSY, "本轮进行中不能切模式（等本轮结束或 session/cancel）")
             return
         session.agent.set_mode(mode_id)
-        #  client 发起的切换：响应本身就是确认，只刷新对账基准、不回声通知
-        session.sink.track_mode(session.agent)
-        self._respond(req_id, {})
+        if config_face:
+            #  发起方是 configOptions：回包带新的 configOptions，另一条面
+            #  （modes）靠 current_mode_update 校正——sync_mode 比对基准后自己发
+            session.sink.sync_mode()
+            self._respond(req_id, {"configOptions": config_options(session.agent)})
+        else:
+            #  发起方是 set_mode：响应即确认，只刷新对账基准不回声；
+            #  另一条面（configOptions）发 config_option_update 校正
+            session.sink.track_mode(session.agent)
+            self._respond(req_id, {})
+            self._notify_config_options(session)
+
+    def _notify_config_options(self, session: _Session) -> None:
+        self._notify(
+            "session/update",
+            {
+                "sessionId": session.session_id,
+                "update": {
+                    "sessionUpdate": "config_option_update",
+                    "configOptions": config_options(session.agent),
+                },
+            },
+        )
 
     def _handle_prompt(self, req_id: Any, params: dict[str, Any]) -> None:
         session = self._sessions.get(str(params.get("sessionId", "")))
