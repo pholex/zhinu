@@ -128,6 +128,13 @@ class ConfigParsingTest(unittest.TestCase):
     def test_no_config_files(self):
         self.assertEqual(mcp.load_server_specs(self.workspace), [])
 
+    def test_inherit_env_parsed_from_config(self):
+        self.write_workspace(
+            {"mcpServers": {"a": {"command": "cmd", "inheritEnv": ["MYAPP_*", ""]}}}
+        )
+        (spec,) = mcp.load_server_specs(self.workspace)
+        self.assertEqual(spec.inherit_env, ["MYAPP_*"])
+
     def test_workspace_overrides_user(self):
         self.write_user({"mcpServers": {"a": {"command": "user-cmd"}}})
         self.write_workspace({"mcpServers": {"a": {"command": "ws-cmd"}}})
@@ -200,6 +207,58 @@ class ConfigParsingTest(unittest.TestCase):
         self.assertEqual(by_name["a"].timeout, 5.0)
         #  非法值回退默认
         self.assertEqual(by_name["b"].timeout, mcp.CALL_TIMEOUT)
+
+
+class LaunchSpecsTest(unittest.TestCase):
+    """显式 specs 的 launch 入口（嵌入宿主/ACP client 下发的清单走这条）。"""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.workspace = Path(self.tmp.name).resolve()
+        self.script = write_fake_server(self.workspace)
+        self.user_dir = self.workspace / "userconf"
+        patcher = mock.patch.object(mcp, "user_config_dir", lambda: self.user_dir)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.addCleanup(mcp.shutdown_all)
+
+    def fake_spec(self, name: str) -> mcp.ServerSpec:
+        return mcp.ServerSpec(
+            name=name, command=sys.executable, args=[str(self.script)], timeout=15.0
+        )
+
+    def test_empty_specs_launch_nothing(self):
+        self.assertIsNone(mcp.launch_specs([]))
+
+    def test_launched_manager_is_registered_for_shutdown(self):
+        """自建 manager 最怕的是没人收尸：登记过才有 at-exit 兜底。"""
+        manager = mcp.launch_specs([self.fake_spec("fake")])
+        self.assertIsNotNone(manager)
+        manager.wait_ready(20.0)
+        self.assertIn(manager, mcp._extra_managers)
+        mcp.shutdown_all()
+        self.assertEqual(mcp._extra_managers, [])
+
+    def test_extra_specs_win_over_config_file_by_name(self):
+        """同名以 client/宿主下发的为准——配置文件里那条指向坏命令也不影响。"""
+        (self.workspace / ".mcp.json").write_text(
+            json.dumps({"mcpServers": {"fake": {"command": "xiaoyu-不存在的命令-xyz"}}}),
+            encoding="utf-8",
+        )
+        config = Config.from_env(workspace=self.workspace)
+        manager = mcp.launch(config, extra_specs=[self.fake_spec("fake")])
+        self.assertIsNotNone(manager)
+        manager.wait_ready(20.0)
+        #  跑起来的是能用的那条（配置文件那条会握手失败、零工具）
+        self.assertTrue(manager.ready_tools())
+
+    def test_extra_specs_path_does_not_poison_the_workspace_cache(self):
+        """按会话下发的清单不能进进程级缓存，否则同工作区第二个会话会串台。"""
+        config = Config.from_env(workspace=self.workspace)
+        manager = mcp.launch(config, extra_specs=[self.fake_spec("fake")])
+        self.assertIsNotNone(manager)
+        self.assertNotIn(config.workspace, mcp._managers)
 
 
 class PublicToolNameTest(unittest.TestCase):
@@ -323,6 +382,33 @@ class SafeEnvTest(unittest.TestCase):
         with mock.patch.dict("os.environ", {"PATH": "/bin"}, clear=True):
             env = mcp._safe_env({"PATH": "/custom"})
         self.assertEqual(env["PATH"], "/custom")
+
+    def test_inherit_env_passes_named_and_prefixed_vars(self):
+        """宿主自己的 server 要靠 MYAPP_HOME 之类找对实例：白名单挡着它，
+        点名透传放行——只放点名的，不放开白名单。"""
+        with mock.patch.dict(
+            "os.environ",
+            {"PATH": "/bin", "MYAPP_HOME": "/data", "MYAPP_PORT": "9",
+             "OTHER": "x", "GITHUB_TOKEN": "秘"},
+            clear=True,
+        ):
+            env = mcp._safe_env(None, ["MYAPP_*", "OTHER"])
+        self.assertEqual(env["MYAPP_HOME"], "/data")
+        self.assertEqual(env["MYAPP_PORT"], "9")
+        self.assertEqual(env["OTHER"], "x")
+        #  点名之外的秘密照旧挡住
+        self.assertNotIn("GITHUB_TOKEN", env)
+
+    def test_inherit_env_missing_names_are_skipped(self):
+        with mock.patch.dict("os.environ", {"PATH": "/bin"}, clear=True):
+            env = mcp._safe_env(None, ["NOT_SET", "ALSO_*"])
+        self.assertNotIn("NOT_SET", env)
+
+    def test_declared_env_beats_inherited_name(self):
+        """三层覆盖方向：白名单 < 点名透传 < 该 server 自己声明的 env。"""
+        with mock.patch.dict("os.environ", {"MYAPP_HOME": "/from-parent"}, clear=True):
+            env = mcp._safe_env({"MYAPP_HOME": "/declared"}, ["MYAPP_HOME"])
+        self.assertEqual(env["MYAPP_HOME"], "/declared")
 
 
 class RedactTest(unittest.TestCase):

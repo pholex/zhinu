@@ -116,6 +116,12 @@ class ServerSpec:
     #  tools/call 超时（秒）
     timeout: float = CALL_TIMEOUT
     disabled: bool = False
+    #  额外从父环境透传给 server 的变量名（或以 * 结尾的前缀，如 "MYAPP_*"）。
+    #  _safe_env 的白名单是给"第三方 server"定的，对**宿主自己的** server 不够：
+    #  它要靠 MYAPP_HOME 之类找到自己的数据目录，拿不到就默默解析成默认路径、
+    #  读错实例的状态（起得来、连得上、答案是别人的——最难查的一类）。
+    #  只透传点名的，不放开白名单本身。
+    inherit_env: list[str] = field(default_factory=list)
 
 
 #  ${env:VAR} 与 ${VAR} 两种写法都认——不同客户端生态各用其一，
@@ -155,8 +161,28 @@ _SAFE_ENV_KEYS_WINDOWS = frozenset(
 )
 
 
-def _safe_env(extra: dict[str, str] | None = None) -> dict[str, str]:
-    """从零构造 stdio 子进程环境：白名单基底 + 配置声明的 env 覆盖。"""
+def _inherited(names: list[str] | None) -> dict[str, str]:
+    """按点名/前缀从父环境取变量（见 ServerSpec.inherit_env）。取不到的跳过。"""
+    picked: dict[str, str] = {}
+    for name in names or []:
+        if name.endswith("*"):
+            prefix = name[:-1]
+            picked.update(
+                {k: v for k, v in os.environ.items() if prefix and k.startswith(prefix)}
+            )
+        elif (value := os.environ.get(name)) is not None:
+            picked[name] = value
+    return picked
+
+
+def _safe_env(
+    extra: dict[str, str] | None = None, inherit: list[str] | None = None
+) -> dict[str, str]:
+    """从零构造 stdio 子进程环境：白名单基底 + 点名透传 + 配置声明的 env 覆盖。
+
+    三层的覆盖方向固定：白名单 < 点名透传（inherit_env）< 配置声明的 env。
+    越靠近这个 server 自己的声明，优先级越高。
+    """
     env = {
         key: value
         for key, value in os.environ.items()
@@ -164,6 +190,7 @@ def _safe_env(extra: dict[str, str] | None = None) -> dict[str, str]:
         or key.startswith(_SAFE_ENV_PREFIXES)
         or (os.name == "nt" and key.upper() in _SAFE_ENV_KEYS_WINDOWS)
     }
+    env.update(_inherited(inherit))
     #  MCP stdio 协议规定 UTF-8，但 Windows 上 Python 子进程的管道默认用
     #  locale 编码（cp1252/gbk）——Python 实现的 server（含自家看门狗）一打印
     #  非 ASCII 就 UnicodeEncodeError 崩掉。只影响 Python 子进程，Node 恒 UTF-8。
@@ -329,6 +356,9 @@ def _parse_config_file(
                 },
                 timeout=float(timeout),
                 disabled=bool(raw.get("disabled", False)),
+                inherit_env=[
+                    str(name) for name in raw.get("inheritEnv") or [] if str(name).strip()
+                ],
             )
         )
     return specs
@@ -527,7 +557,7 @@ class McpServer:
                 errors="replace",
                 #  行缓冲：协议就是一行一条消息
                 bufsize=1,
-                env=_safe_env(self.spec.env),
+                env=_safe_env(self.spec.env, self.spec.inherit_env),
                 **_subprocess_hardening(),
             )
         except OSError as exc:
@@ -1603,12 +1633,36 @@ class McpView:
 #  按工作区缓存 manager：同一进程里反复构造 Toolbox（REPL + explore 已关掉 MCP，
 #  正常只有一次，但测试会多次）不重复拉起子进程。
 _managers: dict[Path, McpManager] = {}
+#  不按工作区缓存、但仍要被 at-exit 兜底关掉的 manager（显式 specs 起的那种，
+#  见 launch_specs）。缓存键是工作区，而这些 manager 的清单是按会话/宿主来的，
+#  同一工作区的两个会话可以有不同清单——共用一份会串台，所以只登记不复用。
+_extra_managers: list[McpManager] = []
 _atexit_registered = False
 
 
-def launch(config: Config) -> McpManager | None:
-    """按配置拉起（或复用）本工作区的 MCP manager。没配置任何 server 返回 None。"""
+def _ensure_atexit() -> None:
     global _atexit_registered
+    if not _atexit_registered:
+        atexit.register(shutdown_all)
+        _atexit_registered = True
+
+
+def launch(config: Config, extra_specs: list[ServerSpec] | None = None) -> McpManager | None:
+    """按配置拉起（或复用）本工作区的 MCP manager。没配置任何 server 返回 None。
+
+    extra_specs：配置发现之外再挂几条 server（ACP client 随会话下发的那种）。
+    **同名以 extra_specs 为准**——它是用户在编辑器里亲手配的，比配置文件里
+    的同名条目更贴近此刻的意图。带 extra_specs 时走不缓存的路径（理由见
+    _extra_managers），返回的 manager 由调用方 close，at-exit 也会兜底。
+    """
+    if extra_specs:
+        merged = {spec.name: spec for spec in load_server_specs(
+            config.workspace,
+            config.extra_env,
+            include_project=getattr(config, "workspace_trusted", True),
+        )}
+        merged.update({spec.name: spec for spec in extra_specs})
+        return launch_specs(list(merged.values()))
     manager = _managers.get(config.workspace)
     if manager is not None:
         return manager
@@ -1623,14 +1677,30 @@ def launch(config: Config) -> McpManager | None:
     manager = McpManager(specs)
     manager.start()
     _managers[config.workspace] = manager
-    if not _atexit_registered:
-        atexit.register(shutdown_all)
-        _atexit_registered = True
+    _ensure_atexit()
+    return manager
+
+
+def launch_specs(specs: list[ServerSpec]) -> McpManager | None:
+    """按给定 specs 现起一个 manager 并登记到 at-exit 清扫（空列表返回 None）。
+
+    嵌入宿主自带 server 清单时的入口：自己 `McpManager(specs)` 也能跑，但那份
+    不在任何登记表里——进程退出时无人 close，子进程要靠看门狗兜底回收。走这里
+    就有兜底。**不复用、不缓存**：调用方拿到的永远是新的一份，用完自己 close
+    （提前 close 过的，at-exit 再关一次是幂等的）。
+    """
+    if not specs:
+        return None
+    manager = McpManager(specs)
+    manager.start()
+    _extra_managers.append(manager)
+    _ensure_atexit()
     return manager
 
 
 def shutdown_all() -> None:
     """关掉全部 server 子进程（atexit 兜底；测试也直接调）。"""
-    for manager in list(_managers.values()):
+    for manager in list(_managers.values()) + list(_extra_managers):
         manager.close()
     _managers.clear()
+    _extra_managers.clear()
