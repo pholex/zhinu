@@ -1,6 +1,6 @@
 """acp 模式：Agent Client Protocol server（agentclientprotocol.com）。
 
-`xiaoyu --acp` 后本进程即 ACP agent：Zed / Neovim / Emacs / marimo 等编辑器
+`xiaoyu acp`（等价旗标 `xiaoyu --acp`）后本进程即 ACP agent：Zed / Neovim / Emacs / marimo 等编辑器
 客户端经 stdin/stdout 驱动（JSON-RPC 2.0，一行一条）。与自研 `--wire` 并存：
 wire 是小羽自己的极简协议（面向自家外壳与测试驱动器），acp 是编辑器生态的
 通用协议——接一层白得整个 ACP 客户端生态，符合「协议兼容、不自建生态」。
