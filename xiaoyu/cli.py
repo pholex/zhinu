@@ -93,6 +93,7 @@ def build_parser() -> argparse.ArgumentParser:
             "xiaoyu mcp add|list|remove  管理 MCP server 声明（详见 xiaoyu mcp --help）；"
             "xiaoyu plugin add|list|update|remove  装卸插件包（skills + MCP，"
             "详见 xiaoyu plugin --help）；"
+            "xiaoyu acp  以 ACP 协议 server 启动，供编辑器客户端驱动（等价 --acp）；"
             "xiaoyu terminal-setup  给 VS Code 系编辑器配 Shift+Enter 换行；"
             "xiaoyu update  升级到最新版（未装 TUI 时自动补上；已装 serve 时一并升级）；"
             "xiaoyu uninstall  卸载（--purge 连配置目录一起删）"
@@ -2199,6 +2200,12 @@ def main(argv: list[str] | None = None) -> int:
         return mcp_command(argv[1:])
     if argv and argv[0] == "serve":
         return serve_command(argv[1:])
+    if argv and argv[0] == "acp":
+        #  子命令形态与 `--acp` 旗标完全等价：转写成旗标再走主解析器，两条路
+        #  共用同一套参数、folder trust 门与 wire/acp 互斥检查，永不漂移。
+        #  两种写法都留：编辑器/registry 的配置模板惯用子命令，`--acp` 是
+        #  既有集成（含 ACP registry 提交物）的入口，属永久别名不做废弃。
+        return main(["--acp", *argv[1:]])
     if argv and argv[0] in ("plugin", "plugins"):
         return plugin_command(argv[1:])
     if argv and argv[0] == "terminal-setup":
@@ -2366,7 +2373,7 @@ def wire_main(args: argparse.Namespace, workspace_trusted: bool = True) -> int:
 
 
 def acp_main(args: argparse.Namespace) -> int:
-    """`--acp` 入口：Agent Client Protocol server（见 acp.py 模块 docstring）。
+    """`xiaoyu acp` / `--acp` 入口：Agent Client Protocol server（见 acp.py 模块 docstring）。
 
     与 wire 的结构差异：ACP 的工作区随 session/new 的 cwd 来（编辑器一个
     项目一个 session），所以 Agent 不在启动期装配，而是给 server 一个工厂
@@ -2378,7 +2385,7 @@ def acp_main(args: argparse.Namespace) -> int:
     from .acp import AcpServer, AcpSink
 
     if prompt_words(args):
-        print(ui.error("--acp 模式不接受命令行指令（用协议里的 session/prompt）"), file=sys.stderr)
+        print(ui.error("acp 模式不接受命令行指令（用协议里的 session/prompt）"), file=sys.stderr)
         return 2
 
     def build_agent(

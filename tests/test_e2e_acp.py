@@ -27,13 +27,14 @@ class AcpCase(E2ECase):
         script: str,
         extra_env: dict[str, str] | None = None,
         env: dict[str, str] | None = None,
+        entry: list[str] | None = None,
     ) -> WireProcess:
         if env is None:
             env = self.scripted_env(script)
             if extra_env:
                 env.update(extra_env)
         proc = subprocess.Popen(
-            [sys.executable, "-m", "xiaoyu", "--acp"],
+            [sys.executable, "-m", "xiaoyu", *(entry or ["--acp"])],
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -142,6 +143,39 @@ class HandshakeTest(AcpCase):
         )
         response, _ = acp.read_until(self.is_response("1"))
         self.assertEqual(response["error"]["code"], -32602)
+
+
+class EntryFormTest(AcpCase):
+    """`xiaoyu acp` 子命令与 `--acp` 旗标必须是同一条路。
+
+    子命令是转写成旗标再走主解析器的，所以要验的不是"能起来"而是
+    "参数照样落地"——旗标漂移的后果是"这个 flag 在 --acp 里生效、在
+    子命令里静默失效"，不报错、只表现为行为不一致。
+    """
+
+    def test_subcommand_starts_same_server(self):
+        acp = self.start_acp("text: ok\n", entry=["acp"])
+        session_id = self.new_session(acp)
+        self.assertTrue(session_id.startswith("sess-"))
+
+    def test_subcommand_still_takes_main_parser_flags(self):
+        acp = self.start_acp("text: ok\n", entry=["acp", "--mode", "plan"])
+        acp.send(
+            {"jsonrpc": "2.0", "id": "init", "method": "initialize",
+             "params": {"protocolVersion": 1, "clientCapabilities": {}}}
+        )
+        acp.read_until(self.is_response("init"))
+        acp.send(
+            {"jsonrpc": "2.0", "id": "new", "method": "session/new",
+             "params": {"cwd": str(self.workspace), "mcpServers": []}}
+        )
+        response, _ = acp.read_until(self.is_response("new"))
+        self.assertEqual(response["result"]["modes"]["currentModeId"], "plan")
+
+    def test_subcommand_rejects_command_line_prompt(self):
+        from xiaoyu import cli
+
+        self.assertEqual(cli.main(["acp", "干活"]), 2)
 
 
 class PromptTest(AcpCase):
