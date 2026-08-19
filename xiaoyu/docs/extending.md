@@ -78,7 +78,7 @@ def run(path: str) -> str:
 
 ## MCP server
 
-声明式接入外部子进程工具（只支持 stdio transport）：
+声明式接入外部工具（本地 stdio 子进程，或远端 Streamable HTTP）：
 
 ```json
 // 工作区 .mcp.json（多客户端通用），或配置目录 mcp.json（用户级）
@@ -95,7 +95,7 @@ def run(path: str) -> str:
 ```
 
 - `command`/`args`/`env` 的值里可写 `${env:VAR}`（兼容 `${VAR}`）引用环境变量。
-- 远程 HTTP server 用桥接：`"command": "npx", "args": ["-y", "mcp-remote", "https://…"]`。
+- 远端 server 直连：`"type": "http", "url": "https://…"`，可带 `"headers": {...}`；明文 http 只允许回环地址。老式 SSE 传输不支持。
 - 工具挂进来的名字是 `mcp__<server>__<tool>`；权限规则（`/allow`）按这个名字写。
 - server 的 stderr 在配置目录 `logs/mcp-<name>.log`，排障看那里；`/mcp` 查看状态。
 

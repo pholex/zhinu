@@ -70,6 +70,37 @@ def admission_violation(command: str, args: list[str], env: dict[str, str]) -> s
     return None
 
 
+_LOOPBACK_HOSTS = frozenset({"localhost", "127.0.0.1", "::1", "[::1]", "0.0.0.0"})
+
+
+def endpoint_violation(url: str) -> str | None:
+    """远端 MCP server 的地址不合规时返回原因，否则 None。
+
+    与 admission_violation 对位：stdio 的准入判据是"这条命令像不像攻击"，
+    HTTP 的判据是"这个地址会不会把凭据裸奔送出去"。两条：
+
+    1. **只认 http/https**：file://、ftp:// 之类到不了 MCP server，出现即配置错
+       （或诱导）——早报错好过在传输层抛一个看不懂的异常；
+    2. **明文 http 只允许回环**：headers 里放的是 Authorization / API key，
+       走公网明文等于把凭据交给路上任何一跳。本机 server 用 http 是常态，放行。
+
+    刻意不做域名白名单：用户配的远端 server 就是他要用的，那属于意图不属于攻击。
+    """
+    from urllib.parse import urlparse
+
+    try:
+        parsed = urlparse(url)
+    except ValueError as exc:
+        return f"地址无法解析（{exc}）"
+    if parsed.scheme not in ("http", "https"):
+        return f"不支持的地址协议 {parsed.scheme or '(空)'}://（只支持 http/https）"
+    if not parsed.hostname:
+        return "地址缺少主机名"
+    if parsed.scheme == "http" and parsed.hostname.lower() not in _LOOPBACK_HOSTS:
+        return f"明文 http 只允许连回环地址（{parsed.hostname} 请用 https）"
+    return None
+
+
 # ---------- OSV 恶意包预检 ----------
 
 OSV_ENDPOINT = "https://api.osv.dev/v1/query"

@@ -10,9 +10,11 @@ import base64
 import json
 import sys
 import tempfile
+import threading
 import textwrap
 import time
 import unittest
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from unittest import mock
 
@@ -128,6 +130,13 @@ class ConfigParsingTest(unittest.TestCase):
     def test_no_config_files(self):
         self.assertEqual(mcp.load_server_specs(self.workspace), [])
 
+    def test_inherit_env_parsed_from_config(self):
+        self.write_workspace(
+            {"mcpServers": {"a": {"command": "cmd", "inheritEnv": ["MYAPP_*", ""]}}}
+        )
+        (spec,) = mcp.load_server_specs(self.workspace)
+        self.assertEqual(spec.inherit_env, ["MYAPP_*"])
+
     def test_workspace_overrides_user(self):
         self.write_user({"mcpServers": {"a": {"command": "user-cmd"}}})
         self.write_workspace({"mcpServers": {"a": {"command": "ws-cmd"}}})
@@ -200,6 +209,259 @@ class ConfigParsingTest(unittest.TestCase):
         self.assertEqual(by_name["a"].timeout, 5.0)
         #  非法值回退默认
         self.assertEqual(by_name["b"].timeout, mcp.CALL_TIMEOUT)
+
+
+class _McpHttpHandler(BaseHTTPRequestHandler):
+    """假的 Streamable HTTP MCP server。类属性即开关，各用例自己拨。"""
+
+    protocol_version = "HTTP/1.1"
+    mode = "json"            # json | sse：响应体的形态
+    require_session = True   # 握手后不带 Mcp-Session-Id 就 400
+    offer_stream = False     # GET 是否给一条 SSE 长流
+    record: dict = {}
+    stop = threading.Event()
+
+    def log_message(self, *args):  # 别把请求日志打进测试输出
+        pass
+
+    # ---- 出站 ----
+
+    def _send_json(self, payload: dict, extra: dict[str, str] | None = None) -> None:
+        body = json.dumps(payload).encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        for key, value in (extra or {}).items():
+            self.send_header(key, value)
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _send_sse(self, payload: dict, extra: dict[str, str] | None = None) -> None:
+        body = f"data: {json.dumps(payload)}\n\n".encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream")
+        self.send_header("Content-Length", str(len(body)))
+        for key, value in (extra or {}).items():
+            self.send_header(key, value)
+        self.end_headers()
+        self.wfile.write(body)
+
+    # ---- 入站 ----
+
+    def do_POST(self) -> None:
+        length = int(self.headers.get("Content-Length") or 0)
+        message = json.loads(self.rfile.read(length) or b"{}")
+        method = message.get("method", "")
+        cls = type(self)
+        cls.record.setdefault("methods", []).append(method)
+        #  HTTP 头大小写不敏感（RFC 9110）：一律降成小写再记，
+        #  否则断言实际上钉的是客户端库的大小写习惯，不是协议
+        cls.record.setdefault("headers", []).append(
+            {key.lower(): value for key, value in self.headers.items()}
+        )
+        if method == "initialize":
+            reply = {"jsonrpc": "2.0", "id": message["id"], "result": {
+                "protocolVersion": "2025-06-18",
+                "capabilities": {"tools": {}},
+                "serverInfo": {"name": "fake-http", "version": "1"},
+            }}
+            self._send_json(reply, {"Mcp-Session-Id": "sess-http-1"})
+            return
+        if cls.require_session and self.headers.get("Mcp-Session-Id") != "sess-http-1":
+            self.send_response(400)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
+        if not message.get("id"):  # 通知：202 无响应体
+            self.send_response(202)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
+        if method == "tools/list":
+            result = {"tools": [{
+                "name": "echo",
+                "description": "回显文本",
+                "inputSchema": {"type": "object", "properties": {"text": {"type": "string"}}},
+            }]}
+        elif method == "tools/call":
+            text = (message.get("params") or {}).get("arguments", {}).get("text", "")
+            result = {"content": [{"type": "text", "text": f"远端回显：{text}"}]}
+        else:
+            result = {}
+        reply = {"jsonrpc": "2.0", "id": message["id"], "result": result}
+        (self._send_sse if cls.mode == "sse" else self._send_json)(reply)
+
+    def do_GET(self) -> None:
+        cls = type(self)
+        if not cls.offer_stream:
+            self.send_response(405)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream")
+        self.end_headers()
+        notice = {"jsonrpc": "2.0", "method": "notifications/tools/list_changed"}
+        self.wfile.write(f"data: {json.dumps(notice)}\n\n".encode())
+        self.wfile.flush()
+        cls.stop.wait(10)
+
+    def do_DELETE(self) -> None:
+        type(self).record["deleted"] = True
+        self.send_response(200)
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+
+
+class HttpTransportTest(unittest.TestCase):
+    """远端 server（Streamable HTTP）：真 HTTP 往返，不打桩传输层。"""
+
+    def setUp(self):
+        _McpHttpHandler.mode = "json"
+        _McpHttpHandler.require_session = True
+        _McpHttpHandler.offer_stream = False
+        _McpHttpHandler.record = {}
+        _McpHttpHandler.stop = threading.Event()
+        self.httpd = ThreadingHTTPServer(("127.0.0.1", 0), _McpHttpHandler)
+        thread = threading.Thread(target=self.httpd.serve_forever, daemon=True)
+        thread.start()
+        self.url = f"http://127.0.0.1:{self.httpd.server_address[1]}/mcp"
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+
+        def teardown():
+            _McpHttpHandler.stop.set()
+            self.httpd.shutdown()
+            self.httpd.server_close()
+
+        self.addCleanup(teardown)
+
+    def make_server(self, **kwargs) -> mcp.McpServer:
+        spec = mcp.ServerSpec(name="remote", command="", url=self.url, timeout=15.0, **kwargs)
+        server = mcp.McpServer(spec, Path(self.tmp.name) / "remote.log")
+        self.addCleanup(server.close)
+        return server
+
+    def test_handshake_list_and_call_over_json(self):
+        server = self.make_server()
+        declared = server.bootstrap()
+        self.assertEqual([t["name"] for t in declared], ["echo"])
+        self.assertEqual(server.server_info, "fake-http 1")
+        self.assertEqual(server.call_tool("echo", {"text": "喂"}), "远端回显：喂")
+        self.assertTrue(server.alive())
+
+    def test_sse_response_body_is_understood(self):
+        """规范允许一次 POST 用 SSE 回响应——只会读 application/json 的客户端
+        在这类 server 上会永远等下去。"""
+        _McpHttpHandler.mode = "sse"
+        server = self.make_server()
+        server.bootstrap()
+        self.assertEqual(server.call_tool("echo", {"text": "sse"}), "远端回显：sse")
+
+    def test_session_id_is_carried_after_handshake(self):
+        """会话 id 不回传的话，规矩的 server 会把后续请求全部拒掉。"""
+        server = self.make_server()
+        server.bootstrap()  # require_session=True，能走完就说明带上了
+        after_init = _McpHttpHandler.record["headers"][1:]
+        self.assertTrue(all(h.get("mcp-session-id") == "sess-http-1" for h in after_init))
+        #  协议版本头握手后才带（initialize 那次还没协商出结果）
+        self.assertNotIn("mcp-protocol-version", _McpHttpHandler.record["headers"][0])
+        self.assertTrue(all(h.get("mcp-protocol-version") for h in after_init))
+
+    def test_custom_headers_are_sent(self):
+        server = self.make_server(headers={"Authorization": "Bearer t0k"})
+        server.bootstrap()
+        self.assertEqual(
+            _McpHttpHandler.record["headers"][0].get("authorization"), "Bearer t0k"
+        )
+
+    def test_close_deletes_remote_session(self):
+        server = self.make_server()
+        server.bootstrap()
+        server.close()
+        self.assertTrue(_McpHttpHandler.record.get("deleted"))
+        self.assertFalse(server.alive())
+
+    def test_list_changed_notification_arrives_on_the_get_stream(self):
+        """rug-pull 监督的触发源：远端只能从 GET 长流推过来。"""
+        _McpHttpHandler.offer_stream = True
+        server = self.make_server()
+        fired = threading.Event()
+        server.on_tools_changed = fired.set
+        server.bootstrap()
+        try:
+            self.assertTrue(fired.wait(10), "长流上的 tools/list_changed 没有送达")
+        finally:
+            #  放行夹具里那条长流 handler：它挂在 stop 上，不放行 teardown 要
+            #  等满超时（10s 是异常兜底，不该出现在正常路径的耗时里）
+            _McpHttpHandler.stop.set()
+
+    def test_missing_get_stream_is_not_a_failure(self):
+        """server 回 405 = 不提供长流，规范允许，不能因此判 server 有问题。"""
+        server = self.make_server()  # offer_stream=False
+        server.bootstrap()
+        self.assertTrue(server.alive())
+        self.assertEqual(server.call_tool("echo", {"text": "ok"}), "远端回显：ok")
+
+    def test_plaintext_http_to_non_loopback_is_blocked(self):
+        """headers 里放的是凭据：公网明文等于交给路上每一跳。"""
+        spec = mcp.ServerSpec(name="remote", command="", url="http://example.com/mcp")
+        server = mcp.McpServer(spec, Path(self.tmp.name) / "blocked.log")
+        with self.assertRaises(mcp.McpError) as caught:
+            server.bootstrap()
+        self.assertIn("回环", str(caught.exception))
+
+
+class LaunchSpecsTest(unittest.TestCase):
+    """显式 specs 的 launch 入口（嵌入宿主/ACP client 下发的清单走这条）。"""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.workspace = Path(self.tmp.name).resolve()
+        self.script = write_fake_server(self.workspace)
+        self.user_dir = self.workspace / "userconf"
+        patcher = mock.patch.object(mcp, "user_config_dir", lambda: self.user_dir)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.addCleanup(mcp.shutdown_all)
+
+    def fake_spec(self, name: str) -> mcp.ServerSpec:
+        return mcp.ServerSpec(
+            name=name, command=sys.executable, args=[str(self.script)], timeout=15.0
+        )
+
+    def test_empty_specs_launch_nothing(self):
+        self.assertIsNone(mcp.launch_specs([]))
+
+    def test_launched_manager_is_registered_for_shutdown(self):
+        """自建 manager 最怕的是没人收尸：登记过才有 at-exit 兜底。"""
+        manager = mcp.launch_specs([self.fake_spec("fake")])
+        self.assertIsNotNone(manager)
+        manager.wait_ready(20.0)
+        self.assertIn(manager, mcp._extra_managers)
+        mcp.shutdown_all()
+        self.assertEqual(mcp._extra_managers, [])
+
+    def test_extra_specs_win_over_config_file_by_name(self):
+        """同名以 client/宿主下发的为准——配置文件里那条指向坏命令也不影响。"""
+        (self.workspace / ".mcp.json").write_text(
+            json.dumps({"mcpServers": {"fake": {"command": "xiaoyu-不存在的命令-xyz"}}}),
+            encoding="utf-8",
+        )
+        config = Config.from_env(workspace=self.workspace)
+        manager = mcp.launch(config, extra_specs=[self.fake_spec("fake")])
+        self.assertIsNotNone(manager)
+        manager.wait_ready(20.0)
+        #  跑起来的是能用的那条（配置文件那条会握手失败、零工具）
+        self.assertTrue(manager.ready_tools())
+
+    def test_extra_specs_path_does_not_poison_the_workspace_cache(self):
+        """按会话下发的清单不能进进程级缓存，否则同工作区第二个会话会串台。"""
+        config = Config.from_env(workspace=self.workspace)
+        manager = mcp.launch(config, extra_specs=[self.fake_spec("fake")])
+        self.assertIsNotNone(manager)
+        self.assertNotIn(config.workspace, mcp._managers)
 
 
 class PublicToolNameTest(unittest.TestCase):
@@ -323,6 +585,33 @@ class SafeEnvTest(unittest.TestCase):
         with mock.patch.dict("os.environ", {"PATH": "/bin"}, clear=True):
             env = mcp._safe_env({"PATH": "/custom"})
         self.assertEqual(env["PATH"], "/custom")
+
+    def test_inherit_env_passes_named_and_prefixed_vars(self):
+        """宿主自己的 server 要靠 MYAPP_HOME 之类找对实例：白名单挡着它，
+        点名透传放行——只放点名的，不放开白名单。"""
+        with mock.patch.dict(
+            "os.environ",
+            {"PATH": "/bin", "MYAPP_HOME": "/data", "MYAPP_PORT": "9",
+             "OTHER": "x", "GITHUB_TOKEN": "秘"},
+            clear=True,
+        ):
+            env = mcp._safe_env(None, ["MYAPP_*", "OTHER"])
+        self.assertEqual(env["MYAPP_HOME"], "/data")
+        self.assertEqual(env["MYAPP_PORT"], "9")
+        self.assertEqual(env["OTHER"], "x")
+        #  点名之外的秘密照旧挡住
+        self.assertNotIn("GITHUB_TOKEN", env)
+
+    def test_inherit_env_missing_names_are_skipped(self):
+        with mock.patch.dict("os.environ", {"PATH": "/bin"}, clear=True):
+            env = mcp._safe_env(None, ["NOT_SET", "ALSO_*"])
+        self.assertNotIn("NOT_SET", env)
+
+    def test_declared_env_beats_inherited_name(self):
+        """三层覆盖方向：白名单 < 点名透传 < 该 server 自己声明的 env。"""
+        with mock.patch.dict("os.environ", {"MYAPP_HOME": "/from-parent"}, clear=True):
+            env = mcp._safe_env({"MYAPP_HOME": "/declared"}, ["MYAPP_HOME"])
+        self.assertEqual(env["MYAPP_HOME"], "/declared")
 
 
 class RedactTest(unittest.TestCase):

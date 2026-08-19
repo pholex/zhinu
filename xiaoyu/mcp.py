@@ -7,8 +7,10 @@
 - **只做 stdio**：newline-delimited JSON-RPC 2.0 over stdin/stdout，纯 stdlib
   （Popen + 一条读线程）就够。不引官方 mcp SDK——那是 anyio 异步栈，塞进
   小羽的同步主循环要多养一个事件循环线程，为低频能力不值。
-  远程 HTTP server 用社区标准桥接：command 写 npx、args 写
-  ["-y", "mcp-remote", "https://…"]，对小羽来说仍是一个 stdio server。
+  远端 server 直连 Streamable HTTP（规范 2025-06-18）：url 非空即走 HTTP 传输，
+  与 stdio 共用本模块的全部上层逻辑（熔断、惰性启动、代际事务、指纹基线）。
+  老式 SSE 传输（2024-11-05）不实现——它已被规范标为过时，现役 server 都在
+  Streamable HTTP 上；真遇到老 server 仍可用 mcp-remote 这类桥接当 stdio 跑。
 - **懒加载不阻塞启动**：每个 server 的 spawn → initialize → tools/list 在
   后台线程跑，REPL 立即可用；工具就绪后在下一次组装 schemas 时追加注册
   （append-only 不重排已有前缀，prompt cache 只作废尾部）。
@@ -70,9 +72,11 @@ import subprocess
 import sys
 import threading
 import time
+import urllib.error
+import urllib.request
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Iterator
 
 from . import mcp_guard, media
 from .config import Config, user_config_dir
@@ -116,6 +120,21 @@ class ServerSpec:
     #  tools/call 超时（秒）
     timeout: float = CALL_TIMEOUT
     disabled: bool = False
+    #  额外从父环境透传给 server 的变量名（或以 * 结尾的前缀，如 "MYAPP_*"）。
+    #  _safe_env 的白名单是给"第三方 server"定的，对**宿主自己的** server 不够：
+    #  它要靠 MYAPP_HOME 之类找到自己的数据目录，拿不到就默默解析成默认路径、
+    #  读错实例的状态（起得来、连得上、答案是别人的——最难查的一类）。
+    #  只透传点名的，不放开白名单本身。
+    inherit_env: list[str] = field(default_factory=list)
+    #  远端 server（Streamable HTTP，规范 2025-06-18）：url 非空即走 HTTP 传输，
+    #  此时 command/args/env/inherit_env 都不适用。headers 是每次请求都带的
+    #  自定义头（Authorization / API key 之类）。
+    url: str = ""
+    headers: dict[str, str] = field(default_factory=dict)
+
+    @property
+    def is_http(self) -> bool:
+        return bool(self.url)
 
 
 #  ${env:VAR} 与 ${VAR} 两种写法都认——不同客户端生态各用其一，
@@ -155,8 +174,28 @@ _SAFE_ENV_KEYS_WINDOWS = frozenset(
 )
 
 
-def _safe_env(extra: dict[str, str] | None = None) -> dict[str, str]:
-    """从零构造 stdio 子进程环境：白名单基底 + 配置声明的 env 覆盖。"""
+def _inherited(names: list[str] | None) -> dict[str, str]:
+    """按点名/前缀从父环境取变量（见 ServerSpec.inherit_env）。取不到的跳过。"""
+    picked: dict[str, str] = {}
+    for name in names or []:
+        if name.endswith("*"):
+            prefix = name[:-1]
+            picked.update(
+                {k: v for k, v in os.environ.items() if prefix and k.startswith(prefix)}
+            )
+        elif (value := os.environ.get(name)) is not None:
+            picked[name] = value
+    return picked
+
+
+def _safe_env(
+    extra: dict[str, str] | None = None, inherit: list[str] | None = None
+) -> dict[str, str]:
+    """从零构造 stdio 子进程环境：白名单基底 + 点名透传 + 配置声明的 env 覆盖。
+
+    三层的覆盖方向固定：白名单 < 点名透传（inherit_env）< 配置声明的 env。
+    越靠近这个 server 自己的声明，优先级越高。
+    """
     env = {
         key: value
         for key, value in os.environ.items()
@@ -164,6 +203,7 @@ def _safe_env(extra: dict[str, str] | None = None) -> dict[str, str]:
         or key.startswith(_SAFE_ENV_PREFIXES)
         or (os.name == "nt" and key.upper() in _SAFE_ENV_KEYS_WINDOWS)
     }
+    env.update(_inherited(inherit))
     #  MCP stdio 协议规定 UTF-8，但 Windows 上 Python 子进程的管道默认用
     #  locale 编码（cp1252/gbk）——Python 实现的 server（含自家看门狗）一打印
     #  非 ASCII 就 UnicodeEncodeError 崩掉。只影响 Python 子进程，Node 恒 UTF-8。
@@ -263,7 +303,12 @@ def load_server_specs(
         #  准入三点执行的中间一点（加载期）：前有 `xiaoyu mcp add` 的写入期、
         #  后有 ensure_started 的启动期——手写进配置文件的、绕过加载路径直接
         #  构造 spec 的，都还得再过一遍（保存/启动双点缺一不可）
-        if reason := mcp_guard.admission_violation(spec.command, spec.args, spec.env):
+        reason = (
+            mcp_guard.endpoint_violation(spec.url)
+            if spec.is_http
+            else mcp_guard.admission_violation(spec.command, spec.args, spec.env)
+        )
+        if reason:
             print(f"[MCP server {spec.name!r} 被安全规则拦截：{reason}，已忽略]", file=sys.stderr)
             continue
         specs.append(spec)
@@ -300,14 +345,25 @@ def _parse_config_file(
         return []
     specs: list[ServerSpec] = []
     for name, raw in servers.items():
-        if not isinstance(raw, dict) or not isinstance(raw.get("command"), str):
-            print(f"[MCP 配置 {path} 里的 {name!r} 缺少 command，已忽略]", file=sys.stderr)
+        if not isinstance(raw, dict):
+            print(f"[MCP 配置 {path} 里的 {name!r} 不是对象，已忽略]", file=sys.stderr)
             continue
-        if raw.get("type") not in (None, "stdio"):
-            #  http/sse 声明明确不支持：静默当 stdio 跑只会得到一个莫名其妙的崩溃
+        kind = raw.get("type")
+        #  形状即类型：有 url 就是远端（Streamable HTTP），有 command 就是 stdio。
+        #  type 字段只用来纠错，不作为唯一判据——各家生态里它时有时无。
+        remote = isinstance(raw.get("url"), str) and bool(raw["url"].strip())
+        if kind == "sse" or (kind == "http" and not remote):
+            #  sse 是 2024-11-05 的老传输，小羽只实现了 Streamable HTTP
             print(
-                f"[MCP server {name!r} 是 {raw['type']} 类型，小羽只支持 stdio，已忽略。"
-                f"远程 server 可用 mcp-remote 桥接（见 /mcp 帮助）]",
+                f"[MCP server {name!r}：{kind} 传输不支持"
+                f"{'（缺 url）' if kind == 'http' else '（老式 SSE，请改用 Streamable HTTP 的 url）'}，"
+                "已忽略]",
+                file=sys.stderr,
+            )
+            continue
+        if not remote and not isinstance(raw.get("command"), str):
+            print(
+                f"[MCP 配置 {path} 里的 {name!r} 既没有 command 也没有 url，已忽略]",
                 file=sys.stderr,
             )
             continue
@@ -318,6 +374,21 @@ def _parse_config_file(
             #  有的客户端生态里 mcp.json 的 timeout 按毫秒计（默认 120000）。用户
             #  跨家抄配置很常见，≥1000 一律按毫秒解释——没人需要 17 分钟以上的工具超时。
             timeout /= 1000
+        if remote:
+            specs.append(
+                ServerSpec(
+                    name=str(name),
+                    command="",
+                    url=_expand(str(raw["url"]).strip(), extra_env),
+                    headers={
+                        str(key): _expand(str(value), extra_env)
+                        for key, value in (raw.get("headers") or {}).items()
+                    },
+                    timeout=float(timeout),
+                    disabled=bool(raw.get("disabled", False)),
+                )
+            )
+            continue
         specs.append(
             ServerSpec(
                 name=str(name),
@@ -329,6 +400,9 @@ def _parse_config_file(
                 },
                 timeout=float(timeout),
                 disabled=bool(raw.get("disabled", False)),
+                inherit_env=[
+                    str(name) for name in raw.get("inheritEnv") or [] if str(name).strip()
+                ],
             )
         )
     return specs
@@ -379,6 +453,187 @@ def declared_violation(declared: list[dict[str, Any]]) -> str | None:
 # ---------- 单个 server ----------
 
 
+class _HttpChannel:
+    """MCP Streamable HTTP 传输（规范 2025-06-18）。
+
+    与 stdio 的结构差异（看代码前先知道这三条，否则会觉得少了半个 server）：
+
+    1. **没有常驻读线程**：请求的响应就在这次 POST 的响应体里——`application/json`
+       一条、`text/event-stream` 若干条，发完当场派发。所以一个 server 的请求是
+       **串行**的（写锁包住整个往返）；stdio 那边靠 id 关联可以多条在飞，这里
+       不做——MCP 调用本来一问一答，为并发引入连接池不值。
+    2. **server→client 方向要单开一条 GET SSE 长流**：
+       notifications/tools/list_changed（rug-pull 监督的触发源）只走那条。
+       server 回 405 就是"我不提供"，按没有处理，不当失败。
+    3. **会话靠 Mcp-Session-Id 头**：initialize 的响应给一个，此后每次带上；
+       server 回 404 表示会话被回收，等价于 stdio 那边的进程没了。
+    """
+
+    #  SSE 长流不设读超时（本来就长时间没数据），请求往返用 spec.timeout
+    _STREAM_TIMEOUT = None
+
+    def __init__(self, spec: ServerSpec) -> None:
+        self.spec = spec
+        self.session_id = ""
+        #  握手后才带协议版本头（规范：initialize 那次还不知道协商结果）
+        self.negotiated = False
+        self._stream: Any = None
+        self._stream_thread: threading.Thread | None = None
+        self._closed = False
+
+    # ---- 出站 ----
+
+    def _headers(self, accept: str) -> dict[str, str]:
+        headers = {
+            "Accept": accept,
+            "Content-Type": "application/json",
+            "User-Agent": f"xiaoyu/{_version()}",
+        }
+        if self.session_id:
+            headers["Mcp-Session-Id"] = self.session_id
+        if self.negotiated:
+            headers["MCP-Protocol-Version"] = PROTOCOL_VERSION
+        #  自定义头最后合并：用户点名的优先（他可能就是要覆盖 UA/Accept）
+        headers.update(self.spec.headers)
+        return headers
+
+    def post(self, payload: dict[str, Any], timeout: float) -> list[dict[str, Any]]:
+        """发一条 JSON-RPC 消息，返回这次往返里收到的全部消息（可能为空）。"""
+        body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        request = urllib.request.Request(
+            self.spec.url,
+            data=body,
+            headers=self._headers("application/json, text/event-stream"),
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=timeout) as response:
+                #  会话 id 只在 initialize 的响应里出现，但每次都读一遍无害
+                if new_id := response.headers.get("Mcp-Session-Id"):
+                    self.session_id = new_id
+                kind = (response.headers.get("Content-Type") or "").split(";")[0].strip()
+                if response.status == 202:
+                    return []  # 通知被接收，无响应体
+                if kind == "text/event-stream":
+                    return list(_read_sse(response))
+                raw = response.read().decode("utf-8", "replace").strip()
+                if not raw:
+                    return []
+                message = json.loads(raw)
+                return [message] if isinstance(message, dict) else list(message)
+        except urllib.error.HTTPError as exc:
+            if exc.code == 404 and self.session_id:
+                raise McpError("远端会话已失效（HTTP 404），需要重连") from exc
+            detail = _redact(exc.read().decode("utf-8", "replace")[:200]) if exc.fp else ""
+            raise McpError(f"HTTP {exc.code} {exc.reason}{'：' + detail if detail else ''}") from exc
+        except (urllib.error.URLError, OSError, json.JSONDecodeError) as exc:
+            raise McpError(f"请求 {self.spec.name} 失败：{exc}") from exc
+
+    # ---- server→client 长流 ----
+
+    def open_stream(self, dispatch: Callable[[dict[str, Any]], None]) -> None:
+        """尝试开 GET SSE 长流；server 不支持（405）就安静放弃。"""
+        request = urllib.request.Request(
+            self.spec.url, headers=self._headers("text/event-stream"), method="GET"
+        )
+        try:
+            stream = urllib.request.urlopen(request, timeout=self._STREAM_TIMEOUT)
+        except urllib.error.HTTPError as exc:
+            if exc.code in (404, 405, 501):
+                return  # 规范允许不提供这条流
+            print(
+                f"[MCP server {self.spec.name!r} 的事件流打不开：HTTP {exc.code}，"
+                "工具变更通知本次不可用]",
+                file=sys.stderr,
+            )
+            return
+        except (urllib.error.URLError, OSError) as exc:
+            print(
+                f"[MCP server {self.spec.name!r} 的事件流打不开：{exc}，"
+                "工具变更通知本次不可用]",
+                file=sys.stderr,
+            )
+            return
+        self._stream = stream
+        self._stream_thread = threading.Thread(
+            target=self._pump_stream,
+            args=(stream, dispatch),
+            name=f"xiaoyu-mcp-sse-{self.spec.name}",
+            daemon=True,
+        )
+        self._stream_thread.start()
+
+    def _pump_stream(self, stream: Any, dispatch: Callable[[dict[str, Any]], None]) -> None:
+        try:
+            for message in _read_sse(stream):
+                if self._closed:
+                    return
+                dispatch(message)
+        except Exception as exc:  # noqa: BLE001 - 见下：这里只负责安静收场
+            #  长流断了不等于 server 没了（代理超时最常见）：下次 POST 会说话，
+            #  别把一次断流误报成 server 挂了。
+            #  异常类型刻意放到最宽：close() 与本线程的 readline 天然竞态，
+            #  http.client 在竞态瞬间抛什么全看版本（3.14 上是内部 fp 已置空的
+            #  AttributeError，不是 OSError）——按类型枚举必漏，漏了就是每次
+            #  关闭都往 stderr 吐一段 traceback。
+            if not self._closed:
+                print(
+                    f"[MCP server {self.spec.name!r} 的事件流中断：{exc}]", file=sys.stderr
+                )
+            return
+
+    def close(self) -> None:
+        self._closed = True
+        if self._stream is not None:
+            with contextlib.suppress(Exception):
+                self._stream.close()
+            self._stream = None
+        if not self.session_id:
+            return
+        #  规范：客户端应当显式 DELETE 掉会话，让 server 释放资源。尽力而为。
+        request = urllib.request.Request(
+            self.spec.url, headers=self._headers("application/json"), method="DELETE"
+        )
+        with contextlib.suppress(Exception):
+            urllib.request.urlopen(request, timeout=5.0).close()
+
+
+def _read_sse(response: Any) -> "Iterator[dict[str, Any]]":
+    """SSE 流 → JSON-RPC 消息，**边读边吐**（生成器）。
+
+    生成器不是风格选择：GET 长流要的就是"事件到一条派发一条"，先收集再返回
+    等于要等流结束——而那条流本来就不会结束。POST 那边 list() 一下即可。
+
+    多行 data 按规范用 \n 拼接。解析不出 JSON 的块跳过——server 拿注释行做
+    心跳是常见做法，不该把心跳当协议错误。
+    """
+    buffer: list[str] = []
+    for raw in response:
+        line = raw.decode("utf-8", "replace") if isinstance(raw, bytes) else raw
+        line = line.rstrip("\r\n")
+        if line.startswith(":"):
+            continue  # 注释/心跳
+        if line == "":
+            if buffer:
+                try:
+                    message = json.loads("\n".join(buffer))
+                except json.JSONDecodeError:
+                    message = None
+                if isinstance(message, dict):
+                    yield message
+                buffer = []
+            continue
+        if line.startswith("data:"):
+            buffer.append(line[5:].lstrip())
+    if buffer:
+        try:
+            message = json.loads("\n".join(buffer))
+        except json.JSONDecodeError:
+            message = None
+        if isinstance(message, dict):
+            yield message
+
+
 class McpServer:
     """一个 stdio MCP server 子进程：拉起、握手、列工具、调工具、关闭。
 
@@ -390,6 +645,9 @@ class McpServer:
         self.spec = spec
         self.log_path = log_path
         self._proc: subprocess.Popen[str] | None = None
+        #  远端 server 的传输通道（stdio 型恒为 None）。两种传输共用本类的
+        #  全部上层逻辑：熔断、惰性启动、代际事务、幽灵工具拦截、指纹基线。
+        self._http: _HttpChannel | None = _HttpChannel(spec) if spec.is_http else None
         self._cond = threading.Condition()
         self._responses: dict[int, dict[str, Any]] = {}
         self._next_id = 0
@@ -461,14 +719,20 @@ class McpServer:
 
     def _start_locked(self) -> None:
         spec = self.spec
-        #  准入双点执行的第二点：启动即是最后一道闸
-        if reason := mcp_guard.admission_violation(spec.command, spec.args, spec.env):
-            raise McpError(f"配置被安全规则拦截：{reason}")
-        #  OSV 恶意包预检（fail-open，命中才拦）。必须在 watchdog 包装 argv
-        #  之前基于原始 spec 判断——包装后 argv[0] 是 python，预检会静默失效。
-        if _enabled("XIAOYU_MCP_OSV"):
-            if reason := mcp_guard.osv_malware_check(spec.command, spec.args):
-                raise McpError(f"启动被拦截：{reason}")
+        #  准入双点执行的第二点：启动即是最后一道闸。两种传输各有各的判据：
+        #  stdio 判"这条命令像不像攻击"，HTTP 判"这个地址会不会让凭据裸奔"。
+        if spec.is_http:
+            if reason := mcp_guard.endpoint_violation(spec.url):
+                raise McpError(f"地址被安全规则拦截：{reason}")
+        else:
+            if reason := mcp_guard.admission_violation(spec.command, spec.args, spec.env):
+                raise McpError(f"配置被安全规则拦截：{reason}")
+            #  OSV 恶意包预检（fail-open，命中才拦）。必须在 watchdog 包装 argv
+            #  之前基于原始 spec 判断——包装后 argv[0] 是 python，预检会静默失效。
+            #  远端 server 没有包可查，这条不适用。
+            if _enabled("XIAOYU_MCP_OSV"):
+                if reason := mcp_guard.osv_malware_check(spec.command, spec.args):
+                    raise McpError(f"启动被拦截：{reason}")
         self._spawn()
         result = self._request(
             "initialize",
@@ -483,7 +747,17 @@ class McpServer:
         self.server_info = " ".join(
             str(part) for part in (info.get("name"), info.get("version")) if part
         )
+        if self._http is not None:
+            #  协商完成的那一刻就要立旗：规范要求 initialize 响应**之后**的每一次
+            #  请求都带 MCP-Protocol-Version，包括紧接着这条 initialized 通知。
+            #  （立旗晚一行，通知就成了唯一漏带的那条——server 严格校验时只有
+            #  这一条被拒，症状是"握手过了但 server 认为没握手"。）
+            self._http.negotiated = True
         self._notify("notifications/initialized")
+        if self._http is not None:
+            #  server→client 长流放在 initialized 之后开：server 有权在握手
+            #  完成前拒绝这条 GET
+            self._http.open_stream(self._dispatch)
         #  没声明 tools capability 的 server（纯 prompts/resources 型）不发
         #  tools/list：省一次注定报 method-not-found 的往返
         capabilities = result.get("capabilities") or {}
@@ -492,6 +766,12 @@ class McpServer:
         self.live_names = {str(item.get("name", "")) for item in declared}
 
     def _spawn(self) -> None:
+        if self._http is not None:
+            #  HTTP 没有"拉起进程"这一步：连接在第一次 POST 时建立，这里只把
+            #  死标志清掉（restart 会重走这条路）。
+            with self._cond:
+                self._dead = False
+            return
         #  ~ 展开 + which：Windows 上 npx/uvx 这类 .cmd 入口不经 shell 找不到，
         #  which 一次全平台通吃。
         expanded = os.path.expanduser(self.spec.command)
@@ -527,7 +807,7 @@ class McpServer:
                 errors="replace",
                 #  行缓冲：协议就是一行一条消息
                 bufsize=1,
-                env=_safe_env(self.spec.env),
+                env=_safe_env(self.spec.env, self.spec.inherit_env),
                 **_subprocess_hardening(),
             )
         except OSError as exc:
@@ -542,6 +822,9 @@ class McpServer:
         self._drain_thread.start()
 
     def alive(self) -> bool:
+        if self._http is not None:
+            #  远端没有进程可查：只要没被判死（会话失效/传输错）就算在线
+            return self.started and not self._dead
         return self._proc is not None and self._proc.poll() is None
 
     def close(self) -> None:
@@ -589,6 +872,12 @@ class McpServer:
             return self.live_declared
 
     def _shutdown_proc(self) -> None:
+        if self._http is not None:
+            self._http.close()
+            with self._cond:
+                self._dead = True
+                self._cond.notify_all()
+            return
         proc = self._proc
         if proc is None:
             return
@@ -703,6 +992,9 @@ class McpServer:
         self._send({"jsonrpc": "2.0", "method": method})
 
     def _send(self, payload: dict[str, Any]) -> None:
+        if self._http is not None:
+            self._post(payload)
+            return
         proc = self._proc
         if proc is None or proc.stdin is None:
             raise McpError("server 未启动")
@@ -734,22 +1026,7 @@ class McpServer:
                 continue
             if not isinstance(message, dict):
                 continue
-            if "method" in message:
-                if message.get("id") is not None:
-                    self._answer_server_request(message)
-                elif message.get("method") == "notifications/tools/list_changed":
-                    #  热更新钩子：只报信，fetch/swap 由 manager 的独立线程做
-                    #  （在本线程发请求会自锁死：响应正等着本线程派发）
-                    callback = self.on_tools_changed
-                    if callback is not None and self._proc is proc and not self._closing:
-                        callback()
-                #  其余通知（progress、logging…）一律忽略
-                continue
-            if "id" in message:
-                with self._cond:
-                    if self._proc is proc:
-                        self._responses[message["id"]] = message
-                        self._cond.notify_all()
+            self._dispatch(message, generation=proc)
         with self._cond:
             if self._proc is not proc:
                 return
@@ -759,6 +1036,53 @@ class McpServer:
         callback = self.on_disconnect
         if callback is not None and not self._closing:
             callback()
+
+    def _dispatch(self, message: dict[str, Any], generation: Any = None) -> None:
+        """一条收到的 JSON-RPC 消息 → 响应槽 / 反向请求应答 / 变更通知。
+
+        stdio 与 HTTP 共用。generation 是 stdio 读线程的代际守卫（restart 换代
+        后，旧线程迟到的响应不能污染新一代的 id 空间）；HTTP 那边响应就在本次
+        POST 的响应体里、不存在迟到，传 None 即可。
+        """
+        if generation is not None and self._proc is not generation:
+            return
+        if "method" in message:
+            if message.get("id") is not None:
+                self._answer_server_request(message)
+            elif message.get("method") == "notifications/tools/list_changed":
+                #  热更新钩子：只报信，fetch/swap 由 manager 的独立线程做
+                #  （在本线程发请求会自锁死：响应正等着本线程派发）
+                callback = self.on_tools_changed
+                if callback is not None and not self._closing:
+                    callback()
+            #  其余通知（progress、logging…）一律忽略
+            return
+        if "id" in message:
+            with self._cond:
+                self._responses[message["id"]] = message
+                self._cond.notify_all()
+
+    def _post(self, payload: dict[str, Any]) -> None:
+        """HTTP 传输的发送：一次往返，收到的消息当场派发。
+
+        写锁包住整个往返（不只是"写"）：远端没有 id 关联的读线程兜底，两个
+        请求交叉在飞时后到的响应会落进先到那次的 read——串行是这里的正确性
+        前提，不是性能取舍。
+        """
+        channel = self._http
+        if channel is None:
+            raise McpError("server 未启动")
+        timeout = self.spec.timeout if payload.get("method") != "initialize" else INIT_TIMEOUT
+        try:
+            with self._write_lock:
+                messages = channel.post(payload, timeout)
+        except McpError:
+            with self._cond:
+                self._dead = True
+                self._cond.notify_all()
+            raise
+        for message in messages:
+            self._dispatch(message)
 
     def _answer_server_request(self, message: dict[str, Any]) -> None:
         """server 反向发来的请求：ping 回 pong，其余一律 method-not-found。
@@ -781,6 +1105,8 @@ class McpServer:
             pass
 
     def _exit_reason(self) -> str:
+        if self._http is not None:
+            return f"与远端 server 的连接已断开（{self.spec.url}）"
         code = self._proc.returncode if self._proc else None
         return (
             f"server 进程已退出（exit {code}）。"
@@ -1560,7 +1886,7 @@ class McpManager:
             f"  {user_config_dir() / 'mcp.json'}\n"
             '格式（与多家客户端的 mcp.json 通用）：{"mcpServers": {"名字": '
             '{"command": "npx", "args": ["-y", "某个包"], "env": {"KEY": "${env:VAR}"}}}}\n'
-            '远程 HTTP server 用 mcp-remote 桥接：args 写 ["-y", "mcp-remote", "https://…"]'
+            '远端 server 用 --url 直连（Streamable HTTP）：xiaoyu mcp add 名字 --url https://…'
         )
 
 
@@ -1603,12 +1929,36 @@ class McpView:
 #  按工作区缓存 manager：同一进程里反复构造 Toolbox（REPL + explore 已关掉 MCP，
 #  正常只有一次，但测试会多次）不重复拉起子进程。
 _managers: dict[Path, McpManager] = {}
+#  不按工作区缓存、但仍要被 at-exit 兜底关掉的 manager（显式 specs 起的那种，
+#  见 launch_specs）。缓存键是工作区，而这些 manager 的清单是按会话/宿主来的，
+#  同一工作区的两个会话可以有不同清单——共用一份会串台，所以只登记不复用。
+_extra_managers: list[McpManager] = []
 _atexit_registered = False
 
 
-def launch(config: Config) -> McpManager | None:
-    """按配置拉起（或复用）本工作区的 MCP manager。没配置任何 server 返回 None。"""
+def _ensure_atexit() -> None:
     global _atexit_registered
+    if not _atexit_registered:
+        atexit.register(shutdown_all)
+        _atexit_registered = True
+
+
+def launch(config: Config, extra_specs: list[ServerSpec] | None = None) -> McpManager | None:
+    """按配置拉起（或复用）本工作区的 MCP manager。没配置任何 server 返回 None。
+
+    extra_specs：配置发现之外再挂几条 server（ACP client 随会话下发的那种）。
+    **同名以 extra_specs 为准**——它是用户在编辑器里亲手配的，比配置文件里
+    的同名条目更贴近此刻的意图。带 extra_specs 时走不缓存的路径（理由见
+    _extra_managers），返回的 manager 由调用方 close，at-exit 也会兜底。
+    """
+    if extra_specs:
+        merged = {spec.name: spec for spec in load_server_specs(
+            config.workspace,
+            config.extra_env,
+            include_project=getattr(config, "workspace_trusted", True),
+        )}
+        merged.update({spec.name: spec for spec in extra_specs})
+        return launch_specs(list(merged.values()))
     manager = _managers.get(config.workspace)
     if manager is not None:
         return manager
@@ -1623,14 +1973,30 @@ def launch(config: Config) -> McpManager | None:
     manager = McpManager(specs)
     manager.start()
     _managers[config.workspace] = manager
-    if not _atexit_registered:
-        atexit.register(shutdown_all)
-        _atexit_registered = True
+    _ensure_atexit()
+    return manager
+
+
+def launch_specs(specs: list[ServerSpec]) -> McpManager | None:
+    """按给定 specs 现起一个 manager 并登记到 at-exit 清扫（空列表返回 None）。
+
+    嵌入宿主自带 server 清单时的入口：自己 `McpManager(specs)` 也能跑，但那份
+    不在任何登记表里——进程退出时无人 close，子进程要靠看门狗兜底回收。走这里
+    就有兜底。**不复用、不缓存**：调用方拿到的永远是新的一份，用完自己 close
+    （提前 close 过的，at-exit 再关一次是幂等的）。
+    """
+    if not specs:
+        return None
+    manager = McpManager(specs)
+    manager.start()
+    _extra_managers.append(manager)
+    _ensure_atexit()
     return manager
 
 
 def shutdown_all() -> None:
     """关掉全部 server 子进程（atexit 兜底；测试也直接调）。"""
-    for manager in list(_managers.values()):
+    for manager in list(_managers.values()) + list(_extra_managers):
         manager.close()
     _managers.clear()
+    _extra_managers.clear()

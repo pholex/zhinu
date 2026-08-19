@@ -161,15 +161,26 @@ class InspectTest(IsolatedConfigTest):
         notes = plugins.inspect_bundle(src).notes
         self.assertTrue(any("hooks" in note for note in notes), notes)
 
-    def test_non_stdio_server_reported_not_silently_dropped(self):
+    def test_http_server_is_installed(self):
+        """Streamable HTTP 已支持，插件里的远端 server 照常装上。"""
         src = make_bundle(self.root / "src")
         write_json(
             src / "mcp.json",
-            {"mcpServers": {"remote": {"type": "http", "command": "x", "url": "https://x"}}},
+            {"mcpServers": {"remote": {"type": "http", "url": "https://x.example/mcp"}}},
+        )
+        bundle = plugins.inspect_bundle(src)
+        self.assertIn("remote", bundle.mcp_servers)
+
+    def test_unsupported_transport_reported_not_silently_dropped(self):
+        """老式 SSE 没实现：静默丢掉会让用户以为装上了，装完发现工具少一半。"""
+        src = make_bundle(self.root / "src")
+        write_json(
+            src / "mcp.json",
+            {"mcpServers": {"old": {"type": "sse", "url": "https://x.example/sse"}}},
         )
         bundle = plugins.inspect_bundle(src)
         self.assertEqual(bundle.mcp_servers, {})
-        self.assertTrue(any("stdio" in note for note in bundle.notes), bundle.notes)
+        self.assertTrue(any("sse" in note for note in bundle.notes), bundle.notes)
 
     def test_illegal_name_rejected(self):
         src = make_bundle(self.root / "src")
