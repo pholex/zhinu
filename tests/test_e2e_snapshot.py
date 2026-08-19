@@ -101,6 +101,7 @@ class SnapshotCase(E2ECase):
                 "--model", REPLAY_MODEL,
                 *sc.args,
             ],
+            stdin=subprocess.DEVNULL,  # 见 test_e2e_scripted 里的同款说明
             capture_output=True, text=True, encoding="utf-8", errors="replace",
             timeout=_TIMEOUT, env=env, cwd=self.tmp,
         )
@@ -205,6 +206,7 @@ class SnapshotCase(E2ECase):
                 *(["--model", model] if model else []),
                 *sc.args,
             ],
+            stdin=subprocess.DEVNULL,  # 见 test_e2e_scripted 里的同款说明
             capture_output=True, text=True, encoding="utf-8", errors="replace",
             timeout=_TIMEOUT, env=env, cwd=self.tmp,
         )
@@ -247,6 +249,7 @@ class UnconsumedGuardTest(SnapshotCase):
         proc = subprocess.run(
             [sys.executable, "-m", "xiaoyu", "说句话", "--output-format", "stream-json",
              "--workspace", str(self.workspace)],
+            stdin=subprocess.DEVNULL,  # 见 test_e2e_scripted 里的同款说明
             capture_output=True, text=True, encoding="utf-8", errors="replace",
             timeout=_TIMEOUT, env=env, cwd=self.tmp,
         )

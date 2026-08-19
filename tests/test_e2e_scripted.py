@@ -125,6 +125,12 @@ class E2ECase(unittest.TestCase):
                 str(self.workspace),
                 *(extra_args or []),
             ],
+            #  stdin 必须显式断开：不给的话子进程继承调用方的 stdin，而
+            #  headless 纪律下非 tty 的 stdin 会被当指令读——调用方的 stdin
+            #  若是不 EOF 的管道/socket（CI 之外的各种壳层就是），子进程
+            #  会一直读下去，表现为"整套测试匀速变慢直到超时"，且只在某些
+            #  调用方身上复现。
+            stdin=subprocess.DEVNULL,
             capture_output=True,
             text=True,
             #  子进程恒输出 UTF-8（见 ui.py 的 reconfigure）；不显式指定的话
