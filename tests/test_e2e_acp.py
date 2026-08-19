@@ -1552,6 +1552,37 @@ class ClientMcpServersTest(unittest.TestCase):
         self.assertEqual(specs, [])
         self.assertTrue(skipped and "拦截" in skipped[0])
 
+    def test_every_ignore_path_says_so(self):
+        """丢掉 client 清单的每一条路径都必须出声。
+
+        第一版漏了"宿主注入了 view"这条：宿主打开网关注入 server、以为生效，
+        实际一条都没进去且毫无输出——比丢在协议层更深、更难查。
+        """
+        from xiaoyu.acp import resolve_mcp_view
+        from xiaoyu.config import Config
+
+        spec = __import__("xiaoyu.mcp", fromlist=["mcp"]).ServerSpec(
+            name="gh", command="/usr/bin/gh"
+        )
+        host_view = object()
+
+        #  ① 宿主注入了自己的视图：以宿主为准，但要说
+        view, note = resolve_mcp_view(Config.from_env(), host_view, [spec])
+        self.assertIs(view, host_view)
+        self.assertIn("忽略", note)
+
+        #  ② 本机总闸关着：忽略，也要说
+        config = Config.from_env()
+        config.enable_mcp = False
+        view, note = resolve_mcp_view(config, None, [spec])
+        self.assertIsNone(view)
+        self.assertIn("enable_mcp", note)
+
+        #  ③ 没有下发清单：什么都不说（别拿噪音填日志）
+        view, note = resolve_mcp_view(Config.from_env(), host_view, [])
+        self.assertIs(view, host_view)
+        self.assertEqual(note, "")
+
     def test_client_servers_reach_the_agent_factory(self):
         """端到端接线：下发的 server 必须真的走到工厂，不是解析完就丢。"""
         import io

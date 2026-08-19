@@ -936,6 +936,45 @@ def _factory_takes_servers(factory: Any) -> bool:
     return "mcp_servers" in params
 
 
+def resolve_mcp_view(
+    config: Config,
+    mcp_view: "mcp.McpView | None",
+    mcp_servers: "list[mcp.ServerSpec] | None",
+) -> "tuple[mcp.McpView | None, str]":
+    """定 session 用哪个 MCP 视图，返回 (视图, 该出声的说明)。
+
+    抽成纯决策（唯一副作用是真要合并时 launch 一个 manager）是为了让"忽略"
+    这件事没有藏身处：**每一条把 client 下发清单丢掉的路径都必须给出说明**。
+    第一版漏了宿主注入那条——宿主打开网关注入 server、以为生效了，实际一条
+    都没进去，且没有任何输出。这正是这条协议面最该防的失败形态，而它比丢在
+    协议层更深、更难查。
+
+    三条路径：
+    - 宿主显式传了 view：以宿主为准（它离用户意图更近，且两个"替代配置发现"
+      的注入面叠在一起没有合理语义）——但要出声；
+    - 本机 enable_mcp=false：忽略并出声。宿主显式传 view 时该开关不拦（那是
+      宿主程序自己的决定），但协议对端不该有权重新打开一个被本机关掉的子系统；
+    - 其余：与配置发现合并（同名 client 优先，合并在 mcp.launch 里做），
+      manager 登记进 at-exit 清扫。
+    """
+    if not mcp_servers:
+        return mcp_view, ""
+    count = len(mcp_servers)
+    if mcp_view is not None:
+        return mcp_view, (
+            f"acp：宿主已注入 MCP 工具视图，忽略 client 随会话下发的 {count} 条 server"
+            "（两者都是替代配置发现的注入面，以宿主为准）"
+        )
+    if not config.enable_mcp:
+        return None, (
+            f"acp：本机 MCP 已关闭（enable_mcp=false），忽略 client 下发的 {count} 条 server"
+        )
+    manager = mcp.launch(config, extra_specs=mcp_servers)
+    if manager is None:
+        return None, f"acp：client 下发的 {count} 条 server 没有一条起得来"
+    return mcp.McpView(manager, "all"), ""
+
+
 def build_agent_factory(
     *,
     model: str | None = None,
@@ -1026,23 +1065,9 @@ def build_agent_factory(
             session_log, history = open_named(
                 session_name, config.model, str(config.workspace)
             )
-        view = mcp_view
-        if mcp_servers and view is None:
-            if config.enable_mcp:
-                #  client 下发的 server 与配置发现合并（同名 client 优先），
-                #  一起装进一个 manager——合并在 mcp.launch 里做，这里只接线。
-                #  manager 登记进 at-exit 清扫（launch_specs），进程退出有人收尸。
-                manager = mcp.launch(config, extra_specs=mcp_servers)
-                view = mcp.McpView(manager, "all") if manager is not None else None
-            else:
-                #  enable_mcp 是本机操作者的总闸。宿主显式传 view 时它不拦
-                #  （那是宿主程序自己的决定），但协议对端不该有权重新打开一个
-                #  被本机关掉的子系统——这两者不是一回事。
-                print(
-                    "acp：本机 MCP 已关闭（enable_mcp=false），"
-                    f"忽略 client 下发的 {len(mcp_servers)} 条 server",
-                    file=sys.stderr,
-                )
+        view, note = resolve_mcp_view(config, mcp_view, mcp_servers)
+        if note:
+            print(note, file=sys.stderr)
         agent = Agent(
             config,
             Toolbox(config, mcp_view=view),
