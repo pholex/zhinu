@@ -36,7 +36,8 @@ sink，不经协议层，所以不需要任何自定义扩展方法；可选能�
                                 目录自然放行）。client 随请求带的 mcpServers
                                 接：与配置发现合并、同名 client 优先、session
                                 作用域不落盘、${VAR} 不兑现、照过准入闸；只收
-                                stdio（http/sse 由 mcpCapabilities 门控，未声明），
+                                stdio 与 Streamable HTTP（mcpCapabilities 里如实
+                                声明 http=true / sse=false），
                                 跳过的条目一律 stderr 出声，不静默少几个工具。
     session/prompt              工作线程跑一轮；UIEvent → session/update 流。
                                 会话内同一时刻只跑一轮（同步架构的约束是
@@ -868,8 +869,10 @@ def client_server_specs(raw: Any) -> tuple[list["mcp.ServerSpec"], list[str]]:
     ③ **`${VAR}` 不兑现**：配置文件里的占位符是小羽自己的约定，client 下发的
        值是编辑器已经算好的最终值——再展开一次等于拿本进程环境去改写用户
        在编辑器里看到的东西；
-    ④ **只收 stdio**：http/sse 由 initialize 的 mcpCapabilities 门控，我们没
-       声明，规范上 client 就不该发；真发了也跳过并说明，不静默忽略。
+    ④ **stdio 与 http（Streamable HTTP）都收**，老式 sse 不收——initialize 的
+       mcpCapabilities 里怎么声明，这里就怎么收，两处必须一致：声明了收不了，
+       用户看到的是 server 凭空消失。远端地址过 endpoint_violation（明文 http
+       只许回环——headers 里放的是凭据）。
     """
     specs: list[mcp.ServerSpec] = []
     skipped: list[str] = []
@@ -877,9 +880,28 @@ def client_server_specs(raw: Any) -> tuple[list["mcp.ServerSpec"], list[str]]:
         if not isinstance(item, dict):
             continue
         name = str(item.get("name", "") or "").strip()
-        kind = str(item.get("type", "") or "stdio")
+        #  形状即类型（与配置文件同一判据）：有 url 就是远端，type 只用来纠错
+        kind = str(item.get("type", "") or ("http" if item.get("url") else "stdio"))
+        if kind == "http":
+            url = str(item.get("url", "") or "").strip()
+            if not name or not url:
+                skipped.append(f"{name or '(未命名)'}：缺 name 或 url")
+                continue
+            #  规范里 headers 与 env 一样是 [{name,value}] 数组
+            headers = {
+                str(entry["name"]): str(entry.get("value", ""))
+                for entry in item.get("headers") or []
+                if isinstance(entry, dict) and entry.get("name")
+            }
+            if reason := mcp_guard.endpoint_violation(url):
+                skipped.append(f"{name}：被安全规则拦截（{reason}）")
+                continue
+            specs.append(mcp.ServerSpec(name=name, command="", url=url, headers=headers))
+            continue
         if kind != "stdio":
-            skipped.append(f"{name or '(未命名)'}：{kind} 传输未声明（只支持 stdio）")
+            #  只剩老式 sse：initialize 里我们就声明了 sse=false，规矩的 client
+            #  不会发；真发了也说清楚，不静默少一个 server
+            skipped.append(f"{name or '(未命名)'}：{kind} 传输未实现（能力里已声明不支持）")
             continue
         command = str(item.get("command", "") or "").strip()
         if not name or not command:
@@ -1175,6 +1197,11 @@ class AcpServer:
                             "audio": False,
                             "embeddedContext": True,
                         },
+                        #  client 据此决定敢不敢下发远端 server。如实声明：
+                        #  http=Streamable HTTP（规范 2025-06-18，已实现）；
+                        #  sse=2024-11-05 的老传输，没实现就不能说有——声明了
+                        #  收不了，用户看到的是 server 凭空消失。
+                        "mcpCapabilities": {"http": True, "sse": False},
                     },
                     "agentInfo": {"name": "xiaoyu", "title": "小羽", "version": __version__},
                     "authMethods": [AUTH_METHOD],

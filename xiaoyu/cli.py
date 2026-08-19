@@ -1402,10 +1402,12 @@ def mcp_add_command(argv: list[str]) -> int:
         #  启动命令段不是 argparse 的位置参数（见 split_mcp_command），
         #  自动生成的 usage 里不会有——手写一行，否则 -h 看不出命令写哪
         usage="xiaoyu mcp add <名字> [-s {project,user}] [-e KEY=VALUE] "
-        "[--timeout 秒] [-f] <命令> [参数…]",
-        description="添加一个 stdio MCP server 声明（小羽只支持 stdio；"
-        "远程 HTTP server 用 mcp-remote 桥接：npx -y mcp-remote https://…）。",
-        epilog="例：xiaoyu mcp add chrome-devtools --scope user npx -y chrome-devtools-mcp@latest",
+        "[--timeout 秒] [-f] <命令> [参数…]\n"
+        "       xiaoyu mcp add <名字> --url https://… [-H 头:值] [-s …] [--timeout 秒] [-f]",
+        description="添加一个 MCP server 声明。两种传输：本地 stdio（给启动命令）"
+        "与远端 Streamable HTTP（给 --url）。老式 SSE 传输不支持。",
+        epilog="例：xiaoyu mcp add chrome-devtools --scope user npx -y chrome-devtools-mcp@latest\n"
+        "例：xiaoyu mcp add 网关 --url https://mcp.example.com/mcp -H 'Authorization: Bearer ${env:TOKEN}'",
     )
     parser.add_argument("name", help="server 名字，工具会挂成 mcp__<名字>__<工具>")
     _mcp_scope_argument(
@@ -1426,6 +1428,19 @@ def mcp_add_command(argv: list[str]) -> int:
         metavar="秒",
         help=f"tools/call 超时，默认 {int(mcp.CALL_TIMEOUT)} 秒",
     )
+    parser.add_argument(
+        "--url",
+        help="远端 server 地址（Streamable HTTP）。给了 --url 就不要再给启动命令；"
+        "明文 http 只允许连回环地址——头里通常放着凭据",
+    )
+    parser.add_argument(
+        "-H",
+        "--header",
+        action="append",
+        metavar="名:值",
+        default=[],
+        help="远端 server 每次请求都带的头，可重复。值里同样支持 ${env:VAR} 延迟展开",
+    )
     parser.add_argument("-f", "--force", action="store_true", help="同名声明已存在时覆盖")
     head, command_argv = split_mcp_command(argv)
     args = parser.parse_args(head)
@@ -1434,8 +1449,20 @@ def mcp_add_command(argv: list[str]) -> int:
     if not MCP_NAME_PATTERN.match(args.name):
         print(ui.error(f"server 名字只能用字母/数字/下划线/连字符：{args.name}"), file=sys.stderr)
         return 2
-    if not command_argv:
-        print(ui.error("缺少启动命令，如：xiaoyu mcp add 名字 npx -y 某个包"), file=sys.stderr)
+    if args.url and command_argv:
+        print(
+            ui.error("--url 与启动命令只能给一个（远端 server 没有本地命令）"),
+            file=sys.stderr,
+        )
+        return 2
+    if not args.url and not command_argv:
+        print(
+            ui.error("缺少启动命令或 --url，如：xiaoyu mcp add 名字 npx -y 某个包"),
+            file=sys.stderr,
+        )
+        return 2
+    if not args.url and args.header:
+        print(ui.error("-H/--header 只对 --url 的远端 server 有意义"), file=sys.stderr)
         return 2
     env: dict[str, str] = {}
     for pair in args.env:
@@ -1448,18 +1475,35 @@ def mcp_add_command(argv: list[str]) -> int:
         print(ui.error("--timeout 得是正数"), file=sys.stderr)
         return 2
 
-    command, *command_args = command_argv
-    #  准入检查的"保存点"（启动点在 mcp.load_server_specs / ensure_started）：
-    #  形状像内联攻击脚本的配置在落盘前就拦掉，别等到某次启动才炸
-    if reason := mcp_guard.admission_violation(command, command_args, env):
-        print(ui.error(f"这条声明被安全规则拦下：{reason}"), file=sys.stderr)
-        return 2
-
-    entry: dict[str, Any] = {"command": command}
-    if command_args:
-        entry["args"] = command_args
-    if env:
-        entry["env"] = env
+    entry: dict[str, Any] = {}
+    if args.url:
+        #  准入的"保存点"，远端版：判据是地址会不会让凭据裸奔（见 endpoint_violation）
+        if reason := mcp_guard.endpoint_violation(args.url):
+            print(ui.error(f"这条声明被安全规则拦下：{reason}"), file=sys.stderr)
+            return 2
+        headers: dict[str, str] = {}
+        for pair in args.header:
+            key, sep, value = pair.partition(":")
+            if not sep or not key.strip():
+                print(ui.error(f"--header 格式应为 名:值：{pair}"), file=sys.stderr)
+                return 2
+            headers[key.strip()] = value.strip()
+        entry["type"] = "http"
+        entry["url"] = args.url
+        if headers:
+            entry["headers"] = headers
+    else:
+        command, *command_args = command_argv
+        #  准入检查的"保存点"（启动点在 mcp.load_server_specs / ensure_started）：
+        #  形状像内联攻击脚本的配置在落盘前就拦掉，别等到某次启动才炸
+        if reason := mcp_guard.admission_violation(command, command_args, env):
+            print(ui.error(f"这条声明被安全规则拦下：{reason}"), file=sys.stderr)
+            return 2
+        entry["command"] = command
+        if command_args:
+            entry["args"] = command_args
+        if env:
+            entry["env"] = env
     if args.timeout is not None:
         entry["timeout"] = args.timeout
 

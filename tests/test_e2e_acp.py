@@ -1493,15 +1493,56 @@ class ClientMcpServersTest(unittest.TestCase):
         )
         self.assertEqual(specs[0].env["P"], "${HOME}/x")
 
-    def test_non_stdio_and_malformed_entries_are_reported(self):
+    def test_http_servers_are_accepted_with_headers(self):
+        """Streamable HTTP：headers 同样是 [{name,value}] 数组。"""
         specs, skipped = self.specs(
-            [{"name": "remote", "type": "http", "url": "https://x"},
+            [{"name": "remote", "type": "http", "url": "https://x.example/mcp",
+              "headers": [{"name": "Authorization", "value": "Bearer t"}]}]
+        )
+        self.assertEqual(skipped, [])
+        self.assertEqual(specs[0].url, "https://x.example/mcp")
+        self.assertEqual(specs[0].headers, {"Authorization": "Bearer t"})
+        self.assertTrue(specs[0].is_http)
+
+    def test_plaintext_remote_url_is_blocked(self):
+        specs, skipped = self.specs([{"name": "plain", "url": "http://evil.example/mcp"}])
+        self.assertEqual(specs, [])
+        self.assertTrue(skipped and "回环" in skipped[0])
+
+    def test_legacy_sse_and_malformed_entries_are_reported(self):
+        """能力里声明 sse=false，这里就不能收——声明与实现不一致的后果是
+        用户看到 server 凭空消失。"""
+        specs, skipped = self.specs(
+            [{"name": "old", "type": "sse", "url": "https://x/sse"},
              {"name": "no-cmd"},
              "不是对象"]
         )
         self.assertEqual(specs, [])
         self.assertEqual(len(skipped), 2)
-        self.assertIn("http", skipped[0])
+        self.assertIn("sse", skipped[0])
+
+    def test_declared_mcp_capabilities_match_what_is_accepted(self):
+        """声明与实现必须同源：initialize 说 http=true/sse=false，
+        解析器就得收 http、拒 sse。"""
+        import io
+
+        from xiaoyu.acp import AcpServer
+
+        out = io.StringIO()
+        server = AcpServer(
+            agent_factory=lambda *a, **k: (None, []),
+            stdin=iter([json.dumps({"jsonrpc": "2.0", "id": "i", "method": "initialize",
+                                    "params": {"protocolVersion": 1}})]),
+            stdout=out,
+        )
+        server.serve()
+        result = json.loads(out.getvalue().splitlines()[0])["result"]
+        capabilities = result["agentCapabilities"]["mcpCapabilities"]
+        self.assertEqual(capabilities, {"http": True, "sse": False})
+        http_specs, _ = self.specs([{"name": "r", "url": "https://x/mcp"}])
+        self.assertTrue(http_specs)
+        sse_specs, _ = self.specs([{"name": "r", "type": "sse", "url": "https://x/sse"}])
+        self.assertEqual(sse_specs, [])
 
     def test_admission_guard_still_applies(self):
         """来源是用户亲手配的，但"这条命令像不像攻击"与来源无关，闸照过。"""

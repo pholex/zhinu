@@ -198,16 +198,22 @@ def inspect_bundle(root: Path, fallback_name: str | None = None) -> Bundle:
         raw = _read_json(path).get("mcpServers")
         if isinstance(raw, dict):
             for server, entry in raw.items():
-                if not isinstance(entry, dict) or not isinstance(entry.get("command"), str):
-                    notes.append(f"{mcp_file} 里的 {server} 缺少 command，跳过")
+                if not isinstance(entry, dict):
+                    notes.append(f"{mcp_file} 里的 {server} 不是对象，跳过")
                     continue
-                if entry.get("type") not in (None, "stdio"):
-                    #  中立规范允许 HTTP/SSE，小羽只跑 stdio——静默丢掉会让用户
+                #  形状即类型（与 mcp.py 的配置解析同一判据）：有 url 是远端，
+                #  有 command 是本地 stdio
+                remote = isinstance(entry.get("url"), str) and bool(entry["url"].strip())
+                if entry.get("type") == "sse":
+                    #  中立规范还允许老式 SSE，小羽没实现——静默丢掉会让用户
                     #  以为装上了，装完发现工具凭空少一半
                     notes.append(
-                        f"{mcp_file} 里的 {server} 是 {entry['type']} 类型，"
-                        "小羽只支持 stdio，未安装"
+                        f"{mcp_file} 里的 {server} 是 sse 类型，"
+                        "小羽支持 stdio 与 Streamable HTTP（url），未安装"
                     )
+                    continue
+                if not remote and not isinstance(entry.get("command"), str):
+                    notes.append(f"{mcp_file} 里的 {server} 既没有 command 也没有 url，跳过")
                     continue
                 mcp_servers[str(server)] = entry
 
