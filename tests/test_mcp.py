@@ -431,8 +431,14 @@ class LaunchSpecsTest(unittest.TestCase):
             name=name, command=sys.executable, args=[str(self.script)], timeout=15.0
         )
 
-    def test_empty_specs_launch_nothing(self):
-        self.assertIsNone(mcp.launch_specs([]))
+    def test_empty_specs_still_yield_a_real_manager(self):
+        """空清单必须给出真 manager：返回 None 的话，嵌入方顺手往下传给
+        Toolbox(mcp_view=None) 就等于"回到配置发现"——操作者自己 mcp.json 里的
+        server 会泄进一个本不该看到它们的会话。零个 server ≠ 没有指定视图。"""
+        manager = mcp.launch_specs([])
+        self.assertIsNotNone(manager)
+        self.assertEqual(manager.ready_tools(), [])
+        self.assertIn(manager, mcp._extra_managers)
 
     def test_launched_manager_is_registered_for_shutdown(self):
         """自建 manager 最怕的是没人收尸：登记过才有 at-exit 兜底。"""

@@ -1977,16 +1977,20 @@ def launch(config: Config, extra_specs: list[ServerSpec] | None = None) -> McpMa
     return manager
 
 
-def launch_specs(specs: list[ServerSpec]) -> McpManager | None:
-    """按给定 specs 现起一个 manager 并登记到 at-exit 清扫（空列表返回 None）。
+def launch_specs(specs: list[ServerSpec]) -> McpManager:
+    """按给定 specs 现起一个 manager 并登记到 at-exit 清扫。
 
     嵌入宿主自带 server 清单时的入口：自己 `McpManager(specs)` 也能跑，但那份
     不在任何登记表里——进程退出时无人 close，子进程要靠看门狗兜底回收。走这里
     就有兜底。**不复用、不缓存**：调用方拿到的永远是新的一份，用完自己 close
     （提前 close 过的，at-exit 再关一次是幂等的）。
+
+    **空清单也返回真 manager，不返回 None**：第一版对空清单返回 None，第一个
+    真实消费者就踩了——嵌入方拿它造 McpView 时顺手往下传，而 `Toolbox(mcp_view=None)`
+    的语义是"回到配置发现"，于是操作者自己 mcp.json 里的 server 泄进了一个
+    本不该看到它们的会话。空 manager 不起任何子进程，代价为零；让"零个 server"
+    与"没有指定视图"这两件事在类型上就分得开，比在 docstring 里叮嘱可靠。
     """
-    if not specs:
-        return None
     manager = McpManager(specs)
     manager.start()
     _extra_managers.append(manager)
