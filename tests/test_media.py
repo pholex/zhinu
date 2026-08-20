@@ -55,7 +55,28 @@ class CacheTest(unittest.TestCase):
         self.assertTrue(first.endswith(".png"))
 
     def test_store_base64_rejects_garbage(self):
-        self.assertEqual(media.store_base64("不是base64!!", "image/png"), "")
+        ref, problem = media.store_base64("不是base64!!", "image/png")
+        self.assertEqual(ref, "")
+        self.assertIn("base64", problem)
+
+    def test_store_base64_goes_through_accept(self):
+        """MCP 图片入口必须走 accept 咽喉：体积超限与假 mime 都要被拒。
+
+        超限图一旦以引用进了历史，每轮请求都会重放它，上游拒一次=轮轮被拒。
+        """
+        #  合法 PNG 走通（自报 mime 错了也不影响——嗅探为准）
+        ref, problem = media.store_base64(base64.b64encode(PNG).decode(), "image/jpeg")
+        self.assertTrue(ref.startswith(media.SCHEME), problem)
+        self.assertTrue(ref.endswith(".png"), "扩展名该来自魔数嗅探，不是自报 mime")
+        #  超限：伪造一个 header 合法但体积超上限的 PNG
+        big = PNG + b"\x00" * (media.MAX_IMAGE_BYTES + 1)
+        ref, problem = media.store_base64(base64.b64encode(big).decode(), "image/png")
+        self.assertEqual(ref, "")
+        self.assertIn("上限", problem)
+        #  非图片字节冒充 image/png：拒收并说明
+        ref, problem = media.store_base64(base64.b64encode(b"just text").decode(), "image/png")
+        self.assertEqual(ref, "")
+        self.assertIn("格式", problem)
 
     def test_data_url_round_trip(self):
         ref = media.store(PNG, "image/png")
