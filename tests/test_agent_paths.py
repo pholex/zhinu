@@ -1099,6 +1099,39 @@ class TestEscalationApproval(AgentTestCase):
         self.assertEqual(asked, [], "--yolo 下普通 bash 不该弹确认")
 
 
+class TestContextBreakdown(AgentTestCase):
+    """上下文归因：同一份段列表既拼 prompt 又做归因，两者不可能对不上。"""
+
+    def test_segments_join_equals_system_prompt(self) -> None:
+        agent = self.build([])
+        joined = "".join(text for _label, text in agent._system_segments())
+        self.assertEqual(joined, agent._system_prompt())
+
+    def test_system_rows_sum_equals_prompt_length(self) -> None:
+        #  各 system 段字符数之和 == system prompt 长度（连接符记在后段头上，
+        #  不漏字节、不重复计）——这是归因不漂移的结构保证
+        agent = self.build([])
+        rows = agent.context_breakdown()
+        sys_chars = sum(chars for label, chars in rows if label.startswith("system:"))
+        self.assertEqual(sys_chars, len(agent._system_prompt()))
+
+    def test_core_identity_always_present(self) -> None:
+        agent = self.build([])
+        labels = [label for label, _ in agent.context_breakdown()]
+        self.assertIn("system:核心身份", labels)
+
+    def test_messages_counted_by_role(self) -> None:
+        agent = self.build([[chunk(content="答复")]])
+        with contextlib.redirect_stdout(io.StringIO()):
+            agent.send("问题")
+        rows = dict(agent.context_breakdown())
+        #  user + assistant 各贡献一条消息的字符（system 那条不在消息计里，
+        #  它按 system 段拆过了）
+        self.assertIn("消息:user", rows)
+        self.assertIn("消息:assistant", rows)
+        self.assertEqual(rows["消息:user"], len("问题"))
+
+
 class TestCrystallizeNudge(AgentTestCase):
     """收尾轻推：反复整写同一文件 + 反复执行的解题迭代，收尾时请模型评估沉淀。
 
