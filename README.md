@@ -5,6 +5,7 @@
 
 [![ci](https://github.com/pholex/zhinu/actions/workflows/ci.yml/badge.svg)](https://github.com/pholex/zhinu/actions/workflows/ci.yml)
 [![PyPI](https://img.shields.io/pypi/v/xiaoyu-agent)](https://pypi.org/project/xiaoyu-agent/)
+[![website](https://img.shields.io/badge/website-xiaoyu.openapi.click-1f6feb)](https://xiaoyu.openapi.click)
 
 > **Zhinu Coding Agent | Token Weaver of the Universe**<br>
 > Weaving code, connecting dots, and showing you the best harness architecture.
