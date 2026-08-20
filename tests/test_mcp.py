@@ -516,7 +516,9 @@ class RenderResultTest(unittest.TestCase):
 
     def test_image_becomes_media_reference(self):
         """图片落盘换成引用回来，base64 绝不进文本结果（那是上下文炸弹）。"""
-        payload = base64.b64encode(b"\x89PNG fake").decode()
+        #  魔数必须完整（8 字节 PNG 签名）：图片入口如今走 accept 的嗅探咽喉，
+        #  残缺魔数会被当"不是图片"拒收——那是护栏不是 bug
+        payload = base64.b64encode(b"\x89PNG\r\n\x1a\n fake bytes").decode()
         out, images = mcp._render_result(
             {"content": [{"type": "image", "data": payload, "mimeType": "image/png"}]}
         )

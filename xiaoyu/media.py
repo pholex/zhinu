@@ -270,12 +270,20 @@ def store(data: bytes, mime: str) -> str:
     return SCHEME + ref
 
 
-def store_base64(payload: str, mime: str) -> str:
-    """MCP 回来的 base64 字符串 → 引用。解不开就返回 ""（当没有这张图）。"""
+def store_base64(payload: str, mime: str) -> tuple[str, str]:
+    """MCP 回来的 base64 字符串 → (引用, 出错原因)。二者恰有一个非空。
+
+    解码后走 accept 的统一咽喉，**不直接 store**：体积上限与魔数嗅探对 MCP
+    server 回的图同样成立——server 自报的 mimeType 不可信（嗅探为准），超限
+    的图更不能入库：图以引用进了对话历史后每一轮请求都会重放它，被上游拒一次
+    就是轮轮被拒，一张坏图能楔死整个会话。mime 参数只留作日志线索不参与判定。
+    """
+    del mime  # 自报的 mimeType 不可信，判定一律以 accept 的魔数嗅探为准
     try:
-        return store(base64.b64decode(payload, validate=True), mime)
+        data = base64.b64decode(payload, validate=True)
     except (ValueError, TypeError):
-        return ""
+        return "", "数据不是有效的 base64"
+    return accept(data, "MCP 返回的图片")
 
 
 def accept(data: bytes, source: str = "") -> tuple[str, str]:

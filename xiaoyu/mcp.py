@@ -1139,11 +1139,13 @@ def _render_result(result: dict[str, Any]) -> tuple[str, list[dict[str, Any]]]:
         if kind == "text":
             parts.append(str(item.get("text", "")))
         elif kind == "image":
-            ref = media.store_base64(str(item.get("data") or ""), str(item.get("mimeType") or ""))
+            ref, problem = media.store_base64(
+                str(item.get("data") or ""), str(item.get("mimeType") or "")
+            )
             if ref:
                 images.append(media.image_part(ref))
             else:
-                parts.append("[image 内容已省略：数据不合法或写缓存失败]")
+                parts.append(f"[image 内容已省略：{problem}]")
         elif kind == "audio":
             parts.append("[audio 内容已省略：无法回灌给文本模型]")
         elif kind == "resource":
