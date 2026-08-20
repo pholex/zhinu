@@ -394,7 +394,8 @@ class AsyncAgent:
         """`recycle()` 的同义别名（保留早期嵌入代码用的名字）。"""
         self.recycle()
 
-    def restore(self, messages: list[Any], source: str = "") -> None:
+    def restore(self, messages: list[Any], source: str = "", copy: bool = True) -> None:
         """resume：把 `session_log.load_messages()` 读出的历史接回会话。
-        透传 `Agent.restore()`——放在这里是让异步宿主在一个对象上找全动词。"""
-        self.agent.restore(messages, source=source)
+        透传 `Agent.restore()`——放在这里是让异步宿主在一个对象上找全动词。
+        copy=False = 历史就在当前会话日志里（续写同一文件），只接上下文不再抄一遍。"""
+        self.agent.restore(messages, source=source, copy=copy)

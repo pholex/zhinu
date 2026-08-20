@@ -24,7 +24,19 @@ serve 是**跑在别处的编排器**（HTTP，一对多、可跨机、可轮询
     POST   /session/{id}/permissions      回一个审批决定（放行/拒绝/改写参数）
     POST   /session/{id}/abort            打断当前这一轮（不杀会话）
     POST   /session/{id}/steer            向进行中的一轮插话
+    POST   /session/{id}/budget           改/撤本会话的预算（budget_reached 后的出路）
     POST   /mcp                           同一会话层的 MCP server 面（见 serve_mcp.py）
+
+控制面（持久化、版本化的 Agent 对象；会话创建时 `agent` 字段引用它）：
+
+    POST   /agent                         新建 agent（model/mode/审批档/沙箱/预算/定价）
+    GET    /agent                         列出
+    GET    /agent/{id}                    详情（?versions=true 带全部版本）
+    POST   /agent/{id}                    更新 → 新版本；已在跑的会话仍钉着旧版本
+    DELETE /agent/{id}                    归档（只读、不再接受新会话；不删）
+
+会话清单与 agent 对象默认落盘在 `~/.xiaoyu/serve/<root slug>/`，serve 重启后
+会话自动接回（历史来自会话日志，事件游标接着编号）。细节见 serve_state.py。
 
 为什么同步与异步两个 prompt 端点都要有：coding agent 一轮动辄几分钟，编排器
 的 HTTP 节点普遍有超时上限（n8n/Dify 默认都在分钟级），同步端点在短任务上
@@ -92,7 +104,18 @@ from .config import Config, MissingConfig
 from .embedding import AsyncAgent, RunCompleted
 from .events import UIEvent
 from .permissions import Permissions
-from .session_log import SessionLog
+from .serve_state import (
+    AgentStore,
+    Budget,
+    NotFound,
+    SessionStore,
+    StateError,
+    budget_breach,
+    check_pricing,
+    public_agent,
+    spend_of,
+)
+from .session_log import SessionLog, _workspace_slug, load_messages, sessions_dir
 from .tools import Toolbox
 
 #  事件环形缓冲的默认容量：一轮重活的事件数在百量级，5000 够存几十轮；
@@ -147,6 +170,15 @@ class ServeConfig:
     #  要不要挂 /mcp（MCP server 面，见 serve_mcp.py）。与 REST 共享会话层，
     #  默认开着；`--no-mcp` 关掉后 serve 退回纯 REST。
     mcp: bool = True
+    #  控制面状态（agent 对象、会话清单、会话日志）落在哪。None = 按 root 推：
+    #  `~/.xiaoyu/serve/<root slug>/`。persist=False 时全在内存（测试 / 一次性跑）。
+    state_dir: Path | None = None
+    persist: bool = True
+
+    def resolved_state_dir(self) -> Path:
+        if self.state_dir is not None:
+            return self.state_dir
+        return sessions_dir().parent / "serve" / _workspace_slug(str(self.root))
 
 
 @dataclass
@@ -260,12 +292,29 @@ class _Session:
     `snapshot_pending()` 取快照。
     """
 
-    def __init__(self, session_id: str, agent: Agent, workspace: Path, cfg: ServeConfig) -> None:
+    def __init__(
+        self,
+        session_id: str,
+        agent: Agent,
+        workspace: Path,
+        cfg: ServeConfig,
+        agent_ref: dict[str, Any] | None = None,
+        agent_config: dict[str, Any] | None = None,
+        budget: Budget | None = None,
+        pricing: dict[str, dict[str, float]] | None = None,
+    ) -> None:
         self.id = session_id
         self.agent = agent
         self.async_agent = AsyncAgent(agent)
         self.workspace = workspace
         self.cfg = cfg
+        #  钉住的 agent（{id, name, version}）与那一版配置的快照。快照进会话而不是
+        #  每次回 store 查：agent 之后再改版/归档都不该影响这个会话。
+        self.agent_ref = agent_ref
+        self.agent_config = agent_config or {}
+        self.budget = budget
+        self.pricing = pricing or {}
+        self.budget_reason = ""
         self.created_at = time.time()
         self.updated_at = self.created_at
 
@@ -353,6 +402,17 @@ class _Session:
 
     # ---------- 状态 ----------
 
+    # ---------- 预算 ----------
+
+    def spend(self):
+        """累计用量（token 恒有；美元只在设了美元预算时算，见 serve_state.spend_of）。"""
+        want_usd = self.budget is not None and self.budget.usd is not None
+        return spend_of(self.agent.usage.snapshot(), self.pricing, want_usd)
+
+    def check_budget(self) -> str:
+        """预算耗尽的原因；空串 = 还有余量。只判定，不改状态。"""
+        return budget_breach(self.budget, self.spend())
+
     def status_dict(self) -> dict[str, Any]:
         return {
             "session_id": self.id,
@@ -361,6 +421,10 @@ class _Session:
             "busy": self.busy,
             "error": self.error,
             "turns": self.turns,
+            "usage": self.agent.usage.to_dict(),
+            "spend": self.spend().to_dict(),
+            "budget": self.budget.to_dict() if self.budget else None,
+            "budget_reason": self.budget_reason,
             "pending_approvals": [item.to_dict() for item in self.snapshot_pending()],
             "next_seq": self.next_seq,
             "first_seq": self.first_seq,
@@ -376,6 +440,23 @@ class _Session:
             "model": self.agent.config.model,
             "mode": getattr(self.agent.config, "mode", ""),
             "context_tokens": self.agent.context_tokens(),
+            "agent": self.agent_ref,
+            "session_log": str(self.agent.session_log.path) if self.agent.session_log else "",
+            "created_at": self.created_at,
+        }
+
+    def manifest(self) -> dict[str, Any]:
+        """重启后重建本会话所需的全部信息（见 serve_state.SessionStore）。"""
+        return {
+            "session_id": self.id,
+            "workspace": str(self.workspace),
+            "agent": self.agent_ref,
+            "agent_config": self.agent_config,
+            "budget": self.budget.to_dict() if self.budget else None,
+            "pricing": self.pricing,
+            "session_log": str(self.agent.session_log.path) if self.agent.session_log else "",
+            "next_seq": self.next_seq,
+            "turns": self.turns,
             "created_at": self.created_at,
         }
 
@@ -431,7 +512,14 @@ class _HttpApprover:
         return request.verdict
 
 
-def build_agent(session_id: str, workspace: Path, cfg: ServeConfig, ref: _SessionRef) -> Agent:
+def build_agent(
+    session_id: str,
+    workspace: Path,
+    cfg: ServeConfig,
+    ref: _SessionRef,
+    session_log: SessionLog | None = None,
+    log_dir: Path | None = None,
+) -> Agent:
     """现配一个 Agent（装配顺序照 acp_main 的工厂，两条协议面保持同源）。
 
     approver 与 sink **必须在这里就是最终对象**（经 `_SessionRef` 间接绑定），
@@ -452,7 +540,12 @@ def build_agent(session_id: str, workspace: Path, cfg: ServeConfig, ref: _Sessio
         workspace_trusted=trusted,
     )
     permissions = Permissions.load(config.workspace, include_workspace=trusted)
-    session_log = SessionLog.create(config.model, str(config.workspace), session_id=session_id)
+    if session_log is None:
+        #  serve 的会话日志单独放一个目录（嵌入宿主的惯例）：常驻服务的几百个
+        #  会话不该混进 `xiaoyu --resume` 列表里，也方便重启时按清单定位
+        session_log = SessionLog.create(
+            config.model, str(config.workspace), directory=log_dir, session_id=session_id
+        )
     return Agent(
         config,
         Toolbox(config),
@@ -475,6 +568,10 @@ def create_app(cfg: ServeConfig):  # noqa: C901 - 路由表天然长，拆开反
         raise ServeUnavailable(str(exc)) from exc
 
     sessions: dict[str, _Session] = {}
+    state_dir = cfg.resolved_state_dir()
+    log_dir = state_dir / "logs"
+    agents = AgentStore(state_dir / "agents" if cfg.persist else None)
+    manifests = SessionStore(state_dir / "sessions" if cfg.persist else None)
 
     @contextlib.asynccontextmanager
     async def lifespan(_app):
@@ -494,9 +591,14 @@ def create_app(cfg: ServeConfig):  # noqa: C901 - 路由表天然长，拆开反
             max_workers=cfg.max_sessions, thread_name_prefix="xiaoyu-serve"
         )
         asyncio.get_running_loop().set_default_executor(pool)
+        restore_sessions()
         try:
             yield
         finally:
+            #  优雅停机：把每个会话的游标水位落盘（next_seq 一直在涨，逐事件写盘
+            #  不值得；停机时写一次即可让重启后的编号接得上）
+            for session in sessions.values():
+                manifests.save(session.manifest())
             pool.shutdown(wait=False, cancel_futures=True)
 
     app = FastAPI(
@@ -549,6 +651,54 @@ def create_app(cfg: ServeConfig):  # noqa: C901 - 路由表天然长，拆开反
             raise HTTPException(status_code=404, detail=f"未知 session_id {session_id!r}")
         return session
 
+    def pick_agent(agent_id: str) -> dict[str, Any]:
+        try:
+            return agents.get(agent_id)
+        except NotFound:
+            raise HTTPException(status_code=404, detail=f"未知 agent_id {agent_id!r}") from None
+
+    def check_tightening(config: dict[str, Any]) -> None:
+        """agent 对象只能比服务端启动参数**更严**，不能更松。
+
+        启动方选了 --approval ask / 开了沙箱，是这台服务的安全底线；一个拿着
+        token 的 HTTP 客户端不该能通过"建个 allow_all 的 agent"把它绕开。
+        放宽在这儿是 400，不是静默钳位——静默钳位会让调用方以为自己拿到了
+        allow_all。
+        """
+        if config.get("approval") == "allow_all" and cfg.approval != "allow_all":
+            raise HTTPException(
+                status_code=400,
+                detail="服务端以 --approval ask 启动，agent 不能放宽成 allow_all（只能收紧）",
+            )
+        if config.get("sandbox") is False and cfg.sandbox is not False:
+            raise HTTPException(status_code=400, detail="agent 不能关掉沙箱（只能收紧：true 或 null）")
+        if config.get("sandbox_network") is True and cfg.sandbox_network is not True:
+            raise HTTPException(
+                status_code=400, detail="agent 不能放开沙箱网络（只能收紧：false 或 null）"
+            )
+
+    def apply_agent_config(config: dict[str, Any], model: str = "", mode: str = "") -> ServeConfig:
+        """agent 配置叠在服务端启动参数上 → 这个会话用的 ServeConfig。
+
+        append_system_prompt 是**叠加**不是替换：服务端那份常是宿主级身份/
+        纪律，agent 那份是用法级人格，两层都该在。
+        """
+        prompts = [cfg.append_system_prompt, config.get("append_system_prompt", "")]
+        return replace(
+            cfg,
+            model=model or config.get("model") or cfg.model,
+            base_url=config.get("base_url") or cfg.base_url,
+            mode=mode or config.get("mode") or cfg.mode,
+            approval=config.get("approval") or cfg.approval,
+            append_system_prompt="\n\n".join(part for part in prompts if part),
+            sandbox=cfg.sandbox if config.get("sandbox") is None else config["sandbox"],
+            sandbox_network=(
+                cfg.sandbox_network
+                if config.get("sandbox_network") is None
+                else config["sandbox_network"]
+            ),
+        )
+
     def resolve_workspace(raw: str) -> Path:
         """把请求里的 workspace 归一并锁进 root 之内。"""
         if not raw:
@@ -566,25 +716,139 @@ def create_app(cfg: ServeConfig):  # noqa: C901 - 路由表天然长，拆开反
             raise HTTPException(status_code=400, detail=f"工作区不存在：{candidate}")
         return candidate
 
-    def make_session(workspace: str = "", model: str = "", mode: str = "") -> _Session:
-        """装配一个会话并登记进注册表。REST 的 POST /session 与 MCP 的 xiaoyu
-        工具共用这一个装配口——两张脸建出的会话必须一模一样，包括 approver 与
-        sink 的构造期注入（见 build_agent 的 docstring）。"""
-        target = resolve_workspace(workspace)
-        session_id = f"sess-{uuid.uuid4().hex[:16]}"
-        local = replace(cfg, model=model or cfg.model, mode=mode or cfg.mode)
+    def assemble(
+        session_id: str,
+        target: Path,
+        local: ServeConfig,
+        *,
+        agent_ref: dict[str, Any] | None,
+        agent_config: dict[str, Any],
+        budget: Budget | None,
+        pricing: dict[str, dict[str, float]],
+        session_log: SessionLog | None = None,
+    ) -> _Session:
+        """新建与重启恢复共用的装配口：Agent、_Session、approver/sink 绑定。"""
         ref = _SessionRef()
         try:
-            agent = build_agent(session_id, target, local, ref)
+            agent = build_agent(session_id, target, local, ref, session_log=session_log, log_dir=log_dir)
         except MissingConfig as exc:
             #  503 而不是 500：这不是 bug，是服务端没配 provider，运维动作明确
             raise HTTPException(status_code=503, detail=f"未配置 provider：{exc}") from exc
-        session = _Session(session_id, agent, target, local)
+        session = _Session(
+            session_id,
+            agent,
+            target,
+            local,
+            agent_ref=agent_ref,
+            agent_config=agent_config,
+            budget=budget,
+            pricing=pricing,
+        )
         #  绑定后 approver / sink 才真正生效。绑定前不可能有一轮在跑（会话还没
         #  返回给调用方），所以这个窗口安全——但 approver 仍 fail closed 兜底
         ref.bind(session, asyncio.get_running_loop())
         sessions[session_id] = session
         return session
+
+    def make_session(
+        workspace: str = "",
+        model: str = "",
+        mode: str = "",
+        agent: Any = None,
+        budget: Any = None,
+    ) -> _Session:
+        """装配一个会话并登记进注册表。REST 的 POST /session 与 MCP 的 xiaoyu
+        工具共用这一个装配口——两张脸建出的会话必须一模一样，包括 approver 与
+        sink 的构造期注入（见 build_agent 的 docstring）。
+
+        `agent` 非空时会话钉住那个 agent 的某一版配置，此时 model/mode 不能再
+        单独给（400）：钉版本的意义就是"这个会话的配置可被完整复现"，旁路
+        覆盖会让版本号失去含义。没给 agent 就是老路——跟随服务端启动参数，
+        model/mode 可临时覆盖。
+        """
+        target = resolve_workspace(workspace)
+        session_id = f"sess-{uuid.uuid4().hex[:16]}"
+        agent_ref: dict[str, Any] | None = None
+        agent_config: dict[str, Any] = {}
+        if agent is not None and agent != "":
+            if model or mode:
+                raise HTTPException(
+                    status_code=400, detail="指定了 agent 就不能再单独给 model / mode（配置以 agent 版本为准）"
+                )
+            try:
+                record, version, agent_config = agents.resolve(agent)
+            except NotFound as exc:
+                raise HTTPException(status_code=404, detail=f"未知 agent {exc.args[0]!r}") from None
+            except StateError as exc:
+                raise HTTPException(status_code=400, detail=str(exc)) from None
+            agent_ref = {"id": record["agent_id"], "name": record["name"], "version": version}
+        try:
+            session_budget = Budget.parse(budget)
+        except StateError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from None
+        #  会话级预算优先于 agent 默认预算（CMA 同此）；都没有就是无预算
+        if session_budget is None and agent_config.get("budget"):
+            session_budget = Budget.parse(agent_config["budget"])
+        local = apply_agent_config(agent_config, model=model, mode=mode)
+        session = assemble(
+            session_id,
+            target,
+            local,
+            agent_ref=agent_ref,
+            agent_config=agent_config,
+            budget=session_budget,
+            pricing=agent_config.get("pricing") or {},
+        )
+        manifests.save(session.manifest())
+        return session
+
+    def restore_sessions() -> None:
+        """启动时按清单把上次的会话接回来（历史来自会话日志，游标接着编号）。
+
+        恢复失败的清单**留在盘上、打一行警告、跳过**：不删是因为失败可能是
+        暂时的（工作区没挂上、provider 没配），删了历史就真没了。
+        """
+        for manifest in manifests.load_all():
+            session_id = manifest["session_id"]
+            log_path = Path(manifest.get("session_log") or "")
+            target = Path(manifest.get("workspace") or "")
+            if not log_path.is_file() or not target.is_dir():
+                print(
+                    f"serve: 跳过会话 {session_id}（会话日志或工作区不在：{log_path} / {target}）",
+                    file=sys.stderr,
+                )
+                continue
+            try:
+                agent_config = dict(manifest.get("agent_config") or {})
+                local = apply_agent_config(agent_config)
+                history = load_messages(log_path)
+                log = SessionLog(log_path)
+                session = assemble(
+                    session_id,
+                    target,
+                    local,
+                    agent_ref=manifest.get("agent"),
+                    agent_config=agent_config,
+                    budget=Budget.parse(manifest.get("budget")),
+                    pricing=check_pricing(manifest.get("pricing")),
+                    session_log=log,
+                )
+            except Exception as exc:  # noqa: BLE001 - 一个坏清单不能拖死整个服务
+                print(f"serve: 恢复会话 {session_id} 失败，已跳过：{exc}", file=sys.stderr)
+                sessions.pop(session_id, None)
+                continue
+            log.event("reopened", version=app.version, model=local.model, messages=len(history))
+            #  copy=False：历史就在这个文件里，再抄一遍等于每次重启都把日志翻倍
+            session.async_agent.restore(history, copy=False)
+            #  游标接着编号：重启前的事件计入 dropped，客户端手里的 from 仍单调
+            resume_seq = max(1, int(manifest.get("next_seq") or 1))
+            session.next_seq = session.first_seq = resume_seq
+            session.dropped = resume_seq - 1
+            session.turns = int(manifest.get("turns") or 0)
+            session.created_at = float(manifest.get("created_at") or session.created_at)
+            session.detail = "recovered"
+            session.publish("session.recovered", messages=len(history))
+            manifests.save(session.manifest())
 
     def close_session(session: _Session) -> None:
         """摘除一个会话：先打断，再把挂着的审批放掉（否则工作线程堵到
@@ -594,12 +858,22 @@ def create_app(cfg: ServeConfig):  # noqa: C901 - 路由表天然长，拆开反
             request.verdict = Deny("会话已被关闭")
             request.done.set()
         sessions.pop(session.id, None)
+        manifests.delete(session.id)
+        if session.agent.session_log:
+            session.agent.session_log.close("closed")
 
     async def start_turn(session: _Session, text: str) -> asyncio.Task:
         """开一轮。已经在跑就 409——同步架构下同一 Agent 一次只能跑一轮，
         默默排队会让编排器以为自己的第二次提交立刻生效了。"""
         if session.busy:
             raise HTTPException(status_code=409, detail="该会话正在跑一轮，先等它结束或 /abort")
+        reason = session.check_budget()
+        if reason:
+            session.budget_reason = reason
+            raise HTTPException(
+                status_code=409,
+                detail=f"预算已耗尽：{reason}。POST /session/{session.id}/budget 调高或撤掉预算后再继续",
+            )
         session.busy = True
         session.status = "running"
         session.detail = "working"
@@ -617,6 +891,15 @@ def create_app(cfg: ServeConfig):  # noqa: C901 - 路由表天然长，拆开反
                     result = asdict(event.result)
                     session.last_result = result
                 session.publish_event(event)
+                #  预算是**硬**闸：一轮里模型可能调用几十次，不能等轮末再算。
+                #  每个事件后看一眼累计用量，越线就 interrupt——下一个 chunk 边界
+                #  收尾，半截话入历史，与 /abort 同一条路
+                if not session.budget_reason:
+                    reason = session.check_budget()
+                    if reason:
+                        session.budget_reason = reason
+                        session.publish("budget.reached", reason=reason)
+                        session.async_agent.interrupt()
         except Exception as exc:  # noqa: BLE001 - 编排方要结构化错误，不要 traceback
             session.status = "error"
             session.detail = "failed"
@@ -626,10 +909,18 @@ def create_app(cfg: ServeConfig):  # noqa: C901 - 路由表天然长，拆开反
         else:
             session.status = "idle"
             session.detail = "interrupted" if (result or {}).get("interrupted") else "finished"
+            #  轮末再结一次账：最后一次模型调用的用量可能在最后一个事件之后才记上
+            if not session.budget_reason:
+                session.budget_reason = session.check_budget()
+                if session.budget_reason:
+                    session.publish("budget.reached", reason=session.budget_reason)
+            if session.budget_reason:
+                session.detail = "budget_reached"
             session.turns += 1
             return result or {}
         finally:
             session.busy = False
+            manifests.save(session.manifest())
             #  会话若在跑的过程中被 DELETE，挂起的审批要有人收尸，否则工作线程
             #  一直阻塞到 approval_timeout。这里统一兜底放拒绝。
             for request in session.snapshot_pending():
@@ -645,8 +936,92 @@ def create_app(cfg: ServeConfig):  # noqa: C901 - 路由表天然长，拆开反
             "version": app.version,
             "root": str(cfg.root),
             "sessions": len(sessions),
+            "agents": len(agents.list()),
             "approval": cfg.approval,
+            "persist": cfg.persist,
+            "state_dir": str(state_dir) if cfg.persist else "",
         }
+
+    # ---------- 控制面：agent 对象 ----------
+
+    @app.post(
+        "/agent",
+        summary="新建 agent（持久化、版本化的配置对象）",
+        tags=["agent"],
+        dependencies=guard,
+        operation_id="create_agent",
+        description=(
+            "把 model / mode / append_system_prompt / approval / sandbox / budget / pricing "
+            "打包成一个可引用的对象；POST /session 用 agent 字段引用它。"
+            "approval / sandbox 只能比服务端启动参数更严。"
+        ),
+    )
+    async def agent_create(
+        name: str = Body(embed=True, description="给人看的名字，不要求唯一"),
+        config: dict[str, Any] = Body(
+            default_factory=dict,
+            embed=True,
+            description=(
+                "model / base_url / mode / approval / append_system_prompt / sandbox / "
+                "sandbox_network / budget{tokens,usd} / pricing{模型:{input,output}}（美元/百万 token）"
+            ),
+        ),
+    ) -> dict[str, Any]:
+        try:
+            check_tightening(config)
+            record = agents.create(name, config)
+        except StateError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from None
+        return public_agent(record)
+
+    @app.get("/agent", summary="列出 agent", tags=["agent"], dependencies=guard, operation_id="list_agents")
+    async def agent_list() -> dict[str, Any]:
+        return {"agents": [public_agent(item) for item in agents.list()]}
+
+    @app.get(
+        "/agent/{agent_id}",
+        summary="agent 详情",
+        tags=["agent"],
+        dependencies=guard,
+        operation_id="get_agent",
+    )
+    async def agent_get(
+        agent_id: str,
+        versions: bool = Query(default=False, description="true=带全部历史版本"),
+    ) -> dict[str, Any]:
+        return public_agent(pick_agent(agent_id), with_versions=versions)
+
+    @app.post(
+        "/agent/{agent_id}",
+        summary="更新 agent → 新版本",
+        tags=["agent"],
+        dependencies=guard,
+        operation_id="update_agent",
+        description="config 里给的键覆盖、没给的沿用；每次更新版本号 +1。已在跑的会话仍钉着创建时的版本。",
+    )
+    async def agent_update(
+        agent_id: str,
+        config: dict[str, Any] = Body(default_factory=dict, embed=True),
+        name: str | None = Body(default=None, embed=True),
+    ) -> dict[str, Any]:
+        record = pick_agent(agent_id)
+        try:
+            check_tightening({**record["config"], **config})
+            record = agents.update(agent_id, config, name=name)
+        except StateError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from None
+        return public_agent(record)
+
+    @app.delete(
+        "/agent/{agent_id}",
+        summary="归档 agent（只读、不再接受新会话）",
+        tags=["agent"],
+        dependencies=guard,
+        operation_id="archive_agent",
+    )
+    async def agent_archive(agent_id: str) -> dict[str, Any]:
+        pick_agent(agent_id)
+        return public_agent(agents.archive(agent_id))
 
     @app.post(
         "/session",
@@ -659,8 +1034,18 @@ def create_app(cfg: ServeConfig):  # noqa: C901 - 路由表天然长，拆开反
         workspace: str = Body(default="", embed=True, description="工作区路径，须在 root 之内；缺省用 root"),
         model: str = Body(default="", embed=True, description="模型名，缺省跟随服务端配置"),
         mode: str = Body(default="", embed=True, description="default / auto / plan"),
+        agent: str | dict[str, Any] | None = Body(
+            default=None,
+            embed=True,
+            description='引用一个 agent：agent_id（最新版本）或 {"id": ..., "version": n}（钉版本）。给了它就不能再给 model/mode',
+        ),
+        budget: dict[str, Any] | None = Body(
+            default=None,
+            embed=True,
+            description="本会话的硬预算 {tokens, usd}；缺省用 agent 的默认预算；usd 需要 agent 带 pricing",
+        ),
     ) -> dict[str, Any]:
-        return make_session(workspace=workspace, model=model, mode=mode).info_dict()
+        return make_session(workspace=workspace, model=model, mode=mode, agent=agent, budget=budget).info_dict()
 
     @app.get(
         "/session",
@@ -860,6 +1245,33 @@ def create_app(cfg: ServeConfig):  # noqa: C901 - 路由表天然长，拆开反
         )
         request.done.set()
         return {"request_id": request_id, "decision": decision}
+
+    @app.post(
+        "/session/{session_id}/budget",
+        summary="改/撤本会话的预算",
+        operation_id="set_budget",
+        description=(
+            "budget=null 撤掉预算；否则整体替换为 {tokens, usd}。到线后的会话（detail=budget_reached）"
+            "只有经这里调高或撤掉才能再跑——这是硬闸，不是提醒。"
+        ),
+        tags=["run"],
+        dependencies=guard,
+    )
+    async def session_budget(
+        session_id: str,
+        budget: dict[str, Any] | None = Body(default=None, embed=True),
+    ) -> dict[str, Any]:
+        session = pick(session_id)
+        try:
+            session.budget = Budget.parse(budget)
+        except StateError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from None
+        session.budget_reason = session.check_budget()
+        if not session.budget_reason and session.detail == "budget_reached":
+            session.detail = "finished"
+        session.publish("budget.changed", budget=session.budget.to_dict() if session.budget else None)
+        manifests.save(session.manifest())
+        return session.status_dict()
 
     @app.post(
         "/session/{session_id}/abort",
