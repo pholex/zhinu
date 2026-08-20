@@ -1,0 +1,21 @@
+{"cmd": "rm -rf /tmp/x", "guard": "dangerous", "expect": "block", "note": "强制递归删"}
+{"cmd": "rm -fr /tmp/x", "guard": "dangerous", "expect": "block", "note": "flag 顺序颠倒"}
+{"cmd": "rm --force /tmp/x", "guard": "dangerous", "expect": "block", "note": "长 flag"}
+{"cmd": "rm /tmp/x -f", "guard": "dangerous", "expect": "block", "note": "flag 在参数后"}
+{"cmd": "sudo rm -rf /tmp/x", "guard": "dangerous", "expect": "block", "note": "sudo 包裹"}
+{"cmd": "env TARGET=/tmp/x rm -rf /tmp/x", "guard": "dangerous", "expect": "block", "note": "env 赋值包裹"}
+{"cmd": "env -i rm -rf /tmp/x", "guard": "dangerous", "expect": "block", "note": "env -i 清环境"}
+{"cmd": "bash -c 'rm -rf /tmp/x'", "guard": "dangerous", "expect": "block", "note": "bash -c 内联"}
+{"cmd": "bash -lc 'rm -rf /tmp/x'", "guard": "dangerous", "expect": "block", "note": "登录 shell -lc"}
+{"cmd": "nohup rm -rf /tmp/x", "guard": "dangerous", "expect": "block", "note": "nohup 包裹"}
+{"cmd": "timeout 5 rm -rf /tmp/x", "guard": "dangerous", "expect": "block", "note": "timeout 带值参数"}
+{"cmd": "trap 'rm -rf /tmp/x' EXIT", "guard": "dangerous", "expect": "block", "note": "trap 里藏 rm"}
+{"cmd": "xargs rm -rf", "guard": "dangerous", "expect": "block", "note": "xargs 喂 rm"}
+{"cmd": "sudo env A=1 bash -c 'rm -rf /tmp/x'", "guard": "dangerous", "expect": "block", "note": "多层嵌套"}
+{"cmd": "echo hi && rm -rf /tmp/x", "guard": "dangerous", "expect": "block", "note": "&& 复合段"}
+{"cmd": "printf x | xargs rm -rf", "guard": "dangerous", "expect": "block", "note": "管道后段"}
+{"cmd": "rm -r /tmp/x", "guard": "dangerous", "expect": "allow", "note": "无 -f 不算强制"}
+{"cmd": "rm -- -f", "guard": "dangerous", "expect": "allow", "note": "删一个叫 -f 的文件"}
+{"cmd": "rm /tmp/x", "guard": "dangerous", "expect": "allow", "note": "普通删单文件"}
+{"cmd": "echo 'rm -rf /tmp/x'", "guard": "dangerous", "expect": "allow", "note": "字面量不是执行"}
+{"cmd": "trap 'echo done' EXIT", "guard": "dangerous", "expect": "allow", "note": "trap 里是无害命令"}
