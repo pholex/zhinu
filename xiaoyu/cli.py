@@ -1147,6 +1147,17 @@ def serve_command(argv: list[str]) -> int:
         help="不挂 /mcp（MCP server 面，给 LangChain/LangGraph 等 MCP client 用；默认挂）",
     )
     parser.add_argument(
+        "--state-dir",
+        dest="state_dir",
+        help="agent 对象 / 会话清单 / 会话日志的落盘目录，默认 ~/.xiaoyu/serve/<root slug>/",
+    )
+    parser.add_argument(
+        "--no-persist",
+        dest="persist",
+        action="store_false",
+        help="不落盘：agent 与会话只在内存里，重启即失（一次性跑 / 临时调试）",
+    )
+    parser.add_argument(
         "--print-openapi",
         action="store_true",
         help="把 OpenAPI schema 打到 stdout 后退出（贴给 Dify 自定义工具用），不起服务",
@@ -1181,6 +1192,8 @@ def serve_command(argv: list[str]) -> int:
         approval_timeout=args.approval_timeout,
         max_sessions=max(1, args.max_sessions),
         mcp=args.mcp,
+        state_dir=Path(args.state_dir).expanduser().resolve() if args.state_dir else None,
+        persist=args.persist,
     )
     try:
         if args.print_openapi:

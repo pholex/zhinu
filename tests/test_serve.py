@@ -65,7 +65,7 @@ class ServeCase(unittest.TestCase):
         (Path(self.tmp) / "config").mkdir()
         self._script_path = Path(self.tmp) / "script.txt"
 
-    def start(self, script: str) -> "TestClient":
+    def start(self, script: str, **cfg_extra: Any) -> "TestClient":
         from xiaoyu.serve import ServeConfig, create_app
 
         self._script_path.write_text(script, encoding="utf-8")
@@ -88,6 +88,7 @@ class ServeCase(unittest.TestCase):
             #  审批超时压到秒级：用例要能在可接受的时间里验到 fail-closed
             approval_timeout=3.0,
             mcp=self.mcp,
+            **cfg_extra,
         )
         client = TestClient(create_app(cfg))
         client.__enter__()

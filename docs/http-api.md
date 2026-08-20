@@ -44,6 +44,8 @@ coding agent 一轮动辄几分钟，而编排器的 HTTP 节点普遍有分钟�
 | `running` | `waiting_for_approval` | **卡在等人放行**，去回 `/permissions` |
 | `idle` | `finished` | 上一轮正常收尾，`last_result` 有正文与 usage |
 | `idle` | `interrupted` | 上一轮被 `/abort` 收掉 |
+| `idle` | `budget_reached` | **预算耗尽**（`budget_reason` 有原因），再提交 `409`，去 `/budget` 调高或撤掉 |
+| `idle` | `recovered` | serve 重启后从清单接回来的会话，还没跑过新的一轮 |
 | `error` | `failed` | 上一轮抛异常，`error` 字段有原文 |
 
 `waiting_for_approval` 单独占一格是这一层最要紧的设计：编排器只看"还在跑"的话，
@@ -211,6 +213,75 @@ n8n 的 HTTP Request 节点默认超时是 300s，够 long-poll 的 60s 上限�
 
 ---
 
+## 控制面：agent 对象（版本化配置）
+
+会话的配置（模型、模式、追加的 system prompt、审批档、沙箱、预算、定价）可以先打包成一个
+**持久化、带版本的 agent 对象**，会话创建时引用它：
+
+```bash
+# 建一次
+curl -X POST :8420/agent -d '{"name":"写手","config":{"model":"claude-opus-5","mode":"auto",
+  "append_system_prompt":"你是技术文档写手","budget":{"tokens":300000}}}'
+#  → {"agent_id":"agent-3f9c…","version":1,...}
+
+# 每次运行只引用
+curl -X POST :8420/session -d '{"agent":"agent-3f9c…"}'                 # 最新版本
+curl -X POST :8420/session -d '{"agent":{"id":"agent-3f9c…","version":1}}'  # 钉版本
+
+# 改配置 = 出新版本；已在跑的会话仍钉着创建时那一版，不受影响
+curl -X POST :8420/agent/agent-3f9c… -d '{"config":{"mode":"plan"}}'  # → version 2
+```
+
+规则：
+
+- **引用了 agent 的会话不能再单独给 `model` / `mode`**（`400`）——钉版本的意义是"这个
+  会话的配置可完整复现"，旁路覆盖会让版本号失去含义。不给 `agent` 就是老路：跟随
+  服务端启动参数，`model` / `mode` 可临时覆盖。
+- **agent 只能比服务端启动参数更严**：服务端 `--approval ask` 时 agent 不能设
+  `allow_all`；不能把沙箱关掉、不能放开沙箱网络。放宽是 `400`，不是静默钳位。
+- `append_system_prompt` 是**叠加**：服务端那份（宿主级身份/纪律）在前，agent 那份
+  （用法级人格）在后。
+- `DELETE /agent/{id}` 是**归档**不是删除：只读、不再接受新会话、老会话照跑、历史版本
+  可查（`GET /agent/{id}?versions=true`）。
+
+## 预算（硬闸，不是提醒）
+
+```bash
+curl -X POST :8420/session -d '{"agent":"agent-…","budget":{"tokens":200000}}'
+curl -X POST :8420/session/sess-…/budget -d '{"budget":{"tokens":500000}}'   # 调高
+curl -X POST :8420/session/sess-…/budget -d '{"budget":null}'                # 撤掉
+```
+
+- 币种以 **token 为主**（prompt + completion 累计，含子 agent 与摘要调用）。小羽记账到
+  provider/model 的 token 为止，**没有内置价格表**——跨十几家 provider 维护一张表既不准
+  也没人更新。
+- **美元预算是可选的**：agent 的 `pricing` 给出 `{模型: {"input": 美元/百万, "output":
+  美元/百万}}`（键可以是 `provider/model` 全限定名或裸模型名），设了 `budget.usd` 才会
+  按它结算。**用到没定价的模型按超支处理**（fail closed）——钱的事上"算不出来"不能
+  悄悄变成"不设限"。
+- 一轮里模型可能调用几十次，所以**轮中每个事件后都结一次账**，越线即 `interrupt`
+  （下一个 chunk 边界收尾，半截话入历史，与 `/abort` 同一条路），轮末状态
+  `idle/budget_reached`，事件流里有 `budget.reached`。之后再提交 `409`，只有经
+  `/budget` 调高或撤掉才能继续。
+- 会话级 `budget` 优先于 agent 的默认 `budget`；`/status` 里 `usage`（累计账本）、
+  `spend`（按预算币种结算的结果）、`budget`、`budget_reason` 四个字段一起看。
+
+## 重启恢复
+
+agent 对象、会话清单、会话日志默认落盘在 `~/.xiaoyu/serve/<root slug>/`
+（`--state-dir` 改位置，`--no-persist` 全放内存）。serve 重启后：
+
+- 会话自动接回（`detail=recovered`），历史来自会话日志（`Agent.restore`，未配对的
+  tool_call 会补"结果未知"），配置、agent 引用、预算、`turns` 随清单回来；
+- **事件缓冲不落盘**——重启前的事件计入 `dropped_events`，`seq` 从上次水位**接着编号**：
+  客户端手里的游标仍单调，拉到的是"中间缺一段"（协议里本来就有表达），不是"序号倒流"；
+- 恢复失败的清单（工作区没挂上、provider 没配）留在盘上、stderr 打一行、跳过——不删，
+  因为失败可能是暂时的。`DELETE /session/{id}` 会删清单；会话日志作为留痕保留。
+
+文件即真相：`agents/agent-*.json`、`sessions/sess-*.json`、`logs/*.jsonl`，`cat` 即可审计。
+
+---
+
 ## 安全边界
 
 这个服务**会执行任意命令**，边界是硬的：
@@ -229,7 +300,9 @@ n8n 的 HTTP Request 节点默认超时是 300s，够 long-poll 的 60s 上限�
 | 方法 | 路径 | |
 |---|---|---|
 | GET | `/health` | 存活探针（不需要 token） |
-| POST | `/session` | 新建会话（可指定 `workspace` / `model` / `mode`） |
+| POST · GET | `/agent` | 新建 agent 对象 · 列出 |
+| GET · POST · DELETE | `/agent/{id}` | 详情（`?versions=true`）· 更新→新版本 · 归档 |
+| POST | `/session` | 新建会话（`workspace` / `model` / `mode`，或 `agent` 引用 + `budget`） |
 | GET | `/session` | 列出会话 |
 | GET · DELETE | `/session/{id}` | 详情 · 关闭 |
 | POST | `/session/{id}/prompt` | 跑一轮，等结果 |
@@ -238,6 +311,7 @@ n8n 的 HTTP Request 节点默认超时是 300s，够 long-poll 的 60s 上限�
 | GET | `/session/{id}/events` | 拉事件（游标 + long-poll） |
 | GET | `/session/{id}/events/stream` | 同一份事件流的 SSE |
 | GET · POST | `/session/{id}/permissions` | 挂起的审批 · 回决定 |
+| POST | `/session/{id}/budget` | 改/撤预算（`budget_reached` 后的出路） |
 | POST | `/session/{id}/abort` | 打断这一轮（不杀会话） |
 | POST | `/session/{id}/steer` | 向进行中的一轮插话（会话空闲时 `409`） |
 | POST | `/mcp` | 同一会话层的 MCP server 面（[docs/mcp-server.md](mcp-server.md)，`--no-mcp` 可关） |
@@ -253,4 +327,5 @@ n8n 的 HTTP Request 节点默认超时是 300s，够 long-poll 的 60s 上限�
 - `steer` 只在会话 `busy` 时有意义：空闲期入队的插话会在下一轮开头被 drain 掉，
   所以空闲时直接回 `409` 而不是假装成功。
 - **会话不会自动回收**：`DELETE /session/{id}` 是唯一的释放口。长跑的服务要自己
-  在编排流程末尾调它，否则会话（含完整消息历史与事件缓冲）会一直占着内存。
+  在编排流程末尾调它，否则会话（含完整消息历史与事件缓冲）会一直占着内存——
+  而且默认落盘，重启也会被接回来。
