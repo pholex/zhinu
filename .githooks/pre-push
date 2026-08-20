@@ -1,8 +1,30 @@
 #!/bin/sh
-# 本地 CI 兜底：push 前跑全部单元测试（~3 秒，全部不打网络）。
+# 本地 CI 兜底：push 前跑全部单元测试（~100 秒，全部不打网络）。
 # 启用：git config core.hooksPath .githooks
+#
+# 只推 tag 时跳过：发版流程是"先 push main 再 push tag"，tag 指向的提交在推
+# main 那次已经测过，再跑一遍只是让发版慢一倍。判据是 stdin 里的全部 ref 都是
+# refs/tags/*；分支与 tag 混推、或纯分支推，照旧全跑。
 set -e
 cd "$(git rev-parse --show-toplevel)"
+
+only_tags=1
+refs=0
+while read -r local_ref local_sha remote_ref remote_sha; do
+    refs=$((refs + 1))
+    case "$local_ref" in
+        refs/tags/*) ;;
+        *) only_tags=0 ;;
+    esac
+done
+if [ "$refs" = 0 ]; then
+    exit 0
+fi
+if [ "$only_tags" = 1 ]; then
+    echo "[pre-push] 只推 tag，跳过单元测试（提交已在推分支时测过）"
+    exit 0
+fi
+
 if [ -x .venv/bin/python ]; then
     PY=.venv/bin/python
 else
