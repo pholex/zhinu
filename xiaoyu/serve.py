@@ -417,9 +417,15 @@ class _HttpApprover:
         session.drop_pending(request.id)
         if not got:
             loop.call_soon_threadsafe(session.mark_resolved, request.id, "timeout")
+            #  拒绝理由必须让模型读得懂三件事：这不是用户的否决（别当成新指示）、
+            #  原样重试只会再超时一次、正确出路是把要什么授权说出来留给编排侧。
+            #  否则无人值守下模型会盲重试同一调用，每次白烧一个完整超时窗口。
             return Deny(
                 f"审批超时（{session.cfg.approval_timeout:g}s 内没有收到 "
-                f"POST /session/{session.id}/permissions 的决定），已自动拒绝"
+                f"POST /session/{session.id}/permissions 的决定），已自动拒绝。"
+                "注意：这不是用户的否决，是无人应答——不要原样重试同一调用"
+                "（只会再超时一次）。请在回复里说明你需要哪个工具、想做什么，"
+                "把决定留给编排侧。"
             )
         loop.call_soon_threadsafe(session.mark_resolved, request.id, "resolved")
         return request.verdict

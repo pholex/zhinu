@@ -221,7 +221,14 @@ class AsyncApprover:
             return future.result(timeout=self._timeout)
         except FutureTimeoutError:
             future.cancel()
-            return f"审批超时（{self._timeout}s 内宿主未给出决定），已自动拒绝"
+            #  说清"不是用户否决 + 别原样重试"：无人值守下模型读不到这两句就会
+            #  盲重试同一调用，每次白烧一个完整超时窗口（serve._HttpApprover 同款纪律）。
+            return (
+                f"审批超时（{self._timeout}s 内宿主未给出决定），已自动拒绝。"
+                "注意：这不是用户的否决，是无人应答——不要原样重试同一调用"
+                "（只会再超时一次）。请在回复里说明你需要哪个工具、想做什么，"
+                "把决定留给宿主。"
+            )
         except Exception as exc:  # noqa: BLE001 - 审批链路故障必须 fail closed，不能让异常掀翻整轮对话
             return f"审批过程出错：{type(exc).__name__}: {exc}，已自动拒绝"
 

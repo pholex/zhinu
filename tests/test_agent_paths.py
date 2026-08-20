@@ -1150,6 +1150,43 @@ class TestCrystallizeNudge(AgentTestCase):
         self.assertEqual(agent.messages[-1]["content"], "无需沉淀")
         self.assertEqual(self.client.completions.script, [], "轻推该恰好多跑一步")
 
+    def test_suppressed_second_nudge_logs_gate_skip(self) -> None:
+        """"每会话一次"压掉第二次够格迭代时必须落 gate_skip 事件——静默拒绝
+        运行的功能和坏掉的功能在会话日志里要可区分，事后才答得了"为什么没推"。
+        """
+        script = [
+            self.iteration_step(1),
+            self.iteration_step(2),
+            self.iteration_step(3),
+            [chunk(content="问题解决了")],
+            [chunk(content="无需沉淀")],
+            #  第二轮：又一次够格的解题迭代，但本会话的一次机会已用掉
+            self.iteration_step(4),
+            self.iteration_step(5),
+            self.iteration_step(6),
+            [chunk(content="又解决了")],
+        ]
+        events: list[tuple[str, dict]] = []
+
+        class FakeLog:
+            def event(self, kind: str, **fields: object) -> None:
+                events.append((kind, fields))
+
+            def append(self, message: dict) -> None:  # _record 也会写消息，收下即可
+                pass
+
+        agent = self.build(script)
+        agent.session_log = FakeLog()
+        with contextlib.redirect_stdout(io.StringIO()):
+            agent.send("修好这个脚本")
+            agent.send("再修另一个问题")
+        self.assertEqual(len(self.nudge_messages(agent)), 1, "每会话仍只推一次")
+        skips = [f for k, f in events if k == "gate_skip"]
+        self.assertEqual(
+            skips,
+            [{"gate": "crystallize_nudge", "reason": "already_nudged_this_session"}],
+        )
+
     def test_below_threshold_stays_quiet(self) -> None:
         #  两轮整写：正常"建文件 + 改一处"的形态，不该被问
         script = [

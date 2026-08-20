@@ -610,6 +610,8 @@ class Agent:
         self._turn_script_runs = 0
         #  每会话最多推一次，免得每个大活收尾都被唠叨
         self._crystallize_nudged = False
+        #  gate_skip 事件按轮去重：门控一轮内会被评估多次（每个收尾步都问一遍）
+        self._crystallize_skip_logged = False
         self.messages: list[dict[str, Any]] = [{"role": "system", "content": self._system_prompt()}]
         #  token 记账锚点（服务端 usage 是权威值，本地只估算它之后新增的
         #  部分，误差不随会话累积）：(权威 prompt_tokens, 当时的消息条数)。
@@ -1216,8 +1218,27 @@ class Agent:
 
         只提议、不动手：沉淀与否由用户拍板——自动沉淀会把偶然跑通的解法固化成
         "经验"，与"持久记忆须人工确认"的纪律冲突。每会话最多推一次。
+
+        "阈值满足却被'每会话一次'压掉"的轮次落一条 gate_skip 事件进会话日志：
+        静默拒绝运行的功能和坏掉的功能在日志里必须可区分，否则事后拿到
+        "为什么没推"的问题只能靠猜。低于阈值的轮次不记——那是常态不是异常。
         """
         if self._crystallize_nudged:
+            if (
+                not self._crystallize_skip_logged
+                and self._turn_script_runs >= self._CRYSTALLIZE_RUNS
+                and any(
+                    count >= self._CRYSTALLIZE_REWRITES
+                    for count in self._turn_write_counts.values()
+                )
+            ):
+                #  又一轮够格的迭代，但本会话的一次机会已用掉——记录而非静默；
+                #  按轮去重（同一轮的多个收尾步只记一条）。
+                self._crystallize_skip_logged = True
+                if self.session_log:
+                    self.session_log.event(
+                        "gate_skip", gate="crystallize_nudge", reason="already_nudged_this_session"
+                    )
             return False
         if self._turn_script_runs < self._CRYSTALLIZE_RUNS:
             return False
@@ -1226,6 +1247,9 @@ class Agent:
         ):
             return False
         self._crystallize_nudged = True
+        #  触发即占掉本轮的 gate_skip 名额：轻推后的收尾步会再评估一次门控，
+        #  同一轮"推过了"不算"被压掉"，不该落 skip 事件
+        self._crystallize_skip_logged = True
         self._record({"role": "user", "content": CRYSTALLIZE_NUDGE})
         self.sink.emit(
             Notice("[检测到反复改写并执行的解题过程，已请模型评估是否值得沉淀]", "info")
@@ -1333,6 +1357,7 @@ class Agent:
         self._loaded_skills.clear()
         #  收尾轻推的"每会话一次"随会话重置——recycle 后的新对话有自己的一次机会
         self._crystallize_nudged = False
+        self._crystallize_skip_logged = False
         self._turn_write_counts.clear()
         self._turn_script_runs = 0
         self._last_call_key = None
@@ -1626,6 +1651,7 @@ class Agent:
         #  解题迭代特征按轮归零：跨轮累计会把两次不相干的小改凑成一次"迭代"
         self._turn_write_counts.clear()
         self._turn_script_runs = 0
+        self._crystallize_skip_logged = False
         #  UserPromptSubmit hook：block 则本轮不发生（不入历史、不调模型）
         if self.hook_engine is not None and self.hook_engine.has("UserPromptSubmit"):
             from .hooks import clip
