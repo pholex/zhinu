@@ -892,39 +892,82 @@ class Agent:
         整个 prompt 在会话内是静态的（构建一次、不随轮次变）——这是 prompt cache
         的前缀资产：OpenAI 兼容网关（DeepSeek/LiteLLM）的前缀缓存是自动的，
         守住"不往 system prompt 里放易变内容（时间、动态状态）"即可白拿折扣。
+
+        实际拼接走 `_system_segments()`：**同一份带标签的段列表既拼成 prompt、
+        又供 /context 做归因**，所以"哪段占多少"不可能和真正发出去的内容对不上
+        （归因靠反向读结构，不靠在每个拼接点埋计数器——后者一旦新增段忘了埋就
+        漂移）。段之间的 "\n\n" 连接符记在**后一段**头上，保证各段字符数之和恰好
+        等于 prompt 长度（有测试钉这个不变量）。
         """
+        return "".join(text for _label, text in self._system_segments())
+
+    def _system_segments(self) -> list[tuple[str, str]]:
+        """system prompt 的带标签分段（label, text）。join 起来即完整 prompt。"""
         from .tools import _platform_shell_note
 
-        prompt = SYSTEM_PROMPT.format(
-            shell_note=_platform_shell_note(),
-            workspace=self.config.workspace,
-            system=f"{platform.system()} {platform.release()} ({platform.machine()})",
+        segments: list[tuple[str, str]] = []
+        segments.append(
+            (
+                "核心身份",
+                SYSTEM_PROMPT.format(
+                    shell_note=_platform_shell_note(),
+                    workspace=self.config.workspace,
+                    system=f"{platform.system()} {platform.release()} ({platform.machine()})",
+                ),
+            )
         )
         #  宿主注入的身份/人格（--append-system-prompt）：紧跟核心身份之后，
         #  早于环境探测/项目指令——人格是"我是谁"，后面两段是"我在什么环境里"。
         if self.config.append_system_prompt:
-            prompt += f"\n\n{self.config.append_system_prompt}"
+            segments.append(("宿主人格", f"\n\n{self.config.append_system_prompt}"))
         #  环境画像（工具链有无 + 网络区域）：启动时探测一次即静态，
         #  让模型在选型阶段就避开"缺 git 的机器选 Git 路线"这类死路
-        prompt += envprobe.block()
+        env_block = envprobe.block()
+        if env_block:
+            segments.append(("环境画像", env_block))
         #  自扩展指南（"文档即能力"）：扩展格式不靠模型的训练记忆——指南随包
         #  分发，这里只放绝对路径，要用时现读全文。路径在会话内静态，
         #  不破坏前缀缓存；文件缺失（罕见的裁剪安装）就整段不提。
         extending_doc = Path(__file__).parent / "docs" / "extending.md"
         if extending_doc.is_file():
-            prompt += (
-                "\n\n要为小羽本身新增能力（技能 SKILL.md、工具插件、MCP server、hooks）时，"
-                f"先完整阅读随包分发的扩展指南再动手：{extending_doc}"
+            segments.append(
+                (
+                    "扩展指南",
+                    "\n\n要为小羽本身新增能力（技能 SKILL.md、工具插件、MCP server、hooks）时，"
+                    f"先完整阅读随包分发的扩展指南再动手：{extending_doc}",
+                )
             )
-        prompt += self._project_instructions()
-        prompt += skills.index_block(
+        project = self._project_instructions()
+        if project:
+            segments.append(("项目指令", project))
+        skills_block = skills.index_block(
             self.skills,
             max_tokens=int(self.config.context_limit * self._SKILL_BUDGET_RATIO),
             #  按使用账本排序：预算降级时让常用技能优先存活。system prompt 每会话
             #  构建一次，账本跨会话慢变，会话内静态（不破坏 prefix cache）。
             rank_by_usage=True,
         )
-        return prompt
+        if skills_block:
+            segments.append(("技能索引", skills_block))
+        return segments
+
+    def context_breakdown(self) -> list[tuple[str, int]]:
+        """当前上下文的字符归因：system prompt 各段 + 消息按角色归类。
+
+        用于 /context 让用户看清"上下文都花在哪"，而不用自己拆解拼装逻辑。
+        单位是字符（精确、免费、确定；token 只是估算，比较各段占比时字符更实在）。
+        各项之和恰等于 system prompt 长度 + 各消息 content 长度之和。
+        """
+        rows: list[tuple[str, int]] = [
+            (f"system:{label}", len(text)) for label, text in self._system_segments()
+        ]
+        #  消息按角色/种类归类（system 那条已在上面逐段拆过，这里不重复计）
+        by_role: dict[str, int] = {}
+        for msg in self.messages[1:]:
+            role = str(msg.get("role", "?"))
+            by_role[role] = by_role.get(role, 0) + len(media.text_of(msg.get("content", "")))
+        rows.extend((f"消息:{role}", chars) for role, chars in by_role.items())
+        return rows
 
     def _project_instructions(self) -> str:
         """项目级指令文件拼进 system prompt（多层收集）。

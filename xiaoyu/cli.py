@@ -2792,6 +2792,14 @@ def handle_slash(agent: Agent, line: str, select: Any = None) -> bool:
                 f"  摘要模型链：{' → '.join(r.qualified for r in agent.summary_models())}"
             )
         )
+        #  归因：上下文都花在哪，按字符降序。让用户无需自己拆解拼装逻辑即可审计。
+        breakdown = sorted(agent.context_breakdown(), key=lambda kv: kv[1], reverse=True)
+        total_chars = sum(chars for _, chars in breakdown) or 1
+        print(ui.secondary("  ── 归因（字符）──"))
+        for label, chars in breakdown:
+            if chars == 0:
+                continue
+            print(ui.secondary(f"    {label:<16} {chars:>8}  {chars / total_chars:>4.0%}"))
     elif command == "/compact":
         note = agent.maybe_compact(force=True)
         print(ui.secondary(f"  {note or '无需压缩'}"))
