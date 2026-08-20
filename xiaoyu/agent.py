@@ -18,7 +18,7 @@ from pathlib import Path
 from dataclasses import dataclass, field
 from typing import Any, Callable, Protocol
 
-from . import envprobe, errors, media, modes, providers, sandbox, skills, tokens
+from . import envprobe, errors, media, modes, providers, sandbox, skill_usage, skills, tokens
 from .compaction import (
     MIN_SUMMARY_CHARS,
     PREFIX_SUMMARY_INSTRUCTION,
@@ -918,7 +918,11 @@ class Agent:
             )
         prompt += self._project_instructions()
         prompt += skills.index_block(
-            self.skills, max_tokens=int(self.config.context_limit * self._SKILL_BUDGET_RATIO)
+            self.skills,
+            max_tokens=int(self.config.context_limit * self._SKILL_BUDGET_RATIO),
+            #  按使用账本排序：预算降级时让常用技能优先存活。system prompt 每会话
+            #  构建一次，账本跨会话慢变，会话内静态（不破坏 prefix cache）。
+            rank_by_usage=True,
         )
         return prompt
 
@@ -1190,6 +1194,9 @@ class Agent:
         body = skills.load_skill_body(found)
         if body.startswith("ERROR:"):
             return body
+        #  只有正文成功送达才记一次使用（加载失败不算）：账本给索引排序用，
+        #  让常用技能在预算降级时优先存活。best-effort，绝不影响加载本身。
+        skill_usage.record_load(name)
         #  基准目录必须随正文给出：技能正文里的相对路径（references/…、
         #  ../共享文档）模型无从知道相对谁——真实会话里模型猜错目录后，
         #  又花二十分钟递归搜盘才找到真实位置。

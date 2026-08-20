@@ -200,8 +200,14 @@ def _line_cost(line: str) -> int:
     return tokens.estimate_text(line + "\n")
 
 
-def index_block(skills: list[Skill], max_tokens: int | None = None) -> str:
+def index_block(
+    skills: list[Skill], max_tokens: int | None = None, rank_by_usage: bool = False
+) -> str:
     """拼进 system prompt 的技能索引。空列表返回空串。
+
+    rank_by_usage=True 时先按使用账本排序（用得多的在前、未用过的按 mtime 新的
+    在前）：预算降级丢的是尾部，排序让"真在用的"优先存活，而不是让来源+文件名
+    的偶然顺序决定谁被丢。排序稳定确定，索引在会话内不抖（prefix cache 前缀）。
 
     max_tokens 是整个索引块的估算 token 预算（调用方给上下文窗口的 2%）。
     超预算时**分三级降级，技能名尽最大努力保住**——索引的唯一作用是让模型
@@ -222,6 +228,10 @@ def index_block(skills: list[Skill], max_tokens: int | None = None) -> str:
     """
     if not skills:
         return ""
+    if rank_by_usage:
+        from . import skill_usage
+
+        skills = skill_usage.ranked(skills)
     header = [
         "",
         "可用技能（当任务和某个技能的描述匹配时，先用 skill 工具加载它的完整说明，再按说明执行）：",
