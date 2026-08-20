@@ -52,6 +52,7 @@ serve = [
 ]
 
 [project.urls]
+Homepage = "https://xiaoyu.openapi.click"
 Repository = "https://github.com/pholex/zhinu"
 Issues = "https://github.com/pholex/zhinu/issues"
 
