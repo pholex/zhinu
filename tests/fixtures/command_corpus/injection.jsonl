@@ -1,0 +1,27 @@
+{"cmd": "git -c core.pager='!sh evil' log", "guard": "injection", "expect": "block", "note": "git -c 注入 pager"}
+{"cmd": "git -ccore.pager=evil log", "guard": "injection", "expect": "block", "note": "-c 粘连写法"}
+{"cmd": "git -p log", "guard": "injection", "expect": "block", "note": "-p 触发 pager"}
+{"cmd": "git --exec-path=/tmp/evil status", "guard": "injection", "expect": "block", "note": "改 exec-path"}
+{"cmd": "git --git-dir /tmp/other status", "guard": "injection", "expect": "block", "note": "改 git-dir"}
+{"cmd": "git diff --ext-diff", "guard": "injection", "expect": "block", "note": "外部 diff 程序"}
+{"cmd": "git diff --output=/tmp/x", "guard": "injection", "expect": "block", "note": "指定输出文件"}
+{"cmd": "/usr/bin/git -c a.b=c log", "guard": "injection", "expect": "block", "note": "绝对路径不绕过按名检查"}
+{"cmd": "git.exe -p log", "guard": "injection", "expect": "block", "note": "Windows 后缀不绕过"}
+{"cmd": "find . -name '*.py' -exec rm {} ;", "guard": "injection", "expect": "block", "note": "find -exec 任意程序"}
+{"cmd": "find . -delete", "guard": "injection", "expect": "block", "note": "find -delete"}
+{"cmd": "rg --pre=evil pattern", "guard": "injection", "expect": "block", "note": "ripgrep --pre 预处理器"}
+{"cmd": "rg --pre evil pattern", "guard": "injection", "expect": "block", "note": "--pre 分离写法"}
+{"cmd": "rg -z pattern", "guard": "injection", "expect": "block", "note": "-z 搜索预处理"}
+{"cmd": "tar --to-command=evil -xf a.tar", "guard": "injection", "expect": "block", "note": "tar 每文件跑程序"}
+{"cmd": "ssh -o ProxyCommand=evil host", "guard": "injection", "expect": "block", "note": "ssh ProxyCommand"}
+{"cmd": "ssh -oProxyCommand=evil host", "guard": "injection", "expect": "block", "note": "-o 粘连写法"}
+{"cmd": "xargs rm", "guard": "injection", "expect": "block", "note": "xargs 跑任意命令"}
+{"cmd": "git commit -m 'unclosed", "guard": "injection", "expect": "block", "note": "引号不闭合按风险处理"}
+{"cmd": "awk 'BEGIN{system(\"id\")}'", "guard": "injection", "expect": "block", "note": "awk system()"}
+{"cmd": "git status", "guard": "injection", "expect": "allow", "note": "普通只读"}
+{"cmd": "git log --oneline -5", "guard": "injection", "expect": "allow", "note": "普通日志"}
+{"cmd": "git commit -m 'fix: x'", "guard": "injection", "expect": "allow", "note": "普通提交"}
+{"cmd": "find . -name '*.py'", "guard": "injection", "expect": "allow", "note": "纯查找无执行口"}
+{"cmd": "rg -n pattern src", "guard": "injection", "expect": "allow", "note": "普通搜索"}
+{"cmd": "tar -tzf a.tar", "guard": "injection", "expect": "allow", "note": "只列内容"}
+{"cmd": "ssh host uptime", "guard": "injection", "expect": "allow", "note": "远程跑一条命令无注入口"}

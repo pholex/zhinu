@@ -1,0 +1,13 @@
+{"cmd": "sudo id", "guard": "privileged", "expect": "block", "note": "sudo"}
+{"cmd": "doas ls", "guard": "privileged", "expect": "block", "note": "doas"}
+{"cmd": "su - root", "guard": "privileged", "expect": "block", "note": "su"}
+{"cmd": "pkexec whoami", "guard": "privileged", "expect": "block", "note": "pkexec"}
+{"cmd": "bash -lc 'sudo apt install foo'", "guard": "privileged", "expect": "block", "note": "shell 内联 sudo"}
+{"cmd": "xargs sudo tee /etc/hosts", "guard": "privileged", "expect": "block", "note": "xargs 喂 sudo"}
+{"cmd": "env A=1 sudo ls", "guard": "privileged", "expect": "block", "note": "env 包裹 sudo"}
+{"cmd": "echo hi && sudo id", "guard": "privileged", "expect": "block", "note": "复合段第二段"}
+{"cmd": "nohup sudo id", "guard": "privileged", "expect": "block", "note": "nohup 包裹"}
+{"cmd": "pytest -q", "guard": "privileged", "expect": "allow", "note": "普通命令"}
+{"cmd": "git status", "guard": "privileged", "expect": "allow", "note": "只读"}
+{"cmd": "echo sudo", "guard": "privileged", "expect": "allow", "note": "只是打印 sudo"}
+{"cmd": "grep -r sudo .", "guard": "privileged", "expect": "allow", "note": "在搜 sudo 不是跑它"}
