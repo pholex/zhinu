@@ -6,6 +6,18 @@
     .venv/bin/xiaoyu-eval --model deepseek-v4-pro --repeat 3
 
 结果同时打到终端并存到当前目录 xiaoyu-eval-results/*.json，方便比较"改 prompt / 换模型前后"的差异。
+
+测量纪律（比"跑出一个数"更重要的三条）：
+- **基础设施故障不计入通过率**：鉴权/额度/限流/网络（errors.classify 的
+  auth/quota/rate_limit/transient）说明的是端点状态，不是模型能力——把它算成
+  FAIL 会让一次网络抖动看起来像"这个模型不会写代码"。这类运行标记为不可测
+  （measurable=false），单独计数，退出码 3（区别于真失败的 1）。
+- **排名差异要过抖动带才算数**：LLM 输出是随机变量。单次运行（--repeat 1）
+  的模型间差异一律标注"未证实"；重复运行时，两个模型的通过数差不超过双方
+  抖动 case（同一 case 时过时不过）之和的，标注"抖动带内，不构成区分"。
+  没有这条，横向对比表就是在把噪声当结论卖。
+- **结果自带来源指纹**（provenance）：版本、端点、超时、重复次数、平台。
+  不带配置的数字连和它自己的下一次 run 都不可比。
 """
 
 from __future__ import annotations
@@ -14,13 +26,14 @@ import argparse
 import contextlib
 import io
 import json
+import platform
 import sys
 import tempfile
 import time
 from datetime import datetime
 from pathlib import Path
 
-from xiaoyu import ui
+from xiaoyu import __version__, errors, ui
 from xiaoyu.agent import Agent
 from xiaoyu.config import Config, MissingConfig, load_dotenv
 from xiaoyu.tools import Toolbox
@@ -31,6 +44,14 @@ from .harness import Case, Context, snapshot
 
 #  结果落在当前工作目录（pip/pipx 安装后包目录不可写，不能往包内写）。
 RESULTS_DIR = Path.cwd() / "xiaoyu-eval-results"
+
+#  横向扫模型时不能让某个卡死的模型拖垮整轮；抽成常量让 provenance 引用同一个值。
+REQUEST_TIMEOUT = 180.0
+
+#  这些分类说明的是端点/账号状态，不是模型能力——算进通过率会把一次网络抖动
+#  记成"这个模型不会干活"。context_overflow 与 fatal 刻意不在内：窗口用爆和
+#  跑挂都是能力相关的真实结局。
+INFRA_KINDS = frozenset({"auth", "quota", "rate_limit", "transient"})
 
 
 def run_case(case: Case, model: str, base_url: str | None, verbose: bool) -> dict:
@@ -57,8 +78,7 @@ def run_case(case: Case, model: str, base_url: str | None, verbose: bool) -> dic
             #  联网搜索结果随时间变，eval 里必须关掉
             enable_web_search=False,
             max_iterations=case.max_iterations,
-            #  横向扫模型时不能让某个卡死的模型拖垮整轮
-            request_timeout=180.0,
+            request_timeout=REQUEST_TIMEOUT,
             #  eval 是无人值守 + 全放行的，必须挡住"往系统 Python 里 pip install"。
             #  真实发生过：某个模型跑 pytest 失败后 pip install 到了系统 site-packages。
             extra_env={
@@ -71,11 +91,17 @@ def run_case(case: Case, model: str, base_url: str | None, verbose: bool) -> dic
 
         buffer = io.StringIO()
         error: str | None = None
+        infra_kind: str | None = None
         try:
             with contextlib.redirect_stdout(buffer):
                 agent.send(case.prompt)
         except Exception as exc:  # noqa: BLE001 - 跑挂了也要记录成一次失败
             error = f"{type(exc).__name__}: {exc}"
+            #  逃出 agent 内部重试的鉴权/额度/限流/网络故障是端点状态不是模型
+            #  能力，标记为不可测——绝不产出一个"悄悄降级"的 FAIL。
+            verdict = errors.classify(exc)
+            if verdict.kind in INFRA_KINDS:
+                infra_kind = verdict.kind
 
         transcript = buffer.getvalue()
         if verbose:
@@ -91,6 +117,11 @@ def run_case(case: Case, model: str, base_url: str | None, verbose: bool) -> dic
 
         results = []
         for label, check in case.checks:
+            if infra_kind:
+                results.append(
+                    {"check": label, "passed": False, "detail": f"基础设施故障（{infra_kind}），无法测量"}
+                )
+                continue
             if error:
                 results.append({"check": label, "passed": False, "detail": "本次运行异常终止"})
                 continue
@@ -110,6 +141,9 @@ def run_case(case: Case, model: str, base_url: str | None, verbose: bool) -> dic
         "model": model,
         "description": case.description,
         "passed": ok,
+        #  不可测 ≠ 失败：measurable=False 的运行不进通过率，单独计数呈现
+        "measurable": infra_kind is None,
+        "infra": infra_kind,
         "checks": results,
         "error": error,
         "tool_calls": [entry["tool"] for entry in agent.trace],
@@ -138,8 +172,13 @@ def summarize_by_model(results: list[dict]) -> list[dict]:
     """把逐 case 结果按模型聚合，用于横向对比。
 
     排序：先按 case 通过数降序，再按成本升序 —— 先看能不能干活，再看多少钱。
+    不可测的运行（基础设施故障）不进 runs/passed，落在 infra 计数里；
+    flaky 记"同一 case 重复运行时过时不过"的 case 数——它是判断两个模型的
+    通过数差是否只是抖动的尺子。
     """
     grouped: dict[str, dict] = {}
+    #  (model, case) → [每次可测运行是否通过]，供 flaky 判定
+    outcomes: dict[tuple[str, str], list[bool]] = {}
     for item in results:
         row = grouped.setdefault(
             item["model"],
@@ -147,6 +186,8 @@ def summarize_by_model(results: list[dict]) -> list[dict]:
                 "model": item["model"],
                 "runs": 0,
                 "passed": 0,
+                "infra": 0,
+                "flaky": 0,
                 "checks_total": 0,
                 "checks_passed": 0,
                 "tool_errors": 0,
@@ -158,8 +199,15 @@ def summarize_by_model(results: list[dict]) -> list[dict]:
                 "errors": [],
             },
         )
+        if not item.get("measurable", True):
+            row["infra"] += 1
+            row["seconds"] += item["seconds"]
+            if item["error"]:
+                row["errors"].append(f"{item['case']}: [未测] {item['error'][:80]}")
+            continue
         row["runs"] += 1
         row["passed"] += 1 if item["passed"] else 0
+        outcomes.setdefault((item["model"], item["case"]), []).append(bool(item["passed"]))
         row["checks_total"] += len(item["checks"])
         row["checks_passed"] += sum(1 for check in item["checks"] if check["passed"])
         row["tool_errors"] += item["tool_errors"]
@@ -172,18 +220,52 @@ def summarize_by_model(results: list[dict]) -> list[dict]:
         if item["error"]:
             row["errors"].append(f"{item['case']}: {item['error'][:80]}")
 
+    for (model, _case), passes in outcomes.items():
+        if len(passes) > 1 and 0 < sum(passes) < len(passes):
+            grouped[model]["flaky"] += 1
+
     rows = list(grouped.values())
     rows.sort(key=lambda row: (-row["passed"], row["cost"] if row["has_cost"] else 1e9))
     return rows
 
 
-def print_matrix(results: list[dict]) -> None:
+def discrimination_note(rows: list[dict], repeat: int) -> str | None:
+    """横向对比的区分度判语：把"这张表能不能读出结论"说出来，而不是让读者
+    把噪声当结论。返回 None = 没有要提醒的。
+
+    三种情况（按优先级）：
+    - 所有模型通过数相同 → 本轮 case 无区分度；
+    - 单次运行且排名有差异 → 差异未证实（LLM 输出是随机变量）；
+    - 重复运行且头两名的通过数差 ≤ 双方抖动 case 之和 → 差异在抖动带内。
+    """
+    if len(rows) < 2:
+        return None
+    if all(row["passed"] == rows[0]["passed"] and row["runs"] == rows[0]["runs"] for row in rows):
+        return "本轮 case 对这批模型无区分度（通过数全部相同）——需要更难/更多的 case"
+    if repeat < 2:
+        return "单次运行：排名差异未证实（LLM 输出是随机变量，--repeat ≥3 才可比）"
+    top, second = rows[0], rows[1]
+    gap = top["passed"] - second["passed"]
+    band = top["flaky"] + second["flaky"]
+    if gap <= band:
+        return (
+            f"头两名通过数差 {gap} ≤ 双方抖动带 {band}"
+            f"（{top['model']} 抖 {top['flaky']}、{second['model']} 抖 {second['flaky']}）"
+            "——不构成区分，加大 --repeat 或补区分度更强的 case"
+        )
+    return None
+
+
+def print_matrix(results: list[dict], repeat: int = 1) -> None:
     rows = summarize_by_model(results)
     if len(rows) < 2:
         return
 
     print("\n" + ui.heading("横向对比") + ui.secondary("（先看能不能干活，再看多少钱）"))
-    header = f"  {'模型':<26}{'case':>7}{'检查项':>9}{'工具错':>7}{'in tok':>9}{'out':>7}{'成本':>10}{'耗时':>8}"
+    header = (
+        f"  {'模型':<26}{'case':>7}{'检查项':>9}{'抖动':>5}{'未测':>5}"
+        f"{'工具错':>7}{'in tok':>9}{'out':>7}{'成本':>10}{'耗时':>8}"
+    )
     print(ui.secondary(header))
     for row in rows:
         cost_text = model_registry.format_cost(row["cost"] if row["has_cost"] else None)
@@ -191,20 +273,35 @@ def print_matrix(results: list[dict]) -> None:
             f"  {row['model']:<26}"
             f"{row['passed']}/{row['runs']:<5}"
             f"{row['checks_passed']}/{row['checks_total']:<7}"
+            f"{row['flaky']:>5}"
+            f"{row['infra']:>5}"
             f"{row['tool_errors']:>7}"
             f"{row['prompt_tokens']:>9}"
             f"{row['completion_tokens']:>7}"
             f"{cost_text:>10}"
             f"{row['seconds']:>7.0f}s"
         )
-        paint = ui.success if row["passed"] == row["runs"] else ui.error if row["passed"] == 0 else ui.warning
+        paint = (
+            ui.success
+            if row["runs"] and row["passed"] == row["runs"]
+            else ui.error
+            if row["passed"] == 0
+            else ui.warning
+        )
         print(paint(line))
         for error in row["errors"][:2]:
             print(ui.secondary(f"      ⚠ {error}"))
 
+    note = discrimination_note(rows, repeat)
+    if note:
+        print(ui.warning(f"  ⚖ {note}"))
+
 
 def print_case_result(result: dict) -> None:
-    mark = ui.success("PASS") if result["passed"] else ui.error("FAIL")
+    if not result.get("measurable", True):
+        mark = ui.warning("未测")
+    else:
+        mark = ui.success("PASS") if result["passed"] else ui.error("FAIL")
     print(
         f"\n{mark}  {ui.heading(result['case'])}  {ui.secondary(result['model'])}"
         f"  {ui.secondary(result['description'])}"
@@ -302,15 +399,18 @@ def main(argv: list[str] | None = None) -> int:
     except KeyboardInterrupt:
         print(ui.warning("\n[已中断，已完成的部分仍会汇总]"))
 
-    passed = sum(1 for item in results if item["passed"])
-    total_checks = sum(len(item["checks"]) for item in results)
-    passed_checks = sum(1 for item in results for c in item["checks"] if c["passed"])
+    measurable = [item for item in results if item.get("measurable", True)]
+    unmeasured = len(results) - len(measurable)
+    passed = sum(1 for item in measurable if item["passed"])
+    total_checks = sum(len(item["checks"]) for item in measurable)
+    passed_checks = sum(1 for item in measurable for c in item["checks"] if c["passed"])
+    infra_note = f" · 未测 {unmeasured}（基础设施故障，不计入通过率）" if unmeasured else ""
     print(
         "\n"
-        + ui.heading(f"总计 {passed}/{len(results)} 次运行通过")
-        + ui.secondary(f" · 检查项 {passed_checks}/{total_checks}")
+        + ui.heading(f"总计 {passed}/{len(measurable)} 次可测运行通过")
+        + ui.secondary(f" · 检查项 {passed_checks}/{total_checks}{infra_note}")
     )
-    print_matrix(results)
+    print_matrix(results, repeat=args.repeat)
 
     if not args.no_save and results:
         RESULTS_DIR.mkdir(parents=True, exist_ok=True)
@@ -323,6 +423,18 @@ def main(argv: list[str] | None = None) -> int:
                     "timestamp": stamp,
                     "models": target_models,
                     "cases": [case.name for case in selected],
+                    #  来源指纹：不带配置的数字连和它自己的下一次 run 都不可比
+                    "provenance": {
+                        "xiaoyu_version": __version__,
+                        "python": platform.python_version(),
+                        "platform": platform.platform(),
+                        "base_url": args.base_url,
+                        "repeat": args.repeat,
+                        "request_timeout": REQUEST_TIMEOUT,
+                    },
+                    "discrimination_note": discrimination_note(
+                        summarize_by_model(results), args.repeat
+                    ),
                     "summary": summarize_by_model(results),
                     "results": results,
                 },
@@ -333,7 +445,14 @@ def main(argv: list[str] | None = None) -> int:
         )
         print(ui.secondary(f"结果已写入 {out}"))
 
-    return 0 if passed == len(results) else 1
+    #  退出码三分：0=可测的全过且没有未测；1=有真失败；3=没有真失败但有未测
+    #  （基础设施故障）。"没测到"和"测了没过"必须在退出码上就可区分，
+    #  CI 里前者该重跑、后者该修。
+    if passed != len(measurable):
+        return 1
+    if unmeasured:
+        return 3
+    return 0
 
 
 if __name__ == "__main__":
