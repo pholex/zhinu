@@ -187,24 +187,48 @@ def _hardened_env(extra: dict[str, str] | None = None) -> dict[str, str]:
     return env
 
 
+#  进程级 core dump 关闭只做一次（rlimit 跨 fork/exec 继承，见 _harden_core_limit）。
+_core_limit_hardened = False
+
+
+def _harden_core_limit() -> None:
+    """在**父进程**里把 RLIMIT_CORE 压到 (0, 0)：命令崩溃时不把内存（可能含
+    密钥）dump 到磁盘；本进程（内存里有 provider 密钥）崩溃时同样不落 core。
+
+    绝不能退回 preexec_fn 方案（历史写法）：preexec_fn 强迫 CPython 放弃
+    posix_spawn 改走 fork()，并在 fork 与 exec 之间的子进程里跑 Python 字节码
+    （旧实现里还有一次 import）。xiaoyu 有常驻工作线程（browser 专用线程、
+    七襄/斗巧线程池），fork 瞬间其他线程持有的锁（import 锁、分配器锁）在
+    子进程里永远无人释放——子进程可能在 exec 前死锁，并带着继承的每个 fd
+    一起挂住。tests/test_subprocess_hardening.py 的 AST 哨兵挡回归。
+
+    rlimit 跨 fork/exec 继承，父进程设一次即可覆盖所有后代——包括 playwright
+    自己拉起的浏览器进程，覆盖面比逐 spawn 设置更广。硬上限一并压到 0，
+    后代无法自行抬回。
+    """
+    global _core_limit_hardened
+    if _core_limit_hardened or os.name == "nt":
+        return
+    _core_limit_hardened = True
+    import resource
+
+    with contextlib.suppress(Exception):
+        resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
+
+
 def _subprocess_hardening() -> dict[str, Any]:
-    """POSIX 子进程加固参数：独立会话 + 禁 core dump。
+    """POSIX 子进程加固参数：独立会话（core dump 由 _harden_core_limit 进程级处理）。
 
     - start_new_session：新进程组/会话，防 TIOCSTI 类终端注入，也让超时杀得干净。
-    - RLIMIT_CORE=0：命令崩溃时不把内存（可能含密钥）dump 到磁盘。
-    Windows 没有这两个语义，返回空。
+      不带 preexec_fn 时 CPython 可走 posix_spawn（POSIX_SPAWN_SETSID），
+      比 fork 快且无 fork-with-threads 风险。
+    Windows 没有这些语义，返回空。
     stdin 归属各调用点自定（MCP server 要 PIPE、工具命令要 DEVNULL），不在此统一。
     """
     if os.name == "nt":
         return {}
-
-    def _limit_core() -> None:
-        import resource
-
-        with contextlib.suppress(Exception):
-            resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
-
-    return {"start_new_session": True, "preexec_fn": _limit_core}
+    _harden_core_limit()
+    return {"start_new_session": True}
 
 
 def _platform_shell_note() -> str:
