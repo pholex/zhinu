@@ -365,7 +365,7 @@ def execute_delegation(
     `sink.quiet_child` 派生（qixiang 传静默 sink 压住批量运行时的工具刷屏）；
     on_agent 在子 Agent 构造后立刻回调（qixiang 用它拿到活句柄做超时/中断）。
     """
-    from .agent import Agent
+    from .agent import Agent, collect_project_docs
     from .mcp import McpView
 
     lock = _store_lock(store)
@@ -539,6 +539,22 @@ def execute_delegation(
     if on_agent is not None:
         on_agent(sub_agent)
     system_text = spec.system_prompt.format(workspace=workdir)
+    #  上下文范围点名：子 agent 只带 spec.system_prompt，不继承父级注入的项目
+    #  指令（AGENTS.md/XIAOYU.md/CLAUDE.md）与父对话记忆。静默缺失的具体危害是
+    #  **子 agent 拿自己的默认当项目约定去猜**（提交加 Co-Authored-By、用错分支
+    #  流程…）。所以在工作区真有项目文档、而本次没喂给它时，明确告诉它"这些约定
+    #  存在但你没拿到"，让它遇到相关决策时报缺口/问，而不是照默认蒙。
+    #  只在文档真实存在时才加这段——没有约定文件的工作区不需要这句噪声。
+    if not spec.system_prompt.count("AGENTS.md") and collect_project_docs(
+        workdir, Agent._PROJECT_DOC_NAMES, Agent._PROJECT_DOC_CAP  # noqa: SLF001
+    ):
+        system_text += (
+            "\n\n[上下文范围] 本工作区有项目约定文件"
+            f"（{ '/'.join(Agent._PROJECT_DOC_NAMES) } 之一），但没有注入到你这里，"  # noqa: SLF001
+            "父会话的对话记忆你也没有。遇到涉及项目惯例的决策（提交信息格式、"
+            "分支流程、代码风格、命名约定等）时，不要拿你的默认当项目约定——"
+            "先读工作区里的约定文件，读不到就在交接里点明这是未确认的假设。"
+        )
     if record is not None:
         #  transcript 续用、system 头按当前 spec 重渲染（body 继承，
         #  head 以现在的定义为准）
