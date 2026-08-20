@@ -84,6 +84,53 @@ def text_turn(text: str) -> list:
     return [chunk(content=text)]
 
 
+class ContextScopeNoteTest(AgentTestCase):
+    """子 agent 上下文范围点名：工作区有项目约定文件、而没喂给子 agent 时，
+    在子 agent 的 system prompt 里明确"这些约定存在但你没拿到"，防止它拿默认
+    当项目约定去猜。文件不存在时不加这句噪声。"""
+
+    def _run_and_capture_system(self, spec: AgentSpec) -> str:
+        from xiaoyu.agents import execute_delegation
+
+        agent = self.build([text_turn("done")])  # 子 agent 只需一轮结论
+        #  on_agent 在构造后、system_text 落定前触发，只能拿句柄；system prompt
+        #  在 execute_delegation 返回后读（那时 messages[0] 已是 spec+范围点名）
+        handle: list = []
+        with contextlib.redirect_stdout(io.StringIO()):
+            execute_delegation(
+                spec, self.config, agent.registry, agent.usage, agent.sink,
+                agent.approver, agent.permissions, {},
+                task="做点事",
+                on_agent=handle.append,
+            )
+        return handle[0].messages[0]["content"]
+
+    def _readonly_spec(self, prompt: str = "只查不改，工作区 {workspace}") -> AgentSpec:
+        return AgentSpec(
+            name="reader", description="查", system_prompt=prompt,
+            tools=("read_file", "grep", "list_files"),
+        )
+
+    def test_note_added_when_project_docs_exist(self):
+        (self.root / "AGENTS.md").write_text("提交不加 Co-Authored-By", encoding="utf-8")
+        system = self._run_and_capture_system(self._readonly_spec())
+        self.assertIn("[上下文范围]", system)
+        self.assertIn("项目约定", system)
+
+    def test_no_note_when_no_project_docs(self):
+        #  裸工作区没有约定文件 → 不加噪声
+        system = self._run_and_capture_system(self._readonly_spec())
+        self.assertNotIn("[上下文范围]", system)
+
+    def test_note_suppressed_when_spec_handles_agents_md(self):
+        #  spec 作者已在 prompt 里点了 AGENTS.md → 视为已处理，不重复加
+        (self.root / "AGENTS.md").write_text("x", encoding="utf-8")
+        system = self._run_and_capture_system(
+            self._readonly_spec("先读 AGENTS.md 再动手，工作区 {workspace}")
+        )
+        self.assertNotIn("[上下文范围]", system)
+
+
 class DelegationTest(AgentTestCase):
     """挂载 + 委托端到端（假 client 脚本按调用顺序被主/子 agent 依次消费）。"""
 
