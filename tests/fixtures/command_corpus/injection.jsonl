@@ -18,6 +18,15 @@
 {"cmd": "xargs rm", "guard": "injection", "expect": "block", "note": "xargs 跑任意命令"}
 {"cmd": "git commit -m 'unclosed", "guard": "injection", "expect": "block", "note": "引号不闭合按风险处理"}
 {"cmd": "awk 'BEGIN{system(\"id\")}'", "guard": "injection", "expect": "block", "note": "awk system()"}
+{"cmd": "sed s/a/b/e file", "guard": "injection", "expect": "block", "note": "sed s///e 标志执行命令"}
+{"cmd": "sed -e 's/x/y/e'", "guard": "injection", "expect": "block", "note": "-e 传的脚本带 e 标志"}
+{"cmd": "sed 'e id'", "guard": "injection", "expect": "block", "note": "sed 独立 e 命令"}
+{"cmd": "vim -c :!sh", "guard": "injection", "expect": "block", "note": "vim -c 跑 ex 命令 :!shell"}
+{"cmd": "vim -S evil.vim", "guard": "injection", "expect": "block", "note": "vim -S source 任意脚本"}
+{"cmd": "nvim --cmd :!id", "guard": "injection", "expect": "block", "note": "nvim --cmd"}
+{"cmd": "sed 's/e/x/'", "guard": "injection", "expect": "allow", "note": "e 是被替换的字面量不是标志"}
+{"cmd": "sed 's/foo/bar/g' input.txt", "guard": "injection", "expect": "allow", "note": "普通替换"}
+{"cmd": "vim file.txt", "guard": "injection", "expect": "allow", "note": "普通编辑无 ex 命令"}
 {"cmd": "git status", "guard": "injection", "expect": "allow", "note": "普通只读"}
 {"cmd": "git log --oneline -5", "guard": "injection", "expect": "allow", "note": "普通日志"}
 {"cmd": "git commit -m 'fix: x'", "guard": "injection", "expect": "allow", "note": "普通提交"}
