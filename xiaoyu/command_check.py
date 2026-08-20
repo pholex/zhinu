@@ -22,6 +22,7 @@
 
 from __future__ import annotations
 
+import re
 import shlex
 
 #  递归剥 wrapper 的深度上限：
@@ -75,6 +76,56 @@ _RG_UNSAFE_PREFIX = ("--pre=", "--hostname-bin=")
 #  tar / rsync / ssh 系：能指定外部程序的选项
 _TAR_UNSAFE_PREFIX = ("--to-command", "--use-compress-program", "--rmt-command", "--rsh-command")
 
+#  sed 家族：脚本里的 e 标志/命令会执行 shell（GNU 扩展）
+_SED_NAMES = {"sed", "gsed", "ssed"}
+#  vim/ex 家族：-c/--cmd/+cmd 跑 ex 命令，可 :!shell 逃逸；-S 直接 source 脚本
+_VIM_NAMES = {"vim", "vi", "view", "nvim", "ex", "rvim", "gvim", "vimdiff", "evim"}
+_VIM_EXEC_EXACT = {"-c", "--cmd", "-S", "--source"}
+_VIM_EXEC_PREFIX = ("-c", "--cmd=", "-S", "--source=", "+")
+
+
+def _sed_script_executes(script: str) -> bool:
+    """sed 脚本里有没有会执行 shell 的构造：`s///e` 标志 或 独立 `e` 命令。
+
+    关键是把 `s/a/b/e`（e 是**替换后的标志**=执行）和 `s/e/x/`（e 只是被替换的
+    字面量）分开——前者危险、后者无害。做法：定位每个 s 命令，越过它的三个
+    定界符（转义的 `\\<定界符>` 不算），只在**定界符之后的标志段**里找 e。
+    """
+    n = len(script)
+    i = 0
+    while i < n:
+        if script[i] == "s" and i + 1 < n:
+            delim = script[i + 1]
+            #  定界符是紧跟 s 的那个字符，通常 / 也可以是别的；字母数字/空白/
+            #  反斜杠不能当定界符（那是普通命令/转义，不是 s 命令）
+            if not delim.isalnum() and delim not in (" ", "\\", "\n"):
+                #  开定界符是 script[i+1]，完整 s 命令后面还有 2 个（中、闭）
+                j, seen = i + 2, 0
+                while j < n and seen < 2:
+                    if script[j] == "\\" and j + 1 < n:
+                        j += 2  # 转义序列整体跳过，`\<定界符>` 不计入定界符
+                        continue
+                    if script[j] == delim:
+                        seen += 1
+                    j += 1
+                if seen == 2:
+                    #  闭定界符之后是标志段（字母数字连续串），含 e 即执行
+                    flags = ""
+                    while j < n and script[j].isalnum():
+                        flags += script[j]
+                        j += 1
+                    if "e" in flags:
+                        return True
+                    i = j
+                    continue
+        i += 1
+    #  独立 e 命令（GNU：`e` 或 `e 命令`）——出现在命令位（脚本开头或 ; / 换行后）。
+    #  带地址的花式形态（`/re/e cmd`）不强求覆盖：over-flag 只是多问一次人，
+    #  漏掉的少数形态由前缀不匹配/人工确认兜底。
+    if re.search(r"(?:^|[;\n])\s*e(?:\s|$)", script):
+        return True
+    return False
+
 
 def injection_risk(segment: str) -> str | None:
     """单段命令（不含 && ; | 等连接符）里发现参数级逃逸口时返回原因，否则 None。
@@ -126,6 +177,18 @@ def injection_risk_argv(argv: list[str]) -> str | None:
     if name in ("awk", "gawk", "mawk", "nawk"):
         if any("system(" in arg for arg in argv[1:]):
             return "awk system() 可执行任意命令"
+        return None
+    if name in _SED_NAMES:
+        #  脚本可能是位置参数，也可能跟在 -e/--expression 后；-f 是脚本文件不检查
+        #  （文件内容用户自控，属意图）。逐 token 扫（文件名不会误命中 s///e 结构）。
+        for arg in argv[1:]:
+            if _sed_script_executes(arg):
+                return "sed 的 e 标志/命令会执行 shell"
+        return None
+    if name in _VIM_NAMES:
+        for arg in argv[1:]:
+            if arg in _VIM_EXEC_EXACT or arg.startswith(_VIM_EXEC_PREFIX):
+                return f"{name} {arg.split('=')[0]} 可执行 ex 命令（:!shell 逃逸）"
         return None
     if name == "xargs":
         return "xargs 会执行任意后续命令"

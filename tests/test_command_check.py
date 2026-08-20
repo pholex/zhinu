@@ -58,6 +58,42 @@ class InjectionRiskTest(unittest.TestCase):
     def test_xargs_flagged(self):
         self.assertIsNotNone(injection_risk("xargs rm"))
 
+    def test_sed_exec_flag(self):
+        #  s///e 的 e 是"把替换结果当命令执行"，危险；关键是别误伤把字面量 e
+        #  当作被替换文本的普通替换
+        self.assertIsNotNone(injection_risk("sed s/a/b/e file"))
+        self.assertIsNotNone(injection_risk("sed 's/a/b/e'"))
+        self.assertIsNotNone(injection_risk("sed 's/a/b/ge'"))  # 多标志里含 e
+        self.assertIsNotNone(injection_risk("sed -e 's/x/y/e'"))  # -e 传脚本
+        self.assertIsNotNone(injection_risk("sed 's|a|b|e'"))  # 非 / 定界符
+
+    def test_sed_exec_command(self):
+        #  独立 e 命令（GNU）同样执行 shell
+        self.assertIsNotNone(injection_risk("sed 'e id'"))
+        self.assertIsNotNone(injection_risk("sed 'p;e cat /etc/passwd'"))
+
+    def test_sed_benign_not_flagged(self):
+        #  e 只是被替换/匹配的字面量，或普通标志——不该误伤
+        self.assertIsNone(injection_risk("sed 's/e/x/'"))
+        self.assertIsNone(injection_risk("sed 's/e/x/g'"))
+        self.assertIsNone(injection_risk("sed 's/a/b/g'"))
+        self.assertIsNone(injection_risk("sed -n 'p'"))
+        self.assertIsNone(injection_risk("sed 's/foo/bar/' input.txt"))
+        self.assertIsNone(injection_risk(r"sed 's/a\/b/c/'"))  # 转义定界符
+        self.assertIsNone(injection_risk("sed 'y/abc/xyz/'"))
+
+    def test_vim_ex_command(self):
+        #  -c/--cmd/+cmd/-S 都能跑 ex 命令，:!shell 逃逸
+        self.assertIsNotNone(injection_risk("vim -c :!sh"))
+        self.assertIsNotNone(injection_risk("vim +!sh file"))
+        self.assertIsNotNone(injection_risk("nvim --cmd :!id"))
+        self.assertIsNotNone(injection_risk("vim -S evil.vim"))
+        self.assertIsNotNone(injection_risk("ex -c '!sh' file"))
+
+    def test_vim_plain_edit_not_flagged(self):
+        self.assertIsNone(injection_risk("vim file.txt"))
+        self.assertIsNone(injection_risk("vim -R readonly.txt"))
+
     def test_unparsable_is_risky(self):
         #  引号不闭合 → 看不清楚 → 保守方向按有风险处理
         self.assertIsNotNone(injection_risk("git commit -m 'unclosed"))
