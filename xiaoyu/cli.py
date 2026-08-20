@@ -2197,6 +2197,11 @@ def resolve_folder_trust(
 def main(argv: list[str] | None = None) -> int:
     if argv is None:
         argv = sys.argv[1:]
+    #  崩溃面包屑：守护进程/后台线程/原生 segfault 的无声崩溃留一条痕迹。
+    #  只在 CLI 入口装，不在 import 时装（嵌入宿主自管 excepthook）。
+    from . import crash_guard
+
+    crash_guard.install()
     #  子命令拦截：nargs="*" 的 prompt 位置参数和 subparsers 不兼容，手动分流
     if argv and argv[0] == "config":
         return config_command(argv[1:])
