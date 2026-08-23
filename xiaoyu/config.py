@@ -302,6 +302,13 @@ class Config:
     #  本地摘要压缩降为兜底（阈值抬高 SERVER_COMPACTION_FALLBACK）。关掉
     #  XIAOYU_SERVER_COMPACTION=0 回到纯本地压缩。
     server_compaction: bool = True
+    #  会话级 token 软预算（prompt+completion 累计，与 serve 的 budget.tokens 同一把尺）。
+    #  None = 不限。模型**知情**：按 BUDGET_NOTICE_STEPS 收到倒计时提示，到线前一步
+    #  优雅收尾（交代现场），而不是被硬闸中途砍断。serve 的硬闸仍在，是兜底
+    budget_tokens: int | None = None
+    #  轮数预算可申请延期：撞 max_iterations 时给模型一步机会申请追加，
+    #  总追加量 ≤ max_iterations × 这个系数（0 = 不许延期，撞顶即收尾）
+    turn_extension: float = 1.0
     #  估算用量占到上限的这个比例时触发压缩。
     compact_at: float = 0.7
     #  压缩时至少保留最近这么多条消息（实际切点会往后找到 user 消息边界）。
@@ -371,6 +378,12 @@ class Config:
                 cfg.keep_recent = int(keep)
         if level := os.environ.get("XIAOYU_EFFORT", "").strip().lower():
             cfg.effort = level
+        if raw := os.environ.get("XIAOYU_BUDGET_TOKENS"):
+            with contextlib.suppress(ValueError):
+                cfg.budget_tokens = int(raw) or None
+        if raw := os.environ.get("XIAOYU_TURN_EXTENSION"):
+            with contextlib.suppress(ValueError):
+                cfg.turn_extension = max(0.0, float(raw))
         if (flag := os.environ.get("XIAOYU_SERVER_COMPACTION")) is not None:
             cfg.server_compaction = flag.strip().lower() not in ("0", "false", "no", "off")
         if ratio := os.environ.get("XIAOYU_COMPACT_AT"):

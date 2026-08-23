@@ -82,6 +82,23 @@ _COMPACTION_MODELS = (
 )
 
 
+#  任务预算（beta）：服务端在生成过程中给模型注入倒计时标记（只模型可见），
+#  内核私有键 TASK_BUDGET_KEY {total, remaining?} → output_config.task_budget。
+#  官方下限 20k；支持型号 Opus 5 / 4.8 / 4.7 / Fable / Mythos / Sonnet 5
+TASK_BUDGET_KEY = "_task_budget"
+TASK_BUDGET_BETA = "task-budgets-2026-03-13"
+TASK_BUDGET_MIN = 20_000
+_TASK_BUDGET_MODELS = (
+    "claude-opus-5", "claude-opus-4-8", "claude-opus-4-7",
+    "claude-fable-5", "claude-mythos", "claude-sonnet-5",
+)
+
+
+def supports_task_budget(model: str) -> bool:
+    bare = model.rpartition("/")[2].lower()
+    return any(bare.startswith(name) for name in _TASK_BUDGET_MODELS)
+
+
 #  认会话中 `role: system` 的型号（官方：Opus 5 / Opus 4.8 / Fable 5 / Mythos；
 #  Sonnet 5 与 4.7 以下不认，发了是 400）。保守：不在清单一律当 user 发
 _MID_SYSTEM_MODELS = ("claude-opus-5", "claude-opus-4-8", "claude-fable-5", "claude-mythos")
@@ -352,6 +369,7 @@ def to_request(
     #  structured outputs 的 format 也住那里
     effort = passthrough.pop("reasoning_effort", None)
     compaction = passthrough.pop(COMPACTION_KEY, None)
+    task_budget = passthrough.pop(TASK_BUDGET_KEY, None)
     max_tokens = None
     for key in ("max_tokens", "max_completion_tokens"):
         if key in passthrough:
@@ -376,6 +394,14 @@ def to_request(
         output_config = dict(request.get("output_config") or {})
         output_config["effort"] = effort
         request["output_config"] = output_config
+    if task_budget and int(task_budget.get("total") or 0) >= TASK_BUDGET_MIN:
+        budget: dict[str, Any] = {"type": "tokens", "total": int(task_budget["total"])}
+        if task_budget.get("remaining") is not None:
+            budget["remaining"] = max(0, int(task_budget["remaining"]))
+        output_config = dict(request.get("output_config") or {})
+        output_config["task_budget"] = budget
+        request["output_config"] = output_config
+        request["betas"] = [*request.get("betas", []), TASK_BUDGET_BETA]
     if compaction:
         edit: dict[str, Any] = {
             "type": COMPACTION_EDIT,

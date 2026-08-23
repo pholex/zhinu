@@ -324,8 +324,8 @@ class _Session:
         #  每次回 store 查：agent 之后再改版/归档都不该影响这个会话。
         self.agent_ref = agent_ref
         self.agent_config = agent_config or {}
-        self.budget = budget
         self.pricing = pricing or {}
+        self.budget = budget
         self.budget_reason = ""
         self.created_at = time.time()
         self.updated_at = self.created_at
@@ -426,6 +426,18 @@ class _Session:
     def check_budget(self) -> str:
         """预算耗尽的原因；空串 = 还有余量。只判定，不改状态。"""
         return budget_breach(self.budget, self.spend())
+
+    @property
+    def budget(self) -> Budget | None:
+        return self._budget
+
+    @budget.setter
+    def budget(self, value: Budget | None) -> None:
+        """预算一变就同步给 agent：硬闸（这里）之外模型还要**知情**——
+        倒计时提示与到线前收尾都靠 agent.config.budget_tokens（美元预算折不成
+        token，只同步 token 那一半）。"""
+        self._budget = value
+        self.agent.set_budget_tokens(value.tokens if value is not None else None)
 
     def status_dict(self) -> dict[str, Any]:
         return {
@@ -994,6 +1006,10 @@ def create_app(cfg: ServeConfig):  # noqa: C901 - 路由表天然长，拆开反
             #  轮末再结一次账：最后一次模型调用的用量可能在最后一个事件之后才记上
             if not session.budget_reason:
                 session.budget_reason = session.check_budget()
+                #  软预算：模型在硬闸之前自己收了尾（RunResult.stopped=budget）——
+                #  同样算到线，下一轮要先调预算；硬闸没越线不等于还能继续干
+                if not session.budget_reason and (result or {}).get("stopped") == "budget":
+                    session.budget_reason = "token 预算即将用尽，模型已按预算收尾"
                 if session.budget_reason:
                     session.publish("budget.reached", reason=session.budget_reason)
             if session.budget_reason:

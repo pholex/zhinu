@@ -177,6 +177,7 @@ class TestAgentEmitsSinkEvents(AgentTestCase):
 
     def test_max_iterations_notice_goes_through_sink(self) -> None:
         self.config.max_iterations = 1
+        self.config.turn_extension = 0
         forever = [chunk(tool_calls=[call_fragment(0, "c1", "read_file", '{"path": "calc.py"}')])]
         wrapup = [chunk(content="收尾")]
         recorder = RecordingSink()
