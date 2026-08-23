@@ -140,3 +140,39 @@ class NewContextTest(AgentTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class HistoryVersionTest(AgentTestCase):
+    """history_version：追加不计，任何改写（翻篇 / 回滚 / 重置 / 修复 / 装入）都 +1。"""
+
+    def test_append_does_not_bump_but_rewrites_do(self) -> None:
+        agent = self.build([[chunk(content="好"), usage_chunk(50, 5)]])
+        self.assertEqual(agent.history_version, 0)
+        with contextlib.redirect_stdout(io.StringIO()):
+            agent.send("你好")
+        self.assertEqual(agent.history_version, 0)
+        before = len(agent.messages)
+
+        agent.messages.append({"role": "assistant", "content": "追加"})
+        self.assertEqual(agent.history_version, 0)
+
+        agent._new_context_notes = "笔记"  # noqa: SLF001
+        agent._start_new_context_window()  # noqa: SLF001
+        self.assertEqual(agent.history_version, 1)
+        self.assertLess(len(agent.messages), before + 1)
+
+        agent.reset()
+        self.assertEqual(agent.history_version, 2)
+
+        agent.restore([{"role": "user", "content": "x"}, {"role": "assistant", "content": "y"}])
+        self.assertEqual(agent.history_version, 3)
+        agent.restore([])
+        self.assertEqual(agent.history_version, 3)
+
+    def test_repair_bumps_only_when_changed(self) -> None:
+        agent = self.build([])
+        agent._repair_history()  # noqa: SLF001
+        self.assertEqual(agent.history_version, 0)
+        agent.messages.append({"role": "tool", "tool_call_id": "orphan", "content": "孤儿"})
+        agent._repair_history()  # noqa: SLF001
+        self.assertEqual(agent.history_version, 1)

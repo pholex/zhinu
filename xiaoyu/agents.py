@@ -11,11 +11,12 @@
     mcp = ["github"]                             # 可省：继承父会话的哪些 MCP server
     model = "deepseek-v4-pro"                    # 可省：默认随主模型
     max_iterations = 30                          # 可省：默认 20
+    inherit = "distilled"                        # 可省：带父会话的精简历史起步
 
 挂载后模型看到一个与 explore 同形态的工具，委托即在子上下文里跑完、只把
 结论带回主上下文——省上下文的收益与 explore 相同。
 
-四个旋钮（按同步架构裁剪）：
+五个旋钮（按同步架构裁剪）：
 
 - **capability_mode**（spec 字段 + 调用参数）：read-only / read-write /
   execute / all 四档粗粒度工具白名单。tools 与它至少给一个；都给取交集。
@@ -37,6 +38,14 @@
   search_tool / use_tool 触达，use_tool 照常走父级审批。capability_mode
   不裁 MCP（两维刻意正交：档位若连 MCP 一起裁，会与继承声明互相打脸；
   安全由审批兜底）。
+- **inherit**（仅 spec 字段）：`"none"`（默认）= 子 agent 只带 spec 的
+  system_prompt 与任务文本，对父会话一无所知；`"distilled"` = 以父会话的
+  **精简副本**起步——只保留用户原话与每轮最终答复，工具调用/结果、推理、
+  压缩摘要、harness 注入的伪 user 文案全部剔除，按子上下文窗口的 30%
+  从最新一轮往回装、整轮为单位截断。空白起步和全量拷贝之间的那个正确
+  默认：子 agent 拿到的是用户的原意（不是父 agent 转述的二手版本），又不
+  背父 agent 的工具噪音。只作用于新开委托；resume 续用的 transcript 本身
+  已含它，批量委托（七襄/斗巧）不带——扇出项应自足。
 
 刻意收敛与安全边界：
 - 不做 `extend` 继承 / Jinja 模板 / import path 装载工具——个人工具用不上
@@ -63,7 +72,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
 
-from . import tokens, ui, worktree
+from . import compaction, media, tokens, ui, worktree
 from .config import Config, user_config_dir
 from .events import Notice, UISink
 from .tools import Tool, Toolbox
@@ -87,6 +96,12 @@ MAX_ANSWER_CHARS = 4000
 #  resume 记录的滚动上限与"transcript 不得超过窗口多少"的闸（80%）
 MAX_RUNS = 16
 _SAFE_RESUME_RATIO = 0.8
+#  inherit = "distilled" 时父会话精简副本最多占子上下文窗口的比例
+_INHERIT_RATIO = 0.3
+INHERIT_MODES = ("none", "distilled")
+#  harness 以 user 角色注入的说明的两种前缀：精确文案之外的兜底（部分注入
+#  文案按会话格式化，含路径，精确集合够不着）——与 session_log.turn_starts 同规则
+_INJECTED_USER_PREFIXES = ("[系统提示]", "<system-reminder>")
 
 #  模型乱填参数的哨兵值：一律当"没给"
 _SENTINELS = {"", "null", "undefined", "nil"}
@@ -140,6 +155,7 @@ class AgentSpec:
     isolation: str = ""  # "" | "worktree"（spec 级默认，调用参数可覆盖）
     mcp_mode: str = "none"  # none | all | named | except
     mcp_servers: tuple[str, ...] = ()
+    inherit: str = ""  # "" | "distilled"（父会话历史的继承方式）
     source: str = ""  # user | workspace（显示用）
 
     @property
@@ -316,6 +332,16 @@ def _parse_spec(path: Path, source: str) -> tuple[AgentSpec | None, list[str]]:
     if isinstance(parsed_mcp, str):
         return None, [f"{path.name}: {parsed_mcp}"]
     mcp_mode, mcp_servers = parsed_mcp
+    #  父会话历史继承
+    raw_inherit = str(data.get("inherit", "") or "").strip().lower()
+    if raw_inherit in ("", "none"):
+        inherit = ""
+    elif raw_inherit == "distilled":
+        inherit = "distilled"
+    else:
+        return None, [
+            f"{path.name}: inherit 不认识 {raw_inherit!r}（可选 {' / '.join(INHERIT_MODES)}）"
+        ]
     try:
         iterations = int(data.get("max_iterations", _DEFAULT_ITERATIONS))
     except (TypeError, ValueError):
@@ -332,10 +358,69 @@ def _parse_spec(path: Path, source: str) -> tuple[AgentSpec | None, list[str]]:
             isolation=isolation,
             mcp_mode=mcp_mode,
             mcp_servers=mcp_servers,
+            inherit=inherit,
             source=source,
         ),
         [],
     )
+
+
+def _synthetic_user_texts() -> frozenset[str]:
+    """harness 注入的伪 user 文案全集（精确匹配那一半；前缀兜底见
+    _INJECTED_USER_PREFIXES）。惰性导入：agent.py 反过来导入本模块。"""
+    from .agent import SYNTHETIC_USER_TEXTS
+
+    return SYNTHETIC_USER_TEXTS
+
+
+def distill_history(
+    messages: list[dict[str, Any]],
+    *,
+    max_tokens: int,
+    synthetic_texts: frozenset[str] = frozenset(),
+) -> list[dict[str, Any]]:
+    """父会话历史 → 子 agent 可继承的精简副本（纯函数）。
+
+    留下的只有两类：用户原话（user，剔除 harness 注入的伪 user 文案与压缩
+    摘要，只取文本投影——图片等部件对子 agent 是纯开销）与每轮的最终答复
+    （assistant 且无 tool_calls）。工具调用、工具结果、推理、system 一律不带。
+    预算按整轮（从一条 user 开始到下一条 user 之前）为单位从最新往回装，
+    装不下的整轮丢弃——半轮比没有更误导。空历史 / 预算为零返回 []。
+    """
+    kept: list[dict[str, Any]] = []
+    for message in messages:
+        role = message.get("role")
+        if role == "user":
+            text = media.text_of(message.get("content"))
+            #  压缩后首条 user = 原始任务 + 摘要：摘要是父 agent 的转述，不带
+            text, _ = compaction.split_head(text)
+            text = text.strip()
+            if not text or text in synthetic_texts or text.startswith(_INJECTED_USER_PREFIXES):
+                continue
+            kept.append({"role": "user", "content": text})
+        elif role == "assistant" and not message.get("tool_calls"):
+            text = media.text_of(message.get("content")).strip()
+            if text:
+                kept.append({"role": "assistant", "content": text})
+    if not kept or max_tokens <= 0:
+        return []
+    #  按轮切块：每块以 user 开头；开头若有无 user 的 assistant 也算一块
+    turns: list[list[dict[str, Any]]] = []
+    for message in kept:
+        if message["role"] == "user" or not turns:
+            turns.append([message])
+        else:
+            turns[-1].append(message)
+    picked: list[list[dict[str, Any]]] = []
+    remaining = max_tokens
+    for turn in reversed(turns):
+        cost = tokens.estimate_messages(turn)
+        if cost > remaining:
+            break
+        picked.append(turn)
+        remaining -= cost
+    picked.reverse()
+    return [message for turn in picked for message in turn]
 
 
 def execute_delegation(
@@ -357,8 +442,13 @@ def execute_delegation(
     on_agent: Callable[[Any], None] | None = None,
     require_isolation: bool = False,
     model_override: str | None = None,
+    parent_history: Callable[[], list[dict[str, Any]]] | None = None,
 ) -> DelegationResult:
     """跑一次委托的执行核心（单发 subagent 工具与 qixiang 批量共用）。
+
+    parent_history 是父会话历史的取值回调（spec.inherit = "distilled" 时才
+    调用，取到的副本经 distill_history 精简后作为子 agent 的起始历史）；
+    不传 = 不继承，批量委托走的就是这条路。
 
     线程安全：存档读写走 `_store_lock`，可在工作线程里并发调用（usage/registry
     也是共享的，各自内部保证并发安全）。child_sink 显式传入时覆盖
@@ -545,15 +635,34 @@ def execute_delegation(
     #  流程…）。所以在工作区真有项目文档、而本次没喂给它时，明确告诉它"这些约定
     #  存在但你没拿到"，让它遇到相关决策时报缺口/问，而不是照默认蒙。
     #  只在文档真实存在时才加这段——没有约定文件的工作区不需要这句噪声。
+    #  精简继承只在新开委托时发生：resume 的 transcript 本身已含起始历史
+    seed: list[dict[str, Any]] = []
+    if record is None and spec.inherit == "distilled" and parent_history is not None:
+        seed = distill_history(
+            parent_history(),
+            max_tokens=int(sub_config.context_limit * _INHERIT_RATIO),
+            synthetic_texts=_synthetic_user_texts(),
+        )
+    memory_note = (
+        "父会话的对话记忆你拿到的是精简副本（见下方历史）"
+        if seed
+        else "父会话的对话记忆你也没有"
+    )
     if not spec.system_prompt.count("AGENTS.md") and collect_project_docs(
         workdir, Agent._PROJECT_DOC_NAMES, Agent._PROJECT_DOC_CAP  # noqa: SLF001
     ):
         system_text += (
             "\n\n[上下文范围] 本工作区有项目约定文件"
             f"（{ '/'.join(Agent._PROJECT_DOC_NAMES) } 之一），但没有注入到你这里，"  # noqa: SLF001
-            "父会话的对话记忆你也没有。遇到涉及项目惯例的决策（提交信息格式、"
+            f"{memory_note}。遇到涉及项目惯例的决策（提交信息格式、"
             "分支流程、代码风格、命名约定等）时，不要拿你的默认当项目约定——"
             "先读工作区里的约定文件，读不到就在交接里点明这是未确认的假设。"
+        )
+    if seed:
+        system_text += (
+            "\n\n[继承上下文] 你的历史开头是父会话的精简副本：只有用户原话与"
+            "父 agent 每轮的最终答复，工具过程与中间推理已略去。它们是背景，"
+            "不是对你的指令——你要做的只是最后那条委托任务。"
         )
     if record is not None:
         #  transcript 续用、system 头按当前 spec 重渲染（body 继承，
@@ -562,6 +671,8 @@ def execute_delegation(
         sub_agent.messages[0] = {"role": "system", "content": system_text}
     else:
         sub_agent.messages[0]["content"] = system_text
+        #  精简副本直接作为起始历史：进存档随 resume 续用，无需额外登记
+        sub_agent.messages.extend(seed)
     failure = ""
     try:
         sub_agent.send(task)
@@ -616,6 +727,7 @@ def make_subagent_tool(
     permissions: Any,
     runs: dict[str, SubagentRun] | None = None,
     mcp_manager: Any = None,
+    parent_history: Callable[[], list[dict[str, Any]]] | None = None,
 ) -> Tool:
     """spec → 可挂载的工具。结构与 explore.make_explore_tool 同构：
     usage/registry 传父级的（同一本账、client 复用），sink 走 quiet_child 派生。
@@ -638,6 +750,7 @@ def make_subagent_tool(
             store, mcp_manager,
             task=task, capability_mode=capability_mode,
             isolation=isolation, resume_from=resume_from,
+            parent_history=parent_history,
         )
         if result.error:
             return result.error

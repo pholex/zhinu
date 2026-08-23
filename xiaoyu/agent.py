@@ -678,6 +678,10 @@ class Agent:
         #  部分，误差不随会话累积）：(权威 prompt_tokens, 当时的消息条数)。
         #  Mantle 系模型不回 usage 时锚点保持 None，退化为纯本地估算。
         self._anchor: tuple[int, int] | None = None
+        #  历史改写版本号：messages 任何非追加式改动（压缩、回滚、翻篇、修复、
+        #  重建 system prompt）都 +1。追加不计。任何对着历史做缓存 / 增量喂给
+        #  侧会话的消费方拿它判断"我看过的那份还是不是现在这份"。
+        self.history_version = 0
         #  上下文窗口编号（1 起）与待应用的翻篇请求：new_context 工具只登记
         #  请求，真正换窗口在这批工具结果入历史之后（见主循环）——工具调用与
         #  结果先配好对再整体丢弃，不留孤儿。
@@ -918,6 +922,7 @@ class Agent:
                         self.approver, self.permissions,
                         runs=subagent_runs,
                         mcp_manager=getattr(self.toolbox, "mcp_manager", None),
+                        parent_history=lambda: self.messages,
                     )
                 )
                 mounted_specs.append(spec)
@@ -1482,7 +1487,13 @@ class Agent:
             self._skills_fingerprint = ()
         new_names = {item.name for item in self.skills}
         self.messages[0] = {"role": "system", "content": self._system_prompt()}
+        self._history_rewritten()
         return sorted(new_names - old_names), sorted(old_names - new_names)
+
+    def _history_rewritten(self) -> None:
+        """messages 被非追加式改写后的统一收尾：token 锚点作废 + 版本号 +1。"""
+        self._anchor = None
+        self.history_version += 1
 
     def reset(self) -> None:
         """清空对话，保留 system prompt。
@@ -1498,7 +1509,7 @@ class Agent:
         静态部分（人格/环境/项目指令）逐字重建结果相同，行为不变。
         """
         self.messages = [{"role": "system", "content": self._system_prompt()}]
-        self._anchor = None
+        self._history_rewritten()
         self.plan = []
         #  plan 档必须跟着清：它的规则是以 user 消息注入历史的，历史一空模型就
         #  不知道自己在规划态了，留着就是"关卡还在拦、模型却不明白为什么"。
@@ -1557,6 +1568,9 @@ class Agent:
                 self._record(message)
             else:
                 self.messages.append(message)
+        if messages:
+            #  整段历史是装进来的，不是这个会话一条条长出来的：按改写计
+            self._history_rewritten()
         if self.session_log and source:
             self.session_log.event("resumed_from", source=source)
         #  崩溃恢复：历史末尾若有未配对的 tool_call（= 会话在工具返回前死了；
@@ -1753,7 +1767,7 @@ class Agent:
                 conversation = False
             else:
                 self.messages = self.messages[:found]
-                self._anchor = None
+                self._history_rewritten()
                 self.plan = []
                 if self.session_log:
                     #  与 compact 同一套 replacement 机制：resume 重放时撞到即
@@ -2018,7 +2032,7 @@ class Agent:
         )
         if cleared:
             #  锚点之前的消息被改写了，权威值不再对应现状
-            self._anchor = None
+            self._history_rewritten()
             after_micro = self.context_tokens()
             self.sink.emit(
                 Notice(f"[已清理 {cleared} 条旧工具输出，估算 {estimated} → {after_micro} tok]")
@@ -2046,7 +2060,7 @@ class Agent:
         self.sink.emit(Notice(f"  {note}"))
         changed = self.messages is not before_compact
         if changed:
-            self._anchor = None
+            self._history_rewritten()
         if self.session_log:
             if changed:
                 #  把压缩后的完整历史（不含 system，resume 时用新的）存进事件：
@@ -2121,7 +2135,7 @@ class Agent:
             self.messages[0],
             {"role": "user", "content": self._context_window_note(notes)},
         ]
-        self._anchor = None
+        self._history_rewritten()
         if self.session_log:
             self.session_log.event(
                 "compact",
@@ -2880,7 +2894,7 @@ class Agent:
                 filler = self._tool_message(call, reason)
                 self.messages.insert(tail, filler)
                 #  插入点可能在锚点之前，权威值不再对应现状
-                self._anchor = None
+                self._history_rewritten()
                 if self.session_log:
                     self.session_log.append(filler)
                 tail += 1
@@ -2908,4 +2922,4 @@ class Agent:
         ]
         if len(repaired) != len(self.messages):
             self.messages = repaired
-            self._anchor = None
+            self._history_rewritten()

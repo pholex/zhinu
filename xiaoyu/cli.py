@@ -2980,8 +2980,11 @@ def make_confirm(permissions: Permissions):
 
         verdict = interpret_confirm_answer(answer)
         if verdict is GRANT_SESSION:
-            permissions.grant_session(name)
-            print(ui.secondary(f"  （本次会话内 {name} 不再逐次确认；/perm 可查看）"))
+            scope = permissions.grant_session_call(name, args)
+            if scope is not None:
+                print(ui.secondary(f"  （本次会话内 {scope} 不再逐次确认；/perm 可查看）"))
+            else:
+                print(ui.secondary("  （这条命令推不出会话授权范围，仅本次允许）"))
             return True
         return verdict
 

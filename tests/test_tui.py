@@ -713,7 +713,7 @@ class TestTuiFrontend(AgentTestCase):
         tui = self.make_tui()
         with mock.patch.object(tui, "_inline_select", return_value="session"):
             self.assertIs(tui.confirm("bash", {"command": "ls"}), True)
-        self.assertIn("bash", tui.permissions.session_allowed)
+        self.assertEqual(tui.permissions.session_commands, {"ls"})
 
     def test_confirm_always_choice_persists_rule(self) -> None:
         from xiaoyu import permissions as perm_mod

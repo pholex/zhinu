@@ -38,6 +38,7 @@ isolation = "worktree"            # 可省：默认在独立 git worktree 里跑
 mcp = ["github"]                  # 可省：继承父会话的哪些 MCP server
 model = "deepseek-v4-pro"         # 可省：默认随主模型
 max_iterations = 30               # 可省：默认 20
+inherit = "distilled"             # 可省：带父会话的精简历史起步（默认不带）
 ```
 
 要点（详见 `xiaoyu/agents.py` 模块说明）：
@@ -49,6 +50,11 @@ max_iterations = 30               # 可省：默认 20
   `git apply` 取回）。
 - **resume 续跑**：每次委托的结论尾部有 `resume_from` 句柄，带上它就在
   那次委托的完整上下文上继续（多阶段委托的正确姿势）。
+- **精简继承**：`inherit = "distilled"` 时子 agent 以父会话的精简副本起步
+  ——只有用户原话与每轮最终答复，工具过程、推理、压缩摘要都不带，按子
+  窗口的 30% 从最新一轮往回整轮装。适合"接着聊的那件事去办"的委托：子
+  agent 拿到用户原意而不是父 agent 的转述。只作用于新开委托；七襄/斗巧
+  的批量扇出不带（扇出项应自足）。
 
 `XIAOYU_ENABLE_AGENTS=0` 一键关闭。
 
