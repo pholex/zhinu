@@ -80,6 +80,39 @@ def sources_fingerprint() -> tuple:
     return tuple(rows)
 
 
+#  frontmatter 顶层键的允许集：agent-skills 规范的五个 + 各家生态里已在用的几个。
+#  拼错的键（descripton:）以前被静默吃掉——技能带着空描述进索引，模型永远
+#  选不中它，而用户看不到任何线索。
+FRONTMATTER_KEYS = frozenset(
+    {
+        "name",
+        "description",
+        "license",
+        "allowed-tools",
+        "metadata",
+        "version",
+        "permissions",
+        "when_to_use",
+        "triggers",
+        "updated",
+        "agent_transfer_payload",
+    }
+)
+
+
+def frontmatter_problems(meta: dict[str, str]) -> list[str]:
+    """frontmatter 的问题清单（空列表=没问题）。未知键回显允许集，便于对照改。"""
+    problems: list[str] = []
+    unknown = sorted(key for key in meta if key not in FRONTMATTER_KEYS)
+    if unknown:
+        problems.append(
+            f"未知的 frontmatter 键 {', '.join(unknown)}（允许：{', '.join(sorted(FRONTMATTER_KEYS))}）"
+        )
+    if not meta.get("description", "").strip():
+        problems.append("缺少 description")
+    return problems
+
+
 def parse_frontmatter(text: str) -> dict[str, str]:
     """提取首个 --- 块里的平铺 key: value。不是合法 frontmatter 就返回空。"""
     lines = text.splitlines()
@@ -147,6 +180,17 @@ def scan_skills() -> list[Skill]:
                 continue
             if source.plugin:
                 name = f"{source.plugin}{NAMESPACE_SEP}{name}"
+            problems = frontmatter_problems(meta)
+            if problems:
+                #  未知键 + 没描述 = 多半是拼错了 description：这样的技能进了
+                #  索引也永远选不中，跳过并说明原因；只是多了个生僻键则照常加载。
+                skip = len(problems) > 1
+                print(
+                    f"[技能 {name!r}{'跳过' if skip else ''}：{'；'.join(problems)}（{skill_md}）]",
+                    file=sys.stderr,
+                )
+                if skip:
+                    continue
             if name in found:
                 print(
                     f"[技能 {name!r} 撞名：用 {found[name].path}，忽略 {skill_md}]",
@@ -188,6 +232,41 @@ def _omitted_note(count: int) -> str:
     #  模型会把它们当成本来就没写描述的技能。
     #  这行本身也在跟技能名抢这点预算，能短则短。
     return f"- …预算耗尽：描述全略去，另有 {count} 个技能名未列出（/skills 看全部）"
+
+
+@dataclass(frozen=True)
+class IndexReport:
+    """index_block 最近一次的预算降级情况（给用户看的，不进 prompt）。"""
+
+    total: int
+    truncated: int  # 描述被截短的技能数
+    truncated_chars: int  # 被截掉的字符总数
+    omitted: int  # 连名字都没列出的技能数
+
+    #  平均截掉不到这么多字不值得打扰用户：几十个字的尾巴对路由影响很小。
+    WARN_AVG_CHARS = 100
+
+    def warning(self) -> str | None:
+        if self.omitted:
+            return (
+                f"技能索引预算不足：{self.omitted}/{self.total} 个技能只剩名字甚至未列出。"
+                "小羽可能找不到它们——停用不用的技能/插件，或换上下文更大的模型。"
+            )
+        if self.truncated and self.truncated_chars / self.truncated > self.WARN_AVG_CHARS:
+            return (
+                f"技能索引预算不足：{self.truncated}/{self.total} 个技能的描述被截短"
+                f"（平均少 {self.truncated_chars // self.truncated} 字）。"
+                "技能都还在，但匹配会变钝——停用不用的技能/插件可腾出预算。"
+            )
+        return None
+
+
+last_index_report: IndexReport | None = None
+
+
+def budget_warning() -> str | None:
+    """最近一次 index_block 的用户侧警告（无需警告返回 None）。启动时打一次即可。"""
+    return last_index_report.warning() if last_index_report else None
 
 
 def _render(name: str, description: str) -> str:
@@ -247,7 +326,26 @@ def index_block(
     if max_tokens is not None:
         budget = max(max_tokens - sum(_line_cost(line) for line in header), 0)
     lines, note = _allocate(entries, budget)
+    global last_index_report
+    last_index_report = _report(entries, lines)
     return "\n".join(header + lines + ([note] if note else []))
+
+
+def _report(entries: list[tuple[str, str]], lines: list[str]) -> IndexReport:
+    truncated = 0
+    truncated_chars = 0
+    for (name, description), line in zip(entries, lines):
+        kept = line[len(f"- {name}: ") :] if line.startswith(f"- {name}: ") else ""
+        lost = len(description) - len(kept)
+        if lost > 0:
+            truncated += 1
+            truncated_chars += lost
+    return IndexReport(
+        total=len(entries),
+        truncated=truncated,
+        truncated_chars=truncated_chars,
+        omitted=len(entries) - len(lines),
+    )
 
 
 def _allocate(entries: list[tuple[str, str]], budget: int | None) -> tuple[list[str], str | None]:

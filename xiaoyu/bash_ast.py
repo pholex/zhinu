@@ -111,11 +111,27 @@ def _argv_from_command(node) -> list[str] | None:
     return argv or None
 
 
+#  裸词里这些字符意味着 shell 会在执行前改写它：brace 展开 `{a,b}`、glob
+#  `* ? [ ]`、转义 `\\`、tilde `~`、zsh 扩展 glob `^ #`、展开 `$` 与反引号。
+#  tree-sitter 把 `-{delete,print}`、`-del*`、`-de\\lete`、`~` 都标成普通
+#  word——源文本的拼写不是运行期 argv 的证明。
+_DYNAMIC_WORD_CHARS = frozenset("{}*?[]\\~^#$`")
+
+
 def _word_text(node) -> str | None:
-    """把一个"词"节点还原成它的字面量值（去引号、拼接 concatenation）。"""
+    """把一个"词"节点还原成它的字面量值（去引号、拼接 concatenation）。
+
+    裸 word / number 额外要求**源文本本身是字面量**：含 `_DYNAMIC_WORD_CHARS`
+    或以 `=`（zsh 的 `=cmd` 展开）开头即放弃。否则 `allow bash(rg *)` 会被
+    `rg --pre{=,=sh} …` 穿透——规则匹配的是改写前的拼写，执行的是改写后的
+    `--pre=sh`。
+    """
     kind = node.type
     if kind in ("word", "number"):
-        return node.text.decode("utf-8", errors="replace")
+        text = node.text.decode("utf-8", errors="replace")
+        if text.startswith("=") or _DYNAMIC_WORD_CHARS.intersection(text):
+            return None
+        return text
     if kind == "raw_string":
         #  'literal'：整个 token 含引号，剥掉首尾
         return node.text.decode("utf-8", errors="replace")[1:-1]

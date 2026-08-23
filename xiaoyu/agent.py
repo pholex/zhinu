@@ -665,6 +665,7 @@ class Agent:
         #  开发的形态，整写重来才像草稿脚本迭代）+ 本轮 bash 执行数。
         self._turn_write_counts: dict[str, int] = {}
         self._turn_script_runs = 0
+        self._turn_implicit_skills: set[str] = set()
         #  每会话最多推一次，免得每个大活收尾都被唠叨
         self._crystallize_nudged = False
         #  gate_skip 事件按轮去重：门控一轮内会被评估多次（每个收尾步都问一遍）
@@ -1467,6 +1468,7 @@ class Agent:
         self._crystallize_skip_logged = False
         self._turn_write_counts.clear()
         self._turn_script_runs = 0
+        self._turn_implicit_skills: set[str] = set()
         self._last_call_key = None
         self._call_repeats = 0
         self._exec_evidence = 0
@@ -1760,6 +1762,7 @@ class Agent:
         #  解题迭代特征按轮归零：跨轮累计会把两次不相干的小改凑成一次"迭代"
         self._turn_write_counts.clear()
         self._turn_script_runs = 0
+        self._turn_implicit_skills: set[str] = set()
         self._crystallize_skip_logged = False
         #  失败流与改动证据同样按轮归零：上一轮的失败/改动不该影响这一轮的判定
         self._fail_streak_tool, self._fail_streak = "", 0
@@ -2685,6 +2688,15 @@ class Agent:
         #  产物对账护栏的改动证据 + 失败流（附注拼在 ERROR 判定之后，同上）
         if ok and name not in _NON_MUTATING_TOOLS:
             self._turn_mutations += 1
+        #  隐式技能使用记账：bash 直读 SKILL.md / 跑技能脚本也算用了该技能
+        #  （理由见 skill_usage 模块 docstring）。每轮每技能一次，失败的命令不算。
+        if ok and name == "bash" and self.skills:
+            for skill_name in skill_usage.implicit_loads(
+                str(args.get("command") or ""), self.skills, self.config.workspace
+            ):
+                if skill_name not in self._turn_implicit_skills:
+                    self._turn_implicit_skills.add(skill_name)
+                    skill_usage.record_load(skill_name)
         streak = self._track_failure(name, ok)
         if failure_note := self._failure_note(name, streak):
             output += failure_note

@@ -13,6 +13,7 @@ import io
 import unittest
 from unittest import mock
 
+from xiaoyu import keys
 from xiaoyu.cli import GRANT_SESSION, interpret_confirm_answer, make_frontend, repl
 
 try:
@@ -483,6 +484,23 @@ class TestTuiFrontend(AgentTestCase):
         self.assertEqual(tui._fold_paste("一\n二\n三\n四"), "[粘贴 #2 · 4 行]")
         #  被手改坏的占位符按字面保留，不炸
         self.assertEqual(tui._expand_pastes("[粘贴 #99 · 1 行]"), "[粘贴 #99 · 1 行]")
+
+    def test_paste_at_line_start_is_literal_input(self) -> None:
+        """行首是粘贴 chip 的提交按字面发模型：贴进来的 `!` / `#` / `/` 不是用户敲的前缀。"""
+        tui = self.make_tui()
+        chip = tui._fold_paste("!rm -rf /\n" + "y\n" * 5)
+        self.assertTrue(tui._starts_with_paste(chip))
+        self.assertTrue(tui._starts_with_paste(f"  {chip} 帮我看这段"))
+        #  chip 不在行首：用户自己敲的前缀照常生效
+        self.assertFalse(tui._starts_with_paste(f"!cat {chip}"))
+        #  手改坏 / 不存在的 chip 不算
+        self.assertFalse(tui._starts_with_paste("[粘贴 #99 · 1 行]"))
+        self.assertFalse(tui._starts_with_paste(""))
+        #  展开后的整行交给路由：literal 下必须是 send 而不是 shell
+        line = tui._expand_pastes(chip)
+        self.assertTrue(line.startswith("!rm"))
+        self.assertEqual(keys.classify_input(line, literal=True).kind, "send")
+        self.assertEqual(keys.classify_input(line).kind, "shell")
 
     def test_image_chip_folds_and_becomes_content_parts(self) -> None:
         """图片 chip：占位符留在文本里，图片作为部件追加——指代关系不能丢。"""

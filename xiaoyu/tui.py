@@ -1208,6 +1208,9 @@ class Tui:
         self._files_cache_at = 0.0
         self._pastes: dict[int, str] = {}
         self._paste_id = 0
+        #  本次提交行首来自粘贴 chip：展开后的 ! / # / 前缀不是用户敲的，路由
+        #  按字面发给模型（由 _submit 置位、主循环取走即清）
+        self._literal_submit = False
         #  图片 chip：编号 → 媒体引用（xiaoyu-media://…）。会话内累加不清理，
         #  用户可能把同一张图在后面几轮里反复引用（Esc-Esc 取回上一条即是）
         self._images: dict[int, str] = {}
@@ -1230,6 +1233,11 @@ class Tui:
         self._paste_id += 1
         self._pastes[self._paste_id] = data
         return f"[粘贴 #{self._paste_id} · {lines} 行]"
+
+    def _starts_with_paste(self, text: str) -> bool:
+        """行首（忽略空白）是否是一个真实存在的粘贴 chip。"""
+        match = _PASTE_REF.match(text.lstrip())
+        return bool(match) and int(match.group(1)) in self._pastes
 
     def _expand_pastes(self, text: str) -> str:
         """提交前把 chip 占位符展开回原文（被手改坏的占位符按字面保留）。"""
@@ -1382,7 +1390,10 @@ class Tui:
                 #  不能直接把 complete_state 置 None——那等于取消补全，
                 #  Tab 轮换插入的文本会被回退成原输入。
                 buffer.apply_completion(state.current_completion)
-            #  chip 展开回原文再提交；输入历史里存的也是展开后的全文
+            #  chip 展开回原文再提交；输入历史里存的也是展开后的全文。
+            #  展开前先看行首：顶在第 0 位的是 chip 就标记"字面提交"，
+            #  否则贴进来的 `!rm -rf` 日志会在展开后被当成 shell 命令跑掉。
+            self._literal_submit = self._starts_with_paste(buffer.text)
             expanded = self._expand_pastes(buffer.text)
             if expanded != buffer.text:
                 buffer.text = expanded
@@ -1965,7 +1976,8 @@ class Tui:
                 continue
 
             #  提交路由单点在 keys.classify_input：TUI 与明文 REPL 同一张表
-            action = keys.classify_input(line)
+            literal, self._literal_submit = self._literal_submit, False
+            action = keys.classify_input(line, literal=literal)
             if action.kind == "empty":
                 continue
             if action.kind == "usage":

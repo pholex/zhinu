@@ -4,7 +4,8 @@ MCP 工具不再全量进模型的 schema（见 tools.py 的 search_tool/use_too
 工具集因此在会话内保持稳定——新 server 中途连上不再作废 prompt cache 的
 工具前缀，几百个工具的 schema 也不再吃掉上下文。检索语料是
 「server 名 + 工具名 + 描述 + 参数名」，外加标识符拆词（SearchDashboards →
-search dashboards、grafana-ai → grafana ai），模型用自然语言就能搜到。
+search dashboards、grafana-ai → grafana ai）；中文等无空格文字按字符 2-gram
+入索引（"发邮件" → 发邮 邮件），模型用中英文自然语言都能搜到。
 
 索引每次搜索现建（几十到几百个工具、亚毫秒级）：不维护增量状态，
 就没有状态不同步。
@@ -24,6 +25,12 @@ _B = 0.75
 #  下划线算词内字符：save_issue 这种复合名整体保留一份，拆词另加
 _ALNUM = re.compile(r"[A-Za-z0-9_]+")
 _CAMEL = re.compile(r"(?<=[a-z0-9])(?=[A-Z])")
+#  非 ASCII 的连续"字"（中日韩等无空格书写系统）：按字符 2-gram 入索引。
+#  只匹配字母类字符，全角标点和空白是天然分隔。
+_CJK_RUN = re.compile(r"[^\x00-\x7f\W]+")
+#  单段文本的 n-gram 上限：描述动辄几百字，超长只留前面——够检索用，别让
+#  一条异常长的描述把索引撑爆。
+_MAX_GRAMS = 512
 
 
 def split_identifier(token: str) -> list[str]:
@@ -36,8 +43,27 @@ def split_identifier(token: str) -> list[str]:
     return parts
 
 
+def char_grams(text: str, limit: int = _MAX_GRAMS) -> list[str]:
+    """非 ASCII 文字的字符 2-gram（单字段落只有一个字时取该字本身）。
+
+    中文没有空格分词，标识符分词对"发邮件"吐出零个 token——检索对中文
+    查询直接失效。2-gram 是无词典条件下 CJK 检索的标准做法：查询和文档
+    同一套切法，靠 BM25 自然打分，不用再引入第二套排序再融合。
+    """
+    grams: list[str] = []
+    for match in _CJK_RUN.finditer(text):
+        run = match.group().lower()
+        if len(run) == 1:
+            grams.append(run)
+        else:
+            grams.extend(run[index : index + 2] for index in range(len(run) - 1))
+        if len(grams) >= limit:
+            return grams[:limit]
+    return grams
+
+
 def tokenize(text: str) -> list[str]:
-    """检索用分词：原词 + 拆词，全部小写。"""
+    """检索用分词：原词 + 拆词 + 非 ASCII 2-gram，全部小写。"""
     tokens: list[str] = []
     for match in _ALNUM.finditer(text):
         word = match.group()
@@ -45,6 +71,7 @@ def tokenize(text: str) -> list[str]:
         pieces = split_identifier(word)
         if len(pieces) > 1:
             tokens.extend(piece.lower() for piece in pieces)
+    tokens.extend(char_grams(text))
     return tokens
 
 

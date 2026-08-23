@@ -69,6 +69,14 @@ class BwrapArgsTest(unittest.TestCase):
         """小羽死则沙箱死——不留孤儿进程。"""
         self.assertIn("--die-with-parent", sandbox.bwrap_args([], allow_network=True))
 
+    def test_hardening_flags(self):
+        """脱离控制终端（防 TIOCSTI 注键）、隔离 IPC、清空 capability。"""
+        args = sandbox.bwrap_args([], allow_network=True)
+        self.assertIn("--new-session", args)
+        self.assertIn("--unshare-ipc", args)
+        index = args.index("--cap-drop")
+        self.assertEqual(args[index + 1], "ALL")
+
 
 class LinuxWrapTest(unittest.TestCase):
     def test_wrap_builds_bwrap_call(self):

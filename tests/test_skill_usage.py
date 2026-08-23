@@ -95,6 +95,34 @@ class SkillUsageTest(unittest.TestCase):
             self.assertNotIn("s0", kept)
 
 
+class ImplicitLoadTest(SkillUsageTest):
+    """bash 直读 SKILL.md / 跑技能脚本 → 归因到技能。"""
+
+    def test_cat_skill_md_and_script(self) -> None:
+        a, b = self._skill("a"), self._skill("b")
+        (self.root / "a" / "scripts").mkdir()
+        cmd = f"cat {a.path} && python3 {self.root}/a/scripts/run.py; ls /tmp"
+        self.assertEqual(skill_usage.implicit_loads(cmd, [a, b]), ["a"])
+
+    def test_relative_and_tilde(self) -> None:
+        a = self._skill("a")
+        self.assertEqual(
+            skill_usage.implicit_loads("sed -n 1,40p a/SKILL.md", [a], cwd=self.root), ["a"]
+        )
+        with mock.patch.dict("os.environ", {"HOME": str(self.root)}):
+            self.assertEqual(skill_usage.implicit_loads("head ~/a/SKILL.md", [a]), ["a"])
+            self.assertEqual(skill_usage.implicit_loads("cat $HOME/a/references/x.md", [a]), ["a"])
+
+    def test_no_match_and_bad_quotes(self) -> None:
+        a = self._skill("a")
+        self.assertEqual(skill_usage.implicit_loads("cat /etc/hosts", [a]), [])
+        self.assertEqual(skill_usage.implicit_loads("echo 'unterminated", [a]), [])
+        self.assertEqual(skill_usage.implicit_loads("ls", []), [])
+        #  同名前缀目录不算（a 与 ab）
+        ab = self._skill("ab")
+        self.assertEqual(skill_usage.implicit_loads(f"cat {ab.path}", [a, ab]), ["ab"])
+
+
 class IndexRankingIntegrationTest(unittest.TestCase):
     """index_block(rank_by_usage=True) 端到端：预算够时全列但顺序按使用度。"""
 

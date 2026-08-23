@@ -590,6 +590,26 @@ class TestBashAndSafety(ToolboxTestCase):
         self.assertEqual(env["KEEP"], "1")
         self.assertEqual(env["EXTRA"], "2")
 
+    def test_bash_env_strips_provider_secrets(self) -> None:
+        """小羽自己的模型密钥不传给模型跑的命令：继承的剔、extra 里的也剔、
+        大小写不敏感；extra 里的其它变量照传（操作者的明确决定）。"""
+        from xiaoyu.tools import _hardened_env, non_inheritable_env_names
+
+        names = non_inheritable_env_names()
+        for expected in ("XIAOYU_API_KEY", "LITELLM_API_KEY", "DEEPSEEK_API_KEY",
+                         "ANTHROPIC_API_KEY", "DASHSCOPE_API_KEY", "XIAOYU_SERVE_TOKEN"):
+            self.assertIn(expected, names)
+        with mock.patch.dict(
+            os.environ,
+            {"XIAOYU_API_KEY": "sk-1", "OPENAI_API_KEY": "sk-2", "GITHUB_TOKEN": "gh"},
+        ):
+            env = _hardened_env({"deepseek_api_key": "sk-3", "LARK_TOKEN": "t"})
+        self.assertNotIn("XIAOYU_API_KEY", env)
+        self.assertNotIn("OPENAI_API_KEY", env)
+        self.assertNotIn("deepseek_api_key", env)
+        self.assertEqual(env["GITHUB_TOKEN"], "gh")
+        self.assertEqual(env["LARK_TOKEN"], "t")
+
 
 class PurposeParamTest(unittest.TestCase):
     """__tool_use_purpose 注入：只进需确认工具的 schema。"""
