@@ -90,6 +90,7 @@ def build_parser() -> argparse.ArgumentParser:
             "xiaoyu plugin add|list|update|remove  装卸插件包（skills + MCP，"
             "详见 xiaoyu plugin --help）；"
             "xiaoyu acp  以 ACP 协议 server 启动，供编辑器客户端驱动（等价 --acp）；"
+            "xiaoyu doctor  体检环境（凭据有无 / 沙箱 / 磁盘 / MCP 配置）；"
             "xiaoyu terminal-setup  给 VS Code 系编辑器配 Shift+Enter 换行；"
             "xiaoyu update  升级到最新版（未装 TUI 时自动补上；已装 serve 时一并升级）；"
             "xiaoyu uninstall  卸载（--purge 连配置目录一起删）"
@@ -855,6 +856,33 @@ def resume_command(argv: list[str]) -> int:
     if note:
         print(ui.secondary(note))
     return run_repl(repl_fn, agent)
+
+
+def doctor_command(argv: list[str]) -> int:
+    """体检：这台机器能不能把小羽跑顺。任一 FAIL 退出码 1；--json 给脚本。"""
+    from . import diagnostics
+
+    parser = argparse.ArgumentParser(
+        prog="xiaoyu doctor",
+        description="检查 Python / 配置目录 / 磁盘 / 凭据有无 / 沙箱 / 命令解析器 / MCP 配置 / 会话目录",
+    )
+    parser.add_argument("--json", action="store_true", help="机器可读输出（含进程快照）")
+    parser.add_argument("-w", "--workspace", default="", help="按哪个工作区检查（默认当前目录）")
+    args = parser.parse_args(argv)
+
+    workspace = Path(args.workspace).expanduser() if args.workspace else None
+    checks = diagnostics.run_doctor(workspace)
+    if args.json:
+        print(diagnostics.to_json(checks))
+    else:
+        paint = {"ok": ui.success, "warn": ui.warning, "fail": ui.error}
+        for line in diagnostics.render(checks):
+            mark = line[:4].strip().lower()
+            if mark in paint:
+                print(paint[mark](line[:4]) + line[4:])
+            else:
+                print(ui.secondary(line))
+    return 1 if diagnostics.overall(checks) == "fail" else 0
 
 
 def terminal_setup_command(argv: list[str]) -> int:
@@ -2240,6 +2268,8 @@ def main(argv: list[str] | None = None) -> int:
         return plugin_command(argv[1:])
     if argv and argv[0] == "terminal-setup":
         return terminal_setup_command(argv[1:])
+    if argv and argv[0] == "doctor":
+        return doctor_command(argv[1:])
     if argv and argv[0] == "update":
         return update_command(argv[1:])
     if argv and argv[0] == "uninstall":

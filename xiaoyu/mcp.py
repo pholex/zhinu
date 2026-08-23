@@ -78,8 +78,11 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Iterator
 
-from . import mcp_guard, media
+from . import diagnostics, mcp_guard, media
 from .config import Config, user_config_dir
+
+#  活着的 MCP 连接数（stdio 子进程 + HTTP 会话），/diagnostics 与 doctor 可见
+CONNECTIONS_LIVE = diagnostics.Gauge("mcp.connections.live")
 
 #  MCP 规范修订号。server 端一般都向后兼容旧修订，握手时对方回什么版本就用什么。
 PROTOCOL_VERSION = "2025-06-18"
@@ -674,6 +677,8 @@ class McpServer:
         #  on_disconnect ← stdout EOF（进程意外退出）。主动 close 不触发。
         self.on_disconnect: Callable[[], None] | None = None
         self._closing = False
+        #  是否已计入 CONNECTIONS_LIVE（启动成功 +1、收进程 -1，重启不重复计）
+        self._counted = False
         self._drain_thread: threading.Thread | None = None
         #  重连预算（按 outage 计，见模块 docstring）；归 manager 的重连线程读写
         self.reconnect_attempts = 0
@@ -706,6 +711,7 @@ class McpServer:
                 return
             try:
                 self._start_locked()
+                self._count_live(True)
             except McpError as exc:
                 self.start_error = str(exc)
                 self.close()
@@ -871,7 +877,16 @@ class McpServer:
             self.start_error = None
             return self.live_declared
 
+    def _count_live(self, alive: bool) -> None:
+        if alive and not self._counted:
+            self._counted = True
+            CONNECTIONS_LIVE.inc()
+        elif not alive and self._counted:
+            self._counted = False
+            CONNECTIONS_LIVE.dec()
+
     def _shutdown_proc(self) -> None:
+        self._count_live(False)
         if self._http is not None:
             self._http.close()
             with self._cond:

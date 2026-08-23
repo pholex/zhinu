@@ -566,6 +566,20 @@ class TestToken(ServeCase):
         response = client.post("/session", json={}, headers={"X-Xiaoyu-Token": self.token})
         self.assertEqual(response.status_code, 200, response.text)
 
+    def test_diagnostics_gated_and_counts_sessions(self):
+        #  /diagnostics 暴露负载形态（RSS / fd / 在册会话），必须和业务面同一道 token 门
+        client = self.start("text: 无所谓\n")
+        self.assertEqual(client.get("/diagnostics").status_code, 401)
+        before = client.get("/diagnostics", headers=self.headers())
+        self.assertEqual(before.status_code, 200, before.text)
+        self.new_session()
+        body = client.get("/diagnostics", headers=self.headers()).json()
+        self.assertEqual(set(body), {"version", "process", "gauges", "uptime_s"})
+        self.assertEqual(body["gauges"]["serve.sessions.live"], 1)
+        #  读 /diagnostics 本身就是一个在途请求
+        self.assertGreaterEqual(body["gauges"]["serve.requests.in_flight"], 1)
+        self.assertIn("rss_bytes", body["process"])
+
 
 class TestOpenApi(ServeCase):
     def test_schema_covers_the_orchestration_surface(self):

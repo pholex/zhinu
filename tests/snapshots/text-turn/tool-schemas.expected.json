@@ -208,6 +208,37 @@
   },
   {
     "function": {
+      "description": "查询当前上下文窗口还剩多少 token（估算）。长任务中途、准备读大文件或跑大输出命令之前调用，余量不足时先收口或调用 new_context 翻篇。",
+      "name": "get_context_remaining",
+      "parameters": {
+        "properties": {},
+        "required": [],
+        "type": "object"
+      }
+    },
+    "type": "function"
+  },
+  {
+    "function": {
+      "description": "开启一个全新的上下文窗口：之前的对话历史全部不再可见，只有 system prompt 和你在 notes 里写的交接笔记会带过去。不做摘要、不改磁盘、不影响已完成的工作。适用：余量不足但任务还长，且当前细节已沉淀到文件/笔记里。notes 要写清任务目标、已完成与未完成项、关键路径与决定——新窗口里的你只有这些。",
+      "name": "new_context",
+      "parameters": {
+        "properties": {
+          "notes": {
+            "description": "交接笔记：目标、进度、关键路径与决定（≤4000 字）",
+            "type": "string"
+          }
+        },
+        "required": [
+          "notes"
+        ],
+        "type": "object"
+      }
+    },
+    "type": "function"
+  },
+  {
+    "function": {
       "description": "更新任务计划（全量替换）。传入完整的步骤列表，每步带 step 文本与 status 状态；explanation 可选，只在计划本身变更时说明原因。同一时刻最多一条 in_progress。",
       "name": "update_plan",
       "parameters": {

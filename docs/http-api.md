@@ -300,6 +300,7 @@ agent 对象、会话清单、会话日志默认落盘在 `~/.xiaoyu/serve/<root
 | 方法 | 路径 | |
 |---|---|---|
 | GET | `/health` | 存活探针（不需要 token） |
+| GET | `/diagnostics` | 进程自诊断：RSS / 线程 / fd + 在册计量（会话、在途请求、MCP 连接、后台任务）。有 token 门——它暴露负载形态 |
 | POST · GET | `/agent` | 新建 agent 对象 · 列出 |
 | GET · POST · DELETE | `/agent/{id}` | 详情（`?versions=true`）· 更新→新版本 · 归档 |
 | POST | `/session` | 新建会话（`workspace` / `model` / `mode`，或 `agent` 引用 + `budget`） |
