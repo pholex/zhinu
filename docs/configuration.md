@@ -155,9 +155,12 @@ XIAOYU_PROVIDER_MINIMAX_API_KEY=<key>
 XIAOYU_PROVIDER_MINIMAX_MODELS=minimax-m2,minimax-m2-turbo   # 留空 = 通配
 XIAOYU_PROVIDER_MINIMAX_PROTOCOL=responses                   # 默认 chat；可选 anthropic
 XIAOYU_PROVIDER_MINIMAX_VISION=*                             # 声明视觉能力，默认不发图
+XIAOYU_PROVIDER_MINIMAX_TOOLS=text                           # 默认 native；端点不会 function calling 时设 text
 ```
 
 `_PROTOCOL=anthropic` 也适用于 Bedrock Mantle 一类只挂 Claude 原生协议的端点。视觉是 fail-closed 的：**未声明即不发图**，模型会收到一行"有 N 张图但看不了"的说明而不是被静默丢弃。
+
+`_TOOLS=text` 是给**不支持 function calling** 的端点（本地 vLLM / Ollama 上的小模型、带 `tools` 就 400 或静默忽略的老服务）准备的逃生舱：工具说明改为写进 system prompt，模型用 ```` ```tool_call ```` 代码块（也认 `<tool_call>` 标签）发起调用，结果以 `<tool_result>` 文本回灌。翻译只发生在出网那一刻，会话历史仍是标准形态，随时 `/model` 切回原生工具调用的模型。它与 `_PROTOCOL` 正交，可同时设置。原生 function calling 能用就别开它——文本解析天生更脆。
 
 ## macOS Keychain
 

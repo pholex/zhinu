@@ -28,6 +28,7 @@ from .config import GATEWAY_KEY_ENVS, Config, MissingConfig, find_api_key
 from .responses import ANTHROPIC, RESPONSES, WILDCARD
 from .responses import wrap as wrap_transport
 from .scripted import SCRIPTED_ENV, SCRIPTED_PROVIDER
+from .textcalls import TEXT as TEXT_TOOLS
 
 #  网关 provider 的固定名字。它是通配的：什么模型名都接（我们不知道网关上有什么，
 #  也不做 /v1/models 探测——启动路径上加网络往返，而且"列得出"不等于"调得通"）。
@@ -58,6 +59,10 @@ class Preset:
     #  说 Anthropic Messages 协议的型号（`*` = 整家）。优先级高于 responses_models。
     #  见 messages.py（为什么原生协议优于官方 OpenAI 兼容端点）
     anthropic_models: tuple[str, ...] = ()
+    #  不会 function calling、工具调用要走文本协议的型号（`*` = 整家）。
+    #  内置厂商目前没有一家需要（名额纪律只收旗舰，旗舰都会 function calling）；
+    #  字段留着是让 preset 与通用 env 兜底形状一致。见 textcalls.py
+    text_tool_models: tuple[str, ...] = ()
 
 
 #  ⚠️ 只内置能确认的厂商。猜错的代价是用户配好了却 404——这类数据宁可缺也不能错
@@ -208,6 +213,8 @@ class Provider:
     vision_models: tuple[str, ...] = ()
     #  说 Anthropic Messages 协议的型号（`*` = 整家），优先级高于 responses_models
     anthropic_models: tuple[str, ...] = ()
+    #  工具调用走文本协议的型号（`*` = 整家）。见 textcalls.py
+    text_tool_models: tuple[str, ...] = ()
 
     @property
     def wildcard(self) -> bool:
@@ -427,6 +434,7 @@ class Registry:
                 provider.anthropic_models,
                 factory,
                 provider=name,
+                text_tool_models=provider.text_tool_models,
             )
         )
 
@@ -621,9 +629,10 @@ def _make(name: str, config: Config) -> Provider | None:
             preset.responses_models,
             preset.vision_models,
             preset.anthropic_models,
+            preset.text_tool_models,
         )
 
-    #  通用兜底：XIAOYU_PROVIDER_<NAME>_{BASE_URL,API_KEY,MODELS,PROTOCOL,VISION}
+    #  通用兜底：XIAOYU_PROVIDER_<NAME>_{BASE_URL,API_KEY,MODELS,PROTOCOL,VISION,TOOLS}
     upper = name.upper()
     base_url = os.environ.get(f"{_GENERIC_PREFIX}{upper}{_GENERIC_SUFFIX}", "").strip()
     if not base_url:
@@ -642,6 +651,18 @@ def _make(name: str, config: Config) -> Provider | None:
     #  VISION=* 整家、或逗号分隔点名。默认空 = 不发图（见 Registry.sees_images 的 fail-closed）
     raw_vision = os.environ.get(f"{_GENERIC_PREFIX}{upper}_VISION", "")
     vision = tuple(item.strip() for item in raw_vision.split(",") if item.strip())
+    #  TOOLS=text：端点不会 function calling（本地小模型 / 老端点），工具调用改走
+    #  文本协议（textcalls.py）。默认 native。与 PROTOCOL 正交，可以同时设
+    tool_mode = os.environ.get(f"{_GENERIC_PREFIX}{upper}_TOOLS", "").strip().lower()
+    text_tools = (WILDCARD,) if tool_mode == TEXT_TOOLS else ()
     return Provider(
-        name, base_url, key, models, f"直连 {name}", speaks_responses, vision, speaks_anthropic
+        name,
+        base_url,
+        key,
+        models,
+        f"直连 {name}",
+        speaks_responses,
+        vision,
+        speaks_anthropic,
+        text_tools,
     )

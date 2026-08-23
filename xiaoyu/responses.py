@@ -395,10 +395,13 @@ class _Completions:
         speaks_anthropic: Any,
         anthropic_client: Any,
         provider: str = "",
+        text_tools: Any = None,
     ) -> None:
         self._inner = inner
         self._speaks_responses = speaks_responses
         self._speaks_anthropic = speaks_anthropic
+        #  型号 → 是否走文本工具协议（见 textcalls.py）。None = 全部原生
+        self._text_tools = text_tools or (lambda _model: False)
         #  零参 callable：懒构造并缓存（见 Transport.anthropic_client）
         self._anthropic_client = anthropic_client
         #  本传输层所属的 provider：reasoning 回放判定要用（provider+model
@@ -418,6 +421,26 @@ class _Completions:
         #  媒体引用展开成 data URL 也在这一层，和私有键净化同一个理由：出网口只有
         #  一个，"记得展开"就不必成为一条要人记住的纪律。三条协议都要，所以在分支之前
         messages = media.inline(messages)
+        #  文本工具协议（textcalls.py）包在协议分派**外面**：它改的是消息内容与
+        #  tools 的有无，不挑 wire protocol——哪条协议都能跑。出网前把历史改写成
+        #  纯文本、tools 拿掉；回来时把正文里的调用块翻回 tool_calls 分片
+        if self._text_tools(model):
+            from . import textcalls
+
+            messages = textcalls.to_text_messages(messages, tools)
+            result = self._dispatch(model, messages, stream, stream_options, None, extra)
+            return textcalls.stream_chunks(result) if stream else textcalls.to_completion(result)
+        return self._dispatch(model, messages, stream, stream_options, tools, extra)
+
+    def _dispatch(
+        self,
+        model: str,
+        messages: list[dict[str, Any]],
+        stream: bool,
+        stream_options: dict[str, Any] | None,
+        tools: list[dict[str, Any]] | None,
+        extra: dict[str, Any],
+    ) -> Any:
         if self._speaks_anthropic(model):
             #  ⚠️ 和 Responses 一路同理，**不能**先 strip_private：`_reasoning`
             #  正是 to_request 要消费的东西。净化是结构性的——逐块重建，
@@ -471,9 +494,10 @@ class _Chat:
         speaks_anthropic: Any,
         anthropic_client: Any,
         provider: str = "",
+        text_tools: Any = None,
     ) -> None:
         self.completions = _Completions(
-            inner, speaks_responses, speaks_anthropic, anthropic_client, provider
+            inner, speaks_responses, speaks_anthropic, anthropic_client, provider, text_tools
         )
 
 
@@ -499,15 +523,33 @@ class Transport:
         anthropic_models: tuple[str, ...] = (),
         anthropic_factory: Any = None,
         provider: str = "",
+        text_tool_models: tuple[str, ...] = (),
     ) -> None:
         self._inner = inner
         self.responses_models = tuple(responses_models)
         self.anthropic_models = tuple(anthropic_models)
+        #  走文本工具协议的型号（`*` = 整家）。与 wire protocol 正交：它说的是
+        #  "这个型号不会 function calling"，不是"说哪种协议"。见 textcalls.py
+        self.text_tool_models = tuple(text_tool_models)
         self._anthropic_factory = anthropic_factory
         self._anthropic: Any = None
         self.chat = _Chat(
-            inner, self.speaks_responses, self.speaks_anthropic, self.anthropic_client, provider
+            inner,
+            self.speaks_responses,
+            self.speaks_anthropic,
+            self.anthropic_client,
+            provider,
+            self.uses_text_tools,
         )
+
+    def uses_text_tools(self, model: str) -> bool:
+        """这个型号的工具调用走不走文本协议。声明纪律同 responses_models。"""
+        return WILDCARD in self.text_tool_models or model in self.text_tool_models
+
+    def tool_mode_for(self, model: str) -> str:
+        from .textcalls import NATIVE, TEXT
+
+        return TEXT if self.uses_text_tools(model) else NATIVE
 
     def speaks_responses(self, model: str) -> bool:
         """这个型号走不走 Responses。裸名比对——全限定名在解析时早已剥掉前缀。"""
@@ -540,6 +582,7 @@ class Transport:
             self.responses_models,
             self.anthropic_models,
             self._anthropic_factory,
+            text_tool_models=self.text_tool_models,
         )
 
     def __getattr__(self, name: str) -> Any:
@@ -552,5 +595,8 @@ def wrap(
     anthropic_models: tuple[str, ...] = (),
     anthropic_factory: Any = None,
     provider: str = "",
+    text_tool_models: tuple[str, ...] = (),
 ) -> Transport:
-    return Transport(client, responses_models, anthropic_models, anthropic_factory, provider)
+    return Transport(
+        client, responses_models, anthropic_models, anthropic_factory, provider, text_tool_models
+    )

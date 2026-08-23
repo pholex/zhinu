@@ -258,6 +258,17 @@ CRYSTALLIZE_NUDGE = (
     "也不必重复已给出的结论。"
 )
 
+#  产物对账护栏的回灌文案：模型在收尾正文里宣称"已创建/修改了 X"，但本轮没有
+#  成功执行过任何会改动现场的工具——改动并不存在。文案固定（不带文件名，文件名
+#  走 Notice 给用户看），才能进 SYNTHETIC_USER_TEXTS 被压缩/fork 正确识别。
+#  给"转述之前轮次的改动"留了出口：这是唯一合理的误报来源，一句话就能澄清。
+PHANTOM_EDIT_NUDGE = (
+    "[系统提示] 你上一条回复说已经创建/修改了某些文件，但本轮没有成功执行过任何"
+    "写文件或执行命令类的工具，所以这些改动并不存在。请二选一：如果你是在转述"
+    "之前轮次已经完成的改动，明确说明；否则现在就用工具把它真正做掉，或如实告诉"
+    "用户尚未完成。不要再次宣称没有发生过的改动。"
+)
+
 #  plan mode（只读规划态）下
 #  允许的工具白名单。deny-by-default：不在名单里的（bash/write_file/str_replace/
 #  browser/MCP/插件工具）一律拦——MCP 工具即使"看起来只读"也可能有副作用，宁可误拦。
@@ -316,8 +327,48 @@ SYNTHETIC_USER_TEXTS = frozenset(
         PLAN_MODE_ENTER_NOTE,
         PLAN_MODE_LEAVE_NOTE,
         CRYSTALLIZE_NUDGE,
+        PHANTOM_EDIT_NUDGE,
     }
 )
+
+#  产物对账护栏认定的"不改动现场"的工具：这些跑过也不算有改动证据。
+#  plan mode 白名单本身就是一份"只读工具"清单，复用它；send_message 往别人的
+#  上下文塞文本，对**本机现场**同样无副作用。白名单之外的一切（bash/写文件/
+#  MCP/插件工具）成功一次即算证据——宁可漏报不可误报：MCP 工具可能真的写了文件。
+_NON_MUTATING_TOOLS = PLAN_MODE_TOOLS | {"send_message"}
+
+#  "已创建/修改了 <路径>" 这类宣称的识别。动词前排除否定词（"没有修改"、
+#  "未创建"不算宣称）；路径要么在反引号里且长得像路径（含 . 或 /），要么是裸的
+#  带扩展名 token。英文一并认，同样排除 "not / didn't / never"。
+#  裸路径的扩展名必须以字母开头：否则 "版本 1.2.3" 会被当成文件
+_PATH_BARE = r"((?:~?/)?(?:[\w.-]+/)*[\w-]+\.[A-Za-z][A-Za-z0-9]{0,7})\b"
+_CLAIM_ZH = re.compile(
+    r"(?<!没有)(?<!没)(?<!未)(?<!不)(?<!无)(?<!否)(?<!别)(?:已经|已|刚刚|刚)?"
+    r"(?:创建|新建|生成|修改|更新|写入|写好|改好|改完|添加|删除|重写|补充)(?:了|好)?"
+    r"[^\n`]{0,15}?(?:`([^`\n]{1,120})`|" + _PATH_BARE + ")"
+)
+_CLAIM_EN = re.compile(
+    r"(?<!not )(?<!n't )(?<!never )"
+    r"\b(?:created|generated|wrote|written|modified|updated|edited|added|saved)\b"
+    r"[^\n`]{0,30}?(?:`([^`\n]{1,120})`|" + _PATH_BARE + ")",
+    re.IGNORECASE,
+)
+
+
+def phantom_claims(text: str) -> list[str]:
+    """收尾正文里宣称已创建/修改的路径（去重、保序）。只做识别，不判真伪——
+    真伪由调用方拿本轮的工具证据判：有改动证据时根本不会来问。"""
+    found: list[str] = []
+    for pattern in (_CLAIM_ZH, _CLAIM_EN):
+        for match in pattern.finditer(text):
+            quoted, bare = match.group(1), match.group(2)
+            path = (quoted or bare or "").strip()
+            #  反引号里的东西什么都可能是（函数名、命令）：只认长得像路径的
+            if quoted and not ("." in path or "/" in path):
+                continue
+            if path and path not in found:
+                found.append(path)
+    return found
 
 
 def _find_project_root(workspace: Path) -> Path:
@@ -536,6 +587,12 @@ class Agent:
         #  打转检测：连续完全相同的 (工具, 参数) 调用计数
         self._last_call_key: tuple[str, str] | None = None
         self._call_repeats = 0
+        #  失败流：同一工具连续返回 ERROR 的次数（参数可以各不相同——打转检测
+        #  管的是"原样重试"，这里管的是"微调参数硬试"）。按轮归零。
+        self._fail_streak_tool = ""
+        self._fail_streak = 0
+        #  产物对账护栏的证据：本轮成功执行过的"会改动现场"的工具次数。按轮归零。
+        self._turn_mutations = 0
         #  库层嵌入用：宿主可从任意线程/协程调用 interrupt()，线程安全，
         #  不依赖 OS 信号。_consume_stream 在下一个 chunk 边界自己发现并收尾。
         self._interrupt_flag = threading.Event()
@@ -1413,6 +1470,8 @@ class Agent:
         self._last_call_key = None
         self._call_repeats = 0
         self._exec_evidence = 0
+        self._fail_streak_tool, self._fail_streak = "", 0
+        self._turn_mutations = 0
         if self.session_log:
             self.session_log.event("clear")
 
@@ -1702,6 +1761,9 @@ class Agent:
         self._turn_write_counts.clear()
         self._turn_script_runs = 0
         self._crystallize_skip_logged = False
+        #  失败流与改动证据同样按轮归零：上一轮的失败/改动不该影响这一轮的判定
+        self._fail_streak_tool, self._fail_streak = "", 0
+        self._turn_mutations = 0
         #  UserPromptSubmit hook：block 则本轮不发生（不入历史、不调模型）
         if self.hook_engine is not None and self.hook_engine.has("UserPromptSubmit"):
             from .hooks import clip
@@ -1715,6 +1777,8 @@ class Agent:
         self._record({"role": "user", "content": user_input})
 
         nudged_empty = False
+        #  产物对账护栏每轮只追问一次：模型坚持己见也不会造出死循环
+        nudged_phantom = False
         #  Stop hook 每轮只顶回一次：hook 永远 block 也不会造出死循环
         stop_checked = False
         for _ in range(self.config.max_iterations):
@@ -1729,6 +1793,26 @@ class Agent:
                     #  把插话入历史再跑一步
                     if self._consume_steers():
                         continue
+                    #  产物对账护栏：正文宣称"已创建/修改 X"，本轮却没有一次
+                    #  成功的改动类工具——改动不存在（真实会话里模型空口宣布
+                    #  "已生成文件"，用户去找时什么都没有）。排在 Stop hook 之前：
+                    #  hook 该看到的是澄清/补做之后的收尾
+                    if not nudged_phantom and self._turn_mutations == 0:
+                        claims = phantom_claims(media.text_of(message.get("content")))
+                        if claims:
+                            nudged_phantom = True
+                            if self.session_log:
+                                self.session_log.event("phantom_edit_claim", paths=claims)
+                            self.sink.emit(
+                                Notice(
+                                    "[回复宣称已创建/修改 "
+                                    + "、".join(claims[:5])
+                                    + "，但本轮没有执行过任何改动类工具，已请模型澄清或补做]",
+                                    "warn",
+                                )
+                            )
+                            self._record({"role": "user", "content": PHANTOM_EDIT_NUDGE})
+                            continue
                     #  Stop hook：block 则把理由作为 user 消息顶回去续跑一步
                     if (
                         not stop_checked
@@ -2334,6 +2418,42 @@ class Agent:
     #  连续相同调用：达到这个次数附加提示 / 直接拒绝执行
     _REPEAT_WARN = 3
     _REPEAT_BLOCK = 5
+    #  同一工具连续失败（参数各异）：达到这个次数注入"先分析再换道"的反思提示 /
+    #  强制收敛（三选一，不许再试）。只数工具自己报的 ERROR：deny、plan mode
+    #  拦截、参数不是 JSON 这些是策略拒绝不是失败，在前面就 return 了；bash
+    #  的非零退出码走 exit_status 前缀，"跑测试→失败→改→再跑"的正常迭代不计入
+    _FAIL_REFLECT = 3
+    _FAIL_CONVERGE = 5
+
+    def _track_failure(self, name: str, ok: bool) -> int:
+        """返回该工具当前的连续失败次数（成功即归零）。"""
+        if ok:
+            self._fail_streak_tool, self._fail_streak = "", 0
+            return 0
+        if name == self._fail_streak_tool:
+            self._fail_streak += 1
+        else:
+            self._fail_streak_tool, self._fail_streak = name, 1
+        return self._fail_streak
+
+    def _failure_note(self, name: str, streak: int) -> str:
+        """失败流的回灌文案：反思阈值给一次"换道"引导，收敛阈值起强制三选一。
+        两档文案不同（不是同一句重复）：模型对反复出现的同一提示会脱敏。"""
+        if streak == self._FAIL_REFLECT:
+            return (
+                f"\n\n[提示] 这是 {name} 连续第 {streak} 次失败（参数各不相同）。"
+                "先停下来分析失败的根本原因，再决定下一步：不要微调参数继续试同一工具；"
+                "考虑换一个工具或换一条路径，或先读相关文件/文档确认前提是否成立。"
+            )
+        if streak >= self._FAIL_CONVERGE:
+            return (
+                f"\n\n[提示] {name} 已连续 {streak} 次失败，继续尝试只是消耗。请三选一：\n"
+                "1. 用完全不同的方法完成这一步；\n"
+                "2. 向用户说明卡在哪里、需要什么信息或决定（可用 ask_user）；\n"
+                "3. 如实告诉用户这一步当前无法完成及原因，继续其余工作。\n"
+                f"不要再调用 {name} 处理同一件事。"
+            )
+        return ""
 
     def _track_repeat(self, name: str, raw_args: str) -> int:
         """返回当前连续相同调用的次数（含本次）。"""
@@ -2562,6 +2682,14 @@ class Agent:
         #  PostToolUse hook：工具已执行，block 的理由作为附注拼进结果让模型看到
         #  （拼在 ERROR 判定之后，反馈不改变工具本身的成败归类——见 ok 的注释）
         ok = not output.startswith("ERROR:")
+        #  产物对账护栏的改动证据 + 失败流（附注拼在 ERROR 判定之后，同上）
+        if ok and name not in _NON_MUTATING_TOOLS:
+            self._turn_mutations += 1
+        streak = self._track_failure(name, ok)
+        if failure_note := self._failure_note(name, streak):
+            output += failure_note
+            if self.session_log:
+                self.session_log.event("tool_fail_streak", tool=name, count=streak)
         if self.hook_engine is not None and self.hook_engine.has("PostToolUse"):
             from .hooks import clip
 

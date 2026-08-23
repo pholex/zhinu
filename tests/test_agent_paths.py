@@ -1274,5 +1274,124 @@ class TestCrystallizeNudge(AgentTestCase):
         self.assertTrue(CRYSTALLIZE_NUDGE.startswith("[系统提示]"))
 
 
+class PhantomEditGuardTest(AgentTestCase):
+    """产物对账护栏：收尾正文宣称"已创建/修改 X"，本轮却没有一次成功的改动类
+    工具——追问一次（每轮最多一次），有真实改动证据时不问。"""
+
+    def _nudges(self, agent) -> list[dict]:
+        from xiaoyu.agent import PHANTOM_EDIT_NUDGE
+
+        return [m for m in agent.messages if m.get("role") == "user" and m.get("content") == PHANTOM_EDIT_NUDGE]
+
+    def test_claim_without_mutation_is_challenged_once(self) -> None:
+        script = [
+            [chunk("我已经创建了 `foo.py` 并修改了 bar.md。"), usage_chunk(10, 5)],
+            #  模型坚持己见：不再追问第二次，本轮到此结束
+            [chunk("我确实已经创建了 foo.py。"), usage_chunk(10, 5)],
+        ]
+        agent = self.build(script)
+        with contextlib.redirect_stdout(io.StringIO()):
+            agent.send("建个文件")
+        self.assertEqual(len(self._nudges(agent)), 1)
+        self.assertEqual(len(self.client.completions.calls), 2)
+        self.assertFalse((self.root / "foo.py").exists())
+
+    def test_real_write_is_evidence(self) -> None:
+        script = [
+            [
+                chunk(
+                    tool_calls=[
+                        call_fragment(
+                            0, "c1", "write_file", json.dumps({"path": "foo.py", "content": "x = 1\n"})
+                        )
+                    ]
+                ),
+                usage_chunk(10, 5),
+            ],
+            [chunk("已创建 `foo.py`。"), usage_chunk(10, 5)],
+        ]
+        agent = self.build(script)
+        with contextlib.redirect_stdout(io.StringIO()):
+            agent.send("建个文件")
+        self.assertEqual(self._nudges(agent), [])
+        self.assertEqual(len(self.client.completions.calls), 2)
+
+    def test_read_only_tools_are_not_evidence(self) -> None:
+        script = [
+            [
+                chunk(tool_calls=[call_fragment(0, "c1", "read_file", json.dumps({"path": "calc.py"}))]),
+                usage_chunk(10, 5),
+            ],
+            [chunk("我已经修改了 calc.py，加了减法。"), usage_chunk(10, 5)],
+            [chunk("抱歉，实际上还没改。"), usage_chunk(10, 5)],
+        ]
+        agent = self.build(script)
+        with contextlib.redirect_stdout(io.StringIO()):
+            agent.send("加个减法")
+        self.assertEqual(len(self._nudges(agent)), 1)
+
+    def test_plain_reply_not_challenged(self) -> None:
+        agent = self.build([[chunk("这个文件没有修改 calc.py 的必要，版本是 1.2.3。"), usage_chunk(10, 5)]])
+        with contextlib.redirect_stdout(io.StringIO()):
+            agent.send("看看")
+        self.assertEqual(self._nudges(agent), [])
+        self.assertEqual(len(self.client.completions.calls), 1)
+
+    def test_nudge_is_registered_as_synthetic(self) -> None:
+        from xiaoyu.agent import PHANTOM_EDIT_NUDGE, SYNTHETIC_USER_TEXTS
+
+        self.assertIn(PHANTOM_EDIT_NUDGE, SYNTHETIC_USER_TEXTS)
+
+
+class ToolFailureStreakTest(AgentTestCase):
+    """失败流：同一工具连续 ERROR（参数各异）第 3 次给"先分析再换道"提示，
+    第 5 次起强制收敛；成功或换工具即归零。"""
+
+    def _fail(self, agent, index: int, tool: str = "str_replace") -> str:
+        args = {"path": f"missing{index}.py", "old_str": "a", "new_str": "b"}
+        call = {"id": f"f{index}", "function": {"name": tool, "arguments": json.dumps(args)}}
+        with contextlib.redirect_stdout(io.StringIO()):
+            return agent._execute(call)["content"]
+
+    def test_reflect_then_converge(self) -> None:
+        agent = self.build([])
+        outputs = [self._fail(agent, i) for i in range(6)]
+        for text in outputs:
+            self.assertTrue(text.startswith("ERROR:"), "附注不改变成败归类")
+        self.assertNotIn("[提示]", outputs[1])
+        self.assertIn("连续第 3 次失败", outputs[2])
+        self.assertNotIn("[提示]", outputs[3], "两档之间不唠叨")
+        self.assertIn("三选一", outputs[4])
+        self.assertIn("三选一", outputs[5], "收敛档之后每次都提醒")
+
+    def test_success_resets(self) -> None:
+        agent = self.build([])
+        self._fail(agent, 0)
+        self._fail(agent, 1)
+        ok = {"id": "ok", "function": {"name": "write_file", "arguments": json.dumps({"path": "fresh.py", "content": "x = 1\n"})}}
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertFalse(agent._execute(ok)["content"].startswith("ERROR:"))
+        self.assertNotIn("[提示]", self._fail(agent, 2))
+
+    def test_switching_tool_resets(self) -> None:
+        agent = self.build([])
+        self._fail(agent, 0)
+        self._fail(agent, 1)
+        other = {"id": "s", "function": {"name": "read_file", "arguments": json.dumps({"path": "nope.py"})}}
+        with contextlib.redirect_stdout(io.StringIO()):
+            out = agent._execute(other)["content"]
+        self.assertTrue(out.startswith("ERROR:"))
+        self.assertNotIn("[提示]", out)
+        self.assertNotIn("[提示]", self._fail(agent, 2), "换过工具后 str_replace 重新从 1 数")
+
+    def test_streak_resets_per_turn(self) -> None:
+        agent = self.build([[chunk("好"), usage_chunk(10, 5)]])
+        self._fail(agent, 0)
+        self._fail(agent, 1)
+        with contextlib.redirect_stdout(io.StringIO()):
+            agent.send("新的一轮")
+        self.assertNotIn("[提示]", self._fail(agent, 2))
+
+
 if __name__ == "__main__":
     unittest.main()
