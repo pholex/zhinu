@@ -212,3 +212,125 @@ class DelegationTest(AgentTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class DistillHistoryTest(unittest.TestCase):
+    """inherit = "distilled"：父会话历史 → 只剩用户原话与最终答复的精简副本。"""
+
+    def _history(self):
+        from xiaoyu.agent import WRAPUP_INSTRUCTION
+        from xiaoyu.compaction import CONTEXT_PREFIX
+
+        return [
+            {"role": "system", "content": "sys"},
+            {"role": "user", "content": "任务一" + CONTEXT_PREFIX + "【摘要】旧摘要"},
+            {"role": "assistant", "content": "", "tool_calls": [{"id": "c1"}], "_reasoning": "想"},
+            {"role": "tool", "tool_call_id": "c1", "content": "工具输出"},
+            {"role": "user", "content": "<system-reminder>\n通知\n</system-reminder>"},
+            {"role": "assistant", "content": "答一"},
+            {"role": "user", "content": WRAPUP_INSTRUCTION},
+            {"role": "user", "content": "[系统提示] 进入 plan mode /tmp/x.md"},
+            {"role": "user", "content": [{"type": "text", "text": "任务二"}, {"type": "image_url", "image_url": {"url": "data:x"}}]},
+            {"role": "assistant", "content": "答二"},
+            {"role": "user", "content": "任务三"},
+        ]
+
+    def test_keeps_user_voice_and_final_answers_only(self):
+        from xiaoyu.agent import SYNTHETIC_USER_TEXTS
+
+        out = agents_mod.distill_history(
+            self._history(), max_tokens=100_000, synthetic_texts=SYNTHETIC_USER_TEXTS
+        )
+        self.assertEqual(
+            out,
+            [
+                {"role": "user", "content": "任务一"},
+                {"role": "assistant", "content": "答一"},
+                {"role": "user", "content": "任务二[图片]"},
+                {"role": "assistant", "content": "答二"},
+                {"role": "user", "content": "任务三"},
+            ],
+        )
+        #  纯函数：再蒸馏一次不变
+        self.assertEqual(agents_mod.distill_history(out, max_tokens=100_000), out)
+
+    def test_budget_cuts_oldest_whole_turns(self):
+        history = self._history()
+        full = agents_mod.distill_history(history, max_tokens=100_000)
+        #  只够装最后两轮（任务二/答二 + 任务三）：最老一轮整轮丢、不留半轮
+        from xiaoyu import tokens
+
+        last_two = tokens.estimate_messages(full[2:])
+        out = agents_mod.distill_history(history, max_tokens=last_two)
+        self.assertEqual(out, full[2:])
+        self.assertEqual(agents_mod.distill_history(history, max_tokens=0), [])
+        self.assertEqual(agents_mod.distill_history([], max_tokens=100), [])
+
+
+class InheritSpecTest(AgentTestCase):
+    def _load(self):
+        with mock.patch.object(agents_mod, "user_config_dir", lambda: self.root / "cfg"):
+            return load_agent_specs(self.root)
+
+    def test_inherit_parsed_and_validated(self):
+        base = self.root / ".xiaoyu" / "agents"
+        write_spec(base, "aa", GOOD_SPEC + 'inherit = "distilled"\n')
+        write_spec(base, "bb", GOOD_SPEC + 'inherit = "none"\n')
+        write_spec(base, "cc", GOOD_SPEC + 'inherit = "full"\n')
+        specs, problems = self._load()
+        self.assertEqual({s.name: s.inherit for s in specs}, {"aa": "distilled", "bb": ""})
+        self.assertTrue(any("cc.toml" in p and "inherit" in p for p in problems))
+
+    def test_distilled_delegation_seeds_child_history(self):
+        spec = AgentSpec(
+            name="doc_reader", description="查文档", system_prompt="只查不改，工作区 {workspace}",
+            tools=("read_file", "grep", "list_files"), inherit="distilled",
+        )
+        runs: dict = {}
+        agent = self.build(
+            [
+                text_turn("先回一句"),                                   # 主：第一轮答复
+                _sub_tool_call("doc_reader", "查 calc.py"),              # 主：第二轮委托
+                text_turn("calc.py 里有 add"),                           # 子：结论
+                text_turn("查完了"),                                     # 主：收尾
+            ]
+        )
+        agent.toolbox.register(
+            make_subagent_tool(
+                spec, self.config, agent.registry, agent.usage, agent.sink,
+                agent.approver, agent.permissions, runs=runs,
+                parent_history=lambda: agent.messages,
+            )
+        )
+        with contextlib.redirect_stdout(io.StringIO()):
+            agent.send("第一句")
+            agent.send("看看文档")
+        record = next(iter(runs.values()))
+        roles = [(m["role"], m.get("content")) for m in record.messages[:4]]
+        self.assertEqual(roles[0][0], "system")
+        self.assertIn("[继承上下文]", roles[0][1])
+        #  父会话两轮的用户原话 + 第一轮最终答复进了子 agent 起始历史，
+        #  委托任务紧随其后；父 agent 发起委托的那条 tool_call 没带过来
+        self.assertEqual(roles[1:4], [("user", "第一句"), ("assistant", "先回一句"), ("user", "看看文档")])
+        self.assertEqual(record.messages[4]["content"], "查 calc.py")
+        self.assertFalse(any(m.get("tool_calls") for m in record.messages[:5]))
+
+    def test_default_inherit_leaves_child_blank(self):
+        spec = AgentSpec(
+            name="doc_reader", description="查文档", system_prompt="工作区 {workspace}",
+            tools=("read_file",),
+        )
+        runs: dict = {}
+        agent = self.build([_sub_tool_call("doc_reader", "查"), text_turn("子答"), text_turn("主答")])
+        agent.toolbox.register(
+            make_subagent_tool(
+                spec, self.config, agent.registry, agent.usage, agent.sink,
+                agent.approver, agent.permissions, runs=runs,
+                parent_history=lambda: agent.messages,
+            )
+        )
+        with contextlib.redirect_stdout(io.StringIO()):
+            agent.send("看看")
+        record = next(iter(runs.values()))
+        self.assertEqual(record.messages[1]["content"], "查")
+        self.assertNotIn("[继承上下文]", record.messages[0]["content"])

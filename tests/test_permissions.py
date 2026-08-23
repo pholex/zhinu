@@ -119,6 +119,75 @@ class DecideTest(unittest.TestCase):
         self.assertEqual(perms.decide("bash", {"command": "rm -rf x"}), "deny")
 
 
+class CommandKeyGrantTest(unittest.TestCase):
+    """bash 的"本会话允许"按命令头记，不按工具名：答一次 a 不交出整个 shell。"""
+
+    def perms(self) -> Permissions:
+        return Permissions(Path("/tmp"))
+
+    def test_keys(self):
+        from xiaoyu.permissions import command_keys
+
+        self.assertEqual(command_keys("git status"), ("git status",))
+        self.assertEqual(command_keys("git -C x status"), None)  # 参数注入口
+        self.assertEqual(command_keys("rg foo src/"), ("rg",))
+        self.assertEqual(command_keys("/usr/bin/rg foo"), ("rg",))
+        self.assertEqual(command_keys("npm -v"), ("npm",))  # 选项不是子命令
+        self.assertEqual(command_keys("git add . && git status | head"), ("git add", "git status", "head"))
+        #  wrapper / shell -c / 批量执行器永远推不出键
+        for command in ("sudo ls", "bash -c ls", "sh -c 'rm x'", "env FOO=1 ls", "xargs rm", "timeout 5 ls"):
+            self.assertIsNone(command_keys(command), command)
+        #  危险命令、看不懂的形状也不给键
+        self.assertIsNone(command_keys("rm -rf build"))
+        self.assertIsNone(command_keys("ls $(cat x)"))
+        self.assertIsNone(command_keys(""))
+
+    def test_git_status_grant_is_narrow(self):
+        perms = self.perms()
+        self.assertEqual(perms.grant_session_call("bash", {"command": "git status"}), "git status")
+        self.assertEqual(perms.decide("bash", {"command": "git status -s"}), "allow")
+        self.assertEqual(perms.decide("bash", {"command": "git commit -m x"}), "ask")
+        self.assertEqual(perms.decide("bash", {"command": "curl http://x"}), "ask")
+        #  git status 放行过，但 git -c 带注入口的形态照问
+        self.assertEqual(perms.decide("bash", {"command": "git -c core.pager=sh status"}), "ask")
+
+    def test_pipeline_needs_every_segment(self):
+        perms = self.perms()
+        perms.grant_session_call("bash", {"command": "git status"})
+        self.assertEqual(perms.decide("bash", {"command": "git status | head"}), "ask")
+        self.assertEqual(perms.grant_session_call("bash", {"command": "head x"}), "head")
+        self.assertEqual(perms.decide("bash", {"command": "git status | head"}), "allow")
+
+    def test_shell_c_never_session_keyed(self):
+        perms = self.perms()
+        self.assertIsNone(perms.session_grant_label("bash", {"command": "bash -c 'ls'"}))
+        self.assertIsNone(perms.grant_session_call("bash", {"command": "bash -c 'ls'"}))
+        self.assertEqual(perms.session_commands, set())
+        self.assertEqual(perms.decide("bash", {"command": "bash -c 'ls'"}), "ask")
+
+    def test_dangerous_not_granted_even_after_key(self):
+        perms = self.perms()
+        perms.grant_session_call("bash", {"command": "rm x"})
+        self.assertEqual(perms.session_commands, {"rm"})
+        self.assertEqual(perms.decide("bash", {"command": "rm y"}), "allow")
+        self.assertEqual(perms.decide("bash", {"command": "rm -rf y"}), "ask")
+
+    def test_non_bash_tools_unchanged(self):
+        perms = self.perms()
+        self.assertEqual(perms.session_grant_label("write_file", {"path": "a.py"}), "write_file")
+        self.assertEqual(perms.grant_session_call("write_file", {"path": "a.py"}), "write_file")
+        self.assertEqual(perms.session_allowed, {"write_file"})
+        self.assertEqual(perms.decide("write_file", {"path": "b.py"}), "allow")
+        self.assertIn("write_file", perms.describe())
+        perms.grant_session_call("bash", {"command": "ls"})
+        self.assertIn("ls", perms.describe())
+
+    def test_deny_beats_session_key(self):
+        perms = Permissions(Path("/tmp"), [parse_rule("deny bash(git push*)")])
+        perms.grant_session_call("bash", {"command": "git push"})
+        self.assertEqual(perms.decide("bash", {"command": "git push origin main"}), "deny")
+
+
 class PersistenceTest(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -219,8 +288,11 @@ class ConfirmSessionGrantTest(unittest.TestCase):
             io.StringIO()
         ):
             self.assertTrue(confirm("bash", {"command": "ls"}))
-        self.assertIn("bash", perms.session_allowed)
-        self.assertEqual(perms.decide("bash", {"command": "任何命令"}), "allow")
+        #  bash 的会话授权按命令头记：ls 放行了，别的命令照问
+        self.assertEqual(perms.session_commands, {"ls"})
+        self.assertEqual(perms.session_allowed, set())
+        self.assertEqual(perms.decide("bash", {"command": "ls -la"}), "allow")
+        self.assertEqual(perms.decide("bash", {"command": "任何命令"}), "ask")
 
     def test_answer_y_allows_once_without_grant(self):
         from xiaoyu.cli import make_confirm

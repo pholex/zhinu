@@ -1655,10 +1655,10 @@ class Tui:
             if reason := command_check.command_risk(str(args.get("command", ""))):
                 self.console.print(Text(f"  ⚠ 注意：{reason}", style="status.warning"))
 
-        options: list[tuple[str, str, str]] = [
-            ("once", "允许一次", "y"),
-            ("session", f"本会话内 {name} 都允许，不再询问", "a"),
-        ]
+        options: list[tuple[str, str, str]] = [("once", "允许一次", "y")]
+        #  bash 的会话授权按命令头记（git status / rg…），推不出头的调用没有这个选项
+        if (scope := self.permissions.session_grant_label(name, args)) is not None:
+            options.append(("session", f"本会话内 {scope} 都允许，不再询问", "a"))
         rule = suggest_allow_rule(name, args, self.permissions.workspace)
         if rule is not None:
             options.append(("always", f"总是允许（规则写入前可编辑：{rule}）", "!"))
@@ -1676,8 +1676,8 @@ class Tui:
         if choice == "once":
             return self._accept("✔ 已允许（仅此一次）", amend)
         if choice == "session":
-            self.permissions.grant_session(name)
-            return self._accept(f"✔ 本会话内 {name} 不再逐次确认（/perm 可查看）", amend)
+            scope = self.permissions.grant_session_call(name, args)
+            return self._accept(f"✔ 本会话内 {scope} 不再逐次确认（/perm 可查看）", amend)
         if choice == "always":
             assert rule is not None  # 只有推导出规则才有这个选项
             edited = self._ask_rule(str(rule))
@@ -1800,10 +1800,13 @@ class Tui:
 
         verdict = interpret_confirm_answer(answer)
         if verdict is GRANT_SESSION:
-            self.permissions.grant_session(name)
-            self.console.print(
-                Text(f"  （本次会话内 {name} 不再逐次确认；/perm 可查看）", style="text.secondary")
+            scope = self.permissions.grant_session_call(name, args)
+            note = (
+                f"  （本次会话内 {scope} 不再逐次确认；/perm 可查看）"
+                if scope is not None
+                else "  （这条命令推不出会话授权范围，仅本次允许）"
             )
+            self.console.print(Text(note, style="text.secondary"))
             return True
         return verdict
 

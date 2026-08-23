@@ -86,6 +86,60 @@ _MULTIWORD_PREFIXES = frozenset({
     "uv", "go", "poetry", "gh", "brew", "conda", "make",
 })
 
+#  会话授权不给键的命令头：透传 wrapper / 会把参数当脚本跑的 shell / 批量执行器。
+#  它们"放行一次"时用户看的是里面那条命令，下次里面换成别的就不是同一件事了——
+#  这类头永远逐次确认，不进会话授权。
+_NO_SESSION_KEY = frozenset(
+    {"sudo", "doas", "nice", "nohup", "time", "timeout", "stdbuf", "command", "env", "xargs"}
+    | {"bash", "sh", "zsh", "dash", "ksh", "fish"}
+)
+
+
+def _plain_argvs(command: str) -> list[list[str]] | None:
+    """命令 → 各段 argv；看不懂返回 None（与 _allowed 同一保守面）。"""
+    if os.name != "nt" and bash_ast.available():
+        argvs = bash_ast.parse_plain_commands(command)
+        return argvs or None
+    if any(marker in command for marker in _ALLOW_UNSAFE_MARKERS):
+        return None
+    argvs = []
+    for part in _SEGMENT_SPLIT.split(command):
+        if not part.strip():
+            continue
+        try:
+            argvs.append(shlex.split(part))
+        except ValueError:
+            return None
+    return argvs or None
+
+
+def command_keys(command: str) -> tuple[str, ...] | None:
+    """会话授权键：命令每一段一个键（git status / rg / npm test…）。
+
+    答"本会话允许"记的是这些键，不是工具名——`git status` 上答一次，
+    后面 `git status -s` 免问，`git commit`、`curl` 照问。推不出键（看不懂 /
+    危险命令 / 参数注入口 / wrapper 与 `sh -c` 这类头）返回 None：这种调用
+    只能一次一批。
+    """
+    command = command.strip()
+    if not command or command_check.dangerous_command(command):
+        return None
+    argvs = _plain_argvs(command)
+    if argvs is None:
+        return None
+    keys: list[str] = []
+    for argv in argvs:
+        if not argv or command_check.injection_risk_argv(argv):
+            return None
+        head = Path(argv[0]).name
+        if head in _NO_SESSION_KEY:
+            return None
+        if head in _MULTIWORD_PREFIXES and len(argv) > 1 and not argv[1].startswith("-"):
+            keys.append(f"{head} {argv[1]}")
+        else:
+            keys.append(head)
+    return tuple(keys)
+
 
 def suggest_allow_rule(name: str, args: dict, workspace: Path) -> Rule | None:
     """从一次待确认的调用推导「总是允许」的持久规则；推不出返回 None。
@@ -243,8 +297,11 @@ class Permissions:
     def __init__(self, workspace: Path, rules: list[Rule] | None = None) -> None:
         self.workspace = workspace
         self.rules: list[Rule] = list(rules or [])
-        #  会话内"全部允许"的工具名（确认框答 a），退出即失效
+        #  会话内"全部允许"的工具名（非命令类工具答 a），退出即失效
         self.session_allowed: set[str] = set()
+        #  会话内已放行的命令键（见 command_keys）：bash 的会话授权按命令头记，
+        #  不按工具名——答一次 a 不该把整个 shell 都交出去
+        self.session_commands: set[str] = set()
 
     @classmethod
     def load(cls, workspace: Path, include_workspace: bool = True) -> "Permissions":
@@ -304,9 +361,13 @@ class Permissions:
         for rule in self.rules:
             if rule.behavior == "deny" and self._deny_matches(rule, name, args):
                 return "deny", rule
-        #  2. 会话授权
+        #  2. 会话授权：工具名（非命令类）或命令键（bash，每段都要已放行）
         if name in self.session_allowed:
             return "allow", None
+        if name == "bash" and self.session_commands:
+            keys = command_keys(str(args.get("command", "")))
+            if keys and all(key in self.session_commands for key in keys):
+                return "allow", None
         #  3. allow 规则（bash 是多条规则联合判定：每一段命中任一条即可）
         if self._allowed(name, args):
             return "allow", None
@@ -397,7 +458,28 @@ class Permissions:
     # ---------- 变更 ----------
 
     def grant_session(self, name: str) -> None:
+        """按工具名放行整个会话——只给非命令类工具用；bash 走 grant_session_call。"""
         self.session_allowed.add(name)
+
+    def session_grant_label(self, name: str, args: dict) -> str | None:
+        """确认框"本会话允许"选项的文案主体；None = 这次调用推不出会话授权范围，
+        选项不该出现。一处定义，三个前端（TUI / 明文 / ACP）同用。"""
+        if name != "bash":
+            return name
+        keys = command_keys(str(args.get("command", "")))
+        return " 与 ".join(keys) if keys else None
+
+    def grant_session_call(self, name: str, args: dict) -> str | None:
+        """落地一次"本会话允许"：bash 记命令键，其它工具记工具名。
+        返回放行范围的文案；推不出范围时不记任何东西并返回 None。"""
+        label = self.session_grant_label(name, args)
+        if label is None:
+            return None
+        if name == "bash":
+            self.session_commands.update(command_keys(str(args.get("command", ""))) or ())
+        else:
+            self.session_allowed.add(name)
+        return label
 
     def add_persistent(self, rule: Rule) -> Path:
         """把规则追加到用户级规则文件并立即生效。
@@ -422,6 +504,8 @@ class Permissions:
             lines += [f"  {rule}" for rule in self.rules]
         if self.session_allowed:
             lines.append("会话内已全部允许：" + ", ".join(sorted(self.session_allowed)))
+        if self.session_commands:
+            lines.append("会话内已放行的命令：" + ", ".join(sorted(self.session_commands)))
         if not lines:
             lines.append("没有配置任何权限规则（写文件/执行命令走逐次确认）。")
             lines.append(f"规则文件：{user_rules_path()}")

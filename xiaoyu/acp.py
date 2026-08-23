@@ -1688,14 +1688,22 @@ class AcpServer:
         )
         options: list[dict[str, Any]] = [
             {"optionId": "allow-once", "name": "允许", "kind": "allow_once"},
+        ]
+        scope = (
+            session.agent.permissions.session_grant_label(name, args)
+            if session is not None
+            else name
+        )
+        if scope is not None:
             #  协议没有"会话作用域"的 kind：借最接近的 allow_always 渲染，
             #  真实语义由 optionId 承载、回程按 id 还原
-            {
-                "optionId": "allow-session",
-                "name": f"本会话内 {name} 都允许",
-                "kind": "allow_always",
-            },
-        ]
+            options.append(
+                {
+                    "optionId": "allow-session",
+                    "name": f"本会话内 {scope} 都允许",
+                    "kind": "allow_always",
+                }
+            )
         if rule is not None:
             options.append(
                 {
@@ -1729,12 +1737,13 @@ class AcpServer:
         while not event.wait(0.2):
             if self._closed:
                 return Deny("acp 连接已关闭，无人审批")
-        return self._resolve_verdict(session, name, rule, slot.get("result"))
+        return self._resolve_verdict(session, name, args, rule, slot.get("result"))
 
     def _resolve_verdict(
         self,
         session: "_Session | None",
         name: str,
+        args: dict[str, Any],
         rule: Any,
         payload: Any,
     ) -> Allow | Deny:
@@ -1754,10 +1763,11 @@ class AcpServer:
         if option == "allow-once":
             return Allow()
         if option == "allow-session" and session is not None:
-            session.agent.permissions.grant_session(name)
-            session.sink.emit(
-                Notice(f"[本会话内 {name} 不再逐次确认（/perm 可查看）]", "info")
-            )
+            scope = session.agent.permissions.grant_session_call(name, args)
+            if scope is not None:
+                session.sink.emit(
+                    Notice(f"[本会话内 {scope} 不再逐次确认（/perm 可查看）]", "info")
+                )
             return Allow()
         if option == "allow-always" and session is not None and rule is not None:
             try:
