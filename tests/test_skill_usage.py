@@ -109,7 +109,8 @@ class ImplicitLoadTest(SkillUsageTest):
         self.assertEqual(
             skill_usage.implicit_loads("sed -n 1,40p a/SKILL.md", [a], cwd=self.root), ["a"]
         )
-        with mock.patch.dict("os.environ", {"HOME": str(self.root)}):
+        #  Windows 的 expanduser 读 USERPROFILE 而非 HOME，两个一起打
+        with mock.patch.dict("os.environ", {"HOME": str(self.root), "USERPROFILE": str(self.root)}):
             self.assertEqual(skill_usage.implicit_loads("head ~/a/SKILL.md", [a]), ["a"])
             self.assertEqual(skill_usage.implicit_loads("cat $HOME/a/references/x.md", [a]), ["a"])
 
