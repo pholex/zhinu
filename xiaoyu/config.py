@@ -65,6 +65,10 @@ def context_window(model: str) -> int:
 # explore 子 agent 用的模型：只做只读检索，翻代码最费 token，交给最便宜的。
 DEFAULT_EXPLORE_MODEL = "deepseek-v4-flash"
 
+#  effort 取值并集：none/minimal 是 OpenAI 线专有，xhigh/max 是 Anthropic/GPT-5 线，
+#  low/medium/high 三家通吃。这里只做拼写把关，不按模型裁剪——是否支持由上游裁决
+EFFORT_LEVELS = ("none", "minimal", "low", "medium", "high", "xhigh", "max")
+
 KEYCHAIN_SERVICE = "XIAOYU_API_KEY"
 
 #  网关 key 的键名序列：自己的名字优先，LiteLLM 生态惯用名兜底——
@@ -288,6 +292,11 @@ class Config:
     #  供宿主进程把 xiaoyu 当执行引擎嵌入时注入身份/人格，
     #  不是项目指令——项目级规范走 AGENTS.md 那条路。
     append_system_prompt: str | None = None
+    #  推理深度（effort）。空 = 不传，上游按自家默认。取值见 EFFORT_LEVELS；
+    #  三条协议各自翻译（chat: reasoning_effort / Responses: reasoning.effort /
+    #  Anthropic: output_config.effort），不认的上游会 400——宁可报错也不静默丢。
+    #  子 agent 可在 spec 里单独声明（只读探索给 low，总控给 high/xhigh）。
+    effort: str = ""
     #  估算用量占到上限的这个比例时触发压缩。
     compact_at: float = 0.7
     #  压缩时至少保留最近这么多条消息（实际切点会往后找到 user 消息边界）。
@@ -355,6 +364,8 @@ class Config:
         if keep := os.environ.get("XIAOYU_KEEP_RECENT"):
             with contextlib.suppress(ValueError):
                 cfg.keep_recent = int(keep)
+        if level := os.environ.get("XIAOYU_EFFORT", "").strip().lower():
+            cfg.effort = level
         if ratio := os.environ.get("XIAOYU_COMPACT_AT"):
             with contextlib.suppress(ValueError):
                 cfg.compact_at = float(ratio)

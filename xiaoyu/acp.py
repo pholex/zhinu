@@ -979,6 +979,7 @@ def build_agent_factory(
     model: str | None = None,
     base_url: str | None = None,
     append_system_prompt: str | None = None,
+    effort: str | None = None,
     auto_approve: bool | None = None,
     mode: str | None = None,
     sandbox: bool | None = None,
@@ -1028,6 +1029,7 @@ def build_agent_factory(
             sandbox=sandbox,
             sandbox_network=sandbox_network,
             append_system_prompt=append_system_prompt or None,
+            effort=effort or None,
             workspace_trusted=trusted,
         )
         permissions = Permissions.load(config.workspace, include_workspace=trusted)

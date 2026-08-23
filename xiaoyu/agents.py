@@ -10,6 +10,7 @@
     isolation = "worktree"                       # 可省：默认在独立 git worktree 里跑
     mcp = ["github"]                             # 可省：继承父会话的哪些 MCP server
     model = "deepseek-v4-pro"                    # 可省：默认随主模型
+    effort = "low"                               # 可省：推理深度，默认随主会话
     max_iterations = 30                          # 可省：默认 20
     inherit = "distilled"                        # 可省：带父会话的精简历史起步
 
@@ -73,7 +74,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from . import compaction, media, tokens, ui, worktree
-from .config import Config, user_config_dir
+from .config import EFFORT_LEVELS, Config, user_config_dir
 from .events import Notice, UISink
 from .tools import Tool, Toolbox
 
@@ -146,6 +147,7 @@ class AgentSpec:
     system_prompt: str
     tools: tuple[str, ...]
     model: str = ""  # 空 = 随主模型
+    effort: str = ""  # 空 = 随主会话；取值见 config.EFFORT_LEVELS
     max_iterations: int = _DEFAULT_ITERATIONS
     capability_mode: str = ""  # 空 = 不设天花板（tools 白名单即是全部约束）
     isolation: str = ""  # "" | "worktree"（spec 级默认，调用参数可覆盖）
@@ -338,6 +340,11 @@ def _parse_spec(path: Path, source: str) -> tuple[AgentSpec | None, list[str]]:
         return None, [
             f"{path.name}: inherit 不认识 {raw_inherit!r}（可选 {' / '.join(INHERIT_MODES)}）"
         ]
+    raw_effort = str(data.get("effort", "") or "").strip().lower()
+    if raw_effort and raw_effort not in EFFORT_LEVELS:
+        return None, [
+            f"{path.name}: effort 不认识 {raw_effort!r}（可选 {' / '.join(EFFORT_LEVELS)}）"
+        ]
     try:
         iterations = int(data.get("max_iterations", _DEFAULT_ITERATIONS))
     except (TypeError, ValueError):
@@ -349,6 +356,7 @@ def _parse_spec(path: Path, source: str) -> tuple[AgentSpec | None, list[str]]:
             system_prompt=system_prompt,
             tools=tools,
             model=str(data.get("model", "") or ""),
+            effort=raw_effort,
             max_iterations=max(1, min(iterations, 100)),
             capability_mode=mode,
             isolation=isolation,
@@ -583,6 +591,8 @@ def execute_delegation(
         summary_model=config.summary_model,
         explore_model=config.explore_model,
         workspace=workdir,
+        #  spec 声明 > 主会话；只读探索类子 agent 适合 low，总控类给 high
+        effort=spec.effort or config.effort,
         max_iterations=spec.max_iterations,
         max_tool_output=config.max_tool_output,
         context_limit_override=config.context_limit_override,

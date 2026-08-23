@@ -64,6 +64,7 @@ XIAOYU_API_KEY=<key>
 
 | 变量 | 默认值 | 说明 |
 |---|---|---|
+| `XIAOYU_EFFORT` | 不传 | 推理深度 `low / medium / high / xhigh / max`（OpenAI 线另有 `none / minimal`）。同一个名字出内核，按协议翻译成 `reasoning_effort` / `reasoning.effort` / `output_config.effort`；上游不认的取值会 400。命令行 `--effort`，会话里 `/effort`，子 agent 可在 spec 里单独声明 |
 | `XIAOYU_CONTEXT_LIMIT` | 按模型查表 | 上下文上限（token）覆写 |
 | `XIAOYU_COMPACT_AT` | `0.7` | 用量占到这个比例时触发回收/压缩 |
 | `XIAOYU_KEEP_RECENT` | `8` | 压缩时至少保留最近几条消息 |

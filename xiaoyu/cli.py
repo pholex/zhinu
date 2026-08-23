@@ -33,6 +33,7 @@ from .session_log import (
 from .config import (
     DEFAULT_MODEL,
     DEFAULT_SUMMARY_MODEL,
+    EFFORT_LEVELS,
     Config,
     MissingConfig,
     _parse_dotenv,
@@ -58,6 +59,7 @@ SLASH_COMMANDS: dict[str, str] = {
     "/skills": "列出可用技能；/skills reload 重扫磁盘并刷新索引",
     "/model": "查看或切换模型（/model 名字）",
     "/usage": "本次会话的 token 统计",
+    "/effort": "查看或设置推理深度（/effort low|medium|high|xhigh|max）",
     "/context": "当前上下文占用与压缩状态",
     "/compact": "立刻压缩历史（不等阈值）",
     "/mode": "切换模式（/mode default|auto|plan），TUI 里 Shift-Tab 同效",
@@ -114,6 +116,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--append-system-prompt",
         dest="append_system_prompt",
         help="追加到内置 system prompt 末尾，用于宿主进程嵌入 xiaoyu 时注入身份/人格",
+    )
+    parser.add_argument(
+        "--effort",
+        choices=list(EFFORT_LEVELS),
+        help="推理深度（默认不传、随上游默认）；会话里可用 /effort 改",
     )
     parser.add_argument(
         "--env-file",
@@ -1166,6 +1173,7 @@ def serve_command(argv: list[str]) -> int:
     parser.add_argument("--model", help="默认模型名，会话可覆盖")
     parser.add_argument("--base-url", dest="base_url", help="OpenAI 兼容端点")
     parser.add_argument("--mode", choices=modes.CYCLE, help="默认交互模式，会话可覆盖")
+    parser.add_argument("--effort", choices=list(EFFORT_LEVELS), help="默认推理深度，agent 对象可覆盖")
     parser.add_argument(
         "--approval",
         choices=("ask", "allow_all"),
@@ -1242,6 +1250,7 @@ def serve_command(argv: list[str]) -> int:
         model=args.model or "",
         base_url=args.base_url or "",
         mode=args.mode or "",
+        effort=args.effort or "",
         approval=args.approval,
         approval_timeout=args.approval_timeout,
         max_sessions=max(1, args.max_sessions),
@@ -2378,6 +2387,7 @@ def main(argv: list[str] | None = None) -> int:
             sandbox=args.sandbox,
             sandbox_network=args.sandbox_network,
             append_system_prompt=args.append_system_prompt,
+            effort=args.effort,
             workspace_trusted=trust.trusted,
         )
         permissions = Permissions.load(config.workspace, include_workspace=trust.trusted)
@@ -2455,6 +2465,7 @@ def wire_main(args: argparse.Namespace, workspace_trusted: bool = True) -> int:
             sandbox=args.sandbox,
             sandbox_network=args.sandbox_network,
             append_system_prompt=args.append_system_prompt,
+            effort=args.effort,
             workspace_trusted=workspace_trusted,
         )
         permissions = Permissions.load(config.workspace, include_workspace=workspace_trusted)
@@ -2501,6 +2512,7 @@ def acp_main(args: argparse.Namespace) -> int:
             model=args.model,
             base_url=args.base_url,
             append_system_prompt=args.append_system_prompt,
+            effort=args.effort,
             auto_approve=args.yolo or None,
             mode=args.mode,
             sandbox=args.sandbox,
@@ -2891,6 +2903,18 @@ def handle_slash(agent: Agent, line: str, select: Any = None) -> bool:
                     print(f"    {name}")
             chain = " → ".join(route.qualified for route in agent.model_chain())
             print(ui.secondary(f"降级链：{chain}"))
+    elif command == "/effort":
+        if rest:
+            level = rest[0].strip().lower()
+            if level in ("off", "default"):
+                level = ""
+            if level and level not in EFFORT_LEVELS:
+                print(ui.secondary(f"effort 只认 {' / '.join(EFFORT_LEVELS)}，或 off 恢复默认"))
+            else:
+                agent.config.effort = level
+                print(ui.secondary(f"推理深度：{level or '上游默认'}"))
+        else:
+            print(ui.secondary(f"推理深度：{agent.config.effort or '上游默认'}"))
     elif command == "/usage":
         print(ui.secondary(str(agent.usage)))
     elif command == "/context":

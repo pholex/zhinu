@@ -254,6 +254,8 @@ curl -X POST :8420/agent/agent-3f9c… -d '{"config":{"mode":"plan"}}'  # → ve
   `allow_all`；不能把沙箱关掉、不能放开沙箱网络。放宽是 `400`，不是静默钳位。
 - `append_system_prompt` 是**叠加**：服务端那份（宿主级身份/纪律）在前，agent 那份
   （用法级人格）在后。
+- `effort`：推理深度（`low / medium / high / xhigh / max`，OpenAI 线另有 `none / minimal`），
+  覆盖服务端 `--effort`；不给则随服务端，服务端也没给就不传、随上游默认。
 - `mcp_servers`：宿主应用**自有的 MCP server**，形状同 `.mcp.json` 的 `mcpServers`
   （`{"名": {"command","args","env"} | {"url","headers"}}`）。随版本钉定；会话创建时
   按那一版拉起一个**会话私有**的 manager（与工作区配置发现合并、同名以 agent 为准），

@@ -261,6 +261,10 @@ def to_request(
     _apply_tail_cache(converted)
 
     passthrough = {k: v for k, v in extra.items() if k not in _DROPPED_PARAMS}
+    #  effort：chat 侧叫 reasoning_effort，Messages 侧住在 output_config.effort
+    #  （GA，无 beta 头）。与调用方已给的 output_config 合并而非覆盖——
+    #  structured outputs 的 format 也住那里
+    effort = passthrough.pop("reasoning_effort", None)
     max_tokens = None
     for key in ("max_tokens", "max_completion_tokens"):
         if key in passthrough:
@@ -281,6 +285,10 @@ def to_request(
         request["tools"] = to_tools(tools)
     for key, value in passthrough.items():
         request[_PARAM_ALIASES.get(key, key)] = value
+    if effort:
+        output_config = dict(request.get("output_config") or {})
+        output_config["effort"] = effort
+        request["output_config"] = output_config
     return request
 
 

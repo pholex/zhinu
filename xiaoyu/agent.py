@@ -2646,6 +2646,10 @@ class Agent:
             request["tools"] = (
                 list(self._step.schemas) if self._step is not None else self.toolbox.schemas()
             )
+        if self.config.effort:
+            #  统一用 chat 的名字出内核；Responses / Messages 两路在 Transport
+            #  里各自翻译（见 responses.to_request / messages.to_request）
+            request["reasoning_effort"] = self.config.effort
 
         content_parts: list[str] = []
         pending: dict[int, dict[str, Any]] = {}
