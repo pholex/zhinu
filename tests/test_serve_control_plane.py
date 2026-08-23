@@ -354,3 +354,49 @@ class TestAgentMcpServers(ServeCase):
 
     def _find_session(self, session_id: str):
         return self.client.app.state.sessions.get(session_id)
+
+
+class TestOpsConsoleSample(ServeCase):
+    """examples/ops-console 的 MCP server 走整条平台回路：agent 自带 server →
+    use_tool 改派挂审批 → /permissions 放行 → output_schema 结构化收尾。
+    样本若与内核脱节（协议形状、字段名），这里先红。"""
+
+    def test_sample_server_end_to_end(self):
+        import os
+        import sys
+        import time
+
+        server = Path(__file__).resolve().parents[1] / "examples" / "ops-console" / "shipments_mcp.py"
+        script = (
+            'tool_call: {"name": "use_tool", "arguments": {"tool_name": "mcp__shipments__reroute_shipment", '
+            '"tool_input": {"id": "SHP-1002", "carrier": "顺丰"}}}\n'
+            "---\n"
+            'tool_call: {"name": "structured_output", "arguments": {"actions": [{"shipment_id": "SHP-1002", '
+            '"action": "reroute→顺丰", "result": "done"}], "summary": "改派 1 单"}}\n'
+        )
+        self.start(script, agent_mcp="all")
+        os.environ["XIAOYU_ENABLE_MCP"] = "1"
+        self.addCleanup(os.environ.__setitem__, "XIAOYU_ENABLE_MCP", "0")
+        agent = self.client.post("/agent", json={"name": "ops", "config": {
+            "mcp_servers": {"shipments": {"command": sys.executable, "args": [str(server)]}},
+        }}, headers=self.headers()).json()
+        sid = self.new_session(agent=agent["agent_id"])
+        session = self.client.app.state.sessions[sid]
+        for _ in range(100):
+            if session.mcp_manager is not None and not session.mcp_manager.loading():
+                break
+            time.sleep(0.1)
+        schema = {"type": "object", "properties": {"actions": {"type": "array"}, "summary": {"type": "string"}},
+                  "required": ["actions", "summary"]}
+        self.client.post(f"/session/{sid}/prompt_async", json={"text": "改派延误单", "output_schema": schema},
+                         headers=self.headers())
+        state = self._wait_for(sid, "waiting_for_approval")
+        pending = state["pending_approvals"]
+        self.assertEqual(pending[0]["tool"], "use_tool")
+        self.client.post(f"/session/{sid}/permissions",
+                         json={"request_id": pending[0]["request_id"], "decision": "allow"},
+                         headers=self.headers())
+        state = self._wait_for(sid, "finished")
+        self.assertEqual(state["last_result"]["output"]["summary"], "改派 1 单")
+        completed = [e for e in self.events(sid, limit=2000) if e["kind"] == "tool.completed"]
+        self.assertIn('"ok": true', completed[0]["output"])

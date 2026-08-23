@@ -121,6 +121,19 @@ class ServeCase(unittest.TestCase):
         self.assertEqual(response.status_code, 200, response.text)
         return response.json()
 
+    def _wait_for(self, session_id: str, detail: str, timeout: float = 10.0) -> dict[str, Any]:
+        """轮询到 detail 出现为止（TestClient 的请求是同步的，这里就地轮询）。"""
+        import time
+
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            state = self.status(session_id)
+            if state["detail"] == detail:
+                return state
+            time.sleep(0.05)
+        self.fail(f"{timeout}s 内没等到 detail={detail}，当前 {self.status(session_id)}")
+
+
 
 class TestBasics(ServeCase):
     def test_health_needs_no_token(self):
@@ -262,18 +275,6 @@ class TestBasics(ServeCase):
         #  SSE 与 /events 是同一份缓冲的两个形态：seq 必须连续且同源
         self.assertEqual([item["seq"] for item in seen], list(range(1, len(seen) + 1)))
         self.assertEqual(len(seen), len(self.events(session_id, limit=2000)))
-
-    def _wait_for(self, session_id: str, detail: str, timeout: float = 10.0) -> dict[str, Any]:
-        """轮询到 detail 出现为止（TestClient 的请求是同步的，这里就地轮询）。"""
-        import time
-
-        deadline = time.monotonic() + timeout
-        while time.monotonic() < deadline:
-            state = self.status(session_id)
-            if state["detail"] == detail:
-                return state
-            time.sleep(0.05)
-        self.fail(f"{timeout}s 内没等到 detail={detail}，当前 {self.status(session_id)}")
 
 
 class TestApproval(ServeCase):
