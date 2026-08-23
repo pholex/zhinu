@@ -31,6 +31,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from .config import EFFORT_LEVELS
+
 #  Agent 对象可携带的配置键。只收这一撮：它们都是 serve 启动参数里"会话可覆盖"
 #  的那一类；token/host/root 这种服务级参数不进 agent（那是运维边界，不是用法）。
 AGENT_CONFIG_KEYS = (
@@ -39,6 +41,7 @@ AGENT_CONFIG_KEYS = (
     "mode",
     "approval",
     "append_system_prompt",
+    "effort",
     "sandbox",
     "sandbox_network",
     "budget",
@@ -228,6 +231,10 @@ def check_agent_config(raw: dict[str, Any]) -> dict[str, Any]:
         if not isinstance(value, str):
             raise StateError(f"{key} 必须是字符串")
         config[key] = value
+    effort = str(raw.get("effort", "") or "").strip().lower()
+    if effort and effort not in EFFORT_LEVELS:
+        raise StateError(f"effort 只认 {' / '.join(EFFORT_LEVELS)}")
+    config["effort"] = effort
     approval = raw.get("approval", "") or ""
     if approval not in ("", "ask", "allow_all"):
         raise StateError("approval 只能是 ask 或 allow_all")

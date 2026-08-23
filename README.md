@@ -76,7 +76,7 @@ xiaoyu mcp add chrome-devtools --scope user npx -y chrome-devtools-mcp@latest
 xiaoyu mcp list                         # 写的就是 .mcp.json / mcp.json
 ```
 
-REPL 里：`/help` `/tools` `/skills` `/model` `/mode` `/usage` `/context` `/compact` `/clear` `/exit` `/tasks` `/plan` `/perm` `/allow` `/deny` `/resume` `/rewind` `/mcp` `/quit`
+REPL 里：`/help` `/tools` `/skills` `/model` `/effort` `/mode` `/usage` `/context` `/compact` `/clear` `/exit` `/tasks` `/plan` `/perm` `/allow` `/deny` `/resume` `/rewind` `/mcp` `/quit`
 
 无人值守时没人按确认键：先用 `/allow` 配规则，或 `--mode auto`、`--yolo`。
 

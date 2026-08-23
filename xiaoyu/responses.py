@@ -206,6 +206,11 @@ def to_request(
     if tools:
         request["tools"] = to_tools(tools)
     for key, value in extra.items():
+        if key == "reasoning_effort":
+            #  chat 的平铺 reasoning_effort → Responses 的 reasoning.effort 对象
+            if value:
+                request["reasoning"] = {**(request.get("reasoning") or {}), "effort": value}
+            continue
         request[_PARAM_ALIASES.get(key, key)] = value
     return request
 

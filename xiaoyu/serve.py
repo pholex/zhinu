@@ -167,6 +167,8 @@ class ServeConfig:
     sandbox: bool | None = None
     sandbox_network: bool | None = None
     append_system_prompt: str = ""
+    #  推理深度默认值；agent 对象可覆盖（见 serve_state.AGENT_CONFIG_KEYS）
+    effort: str = ""
     buffer_limit: int = DEFAULT_BUFFER
     max_field: int = DEFAULT_MAX_FIELD
     #  能同时跑的会话数 = 工作线程池大小。审批期间线程是被占着的（approver 就地
@@ -555,6 +557,7 @@ def build_agent(
         sandbox=cfg.sandbox,
         sandbox_network=cfg.sandbox_network,
         append_system_prompt=cfg.append_system_prompt or None,
+        effort=cfg.effort or None,
         workspace_trusted=trusted,
     )
     permissions = Permissions.load(config.workspace, include_workspace=trusted)
@@ -751,6 +754,7 @@ def create_app(cfg: ServeConfig):  # noqa: C901 - 路由表天然长，拆开反
             mode=mode or config.get("mode") or cfg.mode,
             approval=config.get("approval") or cfg.approval,
             append_system_prompt="\n\n".join(part for part in prompts if part),
+            effort=config.get("effort") or cfg.effort,
             sandbox=cfg.sandbox if config.get("sandbox") is None else config["sandbox"],
             sandbox_network=(
                 cfg.sandbox_network
@@ -1047,7 +1051,7 @@ def create_app(cfg: ServeConfig):  # noqa: C901 - 路由表天然长，拆开反
         dependencies=guard,
         operation_id="create_agent",
         description=(
-            "把 model / mode / append_system_prompt / approval / sandbox / budget / pricing "
+            "把 model / mode / effort / append_system_prompt / approval / sandbox / budget / pricing "
             "打包成一个可引用的对象；POST /session 用 agent 字段引用它。"
             "approval / sandbox 只能比服务端启动参数更严。"
         ),
@@ -1058,7 +1062,7 @@ def create_app(cfg: ServeConfig):  # noqa: C901 - 路由表天然长，拆开反
             default_factory=dict,
             embed=True,
             description=(
-                "model / base_url / mode / approval / append_system_prompt / sandbox / "
+                "model / base_url / mode / effort / approval / append_system_prompt / sandbox / "
                 "sandbox_network / budget{tokens,usd} / pricing{模型:{input,output}}（美元/百万 token）"
                 " / mcp_servers{名:{command,args,env}|{url,headers}}（宿主自有 MCP server，"
                 "同 .mcp.json 的 mcpServers；需服务端 --agent-mcp 开放）"
