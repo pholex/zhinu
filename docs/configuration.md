@@ -67,6 +67,7 @@ XIAOYU_API_KEY=<key>
 | `XIAOYU_EFFORT` | 不传 | 推理深度 `low / medium / high / xhigh / max`（OpenAI 线另有 `none / minimal`）。同一个名字出内核，按协议翻译成 `reasoning_effort` / `reasoning.effort` / `output_config.effort`；上游不认的取值会 400。命令行 `--effort`，会话里 `/effort`，子 agent 可在 spec 里单独声明 |
 | `XIAOYU_CONTEXT_LIMIT` | 按模型查表 | 上下文上限（token）覆写 |
 | `XIAOYU_COMPACT_AT` | `0.7` | 用量占到这个比例时触发回收/压缩 |
+| `XIAOYU_SERVER_COMPACTION` | `1` | 直连 Claude（opus-4.6+/sonnet-4.6+/5 系）时把压缩交给服务端（模型自己写摘要，`compaction` 块下轮回传，服务端忽略块前历史）；本地摘要压缩降为兜底。设 `0` 回纯本地压缩 |
 | `XIAOYU_KEEP_RECENT` | `8` | 压缩时至少保留最近几条消息 |
 | `XIAOYU_EXPLORE_ITERATIONS` | `12` | `explore` 子 agent 单次检索的工具调用轮数上限（1–100；主 agent 的 50 轮不受影响） |
 | `XIAOYU_QIXIANG_CONCURRENCY` | `4` | 七襄批量委托的并发上限（1–16） |

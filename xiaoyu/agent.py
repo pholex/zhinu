@@ -59,6 +59,7 @@ from .events import (
     UISink,
 )
 from .render import PlainSink
+from .messages import COMPACTION_KEY, supports_server_compaction
 from .responses import REASONING_KEY
 from .tools import PURPOSE_PARAM, Tool, Toolbox
 
@@ -634,6 +635,11 @@ def _schema_problems(value: Any, schema: dict[str, Any], path: str = "$") -> lis
             problems.extend(_schema_problems(item, schema["items"], f"{path}[{i}]"))
     return problems
 
+
+#  服务端压缩在岗时本地摘要压缩的兜底线（占窗口比例）：正常情况下服务端在
+#  compact_at 处先接住，估算不会涨到这里；涨到了说明服务端没压（beta 行为变化、
+#  型号清单过期…），本地照旧接管
+SERVER_COMPACTION_FALLBACK = 0.92
 
 class Agent:
     def __init__(
@@ -2209,9 +2215,42 @@ class Agent:
             anchor_tokens, anchor_index = self._anchor
             if anchor_index <= len(self.messages):
                 return anchor_tokens + tokens.estimate_messages(self.messages[anchor_index:])
-        return tokens.estimate_messages(self.messages) + tokens.estimate_tools(
-            self.toolbox.schemas()
+        #  服务端压缩过：compaction 块之前的历史服务端不再看，本地估算也不该算
+        #  （system 仍在 messages[0]，单独计入）
+        floor = self._compaction_floor()
+        live = self.messages[floor:] if floor else self.messages
+        head = self.messages[:1] if floor else []
+        return (
+            tokens.estimate_messages(head)
+            + tokens.estimate_messages(live)
+            + tokens.estimate_tools(self.toolbox.schemas())
         )
+
+    def _server_compaction_route(self, route: Route) -> bool:
+        """这条路由要不要挂服务端压缩：开关开 + 说 Anthropic 协议 + 型号在清单。"""
+        if not self.config.server_compaction:
+            return False
+        protocol_for = getattr(route.client, "protocol_for", None)
+        if protocol_for is None or protocol_for(route.model) != "anthropic":
+            return False
+        return supports_server_compaction(route.model)
+
+    def _compaction_floor(self) -> int:
+        """最近一个带服务端 compaction 块的 assistant 消息下标；没有返回 0。
+        只认当前路由同家产出的（跨家不回放，见 messages._assistant_blocks）。"""
+        route = self._main_route()
+        if route is None or not self._server_compaction_route(route):
+            return 0
+        for index in range(len(self.messages) - 1, 0, -1):
+            message = self.messages[index]
+            if message.get("role") != "assistant":
+                continue
+            reasoning = message.get(REASONING_KEY) or {}
+            if (reasoning.get("provider") or "") != route.provider:
+                continue
+            if any(item.get("type") == "compaction" for item in reasoning.get("items") or []):
+                return index
+        return 0
 
     def context_source(self) -> str:
         """/context 显示用：当前估算的依据。"""
@@ -2231,6 +2270,15 @@ class Agent:
         self.compactor.context_limit = self.config.context_limit
         estimated = self.context_tokens()
         if not force and not self.compactor.should_compact(estimated):
+            return None
+        route = self._main_route()
+        if (
+            not force
+            and route is not None
+            and self._server_compaction_route(route)
+            and estimated < self.config.context_limit * SERVER_COMPACTION_FALLBACK
+        ):
+            #  服务端压缩在岗：本地只在它没接住（估算继续涨过兜底线）时才出手
             return None
 
         self.messages, cleared, saved_chars = microcompact(
@@ -2383,13 +2431,17 @@ class Agent:
                     routes.append(route)
         return routes
 
-    def _main_route_key(self) -> tuple[str, str] | None:
-        """主对话路由的 (provider, model)——前缀缓存只在这条路由上存在。"""
+    def _main_route(self) -> Route | None:
+        """主对话路由；模型名没人接时 None（报错留给真正发请求的那一步）。"""
         try:
-            route = self.registry.resolve(self.config.model)
+            return self.registry.resolve(self.config.model)
         except UnknownModel:
             return None
-        return (route.provider, route.model)
+
+    def _main_route_key(self) -> tuple[str, str] | None:
+        """主对话路由的 (provider, model)——前缀缓存只在这条路由上存在。"""
+        route = self._main_route()
+        return None if route is None else (route.provider, route.model)
 
     def _summary_call(self, route: Route, transcript: str, prefix: list[dict[str, Any]]) -> str:
         """在一条路由上生成一次摘要，返回正文（可能退化，由调用方判定）。
@@ -2650,6 +2702,13 @@ class Agent:
             #  统一用 chat 的名字出内核；Responses / Messages 两路在 Transport
             #  里各自翻译（见 responses.to_request / messages.to_request）
             request["reasoning_effort"] = self.config.effort
+        if self._server_compaction_route(route):
+            #  服务端压缩：阈值与本地同一把尺（compact_at × 窗口），服务端在输入
+            #  越线的那次请求开头先摘要再作答。本地压缩此时只是兜底（阈值抬高，
+            #  见 maybe_compact），两者不会同轮触发
+            request[COMPACTION_KEY] = {
+                "trigger": int(self.config.compact_at * self.config.context_limit),
+            }
 
         content_parts: list[str] = []
         pending: dict[int, dict[str, Any]] = {}
@@ -2692,6 +2751,19 @@ class Agent:
         }
         if pending:
             message["tool_calls"] = [pending[index] for index in sorted(pending)]
+        if any(item.get("type") == "compaction" for item in reasoning):
+            #  服务端刚压缩过：块之前的历史它不再看。本轮 usage 锚点是压缩前还是
+            #  压缩后的输入，流式事件里分不清——作废它，下轮 usage 重新落锚，
+            #  这一轮间隙由 context_tokens 的 floor 估算顶上
+            self._anchor = None
+            summary_chars = sum(
+                len(item.get("content") or "") for item in reasoning if item.get("type") == "compaction"
+            )
+            self.sink.emit(
+                Notice(f"[服务端已压缩上下文：块之前的历史由 {summary_chars} 字摘要替代]", "warn")
+            )
+            if self.session_log:
+                self.session_log.event("server_compaction", summary_chars=summary_chars)
         if reasoning:
             #  挂在消息上（不另起边表）：压缩丢消息时它跟着走、落盘时跟着存，
             #  没有需要"记得同步清理"的地方。记下产出它的 provider+model——

@@ -454,9 +454,15 @@ class _Completions:
 
             request = anthro.to_request(model, messages, tools, stream, extra, self._provider)
             client = self._anthropic_client()
+            #  带 betas 的请求走 beta 命名空间（beta 参数 / 未知 block 类型都只有
+            #  那里的类型认）；不带则照旧走正式面，与从前一个字节不差
+            api = client.beta.messages if request.get("betas") else client.messages
             if not stream:
-                return anthro.to_completion(client.messages.create(**request))
-            return anthro.stream_chunks(client.messages.create(stream=True, **request))
+                return anthro.to_completion(api.create(**request))
+            return anthro.stream_chunks(api.create(stream=True, **request))
+        #  服务端压缩只有 Anthropic 一路认；chat / Responses 两路在此摘掉私有键，
+        #  别让它漏成上游 400（Responses 的 compact_threshold 是另一套，待接）
+        extra = {k: v for k, v in extra.items() if k != "_compaction"}
         if not self._speaks_responses(model):
             #  这里是内核私有键唯一的净化点（为什么必须摘：见 strip_private）
             return self._chat(model, strip_private(messages), stream, stream_options, tools, extra)

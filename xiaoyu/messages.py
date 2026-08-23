@@ -64,6 +64,29 @@ _DROPPED_PARAMS = ("temperature", "top_p", "top_k", "stream_options")
 
 _CACHE_CONTROL = {"type": "ephemeral"}
 
+#  服务端压缩（beta）。内核用私有键 COMPACTION_KEY 表达"请在 N 输入 token 时
+#  压缩"，这里翻成 context_management + beta 头；compaction 块作为 reasoning
+#  item 存在 assistant 消息上（与 thinking 同一条管线），下轮原样回放。
+#  服务端自动忽略块之前的全部内容，所以本地历史不必真删。
+COMPACTION_KEY = "_compaction"
+COMPACTION_BETA = "compact-2026-01-12"
+COMPACTION_EDIT = "compact_20260112"
+#  服务端硬下限：trigger 低于它是 400
+COMPACTION_MIN_TRIGGER = 50_000
+#  支持 compact_20260112 的型号（官方清单，裸名子串匹配：带日期后缀也命中）
+_COMPACTION_MODELS = (
+    "claude-opus-4-6", "claude-opus-4-7", "claude-opus-4-8", "claude-opus-5",
+    "claude-sonnet-4-6", "claude-sonnet-5",
+    "claude-fable-5", "claude-mythos",
+)
+
+
+def supports_server_compaction(model: str) -> bool:
+    """型号是否在服务端压缩的支持清单里。保守：不认识的一律 False，
+    传了不支持的型号是硬 400，比少压一次贵得多。"""
+    bare = model.rpartition("/")[2].lower()
+    return any(bare.startswith(name) for name in _COMPACTION_MODELS)
+
 
 # ---------- 请求方向：chat completions → Messages ----------
 
@@ -143,8 +166,13 @@ def _assistant_blocks(
     """
     blocks: list[dict[str, Any]] = []
     reasoning = message.get(REASONING_KEY) or {}
+    items = reasoning.get("items") or []
     if reasoning.get("model") == model and (reasoning.get("provider") or "") == provider:
-        blocks.extend(reasoning.get("items") or [])
+        blocks.extend(items)
+    elif (reasoning.get("provider") or "") == provider:
+        #  compaction 块不绑型号（官方：任一支持的型号都认），同家切模型照样回放；
+        #  thinking 仍只回给产出它的型号
+        blocks.extend(item for item in items if item.get("type") == "compaction")
     content = message.get("content")
     if isinstance(content, str):
         #  Anthropic 拒绝空/纯空白 text block，chat 侧却允许——静默跳过
@@ -265,6 +293,7 @@ def to_request(
     #  （GA，无 beta 头）。与调用方已给的 output_config 合并而非覆盖——
     #  structured outputs 的 format 也住那里
     effort = passthrough.pop("reasoning_effort", None)
+    compaction = passthrough.pop(COMPACTION_KEY, None)
     max_tokens = None
     for key in ("max_tokens", "max_completion_tokens"):
         if key in passthrough:
@@ -289,6 +318,19 @@ def to_request(
         output_config = dict(request.get("output_config") or {})
         output_config["effort"] = effort
         request["output_config"] = output_config
+    if compaction:
+        edit: dict[str, Any] = {
+            "type": COMPACTION_EDIT,
+            "trigger": {
+                "type": "input_tokens",
+                "value": max(COMPACTION_MIN_TRIGGER, int(compaction.get("trigger") or 0)),
+            },
+        }
+        if instructions := compaction.get("instructions"):
+            edit["instructions"] = instructions
+        request["context_management"] = {"edits": [edit]}
+        #  betas 非空 → Transport 改走 client.beta.messages（见 responses._dispatch）
+        request["betas"] = [*request.get("betas", []), COMPACTION_BETA]
     return request
 
 
@@ -355,6 +397,11 @@ def stream_chunks(events: Iterator[Any]) -> Iterator[Chunk]:
                     "kind": "redacted",
                     "data": getattr(block, "data", "") or "",
                 }
+            elif block_type == "compaction":
+                open_blocks[event.index] = {
+                    "kind": "compaction",
+                    "content": getattr(block, "content", "") or "",
+                }
         elif kind == "content_block_delta":
             delta = event.delta
             delta_type = getattr(delta, "type", "")
@@ -370,6 +417,10 @@ def stream_chunks(events: Iterator[Any]) -> Iterator[Chunk]:
             elif delta_type == "signature_delta":
                 if state := open_blocks.get(event.index):
                     state["signature"] = delta.signature
+            elif delta_type == "compaction_delta":
+                #  摘要整段一次到（官方：不分片）；累加只为防御
+                if state := open_blocks.get(event.index):
+                    state["content"] += getattr(delta, "content", "") or ""
         elif kind == "content_block_stop":
             state = open_blocks.pop(getattr(event, "index", -1), None)
             if state is None:
@@ -388,6 +439,10 @@ def stream_chunks(events: Iterator[Any]) -> Iterator[Chunk]:
                 )
             elif state["kind"] == "redacted":
                 yield Chunk(reasoning=[{"type": "redacted_thinking", "data": state["data"]}])
+            elif state["kind"] == "compaction":
+                #  与 thinking 同一条私有键管线：挂在 assistant 消息上、落盘、回放。
+                #  agent 按 type 识别它（见 Agent._compaction_floor）
+                yield Chunk(reasoning=[{"type": "compaction", "content": state["content"]}])
             elif state["kind"] == "tool" and not state["seen_args"]:
                 #  无参工具调用可能一个 input_json_delta 都不发：补一个 "{}"，
                 #  否则内核攒出 arguments=""，下游 json.loads 会炸

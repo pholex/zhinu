@@ -297,6 +297,11 @@ class Config:
     #  Anthropic: output_config.effort），不认的上游会 400——宁可报错也不静默丢。
     #  子 agent 可在 spec 里单独声明（只读探索给 low，总控给 high/xhigh）。
     effort: str = ""
+    #  服务端压缩透传：走 Anthropic Messages 协议且型号支持时，把压缩交给服务端
+    #  （compact_20260112：模型自己写摘要，返回 compaction 块，下轮回传即可）。
+    #  本地摘要压缩降为兜底（阈值抬高 SERVER_COMPACTION_FALLBACK）。关掉
+    #  XIAOYU_SERVER_COMPACTION=0 回到纯本地压缩。
+    server_compaction: bool = True
     #  估算用量占到上限的这个比例时触发压缩。
     compact_at: float = 0.7
     #  压缩时至少保留最近这么多条消息（实际切点会往后找到 user 消息边界）。
@@ -366,6 +371,8 @@ class Config:
                 cfg.keep_recent = int(keep)
         if level := os.environ.get("XIAOYU_EFFORT", "").strip().lower():
             cfg.effort = level
+        if (flag := os.environ.get("XIAOYU_SERVER_COMPACTION")) is not None:
+            cfg.server_compaction = flag.strip().lower() not in ("0", "false", "no", "off")
         if ratio := os.environ.get("XIAOYU_COMPACT_AT"):
             with contextlib.suppress(ValueError):
                 cfg.compact_at = float(ratio)
