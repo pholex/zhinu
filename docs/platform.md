@@ -1,7 +1,7 @@
 # 把小羽当平台：三张脸怎么选
 
-> **小羽是梭子（Agent），但更是织机（Platform）。**
-> *A shuttle (agent) — and, more to the point, a loom (platform).*
+> **小羽是织手（Agent），但她带来的织机（Platform）更值得你看。**
+> *Xiaoyu is a weaver (agent) — but it's her loom (platform) you can build on.*
 
 小羽不只是一个命令行工具。它的内核——会话状态、流式执行、工具调用、沙箱与审批
 策略——可以嵌进你自己的产品里：运营控制台、安全台、客服后台、CI 流水线。你保留
