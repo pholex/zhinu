@@ -2897,8 +2897,13 @@ def handle_slash(agent: Agent, line: str, select: Any = None) -> bool:
         if rest:
             agent.switch_model(rest[0])
             print(ui.secondary(f"已切换到 {rest[0]}"))
+            #  切模型顺手探一次它的 Models API 能力：自校正上下文上限、报能力/漂移
+            for note in agent.refresh_capabilities():
+                print(ui.secondary(note))
         else:
             print(ui.secondary(f"当前模型 {agent.config.model}"))
+            for note in agent.refresh_capabilities():
+                print(ui.secondary(note))
             #  直连是靠环境变量静默启用的——不把来源印出来，用户根本不知道
             #  请求走的哪条路、钱花在哪家。
             print(agent.registry.describe())
