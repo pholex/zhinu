@@ -355,7 +355,26 @@ def mount_mcp(
                 )
                 return
 
-            progress_seq = 0
+            def progress_frames(fresh: list[dict[str, Any]]) -> list[str]:
+                if token is None:
+                    return []
+                return [
+                    frame(
+                        {
+                            "jsonrpc": "2.0",
+                            "method": "notifications/progress",
+                            "params": {
+                                "progressToken": token,
+                                #  单调递增用事件 seq：轮与轮之间也不回退
+                                "progress": event["seq"],
+                                "message": _progress_message(event),
+                            },
+                        }
+                    )
+                    for event in fresh
+                    if event.get("kind") not in NOISY_KINDS
+                ]
+
             idle = 0.0
             while not task.done():
                 await session.wait_new(cursor, POLL_SLICE)
@@ -363,23 +382,8 @@ def mount_mcp(
                 if fresh:
                     idle = 0.0
                     cursor = fresh[-1]["seq"] + 1
-                    if token is not None:
-                        for event in fresh:
-                            if event.get("kind") in NOISY_KINDS:
-                                continue
-                            progress_seq = event["seq"]
-                            yield frame(
-                                {
-                                    "jsonrpc": "2.0",
-                                    "method": "notifications/progress",
-                                    "params": {
-                                        "progressToken": token,
-                                        #  单调递增用事件 seq：轮与轮之间也不回退
-                                        "progress": progress_seq,
-                                        "message": _progress_message(event),
-                                    },
-                                }
-                            )
+                    for chunk in progress_frames(fresh):
+                        yield chunk
                 else:
                     idle += POLL_SLICE
                     if idle >= HEARTBEAT:
@@ -387,6 +391,10 @@ def mount_mcp(
                         #  与 SSE 端点同一道理：反代/网关会掐长时间无字节的连接
                         yield ": keep-alive\n\n"
 
+            #  轮结束与最后一次 since() 之间还可能落了事件（run.completed 就是
+            #  紧贴 task 完成发的）：收尾前再扫一遍，progress 才不会少最后一站
+            for chunk in progress_frames(session.since(cursor, 500)):
+                yield chunk
             result = task.result()
             yield frame(_rpc_result(request_id, _turn_result(session, result)))
         except _RpcError as exc:
