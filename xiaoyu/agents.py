@@ -101,7 +101,7 @@ _INHERIT_RATIO = 0.3
 INHERIT_MODES = ("none", "distilled")
 #  harness 以 user 角色注入的说明的两种前缀：精确文案之外的兜底（部分注入
 #  文案按会话格式化，含路径，精确集合够不着）——与 session_log.turn_starts 同规则
-_INJECTED_USER_PREFIXES = ("[系统提示]", "<system-reminder>")
+_INJECTED_USER_PREFIXES = ("[系统提示]", "<system-reminder>", "<world_state>")
 
 #  模型乱填参数的哨兵值：一律当"没给"
 _SENTINELS = {"", "null", "undefined", "nil"}

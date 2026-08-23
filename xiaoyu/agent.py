@@ -18,7 +18,19 @@ from pathlib import Path
 from dataclasses import dataclass, field
 from typing import Any, Callable, Protocol
 
-from . import diagnostics, envprobe, errors, media, modes, providers, sandbox, skill_usage, skills, tokens
+from . import (
+    diagnostics,
+    envprobe,
+    errors,
+    media,
+    modes,
+    providers,
+    sandbox,
+    skill_usage,
+    skills,
+    tokens,
+    world_state,
+)
 from .compaction import (
     MIN_SUMMARY_CHARS,
     PREFIX_SUMMARY_INSTRUCTION,
@@ -320,6 +332,31 @@ def wrap_interjection(text: str) -> str:
 #  PLAN_MODE_ENTER_NOTE 是模板（含 {plan_file}），格式化后的实文由 Agent 追加
 #  进自己的 Compactor 集合；turn_starts 另有"[系统提示] 前缀即跳过"的兜底
 #  （session_log.turn_starts），离线场景（fork 列轮次）不依赖会话态也能排除。
+@dataclass(frozen=True)
+class StepContext:
+    """一次采样请求的冻结快照：这一步"广告了什么、按什么规则执行"。
+
+    一轮里有多次模型调用（步），步与步之间用户可能 /model、Shift-Tab 切档、
+    技能或 MCP 工具集也可能增减。若请求构造、路由选择、工具执行各自实时读
+    self，就可能出现"发出去的 schema 里没有 X，执行时却按 X 放行"或"审批按
+    旧档判、执行按新档跑"。所以每步开头拍一次快照，这一步内全部只看快照；
+    任何中途改动一律下一步生效。
+
+    `schemas` 就是发给模型的那份列表（不要改它）；`tool_names` 是它的名字集，
+    不在集合里的工具本步不可调用——哪怕它刚刚被注册。
+    """
+
+    index: int
+    model: str
+    mode: str
+    schemas: tuple[dict[str, Any], ...]
+    tool_names: frozenset[str]
+    workspace: Path
+    context_limit: int
+    history_version: int
+    sandbox_ready: bool
+
+
 SYNTHETIC_USER_TEXTS = frozenset(
     {
         WRAPUP_INSTRUCTION,
@@ -687,6 +724,12 @@ class Agent:
         #  结果先配好对再整体丢弃，不留孤儿。
         self._context_window = 1
         self._new_context_notes: str | None = None
+        #  当前步的冻结快照（见 StepContext）；步外为 None
+        self._step: StepContext | None = None
+        self._step_index = 0
+        #  环境差量播报的基线：__init__ 末尾 adopt（system prompt 刚说过）
+        self.world_state = world_state.WorldState()
+        self._logged_baseline: dict[str, Any] | None = None
         #  发请求时的消息条数，usage 到达时用来落锚
         self._request_len = 0
         self.compactor = Compactor(
@@ -984,6 +1027,7 @@ class Agent:
                     check_fn=lambda: bool(self.skills),
                 )
             )
+        self.world_state.adopt(self)
 
     def last_assistant_text(self) -> str:
         """最后一条 assistant 正文，子 agent 用它把结论交回给父级。"""
@@ -1166,6 +1210,9 @@ class Agent:
         plan 的进出要往历史里注入说明（模型得知道规则变了），其它档不注入：
         auto 与默认档的差别只在"问不问用户"，模型侧的能力完全一样，
         告诉它反而是在暗示"现在没人看着"。
+
+        轮次进行中调用时，当前这一步的审批仍按步开头的档位判（见 StepContext），
+        下一步起按新档。
         """
         target = modes.get(name).name
         if target == self.mode:
@@ -1573,6 +1620,17 @@ class Agent:
             self._history_rewritten()
         if self.session_log and source:
             self.session_log.event("resumed_from", source=source)
+        #  环境播报基线：来源文件里有就接上，没有就按未知处理——下一步把
+        #  当前环境完整说一遍，不赌模型记得上次会话的环境
+        if messages:
+            self.world_state.baseline = None
+            if source:
+                from .session_log import last_world_state
+
+                try:
+                    self.world_state.baseline = last_world_state(Path(source))
+                except OSError:
+                    self.world_state.baseline = None
         #  崩溃恢复：历史末尾若有未配对的 tool_call（= 会话在工具返回前死了；
         #  正常退出路径都会先补齐），用"结果未知"文案补齐——修复写进新会话
         #  文件（copy=False 时写进续写的原文件），下次 resume 不必再修。
@@ -1853,6 +1911,7 @@ class Agent:
         stop_checked = False
         for _ in range(self.config.max_iterations):
             self.maybe_compact()
+            self._begin_step()
             message = self._stream_with_recovery()
             self._record(message)
 
@@ -1941,7 +2000,42 @@ class Agent:
             Notice(f"\n[已达到单轮工具调用上限 {self.config.max_iterations}，请模型收尾]", "warn")
         )
         self._record({"role": "user", "content": WRAPUP_INSTRUCTION})
+        self._begin_step(with_tools=False)
         self._record(self._stream_with_recovery(with_tools=False))
+
+    def _begin_step(self, with_tools: bool = True) -> StepContext:
+        """开一步：先播报环境差量，再拍本步快照。
+
+        顺序不能反——播报是一条 user 消息，要排在本步请求里；快照里的工具集
+        则要等播报写完后再取（播报本身不改工具，但保持"先定历史、后定快照"的
+        单一顺序，读代码的人不用想两种情况）。
+        """
+        note = self.world_state.diff(self)
+        if note:
+            self._record({"role": "user", "content": note})
+            self.compactor.synthetic_user_texts |= {note}
+        if self.session_log and self.world_state.baseline != self._logged_baseline:
+            self._logged_baseline = self.world_state.baseline
+            self.session_log.event("world_state", baseline=self.world_state.baseline)
+        schemas = tuple(self.toolbox.schemas()) if with_tools else ()
+        self._step_index += 1
+        self._step = StepContext(
+            index=self._step_index,
+            model=self.config.model,
+            mode=self.mode,
+            schemas=schemas,
+            tool_names=frozenset(
+                schema.get("function", {}).get("name", "") for schema in schemas
+            ),
+            workspace=self.config.workspace,
+            context_limit=self.config.context_limit,
+            history_version=self.history_version,
+            sandbox_ready=self.sandbox_ready(),
+        )
+        return self._step
+
+    def _step_mode(self) -> str:
+        return self._step.mode if self._step is not None else self.mode
 
     def _attach_media(self) -> None:
         """把本批工具产出的图片接到历史里（目前只有 MCP 工具会产出）。
@@ -2136,6 +2230,9 @@ class Agent:
             {"role": "user", "content": self._context_window_note(notes)},
         ]
         self._history_rewritten()
+        #  翻篇说明已写明窗口编号，环境播报不必再说一遍；其它维度的变化照常比对
+        if self.world_state.baseline is not None:
+            self.world_state.baseline["context_window"] = {"value": self._context_window}
         if self.session_log:
             self.session_log.event(
                 "compact",
@@ -2280,6 +2377,9 @@ class Agent:
         粘性切换）都走这里：留痕是给"恢复时跟随旧模型"用的——ACP session/load
         按日志里最后生效的模型起会话（session_log.last_model），不留痕的切换
         在恢复后就会静默回到默认模型。
+
+        轮次进行中调用时对当前这一步无效：本步已按开头的快照选好路由
+        （见 StepContext），下一步起生效。
         """
         self.config.model = name
         if self.session_log:
@@ -2306,7 +2406,8 @@ class Agent:
 
     def model_chain(self) -> list[Route]:
         """本次请求的路由尝试顺序：主模型 + 它的影子兜底 + 配置的备用模型（各带兜底）。"""
-        return self._routes([self.config.model, *self.config.fallback_models])
+        model = self._step.model if self._step is not None else self.config.model
+        return self._routes([model, *self.config.fallback_models])
 
     def _stream_with_recovery(self, with_tools: bool = True) -> dict[str, Any]:
         """备用模型降级链的外层：主模型重试耗尽后依次切备用模型。
@@ -2430,7 +2531,9 @@ class Agent:
             "stream_options": {"include_usage": True},
         }
         if with_tools:
-            request["tools"] = self.toolbox.schemas()
+            request["tools"] = (
+                list(self._step.schemas) if self._step is not None else self.toolbox.schemas()
+            )
 
         content_parts: list[str] = []
         pending: dict[int, dict[str, Any]] = {}
@@ -2633,6 +2736,13 @@ class Agent:
             )
         if not isinstance(args, dict):
             return self._tool_message(call, "ERROR: 参数必须是 JSON 对象。")
+        #  只认本步广告过的工具：步中途注册的新工具下一步才可见，模型此刻
+        #  不可能正当地知道它（知道也是从别处猜的）；本步广告过、此后被撤的
+        #  工具照常走下面的 toolbox 查找，撤了自然报错。
+        if self._step is not None and name not in self._step.tool_names:
+            return self._tool_message(
+                call, f"ERROR: 工具 {name} 不在本步可见集合，下一步再试。"
+            )
 
         #  目的参数只给人看，不进 handler（handler 收到未知 kwarg 会 TypeError）。
         #  无条件剥离：模型可能给免确认的工具也编一个。
@@ -2718,7 +2828,7 @@ class Agent:
         #  auto 白名单里——bypass-immune 这种承诺不该靠巧合成立。
         auto_ok = (
             not must_confirm
-            and self.mode == modes.AUTO
+            and self._step_mode() == modes.AUTO
             and modes.auto_approves(
                 name,
                 args,

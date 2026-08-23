@@ -364,7 +364,7 @@ def turn_starts(
             continue
         #  "[系统提示]" 开头 = harness 注入的说明（plan mode 进出等）。有些注入
         #  文案按会话格式化（含路径），exclude_texts 的精确匹配够不着，按前缀兜底
-        if text.startswith("[系统提示]"):
+        if text.startswith(("[系统提示]", "<world_state>")):
             continue
         starts.append(index)
     return starts
@@ -396,6 +396,32 @@ def last_model(path: Path) -> str:
     except OSError:
         return ""
     return model
+
+
+def last_world_state(path: Path) -> dict[str, Any] | None:
+    """会话文件里最后记录的环境播报基线；没有回 None（= 未知，下一步全量播报）。
+
+    Agent 在基线变化时写 world_state 事件（见 world_state 模块）。顺序遍历、
+    最后一条说了算；compact/clear 不影响它——基线描述的是环境，不是历史。
+    """
+    baseline: dict[str, Any] | None = None
+    try:
+        with path.open(encoding="utf-8", errors="replace") as handle:
+            for line in handle:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    record = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if record.get("event") == "world_state" and isinstance(
+                    record.get("baseline"), dict
+                ):
+                    baseline = record["baseline"]
+    except OSError:
+        return None
+    return baseline
 
 
 def last_mode(path: Path) -> str:
