@@ -392,7 +392,11 @@ _TRIGGER_SKILLS = {
 
 
 def _trigger_case(name: str, prompt: str, expect: str | None, max_iter: int = 6) -> Case:
-    """expect=技能名 → 正例（应加载它）；expect=None → 负例（不该加载任何技能）。"""
+    """expect=技能名 → 正例（应加载它）；expect=None → 负例（不该加载任何技能）。
+
+    负例设为回归 case：对明显跑题的输入"不误触发"是低方差的稳定行为，
+    适合当 pass^k 回归门的地板；正例更看能力，不进门。
+    """
     checks = (
         [(f"选中 {expect}", loaded_skill(expect))]
         if expect
@@ -401,7 +405,7 @@ def _trigger_case(name: str, prompt: str, expect: str | None, max_iter: int = 6)
     return Case(
         name=name, prompt=prompt, setup=lambda root: None, checks=checks,
         max_iterations=max_iter, enable_skills=True, skills=_TRIGGER_SKILLS,
-        description="技能触发准确率",
+        description="技能触发准确率", regression=expect is None,
     )
 
 

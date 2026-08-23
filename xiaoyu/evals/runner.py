@@ -16,7 +16,12 @@
   的模型间差异一律标注"未证实"；重复运行时，两个模型的通过数差不超过双方
   抖动 case（同一 case 时过时不过）之和的，标注"抖动带内，不构成区分"。
   没有这条，横向对比表就是在把噪声当结论卖。
-- **结果自带来源指纹**（provenance）：版本、端点、超时、重复次数、平台。
+- **pass^k 回归门**：回归 case（`Case.regression=True`，如触发负例这种稳定行为）
+  必须每次运行都过；一次没保住就是回归门失败，退出码 2（优先级高于真失败）。
+  能力 case 起步低分正常，不进这道门（区分"该保持 ~100%"与"看能力"）。
+- **结果自带来源指纹**（provenance）：版本、端点、超时、重复次数、平台，
+  外加机器资源画像（cpu/内存/架构）——资源配置本身是实验变量（Anthropic
+  infrastructure-noise），不记就把"换台机器差几分"当结论。
   不带配置的数字连和它自己的下一次 run 都不可比。
 """
 
@@ -27,6 +32,7 @@ import contextlib
 import os
 import io
 import json
+import os
 import platform
 import sys
 import tempfile
@@ -53,6 +59,22 @@ REQUEST_TIMEOUT = 180.0
 #  记成"这个模型不会干活"。context_overflow 与 fatal 刻意不在内：窗口用爆和
 #  跑挂都是能力相关的真实结局。
 INFRA_KINDS = frozenset({"auth", "quota", "rate_limit", "transient"})
+
+
+def _machine_resources() -> dict:
+    """跑分机器的资源画像，进 provenance。Anthropic infrastructure-noise 的教训：
+    资源配置本身是实验变量，不记进元数据就没法解释"同一 case 换台机器差几分"。
+    memory 用 os.sysconf 拿总内存（拿不到就 None，绝不臆造）。"""
+    mem_gb = None
+    try:
+        mem_gb = round(os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES") / 1024**3, 1)
+    except (ValueError, OSError, AttributeError):
+        pass
+    return {
+        "cpu_count": os.cpu_count(),
+        "memory_gb": mem_gb,
+        "machine": platform.machine(),
+    }
 
 
 def run_case(case: Case, model: str, base_url: str | None, verbose: bool) -> dict:
@@ -161,6 +183,7 @@ def run_case(case: Case, model: str, base_url: str | None, verbose: bool) -> dic
     reported_usage = agent.usage.prompt_tokens > 0
     return {
         "case": case.name,
+        "regression": case.regression,
         "model": model,
         "description": case.description,
         "passed": ok,
@@ -200,8 +223,12 @@ def summarize_by_model(results: list[dict]) -> list[dict]:
     通过数差是否只是抖动的尺子。
     """
     grouped: dict[str, dict] = {}
-    #  (model, case) → [每次可测运行是否通过]，供 flaky 判定
+    #  (model, case) → [每次可测运行是否通过]，供 flaky 与 pass^k 判定
     outcomes: dict[tuple[str, str], list[bool]] = {}
+    #  哪些 case 是回归 case（pass^k 门只管它们）
+    regression_cases: set[str] = {
+        item["case"] for item in results if item.get("regression")
+    }
     for item in results:
         row = grouped.setdefault(
             item["model"],
@@ -211,6 +238,9 @@ def summarize_by_model(results: list[dict]) -> list[dict]:
                 "passed": 0,
                 "infra": 0,
                 "flaky": 0,
+                "pass_hat_k": 0,
+                "regression_total": 0,
+                "regression_failed": 0,
                 "checks_total": 0,
                 "checks_passed": 0,
                 "tool_errors": 0,
@@ -243,13 +273,38 @@ def summarize_by_model(results: list[dict]) -> list[dict]:
         if item["error"]:
             row["errors"].append(f"{item['case']}: {item['error'][:80]}")
 
-    for (model, _case), passes in outcomes.items():
+    for (model, case_name), passes in outcomes.items():
         if len(passes) > 1 and 0 < sum(passes) < len(passes):
             grouped[model]["flaky"] += 1
+        #  pass^k：这个 case 的每一次可测运行都过（没有可测运行不算过）
+        all_pass = bool(passes) and all(passes)
+        if all_pass:
+            grouped[model]["pass_hat_k"] += 1
+        #  回归门：回归 case 必须 pass^k，否则计一次门失败
+        if case_name in regression_cases:
+            grouped[model]["regression_total"] += 1
+            if not all_pass:
+                grouped[model]["regression_failed"] += 1
 
     rows = list(grouped.values())
     rows.sort(key=lambda row: (-row["passed"], row["cost"] if row["has_cost"] else 1e9))
     return rows
+
+
+def regression_failures(rows: list[dict]) -> list[str]:
+    """回归门失败清单（每个模型一行说明），没失败返回空。
+
+    回归 case 断言的是稳定行为——一次没保住 pass^k 就该在退出码上叫出来，
+    比淹在"总通过数"里强。能力 case 不进这道门（起步低分正常）。
+    """
+    out: list[str] = []
+    for row in rows:
+        if row.get("regression_failed"):
+            out.append(
+                f"{row['model']}：{row['regression_failed']}/{row['regression_total']} "
+                "个回归 case 没保住 pass^k（每次运行都要过）"
+            )
+    return out
 
 
 def discrimination_note(rows: list[dict], repeat: int) -> str | None:
@@ -286,7 +341,7 @@ def print_matrix(results: list[dict], repeat: int = 1) -> None:
 
     print("\n" + ui.heading("横向对比") + ui.secondary("（先看能不能干活，再看多少钱）"))
     header = (
-        f"  {'模型':<26}{'case':>7}{'检查项':>9}{'抖动':>5}{'未测':>5}"
+        f"  {'模型':<26}{'case':>7}{'pass^k':>8}{'检查项':>9}{'抖动':>5}{'未测':>5}"
         f"{'工具错':>7}{'in tok':>9}{'out':>7}{'成本':>10}{'耗时':>8}"
     )
     print(ui.secondary(header))
@@ -295,6 +350,7 @@ def print_matrix(results: list[dict], repeat: int = 1) -> None:
         line = (
             f"  {row['model']:<26}"
             f"{row['passed']}/{row['runs']:<5}"
+            f"{row['pass_hat_k']:>8}"
             f"{row['checks_passed']}/{row['checks_total']:<7}"
             f"{row['flaky']:>5}"
             f"{row['infra']:>5}"
@@ -318,6 +374,8 @@ def print_matrix(results: list[dict], repeat: int = 1) -> None:
     note = discrimination_note(rows, repeat)
     if note:
         print(ui.warning(f"  ⚖ {note}"))
+    for line in regression_failures(rows):
+        print(ui.error(f"  ✗ 回归门失败：{line}"))
 
 
 def print_case_result(result: dict) -> None:
@@ -454,6 +512,9 @@ def main(argv: list[str] | None = None) -> int:
                         "base_url": args.base_url,
                         "repeat": args.repeat,
                         "request_timeout": REQUEST_TIMEOUT,
+                        #  资源画像：Anthropic infrastructure-noise——同一 case 在
+                        #  紧配额机器上差几分，不记资源就把噪声当结论
+                        "resources": _machine_resources(),
                     },
                     "discrimination_note": discrimination_note(
                         summarize_by_model(results), args.repeat
@@ -468,9 +529,12 @@ def main(argv: list[str] | None = None) -> int:
         )
         print(ui.secondary(f"结果已写入 {out}"))
 
-    #  退出码三分：0=可测的全过且没有未测；1=有真失败；3=没有真失败但有未测
-    #  （基础设施故障）。"没测到"和"测了没过"必须在退出码上就可区分，
-    #  CI 里前者该重跑、后者该修。
+    #  退出码四分：0=可测的全过且没有未测；1=有真失败；2=回归门失败（回归 case
+    #  没保住 pass^k——最该叫出来的一档，稳定行为退化了）；3=没有真失败但有未测
+    #  （基础设施故障）。"没测到"/"测了没过"/"稳定行为退化"必须在退出码上就可区分：
+    #  CI 里未测该重跑、真失败该修、回归失败该拦。回归门优先级最高。
+    if regression_failures(summarize_by_model(results)):
+        return 2
     if passed != len(measurable):
         return 1
     if unmeasured:
