@@ -29,6 +29,11 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
 
+from . import diagnostics
+
+#  仍在跑的后台任务数（monitor + command），/diagnostics 可见
+TASKS_LIVE = diagnostics.Gauge("background.tasks.live")
+
 #  单行/单批事件的字符上限
 _LINE_CAP = 500
 _BATCH_CAP = 3000
@@ -209,6 +214,7 @@ class TaskManager:
         )
         with self._lock:
             self._tasks[task_id] = task
+        TASKS_LIVE.inc()
         threading.Thread(
             target=self._watch, args=(task, timeout), daemon=True, name=f"xiaoyu-{task_id}"
         ).start()
@@ -232,6 +238,7 @@ class TaskManager:
             pass
         task.exit_code = task.proc.returncode
         task.done.set()
+        TASKS_LIVE.dec()
         self._announce_completion(task)
 
     def _announce_completion(self, task: BackgroundTask) -> None:

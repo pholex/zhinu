@@ -18,7 +18,7 @@ from pathlib import Path
 from dataclasses import dataclass, field
 from typing import Any, Callable, Protocol
 
-from . import envprobe, errors, media, modes, providers, sandbox, skill_usage, skills, tokens
+from . import diagnostics, envprobe, errors, media, modes, providers, sandbox, skill_usage, skills, tokens
 from .compaction import (
     MIN_SUMMARY_CHARS,
     PREFIX_SUMMARY_INSTRUCTION,
@@ -277,7 +277,7 @@ PHANTOM_EDIT_NUDGE = (
 PLAN_MODE_TOOLS = frozenset(
     {"read_file", "grep", "list_files", "explore", "skill", "web_search",
      "update_plan", "exit_plan_mode", "ask_user", "list_sessions", "task_output",
-     "search_tool"}
+     "search_tool", "get_context_remaining"}
 )
 
 #  进入/退出 plan mode 时注入历史的说明（user 角色）：模型从历史里得知规则，
@@ -547,6 +547,9 @@ class Usage:
         return "\n".join(lines)
 
 
+#  进程级仪表：serve /diagnostics 与 doctor 读它回答"现在有几轮在跑"
+_TURNS_ACTIVE = diagnostics.Gauge("core.turns.active")
+
 class Agent:
     def __init__(
         self,
@@ -675,6 +678,11 @@ class Agent:
         #  部分，误差不随会话累积）：(权威 prompt_tokens, 当时的消息条数)。
         #  Mantle 系模型不回 usage 时锚点保持 None，退化为纯本地估算。
         self._anchor: tuple[int, int] | None = None
+        #  上下文窗口编号（1 起）与待应用的翻篇请求：new_context 工具只登记
+        #  请求，真正换窗口在这批工具结果入历史之后（见主循环）——工具调用与
+        #  结果先配好对再整体丢弃，不留孤儿。
+        self._context_window = 1
+        self._new_context_notes: str | None = None
         #  发请求时的消息条数，usage 到达时用来落锚
         self._request_len = 0
         self.compactor = Compactor(
@@ -793,6 +801,50 @@ class Agent:
                     handler=self._ask_user,
                     requires_approval=False,
                     check_fn=lambda: self.asker is not None,
+                )
+            )
+        #  上下文窗口两件套：让模型自己看得见余量、自己决定何时翻篇。
+        #  get_context_remaining 纯查询（与 maybe_compact 同一把尺子）；
+        #  new_context 不做摘要调用——把"带什么过去"交给模型写成交接笔记，
+        #  不花钱、不被摘要器转述失真。只挂根 agent：子 agent 的历史由父级
+        #  把控，它自己翻篇会让委托交接对不上号。
+        if self.toolbox.get("get_context_remaining") is None:
+            self.toolbox.register(
+                Tool(
+                    name="get_context_remaining",
+                    description=(
+                        "查询当前上下文窗口还剩多少 token（估算）。"
+                        "长任务中途、准备读大文件或跑大输出命令之前调用，"
+                        "余量不足时先收口或调用 new_context 翻篇。"
+                    ),
+                    parameters={"type": "object", "properties": {}, "required": []},
+                    handler=self._get_context_remaining,
+                    requires_approval=False,
+                )
+            )
+        if allow_explore and self.toolbox.get("new_context") is None:
+            self.toolbox.register(
+                Tool(
+                    name="new_context",
+                    description=(
+                        "开启一个全新的上下文窗口：之前的对话历史全部不再可见，"
+                        "只有 system prompt 和你在 notes 里写的交接笔记会带过去。"
+                        "不做摘要、不改磁盘、不影响已完成的工作。适用：余量不足但任务"
+                        "还长，且当前细节已沉淀到文件/笔记里。notes 要写清任务目标、"
+                        "已完成与未完成项、关键路径与决定——新窗口里的你只有这些。"
+                    ),
+                    parameters={
+                        "type": "object",
+                        "properties": {
+                            "notes": {
+                                "type": "string",
+                                "description": "交接笔记：目标、进度、关键路径与决定（≤4000 字）",
+                            }
+                        },
+                        "required": ["notes"],
+                    },
+                    handler=self._new_context,
+                    requires_approval=False,
                 )
             )
         #  update_plan：任务清单工具。handler 几乎什么都不做——
@@ -1733,7 +1785,8 @@ class Agent:
         if store is not None:
             store.begin(media.text_of(user_input))
         try:
-            self._turn(user_input)
+            with _TURNS_ACTIVE.track():
+                self._turn(user_input)
         finally:
             if store is not None:
                 store.finish()
@@ -1861,6 +1914,9 @@ class Agent:
 
             for call in calls:
                 self._record(self._execute(call))
+            if self._new_context_notes is not None:
+                #  翻篇排在附图与插话之前：同批图片和用户插话落进新窗口而不是被丢掉
+                self._start_new_context_window()
             self._attach_media()
             #  一批工具执行完是插话生效的主时机：赶在下一次模型调用之前
             self._consume_steers()
@@ -2002,6 +2058,78 @@ class Agent:
                 self.session_log.event("compact", note=note)
             self.session_log.event("compact_end", ok=changed)
         return note
+
+    # ---------- 上下文窗口工具（模型自管余量） ----------
+
+    _NEW_CONTEXT_NOTES_CAP = 4000
+
+    def _get_context_remaining(self, **extra: Any) -> str:
+        """get_context_remaining 的 handler：与 maybe_compact 同一把尺子。"""
+        if extra:
+            return f"ERROR: get_context_remaining 不接受参数：{', '.join(extra)}。"
+        limit = self.config.context_limit
+        used = self.context_tokens()
+        return json.dumps(
+            {
+                "tokens_left": max(limit - used, 0),
+                "context_window": limit,
+                "used": used,
+                "window": self._context_window,
+            },
+            ensure_ascii=False,
+        )
+
+    def _new_context(self, notes: Any = "", **extra: Any) -> str:
+        """new_context 的 handler：只登记请求，换窗口在本批工具结果入历史后进行。"""
+        if extra:
+            return f"ERROR: new_context 不接受这些字段：{', '.join(extra)}。只有 notes。"
+        text = str(notes or "").strip()
+        if not text:
+            return "ERROR: notes 不能为空——新窗口里只有这份笔记，写清目标、进度与关键决定。"
+        if len(text) > self._NEW_CONTEXT_NOTES_CAP:
+            text = text[: self._NEW_CONTEXT_NOTES_CAP] + "\n[笔记超长，已截断]"
+        self._new_context_notes = text
+        return f"ok：本批工具结果记录后开启第 {self._context_window + 1} 个上下文窗口。"
+
+    def _context_window_note(self, notes: str) -> str:
+        previous = self._context_window - 1
+        return (
+            f"[系统提示] 已开启新的上下文窗口（第 {self._context_window} 个，"
+            f"上一窗口为第 {previous} 个）。之前的对话历史不再可见；"
+            "用户没有离开，无需重新问候。以下是你在上一窗口末尾写下的交接笔记，"
+            "据此继续：\n\n"
+            f"{notes}"
+        )
+
+    def _start_new_context_window(self) -> None:
+        """应用 new_context 请求：历史只留 system prompt + 交接笔记。
+
+        复用压缩的日志协议（compact_start / compact(replacement) / compact_end）：
+        resume 只认"最后一个带 replacement 的 compact 事件"，不必理解翻篇语义；
+        /rewind 按用户原文定位，旧窗口的点自然失配。
+        """
+        notes = self._new_context_notes or ""
+        self._new_context_notes = None
+        self._context_window += 1
+        before = self.context_tokens()
+        self.sink.emit(
+            Notice(f"[开启第 {self._context_window} 个上下文窗口（估算 {before} tok 的历史不再可见）]", "warn")
+        )
+        if self.session_log:
+            self.session_log.event("compact_start", trigger="new_context")
+        self.messages = [
+            self.messages[0],
+            {"role": "user", "content": self._context_window_note(notes)},
+        ]
+        self._anchor = None
+        if self.session_log:
+            self.session_log.event(
+                "compact",
+                note=f"new_context：第 {self._context_window} 个窗口",
+                replacement=self.messages[1:],
+                window=self._context_window,
+            )
+            self.session_log.event("compact_end", ok=True)
 
     def summary_models(self) -> list[Route]:
         """摘要的尝试顺序：先便宜的（连它的影子兜底），失败再回退主模型。"""

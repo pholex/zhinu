@@ -98,7 +98,7 @@ try:
 except ImportError:  # pragma: no cover - 没装 [serve] 时 create_app 会先抛 ServeUnavailable
     Request = Any  # type: ignore[assignment,misc]
 
-from . import folder_trust
+from . import diagnostics, folder_trust
 from .agent import Agent, Allow, Deny
 from .config import Config, MissingConfig
 from .embedding import AsyncAgent, RunCompleted
@@ -117,6 +117,10 @@ from .serve_state import (
 )
 from .session_log import SessionLog, _workspace_slug, load_messages, sessions_dir
 from .tools import Toolbox
+
+#  进程级计量：在册会话数 / 处理中的 HTTP 请求数（GET /diagnostics 读）
+SESSIONS_LIVE = diagnostics.Gauge("serve.sessions.live")
+REQUESTS_IN_FLIGHT = diagnostics.Gauge("serve.requests.in_flight")
 
 #  事件环形缓冲的默认容量：一轮重活的事件数在百量级，5000 够存几十轮；
 #  超出后从头丢，并把 first_seq/dropped 如实报给客户端——静默截断会让
@@ -748,6 +752,7 @@ def create_app(cfg: ServeConfig):  # noqa: C901 - 路由表天然长，拆开反
         #  返回给调用方），所以这个窗口安全——但 approver 仍 fail closed 兜底
         ref.bind(session, asyncio.get_running_loop())
         sessions[session_id] = session
+        SESSIONS_LIVE.set(len(sessions))
         return session
 
     def make_session(
@@ -836,6 +841,7 @@ def create_app(cfg: ServeConfig):  # noqa: C901 - 路由表天然长，拆开反
             except Exception as exc:  # noqa: BLE001 - 一个坏清单不能拖死整个服务
                 print(f"serve: 恢复会话 {session_id} 失败，已跳过：{exc}", file=sys.stderr)
                 sessions.pop(session_id, None)
+                SESSIONS_LIVE.set(len(sessions))
                 continue
             log.event("reopened", version=app.version, model=local.model, messages=len(history))
             #  copy=False：历史就在这个文件里，再抄一遍等于每次重启都把日志翻倍
@@ -858,6 +864,7 @@ def create_app(cfg: ServeConfig):  # noqa: C901 - 路由表天然长，拆开反
             request.verdict = Deny("会话已被关闭")
             request.done.set()
         sessions.pop(session.id, None)
+        SESSIONS_LIVE.set(len(sessions))
         manifests.delete(session.id)
         if session.agent.session_log:
             session.agent.session_log.close("closed")
@@ -928,6 +935,24 @@ def create_app(cfg: ServeConfig):  # noqa: C901 - 路由表天然长，拆开反
                 request.done.set()
 
     # ---------- 路由 ----------
+
+    @app.middleware("http")
+    async def count_in_flight(request, call_next):
+        with REQUESTS_IN_FLIGHT.track():
+            return await call_next(request)
+
+    @app.get(
+        "/diagnostics",
+        summary="进程自诊断：RSS / 线程 / fd + 各子系统在册计量（会话、请求、MCP 连接、后台任务）",
+        tags=["system"],
+        dependencies=guard,
+        operation_id="diagnostics",
+    )
+    async def diagnostics_report() -> dict[str, Any]:
+        #  与 /health 不同：这里有 token 门——进程仪表是运维视角的数据，只给持令牌者
+        body = diagnostics.report()
+        body["uptime_s"] = body["process"].pop("uptime_s")
+        return body
 
     @app.get("/health", summary="存活探针", tags=["system"], operation_id="health")
     async def health() -> dict[str, Any]:
