@@ -29,7 +29,10 @@ DEFAULT_MODEL = "deepseek-v4-pro"
 # 摘要/检索这类有界的辅助任务用更便宜的模型：不需要工具调用，失败可回退主模型。
 DEFAULT_SUMMARY_MODEL = "deepseek-v4-flash"
 
-#  已知模型的上下文输入窗口（token），按模型名前缀匹配。
+#  已知模型的上下文输入窗口（token），按模型名前缀匹配。**这是零往返的快路径
+#  兜底**——权威值是 Models API 的 `max_input_tokens`（`/model` 探测时抓取并
+#  自校正当前会话，见 providers.probe_model_caps）。启动刻意不探测（"列得出不
+#  等于调得通"），所以这张表仍是默认来源，探测过才被更准的值顶掉。
 #  数字来源：网关侧声明的 max_input_tokens（deepseek/glm/kimi）与厂商公布的
 #  规格（fable-5、qwen3.8-max 均 1M）。
 #  没命中的用保守兜底：Claude 系一般 200k，留点余量取 180k——
@@ -293,6 +296,9 @@ class Config:
     #  上下文窗口上限（token）的显式覆写；None = 按 CONTEXT_WINDOWS 表
     #  跟随当前 model 自动取（读 context_limit 属性即得生效值）。
     context_limit_override: int | None = None
+    #  上面这个 override 是不是探测（Models API）写进来的：True = 可被后续探测更新，
+    #  False = 用户显式设的（XIAOYU_CONTEXT_LIMIT / --）绝不被探测覆盖
+    context_limit_probed: bool = False
     #  追加到内置 system prompt 末尾的自定义内容；None = 不追加，行为不变。
     #  供宿主进程把 xiaoyu 当执行引擎嵌入时注入身份/人格，
     #  不是项目指令——项目级规范走 AGENTS.md 那条路。
@@ -360,6 +366,24 @@ class Config:
     @context_limit.setter
     def context_limit(self, value: int) -> None:
         self.context_limit_override = value
+
+    def apply_probed_limit(self, limit: int | None) -> bool:
+        """把 Models API 探到的 max_input_tokens 写进 override——但绝不覆盖用户
+        显式设的值。返回是否实际改动（供打印"已自校正"）。
+
+        判据：当前 override 为空（还在用硬编码表），或它本来就是探测写进去的。
+        用户设过（context_limit_probed=False 且 override 非空）则纹丝不动。
+        """
+        if not limit or limit <= 0:
+            return False
+        if self.context_limit_override is not None and not self.context_limit_probed:
+            return False
+        if self.context_limit_override == limit:
+            self.context_limit_probed = True
+            return False
+        self.context_limit_override = limit
+        self.context_limit_probed = True
+        return True
 
     @classmethod
     def from_env(cls, workspace: Path | None = None, **overrides) -> "Config":

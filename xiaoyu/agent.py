@@ -2757,6 +2757,39 @@ class Agent:
         if self.session_log:
             self.session_log.event("model", model=name)
 
+    def refresh_capabilities(self, model: str | None = None) -> list[str]:
+        """探测当前模型的 Models API 能力并自校正上下文上限（on-demand，非启动期）。
+
+        返回给用户看的说明行（可能为空）：探到权威 max_input_tokens 与硬编码表
+        不一致时告警（表该更新了）、自校正生效时也说一句；顺带报 image 能力。
+        绝不抛——能力探测是锦上添花。
+        """
+        from .config import context_window
+
+        target = model or self.config.model
+        caps = self.registry.probe_model_caps(target)
+        if not caps:
+            return []
+        notes: list[str] = []
+        probed = caps.get("max_input_tokens")
+        if probed:
+            table = context_window(target)
+            if probed != table:
+                notes.append(
+                    f"[能力] {target} 的权威上下文窗口是 {probed}（硬编码表记的是 {table}）"
+                )
+            if target == self.config.model:
+                before = self.config.context_limit
+                self.config.apply_probed_limit(probed)
+                after = self.config.context_limit
+                if after != before:
+                    self.compactor.context_limit = after
+                    notes.append(f"[能力] 已按 Models API 自校正本会话上下文上限：{before} → {after}")
+        image = caps.get("image_input")
+        if image is not None:
+            notes.append(f"[能力] {target} {'收图' if image else '不收图'}（Models API 声明）")
+        return notes
+
     def switchable_models(self) -> list[str]:
         """`/model <名字>` 补全的候选：合并清单 + 全限定名 + 当前降级链
         + 网关探测缓存里出现过的。

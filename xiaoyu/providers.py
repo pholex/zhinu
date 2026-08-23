@@ -274,6 +274,10 @@ class Registry:
         #  remote_models 探测到的通配 provider 清单（会话级）：补全候选用。
         #  逐键补全不能做网络请求，所以只有探测过一次之后才补得出网关模型
         self._remote_cache: dict[str, list[str]] = {}
+        #  Models API 能力缓存（qualified 名 → {max_input_tokens, image_input}）：
+        #  probe_model_caps 按需填，零启动往返；探到的 max_input_tokens 是上下文
+        #  上限的权威值，硬编码 CONTEXT_WINDOWS 只是它未探测时的兜底
+        self._capabilities: dict[str, dict[str, Any]] = {}
 
     @classmethod
     def for_client(cls, client: Any, name: str = GATEWAY) -> "Registry":
@@ -503,6 +507,68 @@ class Registry:
                 if name not in names:
                     names.append(name)
         return names
+
+    @staticmethod
+    def _extract_caps(model_obj: Any) -> dict[str, Any]:
+        """从一个 /v1/models 的模型对象里挖 max_input_tokens 与 image_input。
+
+        Anthropic 原生返回富 capabilities（image_input.supported 等）+
+        max_input_tokens；OpenAI 兼容网关多半没有这些字段——挖不到就留 None，
+        绝不臆造（None = 不知道，走硬编码兜底）。
+        """
+        data: dict[str, Any] = {}
+        if hasattr(model_obj, "model_dump"):
+            try:
+                data = model_obj.model_dump()
+            except Exception:  # noqa: BLE001
+                data = {}
+        if not data:
+            data = {k: getattr(model_obj, k) for k in dir(model_obj) if not k.startswith("_")}
+        raw_limit = data.get("max_input_tokens")
+        try:
+            limit = int(raw_limit) if raw_limit else None
+        except (TypeError, ValueError):
+            limit = None
+        image = None
+        caps = data.get("capabilities")
+        if isinstance(caps, dict) and isinstance(caps.get("image_input"), dict):
+            image = bool(caps["image_input"].get("supported"))
+        return {"max_input_tokens": limit, "image_input": image}
+
+    def probe_model_caps(self, model: str, timeout: float = 10.0) -> dict[str, Any]:
+        """按需拉一个模型的 Models API 能力（缓存、绝不抛、绝不启动期调用）。
+
+        走对应 provider 的 client：说 Anthropic 协议的用原生 SDK client（它才有
+        富 capabilities），其余用被包 client 的 `.models`。失败/无此字段 → {}。
+        """
+        try:
+            route = self.resolve(model)
+        except UnknownModel:
+            return {}
+        transport = route.client
+        try:
+            speaks = getattr(transport, "speaks_anthropic", None)
+            build = getattr(transport, "anthropic_client", None)
+            if callable(speaks) and callable(build) and speaks(route.model):
+                #  Anthropic 原生 SDK client 才有富 capabilities（OpenAI 兼容面没有）
+                api = build().with_options(timeout=timeout).models
+            elif hasattr(transport, "with_options"):
+                api = transport.with_options(timeout=timeout).models
+            else:
+                api = transport.models
+            obj = api.retrieve(route.model)
+            caps = self._extract_caps(obj)
+        except Exception:  # noqa: BLE001 - 能力探测是锦上添花，任何失败都静默降级
+            return {}
+        self._capabilities[route.qualified] = caps
+        return caps
+
+    def cached_caps(self, model: str) -> dict[str, Any] | None:
+        try:
+            route = self.resolve(model)
+        except UnknownModel:
+            return None
+        return self._capabilities.get(route.qualified)
 
     def describe(self) -> str:
         """`/model` 无参时的合并清单。让"钱花在哪、请求走哪条路"看得见——
