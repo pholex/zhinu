@@ -24,11 +24,11 @@ from pathlib import Path
 
 from xiaoyu.agent import Agent, Interrupted
 from xiaoyu.config import Config
-from xiaoyu.embedding import AsyncAgent
+from xiaoyu.embedding import AsyncAgent, RunCompleted
 from xiaoyu.providers import Registry
 from xiaoyu.tools import Toolbox
 
-from tests.test_agent_paths import FakeClient, chunk
+from tests.test_agent_paths import FakeClient, call_fragment, chunk, usage_chunk
 
 
 class EmbeddingTestCase(unittest.TestCase):
@@ -250,3 +250,42 @@ class TestRunResult(unittest.IsolatedAsyncioTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestOutputSchema(EmbeddingTestCase):
+    """output_schema 走 embedding 面：结果在 RunResult.output，且只对那一轮生效。"""
+
+    SCHEMA = {"type": "object", "properties": {"ok": {"type": "boolean"}}, "required": ["ok"]}
+
+    def test_send_returns_output_and_unmounts_tool(self) -> None:
+        agent = self.build(
+            [
+                [
+                    chunk(tool_calls=[call_fragment(0, "c1", "structured_output", '{"ok": true}')]),
+                    usage_chunk(50, 5),
+                ],
+                [chunk(content="下一轮普通收尾"), usage_chunk(60, 6)],
+            ]
+        )
+        async_agent = AsyncAgent(agent)
+        result = asyncio.run(async_agent.send("判断", output_schema=self.SCHEMA))
+        self.assertEqual(result.output, {"ok": True})
+        self.assertIsNone(agent.toolbox.get("structured_output"))
+        plain = asyncio.run(async_agent.send("再来"))
+        self.assertIsNone(plain.output)
+        self.assertEqual(plain.text, "下一轮普通收尾")
+
+    def test_stream_run_completed_carries_output(self) -> None:
+        agent = self.build(
+            [[chunk(tool_calls=[call_fragment(0, "c1", "structured_output", '{"ok": false}')])]]
+        )
+
+        async def drive():
+            last = None
+            async for event in AsyncAgent(agent).stream("判断", output_schema=self.SCHEMA):
+                last = event
+            return last
+
+        last = asyncio.run(drive())
+        self.assertIsInstance(last, RunCompleted)
+        self.assertEqual(last.result.output, {"ok": False})

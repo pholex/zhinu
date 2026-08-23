@@ -28,6 +28,19 @@ coding agent 一轮动辄几分钟，而编排器的 HTTP 节点普遍有分钟�
 
 异步那条的配套是状态轮询和事件游标，见下面两节。
 
+两个端点都可带 `output_schema`（JSON Schema）：要求这一轮以符合它的**对象**收尾，
+而不是一段正文。模型经 `structured_output` 工具交回，结果在 `result.output`
+（`prompt` 直接返回；`prompt_async` 在 `GET /status` 的 `last_result.output`）。
+模型没按要求给则为 `null`，编排侧据此判失败。校验只做 type / required /
+enum / items 这一层，复杂关键字自己再校。
+
+```bash
+curl -X POST :8420/session/$SID/prompt -d '{"text":"评估这个 PR 能不能合",
+  "output_schema":{"type":"object","properties":{"mergeable":{"type":"boolean"},
+  "reasons":{"type":"array","items":{"type":"string"}}},"required":["mergeable"]}}'
+#  → {..., "result": {"text": "...", "output": {"mergeable": false, "reasons": [...]}, ...}}
+```
+
 ---
 
 ## 状态机（编排的主要抓手）
