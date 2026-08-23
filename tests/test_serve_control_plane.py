@@ -287,3 +287,70 @@ class TestPersistence(ServeCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestAgentMcpServers(ServeCase):
+    """agent 对象自带 MCP server（mcp_servers）：形状 400、服务端档位闸、会话私有 manager。"""
+
+    def create(self, status: int = 200, **config: Any):
+        response = self.client.post(
+            "/agent", json={"name": "a", "config": config}, headers=self.headers()
+        )
+        self.assertEqual(response.status_code, status, response.text)
+        return response.json()
+
+    def test_default_off_rejects(self):
+        self.start(SIMPLE)
+        body = self.create(status=400, mcp_servers={"r": {"url": "https://example.com/mcp"}})
+        self.assertIn("--agent-mcp", body["detail"])
+
+    def test_shape_errors_are_400_not_silent(self):
+        self.start(SIMPLE, agent_mcp="all")
+        self.create(status=400, mcp_servers=["not", "a", "dict"])
+        body = self.create(status=400, mcp_servers={"bad": {"type": "sse", "url": "http://127.0.0.1/x"}})
+        self.assertIn("bad", body["detail"])
+        self.create(status=400, mcp_servers={"nothing": {}})
+
+    def test_http_tier_rejects_stdio_and_plaintext_remote(self):
+        self.start(SIMPLE, agent_mcp="http")
+        body = self.create(status=400, mcp_servers={"s": {"command": "python", "args": ["x.py"]}})
+        self.assertIn("--agent-mcp all", body["detail"])
+        #  明文 http 只许回环（headers 里放凭据）
+        self.create(status=400, mcp_servers={"r": {"url": "http://example.com/mcp"}})
+        self.create(mcp_servers={"r": {"url": "https://example.com/mcp", "headers": {"X": "${NOT_EXPANDED}"}}})
+
+    def test_stdio_server_is_session_private_and_closed_with_session(self):
+        import os
+        import sys
+        import time
+
+        from tests.test_mcp import write_fake_server
+
+        self.start(SIMPLE, agent_mcp="all")
+        #  ServeCase 的隔离环境关了 MCP 发现；本用例要真起 server
+        os.environ["XIAOYU_ENABLE_MCP"] = "1"
+        self.addCleanup(os.environ.__setitem__, "XIAOYU_ENABLE_MCP", "0")
+        script = write_fake_server(self.root)
+        agent = self.create(mcp_servers={"fake": {"command": sys.executable, "args": [str(script)]}})
+        self.assertEqual(agent["version"], 1)
+        session_id = self.new_session(agent=agent["agent_id"])
+        #  通过 /tools 看不到（检索模式把 MCP 工具藏在 search_tool 后面），直接查会话对象
+        session = None
+        for _ in range(50):
+            session = self._find_session(session_id)
+            if session is not None and session.mcp_manager is not None and not session.mcp_manager.loading():
+                break
+            time.sleep(0.1)
+        self.assertIsNotNone(session.mcp_manager)
+        names = [tool.name for tool in session.mcp_manager.ready_tools()]
+        self.assertTrue(any("fake" in name and "echo" in name for name in names), names)
+        #  不带 agent 的会话看不到它（会话私有，不进进程级缓存）
+        plain = self._find_session(self.new_session())
+        self.assertIsNone(plain.mcp_manager)
+        self.client.delete(f"/session/{session_id}", headers=self.headers())
+        #  关会话即关 manager：子进程收掉、manager 标记 closed
+        self.assertTrue(session.mcp_manager._closed)
+        self.assertFalse(session.mcp_manager._servers)
+
+    def _find_session(self, session_id: str):
+        return self.client.app.state.sessions.get(session_id)

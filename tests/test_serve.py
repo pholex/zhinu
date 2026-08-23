@@ -402,7 +402,7 @@ class TestConstructionTimeInjection(ServeCase):
 
         self.start("text: 无所谓\n")
         ref = _SessionRef()
-        agent = build_agent("sess-probe", self.root, ServeConfig(root=self.root), ref)
+        agent, _manager = build_agent("sess-probe", self.root, ServeConfig(root=self.root), ref)
         #  不是 Agent.__init__ 那个"永远批准"的缺省 lambda
         self.assertIsInstance(agent.approver, _HttpApprover)
         self.assertIsInstance(agent.sink, _BridgeSink)

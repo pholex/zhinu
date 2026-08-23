@@ -43,6 +43,9 @@ AGENT_CONFIG_KEYS = (
     "sandbox_network",
     "budget",
     "pricing",
+    #  宿主应用自有的 MCP server（.mcp.json 的 mcpServers 形状）：随版本钉定，
+    #  会话创建时按这一版拉起。服务端是否放行、放行到哪一档，在 serve.py 判
+    "mcp_servers",
 )
 MAX_NAME = 64
 
@@ -237,7 +240,30 @@ def check_agent_config(raw: dict[str, Any]) -> dict[str, Any]:
     budget = Budget.parse(raw.get("budget"))
     config["budget"] = budget.to_dict() if budget else None
     config["pricing"] = check_pricing(raw.get("pricing"))
+    config["mcp_servers"] = check_mcp_servers(raw.get("mcp_servers"))
     return config
+
+
+def check_mcp_servers(raw: Any) -> dict[str, Any] | None:
+    """mcp_servers 的形状校验：name → 声明对象，与 .mcp.json 的 mcpServers 同形。
+
+    解析器复用 mcp.parse_server_mapping；它对配置文件是"坏条目打一行警告跳过"，
+    这里是 API 输入，坏条目直接 400——宿主写错一条 server 名，静默少一个工具
+    是它最难查的失败。不展开 ${VAR}、不起进程；准入闸在 serve 侧按档判。
+    """
+    if raw is None or raw == {}:
+        return None
+    if not isinstance(raw, dict):
+        raise StateError("mcp_servers 必须是对象（server 名 → 声明，同 .mcp.json 的 mcpServers）")
+    from . import mcp
+
+    for name in raw:
+        if not isinstance(name, str) or not name.strip():
+            raise StateError("mcp_servers 的键（server 名）不能为空")
+    specs, problems = mcp.parse_server_mapping(raw, expand=False)
+    if problems:
+        raise StateError("mcp_servers 不合法：" + "；".join(problems))
+    return {name: raw[name] for name in raw}
 
 
 def check_name(raw: Any) -> str:
