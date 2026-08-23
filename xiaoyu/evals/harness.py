@@ -77,6 +77,10 @@ class Case:
     #  跑分机器上真装的技能
     enable_skills: bool = False
     skills: dict[str, str] | None = None
+    #  回归 case：断言"稳定行为，应保持 ~100%"。pass^k 门槛只对它生效——
+    #  一次没过（k 次里任一次挂）就是回归门失败（退出码 2）。能力 case
+    #  （默认 regression=False）起步低分正常，不进这道门
+    regression: bool = False
 
 
 def snapshot(root: Path) -> dict[str, str]:
@@ -342,11 +346,18 @@ def nothing_written() -> Check:
 
 
 def transcript_contains(needle: str) -> Check:
-    """模型的回答里必须出现某个客观事实（数字、文件名等）。"""
+    """模型的**自述**里必须出现某个客观事实（数字、文件名等）。
+
+    这是唯一的自我报告型判据（看 transcript 而非磁盘/git/测试/工具轨迹）——
+    Anthropic 的评测纪律是"按最终环境状态判分，别信 agent 自述"。所以它标了
+    `self_report=True`，且**必须与至少一个状态型判据配对**（见 harness 自证测试
+    `每个 case 都要有状态型判据`），不能单独当一个 case 的全部证据。"""
 
     def check(ctx: Context) -> tuple[bool, str]:
         hit = needle in ctx.transcript
         return hit, f"回答中{'含有' if hit else '缺少'} {needle!r}"
+
+    check.self_report = True  # type: ignore[attr-defined]
 
     return check
 

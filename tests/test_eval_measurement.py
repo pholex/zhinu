@@ -9,14 +9,22 @@ from __future__ import annotations
 
 import unittest
 
-from xiaoyu.evals.runner import INFRA_KINDS, discrimination_note, summarize_by_model
+from xiaoyu.evals.runner import (
+    INFRA_KINDS,
+    _machine_resources,
+    discrimination_note,
+    regression_failures,
+    summarize_by_model,
+)
 
 
-def _run(model: str, case: str, passed: bool, *, measurable: bool = True, infra=None) -> dict:
+def _run(model: str, case: str, passed: bool, *, measurable: bool = True, infra=None,
+         regression: bool = False) -> dict:
     """最小合法的 run_case 结果骨架。"""
     return {
         "case": case,
         "model": model,
+        "regression": regression,
         "description": "",
         "passed": passed,
         "measurable": measurable,
@@ -135,6 +143,79 @@ class TestInfraKindsContract(unittest.TestCase):
         #  能力相关的两类绝不能被划进基础设施：窗口用爆和跑挂是真实结局
         self.assertNotIn("context_overflow", INFRA_KINDS)
         self.assertNotIn("fatal", INFRA_KINDS)
+
+
+
+class TestPassHatK(unittest.TestCase):
+    def test_pass_hat_k_needs_all_runs_pass(self) -> None:
+        results = [
+            _run("m", "stable", True), _run("m", "stable", True),   # 两次全过 → 计入 pass^k
+            _run("m", "flaky", True), _run("m", "flaky", False),    # 时过时不过 → 不计
+            _run("m", "dead", False), _run("m", "dead", False),     # 全不过 → 不计
+        ]
+        (row,) = summarize_by_model(results)
+        self.assertEqual(row["pass_hat_k"], 1)
+
+    def test_no_measurable_run_is_not_pass_hat_k(self) -> None:
+        results = [_run("m", "x", False, measurable=False, infra="rate_limit")]
+        (row,) = summarize_by_model(results)
+        self.assertEqual(row["pass_hat_k"], 0)
+
+
+class TestRegressionGate(unittest.TestCase):
+    def test_regression_case_must_pass_all_runs(self) -> None:
+        results = [
+            _run("m", "reg", True, regression=True),
+            _run("m", "reg", False, regression=True),   # 一次没过 → 门失败
+        ]
+        (row,) = summarize_by_model(results)
+        self.assertEqual((row["regression_total"], row["regression_failed"]), (1, 1))
+        self.assertTrue(regression_failures([row]))
+
+    def test_regression_all_pass_no_gate_failure(self) -> None:
+        results = [_run("m", "reg", True, regression=True), _run("m", "reg", True, regression=True)]
+        (row,) = summarize_by_model(results)
+        self.assertEqual(row["regression_failed"], 0)
+        self.assertEqual(regression_failures([row]), [])
+
+    def test_capability_case_failing_is_not_a_gate_failure(self) -> None:
+        #  能力 case（regression=False）失败不进门——起步低分正常
+        results = [_run("m", "cap", False, regression=False)]
+        (row,) = summarize_by_model(results)
+        self.assertEqual(row["regression_total"], 0)
+        self.assertEqual(regression_failures([row]), [])
+
+
+class TestResources(unittest.TestCase):
+    def test_resource_profile_shape(self) -> None:
+        res = _machine_resources()
+        self.assertIn("cpu_count", res)
+        self.assertIn("memory_gb", res)
+        self.assertIn("machine", res)
+        #  cpu_count 恒为正整数或 None，绝不臆造
+        self.assertTrue(res["cpu_count"] is None or res["cpu_count"] > 0)
+
+
+
+class TestStateBasedGrading(unittest.TestCase):
+    """看磁盘/git/测试/工具轨迹判分，别信 agent 自述——每个 case 至少要有一个
+    非自述型判据。自述型（transcript_contains）只能配对出现，不能独撑一个 case。"""
+
+    def test_every_case_has_a_state_based_check(self) -> None:
+        from xiaoyu.evals.cases import CASES
+
+        for case in CASES:
+            has_state = any(
+                not getattr(check, "self_report", False) for _label, check in case.checks
+            )
+            self.assertTrue(has_state, f"{case.name} 只有自述型判据，缺状态型证据")
+
+    def test_transcript_contains_is_tagged_self_report(self) -> None:
+        from xiaoyu.evals.harness import nothing_written, transcript_contains
+
+        self.assertTrue(getattr(transcript_contains("x"), "self_report", False))
+        #  状态型判据不带这个标（默认即状态型）
+        self.assertFalse(getattr(nothing_written(), "self_report", False))
 
 
 if __name__ == "__main__":
