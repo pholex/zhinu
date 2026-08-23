@@ -131,6 +131,45 @@ class InspectTest(IsolatedConfigTest):
         src = make_bundle(self.root / "src", mcp_at=".mcp.json")
         self.assertEqual(plugins.inspect_bundle(src).mcp_file, ".mcp.json")
 
+    @unittest.skipIf(os.name == "nt", "Windows 建软链要特权")
+    def test_symlinked_manifest_rejected_not_skipped(self):
+        """根上 plugin.json 是软链、.claude-plugin/plugin.json 是普通文件。
+
+        拷贝时软链被丢掉，若识别阶段认了软链那份（或悄悄跳过去认下一份），
+        校验的和装进去的就不是同一个 manifest——必须整个拒掉。
+        """
+        root = make_bundle(self.root / "b", manifest_at=".claude-plugin/plugin.json")
+        write_json(self.root / "elsewhere.json", {"name": "demo", "description": "软链那份"})
+        (root / "plugin.json").symlink_to(self.root / "elsewhere.json")
+        with self.assertRaises(plugins.PluginError) as ctx:
+            plugins.inspect_bundle(root)
+        self.assertIn("符号链接", str(ctx.exception))
+
+    @unittest.skipIf(os.name == "nt", "Windows 建软链要特权")
+    def test_symlinked_parent_dir_rejected(self):
+        root = make_bundle(self.root / "b", manifest_at=None)
+        real = self.root / "real-meta"
+        write_json(real / "plugin.json", {"name": "demo"})
+        (root / ".claude-plugin").symlink_to(real, target_is_directory=True)
+        with self.assertRaises(plugins.PluginError):
+            plugins.inspect_bundle(root)
+
+    @unittest.skipIf(os.name == "nt", "Windows 建软链要特权")
+    def test_materialize_refuses_when_staged_manifest_differs(self):
+        """绕过 inspect 直接 materialize 也守得住：落盘后复核选中的 manifest。"""
+        root = make_bundle(self.root / "b", manifest_at=".claude-plugin/plugin.json")
+        write_json(self.root / "elsewhere.json", {"name": "demo"})
+        (root / "plugin.json").symlink_to(self.root / "elsewhere.json")
+        with self.assertRaises(plugins.PluginError):
+            plugins.materialize(root, "demo")
+        self.assertFalse((plugins.plugins_root() / "demo").exists())
+        self.assertFalse((plugins.plugins_root() / ".staging-demo").exists())
+
+    def test_materialize_keeps_chosen_manifest(self):
+        root = make_bundle(self.root / "b", manifest_at=".claude-plugin/plugin.json")
+        target = plugins.materialize(root, "demo")
+        self.assertTrue((target / ".claude-plugin/plugin.json").is_file())
+
     def test_no_manifest_uses_directory_name(self):
         src = make_bundle(self.root / "my-pkg", manifest_at="", mcp_at=None)
         bundle = plugins.inspect_bundle(src)

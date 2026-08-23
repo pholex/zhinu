@@ -171,11 +171,33 @@ def _interactive_auth_hint(output: str) -> str:
     )
 
 
+@functools.lru_cache(maxsize=1)
+def non_inheritable_env_names() -> frozenset[str]:
+    """模型跑的子进程**永远**拿不到的环境变量名（统一大写比较）。
+
+    集合 = 小羽自己的密钥：网关 key、每个直连 provider 的 key（含别名）、
+    serve 令牌。这些是"小羽调模型用的"，模型跑的命令没有任何正当理由需要
+    它们——而 `env | grep KEY` 是最省事的外泄方式。
+    名单从 providers.PRESETS 推导而不是手抄：新增 provider 自动纳入。
+    """
+    from .config import GATEWAY_KEY_ENVS
+    from .providers import PRESETS
+
+    names = set(GATEWAY_KEY_ENVS) | {"XIAOYU_SERVE_TOKEN"}
+    for preset in PRESETS.values():
+        names.update(preset.key_envs)
+    return frozenset(name.upper() for name in names)
+
+
 def _hardened_env(extra: dict[str, str] | None = None) -> dict[str, str]:
-    """子进程环境：剔除 LD_* / DYLD_*（进程加固）。
+    """子进程环境：剔除 LD_* / DYLD_*（进程加固）与小羽自己的密钥。
 
     LD_PRELOAD / DYLD_INSERT_LIBRARIES 能往任何被执行的程序里注入代码——
     模型跑的命令不该继承这类注入通道。
+
+    密钥剔除在 `extra` 合并**之后**做，且不区分大小写：否则 extra 里一个
+    `deepseek_api_key` 就把刚剔掉的又塞回去。extra 里其它变量（宿主有意
+    递给工具的 GITHUB_TOKEN 之类）是操作者的明确决定，照传。
     """
     env = {
         key: value
@@ -184,7 +206,8 @@ def _hardened_env(extra: dict[str, str] | None = None) -> dict[str, str]:
     }
     if extra:
         env.update(extra)
-    return env
+    secrets = non_inheritable_env_names()
+    return {key: value for key, value in env.items() if key.upper() not in secrets}
 
 
 #  进程级 core dump 关闭只做一次（rlimit 跨 fork/exec 继承，见 _harden_core_limit）。

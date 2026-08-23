@@ -51,6 +51,14 @@ class TestClassifyInput(unittest.TestCase):
                 self.assertEqual(action.kind, kind)
                 self.assertEqual(action.args, args)
 
+    def test_literal_skips_prefix_routing(self) -> None:
+        """literal=True（行首来自粘贴 chip）：! / # / 前缀都不算命令，原样发模型。"""
+        for line, args in (("!ls", "!ls"), ("# 标题", "# 标题"), ("/halp", "/halp"), ("  !rm -rf /  ", "!rm -rf /")):
+            with self.subTest(line=line):
+                action = keys.classify_input(line, literal=True)
+                self.assertEqual((action.kind, action.args), ("send", args))
+        self.assertEqual(keys.classify_input("   ", literal=True).kind, "empty")
+
     def test_bare_prefixes_return_usage_hint(self) -> None:
         """前缀对了但没内容：给用法提示，两个前端打的是同一句。"""
         for line in ("!", "!   ", "#", "##  "):

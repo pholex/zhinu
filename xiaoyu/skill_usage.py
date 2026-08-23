@@ -8,10 +8,11 @@
 记账纪律（只算"正文送达"）：
 - **只有 skill 工具成功加载正文**才算一次 hit（`record_load`）。索引里列出名字
   不算、/skills 浏览不算、加载失败不算——那些都不是"用了这个技能"。
-- 已知局限：模型也可能绕过 skill 工具、直接 `cat SKILL.md`（bash）读正文，
-  这种读**不计入**。xiaoyu 的 skill 工具是加载正文的主路径，bash-cat 是少数
-  情况，先记干净的那条信号，不为不确定的归因引入复杂度。若日后发现 cat 绕过
-  普遍到让排序失真，再补按 bash 命令段归因的记账。
+- **隐式加载也算**：模型常绕过 skill 工具、直接 `cat …/SKILL.md` 或跑技能目录
+  下的脚本。这类 bash 命令按 argv 里的路径归因到技能（`implicit_loads`），
+  每轮每技能只记一次。不记的话账本系统性漏掉模型最爱直读的技能——而账本
+  正是索引排序依据，漏记会自我强化成"越常用越排后"。归因是 best-effort
+  的宽松解析（shlex），这是排序信号不是安全判定，宁可多记不可漏记。
 
 排序键：`(hits 降序, 最近使用/文件 mtime 降序)`。未用过的技能 hits=0，靠
 SKILL.md 的 mtime 兜底排序——刚装的新技能不会被一堆"老而没用过"的技能压在
@@ -24,6 +25,8 @@ import atexit
 import contextlib
 import json
 import os
+import re
+import shlex
 import threading
 import time
 from pathlib import Path
@@ -103,6 +106,52 @@ def record_load(name: str) -> None:
         _dirty = True
         if time.monotonic() - _last_flush >= _FLUSH_INTERVAL:
             _flush_locked()
+
+
+#  命令段分隔：按这些切开后各段独立 shlex。不求严格（引号内的 && 切错只影响
+#  归因，不影响执行），求的是 `cat a && python b` 两段都看得到。
+_SEGMENT_SPLIT = re.compile(r"\|\||&&|[;|\n]")
+
+
+def implicit_loads(command: str, skills: list["Skill"], cwd: Path | None = None) -> list[str]:
+    """从一条 bash 命令里找出被隐式使用的技能名（去重、按出现顺序）。
+
+    判定：argv 中任一词解析成路径后落在某技能目录（SKILL.md 所在目录）之内——
+    读正文、读 references/、跑 scripts/ 都算"用了这个技能"。`~` 与 `$HOME`
+    手工展开（技能目录几乎总在 home 下）；其它变量不展开，解析不了的段跳过。
+    """
+    if not skills or not command.strip():
+        return []
+    home = os.path.expanduser("~")
+    roots: list[tuple[str, str]] = []
+    for skill in skills:
+        try:
+            roots.append((os.path.realpath(skill.path.parent), skill.name))
+        except OSError:
+            continue
+    found: list[str] = []
+    for segment in _SEGMENT_SPLIT.split(command):
+        try:
+            words = shlex.split(segment, comments=True)
+        except ValueError:
+            continue
+        for word in words:
+            if "/" not in word and word != "SKILL.md":
+                continue
+            word = word.replace("$HOME", home).replace("${HOME}", home)
+            if word.startswith("~"):
+                word = os.path.expanduser(word)
+            path = word if os.path.isabs(word) else os.path.join(str(cwd or Path.cwd()), word)
+            try:
+                real = os.path.realpath(path)
+            except (OSError, ValueError):
+                continue
+            for root, name in roots:
+                if real == root or real.startswith(root + os.sep):
+                    if name not in found:
+                        found.append(name)
+                    break
+    return found
 
 
 def flush() -> None:

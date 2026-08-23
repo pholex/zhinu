@@ -125,7 +125,15 @@ def bwrap_args(writable_roots: list[str], allow_network: bool) -> list[str]:
     - `--unshare-pid` 必须和 `--proc /proc` 成对：只读的 /proc 会打断
       `/proc/self/*` 写入，而挂新 procfs 内核要求持有对应 pid namespace
     - `--die-with-parent`：小羽进程死，沙箱内整棵进程树跟着死，不留孤儿
+    - `--new-session`：沙箱进程脱离控制终端。否则它仍握着小羽的 tty，可以
+      `TIOCSTI` 往 prompt_toolkit 的输入里注键——等于替用户敲下一条命令
+    - `--unshare-ipc`：独立 IPC namespace，隔离 SysV 共享内存 / 信号量
+    - `--cap-drop ALL`：清空 capability 集合；user namespace 里的"root"
+      不该再带任何 cap
     - 断网 = `--unshare-net`（空 network namespace，连 localhost 都没有）
+    - 刻意不加 `--as-pid-1`：它要求沙箱内 pid 1 自己做 init（转发信号、
+      收割孤儿、保留退出码），需要配一个内层 reaper 进程；没有 reaper 的
+      `--as-pid-1` 比不加更糟。`--unshare-pid` 下的僵尸随沙箱退出一起消失
     - 可写根目录逐个 `--bind`。⚠️ 与 seatbelt 的语义差异：bind 不了不存在的
       目录，只能过滤掉——所以 Linux 上"允许写一个尚不存在的缓存目录"不成立，
       目录要先存在才可写（workspace/tmp 恒存在，不受影响）。
@@ -134,8 +142,11 @@ def bwrap_args(writable_roots: list[str], allow_network: bool) -> list[str]:
         "--ro-bind", "/", "/",
         "--dev-bind", "/dev", "/dev",
         "--unshare-pid",
+        "--unshare-ipc",
         "--proc", "/proc",
         "--die-with-parent",
+        "--new-session",
+        "--cap-drop", "ALL",
     ]
     if not allow_network:
         args.append("--unshare-net")

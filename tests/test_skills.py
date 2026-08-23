@@ -72,6 +72,14 @@ class FrontmatterTest(unittest.TestCase):
     def test_unclosed_frontmatter_returns_empty(self):
         self.assertEqual(skills.parse_frontmatter("---\nname: x\n没有闭合"), {})
 
+    def test_unknown_keys_reported_with_allowed_set(self):
+        problems = skills.frontmatter_problems({"name": "x", "descripton": "拼错了"})
+        self.assertEqual(len(problems), 2)
+        self.assertIn("descripton", problems[0])
+        self.assertIn("description", problems[0])  # 回显允许集
+        self.assertIn("缺少 description", problems[1])
+        self.assertEqual(skills.frontmatter_problems({"name": "x", "description": "ok", "version": "1"}), [])
+
     def test_strip_frontmatter(self):
         text = "---\nname: x\n---\n\n# 标题\n内容"
         self.assertEqual(skills.strip_frontmatter(text), "# 标题\n内容")
@@ -139,6 +147,43 @@ class ScanTest(unittest.TestCase):
         self.assertIsNone(found["deploy"].plugin)
         self.assertEqual(found["pkg-a:deploy"].plugin, "pkg-a")
         self.assertEqual(found["pkg-b:deploy"].description, "B 家的部署")
+
+    def test_typo_description_skipped_with_warning(self):
+        """descripton: 拼错 → 以前静默进索引、永远选不中；现在跳过并在 stderr 指出。"""
+        write_skill(self.primary, "typo", "name: typo\ndescripton: 做事")
+        write_skill(self.primary, "rare", "name: rare\ndescription: 有描述\nfoo: 生僻键")
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            names = {skill.name for skill in skills.scan_skills()}
+        self.assertNotIn("typo", names)
+        self.assertIn("rare", names)  # 只是多了个生僻键，照常加载
+        self.assertIn("descripton", err.getvalue())
+        self.assertIn("允许", err.getvalue())
+        self.assertIn("foo", err.getvalue())
+
+    def test_index_report_and_user_warning(self):
+        found = self._write_bulk(20, description_chars=300)
+        skills.index_block(found, max_tokens=100_000)
+        self.assertIsNone(skills.budget_warning())
+        self.assertEqual(skills.last_index_report.truncated, 0)
+        skills.index_block(found, max_tokens=500)
+        report = skills.last_index_report
+        self.assertEqual(report.total, 20)
+        self.assertGreater(report.truncated, 0)
+        self.assertEqual(report.omitted, 0)
+        self.assertIn("描述被截短", skills.budget_warning())
+        skills.index_block(found, max_tokens=150)
+        self.assertGreater(skills.last_index_report.omitted, 0)
+        self.assertIn("未列出", skills.budget_warning())
+
+    def test_small_truncation_does_not_nag(self):
+        """平均只截掉几十个字不值得警告。"""
+        found = self._write_bulk(20, description_chars=60)
+        skills.index_block(found, max_tokens=len(found) * 20 + 60)
+        report = skills.last_index_report
+        if report.truncated and not report.omitted:
+            self.assertLessEqual(report.truncated_chars / report.truncated, 60)
+            self.assertIsNone(skills.budget_warning())
 
     def test_missing_dirs_are_fine(self):
         self.assertEqual(skills.scan_skills(), [])

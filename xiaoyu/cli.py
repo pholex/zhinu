@@ -17,7 +17,7 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
-from . import __version__, command_check, keys, media, modes, peers, providers, terminal, ui
+from . import __version__, command_check, keys, media, modes, peers, providers, skills, terminal, ui
 from .agent import Agent
 from .banner import build_banner
 from .session_log import (
@@ -846,6 +846,8 @@ def resume_command(argv: list[str]) -> int:
             print(ui.secondary(f"已恢复会话（{len(loaded)} 条消息，来自 {chosen.path.name}{forked}）"))
         return run_once(agent, prompt, args.output_format)
     print(build_banner(model_label(agent), str(config.workspace)))
+    if budget_note := skills.budget_warning():
+        print(ui.secondary(budget_note))
     print(ui.secondary(f"已恢复会话（{len(loaded)} 条消息，来自 {chosen.path.name}{forked}）"))
     #  回放最近几轮补进 scrollback（重建 turn 喂同一个
     #  渲染器），恢复后不再两眼一抹黑（/resume 切会话共用同一条路径）
@@ -2339,6 +2341,8 @@ def main(argv: list[str] | None = None) -> int:
     if env_files:
         print(ui.secondary("已加载 " + ", ".join(str(p) for p in env_files)))
     print(ui.secondary(sandbox_status(config)))
+    if budget_note := skills.budget_warning():
+        print(ui.secondary(budget_note))
     if resumed:
         #  接回上下文却不回放，人进来是两眼一抹黑——与 resume 同一条纪律
         print(ui.secondary(resumed))

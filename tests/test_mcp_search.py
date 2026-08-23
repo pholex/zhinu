@@ -74,6 +74,48 @@ class SearchTest(unittest.TestCase):
         self.assertEqual(mcp_search.search(self.entries, "  "), [])
         self.assertEqual(mcp_search.search([], "anything"), [])
 
+    def test_ascii_only_query_unaffected_by_grams(self):
+        """纯 ASCII 查询不产生 2-gram，排序与以前一致。"""
+        self.assertEqual(mcp_search.char_grams("linear create issue"), [])
+        ranked = mcp_search.search(self.entries, "slack message")
+        self.assertEqual(ranked[0][0].name, "mcp__slack__post_message")
+
+
+class CjkSearchTest(unittest.TestCase):
+    """中文查询：以前分词吐零 token 直接返回空，检索对中文用户整体失效。"""
+
+    def setUp(self):
+        self.entries = [
+            entry("mcp__lark__send_mail", "lark", "发送一封邮件给指定收件人", ["to", "subject"]),
+            entry("mcp__grafana__search_dashboards", "grafana", "搜索 Grafana 仪表盘", ["query"]),
+            entry("mcp__linear__save_issue", "linear", "Create or update a Linear issue"),
+        ]
+
+    def test_char_grams(self):
+        self.assertEqual(mcp_search.char_grams("发邮件"), ["发邮", "邮件"])
+        self.assertEqual(mcp_search.char_grams("邮"), ["邮"])
+        #  全角标点/空格是分隔，不跨段成 gram
+        self.assertEqual(mcp_search.char_grams("发送，邮件"), ["发送", "邮件"])
+        self.assertEqual(mcp_search.tokenize("邮件"), ["邮件"])
+
+    def test_chinese_query_hits_chinese_description(self):
+        ranked = mcp_search.search(self.entries, "发邮件")
+        self.assertTrue(ranked)
+        self.assertEqual(ranked[0][0].name, "mcp__lark__send_mail")
+        ranked = mcp_search.search(self.entries, "查一下仪表盘")
+        self.assertEqual(ranked[0][0].name, "mcp__grafana__search_dashboards")
+
+    def test_mixed_query(self):
+        ranked = mcp_search.search(self.entries, "grafana 仪表盘")
+        self.assertEqual(ranked[0][0].name, "mcp__grafana__search_dashboards")
+        #  中文不相关 + 英文标识符命中：英文词仍起作用
+        ranked = mcp_search.search(self.entries, "创建 linear issue")
+        self.assertEqual(ranked[0][0].name, "mcp__linear__save_issue")
+
+    def test_grams_are_capped(self):
+        grams = mcp_search.char_grams("字" * 5000)
+        self.assertEqual(len(grams), mcp_search._MAX_GRAMS)
+
 
 class ToolboxSearchModeTest(unittest.TestCase):
     """经 .mcp.json + 假 server 的完整链路（检索模式=默认配置）。"""

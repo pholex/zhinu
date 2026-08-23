@@ -184,11 +184,18 @@ _USAGE_HINTS = {
 _SLASH_COMMAND_SHAPE = re.compile(r"^/[A-Za-z][A-Za-z0-9_:-]*$")
 
 
-def classify_input(line: str) -> InputAction:
-    """所有前端的提交路由单点：一行输入 → 本地动作或发给模型。"""
+def classify_input(line: str, *, literal: bool = False) -> InputAction:
+    """所有前端的提交路由单点：一行输入 → 本地动作或发给模型。
+
+    `literal=True`：行首不是用户敲的（粘贴 chip 展开回来的正文顶在第 0 位），
+    ! / # / 前缀不算命令，整行原样发给模型——贴一段以 `!` 开头的日志不该
+    跑成 shell，贴一段 `# 标题` 不该记成备忘。
+    """
     line = line.strip()
     if not line:
         return InputAction("empty")
+    if literal:
+        return InputAction("send", line)
     if line.startswith("/"):
         head = line.split(None, 1)[0]
         #  路径形态（首 token 带第二个 / 或点号等）按普通输入发给模型，

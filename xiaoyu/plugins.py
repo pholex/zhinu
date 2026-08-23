@@ -127,10 +127,54 @@ def _read_json(path: Path) -> dict[str, Any]:
 
 
 def _first_existing(root: Path, candidates: tuple[str, ...]) -> tuple[str, Path] | None:
+    """按优先级找第一个存在的元数据文件。
+
+    **存在但不是"普通文件经普通目录"的候选直接拒**，而不是跳到下一个：
+    安装拷贝（`_copy_filter`）会丢掉所有符号链接，若这里对软链 manifest
+    "视而不见"去认下一个，或者反过来认了软链而拷贝时丢掉，校验看到的和
+    装进去的就不是同一份——低优先级的那份会顶上来。
+    """
     for relative in candidates:
         path = root / relative
+        if not path.exists() and not path.is_symlink():
+            continue
+        _require_regular(root, relative)
         if path.is_file():
             return relative, path
+    return None
+
+
+def _require_regular(root: Path, relative: str) -> None:
+    """relative 自身及 root 之下的每一级父目录都必须不是符号链接。"""
+    current = root
+    for part in Path(relative).parts:
+        current = current / part
+        if current.is_symlink():
+            raise PluginError(f"{root / relative} 经过符号链接（{current}），安装时会被丢弃，拒绝识别")
+    if current.exists() and not current.is_file():
+        raise PluginError(f"{root / relative} 不是普通文件")
+
+
+def _staged_matches(source: Path, staged: Path, candidates: tuple[str, ...]) -> str | None:
+    """校验阶段选中的元数据文件，落盘后必须还是同一路径、同一内容。返回错误描述或 None。"""
+    try:
+        chosen = _first_existing(source, candidates)
+    except PluginError as exc:
+        return str(exc)
+    if chosen is None:
+        return None
+    relative, origin = chosen
+    copy = staged / relative
+    if not copy.is_file():
+        return f"{relative} 校验时在，落盘后不在（拷贝过程丢掉了它）"
+    try:
+        if origin.read_bytes() != copy.read_bytes():
+            return f"{relative} 落盘后内容与校验时不一致"
+    except OSError as exc:
+        return f"{relative} 复核读不出来：{exc}"
+    staged_choice = _first_existing(staged, candidates)
+    if staged_choice is None or staged_choice[0] != relative:
+        return f"落盘后生效的是 {staged_choice[0] if staged_choice else '无'}，而校验时是 {relative}"
     return None
 
 
@@ -538,6 +582,13 @@ def materialize(bundle_dir: Path, name: str) -> Path:
         if leftover.exists():
             shutil.rmtree(leftover, ignore_errors=True)
     shutil.copytree(bundle_dir, staging, ignore=_copy_filter, symlinks=False)
+    #  校验看到的元数据必须就是装进去的那份：拷贝会丢符号链接，软链 manifest
+    #  若在校验时胜出、落盘后消失，低优先级的另一份就会顶上来生效。
+    for candidates in (MANIFEST_FILES, MCP_FILES):
+        problem = _staged_matches(bundle_dir, staging, candidates)
+        if problem:
+            shutil.rmtree(staging, ignore_errors=True)
+            raise PluginError(f"安装中止：{problem}")
     if target.exists():
         os.replace(target, backup)
     try:

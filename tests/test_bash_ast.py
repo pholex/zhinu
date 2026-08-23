@@ -68,6 +68,26 @@ class ParsePlainCommandsTest(unittest.TestCase):
         for script in rejected:
             self.assertIsNone(self.parse(script), script)
 
+    def test_dynamic_words_rejected(self):
+        """源文本拼写 ≠ 运行期 argv：会被 shell 改写的裸词整条判 None。"""
+        rejected = [
+            "rg --pre{=,=sh} pattern payload.sh",  # brace 展开 → --pre=sh
+            "find . -del*",  # glob → -delete
+            "echo ~",  # tilde
+            "=sh",  # zsh = 展开
+            "ls -de\\lete",  # 转义
+            "ls ^foo",  # zsh 扩展 glob
+            "ls a#b",  # zsh 扩展 glob
+        ]
+        for script in rejected:
+            self.assertIsNone(self.parse(script), script)
+
+    def test_literal_words_still_accepted(self):
+        self.assertEqual(
+            self.parse("rg --type=py -n pattern src/a.py"),
+            [["rg", "--type=py", "-n", "pattern", "src/a.py"]],
+        )
+
     def test_syntax_error_rejected(self):
         for script in ("ls &&", "&& ls", "ls | | wc", "echo 'unclosed"):
             self.assertIsNone(self.parse(script), script)
