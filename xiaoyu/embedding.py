@@ -91,6 +91,9 @@ class RunResult:
     #  带 output_schema 跑的那一轮：模型经 structured_output 工具交回的对象
     #  （已按 schema 轻校验）；没要 schema、或模型没给，都是 None
     output: Any = None
+    #  本轮怎么停的：done（模型自然收尾）/ turn_cap（轮数预算用尽，已让模型交代现场）/
+    #  budget（token 软预算到线，同上）/ interrupted。宿主据此决定是调预算续跑还是结案
+    stopped: str = "done"
 
 
 @dataclass(frozen=True)
@@ -196,6 +199,7 @@ def measured_send(
         },
         context_tokens=agent.context_tokens(),
         output=output,
+        stopped="interrupted" if interrupted else agent.last_stop,
     )
 
 

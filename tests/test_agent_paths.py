@@ -182,6 +182,7 @@ class TestToolCallLoop(AgentTestCase):
     def test_max_iterations_wraps_up_with_summary(self) -> None:
         #  模型一直要求调工具，必须被轮次上限刹住，且要产出收尾总结而不是静默截断
         self.config.max_iterations = 3
+        self.config.turn_extension = 0  # 不许延期：撞顶即收尾（延期路径见 test_budget_pacing）
         forever = [
             [chunk(tool_calls=[call_fragment(0, f"c{n}", "read_file", '{"path": "calc.py"}')])]
             for n in range(3)

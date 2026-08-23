@@ -59,7 +59,12 @@ from .events import (
     UISink,
 )
 from .render import PlainSink
-from .messages import COMPACTION_KEY, supports_server_compaction
+from .messages import (
+    COMPACTION_KEY,
+    TASK_BUDGET_KEY,
+    supports_server_compaction,
+    supports_task_budget,
+)
 from .responses import OPERATOR_KEY, REASONING_KEY
 from .tools import PURPOSE_PARAM, Tool, Toolbox
 
@@ -260,6 +265,44 @@ WRAPUP_INSTRUCTION = """已达到本轮工具调用次数上限，请立刻停�
 2. 进行到哪一步、还剩什么没做
 3. 建议用户下一步怎么做（继续让你做？手动处理？换个思路？）"""
 
+#  token 软预算到线前的收尾指令：与轮数上限同一精神——交代现场，不静默截断
+BUDGET_WRAPUP_INSTRUCTION = """本会话的 token 预算即将用尽，请立刻停止操作，不要再调用任何工具。
+直接用几句话总结：
+1. 已经完成了什么（具体到文件/改动）
+2. 进行到哪一步、还剩什么没做
+3. 建议下一步怎么做（调高预算继续？手动处理？换个思路？）"""
+
+#  token 软预算的下限：低于它就是纯硬闸（连系统提示都装不下，"节奏"无从谈起），
+#  不做倒计时/优雅收尾——那是 serve 硬闸的活。5k 之上才有 pace 的余地
+BUDGET_SOFT_FLOOR = 5_000
+
+#  预算倒计时：累计用量跨过这些比例时各提示一次（operator 通道）。模型知情才能
+#  自己收敛——否则它到最后一步还在开新探索，然后被砍断
+BUDGET_NOTICE_STEPS = (0.5, 0.8, 0.95)
+
+#  撞轮数上限时的延期邀约：给模型一步，只开 extend_turns 一个工具。
+#  它可以申请（说明理由与轮数），也可以直接交代现场收尾
+TURN_EXTENSION_OFFER = """已用完本轮的工具调用轮数预算。二选一：
+- 任务确实还需要继续：调用 extend_turns 工具，说明还需要几轮、用来做什么；
+- 否则不要再调用其它工具，直接用几句话总结已完成什么、剩什么、建议下一步。"""
+EXTEND_TURNS_TOOL = "extend_turns"
+EXTEND_TURNS_SCHEMA = {
+    "type": "function",
+    "function": {
+        "name": EXTEND_TURNS_TOOL,
+        "description": "申请追加本轮的工具调用轮数。只在撞轮数上限时可用；"
+        "批准的轮数受总追加上限约束，理由会展示给用户。",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "turns": {"type": "integer", "minimum": 1, "description": "还需要几轮"},
+                "reason": {"type": "string", "description": "用来做什么（一句话）"},
+            },
+            "required": ["turns", "reason"],
+        },
+    },
+}
+
 #  收尾轻推（固化流水线的最后一环）：本轮呈现"反复整写同一文件 + 反复执行"的
 #  解题迭代特征时，请模型评估要不要把解法沉淀下去。只提议、不动手——沉淀与否
 #  由用户拍板（持久记忆须人工确认的纪律），一次性脚本与常规开发不该被固化。
@@ -370,6 +413,8 @@ class StepContext:
 SYNTHETIC_USER_TEXTS = frozenset(
     {
         WRAPUP_INSTRUCTION,
+        BUDGET_WRAPUP_INSTRUCTION,
+        TURN_EXTENSION_OFFER,
         EMPTY_REPLY_NUDGE,
         PLAN_MODE_ENTER_NOTE,
         PLAN_MODE_LEAVE_NOTE,
@@ -781,6 +826,11 @@ class Agent:
         #  当前步的冻结快照（见 StepContext）；步外为 None
         self._step: StepContext | None = None
         self._step_index = 0
+        #  本轮的停止原因：done / turn_cap / budget（RunResult.stopped 回报给宿主）
+        self.last_stop = "done"
+        #  预算倒计时已说过的提示线；history_version 基线决定 task_budget 要不要带 remaining
+        self._budget_notified: set[float] = set()
+        self._budget_baseline_version = 0
         #  环境差量播报的基线：__init__ 末尾 adopt（system prompt 刚说过）
         self.world_state = world_state.WorldState()
         self._logged_baseline: dict[str, Any] | None = None
@@ -2023,7 +2073,27 @@ class Agent:
         stop_checked = False
         #  结构化输出只催一次：模型坚持用正文收尾就到此为止，消费方拿到 null
         nudged_structured = False
-        for _ in range(self.config.max_iterations):
+        #  轮数预算：撞顶可申请延期（见 _offer_extension），总追加量有上限
+        steps = 0
+        turn_budget = self.config.max_iterations
+        extension_pool = int(self.config.max_iterations * self.config.turn_extension)
+        self.last_stop = "done"
+        while True:
+            if steps >= turn_budget:
+                granted, wrapped = self._offer_extension(extension_pool)
+                if wrapped:
+                    self.last_stop = "turn_cap"
+                    return
+                if granted <= 0:
+                    self.last_stop = "turn_cap"
+                    break
+                turn_budget += granted
+                extension_pool -= granted
+            self._budget_countdown()
+            if self._budget_exhausted():
+                self.last_stop = "budget"
+                break
+            steps += 1
             self.maybe_compact()
             self._begin_step()
             message = self._stream_with_recovery()
@@ -2118,16 +2188,136 @@ class Agent:
             #  一批工具执行完是插话生效的主时机：赶在下一次模型调用之前
             self._consume_steers()
 
-        #  撞上限不静默截断：
+        #  撞上限/预算到线不静默截断：
         #  干了几十轮的活，至少让模型交代做到哪了、下一步怎么办
-        self.sink.emit(
-            Notice(f"\n[已达到单轮工具调用上限 {self.config.max_iterations}，请模型收尾]", "warn")
-        )
-        self._record_operator(WRAPUP_INSTRUCTION)
+        if self.last_stop == "budget":
+            spent = self.usage.prompt_tokens + self.usage.completion_tokens
+            self.sink.emit(
+                Notice(
+                    f"\n[token 预算即将用尽：已用 {spent} / {self.config.budget_tokens}，请模型收尾]",
+                    "warn",
+                )
+            )
+            if self.session_log:
+                self.session_log.event("budget_wrapup", spent=spent, budget=self.config.budget_tokens)
+            self._record_operator(BUDGET_WRAPUP_INSTRUCTION)
+        else:
+            self.sink.emit(
+                Notice(f"\n[已达到单轮工具调用上限 {turn_budget}，请模型收尾]", "warn")
+            )
+            self._record_operator(WRAPUP_INSTRUCTION)
         self._begin_step(with_tools=False)
         self._record(self._stream_with_recovery(with_tools=False))
 
-    def _begin_step(self, with_tools: bool = True) -> StepContext:
+    # ---------- 预算：token 软预算 + 轮数延期 ----------
+
+    def set_budget_tokens(self, budget: int | None) -> None:
+        """改会话 token 软预算（宿主/serve 的 /budget 调用）。倒计时提示按新预算重算。"""
+        self.config.budget_tokens = budget if budget and budget > 0 else None
+        self._budget_notified = set()
+        #  从现在起历史若被改写（压缩），task_budget 才需要补 remaining
+        self._budget_baseline_version = self.history_version
+
+    def _budget_active(self) -> int:
+        """软预算生效值（≥ 下限才算）；0 = 不做软节奏（None 或太小）。"""
+        budget = self.config.budget_tokens
+        return budget if budget and budget >= BUDGET_SOFT_FLOOR else 0
+
+    def _budget_spent(self) -> int:
+        return self.usage.prompt_tokens + self.usage.completion_tokens
+
+    def _budget_exhausted(self) -> bool:
+        """下一次模型调用是否会越线：每次调用都重新计费整段上下文，所以
+        "还剩的钱"要够付一次 context_tokens 再说；不够就现在收尾，把最后一次
+        调用留给交代现场，而不是开工到一半被硬闸砍断。"""
+        budget = self._budget_active()
+        if not budget:
+            return False
+        return self._budget_spent() + self.context_tokens() >= budget
+
+    def _budget_countdown(self) -> None:
+        """跨过提示线时给模型一条倒计时（operator 通道），每条线只说一次。"""
+        budget = self._budget_active()
+        if not budget:
+            return
+        spent = self._budget_spent()
+        ratio = spent / budget
+        for step in BUDGET_NOTICE_STEPS:
+            if ratio >= step and step not in self._budget_notified:
+                self._budget_notified.add(step)
+                remaining = max(0, budget - spent)
+                note = (
+                    f"[预算] 本会话 token 已用 {spent} / {budget}（{int(ratio * 100)}%），"
+                    f"剩余约 {remaining}。每次调用都会重新计入整段上下文，请据此安排："
+                    "优先把手头的事做到可交付并给出结论，不要开启大的新探索。"
+                )
+                self._record_operator(note)
+                self.compactor.synthetic_user_texts |= {note}
+                self.sink.emit(Notice(f"[预算 {int(ratio * 100)}%：已用 {spent} / {budget} tok]", "warn"))
+                if self.session_log:
+                    self.session_log.event("budget_notice", ratio=step, spent=spent)
+
+    def _task_budget_hint(self) -> dict[str, Any] | None:
+        """Anthropic 原生 task_budget（服务端倒计时）。历史被改写过（本地压缩 /
+        服务端压缩）时服务端算不出既往开销，补 remaining；否则只给 total
+        （官方：重发全历史时再给 remaining 会重复计入，低报预算）。"""
+        budget = self.config.budget_tokens
+        if not budget:
+            return None
+        hint: dict[str, Any] = {"total": budget}
+        if self.history_version != self._budget_baseline_version or self._compaction_floor():
+            hint["remaining"] = max(0, budget - self._budget_spent())
+        return hint
+
+    def _offer_extension(self, pool: int) -> tuple[int, bool]:
+        """撞轮数上限：给模型一步只开 extend_turns。返回 (批准轮数, 是否已自行收尾)。
+
+        池子空了就不邀约（直接走收尾）。批准量 = min(申请, 池子余量)——
+        无人值守也有界，不会变成无限轮；理由原样展示给用户，可审计。
+        """
+        if pool <= 0:
+            return 0, False
+        self.sink.emit(Notice(f"\n[已达到工具调用轮数预算，可追加 ≤{pool} 轮，询问模型]", "warn"))
+        self._record_operator(TURN_EXTENSION_OFFER)
+        self._begin_step(schemas=(EXTEND_TURNS_SCHEMA,))
+        message = self._stream_with_recovery()
+        self._record(message)
+        granted = 0
+        calls = message.get("tool_calls") or []
+        for call in calls:
+            function = call.get("function") or {}
+            if function.get("name") != EXTEND_TURNS_TOOL:
+                self._record(self._execute(call))
+                continue
+            try:
+                args = json.loads(function.get("arguments") or "{}")
+            except ValueError:
+                args = {}
+            try:
+                asked = max(1, int(args.get("turns") or 1))
+            except (TypeError, ValueError):
+                asked = 1
+            reason = str(args.get("reason") or "").strip() or "（未说明）"
+            granted = min(asked, pool)
+            self.sink.emit(Notice(f"[模型申请追加 {asked} 轮：{reason}；批准 {granted} 轮]", "warn"))
+            if self.session_log:
+                self.session_log.event("turn_extension", asked=asked, granted=granted, reason=reason)
+            self._record(
+                {
+                    "role": "tool",
+                    "tool_call_id": call.get("id", ""),
+                    "content": f"已批准追加 {granted} 轮（申请 {asked}，剩余可追加 {pool - granted}）。",
+                }
+            )
+        if granted:
+            return granted, False
+        #  没申请：正文非空即视为已收尾；空回复则走常规收尾再要一次总结
+        wrapped = not calls and bool(media.text_of(message.get("content")).strip())
+        return 0, wrapped
+
+    def _begin_step(
+        self, with_tools: bool = True, schemas: tuple[dict[str, Any], ...] | None = None
+    ) -> StepContext:
         """开一步：先播报环境差量，再拍本步快照。
 
         顺序不能反——播报是一条 user 消息，要排在本步请求里；快照里的工具集
@@ -2141,7 +2331,8 @@ class Agent:
         if self.session_log and self.world_state.baseline != self._logged_baseline:
             self._logged_baseline = self.world_state.baseline
             self.session_log.event("world_state", baseline=self.world_state.baseline)
-        schemas = tuple(self.toolbox.schemas()) if with_tools else ()
+        if schemas is None:
+            schemas = tuple(self.toolbox.schemas()) if with_tools else ()
         self._step_index += 1
         self._step = StepContext(
             index=self._step_index,
@@ -2232,14 +2423,16 @@ class Agent:
             + tokens.estimate_tools(self.toolbox.schemas())
         )
 
+    @staticmethod
+    def _anthropic_route(route: Route) -> bool:
+        protocol_for = getattr(route.client, "protocol_for", None)
+        return protocol_for is not None and protocol_for(route.model) == "anthropic"
+
     def _server_compaction_route(self, route: Route) -> bool:
         """这条路由要不要挂服务端压缩：开关开 + 说 Anthropic 协议 + 型号在清单。"""
         if not self.config.server_compaction:
             return False
-        protocol_for = getattr(route.client, "protocol_for", None)
-        if protocol_for is None or protocol_for(route.model) != "anthropic":
-            return False
-        return supports_server_compaction(route.model)
+        return self._anthropic_route(route) and supports_server_compaction(route.model)
 
     def _compaction_floor(self) -> int:
         """最近一个带服务端 compaction 块的 assistant 消息下标；没有返回 0。
@@ -2708,6 +2901,13 @@ class Agent:
             #  统一用 chat 的名字出内核；Responses / Messages 两路在 Transport
             #  里各自翻译（见 responses.to_request / messages.to_request）
             request["reasoning_effort"] = self.config.effort
+        if (
+            with_tools
+            and (hint := self._task_budget_hint()) is not None
+            and self._anthropic_route(route)
+            and supports_task_budget(route.model)
+        ):
+            request[TASK_BUDGET_KEY] = hint
         if self._server_compaction_route(route):
             #  服务端压缩：阈值与本地同一把尺（compact_at × 窗口），服务端在输入
             #  越线的那次请求开头先摘要再作答。本地压缩此时只是兜底（阈值抬高，

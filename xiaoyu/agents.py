@@ -593,6 +593,7 @@ def execute_delegation(
         workspace=workdir,
         #  spec 声明 > 主会话；只读探索类子 agent 适合 low，总控类给 high
         effort=spec.effort or config.effort,
+        turn_extension=config.turn_extension,
         max_iterations=spec.max_iterations,
         max_tool_output=config.max_tool_output,
         context_limit_override=config.context_limit_override,

@@ -123,6 +123,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="推理深度（默认不传、随上游默认）；会话里可用 /effort 改",
     )
     parser.add_argument(
+        "--budget-tokens",
+        dest="budget_tokens",
+        type=int,
+        help="本会话 token 软预算（prompt+completion 累计）：模型会收到倒计时并在到线前收尾",
+    )
+    parser.add_argument(
         "--env-file",
         dest="env_file",
         help="指定 .env 路径，默认依次读当前目录、项目根、用户配置目录",
@@ -2388,6 +2394,7 @@ def main(argv: list[str] | None = None) -> int:
             sandbox_network=args.sandbox_network,
             append_system_prompt=args.append_system_prompt,
             effort=args.effort,
+            budget_tokens=args.budget_tokens,
             workspace_trusted=trust.trusted,
         )
         permissions = Permissions.load(config.workspace, include_workspace=trust.trusted)
@@ -2466,6 +2473,7 @@ def wire_main(args: argparse.Namespace, workspace_trusted: bool = True) -> int:
             sandbox_network=args.sandbox_network,
             append_system_prompt=args.append_system_prompt,
             effort=args.effort,
+            budget_tokens=args.budget_tokens,
             workspace_trusted=workspace_trusted,
         )
         permissions = Permissions.load(config.workspace, include_workspace=workspace_trusted)
@@ -2513,6 +2521,7 @@ def acp_main(args: argparse.Namespace) -> int:
             base_url=args.base_url,
             append_system_prompt=args.append_system_prompt,
             effort=args.effort,
+            budget_tokens=args.budget_tokens,
             auto_approve=args.yolo or None,
             mode=args.mode,
             sandbox=args.sandbox,

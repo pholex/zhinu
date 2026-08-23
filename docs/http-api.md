@@ -254,6 +254,9 @@ curl -X POST :8420/agent/agent-3f9c… -d '{"config":{"mode":"plan"}}'  # → ve
   `allow_all`；不能把沙箱关掉、不能放开沙箱网络。放宽是 `400`，不是静默钳位。
 - `append_system_prompt` 是**叠加**：服务端那份（宿主级身份/纪律）在前，agent 那份
   （用法级人格）在后。
+- `budget`（既有的硬闸）现在**兼作模型知情的软预算**：设了 `{tokens: N}` 后模型会收到
+  倒计时并在硬闸之前优雅收尾（`run.completed` 的 `stopped=budget`），到线后仍需
+  `POST /session/{id}/budget` 调高才能再跑。美元预算只硬闸、不折算成模型可见的 token 节奏。
 - `effort`：推理深度（`low / medium / high / xhigh / max`，OpenAI 线另有 `none / minimal`），
   覆盖服务端 `--effort`；不给则随服务端，服务端也没给就不传、随上游默认。
 - `mcp_servers`：宿主应用**自有的 MCP server**，形状同 `.mcp.json` 的 `mcpServers`

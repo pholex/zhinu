@@ -455,6 +455,9 @@ class _StubAgent:
     def context_tokens(self) -> int:
         return 0
 
+    def set_budget_tokens(self, budget: int | None) -> None:
+        pass
+
 
 class TestReviewFixes(ServeCase):
     """针对复查发现的其余几条的回归。"""
