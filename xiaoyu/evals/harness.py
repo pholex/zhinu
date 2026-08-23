@@ -47,6 +47,17 @@ class Context:
     def tools_used(self) -> list[str]:
         return [entry["tool"] for entry in self.trace]
 
+    def skills_loaded(self) -> list[str]:
+        """本轮经 skill 工具加载了哪些技能（按 args["name"]，去重保序）。"""
+        seen: list[str] = []
+        for entry in self.trace:
+            if entry.get("tool") != "skill":
+                continue
+            name = (entry.get("args") or {}).get("name", "")
+            if name and name not in seen:
+                seen.append(name)
+        return seen
+
 
 #  检查函数：返回 (是否通过, 说明)
 Check = Callable[[Context], tuple[bool, str]]
@@ -61,6 +72,11 @@ class Case:
     checks: list[tuple[str, Check]]
     max_iterations: int = 20
     description: str = ""
+    #  触发准确率类 case：要开技能，并铺一套隔离技能（name → SKILL.md 全文）。
+    #  runner 把它们写进临时技能目录、经 XIAOYU_SKILLS_DIR 隔离加载，绝不碰
+    #  跑分机器上真装的技能
+    enable_skills: bool = False
+    skills: dict[str, str] | None = None
 
 
 def snapshot(root: Path) -> dict[str, str]:
@@ -290,6 +306,26 @@ def never_used_tool(name: str) -> Check:
     def check(ctx: Context) -> tuple[bool, str]:
         used = ctx.tools_used()
         return name not in used, f"用到的工具：{used or '无'}"
+
+    return check
+
+
+def loaded_skill(name: str) -> Check:
+    """触发正例：模型应经 skill 工具加载指定技能（选对了）。"""
+
+    def check(ctx: Context) -> tuple[bool, str]:
+        loaded = ctx.skills_loaded()
+        return name in loaded, f"加载的技能：{loaded or '无'}"
+
+    return check
+
+
+def no_skill_loaded() -> Check:
+    """触发负例：模型不该加载任何技能（不该误触发）。"""
+
+    def check(ctx: Context) -> tuple[bool, str]:
+        loaded = ctx.skills_loaded()
+        return not loaded, f"加载的技能：{loaded or '无'}"
 
     return check
 

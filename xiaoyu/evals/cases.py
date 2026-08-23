@@ -16,6 +16,8 @@ from .harness import (
     file_contains,
     file_exists,
     file_not_contains,
+    loaded_skill,
+    no_skill_loaded,
     max_changed_lines,
     never_used_tool,
     no_tool_errors,
@@ -339,11 +341,97 @@ CASE_MULTI_FILE_RENAME = Case(
 )
 
 
+
+
+# ---------- 触发准确率回归集（模型驱动，需真实模型；不进 keyless CI） ----------
+#
+# OpenAI eval-skills / skills-shell-tips 的方法：把"触发准确率"与"任务质量"分开
+# 测。这里铺一小组隔离技能（含 when_not 负例），正例查"选对了那个技能"、负例查
+# "不误触发"。when_not 的作用正是把负例从 ~20% 的误选里救回来。
+# 隔离靠 XIAOYU_SKILLS_DIR（runner 写进临时目录、跑完还原），绝不碰真装的技能。
+
+
+def _skill(name: str, description: str, when_not: str, body: str) -> str:
+    #  body 里放一条模型**猜不到**的硬约定（独有标记/固定步骤）——只有加载技能
+    #  才拿得到。这样"该不该加载"有明确正确答案，触发准确率才可测（空 body 的
+    #  技能模型会绕过自己干，测不出触发意图）
+    fm = [f"name: {name}", f"description: {description}", f"when_not: {when_not}"]
+    return "---\n" + "\n".join(fm) + "\n---\n" + body
+
+
+#  每个技能带一条独有硬约定：正例任务要做对就得先加载它
+_TRIGGER_SKILLS = {
+    "pdf-export": _skill(
+        "pdf-export", "把 Markdown 或 HTML 文档导出成带排版的 PDF 文件。",
+        "只是要纯文本、Markdown 本身、或截图；那些不需要本技能",
+        "本团队导出 PDF 必须用 `mkpdf --preset=client` 这条内部命令，并在页脚加水印"
+        " `XY-CONFIDENTIAL`。不要自己用别的库拼 PDF。",
+    ),
+    "sql-tuning": _skill(
+        "sql-tuning", "诊断慢 SQL、读执行计划、给出加索引/改写查询的优化建议。",
+        "写新的业务 SQL、建表 DDL、或非数据库的性能问题",
+        "优化前必须先跑 `EXPLAIN (ANALYZE, BUFFERS)` 并贴出计划，再按团队清单逐项核对。",
+    ),
+    "release-notes": _skill(
+        "release-notes", "把一段 git 提交历史整理成面向用户的发布说明。",
+        "写单条 commit message、或生成 changelog 之外的技术文档",
+        "发布说明必须分 `## 新功能 / ## 修复 / ## 破坏性变更` 三节，每条以动词开头、面向用户。",
+    ),
+    "i18n-audit": _skill(
+        "i18n-audit", "扫描前端代码里未做国际化的硬编码文案，产出待翻译清单。",
+        "实际翻译文案、或调整已有翻译的措辞",
+        "清单必须是 `文件:行号 | 原文 | 建议 key` 三列，key 用点分命名空间（如 `home.title`）。",
+    ),
+    "flaky-test": _skill(
+        "flaky-test", "分析间歇失败（flaky）的测试，定位随机源并给出稳定化改法。",
+        "修复稳定复现的测试失败、或新写测试",
+        "必须先按团队清单排查五类随机源（时钟/并发/网络/随机数/顺序依赖），逐条给出结论再改。",
+    ),
+}
+
+
+
+def _trigger_case(name: str, prompt: str, expect: str | None, max_iter: int = 6) -> Case:
+    """expect=技能名 → 正例（应加载它）；expect=None → 负例（不该加载任何技能）。"""
+    checks = (
+        [(f"选中 {expect}", loaded_skill(expect))]
+        if expect
+        else [("不误触发任何技能", no_skill_loaded())]
+    )
+    return Case(
+        name=name, prompt=prompt, setup=lambda root: None, checks=checks,
+        max_iterations=max_iter, enable_skills=True, skills=_TRIGGER_SKILLS,
+        description="技能触发准确率",
+    )
+
+
+#  正例：措辞与某个技能强匹配，应选中它
+TRIGGER_POSITIVES = [
+    _trigger_case("trig_pos_pdf", "把这份 README.md 导出成一个排版好看的 PDF 发给客户。", "pdf-export"),
+    _trigger_case("trig_pos_sql", "这条查询在生产上要跑 8 秒，帮我看看执行计划、该加什么索引。", "sql-tuning"),
+    _trigger_case("trig_pos_release", "把最近这些提交整理成给用户看的发布说明。", "release-notes"),
+    _trigger_case("trig_pos_i18n", "帮我找出前端里还没做国际化的硬编码中文，列个待翻译清单。", "i18n-audit"),
+    _trigger_case("trig_pos_flaky", "这个测试有时过有时不过，帮我定位它为什么 flaky 并稳定化。", "flaky-test"),
+]
+
+#  负例：措辞蹭到某技能的边、但按 when_not 明确不该触发
+TRIGGER_NEGATIVES = [
+    _trigger_case("trig_neg_pdf", "把这份 README.md 的正文纯文本内容打印到终端给我看。", None),
+    _trigger_case("trig_neg_sql", "帮我写一条 SQL 建一张 users 表，字段 id/name/email。", None),
+    _trigger_case("trig_neg_release", "给我这次改动写一条规范的 commit message。", None),
+    _trigger_case("trig_neg_i18n", "把这句英文界面文案翻译成地道的中文。", None),
+    _trigger_case("trig_neg_flaky", "这个测试稳定地失败，报 KeyError，帮我修好它。", None),
+]
+
+TRIGGER_CASES: list[Case] = TRIGGER_POSITIVES + TRIGGER_NEGATIVES
+
+
 CASES: list[Case] = [
     CASE_FIX_AND_TEST,
     CASE_TARGETED_EDIT,
     CASE_READONLY_ANSWER,
     CASE_MULTI_FILE_RENAME,
+    *TRIGGER_CASES,
 ]
 
 

@@ -82,6 +82,7 @@ XIAOYU_API_KEY=<key>
 |---|---|
 | `XIAOYU_ENABLE_EXPLORE` | `explore` 检索子 agent |
 | `XIAOYU_ENABLE_SKILLS` | 扫描 `~/.agents/skills/` 与已装插件包下的 SKILL.md |
+| `XIAOYU_SKILLS_DIR` | 覆盖技能扫描目录（`os.pathsep` 分隔）：给了就只认它、不混默认目录（宿主指定技能库 / 测试隔离用） |
 | `XIAOYU_ENABLE_WEB_SEARCH` | `web_search` 工具 |
 | `XIAOYU_SEARCH_PROVIDER` | 搜索走哪家：`deepseek`（默认，便宜）/ `xai`（grok-4.6，更强更贵） |
 | `XIAOYU_ENABLE_BROWSER` | `browser` 浏览器工具（依赖可选 `[browser]` extra 的 playwright，没装时本来就不出现） |
