@@ -282,7 +282,7 @@ class TestReadonlySubset(ReadonlyToolsTestCase):
             sorted(self.box.names()),
             [
                 "bash", "browser", "grep", "kill_task", "list_files", "monitor",
-                "read_file", "str_replace", "task_output", "write_file",
+                "read_file", "recall", "str_replace", "task_output", "write_file",
             ],
         )
 

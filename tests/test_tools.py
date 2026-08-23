@@ -420,24 +420,24 @@ class TestBashAndSafety(ToolboxTestCase):
         self.assertIn("ok-true", result)
 
     def test_output_truncation(self) -> None:
-        """超长输出走 spill：完整落盘 + 内联留预览和取回定位符。"""
+        """超长输出走 spill：完整落盘 + 内联留预览和短召回 id。"""
         self.config.max_tool_output = 50
         result = self.box.run("bash", {"command": "python3 -c \"print('x' * 500)\""})
-        self.assertIn("完整输出已存至", result)
-        #  从定位符里抠出落盘路径，验证完整内容真的在
-        match = re.search(r"完整输出已存至 (\S+?)（", result)
-        self.assertIsNotNone(match, result)
-        spilled = Path(match.group(1))
+        self.assertIn("召回 id: 1", result)
+        #  完整内容真的落盘了
+        spilled = self.box._spills["1"]["path"]  # noqa: SLF001
         self.assertTrue(spilled.is_file())
         self.assertIn("x" * 500, spilled.read_text(encoding="utf-8"))
-        #  取回不该再弹确认：spill 文件按工作区内对待
+        #  召回不该再弹确认：spill 文件按工作区内对待
         self.assertFalse(self.box.outside_workspace({"path": str(spilled)}))
         self.assertFalse(self.box.needs_approval("read_file", {"path": str(spilled)}))
-        #  read_file 能直接读回，且不带"工作区之外"标注
+        #  recall 按 id 取回中段
         self.config.max_tool_output = 5000
-        retrieved = self.box.run("read_file", {"path": str(spilled), "offset": 3, "limit": 1})
+        retrieved = self.box.run("recall", {"id": "1", "pattern": "xxx"})
         self.assertIn("xxx", retrieved)
-        self.assertNotIn("工作区之外", retrieved)
+        #  read_file(path) 仍可直读、不带"工作区之外"标注（power-user 通道）
+        direct = self.box.run("read_file", {"path": str(spilled), "offset": 1, "limit": 1})
+        self.assertNotIn("工作区之外", direct)
 
     def test_spill_write_failure_falls_back_to_truncate(self) -> None:
         """落盘失败（磁盘满等）退回纯截断，工具本身不能受影响。"""

@@ -530,6 +530,10 @@ class Toolbox:
         #  懒创建，进程级临时目录。落盘失败退回纯截断，绝不影响工具本身。
         self._spill_dir: Path | None = None
         self._spill_seq = 0
+        #  spill 召回表：短 id（序号字符串）→ 元信息。inline 预览只留头尾 + 一个
+        #  短 id，中段随时用 recall(id, ...) 按需取回——id 只有一两个字符，压缩
+        #  丢了 60 字符的临时路径也不影响召回（addressable recall）
+        self._spills: dict[str, dict[str, Any]] = {}
         #  连续 read_file 次数，用于引导改用 explore
         self._read_streak = 0
         self._register_builtins()
@@ -1027,6 +1031,31 @@ class Toolbox:
                 },
                 handler=self._grep,
                 requires_approval=False,
+            )
+        )
+        self.register(
+            Tool(
+                name="recall",
+                description=(
+                    "召回之前因超长而只留了头尾预览的工具输出。预览里给了「召回 id」，"
+                    "用它取回被省略的中段，不必重跑原命令。"
+                    "不给 id：列出本会话所有可召回的输出（id / 来源 / 规模 / 首行）。"
+                    "给 id + pattern：在该输出里按正则找匹配行（带行号）。"
+                    "给 id + offset/limit：取该输出的某一段行。这是只读操作。"
+                ),
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "id": {"type": "string", "description": "召回 id（预览里给的）；省略则列出全部"},
+                        "pattern": {"type": "string", "description": "正则：在该输出里找匹配行"},
+                        "offset": {"type": "integer", "description": "起始行号（从 1）；与 limit 配合取一段"},
+                        "limit": {"type": "integer", "description": "最多取多少行"},
+                    },
+                    "required": [],
+                },
+                handler=self._recall,
+                requires_approval=False,
+                check_fn=lambda: bool(self._spills),
             )
         )
         self.register(
@@ -1967,18 +1996,28 @@ class Toolbox:
         outside = not resolved.is_relative_to(self.config.workspace)
         return resolved, outside
 
-    def _spill(self, name: str, text: str) -> Path | None:
-        """把完整输出落盘，返回文件路径；写失败返回 None（退回纯截断）。"""
+    def _spill(self, name: str, text: str) -> tuple[Path, str] | None:
+        """把完整输出落盘并登记进召回表，返回 (文件路径, 短 id)；
+        写失败返回 None（退回纯截断）。"""
         try:
             if self._spill_dir is None:
                 #  resolve 后再存：outside_workspace 的豁免判断用的是 resolve 过的
                 #  路径，macOS 的 /var → /private/var 符号链接会让未解析形态对不上
                 self._spill_dir = Path(tempfile.mkdtemp(prefix="xiaoyu-spill-")).resolve()
             self._spill_seq += 1
+            spill_id = str(self._spill_seq)
             safe_name = "".join(ch if ch.isalnum() else "-" for ch in name)[:40] or "tool"
             path = self._spill_dir / f"{self._spill_seq:03d}-{safe_name}.txt"
             path.write_text(text, encoding="utf-8")
-            return path
+            first_line = next((ln.strip() for ln in text.splitlines() if ln.strip()), "")
+            self._spills[spill_id] = {
+                "path": path,
+                "name": name,
+                "chars": len(text),
+                "lines": text.count("\n") + 1,
+                "summary": first_line[:120],
+            }
+            return path, spill_id
         except OSError:
             return None
 
@@ -1992,21 +2031,94 @@ class Toolbox:
         limit = self.config.max_tool_output
         if len(text) <= limit:
             return text
-        spilled = self._spill(name, text)
-        if spilled is None:
+        result = self._spill(name, text)
+        if result is None:
             return self._truncate(text)
+        spilled, spill_id = result
         omitted = len(text) - limit
         head = limit // 2
         tail = limit - head
-        marker = f"\n\n… [中间省略 {omitted} 字符，完整内容见上述文件] …\n\n"
+        marker = f"\n\n… [中间省略 {omitted} 字符，完整内容见召回 id {spill_id}] …\n\n"
         total_lines = text.count("\n") + 1
         return (
-            f"[输出超长：原始 {len(text)} 字符 / 约 {total_lines} 行。"
-            f"完整输出已存至 {spilled}（进程级临时文件，会话结束后可能被清理）。"
-            "需要中段内容时用 read_file(path, offset=行号, limit=行数) 或 "
-            "grep(pattern, path=该文件) 按需取回，不要为此重跑原命令。"
+            f"[输出超长：原始 {len(text)} 字符 / 约 {total_lines} 行，"
+            f"完整内容已存，召回 id: {spill_id}。"
+            f"需要中段时用 recall(id=\"{spill_id}\", pattern=…) 按正则找，或 "
+            f"recall(id=\"{spill_id}\", offset=行号, limit=行数) 取一段——不要为此重跑原命令。"
             "以下保留开头和结尾]\n"
             f"{text[:head]}{marker}{text[-tail:]}"
+        )
+
+    def _recall(
+        self,
+        id: str | None = None,
+        pattern: str | None = None,
+        offset: int | None = None,
+        limit: int | None = None,
+    ) -> str:
+        """按 id 召回超长输出的片段（addressable recall）。
+
+        无 id = 列表；id+pattern = 该输出内正则找行；id+offset/limit = 取行段；
+        id 单独 = 取一段中部（比 inline 预览多、又不至于再次撑爆）。
+        """
+        if not id:
+            if not self._spills:
+                return "没有可召回的输出（还没有工具输出超长落盘）。"
+            rows = [
+                f"  id {sid}: {meta['name']}（{meta['chars']} 字符 / {meta['lines']} 行）"
+                + (f" — {meta['summary']}" if meta["summary"] else "")
+                for sid, meta in self._spills.items()
+            ]
+            return "可召回的输出：\n" + "\n".join(rows)
+        meta = self._spills.get(str(id).strip())
+        if meta is None:
+            avail = "、".join(self._spills) or "（无）"
+            return f"ERROR: 没有召回 id {id}。可用 id：{avail}"
+        try:
+            text = Path(meta["path"]).read_text(encoding="utf-8", errors="replace")
+        except OSError as exc:
+            return f"ERROR: 召回 id {id} 的文件已不可读（{exc}）——可能会话临时目录已被清理，只能重跑原命令。"
+        lines = text.splitlines()
+        total = len(lines)
+        #  recall 的结果也会经 run() 外层的 _bound_output——若超长会再次落盘、
+        #  生成新 id 又把中段丢掉。所以这里主动把结果压到预算内（从开头留，尾部
+        #  截并注明），召回自己绝不触发二次 spill
+        budget = max(200, self.config.max_tool_output - 200)
+
+        def fit(header: str, body: str, tail_hint: str) -> str:
+            if len(body) <= budget:
+                return f"{header}\n{body}"
+            return f"{header}（内容过长，只显示前 {budget} 字符，{tail_hint}）\n{body[:budget]}"
+
+        if pattern:
+            try:
+                rx = re.compile(pattern)
+            except re.error as exc:
+                return f"ERROR: 正则有误：{exc}"
+            hits = [f"{n}: {ln}" for n, ln in enumerate(lines, 1) if rx.search(ln)]
+            if not hits:
+                return f"召回 id {id}（{total} 行）里没有匹配 {pattern!r} 的行。"
+            return fit(
+                f"召回 id {id} 匹配 {pattern!r}（{len(hits)} 处）：",
+                "\n".join(hits),
+                "缩小范围或用 offset/limit 取具体段",
+            )
+        if offset is not None or limit is not None:
+            start = max(1, offset or 1)
+            if start > total:
+                return f"ERROR: 召回 id {id} 只有 {total} 行，offset={start} 超出范围"
+            end = total if limit is None else min(total, start + max(1, limit) - 1)
+            chunk = "\n".join(lines[start - 1 : end])
+            return fit(f"[召回 id {id} 第 {start}-{end} 行，共 {total} 行]", chunk, "减小 limit")
+        #  只给 id：取中部一段（inline 预览已给头尾，中部最可能是被丢掉的）
+        if len(text) <= budget:
+            return f"[召回 id {id} 完整内容，{total} 行]\n{text}"
+        mid = len(text) // 2
+        half = budget // 2
+        lo, hi = max(0, mid - half), mid + half
+        return (
+            f"[召回 id {id} 中段（约第 {lo}–{hi} 字符，共 {meta['chars']}）；"
+            f"要头尾看原预览，要定位段用 pattern= 或 offset=]\n{text[lo:hi]}"
         )
 
     def _truncate(self, text: str) -> str:
