@@ -88,6 +88,9 @@ class RunResult:
     duration_seconds: float
     usage: dict[str, Any] = field(default_factory=dict)
     context_tokens: int = 0
+    #  带 output_schema 跑的那一轮：模型经 structured_output 工具交回的对象
+    #  （已按 schema 轻校验）；没要 schema、或模型没给，都是 None
+    output: Any = None
 
 
 @dataclass(frozen=True)
@@ -120,12 +123,19 @@ class _QueueSink:
 _STREAM_DONE = object()
 
 
-def measured_send(agent: Agent, user_input: str | list[dict[str, Any]]) -> RunResult:
+def measured_send(
+    agent: Agent,
+    user_input: str | list[dict[str, Any]],
+    output_schema: dict[str, Any] | None = None,
+) -> RunResult:
     """跑一轮 `Agent.send()` 并结算本轮元数据（同步；异步宿主经 `AsyncAgent`）。
 
     `interrupt()` 触发的打断在这里被吸收成 `RunResult.interrupted=True`——
     那是宿主自己的主动动作，不该再以异常的形式弹回宿主；真正的错误
     （网络、配置、bug）照常抛出。
+
+    `output_schema` 只对这一轮生效：挂上 structured_output 工具，模型交回的
+    对象放 `RunResult.output`；轮末撤掉工具，下一轮不受影响。
     """
     #  锁内快照：宸枢的 worker 线程可跨轮存活，裸迭代 by_model 会撞上
     #  另一头的 add()（dictionary changed size）
@@ -136,10 +146,16 @@ def measured_send(agent: Agent, user_input: str | list[dict[str, Any]]) -> RunRe
     start_index = len(agent.messages)
     started = time.monotonic()
     interrupted = False
+    if output_schema is not None:
+        agent.set_output_schema(output_schema)
     try:
         agent.send(user_input)
     except Interrupted:
         interrupted = True
+    finally:
+        output = agent.structured_output if output_schema is not None else None
+        if output_schema is not None:
+            agent.set_output_schema(None)
     duration = time.monotonic() - started
 
     by_model: dict[str, dict[str, int]] = {}
@@ -179,6 +195,7 @@ def measured_send(agent: Agent, user_input: str | list[dict[str, Any]]) -> RunRe
             "by_model": by_model,
         },
         context_tokens=agent.context_tokens(),
+        output=output,
     )
 
 
@@ -275,20 +292,29 @@ class AsyncAgent:
             if self.agent.sink is bridge:
                 self.agent.sink = original
 
-    async def send(self, user_input: str | list[dict[str, Any]]) -> RunResult:
+    async def send(
+        self,
+        user_input: str | list[dict[str, Any]],
+        output_schema: dict[str, Any] | None = None,
+    ) -> RunResult:
         """在工作线程里跑 `Agent.send()`，不阻塞调用方的事件循环。
 
         返回本轮元数据 `RunResult`。`interrupt()` 触发的打断不作为异常抛出
         ——以 `result.interrupted=True` 报告（打断是宿主自己的主动动作）；
-        真正的错误照常抛。
+        真正的错误照常抛。`output_schema`（JSON Schema）要求本轮以结构化
+        对象收尾，结果在 `RunResult.output`。
         """
         await self._settle_previous()
-        task = asyncio.ensure_future(asyncio.to_thread(measured_send, self.agent, user_input))
+        task = asyncio.ensure_future(
+            asyncio.to_thread(measured_send, self.agent, user_input, output_schema)
+        )
         self._task = task
         return await task
 
     async def stream(
-        self, user_input: str | list[dict[str, Any]]
+        self,
+        user_input: str | list[dict[str, Any]],
+        output_schema: dict[str, Any] | None = None,
     ) -> AsyncIterator[UIEvent]:
         """驱动一轮对话并逐个产出 UI 事件；最后一个事件是 `RunCompleted`。
 
@@ -326,7 +352,7 @@ class AsyncAgent:
 
         def run() -> RunResult:
             try:
-                return measured_send(self.agent, user_input)
+                return measured_send(self.agent, user_input, output_schema)
             finally:
                 #  哨兵在 finally：正常收尾、抛异常两条路都必须让消费循环退出
                 loop.call_soon_threadsafe(queue.put_nowait, _STREAM_DONE)

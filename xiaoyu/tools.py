@@ -587,6 +587,9 @@ class Toolbox:
     def register(self, tool: Tool) -> None:
         self._tools[tool.name] = tool
 
+    def unregister(self, name: str) -> None:
+        self._tools.pop(name, None)
+
     def _register_mcp_search(self) -> None:
         """检索模式的两个元工具。它们自身常驻 schema（稳定），MCP 工具藏在后面。"""
         self.register(

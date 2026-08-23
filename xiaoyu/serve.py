@@ -869,7 +869,9 @@ def create_app(cfg: ServeConfig):  # noqa: C901 - 路由表天然长，拆开反
         if session.agent.session_log:
             session.agent.session_log.close("closed")
 
-    async def start_turn(session: _Session, text: str) -> asyncio.Task:
+    async def start_turn(
+        session: _Session, text: str, output_schema: dict[str, Any] | None = None
+    ) -> asyncio.Task:
         """开一轮。已经在跑就 409——同步架构下同一 Agent 一次只能跑一轮，
         默默排队会让编排器以为自己的第二次提交立刻生效了。"""
         if session.busy:
@@ -886,14 +888,16 @@ def create_app(cfg: ServeConfig):  # noqa: C901 - 路由表天然长，拆开反
         session.detail = "working"
         session.error = ""
         session.publish("run.started", prompt=text)
-        task = asyncio.create_task(_drive(session, text))
+        task = asyncio.create_task(_drive(session, text, output_schema))
         session._task = task
         return task
 
-    async def _drive(session: _Session, text: str) -> dict[str, Any]:
+    async def _drive(
+        session: _Session, text: str, output_schema: dict[str, Any] | None = None
+    ) -> dict[str, Any]:
         result: dict[str, Any] | None = None
         try:
-            async for event in session.async_agent.stream(text):
+            async for event in session.async_agent.stream(text, output_schema):
                 if isinstance(event, RunCompleted):
                     result = asdict(event.result)
                     session.last_result = result
@@ -1114,9 +1118,14 @@ def create_app(cfg: ServeConfig):  # noqa: C901 - 路由表天然长，拆开反
     async def session_prompt(
         session_id: str,
         text: str = Body(embed=True, description="给模型的指令"),
+        output_schema: dict[str, Any] | None = Body(
+            default=None,
+            embed=True,
+            description="JSON Schema：要求本轮以符合它的对象收尾，结果在 result.output（模型没给则 null）",
+        ),
     ) -> dict[str, Any]:
         session = pick(session_id)
-        task = await start_turn(session, text)
+        task = await start_turn(session, text, output_schema)
         result = await task
         return {"session_id": session_id, **session.status_dict(), "result": result}
 
@@ -1132,9 +1141,14 @@ def create_app(cfg: ServeConfig):  # noqa: C901 - 路由表天然长，拆开反
     async def session_prompt_async(
         session_id: str,
         text: str = Body(embed=True, description="给模型的指令"),
+        output_schema: dict[str, Any] | None = Body(
+            default=None,
+            embed=True,
+            description="JSON Schema：要求本轮以符合它的对象收尾，结果在 result.output（模型没给则 null）",
+        ),
     ) -> dict[str, Any]:
         session = pick(session_id)
-        await start_turn(session, text)
+        await start_turn(session, text, output_schema)
         return {"session_id": session_id, "accepted": True, **session.status_dict()}
 
     @app.get(

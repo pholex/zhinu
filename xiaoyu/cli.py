@@ -224,6 +224,14 @@ def add_output_format(parser: argparse.ArgumentParser) -> None:
         help="一次性模式的输出：text=明文；json=末尾一个 JSON 对象（result/usage）；"
         "stream-json=每个事件一行 JSON（NDJSON），末行 kind=result",
     )
+    parser.add_argument(
+        "--output-schema",
+        dest="output_schema",
+        metavar="FILE|JSON",
+        help="要求模型以符合该 JSON Schema 的对象收尾（文件路径或内联 JSON）；"
+        "结果放在 json/stream-json 收尾对象的 output 字段，text 模式单独打印一行 JSON。"
+        "只用于一次性模式",
+    )
 
 
 _CONFIG_VARS = (
@@ -730,6 +738,14 @@ def resume_command(argv: list[str]) -> int:
             file=sys.stderr,
         )
         return 2
+    if args.output_schema and not prompt:
+        print(ui.error("--output-schema 只用于一次性模式（给出指令或从管道输入）"), file=sys.stderr)
+        return 2
+    try:
+        output_schema = load_output_schema(args.output_schema)
+    except ValueError as exc:
+        print(ui.error(str(exc)), file=sys.stderr)
+        return 2
 
     workspace = Path.cwd().resolve()
     sessions = list_sessions(workspace=None if args.all else str(workspace))
@@ -845,7 +861,7 @@ def resume_command(argv: list[str]) -> int:
     if prompt:
         if args.output_format == "text":
             print(ui.secondary(f"已恢复会话（{len(loaded)} 条消息，来自 {chosen.path.name}{forked}）"))
-        return run_once(agent, prompt, args.output_format)
+        return run_once(agent, prompt, args.output_format, output_schema)
     print(build_banner(model_label(agent), str(config.workspace)))
     if budget_note := skills.budget_warning():
         print(ui.secondary(budget_note))
@@ -2159,6 +2175,21 @@ def make_headless_deny():
     return confirm
 
 
+def load_output_schema(spec: str | None) -> dict[str, Any] | None:
+    """--output-schema 的值：存在的文件路径读文件，否则当内联 JSON 解析。"""
+    if not spec:
+        return None
+    path = Path(spec)
+    try:
+        text = path.read_text(encoding="utf-8") if path.is_file() else spec
+        schema = json.loads(text)
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError(f"--output-schema 不是合法的 JSON Schema 文件或内联 JSON：{exc}") from exc
+    if not isinstance(schema, dict):
+        raise ValueError("--output-schema 顶层必须是 JSON 对象")
+    return schema
+
+
 def oneshot_frontend(permissions: Permissions, output_format: str):
     """一次性模式的 (approver, sink)。sink=None 表示用 Agent 默认的 PlainSink。
 
@@ -2313,6 +2344,14 @@ def main(argv: list[str] | None = None) -> int:
             file=sys.stderr,
         )
         return 2
+    if args.output_schema and not prompt:
+        print(ui.error("--output-schema 只用于一次性模式（给出指令或从管道输入）"), file=sys.stderr)
+        return 2
+    try:
+        output_schema = load_output_schema(args.output_schema)
+    except ValueError as exc:
+        print(ui.error(str(exc)), file=sys.stderr)
+        return 2
 
     workspace = Path(args.workspace).expanduser() if args.workspace else Path.cwd()
     if not workspace.is_dir():
@@ -2366,7 +2405,7 @@ def main(argv: list[str] | None = None) -> int:
     if prompt:
         if resumed and args.output_format == "text":
             print(ui.secondary(resumed))
-        return run_once(agent, prompt, args.output_format)
+        return run_once(agent, prompt, args.output_format, output_schema)
     print(build_banner(model_label(agent), str(config.workspace)))
     if env_files:
         print(ui.secondary("已加载 " + ", ".join(str(p) for p in env_files)))
@@ -2461,8 +2500,15 @@ def acp_main(args: argparse.Namespace) -> int:
     ).serve()
 
 
-def run_once(agent: Agent, prompt: str, output_format: str = "text") -> int:
+def run_once(
+    agent: Agent,
+    prompt: str,
+    output_format: str = "text",
+    output_schema: dict[str, Any] | None = None,
+) -> int:
     error = ""
+    if output_schema is not None:
+        agent.set_output_schema(output_schema)
     try:
         agent.send(prompt)
     except KeyboardInterrupt:
@@ -2479,10 +2525,19 @@ def run_once(agent: Agent, prompt: str, output_format: str = "text") -> int:
             raise
         error = f"{type(exc).__name__}: {exc}"
 
+    #  要了 schema 却没收到结构化结果：消费方拿 null 没法用，按失败退出
+    if output_schema is not None and agent.structured_output is None and not error:
+        error = "模型没有按 --output-schema 给出结构化结果"
+
     if output_format == "text":
+        if output_schema is not None:
+            if agent.structured_output is not None:
+                print(json.dumps(agent.structured_output, ensure_ascii=False), flush=True)
+            else:
+                print(ui.error(f"[{error}]"), file=sys.stderr)
         #  一次性模式也把用量打出来：做了模型路由就得看得见每个模型花了多少
         print(ui.secondary(f"\n{agent.usage}"))
-        return 0
+        return 1 if error else 0
 
     #  json / stream-json 的收尾对象结构相同；stream-json 带 kind 与事件流同一词汇
     payload: dict[str, Any] = {
@@ -2490,6 +2545,8 @@ def run_once(agent: Agent, prompt: str, output_format: str = "text") -> int:
         "usage": agent.usage.to_dict(),
         "model": agent.config.model,
     }
+    if output_schema is not None:
+        payload["output"] = agent.structured_output
     if agent.session_log:
         payload["session_log"] = str(agent.session_log.path)
     if error:

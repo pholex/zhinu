@@ -64,6 +64,7 @@ xiaoyu                                  # 交互（xy 是等价缩写）
 xy "把 utils.py 里的类型注解补全"          # 一次性执行（-p/--prompt 是等价拼写，兼容抄来的脚本）
 git diff | xy "写一条 commit message"     # 管道内容当材料
 xy --output-format json "总结这个仓库"     # 或 stream-json（NDJSON 事件流）
+xy --output-schema schema.json "给这个仓库打分"   # 按 JSON Schema 收尾，结果在 output 字段（脚本/CI 用）
 xy resume --last "继续把测试修完"
 xy -s nightly "跑一下回归"                # 命名会话：同名接着聊，脚本反复调用用它
 

@@ -281,6 +281,15 @@ PHANTOM_EDIT_NUDGE = (
     "用户尚未完成。不要再次宣称没有发生过的改动。"
 )
 
+#  结构化输出（--output-schema）的回灌文案：模型用正文收尾却没调 structured_output，
+#  顶回去一次。固定文案，同样进 SYNTHETIC_USER_TEXTS。
+STRUCTURED_OUTPUT_NUDGE = (
+    "[系统提示] 本次任务要求以结构化结果收尾：请调用 structured_output 工具，按其参数"
+    " schema 给出最终结果。正文不算结果，消费方只读取该工具的参数。"
+)
+#  structured_output 工具名（cli / serve / embedding 三面共用同一个名字）
+STRUCTURED_OUTPUT_TOOL = "structured_output"
+
 #  plan mode（只读规划态）下
 #  允许的工具白名单。deny-by-default：不在名单里的（bash/write_file/str_replace/
 #  browser/MCP/插件工具）一律拦——MCP 工具即使"看起来只读"也可能有副作用，宁可误拦。
@@ -365,6 +374,7 @@ SYNTHETIC_USER_TEXTS = frozenset(
         PLAN_MODE_LEAVE_NOTE,
         CRYSTALLIZE_NUDGE,
         PHANTOM_EDIT_NUDGE,
+        STRUCTURED_OUTPUT_NUDGE,
     }
 )
 
@@ -586,6 +596,44 @@ class Usage:
 
 #  进程级仪表：serve /diagnostics 与 doctor 读它回答"现在有几轮在跑"
 _TURNS_ACTIVE = diagnostics.Gauge("core.turns.active")
+
+def _schema_problems(value: Any, schema: dict[str, Any], path: str = "$") -> list[str]:
+    """轻量 JSON Schema 校验（type / required / properties / items / enum）。
+
+    不引 jsonschema 依赖：这里只需要把模型最常犯的错（漏必填键、类型错）
+    顶回去，复杂关键字（oneOf/pattern/format）放过，消费方自己再校。
+    """
+    problems: list[str] = []
+    expected = schema.get("type")
+    type_map = {
+        "object": dict, "array": list, "string": str, "boolean": bool,
+        "integer": int, "number": (int, float), "null": type(None),
+    }
+    if expected:
+        types = expected if isinstance(expected, list) else [expected]
+        ok = False
+        for t in types:
+            py = type_map.get(t)
+            if py is None:
+                ok = True
+            elif isinstance(value, py) and not (t in ("integer", "number") and isinstance(value, bool)):
+                ok = True
+        if not ok:
+            return [f"{path} 应为 {expected}，实为 {type(value).__name__}"]
+    if "enum" in schema and value not in schema["enum"]:
+        problems.append(f"{path} 不在枚举 {schema['enum']} 内")
+    if isinstance(value, dict):
+        for key in schema.get("required", []):
+            if key not in value:
+                problems.append(f"{path}.{key} 必填")
+        for key, sub in schema.get("properties", {}).items():
+            if key in value and isinstance(sub, dict):
+                problems.extend(_schema_problems(value[key], sub, f"{path}.{key}"))
+    if isinstance(value, list) and isinstance(schema.get("items"), dict):
+        for i, item in enumerate(value):
+            problems.extend(_schema_problems(item, schema["items"], f"{path}[{i}]"))
+    return problems
+
 
 class Agent:
     def __init__(
@@ -899,6 +947,10 @@ class Agent:
         #  靠 system prompt 不靠代码，写错的代价只是界面显示怪一点，不值得
         #  用 error 打断模型。全量替换语义：没有增量 API 就没有状态不同步。
         self.plan: list[dict[str, str]] = []
+        #  结构化输出：set_output_schema 挂上 structured_output 工具后，模型调用
+        #  它即等于收尾；结果存这里，消费方（run_once / serve / embedding）直接取
+        self.output_schema: dict[str, Any] | None = None
+        self.structured_output: Any = None
         if config.enable_plan and self.toolbox.get("update_plan") is None:
             self.toolbox.register(
                 Tool(
@@ -1188,6 +1240,51 @@ class Agent:
         return "已更新计划" + note
 
     # ---------- 交互模式（默认 / auto / plan） ----------
+
+    # ---------- 结构化输出 ----------
+
+    def set_output_schema(self, schema: dict[str, Any] | None) -> None:
+        """要求本 agent 以 JSON Schema 约束的对象收尾（exec / serve / SDK 共用）。
+
+        做法是挂一个 structured_output 工具，参数 schema 就是用户给的 schema：
+        模型调用它即视为本轮结束，参数即结果。顶层不是 object 的 schema
+        （数组/标量）包一层 {"value": schema}，取结果时再拆——function calling
+        的参数必须是对象。传 None 撤掉。
+        """
+        if schema is None:
+            self.output_schema = None
+            self.structured_output = None
+            self.toolbox.unregister(STRUCTURED_OUTPUT_TOOL)
+            return
+        if not isinstance(schema, dict):
+            raise ValueError("output schema 必须是 JSON 对象（JSON Schema）")
+        self.output_schema = schema
+        self.structured_output = None
+        params: dict[str, Any] = schema
+        if schema.get("type") != "object" or "properties" not in schema:
+            params = {"type": "object", "properties": {"value": schema}, "required": ["value"]}
+        self.toolbox.register(
+            Tool(
+                name=STRUCTURED_OUTPUT_TOOL,
+                description=(
+                    "提交本次任务的最终结构化结果（必须调用、且只在所有工作完成后调用一次）。"
+                    "参数即结果，严格按 schema 填写；调用后本轮结束。"
+                ),
+                parameters=params,
+                handler=self._structured_output,
+                requires_approval=False,
+            )
+        )
+
+    def _structured_output(self, **data: Any) -> str:
+        schema = self.output_schema or {}
+        wrapped = schema.get("type") != "object" or "properties" not in schema
+        value = data.get("value") if wrapped else data
+        problems = _schema_problems(value, schema)
+        if problems:
+            return "ERROR: 结果不符合 schema：" + "；".join(problems[:5]) + "。请修正后重新调用。"
+        self.structured_output = value
+        return "已记录结构化结果，本轮到此结束。"
 
     @property
     def plan_mode(self) -> bool:
@@ -1892,6 +1989,7 @@ class Agent:
         #  失败流与改动证据同样按轮归零：上一轮的失败/改动不该影响这一轮的判定
         self._fail_streak_tool, self._fail_streak = "", 0
         self._turn_mutations = 0
+        self.structured_output = None
         #  UserPromptSubmit hook：block 则本轮不发生（不入历史、不调模型）
         if self.hook_engine is not None and self.hook_engine.has("UserPromptSubmit"):
             from .hooks import clip
@@ -1909,6 +2007,8 @@ class Agent:
         nudged_phantom = False
         #  Stop hook 每轮只顶回一次：hook 永远 block 也不会造出死循环
         stop_checked = False
+        #  结构化输出只催一次：模型坚持用正文收尾就到此为止，消费方拿到 null
+        nudged_structured = False
         for _ in range(self.config.max_iterations):
             self.maybe_compact()
             self._begin_step()
@@ -1921,6 +2021,15 @@ class Agent:
                     #  模型已给出收尾正文，但期间用户插了话：不结束本轮，
                     #  把插话入历史再跑一步
                     if self._consume_steers():
+                        continue
+                    #  要求结构化收尾却用正文收尾：顶回去一次
+                    if (
+                        self.output_schema is not None
+                        and self.structured_output is None
+                        and not nudged_structured
+                    ):
+                        nudged_structured = True
+                        self._record({"role": "user", "content": STRUCTURED_OUTPUT_NUDGE})
                         continue
                     #  产物对账护栏：正文宣称"已创建/修改 X"，本轮却没有一次
                     #  成功的改动类工具——改动不存在（真实会话里模型空口宣布
@@ -1987,6 +2096,9 @@ class Agent:
 
             for call in calls:
                 self._record(self._execute(call))
+            #  structured_output 已落：这就是收尾，不再让模型多说一轮
+            if self.output_schema is not None and self.structured_output is not None:
+                return
             if self._new_context_notes is not None:
                 #  翻篇排在附图与插话之前：同批图片和用户插话落进新窗口而不是被丢掉
                 self._start_new_context_window()
