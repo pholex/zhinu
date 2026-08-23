@@ -346,10 +346,35 @@ def _parse_config_file(
     servers = data.get("mcpServers")
     if not isinstance(servers, dict):
         return []
+    specs, problems = parse_server_mapping(servers, extra_env=extra_env)
+    for problem in problems:
+        print(f"[MCP 配置 {path}：{problem}]", file=sys.stderr)
+    return specs
+
+
+def parse_server_mapping(
+    servers: dict[str, Any],
+    *,
+    extra_env: dict[str, str] | None = None,
+    expand: bool = True,
+) -> tuple[list[ServerSpec], list[str]]:
+    """`mcpServers` 形状（name → 声明对象）→ (ServerSpec 列表, 跳过/忽略说明)。
+
+    配置文件与 serve 的 agent 对象（`mcp_servers` 字段）共用这一个解析器：
+    宿主应用往 agent 里写的就是它在 .mcp.json 里写惯的那一段，不另发明形状。
+    `expand=False` 时 `${VAR}` 不兑现（协议通道来的值是对端算好的终值；拿本
+    进程环境去改写它既不合预期、也给了对端一条读服务端环境变量的路——与 acp
+    的 client_server_specs 同一条边界）。
+    """
     specs: list[ServerSpec] = []
+    problems: list[str] = []
+
+    def ex(value: Any) -> str:
+        return _expand(str(value), extra_env) if expand else str(value)
+
     for name, raw in servers.items():
         if not isinstance(raw, dict):
-            print(f"[MCP 配置 {path} 里的 {name!r} 不是对象，已忽略]", file=sys.stderr)
+            problems.append(f"{name!r} 不是对象，已忽略")
             continue
         kind = raw.get("type")
         #  形状即类型：有 url 就是远端（Streamable HTTP），有 command 就是 stdio。
@@ -357,18 +382,14 @@ def _parse_config_file(
         remote = isinstance(raw.get("url"), str) and bool(raw["url"].strip())
         if kind == "sse" or (kind == "http" and not remote):
             #  sse 是 2024-11-05 的老传输，小羽只实现了 Streamable HTTP
-            print(
-                f"[MCP server {name!r}：{kind} 传输不支持"
+            problems.append(
+                f"server {name!r}：{kind} 传输不支持"
                 f"{'（缺 url）' if kind == 'http' else '（老式 SSE，请改用 Streamable HTTP 的 url）'}，"
-                "已忽略]",
-                file=sys.stderr,
+                "已忽略"
             )
             continue
         if not remote and not isinstance(raw.get("command"), str):
-            print(
-                f"[MCP 配置 {path} 里的 {name!r} 既没有 command 也没有 url，已忽略]",
-                file=sys.stderr,
-            )
+            problems.append(f"{name!r} 既没有 command 也没有 url，已忽略")
             continue
         timeout = raw.get("timeout", CALL_TIMEOUT)
         if not isinstance(timeout, (int, float)) or timeout <= 0:
@@ -382,10 +403,9 @@ def _parse_config_file(
                 ServerSpec(
                     name=str(name),
                     command="",
-                    url=_expand(str(raw["url"]).strip(), extra_env),
+                    url=ex(raw["url"]).strip(),
                     headers={
-                        str(key): _expand(str(value), extra_env)
-                        for key, value in (raw.get("headers") or {}).items()
+                        str(key): ex(value) for key, value in (raw.get("headers") or {}).items()
                     },
                     timeout=float(timeout),
                     disabled=bool(raw.get("disabled", False)),
@@ -395,12 +415,9 @@ def _parse_config_file(
         specs.append(
             ServerSpec(
                 name=str(name),
-                command=_expand(raw["command"], extra_env),
-                args=[_expand(str(item), extra_env) for item in raw.get("args") or []],
-                env={
-                    str(key): _expand(str(value), extra_env)
-                    for key, value in (raw.get("env") or {}).items()
-                },
+                command=ex(raw["command"]),
+                args=[ex(item) for item in raw.get("args") or []],
+                env={str(key): ex(value) for key, value in (raw.get("env") or {}).items()},
                 timeout=float(timeout),
                 disabled=bool(raw.get("disabled", False)),
                 inherit_env=[
@@ -408,7 +425,7 @@ def _parse_config_file(
                 ],
             )
         )
-    return specs
+    return specs, problems
 
 
 # ---------- 确定性命名 ----------

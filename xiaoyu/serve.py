@@ -98,7 +98,7 @@ try:
 except ImportError:  # pragma: no cover - 没装 [serve] 时 create_app 会先抛 ServeUnavailable
     Request = Any  # type: ignore[assignment,misc]
 
-from . import diagnostics, folder_trust
+from . import diagnostics, folder_trust, mcp, mcp_guard
 from .agent import Agent, Allow, Deny
 from .config import Config, MissingConfig
 from .embedding import AsyncAgent, RunCompleted
@@ -111,6 +111,7 @@ from .serve_state import (
     SessionStore,
     StateError,
     budget_breach,
+    check_mcp_servers,
     check_pricing,
     public_agent,
     spend_of,
@@ -174,6 +175,11 @@ class ServeConfig:
     #  要不要挂 /mcp（MCP server 面，见 serve_mcp.py）。与 REST 共享会话层，
     #  默认开着；`--no-mcp` 关掉后 serve 退回纯 REST。
     mcp: bool = True
+    #  agent 对象能否自带 MCP server（mcp_servers 字段）：off=不收；http=只收远端
+    #  （Streamable HTTP，不在本机起进程）；all=stdio 也收。默认 off——stdio
+    #  server 是**沙箱之外**的本机子进程，一个拿着 token 的 HTTP 客户端不该
+    #  默认就能让服务端跑任意命令。
+    agent_mcp: str = "off"
     #  控制面状态（agent 对象、会话清单、会话日志）落在哪。None = 按 root 推：
     #  `~/.xiaoyu/serve/<root slug>/`。persist=False 时全在内存（测试 / 一次性跑）。
     state_dir: Path | None = None
@@ -327,6 +333,8 @@ class _Session:
         self.error = ""
         self.busy = False
         self.last_result: dict[str, Any] | None = None
+        #  agent 自带 MCP server 的会话私有 manager（assemble 里回填），关会话时收掉
+        self.mcp_manager: Any = None
         self.turns = 0
 
         self.events: list[dict[str, Any]] = []
@@ -523,8 +531,14 @@ def build_agent(
     ref: _SessionRef,
     session_log: SessionLog | None = None,
     log_dir: Path | None = None,
-) -> Agent:
+    mcp_servers: dict[str, Any] | None = None,
+) -> tuple[Agent, "mcp.McpManager | None"]:
     """现配一个 Agent（装配顺序照 acp_main 的工厂，两条协议面保持同源）。
+
+    `mcp_servers`（agent 对象自带的 server）非空时，与工作区配置发现合并
+    （同名以 agent 为准，合并在 mcp.launch 里做）起一个**会话私有**的
+    manager 注入 Toolbox；返回它以便会话关闭时一并收掉——这些进程/连接
+    的生命周期就是这个会话，不能挂到进程级缓存里跟别的会话共用。
 
     approver 与 sink **必须在这里就是最终对象**（经 `_SessionRef` 间接绑定），
     不能构造完再回填——`Agent.__init__` 会把这两样按值捕获进 explore /
@@ -550,9 +564,16 @@ def build_agent(
         session_log = SessionLog.create(
             config.model, str(config.workspace), directory=log_dir, session_id=session_id
         )
-    return Agent(
+    manager: mcp.McpManager | None = None
+    mcp_view: mcp.McpView | None = None
+    if mcp_servers and config.enable_mcp:
+        specs, _ = mcp.parse_server_mapping(mcp_servers, expand=False)
+        manager = mcp.launch(config, extra_specs=specs)
+        if manager is not None:
+            mcp_view = mcp.McpView(manager, "all")
+    agent = Agent(
         config,
-        Toolbox(config),
+        Toolbox(config, mcp_view=mcp_view),
         approver=_HttpApprover(ref),
         session_log=session_log,
         permissions=permissions,
@@ -561,6 +582,7 @@ def build_agent(
         #  不能给 NullSink——那批工具的事件会整段消失，编排侧看不出它在干活。
         sink=_BridgeSink(ref),
     )
+    return agent, manager
 
 
 def create_app(cfg: ServeConfig):  # noqa: C901 - 路由表天然长，拆开反而更难读
@@ -627,6 +649,8 @@ def create_app(cfg: ServeConfig):  # noqa: C901 - 路由表天然长，拆开反
             )
         ),
     )
+    #  会话注册表挂到 app.state：测试 / 运维脚本可直接查会话对象（包括私有 MCP manager）
+    app.state.sessions = sessions
 
     # ---------- 鉴权 ----------
 
@@ -680,6 +704,38 @@ def create_app(cfg: ServeConfig):  # noqa: C901 - 路由表天然长，拆开反
             raise HTTPException(
                 status_code=400, detail="agent 不能放开沙箱网络（只能收紧：false 或 null）"
             )
+        check_agent_mcp(config.get("mcp_servers"))
+
+    def check_agent_mcp(servers: dict[str, Any] | None) -> None:
+        """agent 自带 MCP server 的准入：先看服务端档位，再过 mcp_guard。
+
+        形状已在 serve_state 校过；这里判的是"这台服务允不允许"。stdio 与
+        http 分档：远端 server 不在本机起进程，风险面小得多。准入闸与 acp 的
+        client_server_specs 同一套（admission_violation / endpoint_violation），
+        违规是 400 带原因，不静默少一个 server。
+        """
+        #  先过形状（StateError → 端点映射成 400），再判档位：坏形状不该被
+        #  "服务端未开放"这句更笼统的拒绝遮住
+        servers = check_mcp_servers(servers)
+        if not servers:
+            return
+        if cfg.agent_mcp == "off":
+            raise HTTPException(
+                status_code=400,
+                detail="服务端未开放 agent 自带 MCP server（启动时加 --agent-mcp http 或 all）",
+            )
+        specs, _ = mcp.parse_server_mapping(servers, expand=False)
+        for spec in specs:
+            if spec.is_http:
+                reason = mcp_guard.endpoint_violation(spec.url)
+            elif cfg.agent_mcp != "all":
+                reason = "服务端只开放了远端（http）server，stdio 需要 --agent-mcp all"
+            else:
+                reason = mcp_guard.admission_violation(spec.command, spec.args, spec.env)
+            if reason:
+                raise HTTPException(
+                    status_code=400, detail=f"mcp_servers 里的 {spec.name!r} 被拒：{reason}"
+                )
 
     def apply_agent_config(config: dict[str, Any], model: str = "", mode: str = "") -> ServeConfig:
         """agent 配置叠在服务端启动参数上 → 这个会话用的 ServeConfig。
@@ -734,7 +790,15 @@ def create_app(cfg: ServeConfig):  # noqa: C901 - 路由表天然长，拆开反
         """新建与重启恢复共用的装配口：Agent、_Session、approver/sink 绑定。"""
         ref = _SessionRef()
         try:
-            agent = build_agent(session_id, target, local, ref, session_log=session_log, log_dir=log_dir)
+            agent, manager = build_agent(
+                session_id,
+                target,
+                local,
+                ref,
+                session_log=session_log,
+                log_dir=log_dir,
+                mcp_servers=agent_config.get("mcp_servers"),
+            )
         except MissingConfig as exc:
             #  503 而不是 500：这不是 bug，是服务端没配 provider，运维动作明确
             raise HTTPException(status_code=503, detail=f"未配置 provider：{exc}") from exc
@@ -750,6 +814,7 @@ def create_app(cfg: ServeConfig):  # noqa: C901 - 路由表天然长，拆开反
         )
         #  绑定后 approver / sink 才真正生效。绑定前不可能有一轮在跑（会话还没
         #  返回给调用方），所以这个窗口安全——但 approver 仍 fail closed 兜底
+        session.mcp_manager = manager
         ref.bind(session, asyncio.get_running_loop())
         sessions[session_id] = session
         SESSIONS_LIVE.set(len(sessions))
@@ -868,6 +933,8 @@ def create_app(cfg: ServeConfig):  # noqa: C901 - 路由表天然长，拆开反
         manifests.delete(session.id)
         if session.agent.session_log:
             session.agent.session_log.close("closed")
+        if session.mcp_manager is not None:
+            session.mcp_manager.close()
 
     async def start_turn(
         session: _Session, text: str, output_schema: dict[str, Any] | None = None
@@ -993,6 +1060,8 @@ def create_app(cfg: ServeConfig):  # noqa: C901 - 路由表天然长，拆开反
             description=(
                 "model / base_url / mode / approval / append_system_prompt / sandbox / "
                 "sandbox_network / budget{tokens,usd} / pricing{模型:{input,output}}（美元/百万 token）"
+                " / mcp_servers{名:{command,args,env}|{url,headers}}（宿主自有 MCP server，"
+                "同 .mcp.json 的 mcpServers；需服务端 --agent-mcp 开放）"
             ),
         ),
     ) -> dict[str, Any]:

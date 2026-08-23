@@ -254,6 +254,24 @@ curl -X POST :8420/agent/agent-3f9c… -d '{"config":{"mode":"plan"}}'  # → ve
   `allow_all`；不能把沙箱关掉、不能放开沙箱网络。放宽是 `400`，不是静默钳位。
 - `append_system_prompt` 是**叠加**：服务端那份（宿主级身份/纪律）在前，agent 那份
   （用法级人格）在后。
+- `mcp_servers`：宿主应用**自有的 MCP server**，形状同 `.mcp.json` 的 `mcpServers`
+  （`{"名": {"command","args","env"} | {"url","headers"}}`）。随版本钉定；会话创建时
+  按那一版拉起一个**会话私有**的 manager（与工作区配置发现合并、同名以 agent 为准），
+  关会话即收掉。这是"把业务动作交给 agent"的正道：仪表盘/工单系统把自己的 API 包成
+  MCP server 挂在 agent 上，审批仍走 `/permissions`。
+  - 服务端默认**不收**：启动加 `--agent-mcp http`（只收远端 Streamable HTTP，不在本机
+    起进程）或 `--agent-mcp all`（stdio 也收——那是沙箱之外的本机子进程，确认 token
+    持有方可信再开）。未开放时 `400`。
+  - 形状错、老式 sse、缺 command/url：`400` 带 server 名，不静默少一个。
+  - 准入与 ACP 同一套：stdio 过 `mcp_guard.admission_violation`，远端明文 `http://`
+    只许回环。`${VAR}` **不展开**——值是宿主算好的终值，也不给对端一条读服务端环境的路。
+
+  ```bash
+  xiaoyu serve --agent-mcp http
+  curl -X POST :8420/agent -d '{"name":"运单助手","config":{"mode":"auto",
+    "mcp_servers":{"shipments":{"url":"https://ops.internal/mcp",
+                                "headers":{"Authorization":"Bearer …"}}}}}'
+  ```
 - `DELETE /agent/{id}` 是**归档**不是删除：只读、不再接受新会话、老会话照跑、历史版本
   可查（`GET /agent/{id}?versions=true`）。
 

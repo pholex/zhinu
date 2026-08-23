@@ -1193,6 +1193,14 @@ def serve_command(argv: list[str]) -> int:
         help="不挂 /mcp（MCP server 面，给 LangChain/LangGraph 等 MCP client 用；默认挂）",
     )
     parser.add_argument(
+        "--agent-mcp",
+        dest="agent_mcp",
+        choices=("off", "http", "all"),
+        default="off",
+        help="agent 对象能否自带 MCP server（mcp_servers 字段）：off=不收（默认）；"
+        "http=只收远端 Streamable HTTP；all=stdio 也收（会在本机、沙箱之外起子进程）",
+    )
+    parser.add_argument(
         "--state-dir",
         dest="state_dir",
         help="agent 对象 / 会话清单 / 会话日志的落盘目录，默认 ~/.xiaoyu/serve/<root slug>/",
@@ -1238,6 +1246,7 @@ def serve_command(argv: list[str]) -> int:
         approval_timeout=args.approval_timeout,
         max_sessions=max(1, args.max_sessions),
         mcp=args.mcp,
+        agent_mcp=args.agent_mcp,
         state_dir=Path(args.state_dir).expanduser().resolve() if args.state_dir else None,
         persist=args.persist,
     )
