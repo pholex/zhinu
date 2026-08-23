@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import os
 import io
 import json
 import platform
@@ -61,6 +62,16 @@ def run_case(case: Case, model: str, base_url: str | None, verbose: bool) -> dic
     with tempfile.TemporaryDirectory(prefix=f"xiaoyu-eval-{case.name}-") as tmp:
         workspace = Path(tmp).resolve()
         case.setup(workspace)
+        #  触发准确率 case：把隔离技能铺进独立目录，经 XIAOYU_SKILLS_DIR 加载
+        #  （只认这个目录，不混机器上真装的技能）。放在 workspace 之外，免得
+        #  被 setup 的文件快照/文件类判据看见
+        skills_dir: str | None = None
+        if case.enable_skills and case.skills:
+            sroot = Path(tmp).parent / f"{Path(tmp).name}-skills"
+            for sname, body in case.skills.items():
+                (sroot / sname).mkdir(parents=True, exist_ok=True)
+                (sroot / sname / "SKILL.md").write_text(body, encoding="utf-8")
+            skills_dir = str(sroot)
         before = snapshot(workspace)
 
         config = Config.from_env(
@@ -69,8 +80,9 @@ def run_case(case: Case, model: str, base_url: str | None, verbose: bool) -> dic
             base_url=base_url,
             #  eval 必须无人值守，否则确认提示会卡死。
             auto_approve=True,
-            #  eval 环境要确定：不能受跑分机器上装了什么技能/插件影响
-            enable_skills=False,
+            #  eval 环境要确定：不能受跑分机器上装了什么技能/插件影响。
+            #  触发准确率 case 例外——它自带隔离技能（见上）
+            enable_skills=case.enable_skills,
             enable_agents=False,
             enable_hooks=False,
             enable_plugins=False,
@@ -87,6 +99,11 @@ def run_case(case: Case, model: str, base_url: str | None, verbose: bool) -> dic
                 "PYTHONDONTWRITEBYTECODE": "1",
             },
         )
+        #  技能在 turn 开始（_refresh_skills）重扫，所以 env 要贯穿整个 send，
+        #  用完在 finally 还原，绝不泄漏到下一个 case
+        prev_skills_env = os.environ.get("XIAOYU_SKILLS_DIR")
+        if skills_dir:
+            os.environ["XIAOYU_SKILLS_DIR"] = skills_dir
         agent = Agent(config, Toolbox(config))
 
         buffer = io.StringIO()
@@ -102,6 +119,12 @@ def run_case(case: Case, model: str, base_url: str | None, verbose: bool) -> dic
             verdict = errors.classify(exc)
             if verdict.kind in INFRA_KINDS:
                 infra_kind = verdict.kind
+        finally:
+            if skills_dir:
+                if prev_skills_env is None:
+                    os.environ.pop("XIAOYU_SKILLS_DIR", None)
+                else:
+                    os.environ["XIAOYU_SKILLS_DIR"] = prev_skills_env
 
         transcript = buffer.getvalue()
         if verbose:

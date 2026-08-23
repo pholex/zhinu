@@ -12,6 +12,7 @@
 
 from __future__ import annotations
 
+import os
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -29,6 +30,9 @@ class Skill:
     description: str
     path: Path  # SKILL.md 的完整路径
     plugin: str | None = None  # 来自哪个插件包；None = 散装技能目录
+    #  负例（"别用于…"）：写进索引帮模型排除误触发。实测负例能显著降低误选，
+    #  且比在 description 里堆正例更省——它落在描述尾部，预算紧张时最先被截掉
+    when_not: str = ""
 
 
 @dataclass(frozen=True)
@@ -45,6 +49,10 @@ def skill_dirs() -> list[Path]:
     推不出 home（服务账户/容器随机 UID，见 `config.home_dir`）就跳过
     `~/.agents/skills` 这一来源——少一个技能目录是降级，构造 Agent 炸掉不是。
     """
+    #  XIAOYU_SKILLS_DIR（os.pathsep 分隔）优先：宿主指定技能目录 / eval 隔离用；
+    #  给了就**只**认它，不再混入默认目录（隔离的前提是不被机器上的技能污染）
+    if override := os.environ.get("XIAOYU_SKILLS_DIR", "").strip():
+        return [Path(part).expanduser() for part in override.split(os.pathsep) if part.strip()]
     home = home_dir()
     dirs = [home / ".agents" / "skills"] if home is not None else []
     return [*dirs, user_config_dir() / "skills"]
@@ -93,6 +101,7 @@ FRONTMATTER_KEYS = frozenset(
         "version",
         "permissions",
         "when_to_use",
+        "when_not",
         "triggers",
         "updated",
         "agent_transfer_payload",
@@ -202,6 +211,7 @@ def scan_skills() -> list[Skill]:
                 description=meta.get("description", "").strip(),
                 path=skill_md,
                 plugin=source.plugin,
+                when_not=meta.get("when_not", "").strip(),
             )
     return list(found.values())
 
@@ -220,6 +230,8 @@ def load_skill_body(skill: Skill) -> str:
 #  路由信息（"什么时候别用这个技能"这类反向边界常写在最后），而那正是索引
 #  该有的东西——"怎么执行"才留给 skill 工具加载正文。
 DESCRIPTION_CAP = 1_024
+#  负例上限：它是排除线索不是正文，短即可；超了截断（不加省略号，尾部本就是提示）
+WHEN_NOT_CAP = 200
 
 
 #  预算不够时的说明。技能全在、只是描述变短——不说清楚，模型会把截断的
@@ -320,6 +332,10 @@ def index_block(
         description = skill.description or "（无描述）"
         if len(description) > DESCRIPTION_CAP:
             description = description[:DESCRIPTION_CAP] + "…"
+        if skill.when_not:
+            #  负例挂在描述尾部：跟着描述一起进预算，紧张时优先被截（waterfill 保前缀）
+            when_not = skill.when_not[:WHEN_NOT_CAP]
+            description = f"{description}（别用于：{when_not}）"
         entries.append((skill.name, description))
 
     budget = None
