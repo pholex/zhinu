@@ -99,10 +99,6 @@ _SAFE_RESUME_RATIO = 0.8
 #  inherit = "distilled" 时父会话精简副本最多占子上下文窗口的比例
 _INHERIT_RATIO = 0.3
 INHERIT_MODES = ("none", "distilled")
-#  harness 以 user 角色注入的说明的两种前缀：精确文案之外的兜底（部分注入
-#  文案按会话格式化，含路径，精确集合够不着）——与 session_log.turn_starts 同规则
-_INJECTED_USER_PREFIXES = ("[系统提示]", "<system-reminder>", "<world_state>")
-
 #  模型乱填参数的哨兵值：一律当"没给"
 _SENTINELS = {"", "null", "undefined", "nil"}
 
@@ -395,7 +391,7 @@ def distill_history(
             #  压缩后首条 user = 原始任务 + 摘要：摘要是父 agent 的转述，不带
             text, _ = compaction.split_head(text)
             text = text.strip()
-            if not text or text in synthetic_texts or text.startswith(_INJECTED_USER_PREFIXES):
+            if media.is_injected_user_text(text, synthetic_texts):
                 continue
             kept.append({"role": "user", "content": text})
         elif role == "assistant" and not message.get("tool_calls"):

@@ -360,11 +360,8 @@ def turn_starts(
         if message.get("role") != "user":
             continue
         text = media.text_of(message.get("content"))
-        if not text.strip() or text in exclude_texts:
-            continue
-        #  "[系统提示]" 开头 = harness 注入的说明（plan mode 进出等）。有些注入
-        #  文案按会话格式化（含路径），exclude_texts 的精确匹配够不着，按前缀兜底
-        if text.startswith(("[系统提示]", "<world_state>")):
+        #  harness 注入的说明（plan mode 进出、环境差分等）不算一轮，判据全仓一份
+        if media.is_injected_user_text(text, exclude_texts):
             continue
         starts.append(index)
     return starts

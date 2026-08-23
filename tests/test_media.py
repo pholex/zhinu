@@ -550,3 +550,61 @@ class AttachMediaTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class InjectedUserTextTest(unittest.TestCase):
+    """harness 注入的 user 条目判据全仓一份：四个消费方（子代理蒸馏 / turn_starts /
+    TUI 回放 / ACP 回放）都走它。ACP 回放曾自抄一份只认 "[系统提示]"，
+    <world_state> 差分（现拼的动态文本，精确集合装不下）一条都拦不住，
+    每次 session/load 都把累积的环境播报当用户原话重演一遍。"""
+
+    def _note(self) -> str:
+        from xiaoyu import world_state
+
+        return f"{world_state.TAG_OPEN}\n环境有变：\n- 模型：x\n{world_state.TAG_CLOSE}"
+
+    def test_predicate_covers_all_prefixes_and_blank(self):
+        for text in ("", "  \n", "[系统提示] 任意", "<system-reminder>\nx\n</system-reminder>",
+                     self._note(), "  \n<world_state>带前导空白"):
+            self.assertTrue(media.is_injected_user_text(text), repr(text))
+        self.assertFalse(media.is_injected_user_text("你好"))
+        self.assertFalse(media.is_injected_user_text("讲讲 <world_state> 是什么"))
+        self.assertTrue(media.is_injected_user_text("精确文案", frozenset({"精确文案"})))
+
+    def _history(self) -> list[dict]:
+        return [
+            {"role": "user", "content": "你好"},
+            {"role": "user", "content": self._note()},
+            {"role": "user", "content": "<system-reminder>\n后台任务完成\n</system-reminder>"},
+            {"role": "assistant", "content": "在的"},
+        ]
+
+    def test_acp_replay_skips_injected_user_entries(self):
+        from types import SimpleNamespace
+
+        from xiaoyu.acp import AcpSink
+
+        frames: list[dict] = []
+        server = SimpleNamespace(_notify=lambda m, p: frames.append(p))
+        AcpSink(server, "sess-1", Path("/tmp")).replay(self._history())
+        users = [p["update"]["content"]["text"] for p in frames
+                 if p["update"]["sessionUpdate"] == "user_message_chunk"]
+        self.assertEqual(users, ["你好"])
+
+    def test_tui_replay_skips_injected_user_entries(self):
+        from xiaoyu import render
+        from xiaoyu.events import Notice
+
+        seen: list[str] = []
+
+        class Sink:
+            def emit(self, event):
+                if isinstance(event, Notice):
+                    seen.append(event.text)
+
+        render.replay_transcript(self._history(), Sink())
+        user_lines = [t for t in seen if t.startswith("› ")]
+        self.assertEqual(user_lines, ["› 你好"])
+
+    def test_turn_starts_skips_injected_user_entries(self):
+        self.assertEqual(session_log.turn_starts(self._history(), frozenset()), [0])

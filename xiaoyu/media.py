@@ -223,6 +223,22 @@ def text_of(content: Any) -> str:
     return "".join(pieces)
 
 
+#  harness 以 user 角色注入的说明的前缀：精确文案（SYNTHETIC_USER_TEXTS）之外的
+#  兜底——部分注入按会话现拼（含路径 / 环境差分），精确集合够不着。
+#  **全仓唯一一份**：子代理蒸馏历史、turn_starts/rewind 数轮次、TUI 与 ACP 的
+#  历史回放都拿 is_injected_user_text 判，别再各抄一份判据（第四份就是漏的那份）
+INJECTED_USER_PREFIXES = ("[系统提示]", "<system-reminder>", "<world_state>")
+
+
+def is_injected_user_text(text: str, exclude: frozenset[str] | set[str] = frozenset()) -> bool:
+    """user 角色的这条是不是 harness 注入（或空白）——回放 / 数轮次 / 蒸馏时跳过。
+
+    日志读回来的内容前面可能带空白，前缀按 lstrip 后比。
+    """
+    stripped = text.strip()
+    return not stripped or text in exclude or stripped.startswith(INJECTED_USER_PREFIXES)
+
+
 def as_parts(content: Any) -> list[dict[str, Any]]:
     """任意 content → 部件列表。空内容给空列表（拼接时天然不留空洞）。"""
     if isinstance(content, list):

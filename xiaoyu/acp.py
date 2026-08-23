@@ -769,11 +769,7 @@ class AcpSink:
             role = record.get("role")
             if role == "user":
                 text = media.text_of(record.get("content"))
-                if (
-                    not text.strip()
-                    or text in SYNTHETIC_USER_TEXTS
-                    or text.startswith("[系统提示]")
-                ):
+                if media.is_injected_user_text(text, SYNTHETIC_USER_TEXTS):
                     continue
                 self._update(
                     {
