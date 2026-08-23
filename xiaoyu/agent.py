@@ -60,7 +60,7 @@ from .events import (
 )
 from .render import PlainSink
 from .messages import COMPACTION_KEY, supports_server_compaction
-from .responses import REASONING_KEY
+from .responses import OPERATOR_KEY, REASONING_KEY
 from .tools import PURPOSE_PARAM, Tool, Toolbox
 
 #  approver(tool_name, args) -> True=允许；(True, 附言)=允许且附言随 tool result
@@ -1324,9 +1324,9 @@ class Agent:
         self.mode = target
         if target == modes.PLAN:
             self._seed_plan_file()
-            self._record({"role": "user", "content": self._plan_enter_note})
+            self._record_operator(self._plan_enter_note)
         elif was_plan:
-            self._record({"role": "user", "content": PLAN_MODE_LEAVE_NOTE})
+            self._record_operator(PLAN_MODE_LEAVE_NOTE)
         if self.session_log:
             self.session_log.event("mode", value=target)
             #  plan 的进出照旧再发一条：已有的会话日志消费方按这个键读
@@ -1565,7 +1565,7 @@ class Agent:
         #  触发即占掉本轮的 gate_skip 名额：轻推后的收尾步会再评估一次门控，
         #  同一轮"推过了"不算"被压掉"，不该落 skip 事件
         self._crystallize_skip_logged = True
-        self._record({"role": "user", "content": CRYSTALLIZE_NUDGE})
+        self._record_operator(CRYSTALLIZE_NUDGE)
         self.sink.emit(
             Notice("[检测到反复改写并执行的解题过程，已请模型评估是否值得沉淀]", "info")
         )
@@ -1613,7 +1613,7 @@ class Agent:
             + "。新增技能本会话即可用 skill 工具按名加载；system prompt 里的索引"
             "下次会话才刷新，与本条不一致时以本条为准。不必回应本条。"
         )
-        self._record({"role": "user", "content": note})
+        self._record_operator(note)
         #  压缩与 turn_starts 都不能把这条当用户原话（[系统提示] 前缀是离线侧
         #  的兜底判据，这里再进会话内集合，双保险与 plan mode 注入同一纪律）
         self.compactor.synthetic_user_texts |= {note}
@@ -1875,9 +1875,7 @@ class Agent:
         #  wake_only 跟着 consumed 走：插话/信箱已经让这一步非跑不可时，
         #  捎带把不唤醒的通知也送了；否则只有 wake 项才值得多跑一步。
         for note in self._drain_notifications(wake_only=not consumed):
-            self._record(
-                {"role": "user", "content": f"<system-reminder>\n{note}\n</system-reminder>"}
-            )
+            self._record_operator(f"<system-reminder>\n{note}\n</system-reminder>")
             if self.session_log:
                 self.session_log.event("notify")
             consumed = True
@@ -1888,6 +1886,16 @@ class Agent:
         self.messages.append(message)
         if self.session_log:
             self.session_log.append(message)
+
+    def _record_operator(self, text: str) -> None:
+        """以 operator 身份入历史：harness/宿主说的话，不是用户原话。
+
+        内核形态仍是 role=user（压缩的 synthetic 判据、fork、回放全部不变），
+        只多一个私有标记；出网时认会话中 system 的型号翻成 `role: system`
+        （见 messages._place_operators），其余协议与从前一个字节不差。
+        **不可放不可信内容**（同伴来信、工具输出、插话都不走这里）。
+        """
+        self._record({"role": "user", "content": text, OPERATOR_KEY: True})
 
     # ---------- rewind（/rewind：回滚到某轮开始前） ----------
 
@@ -2035,7 +2043,7 @@ class Agent:
                         and not nudged_structured
                     ):
                         nudged_structured = True
-                        self._record({"role": "user", "content": STRUCTURED_OUTPUT_NUDGE})
+                        self._record_operator(STRUCTURED_OUTPUT_NUDGE)
                         continue
                     #  产物对账护栏：正文宣称"已创建/修改 X"，本轮却没有一次
                     #  成功的改动类工具——改动不存在（真实会话里模型空口宣布
@@ -2055,7 +2063,7 @@ class Agent:
                                     "warn",
                                 )
                             )
-                            self._record({"role": "user", "content": PHANTOM_EDIT_NUDGE})
+                            self._record_operator(PHANTOM_EDIT_NUDGE)
                             continue
                     #  Stop hook：block 则把理由作为 user 消息顶回去续跑一步
                     if (
@@ -2073,9 +2081,7 @@ class Agent:
                             self.sink.emit(
                                 Notice(f"[Stop hook 要求继续：{decision.reason}]", "warn")
                             )
-                            self._record(
-                                {"role": "user", "content": f"[hook 反馈] {decision.reason}"}
-                            )
+                            self._record_operator(f"[hook 反馈] {decision.reason}")
                             continue
                     #  收尾轻推排在 Stop hook 之后：hook 顶回去续跑的轮次还没
                     #  真正收尾，等它真结束时这里自然会再走到
@@ -2097,7 +2103,7 @@ class Agent:
                     return
                 nudged_empty = True
                 self.sink.emit(Notice("[模型返回了空回复，已自动请它补上结论]", "warn"))
-                self._record({"role": "user", "content": EMPTY_REPLY_NUDGE})
+                self._record_operator(EMPTY_REPLY_NUDGE)
                 continue
 
             for call in calls:
@@ -2117,7 +2123,7 @@ class Agent:
         self.sink.emit(
             Notice(f"\n[已达到单轮工具调用上限 {self.config.max_iterations}，请模型收尾]", "warn")
         )
-        self._record({"role": "user", "content": WRAPUP_INSTRUCTION})
+        self._record_operator(WRAPUP_INSTRUCTION)
         self._begin_step(with_tools=False)
         self._record(self._stream_with_recovery(with_tools=False))
 
@@ -2130,7 +2136,7 @@ class Agent:
         """
         note = self.world_state.diff(self)
         if note:
-            self._record({"role": "user", "content": note})
+            self._record_operator(note)
             self.compactor.synthetic_user_texts |= {note}
         if self.session_log and self.world_state.baseline != self._logged_baseline:
             self._logged_baseline = self.world_state.baseline

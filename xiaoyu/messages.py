@@ -37,6 +37,7 @@ import json
 from typing import Any, Iterator
 
 from .responses import (
+    OPERATOR_KEY,
     REASONING_KEY,
     Chunk,
     Completion,
@@ -79,6 +80,16 @@ _COMPACTION_MODELS = (
     "claude-sonnet-4-6", "claude-sonnet-5",
     "claude-fable-5", "claude-mythos",
 )
+
+
+#  认会话中 `role: system` 的型号（官方：Opus 5 / Opus 4.8 / Fable 5 / Mythos；
+#  Sonnet 5 与 4.7 以下不认，发了是 400）。保守：不在清单一律当 user 发
+_MID_SYSTEM_MODELS = ("claude-opus-5", "claude-opus-4-8", "claude-fable-5", "claude-mythos")
+
+
+def supports_mid_system(model: str) -> bool:
+    bare = model.rpartition("/")[2].lower()
+    return any(bare.startswith(name) for name in _MID_SYSTEM_MODELS)
 
 
 def supports_server_compaction(model: str) -> bool:
@@ -193,6 +204,44 @@ def _assistant_blocks(
     return blocks
 
 
+def _place_operators(converted: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """把暂存的 operator 条目（role=system）放到服务端认可的位置，放不下的
+    折回 user。约束（官方）：不能是第一条；前一条必须是 user（tool_result 合并
+    后的 user 也算）；后一条必须是 assistant 或它就是最后一条。
+
+    放置策略：后面紧跟一条 user（典型：两轮之间切了档，再来新提问）就把它
+    **移到那条 user 之后**——"规则变了"在模型作答前看到即可，先后无伤；
+    仍不满足就折成 user 文本（与旧行为一个字节不差）。相邻的 operator 条目
+    合成一条 system（官方未说允许连发，不赌）。
+    """
+    placed: list[dict[str, Any]] = []
+    pending_ops: list[str] = []
+
+    def flush(next_role: str | None) -> None:
+        if not pending_ops:
+            return
+        text = "\n\n".join(pending_ops)
+        pending_ops.clear()
+        prev_is_user = bool(placed) and placed[-1]["role"] == "user"
+        if prev_is_user and next_role in (None, "assistant"):
+            placed.append({"role": "system", "content": text})
+        else:
+            placed.append({"role": "user", "content": text})
+
+    for entry in converted:
+        if entry["role"] == "system":
+            pending_ops.append(entry["content"])
+            continue
+        if entry["role"] == "user" and pending_ops:
+            #  后面紧跟 user：先放这条 user，operator 挪到它后面再定夺
+            placed.append(entry)
+            continue
+        flush(entry["role"])
+        placed.append(entry)
+    flush(None)
+    return placed
+
+
 def _to_messages(
     messages: list[dict[str, Any]], model: str, provider: str = ""
 ) -> list[dict[str, Any]]:
@@ -207,6 +256,7 @@ def _to_messages(
     """
     converted: list[dict[str, Any]] = []
     previous_was_tool = False
+    mid_system = supports_mid_system(model)
     for message in messages:
         role = message.get("role")
         if role == "tool":
@@ -229,12 +279,15 @@ def _to_messages(
             continue
         #  user：纯字符串直通（最省，也合法）；部件列表逐个翻译
         content = message.get("content")
-        if isinstance(content, list):
+        if message.get(OPERATOR_KEY) and mid_system and isinstance(content, str) and content:
+            #  operator 条目先暂存成 role=system，位置由 _place_operators 定
+            converted.append({"role": "system", "content": content})
+        elif isinstance(content, list):
             if blocks := _to_blocks(content):
                 converted.append({"role": "user", "content": blocks})
         elif content:
             converted.append({"role": "user", "content": content})
-    return converted
+    return _place_operators(converted) if mid_system else converted
 
 
 def _apply_tail_cache(converted: list[dict[str, Any]]) -> None:
@@ -245,11 +298,16 @@ def _apply_tail_cache(converted: list[dict[str, Any]]) -> None:
     消息的 blocks 里可能有**原样回放的 thinking dict**，往上面写 cache_control
     等于篡改必须字节一致的东西。
     """
-    if not converted or converted[-1]["role"] != "user":
+    #  尾部若是 operator 的 system 条目，断点打在它前面那条 user 上：
+    #  前缀照样全部盖住，且不往 system 条目上挂 cache_control（官方未说认）
+    index = len(converted) - 1
+    while index >= 0 and converted[index]["role"] == "system":
+        index -= 1
+    if index < 0 or converted[index]["role"] != "user":
         return
-    content = converted[-1]["content"]
+    content = converted[index]["content"]
     if isinstance(content, str):
-        converted[-1]["content"] = content = [{"type": "text", "text": content}]
+        converted[index]["content"] = content = [{"type": "text", "text": content}]
     if content:
         content[-1]["cache_control"] = dict(_CACHE_CONTROL)
 

@@ -48,6 +48,11 @@ WILDCARD = "*"
 #  assistant 消息上的私有键：存这一轮的 reasoning item。下划线开头 = 内核私有，
 #  绝不出网（见 strip_private）。值的形状是 {"model": 产出它的模型, "items": [...]}
 REASONING_KEY = "_reasoning"
+#  user 消息上的私有键：标记"这条是 harness/宿主以 operator 身份说的，不是用户
+#  原话"（plan 进出说明、nudge、系统通知…）。内核形态仍是 role=user（压缩 /
+#  fork / 回放的全部判据不变）；出网时 Anthropic 支持的型号翻成会话中
+#  `role: system`（operator 权威通道，且不破缓存前缀），其余协议照旧当 user 发
+OPERATOR_KEY = "_operator"
 
 #  拿回 reasoning 状态所必须的 include。实测 xai / qwen / deepseek 的 Responses
 #  端点都容得下这个参数（不支持推理的模型只是不回而已），所以无条件发。
