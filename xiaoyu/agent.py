@@ -696,6 +696,7 @@ class Agent:
         registry: Registry | None = None,
         quiet: bool = False,
         allow_explore: bool = True,
+        allow_nesting: bool | None = None,
         session_log: Any | None = None,
         permissions: Permissions | None = None,
         sink: UISink | None = None,
@@ -846,6 +847,14 @@ class Agent:
             synthetic_user_texts=SYNTHETIC_USER_TEXTS | {self._plan_enter_note},
         )
         #  子 agent 不再挂 explore，避免无限套娃
+        #  嵌套闸（与 allow_explore 解耦）：allow_explore 管 explore/new_context 这类
+        #  "更高阶工具"；allow_nesting 单独管"子 agent 能不能再派子 agent"。默认
+        #  跟随 allow_explore（主会话 True、explore/chenshu 成员 False，行为不变）。
+        #  深度未到上限才允许——默认 max=1 时子 agent 一律 False，即不套娃
+        nesting_ok = (
+            (allow_explore if allow_nesting is None else allow_nesting)
+            and config.subagent_depth < config.subagent_max_depth
+        )
         if allow_explore and config.enable_explore and self.toolbox.get("explore") is None:
             from .explore import make_explore_tool
 
@@ -1051,7 +1060,7 @@ class Agent:
             )
         #  声明式 subagent（agents/*.toml）：挂成与 explore
         #  同形态的委托工具。allow_explore 兼作"不套娃"闸门——子 agent 不再挂
-        if allow_explore and config.enable_agents:
+        if nesting_ok and config.enable_agents:
             from .agents import RunStore, load_agent_specs, make_subagent_tool
 
             agent_specs, spec_problems = load_agent_specs(config.workspace)
@@ -1104,7 +1113,7 @@ class Agent:
                 )
         #  宸枢（编排总控模式）：init 常驻 schema，其余工具在 active 后经
         #  check_fn 浮现。与 allow_explore 同闸（成员不再挂宸枢，不套娃）
-        if allow_explore and config.enable_chenshu and self.toolbox.get("chenshu_init") is None:
+        if nesting_ok and config.enable_chenshu and self.toolbox.get("chenshu_init") is None:
             from .chenshu import ChenshuRuntime, make_chenshu_tools
 
             self.chenshu = ChenshuRuntime(

@@ -39,7 +39,7 @@ mcp = ["github"]                  # 可省：继承父会话的哪些 MCP server
 model = "deepseek-v4-pro"         # 可省：默认随主模型
 effort = "low"                    # 可省：推理深度，默认随主会话（只读探索给 low 省钱）
 max_iterations = 30               # 可省：默认 20
-inherit = "distilled"             # 可省：带父会话的精简历史起步（默认不带）
+inherit = "distilled"             # 可省：none（默认）/ distilled（精简副本）/ fork（完整上下文）
 ```
 
 要点（详见 `xiaoyu/agents.py` 模块说明）：
@@ -56,6 +56,12 @@ inherit = "distilled"             # 可省：带父会话的精简历史起步�
   窗口的 30% 从最新一轮往回整轮装。适合"接着聊的那件事去办"的委托：子
   agent 拿到用户原意而不是父 agent 的转述。只作用于新开委托；七襄/斗巧
   的批量扇出不带（扇出项应自足）。
+- **完整继承（fork）**：`inherit = "fork"` 时子 agent 逐字带走父会话的**完整**
+  上下文（工具过程、结果、推理都在，故名 fork）。要精确接着父会话
+  干、细节不能丢时用；代价是可能撑爆子窗口（子 agent 首轮自动压缩兜底）。
+- **嵌套深度**：默认**不套娃**——子 agent 不能再派子 agent（单写者纪律）。
+  `XIAOYU_SUBAGENT_MAX_DEPTH`（默认 1）显式放开有界嵌套：设 2/3 时子 agent
+  可再委托，逐层 +1、到顶即止，不会失控递归。宸枢多层编排才需要。
 
 `XIAOYU_ENABLE_AGENTS=0` 一键关闭。
 

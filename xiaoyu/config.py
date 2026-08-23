@@ -262,6 +262,11 @@ class Config:
     #  是否加载声明式 subagent（agents/*.toml，见 agents.py；工作区级安全——
     #  spec 能声明的最大权限=用户逐次批准的权限，见该模块 docstring）。
     enable_agents: bool = True
+    #  子 agent 嵌套深度：当前深度（主会话=0，每委托一层 +1）与最大深度。
+    #  默认 max=1 = 不套娃（与既有行为一致，"单写者"纪律的显式化）；
+    #  宸枢多层编排要嵌套时 XIAOYU_SUBAGENT_MAX_DEPTH=2/3 显式放开，有界不失控。
+    subagent_depth: int = 0
+    subagent_max_depth: int = 1
     #  七襄（qixiang，批量并行委托）的并发上限。默认 4：单机直连场景的保守值
     #  （上限式并发，不做自适应爬坡——理由见 qixiang.py docstring）。
     qixiang_concurrency: int = 4
@@ -414,6 +419,9 @@ class Config:
             cfg.mcp_tool_search = flag.strip().lower() not in ("0", "false", "no", "off")
         if (flag := os.environ.get("XIAOYU_ENABLE_AGENTS")) is not None:
             cfg.enable_agents = flag.strip().lower() not in ("0", "false", "no", "off")
+        if raw := os.environ.get("XIAOYU_SUBAGENT_MAX_DEPTH"):
+            with contextlib.suppress(ValueError):
+                cfg.subagent_max_depth = max(1, int(raw))
         if raw := os.environ.get("XIAOYU_QIXIANG_CONCURRENCY"):
             with contextlib.suppress(ValueError):
                 cfg.qixiang_concurrency = max(1, min(int(raw), 16))
