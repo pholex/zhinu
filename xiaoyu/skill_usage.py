@@ -132,11 +132,16 @@ def implicit_loads(command: str, skills: list["Skill"], cwd: Path | None = None)
     found: list[str] = []
     for segment in _SEGMENT_SPLIT.split(command):
         try:
-            words = shlex.split(segment, comments=True)
+            #  Windows 下 posix 模式会把 D:\a\x 里的反斜杠当转义吃掉，改用
+            #  非 posix 切分再手工剥引号
+            if os.name == "nt":
+                words = [w.strip("\"'") for w in shlex.split(segment, comments=True, posix=False)]
+            else:
+                words = shlex.split(segment, comments=True)
         except ValueError:
             continue
         for word in words:
-            if "/" not in word and word != "SKILL.md":
+            if "/" not in word and "\\" not in word and word != "SKILL.md":
                 continue
             word = word.replace("$HOME", home).replace("${HOME}", home)
             if word.startswith("~"):
