@@ -99,7 +99,7 @@ def replay_transcript(
         role = record.get("role")
         if role == "user":
             text = media.text_of(record.get("content"))
-            if not text.strip() or text in skip_user_texts:
+            if media.is_injected_user_text(text, skip_user_texts):
                 continue
             if emitted:
                 notice("")  # 轮与轮之间空一行
