@@ -336,11 +336,22 @@ class TestOrderAndKeys(ProviderTestCase):
 
     def test_deepseek_speaks_responses_only_on_flash(self) -> None:
         """v4-pro 的 /responses 明确"稍后开放"，而它是默认主模型——协议按型号
-        声明就是为了这种一家两制，按家切会当场把主模型切死。"""
+        声明就是为了这种一家两制，按家切会当场把主模型切死。
+        vision-exp（flash 底座）实测 /responses 通且回 encrypted reasoning，随 flash 选边。"""
         with isolated_env({"DEEPSEEK_API_KEY": "ds"}):
             client = providers.build(config(base_url="")).client("deepseek")
             self.assertEqual(client.protocol_for("deepseek-v4-flash"), "responses")
+            self.assertEqual(client.protocol_for("deepseek-v4-flash-vision-exp"), "responses")
             self.assertEqual(client.protocol_for("deepseek-v4-pro"), "chat")
+
+    def test_deepseek_vision_only_on_vision_exp(self) -> None:
+        """vision_models 只写实测过的：vision-exp 绿/紫两轮全对（2026-08-24），
+        pro/flash 仍不收图（fail-closed，误声明=工具回图时每轮 400）。"""
+        with isolated_env({"DEEPSEEK_API_KEY": "ds"}):
+            registry = providers.build(config(base_url=""))
+            self.assertTrue(registry.sees_images("deepseek-v4-flash-vision-exp"))
+            self.assertFalse(registry.sees_images("deepseek-v4-flash"))
+            self.assertFalse(registry.sees_images("deepseek-v4-pro"))
 
     def test_generic_provider_can_opt_into_responses(self) -> None:
         """未内置的厂商也能自救：PROTOCOL=responses，不必等我们补 preset。"""

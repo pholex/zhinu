@@ -85,18 +85,25 @@ PRESETS: dict[str, Preset] = {
     "deepseek": Preset(
         name="deepseek",
         base_url="https://api.deepseek.com/v1",
-        models=("deepseek-v4-pro", "deepseek-v4-flash"),
+        #  vision-exp（2026-08-24 入册）：flash 底座 + 图片输入的实验型号，
+        #  与 flash 同价、同 1M 窗口——deepseek 首个能看图的在册型号。
+        #  实测：chat 与 /responses 两路 tool_calls 都通
+        models=("deepseek-v4-pro", "deepseek-v4-flash", "deepseek-v4-flash-vision-exp"),
         #  键名就用厂商原生名，.env / 环境变量 / Keychain 三处同名，用户只记一个
         key_envs=("DEEPSEEK_API_KEY",),
         label="直连 deepseek",
-        #  ⚠️ 只有 flash：v4-pro 的 /responses 实测回"尚未开放"类明确报错，
-        #  而 v4-pro 是默认主模型——这正是协议必须按型号声明、不能按家切的原因。
-        #  实测两边 token 计数完全一致（长短输入都 0 差），换协议不多花钱
-        responses_models=("deepseek-v4-flash",),
-        #  ⚠️ 两个型号都不收图，且**失败方式不同**：v4-pro 的 chat 端点直接 400
+        #  ⚠️ v4-pro 不进 /responses：实测回"尚未开放"类明确报错，而 v4-pro 是
+        #  默认主模型——这正是协议必须按型号声明、不能按家切的原因。
+        #  flash 实测两边 token 计数完全一致（长短输入都 0 差），换协议不多花钱；
+        #  vision-exp 实测 /responses 通且回 encrypted reasoning（选边的收益所在），
+        #  图片部件经翻译层转成 input_image 后答色正确
+        responses_models=("deepseek-v4-flash", "deepseek-v4-flash-vision-exp"),
+        #  ⚠️ pro / flash 不收图，且**失败方式不同**：v4-pro 的 chat 端点直接 400
         #  （unknown variant `image_url`），v4-flash 的 /responses 却 200 收下、
         #  prompt_tokens 只涨 5 个（92→107）、然后答"无法确定"——图被静默丢弃。
-        #  后者正是 vision_probe 不能只看状态码的原因
+        #  后者正是 vision_probe 不能只看状态码的原因。
+        #  vision-exp 2026-08-24 实测绿/紫两轮全对（chat 与 /responses 都试过）
+        vision_models=("deepseek-v4-flash-vision-exp",),
     ),
     #  以下三家 2026-08-11 实测过 chat completions 通、模型名正确
     "moonshot": Preset(
