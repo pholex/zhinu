@@ -69,6 +69,7 @@ def make_explore_tool(
             model=config.explore_model,
             summary_model=config.summary_model,
             explore_model=config.explore_model,
+            vision_fallback_model=config.vision_fallback_model,
             workspace=config.workspace,
             max_iterations=config.explore_iterations,
             max_tool_output=config.max_tool_output,

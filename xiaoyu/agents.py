@@ -597,6 +597,7 @@ def execute_delegation(
         model=model,
         summary_model=config.summary_model,
         explore_model=config.explore_model,
+        vision_fallback_model=config.vision_fallback_model,
         workspace=workdir,
         #  spec 声明 > 主会话；只读探索类子 agent 适合 low，总控类给 high
         effort=spec.effort or config.effort,

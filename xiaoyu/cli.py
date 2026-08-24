@@ -2501,18 +2501,27 @@ def main(argv: list[str] | None = None) -> int:
     if prompt:
         user_input: str | list[dict[str, Any]] = prompt
         if image_parts:
-            #  显式发图撞上不看图的模型：硬报错，不做管线内那种降级说明
-            if not agent.registry.sees_images(config.model):
-                print(
-                    ui.error(
-                        f"当前模型 {config.model} 未声明视觉能力，--image/--paste 发不出去。"
-                        "换视觉模型（如 --model deepseek-v4-flash-vision-exp），"
-                        "或用 XIAOYU_VISION_MODELS 点名放行网关上的视觉模型"
-                    ),
-                    file=sys.stderr,
-                )
-                return 2
-            user_input = [{"type": "text", "text": prompt}, *image_parts]
+            #  显式发图撞上不看图的模型：硬报错，不做管线内那种降级说明。
+            #  例外是点名了代读模型——一次性模式最常出现在脚本/CI 里，没人在环里
+            #  改命令行重跑，用户既然显式配了代读就是要它在这种时候顶上
+            if agent.registry.sees_images(config.model):
+                user_input = [{"type": "text", "text": prompt}, *image_parts]
+            else:
+                block, notice = agent.caption_images(image_parts, guide=prompt)
+                if not block:
+                    print(
+                        ui.error(
+                            f"当前模型 {config.model} 未声明视觉能力，--image/--paste 发不出去。"
+                            "换视觉模型（如 --model deepseek-v4-flash-vision-exp）；"
+                            "或用 XIAOYU_VISION_FALLBACK 点名一个代读模型；"
+                            "或用 XIAOYU_VISION_MODELS 点名放行网关上的视觉模型"
+                        ),
+                        file=sys.stderr,
+                    )
+                    return 2
+                #  提示走 stderr：stdout 是这条命令的产物，管道下游只该拿到正文
+                print(ui.secondary(notice.strip()), file=sys.stderr)
+                user_input = f"{prompt}\n\n{block}"
         if resumed and args.output_format == "text":
             print(ui.secondary(resumed))
         return run_once(agent, user_input, args.output_format, output_schema)
@@ -3001,6 +3010,11 @@ def handle_slash(agent: Agent, line: str, select: Any = None) -> bool:
                     print(f"    {name}")
             chain = " → ".join(route.qualified for route in agent.model_chain())
             print(ui.secondary(f"降级链：{chain}"))
+            #  代读只在配了的时候印：默认没有，多印一行"未配置"是噪音。
+            #  当前模型本来就能看图时也说清楚——代读此刻不会触发，别让用户以为
+            #  自己看到的每张图都被转述过一道
+            if note := agent.vision_note():
+                print(ui.secondary(note))
     elif command == "/effort":
         if rest:
             level = rest[0].strip().lower()

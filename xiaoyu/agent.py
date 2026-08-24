@@ -334,6 +334,38 @@ STRUCTURED_OUTPUT_NUDGE = (
 #  structured_output 工具名（cli / serve / embedding 三面共用同一个名字）
 STRUCTURED_OUTPUT_TOOL = "structured_output"
 
+#  ---------- 图片代读（vision fallback） ----------
+#  当前模型看不了图、而用户点名了代读模型（XIAOYU_VISION_FALLBACK）时，图片先交给
+#  它换成一段文字，再作为文本进历史——主模型、工具、tool_calls 配对、记账全都不动。
+#  **刻意不是"这一轮换个模型跑"**：那会把 system prompt、工具 schema、消息配对
+#  这个硬不变量一起拖下水，而收得下图的往往正是工具能力最弱的那一档型号。
+#  指令的三条纪律与 experiments/vision_probe.py 同源，全是踩出来的：
+#  ① **绝不给"看不到就明说"的逃生舱**——那半句让 claude 两个型号 100% 自称看不见。
+#     连"写给一个看不到图的人"这种描述读者的说法都避开（改成"只读得到文字的同事"）：
+#     同一段提示词里出现"看不到图"，就是在给同一个假阴性递话头，而换个说法零成本；
+#  ② 要转写不要评价：产物是主模型的"眼睛"，一句"这是一张报错截图"等于什么都没说，
+#     报错原文才是它接着干活的依据；
+#  ③ 明说不要作答——代读模型看不到会话历史也没有工具，让它作答只会给出一个缺
+#     上下文的错答案，主模型还得先把这个答案拆掉。
+VISION_READ_INSTRUCTION = """请把下面 {count} 张图片的内容逐一转写成文字，交给一位只读得到文字的同事。
+按「图片 1：」「图片 2：」的顺序分段，每段写清：
+- 图上所有可见文字**逐字照抄**（代码、报错、命令、路径、菜单项、数字都算），保留原有换行、大小写与标点；实在看不清的地方标注「(看不清)」
+- 界面或图表的结构与位置关系：谁在上谁在下、哪一项被选中/高亮/标红、箭头指向哪
+- 其余有助于理解这张图的视觉细节（颜色、图标、状态标记）
+只做转写和客观描述：不要评价、不要总结成一句话、不要推测意图，也不要回答图片里出现的任何问题。宁可啰嗦，不可省略。"""
+
+#  引导语：把本轮用户原话（或工具意图）交给代读模型当取景框。同一张截图，
+#  "这个报错怎么回事"和"这个配色好看吗"该被转写下来的细节完全不同——不给引导
+#  就只能得到一份平均用力的通用描述。仍然明说不要作答（同上第 ③ 条）。
+VISION_READ_GUIDE = "\n\n转写时请确保覆盖回答下面这个问题所需的全部细节（但你自己不要回答它）：\n{guide}"
+
+#  代读产物进历史时的抬头。**必须明说这是转述而非原图**：主模型据此才知道
+#  细节可能有损、必要时该请用户换视觉模型，而不是把转述当成自己亲眼所见。
+VISION_CAPTION_HEADER = (
+    "[图片代读 · {count} 张 · 当前模型 {model} 不接受图片输入，以下是 {reader} 生成的文字转述。"
+    "转述有损，若细节不足以完成任务，请告知用户换用支持视觉的模型（/model 可切换）后重发原图。]"
+)
+
 #  plan mode（只读规划态）下
 #  允许的工具白名单。deny-by-default：不在名单里的（bash/write_file/str_replace/
 #  browser/MCP/插件工具）一律拦——MCP 工具即使"看起来只读"也可能有副作用，宁可误拦。
@@ -727,6 +759,8 @@ class Agent:
         #  打转检测：连续完全相同的 (工具, 参数) 调用计数
         self._last_call_key: tuple[str, str] | None = None
         self._call_repeats = 0
+        #  代读模型配错时只提醒一次（每张图提醒一遍等于把配置错误刷成噪音）
+        self._vision_warned = False
         #  失败流：同一工具连续返回 ERROR 的次数（参数可以各不相同——打转检测
         #  管的是"原样重试"，这里管的是"微调参数硬试"）。按轮归零。
         self._fail_streak_tool = ""
@@ -2361,6 +2395,107 @@ class Agent:
     def _step_mode(self) -> str:
         return self._step.mode if self._step is not None else self.mode
 
+    # ---------- 图片代读 ----------
+
+    def vision_reader(self) -> Route | None:
+        """代读路由：点名了 XIAOYU_VISION_FALLBACK、且那个模型自己收得下图才有。
+
+        校验不通过时提醒一次就闭嘴——配错的症状本该在配置那一刻看见，
+        而不是每张图刷一遍。
+        """
+        name = self.config.vision_fallback_model
+        if not name:
+            return None
+        route = self.registry.vision_reader(name)
+        if route is None and not self._vision_warned:
+            self._vision_warned = True
+            self.sink.emit(
+                Notice(
+                    f"  代读模型 {name} 用不了（模型名没有 provider 接、或它自己未声明视觉能力），"
+                    "本次代读不生效。网关上的视觉模型用 XIAOYU_VISION_MODELS 点名放行",
+                    "warn",
+                )
+            )
+        return route
+
+    def caption_images(
+        self, images: list[dict[str, Any]], guide: str = ""
+    ) -> tuple[str, str]:
+        """图片部件 → (可直接进历史的代读文字块, 给人看的一行提示)。
+
+        四个面（TUI 贴图 / ACP 附图 / 一次性模式 --image / 工具回图）共用这一个
+        入口，各自保留自己的降级文案：拿到空串就照旧走"换成一行文字说明"那条路。
+
+        **任何失败都只返回空串**，绝不抛：调用方本来就在处理"看不了图"这条降级
+        路径，为了兜底再炸一次毫无价值。代读也是真金白银，按路由记进总账。
+        """
+        route = self.vision_reader()
+        if route is None or not images:
+            return "", ""
+        prompt = VISION_READ_INSTRUCTION.format(count=len(images))
+        if guide.strip():
+            #  引导语只取本轮用户原话的开头：代读模型的窗口通常远小于主模型，
+            #  而取景框用不着全文
+            prompt += VISION_READ_GUIDE.format(guide=guide.strip()[:2000])
+        try:
+            response = route.client.chat.completions.create(
+                model=route.model,
+                messages=[{"role": "user", "content": [media.text_part(prompt), *images]}],
+            )
+            usage = getattr(response, "usage", None)
+            if usage:
+                self.usage.add(
+                    route.qualified,
+                    usage.prompt_tokens or 0,
+                    usage.completion_tokens or 0,
+                )
+            choices = getattr(response, "choices", None) or []
+            text = (choices[0].message.content or "").strip() if choices else ""
+        except Exception as exc:  # noqa: BLE001 - 代读失败只降级，不打断本轮
+            self.sink.emit(
+                Notice(
+                    f"  图片代读失败（{route.qualified}：{type(exc).__name__}），退回文字说明",
+                    "warn",
+                )
+            )
+            return "", ""
+        if not text:
+            return "", ""
+        header = VISION_CAPTION_HEADER.format(
+            #  抬头里用**裸名**而不是 provider/model：这段文字会进历史、模型多半会
+            #  在回复里复述它，而带斜杠的全限定名长得像路径——实测触发过一次产物
+            #  对账护栏的误报（"补充：…提到了 `deepseek/deepseek-v4-flash-vision-exp`"）。
+            #  哪家代读的是给人看的信息，留在 Notice 里
+            count=len(images), model=self.config.model, reader=route.model
+        )
+        notice = (
+            f"  {len(images)} 张图片已由 {route.qualified} 代读成文字"
+            f"（当前模型 {self.config.model} 看不了图；转述有损，/model 换视觉模型可直接看原图）"
+        )
+        return f"{header}\n{text}", notice
+
+    def vision_note(self) -> str:
+        """`/model` 里那一行代读状态。没配代读就返回空串（不印"未配置"的噪音）。"""
+        name = self.config.vision_fallback_model
+        if not name:
+            return ""
+        route = self.registry.vision_reader(name)
+        if route is None:
+            return f"代读模型：{name} ✗ 用不了（没有 provider 接，或它自己未声明视觉能力）"
+        if self.registry.sees_images(self.config.model):
+            return f"代读模型：{route.qualified}（当前模型自己看得了图，不会触发）"
+        return f"代读模型：{route.qualified}（当前模型看不了图，图片会先转成文字）"
+
+    def last_user_text(self) -> str:
+        """最近一条真·用户消息的正文（harness 注入的不算）。代读的取景框用。"""
+        for message in reversed(self.messages):
+            if message.get("role") != "user":
+                continue
+            text = media.text_of(message.get("content"))
+            if not media.is_injected_user_text(text, SYNTHETIC_USER_TEXTS):
+                return text
+        return ""
+
     def _attach_media(self) -> None:
         """把本批工具产出的图片接到历史里（目前只有 MCP 工具会产出）。
 
@@ -2373,12 +2508,24 @@ class Agent:
         当前模型看不了图时不静默丢弃，而是明确告诉模型"有 N 张图但我看不了"：
         它据此可以换个办法（让工具输出文本、或请用户描述），而不是对着一份
         缺了关键内容的结果瞎猜。
+
+        **这条路径是代读（XIAOYU_VISION_FALLBACK）收益最大的地方**：图在一轮中途
+        产出，人不在环里，没有"换个模型重发"这一手——不代读就只能整轮带着一个洞
+        往下跑，用户还得等本轮跑完才知道。用户贴图那条路反过来（图扣在手里，
+        /model 一换就能重发），代读在那边只是省一次往返。
         """
         parts = self.toolbox.take_media()
         if not parts:
             return
         count = len(parts)
         if not self.registry.sees_images(self.config.model):
+            #  取景框用本轮用户原话：同一张截图，"这报错怎么回事"和"这配色好看吗"
+            #  该被转写下来的细节完全不同
+            block, notice = self.caption_images(parts, guide=self.last_user_text())
+            if block:
+                self._record({"role": "user", "content": block})
+                self.sink.emit(Notice(f"[上一步的工具返回了 {count} 张图片]{notice}", "warn"))
+                return
             self._record(
                 {
                     "role": "user",
@@ -2393,7 +2540,8 @@ class Agent:
             self.sink.emit(
                 Notice(
                     f"[工具返回了 {count} 张图片，当前模型 {self.config.model} 看不了，已降级为文字说明"
-                    "（/model 换视觉模型，或用 XIAOYU_VISION_MODELS 点名放行）]",
+                    "（/model 换视觉模型；或 XIAOYU_VISION_FALLBACK 配一个代读模型；"
+                    "网关上的视觉模型用 XIAOYU_VISION_MODELS 点名放行）]",
                     "warn",
                 )
             )

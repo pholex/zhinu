@@ -228,6 +228,13 @@ class Config:
     summary_model: str = DEFAULT_SUMMARY_MODEL
     #  explore 子 agent 用的便宜模型
     explore_model: str = DEFAULT_EXPLORE_MODEL
+    #  代读模型：当前模型看不了图时，把图交给它换成一段文字（见 agent.read_images）。
+    #  **默认空 = 不代读**，行为与从前一致。不预置默认值是刻意的：代读是有损的，
+    #  默认打开等于让用户以为主模型看了图，而它看的是一段转述——与
+    #  Registry.sees_images 的 fail-closed 同一条诚实纪律；何况默认值要点名某一家
+    #  厂商的型号（还得是用户配了 key 的那家），猜错就是又一次静默失败。
+    #  来源 XIAOYU_VISION_FALLBACK，值是模型名（如 deepseek-v4-flash-vision-exp）。
+    vision_fallback_model: str = ""
     #  是否给主 agent 挂 explore 工具（子 agent 自己一定关掉，避免套娃）
     enable_explore: bool = True
     #  是否扫描 SKILL.md 技能（explore 子 agent 与 eval 关掉，保持行为确定）
@@ -392,6 +399,7 @@ class Config:
             model=os.environ.get("XIAOYU_MODEL", DEFAULT_MODEL),
             summary_model=os.environ.get("XIAOYU_SUMMARY_MODEL", DEFAULT_SUMMARY_MODEL),
             explore_model=os.environ.get("XIAOYU_EXPLORE_MODEL", DEFAULT_EXPLORE_MODEL),
+            vision_fallback_model=os.environ.get("XIAOYU_VISION_FALLBACK", "").strip(),
             workspace=(workspace or Path.cwd()).resolve(),
         )
         if raw := os.environ.get("XIAOYU_FALLBACK_MODELS"):

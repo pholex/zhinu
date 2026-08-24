@@ -608,3 +608,206 @@ class InjectedUserTextTest(unittest.TestCase):
 
     def test_turn_starts_skips_injected_user_entries(self):
         self.assertEqual(session_log.turn_starts(self._history(), frozenset()), [0])
+
+
+class _Reply:
+    """一次非流式回复的最小形状（choices[0].message.content + usage）。"""
+
+    def __init__(self, text: str, prompt: int = 11, completion: int = 7) -> None:
+        from types import SimpleNamespace
+
+        self.choices = [SimpleNamespace(message=SimpleNamespace(content=text))]
+        self.usage = SimpleNamespace(prompt_tokens=prompt, completion_tokens=completion)
+
+
+class _ReaderClient:
+    """只实现 chat.completions.create 的鸭子 client，把请求录下来供断言。"""
+
+    def __init__(self, reply) -> None:
+        from types import SimpleNamespace
+
+        self.requests: list[dict] = []
+        self._reply = reply
+        self.chat = SimpleNamespace(completions=SimpleNamespace(create=self._create))
+
+    def _create(self, **kwargs):
+        self.requests.append(kwargs)
+        if isinstance(self._reply, Exception):
+            raise self._reply
+        return self._reply
+
+
+class VisionFallbackTest(unittest.TestCase):
+    """代读（XIAOYU_VISION_FALLBACK）：当前模型看不了图时把图换成一段文字。
+
+    两个方向都要钉住——**能代读时别再降级成一行说明**（那是白配），
+    **代读用不了时必须原样退回旧行为**（配错/超时不该比没配更糟）。
+    """
+
+    def build(self, *, vision=(), fallback="", reply=None, reader_vision=("reader-model",)):
+        from xiaoyu.agent import Agent
+        from xiaoyu.config import Config
+        from xiaoyu.tools import Toolbox
+
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        config = Config(
+            base_url="http://unused",
+            model="main-model",
+            workspace=Path(tmp.name).resolve(),
+            vision_fallback_model=fallback,
+            enable_skills=False,
+            enable_agents=False,
+            enable_hooks=False,
+            enable_plugins=False,
+            enable_mcp=False,
+        )
+        self.reader = _ReaderClient(reply if reply is not None else _Reply("图片 1：一行报错"))
+        registry = providers.Registry(
+            [
+                providers.Provider("main", "", "", ("main-model",), "主", (), vision),
+                providers.Provider(
+                    "reader", "", "", ("reader-model", "blind-model"), "代读", (), reader_vision
+                ),
+            ],
+            clients={"main": mock.MagicMock(), "reader": self.reader},
+        )
+        agent = Agent(config, Toolbox(config), registry=registry)
+        ref = media.store(PNG, "image/png")
+        agent.toolbox.take_media = lambda: [media.image_part(ref)]  # type: ignore[method-assign]
+        return agent
+
+    #  —— 校验：代读模型自己必须收得下图 ——
+
+    def test_reader_must_declare_vision_itself(self):
+        """配成一个不收图的型号 = 每张图换来一次 400。校验复用同一套 fail-closed。"""
+        agent = self.build(fallback="blind-model")
+        self.assertIsNone(agent.registry.vision_reader("blind-model"))
+        self.assertIsNone(agent.registry.vision_reader("查无此名"))
+        self.assertIsNone(agent.registry.vision_reader(""))
+        route = agent.registry.vision_reader("reader-model")
+        self.assertIsNotNone(route)
+        self.assertEqual(route.qualified, "reader/reader-model")
+
+    def test_unusable_reader_degrades_exactly_like_before(self):
+        agent = self.build(fallback="blind-model")
+        agent._attach_media()
+        self.assertIn("不接受图片输入", media.text_of(agent.messages[-1]["content"]))
+        self.assertEqual(self.reader.requests, [])
+
+    #  —— 工具回图：代读收益最大的那条路径（人不在环里）——
+
+    def test_tool_images_become_text(self):
+        agent = self.build(fallback="reader-model")
+        agent._attach_media()
+        last = agent.messages[-1]
+        self.assertEqual(last["role"], "user")
+        self.assertEqual(media.images_of(last["content"]), [])
+        #  抬头必须说清这是转述而不是原图，否则主模型会把它当亲眼所见
+        self.assertIn("图片代读", last["content"])
+        self.assertIn("reader-model", last["content"])
+        #  抬头里刻意用裸名：带斜杠的全限定名长得像路径，会误触发产物对账护栏
+        self.assertNotIn("reader/reader-model", last["content"])
+        self.assertIn("图片 1：一行报错", last["content"])
+        #  图真的发给了代读模型
+        sent = self.reader.requests[0]["messages"][0]["content"]
+        self.assertEqual(len(media.images_of(sent)), 1)
+
+    def test_guide_is_the_last_real_user_message(self):
+        """取景框：同一张截图，问报错和问配色该被转写下来的细节完全不同。"""
+        agent = self.build(fallback="reader-model")
+        agent.messages.append({"role": "user", "content": "这个报错怎么回事"})
+        agent._attach_media()
+        prompt = media.text_of(self.reader.requests[0]["messages"][0]["content"])
+        self.assertIn("这个报错怎么回事", prompt)
+
+    def test_injected_user_text_is_not_used_as_guide(self):
+        from xiaoyu.agent import WRAPUP_INSTRUCTION
+
+        agent = self.build(fallback="reader-model")
+        agent.messages.append({"role": "user", "content": "这个报错怎么回事"})
+        agent.messages.append({"role": "user", "content": WRAPUP_INSTRUCTION})
+        agent._attach_media()
+        prompt = media.text_of(self.reader.requests[0]["messages"][0]["content"])
+        self.assertIn("这个报错怎么回事", prompt)
+        self.assertNotIn("已达到本轮工具调用次数上限", prompt)
+
+    def test_reader_failure_falls_back_to_the_note(self):
+        """代读是兜底路径上的兜底：它自己炸了也不能让本轮更糟。"""
+        agent = self.build(fallback="reader-model", reply=RuntimeError("上游 429"))
+        agent._attach_media()
+        self.assertIn("不接受图片输入", media.text_of(agent.messages[-1]["content"]))
+
+    def test_empty_caption_falls_back(self):
+        agent = self.build(fallback="reader-model", reply=_Reply("   "))
+        agent._attach_media()
+        self.assertIn("不接受图片输入", media.text_of(agent.messages[-1]["content"]))
+
+    def test_caption_is_billed(self):
+        agent = self.build(fallback="reader-model")
+        agent._attach_media()
+        self.assertEqual(agent.usage.by_model["reader/reader-model"].prompt_tokens, 11)
+        self.assertEqual(agent.usage.by_model["reader/reader-model"].calls, 1)
+
+    #  —— 不该触发的时候别触发 ——
+
+    def test_vision_model_still_gets_the_real_image(self):
+        agent = self.build(vision=("*",), fallback="reader-model")
+        agent._attach_media()
+        self.assertEqual(len(media.images_of(agent.messages[-1]["content"])), 1)
+        self.assertEqual(self.reader.requests, [])
+
+    def test_unconfigured_is_a_no_op(self):
+        agent = self.build()
+        self.assertEqual(agent.caption_images([media.image_part("x")]), ("", ""))
+        self.assertEqual(agent.vision_note(), "")
+
+    def test_note_tells_whether_it_will_fire(self):
+        self.assertIn("会先转成文字", self.build(fallback="reader-model").vision_note())
+        self.assertIn("不会触发", self.build(vision=("*",), fallback="reader-model").vision_note())
+        self.assertIn("用不了", self.build(fallback="blind-model").vision_note())
+
+    def test_instruction_gives_no_escape_hatch(self):
+        """vision_probe 的第四条纪律：给模型"看不到就明说"的出口 = 给假阴性开门。
+
+        代读指令走的是同一条链路，同一个坑——加了那半句，部分型号会 100%
+        自称看不见，代读整个功能静默失效。
+        """
+        from xiaoyu.agent import VISION_READ_GUIDE, VISION_READ_INSTRUCTION
+
+        for text in (VISION_READ_INSTRUCTION, VISION_READ_GUIDE):
+            for hatch in ("看不到", "看不见", "无法看到", "如果你不能"):
+                self.assertNotIn(hatch, text)
+        #  要的是转写不是评价：产物是主模型的眼睛
+        self.assertIn("逐字照抄", VISION_READ_INSTRUCTION)
+
+    #  —— ACP 面：协议面没有"扣住图等重发"的交互，代读在这里比 TUI 值钱 ——
+
+    def acp_degrade(self, agent, text="这个报错怎么回事"):
+        from types import SimpleNamespace
+
+        from xiaoyu.acp import _degrade_images
+
+        ref = media.store(PNG, "image/png")
+        content = [media.text_part(text), media.image_part(ref)]
+        session = SimpleNamespace(agent=agent, sink=agent.sink)
+        return _degrade_images(session, content)
+
+    def test_acp_attached_images_become_text(self):
+        agent = self.build(fallback="reader-model")
+        result = self.acp_degrade(agent)
+        self.assertIsInstance(result, str)
+        self.assertIn("这个报错怎么回事", result)
+        self.assertIn("图片 1：一行报错", result)
+        prompt = media.text_of(self.reader.requests[0]["messages"][0]["content"])
+        self.assertIn("这个报错怎么回事", prompt)
+
+    def test_acp_without_reader_keeps_the_note(self):
+        agent = self.build()
+        result = self.acp_degrade(agent)
+        self.assertIn("不接受图片输入", result)
+
+    def test_acp_vision_model_keeps_the_parts_untouched(self):
+        agent = self.build(vision=("*",), fallback="reader-model")
+        result = self.acp_degrade(agent)
+        self.assertEqual(len(media.images_of(result)), 1)

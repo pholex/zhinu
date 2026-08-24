@@ -904,6 +904,7 @@ class ChenshuRuntime:
                 model=self.config.model,
                 summary_model=self.config.summary_model,
                 explore_model=self.config.explore_model,
+                vision_fallback_model=self.config.vision_fallback_model,
                 workspace=workdir,
                 max_iterations=_WORKER_ITERATIONS,
                 max_tool_output=self.config.max_tool_output,

@@ -379,6 +379,24 @@ class Registry:
             provider = next((p for p in self.providers if p.accepts(model)), None)
         return provider is not None and provider.sees_images(model)
 
+    def vision_reader(self, name: str) -> Route | None:
+        """代读路由：名字解析得出、**且它自己收得下图**，才给；否则 None。
+
+        第二个条件不是多余的——代读模型配错（写成 deepseek-v4-flash 这种不收图的）
+        的症状是每张图都换来一次 400 或一句"无法确定"，而调用方本来就是在处理
+        "看不了图"这条降级路径，再炸一次毫无价值。校验直接复用 sees_images 的
+        fail-closed：未声明即不能看图，网关上的视觉模型仍用 XIAOYU_VISION_MODELS 点名。
+        """
+        name = name.strip()
+        if not name:
+            return None
+        if not self.sees_images(name):
+            return None
+        try:
+            return self.resolve(name)
+        except UnknownModel:
+            return None
+
     def sticky_name(self, route: Route) -> str:
         """粘性降级写回 config.model 用：能用裸名表达就用裸名，否则用全限定名。
 

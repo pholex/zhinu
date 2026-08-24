@@ -533,10 +533,38 @@ class TestTuiFrontend(AgentTestCase):
             [providers.Provider("p", "", "", ("m-blind",), "直连")],
             clients={"p": mock.MagicMock()},
         )
+        #  没配代读模型（XIAOYU_VISION_FALLBACK）：caption_images 给空串
+        tui.agent.caption_images.return_value = ("", "")
         chip = tui._take_image(PNG_BYTES)
         content = tui._content_of(f"看看 {chip}")
         self.assertEqual(content, f"看看 {chip}", "降级成纯文本，不静默塞图")
         #  引用仍在表里：/model 换完模型 Esc-Esc 取回上一条即可重发
+        self.assertEqual(len(tui._images), 1)
+
+    def test_image_chip_captioned_for_blind_model_when_reader_configured(self) -> None:
+        """配了代读模型：图换成文字随本条一起发，chip 与提示都还在。
+
+        提示照打是刻意的——代读有损，"凑合看懂"和"真看见了"必须让用户分得清，
+        而原图始终只有 /model 换视觉模型这一条路。
+        """
+        from xiaoyu import media, providers
+
+        tui = self.make_tui()
+        tui.agent = mock.Mock()
+        tui.agent.config.model = "m-blind"
+        tui.agent.registry = providers.Registry(
+            [providers.Provider("p", "", "", ("m-blind",), "直连")],
+            clients={"p": mock.MagicMock()},
+        )
+        tui.agent.caption_images.return_value = ("[图片代读 · 1 张]\n一行报错", "  已代读")
+        chip = tui._take_image(PNG_BYTES)
+        content = tui._content_of(f"看看 {chip}")
+        self.assertIsInstance(content, str, "代读产物是文本，图片部件不入历史")
+        self.assertIn(chip, content, "chip 原文保留：指代关系不能丢")
+        self.assertIn("一行报错", content)
+        self.assertEqual(media.images_of(content), [])
+        #  取景框是用户这一行原话
+        self.assertIn(chip, tui.agent.caption_images.call_args.kwargs["guide"])
         self.assertEqual(len(tui._images), 1)
 
     def test_bad_image_rejected_with_reason(self) -> None:
