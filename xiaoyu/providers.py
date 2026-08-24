@@ -76,11 +76,13 @@ class Preset:
 #  每个在册型号的协议选边 / vision / reasoning 回传都要有实测数字，500 家的
 #  everything connector 做不到这一点，这正是"内置"二字的含金量。
 #
-#  ⚠️ `vision_models` 同样只写实测过的（`experiments/vision_probe.py`，2026-08-12
-#  跑过全部 11 个内置型号）。判据是**绿、紫两张纯色图都答对**：不看 HTTP 200
-#  （deepseek-v4-flash 会 200 收下再说"无法确定"），不用红色（蒙也蒙得中），
-#  **更不能在提示词里给"看不到就明说"的逃生舱**——那半句让 claude 两个型号
-#  100% 自称看不见，第一版据此把 anthropic 错记成"不收图"。补新型号照跑一遍。
+#  ⚠️ `vision_models` 同样只写实测过的（`experiments/vision_probe.py`）。判据
+#  2026-08-24 起为**单图四象限（绿/紫/蓝/橙）四色全中**（旧判据是绿、紫两张
+#  纯色图两轮全对，当日按新判法全量复跑 12 个在册型号，结论与旧表一致）：
+#  不看 HTTP 200（deepseek-v4-flash 会 200 收下再自称看不见），不用红色
+#  （蒙也蒙得中），**更不能在提示词里给"看不到就明说"的逃生舱**——那半句让
+#  claude 两个型号 100% 自称看不见，第一版据此把 anthropic 错记成"不收图"。
+#  补新型号照跑一遍。
 PRESETS: dict[str, Preset] = {
     "deepseek": Preset(
         name="deepseek",
