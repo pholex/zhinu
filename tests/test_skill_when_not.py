@@ -60,7 +60,7 @@ class SkillsDirOverrideTest(unittest.TestCase):
     def test_override_replaces_default_dirs(self):
         with mock.patch.dict(os.environ, {"XIAOYU_SKILLS_DIR": "/a" + os.pathsep + "/b"}):
             dirs = skills.skill_dirs()
-        self.assertEqual([str(d) for d in dirs], ["/a", "/b"])
+        self.assertEqual(list(dirs), [Path("/a"), Path("/b")])
 
     def test_no_override_uses_defaults(self):
         with mock.patch.dict(os.environ, {}, clear=False):
