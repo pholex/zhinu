@@ -91,6 +91,14 @@ def sources_fingerprint() -> tuple:
 #  frontmatter 顶层键的允许集：agent-skills 规范的五个 + 各家生态里已在用的几个。
 #  拼错的键（descripton:）以前被静默吃掉——技能带着空描述进索引，模型永远
 #  选不中它，而用户看不到任何线索。
+#
+#  ⚠️ 这张表是**笔误比对的基准，不是准入白名单**（2026-08-24 收窄）。第一版把
+#  "不在表里"直接当问题报，于是别家生态的合法键——kdocs 官方技能的 `homepage:`、
+#  agent-skills 的 `dependencies:`——每次启动各报一行。那些技能是 `npx skills`
+#  装的第三方件，用户改了下次 update 就被覆盖，**噪音无法从源头消除**；而这条
+#  检查真正要抓的"拼错 description"，另有独立的缺描述检查兜着。
+#  现在只报**长得像已知键的笔误**（见 _typo_of），彻底陌生的键静默放行：
+#  技能生态里各家自带私有键是常态，我们没有资格也没有必要给它们评判。
 FRONTMATTER_KEYS = frozenset(
     {
         "name",
@@ -109,13 +117,67 @@ FRONTMATTER_KEYS = frozenset(
 )
 
 
+def _edit_distance(left: str, right: str) -> int:
+    """Damerau-Levenshtein（相邻两字符换位算**一步**）。
+
+    换位是最常见的手滑（`nmae` / `descrpition`），按普通 Levenshtein 算成两步
+    会让它们恰好落在阈值外——正是最该抓的那一类漏网。键都是十几个字符，
+    全量 DP 的开销可以忽略。
+    """
+    previous_2: list[int] = []
+    previous = list(range(len(right) + 1))
+    for i, left_char in enumerate(left, start=1):
+        current = [i] + [0] * len(right)
+        for j, right_char in enumerate(right, start=1):
+            cost = 0 if left_char == right_char else 1
+            current[j] = min(
+                previous[j] + 1,  # 删
+                current[j - 1] + 1,  # 增
+                previous[j - 1] + cost,  # 改
+            )
+            if i > 1 and j > 1 and left_char == right[j - 2] and left[i - 2] == right_char:
+                current[j] = min(current[j], previous_2[j - 2] + cost)  # 换位
+        previous_2, previous = previous, current
+    return previous[len(right)]
+
+
+def _typo_of(key: str) -> str:
+    """这个键像不像某个已知键的笔误：像就返回那个已知键，否则空串。
+
+    阈值按长度收紧（短键 1、长键 2）：`date` 与 `name` 只差 2，按统一阈值会把
+    一个常见的私有键报成 `name` 拼错——**误报比漏报贵得多**，因为用户对第三方
+    技能里的键无能为力，只能每次启动看着它。大小写不同也算笔误（YAML 区分
+    大小写，`Description:` 与拼错等效）。
+    """
+    lowered = key.lower()
+    budget = 1 if len(lowered) <= 5 else 2
+    best, best_distance = "", budget + 1
+    for known in sorted(FRONTMATTER_KEYS):
+        #  长度差就已经超预算的，不可能在阈值内
+        if abs(len(known) - len(lowered)) > budget:
+            continue
+        distance = _edit_distance(lowered, known)
+        if distance < best_distance:
+            best, best_distance = known, distance
+    return best
+
+
 def frontmatter_problems(meta: dict[str, str]) -> list[str]:
-    """frontmatter 的问题清单（空列表=没问题）。未知键回显允许集，便于对照改。"""
+    """frontmatter 的问题清单（空列表=没问题）。
+
+    只报**疑似拼错**的键（连带给出正确拼法，比回显整张允许集更可行动），
+    陌生但不像笔误的键静默放行——理由见 FRONTMATTER_KEYS 上方。
+    """
     problems: list[str] = []
-    unknown = sorted(key for key in meta if key not in FRONTMATTER_KEYS)
-    if unknown:
+    typos = [
+        (key, known)
+        for key in sorted(meta)
+        if key not in FRONTMATTER_KEYS and (known := _typo_of(key))
+    ]
+    if typos:
         problems.append(
-            f"未知的 frontmatter 键 {', '.join(unknown)}（允许：{', '.join(sorted(FRONTMATTER_KEYS))}）"
+            "疑似拼错的 frontmatter 键："
+            + "、".join(f"{key} → 是不是 {known}？" for key, known in typos)
         )
     if not meta.get("description", "").strip():
         problems.append("缺少 description")
@@ -191,8 +253,9 @@ def scan_skills() -> list[Skill]:
                 name = f"{source.plugin}{NAMESPACE_SEP}{name}"
             problems = frontmatter_problems(meta)
             if problems:
-                #  未知键 + 没描述 = 多半是拼错了 description：这样的技能进了
-                #  索引也永远选不中，跳过并说明原因；只是多了个生僻键则照常加载。
+                #  疑似笔误 + 没描述 = 多半就是把 description 拼错了：这样的技能
+                #  进了索引也永远选不中，跳过并说明原因；只是某个键拼歪了、描述
+                #  仍在，则照常加载。彻底陌生的键连问题都不算，走不到这里。
                 skip = len(problems) > 1
                 print(
                     f"[技能 {name!r}{'跳过' if skip else ''}：{'；'.join(problems)}（{skill_md}）]",

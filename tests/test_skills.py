@@ -72,13 +72,46 @@ class FrontmatterTest(unittest.TestCase):
     def test_unclosed_frontmatter_returns_empty(self):
         self.assertEqual(skills.parse_frontmatter("---\nname: x\n没有闭合"), {})
 
-    def test_unknown_keys_reported_with_allowed_set(self):
+    def test_typo_keys_reported_with_the_intended_spelling(self):
         problems = skills.frontmatter_problems({"name": "x", "descripton": "拼错了"})
         self.assertEqual(len(problems), 2)
         self.assertIn("descripton", problems[0])
-        self.assertIn("description", problems[0])  # 回显允许集
+        self.assertIn("description", problems[0])  # 指出正确拼法
         self.assertIn("缺少 description", problems[1])
         self.assertEqual(skills.frontmatter_problems({"name": "x", "description": "ok", "version": "1"}), [])
+
+    def test_foreign_keys_are_silent(self):
+        """回归钉子：别家生态的合法键不是问题。
+
+        第一版把"不在允许集"直接当问题报，于是 kdocs 官方技能的 homepage: 与
+        agent-skills 的 dependencies: 每次启动各刷一行——而那些是 npx skills
+        装的第三方件，用户改了下次 update 就被覆盖，噪音无从消除。
+        """
+        for foreign in ("homepage", "dependencies", "author", "category", "date", "tags", "icon"):
+            with self.subTest(key=foreign):
+                self.assertEqual(
+                    skills.frontmatter_problems({"name": "x", "description": "ok", foreign: "v"}),
+                    [],
+                )
+
+    def test_typos_still_caught_including_transpositions(self):
+        for typo, intended in (
+            ("descripton", "description"),
+            ("descrpition", "description"),  # 换位：按普通编辑距离算两步就漏了
+            ("Description", "description"),  # YAML 区分大小写，等效于拼错
+            ("nmae", "name"),
+            ("verison", "version"),
+            ("allowed-tool", "allowed-tools"),
+        ):
+            with self.subTest(typo=typo):
+                self.assertEqual(skills._typo_of(typo), intended)
+
+    def test_short_foreign_keys_are_not_forced_onto_known_ones(self):
+        """短键容易撞脸（date 与 name 只差 2）——误报比漏报贵：用户对第三方
+        技能里的键无能为力，只能每次启动看着它。"""
+        for foreign in ("date", "tags", "path", "kind"):
+            with self.subTest(key=foreign):
+                self.assertEqual(skills._typo_of(foreign), "")
 
     def test_strip_frontmatter(self):
         text = "---\nname: x\n---\n\n# 标题\n内容"
@@ -156,10 +189,11 @@ class ScanTest(unittest.TestCase):
         with contextlib.redirect_stderr(err):
             names = {skill.name for skill in skills.scan_skills()}
         self.assertNotIn("typo", names)
-        self.assertIn("rare", names)  # 只是多了个生僻键，照常加载
+        self.assertIn("rare", names)  # 只是多了个生僻键，照常加载且不出声
         self.assertIn("descripton", err.getvalue())
-        self.assertIn("允许", err.getvalue())
-        self.assertIn("foo", err.getvalue())
+        self.assertIn("description", err.getvalue())  # 指出正确拼法
+        #  生僻键既不影响加载，也不该刷一行——第三方技能里的私有键是常态
+        self.assertNotIn("foo", err.getvalue())
 
     def test_index_report_and_user_warning(self):
         found = self._write_bulk(20, description_chars=300)
