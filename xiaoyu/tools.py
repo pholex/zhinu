@@ -179,14 +179,19 @@ def non_inheritable_env_names() -> frozenset[str]:
     serve 令牌。这些是"小羽调模型用的"，模型跑的命令没有任何正当理由需要
     它们——而 `env | grep KEY` 是最省事的外泄方式。
     名单从 providers.PRESETS 推导而不是手抄：新增 provider 自动纳入。
+    例外同样从 PRESETS 推导：声明为 shared_key_envs 的多产品通用名
+    （如 GOOGLE_API_KEY）"没有任何正当理由"不成立——gcloud 一类无关命令
+    正当地需要它，剥了是误伤，故不进名单。
     """
     from .config import GATEWAY_KEY_ENVS
     from .providers import PRESETS
 
     names = set(GATEWAY_KEY_ENVS) | {"XIAOYU_SERVE_TOKEN"}
+    shared: set[str] = set()
     for preset in PRESETS.values():
         names.update(preset.key_envs)
-    return frozenset(name.upper() for name in names)
+        shared.update(preset.shared_key_envs)
+    return frozenset(name.upper() for name in names) - {name.upper() for name in shared}
 
 
 def _hardened_env(extra: dict[str, str] | None = None) -> dict[str, str]:
