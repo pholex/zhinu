@@ -1,5 +1,9 @@
 """供宿主进程把 xiaoyu 当库嵌入使用的官方入口（「库层嵌入 SDK 化」）。
 
+公开面清单、稳定性承诺（semver + 弃用期）与可交付的示例见 docs/embedding.md；
+宿主应从顶层 `import xiaoyu` 取这些名字，而不是吃 `xiaoyu.embedding` /
+`xiaoyu.agent` 的模块路径。
+
 这不是新架构——`Agent` 本来就是可以被反复 `send()`、可注入 `approver`/`sink`、
 跨轮保留 `messages` 的库对象（`tests/test_embedding_smoke.py` 已验证）。这个模块
 补的是最后一块：`Agent` 核心循环是同步的，宿主如果自己跑在 asyncio 事件循环里

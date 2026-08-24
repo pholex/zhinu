@@ -12,7 +12,7 @@
 | 你是谁 | 用哪张脸 | 入口 | 文档 |
 |---|---|---|---|
 | **脚本 / CI / 定时任务**：跑一次、拿结果、退出 | 一次性执行 | `xy "…" --output-format json [--output-schema …]` | [README](../README.md#用) |
-| **Python 进程**：agent 跑在你的进程里，自己管生命周期 | 嵌入 SDK | `xiaoyu.embedding.AsyncAgent`（`send` / `stream` / `interrupt` / `steer` / `restore`） | [embedding.py](../xiaoyu/embedding.py) 模块 docstring |
+| **Python 进程**：agent 跑在你的进程里，自己管生命周期 | 嵌入 SDK | `import xiaoyu` → `AsyncAgent`（`send` / `stream` / `interrupt` / `steer` / `restore`） | [embedding.md](embedding.md)（公开面清单与稳定性承诺） |
 | **别的语言 / 别的进程 / 编排器**（n8n、Dify、LangChain、自研平台） | 服务 | `xiaoyu serve`：REST + `/mcp` | [http-api.md](http-api.md) · [mcp-server.md](mcp-server.md) |
 | **编辑器 / IDE** | ACP | `xiaoyu --acp`（stdio JSON-RPC） | [acp-registry/](acp-registry/) |
 
