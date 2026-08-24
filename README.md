@@ -121,7 +121,7 @@ auto 档**放行的依据是沙箱，不是信任**——沙箱不可用时自�
 - **多 agent 织造**：声明式 subagent（`agents/*.toml` 放一个文件就多一个可委托的子 agent，带 worktree 隔离与 resume 续跑）；**七襄·并行织造模式**（Qixiang · Parallel-Weave）——召集多名织手横向并行，一个模板 + N 份材料扇出，按输入顺序聚合成带续跑句柄的 report；**斗巧·竞争织造模式**（Douqiao · Contest-Weave）——多名织手互不相通地独立完成同一任务（`models` 参数可让不同厂商模型各织一匹），判官比对择优，以 N 倍投入换质量上限；**宸枢·统筹织造模式**（Chenshu · Sovereign-Weave）——总枢坐镇规划、分派、监督、汇总，大工程拆成 scope 互不重叠的 mission，worker 在独立分支 worktree 里并行推进，评审过闸后合回主干。见 [docs/multi-agent.md](docs/multi-agent.md)
 - **多会话并行**：一个终端跑长任务，另一个终端 `xiaoyu send <会话名> "..."` 递话，对方在下个步骤边界收进上下文；模型自己也会用——直接说"看看还有哪些会话""让 api-1 帮我查一下"，发信前问你一次
 - **可平台化**：三张脸（一次性执行 / 嵌入 SDK / `serve`）共用同一套事件流、审批回路、`output_schema` 结构化收尾与边界；宿主把业务动作包成 MCP server 挂到 agent 对象上，审批走宿主自己的 UI——选型与样本见 [docs/platform.md](docs/platform.md)、[examples/ops-console](examples/ops-console/)
-- **可嵌入**：`xiaoyu.embedding` 的 `AsyncAgent` 把 agent 当执行引擎嵌进你自己的进程（异步审批、事件流、会话复用）；跨语言用 `--wire` 的 stdio JSON-RPC
+- **可嵌入**：`import xiaoyu` 顶层导出即公开 API（`Agent` / `AsyncAgent` / `Allow` / `Deny` / 事件类型……，按 semver 维护、破坏性变更走弃用期），把 agent 当执行引擎嵌进你自己的进程（异步审批、事件流、会话复用）；跨语言用 `--wire` 的 stdio JSON-RPC——契约与示例见 [docs/embedding.md](docs/embedding.md)
 - **可编排**：`xiaoyu serve` 起 HTTP API，n8n / Dify / 自研调度直接驱动（异步提交 + 状态轮询 + 事件游标，需要放行的工具调用挂起等 HTTP 回决定）。OpenAPI schema 由代码生成，贴给 Dify 自定义工具即用——见 [docs/http-api.md](docs/http-api.md)。同一服务还在 `/mcp` 挂着 **agent 级 MCP server**（`xiaoyu` / `xiaoyu_reply` / `xiaoyu_close` 三工具，streamable HTTP），LangChain / LangGraph 经官方 `langchain-mcp-adapters` 即插即用，其它 MCP client 同理——见 [docs/mcp-server.md](docs/mcp-server.md)
 - **浏览器**：推荐挂 chrome-devtools MCP；内置 `[browser]` 是纯 pip 的兜底，`playwright install chromium` 后即用
 
