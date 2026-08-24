@@ -536,13 +536,27 @@ def _degrade_images(
     但协议面没有"扣住图等重发"的交互：改成明确告诉两边——模型收到
     "有图被省略"的说明（它据此可以请用户换模型），用户在 thought 轨道
     看到原因。切到视觉模型（下拉框就能切）后重发即可。
+
+    配了代读模型（XIAOYU_VISION_FALLBACK）时先把图换成文字随本条一起发。
+    正因为协议面没有"扣住图等重发"，这里的代读比 TUI 那边值钱：宿主重发一条
+    带图消息的成本高得多。
     """
     if not isinstance(content, list):
         return content
     agent = session.agent
-    count = len(media.images_of(content))
+    images = media.images_of(content)
+    count = len(images)
     if not count or agent.registry.sees_images(agent.config.model):
         return content
+    text_only = "".join(
+        str(part.get("text") or "")
+        for part in content
+        if isinstance(part, dict) and part.get("type") == media.TEXT_PART
+    )
+    block, notice = agent.caption_images(images, guide=text_only)
+    if block:
+        session.sink.emit(Notice(f"[消息附带 {count} 张图片]{notice}", "warn"))
+        return f"{text_only}\n\n{block}" if text_only.strip() else block
     session.sink.emit(
         Notice(
             f"[消息附带 {count} 张图片，当前模型 {agent.config.model} 看不了，"
@@ -551,17 +565,12 @@ def _degrade_images(
             "warn",
         )
     )
-    text = "".join(
-        str(part.get("text") or "")
-        for part in content
-        if isinstance(part, dict) and part.get("type") == media.TEXT_PART
-    )
     note = (
         f"[用户随消息附了 {count} 张图片，但当前模型 {agent.config.model} "
         "不接受图片输入，已省略。若图片是完成任务的关键，请告知用户换用"
         "支持视觉的模型后重发。]"
     )
-    return f"{text}\n\n{note}" if text.strip() else note
+    return f"{text_only}\n\n{note}" if text_only.strip() else note
 
 
 class AcpSink:

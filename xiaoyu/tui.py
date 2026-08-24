@@ -1308,7 +1308,10 @@ class Tui:
         "这两张图哪个更好"如果只剩两张裸图，指代关系就丢了。
 
         当前模型看不了图时不静默丢弃，也不改文本：告诉用户换模型，图片留在
-        chip 表里，切完 /model 重发即可（Esc-Esc 就能取回上一条）。
+        chip 表里，切完 /model 重发即可（Esc-Esc 就能取回上一条）。配了代读模型
+        （XIAOYU_VISION_FALLBACK）则先把图换成文字随本条一起发——**但提示照打**：
+        代读是有损的，"能凑合看懂"和"真看见了"必须让用户分得清，而原图始终只有
+        `/model` 换视觉模型这一条路。
         """
         refs = [
             self._images[int(match.group(1))]
@@ -1319,7 +1322,14 @@ class Tui:
             return text
         agent = self.agent
         model = agent.config.model if agent is not None else ""
+        parts = [media.image_part(ref) for ref in refs]
         if agent is not None and not agent.registry.sees_images(model):
+            #  代读要发一次网络请求，但这里已经在提交之后（全同步 REPL，
+            #  紧接着就是 agent.send 阻塞整轮），不额外卡住任何输入循环
+            block, notice = agent.caption_images(parts, guide=text)
+            if block:
+                self.console.print(Text(notice, style="status.warning"))
+                return f"{text}\n\n{block}"
             self.console.print(
                 Text(
                     f"  当前模型 {model} 不接受图片输入，这条只发文字。"
@@ -1328,7 +1338,7 @@ class Tui:
                 )
             )
             return text
-        return [media.text_part(text), *(media.image_part(ref) for ref in refs)]
+        return [media.text_part(text), *parts]
 
     def _tab_complete(self, buffer: Any) -> None:
         """Tab 先补到所有候选的最长公共前缀、再按才轮换（readline 直觉）。
