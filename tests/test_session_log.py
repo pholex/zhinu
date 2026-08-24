@@ -18,6 +18,7 @@ from xiaoyu.session_log import (
     load_messages,
     open_named,
     sessions_dir,
+    usage_digest,
 )
 
 
@@ -137,6 +138,131 @@ class SessionLogTest(SessionDirTestCase):
         lines = self.read_lines(log)
         self.assertEqual(lines[1]["content"], "任务")
         self.assertEqual(lines[2]["event"], "clear")
+
+
+class UsageDigestTest(SessionDirTestCase):
+    """`xiaoyu sessions digest` 的地基：跨会话聚合轮末 usage 快照。"""
+
+    def make_log(self, name: str, workspace: str) -> SessionLog:
+        """手动指定文件名建会话文件（create 的时间戳到秒，同秒同 pid 会撞名）。"""
+        path = sessions_dir() / name
+        log = SessionLog(path)
+        log.event(
+            "meta", format=SESSION_FORMAT, model="m", workspace=workspace,
+            started_at="2026-08-24T00:00:00",
+        )
+        return log
+
+    @staticmethod
+    def usage_event(log: SessionLog, **models: tuple[int, int, int]) -> None:
+        log.event(
+            "usage",
+            turns=sum(calls for calls, _, _ in models.values()),
+            prompt_tokens=sum(p for _, p, _ in models.values()),
+            completion_tokens=sum(c for _, _, c in models.values()),
+            by_model={
+                model: {"calls": calls, "prompt_tokens": p, "completion_tokens": c}
+                for model, (calls, p, c) in models.items()
+            },
+        )
+
+    def test_last_snapshot_wins_and_workspaces_aggregate(self):
+        """快照是累计值：每文件只算最后一条；同工作区跨文件求和。"""
+        a1 = self.make_log("a1.jsonl", "/ws/a")
+        self.usage_event(a1, **{"p/m1": (1, 100, 10)})
+        self.usage_event(a1, **{"p/m1": (3, 300, 30)})  # 累计快照，覆盖前一条
+        a2 = self.make_log("a2.jsonl", "/ws/a")
+        self.usage_event(a2, **{"p/m1": (1, 50, 5), "p/m2": (2, 200, 20)})
+        b = self.make_log("b.jsonl", "/ws/b")
+        self.usage_event(b, **{"p/m1": (1, 7, 3)})
+        digest = usage_digest()
+        self.assertEqual(set(digest.by_workspace), {"/ws/a", "/ws/b"})
+        ws_a = digest.by_workspace["/ws/a"]
+        self.assertEqual(ws_a.sessions, 2)
+        self.assertEqual(ws_a.by_model["p/m1"], [4, 350, 35])
+        self.assertEqual(ws_a.by_model["p/m2"], [2, 200, 20])
+        self.assertEqual(ws_a.prompt_tokens, 550)
+        self.assertEqual(ws_a.completion_tokens, 55)
+        self.assertEqual(digest.no_usage, 0)
+        self.assertEqual(digest.corrupt, 0)
+
+    def test_files_without_usage_are_counted_not_silenced(self):
+        self.make_log("old.jsonl", "/ws/a")  # 只有 meta：旧版本记录/零调用
+        digest = usage_digest()
+        self.assertEqual(digest.no_usage, 1)
+        self.assertEqual(digest.by_workspace, {})
+
+    def test_truncated_usage_line_is_counted(self):
+        """断电截断的 usage 半行：跳过且计数，绝不静默。"""
+        log = self.make_log("t.jsonl", "/ws/a")
+        self.usage_event(log, **{"p/m1": (1, 100, 10)})
+        with log.path.open("a", encoding="utf-8") as handle:
+            handle.write('{"ts": "x", "event": "usage", "turns": 2, "prompt_to')
+        digest = usage_digest()
+        self.assertEqual(digest.corrupt, 1)
+        #  完整的那条照常入账
+        self.assertEqual(digest.by_workspace["/ws/a"].by_model["p/m1"], [1, 100, 10])
+
+    def test_workspace_filter_uses_meta(self):
+        a = self.make_log("a.jsonl", "/ws/a")
+        self.usage_event(a, **{"p/m1": (1, 100, 10)})
+        b = self.make_log("b.jsonl", "/ws/b")
+        self.usage_event(b, **{"p/m1": (1, 7, 3)})
+        digest = usage_digest(workspace="/ws/a")
+        self.assertEqual(set(digest.by_workspace), {"/ws/a"})
+
+    def test_usage_event_is_ignored_on_replay(self):
+        """resume 重放不认识 usage 事件——照常跳过，不进历史。"""
+        log = self.make_log("r.jsonl", "/ws/a")
+        log.append({"role": "user", "content": "hi"})
+        self.usage_event(log, **{"p/m1": (1, 100, 10)})
+        messages = load_messages(log.path)
+        self.assertEqual([m["role"] for m in messages], ["user"])
+
+    def test_agent_logs_cumulative_snapshot_only_on_change(self):
+        """轮末落累计快照；用量没变的轮不重复写。"""
+        from xiaoyu.agent import Agent
+        from xiaoyu.config import Config
+        from xiaoyu.providers import Registry
+
+        config = Config(base_url="http://unused", model="m", workspace=Path.cwd())
+        config.enable_explore = False
+        config.enable_skills = False
+        log = SessionLog.create("m", "/ws")
+        agent = Agent(config, registry=Registry.for_client(object()), session_log=log)
+        agent._log_usage()  # 零调用：不写
+        agent.usage.add("p/m1", 100, 10)
+        agent._log_usage()
+        agent._log_usage()  # 没变：不重复写
+        agent.usage.add("p/m1", 50, 5)
+        agent._log_usage()
+        events = [line for line in self.read_lines(log) if line.get("event") == "usage"]
+        self.assertEqual(len(events), 2)
+        self.assertEqual(events[0]["by_model"]["p/m1"]["prompt_tokens"], 100)
+        self.assertEqual(events[1]["by_model"]["p/m1"]["prompt_tokens"], 150)  # 累计
+
+    def test_send_snapshots_usage_even_when_turn_dies(self):
+        """接线在 send() 的 finally：异常轮已烧掉的 token 也入账。"""
+        from xiaoyu.agent import Agent
+        from xiaoyu.config import Config
+        from xiaoyu.providers import Registry
+
+        config = Config(base_url="http://unused", model="m", workspace=Path.cwd())
+        config.enable_explore = False
+        config.enable_skills = False
+        log = SessionLog.create("m", "/ws")
+        agent = Agent(config, registry=Registry.for_client(object()), session_log=log)
+
+        def dying_turn(user_input):
+            agent.usage.add("p/m1", 100, 10)
+            raise RuntimeError("boom")
+
+        agent._turn = dying_turn
+        with self.assertRaises(RuntimeError):
+            agent.send("hi")
+        events = [line for line in self.read_lines(log) if line.get("event") == "usage"]
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0]["prompt_tokens"], 100)
 
 
 class ResumeTest(SessionDirTestCase):

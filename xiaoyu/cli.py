@@ -29,6 +29,7 @@ from .session_log import (
     load_messages,
     open_named,
     turn_starts,
+    usage_digest,
 )
 from .config import (
     DEFAULT_MODEL,
@@ -86,7 +87,7 @@ def build_parser() -> argparse.ArgumentParser:
         epilog=(
             "子命令：xiaoyu config  初始化/查看配置（详见 xiaoyu config --help）；"
             "xiaoyu resume  恢复历史会话（详见 xiaoyu resume --help）；"
-            "xiaoyu sessions  列出本机在跑的会话；"
+            "xiaoyu sessions  列出本机在跑的会话（sessions digest 汇总 token 用量）；"
             "xiaoyu send <会话> <消息>  给另一个会话发一条消息；"
             "xiaoyu mcp add|list|remove  管理 MCP server 声明（详见 xiaoyu mcp --help）；"
             "xiaoyu plugin add|list|update|remove  装卸插件包（skills + MCP，"
@@ -677,10 +678,16 @@ def sessions_command(argv: list[str]) -> int:
 
     一行一个、`·` 分隔（不排表格：inline TUI 的
     调性是紧凑）。列的是**可寻址性**——名字就是地址，`[ref]` 只在重名时才用得上。
+    `xiaoyu sessions digest` 是历史维度：跨会话的 token 用量账本。
     """
+    if argv and argv[0] == "digest":
+        return sessions_digest_command(argv[1:])
     parser = argparse.ArgumentParser(
         prog="xiaoyu sessions",
-        description="列出本机在跑的小羽会话（可作为 `xiaoyu send` 的收件人）。",
+        description=(
+            "列出本机在跑的小羽会话（可作为 `xiaoyu send` 的收件人）。"
+            "`xiaoyu sessions digest` 汇总历史会话的 token 用量。"
+        ),
     )
     parser.parse_args(argv)
     live = peers.list_peers()
@@ -700,6 +707,61 @@ def sessions_command(argv: list[str]) -> int:
             fields.append("本会话")
         head = f"  {ui.accent(peer.name)} {ui.secondary('[' + peer.ref + ']')}"
         print(head + ui.secondary("  ·  " + "  ·  ".join(fields)))
+    return 0
+
+
+def sessions_digest_command(argv: list[str]) -> int:
+    """`xiaoyu sessions digest`：跨会话的 token 用量账本，按工作区聚合。
+
+    回答"配额花在哪个项目、哪个模型上"。数据源是会话文件里轮末落盘的
+    累计 usage 快照——没有快照的文件（旧版本记录 / 零调用）与跳过的损坏行
+    都如实报数，不静默：沉默会暗示"全都算进来了"。
+    """
+    parser = argparse.ArgumentParser(
+        prog="xiaoyu sessions digest",
+        description="汇总历史会话的 token 用量（按工作区 × 模型）。",
+    )
+    parser.add_argument("--workspace", help="只看这个工作区（默认全部）")
+    args = parser.parse_args(argv)
+    digest = usage_digest(workspace=args.workspace)
+    ranked = sorted(
+        digest.by_workspace.items(),
+        key=lambda item: item[1].prompt_tokens + item[1].completion_tokens,
+        reverse=True,
+    )
+    if not ranked:
+        print(ui.secondary("没有带用量记录的历史会话。"))
+    else:
+        total_sessions = sum(entry.sessions for _, entry in ranked)
+        total_in = sum(entry.prompt_tokens for _, entry in ranked)
+        total_out = sum(entry.completion_tokens for _, entry in ranked)
+        print(ui.heading(
+            f"用量账本（{total_sessions} 个会话 · "
+            f"in {total_in:,} tok / out {total_out:,} tok）："
+        ))
+        for workspace, entry in ranked:
+            print(
+                f"  {ui.accent(shorten_home(workspace) or '（未知工作区）')}"
+                + ui.secondary(
+                    f"  ·  {entry.sessions} 会话"
+                    f"  ·  in {entry.prompt_tokens:,} / out {entry.completion_tokens:,}"
+                )
+            )
+            models = sorted(
+                entry.by_model.items(), key=lambda item: item[1][1] + item[1][2], reverse=True
+            )
+            for model, (calls, prompt, completion) in models:
+                print(ui.secondary(
+                    f"    {model}: {calls} 次 · in {prompt:,} / out {completion:,}"
+                ))
+    #  诚实行：观察不到的部分要说出来
+    notes = []
+    if digest.no_usage:
+        notes.append(f"{digest.no_usage} 个会话文件无用量记录（旧版本记录或未产生调用）")
+    if digest.corrupt:
+        notes.append(f"跳过 {digest.corrupt} 行疑似损坏的用量记录")
+    if notes:
+        print(ui.secondary("  （" + "；".join(notes) + "）"))
     return 0
 
 

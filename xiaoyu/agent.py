@@ -801,6 +801,8 @@ class Agent:
         self.peer = peer
         #  会话落盘（可选，由 CLI 注入；eval / explore 子 agent 不落盘）
         self.session_log = session_log
+        #  上一次快照进日志的用量（轮末对比，变了才写；见 _log_usage）
+        self._usage_logged: dict[str, Any] | None = None
         #  plan mode 的计划文件：有会话文件就放它旁边
         #  （<会话名>.plan.md，不进仓库）；没有（eval/嵌入）退到工作区 .xiaoyu/。
         log_path = getattr(session_log, "path", None) if session_log is not None else None
@@ -2066,7 +2068,25 @@ class Agent:
         finally:
             if store is not None:
                 store.finish()
+            self._log_usage()
             self._peer_state("idle")
+
+    def _log_usage(self) -> None:
+        """轮末把**累计**用量快照进会话日志（`usage` 事件）。
+
+        写累计而非增量：`sessions digest` 只取每个文件的最后一条 usage 事件，
+        中途 kill -9 也只丢最后一轮的精度，不需要重放求和。放 send() 的
+        finally 里，中断/异常轮已烧掉的 token 也入账。没变化不写（纯 /命令轮、
+        resume 后的空轮），免得长会话里堆重复行。usage 是父子共享的一本账，
+        快照天然含子 agent（explore / 七襄）用量——这正是"会话花了多少"的口径。
+        """
+        if not self.session_log:
+            return
+        snapshot = self.usage.to_dict()
+        if not snapshot["turns"] or snapshot == self._usage_logged:
+            return
+        self._usage_logged = snapshot
+        self.session_log.event("usage", **snapshot)
 
     def _peer_state(self, state: str) -> None:
         if self.peer is None:
