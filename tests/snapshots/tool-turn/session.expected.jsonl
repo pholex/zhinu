@@ -4,4 +4,5 @@
 {"ts": "<ts>", "role": "assistant", "content": null, "tool_calls": [{"id": "<call-1>", "type": "function", "function": {"name": "bash", "arguments": "{\"command\": \"echo snapshot-ok\"}"}}]}
 {"ts": "<ts>", "role": "tool", "tool_call_id": "<call-1>", "content": "exit_status: 0\nstdout:\nsnapshot-ok"}
 {"ts": "<ts>", "role": "assistant", "content": "命令输出 snapshot-ok，完成。"}
+{"ts": "<ts>", "event": "usage", "turns": 2, "prompt_tokens": 340, "completion_tokens": 32, "by_model": {"_scripted/snapshot-model": {"calls": 2, "prompt_tokens": 340, "completion_tokens": 32}}}
 {"ts": "<ts>", "event": "exit", "reason": "normal"}

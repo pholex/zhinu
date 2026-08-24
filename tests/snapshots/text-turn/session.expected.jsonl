@@ -2,4 +2,5 @@
 {"ts": "<ts>", "role": "user", "content": "打个招呼"}
 {"ts": "<ts>", "event": "world_state", "baseline": {"model": {"value": "snapshot-model"}, "mode": {"value": ["default", false]}, "cwd": {"value": "<tmp>/ws"}, "skills": {"names": []}, "tools": {"names": ["ask_user", "bash", "browser", "chenshu_inbox", "chenshu_init", "chenshu_merge", "chenshu_mission", "chenshu_plan", "chenshu_review", "chenshu_send", "chenshu_spawn", "chenshu_status", "chenshu_teardown", "chenshu_wait", "exit_plan_mode", "get_context_remaining", "grep", "kill_task", "list_files", "monitor", "new_context", "read_file", "recall", "str_replace", "task_output", "update_plan", "write_file"]}, "project_instructions": {"digest": ""}, "context_window": {"value": 1}}}
 {"ts": "<ts>", "role": "assistant", "content": "你好！我是小羽。"}
+{"ts": "<ts>", "event": "usage", "turns": 1, "prompt_tokens": 120, "completion_tokens": 8, "by_model": {"_scripted/snapshot-model": {"calls": 1, "prompt_tokens": 120, "completion_tokens": 8}}}
 {"ts": "<ts>", "event": "exit", "reason": "normal"}
