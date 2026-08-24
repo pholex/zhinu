@@ -610,6 +610,21 @@ class TestBashAndSafety(ToolboxTestCase):
         self.assertEqual(env["GITHUB_TOKEN"], "gh")
         self.assertEqual(env["LARK_TOKEN"], "t")
 
+    def test_shared_key_envs_stay_inheritable(self) -> None:
+        """多产品通用名（shared_key_envs，如 GOOGLE_API_KEY）不剥：gcloud 一类
+        无关命令正当地需要它；同一 preset 的专名（GEMINI_API_KEY）照剥。"""
+        from xiaoyu.tools import _hardened_env, non_inheritable_env_names
+
+        names = non_inheritable_env_names()
+        self.assertIn("GEMINI_API_KEY", names)
+        self.assertNotIn("GOOGLE_API_KEY", names)
+        with mock.patch.dict(
+            os.environ, {"GEMINI_API_KEY": "sk-g", "GOOGLE_API_KEY": "AIza-maps"}
+        ):
+            env = _hardened_env()
+        self.assertNotIn("GEMINI_API_KEY", env)
+        self.assertEqual(env["GOOGLE_API_KEY"], "AIza-maps")
+
 
 class PurposeParamTest(unittest.TestCase):
     """__tool_use_purpose 注入：只进需确认工具的 schema。"""

@@ -50,6 +50,12 @@ class Preset:
     key_envs: tuple[str, ...]
     #  给人看的来源标注
     label: str
+    #  key_envs 里属于**多产品通用名**的子集（如 GOOGLE_API_KEY：gcloud / Maps /
+    #  genai 全家都认）：找 key 照常兜底，但**不进**子进程密钥剥除名单——
+    #  tools.non_inheritable_env_names 对所有 PRESETS 无条件取并集，剥了通用名
+    #  会弄坏用户与模型无关的工作流（agent 里跑 gcloud 脚本莫名缺 key）。
+    #  代价是 key 若只放在通用名下会被子进程继承；要剥除保护就用主键名（专名）。
+    shared_key_envs: tuple[str, ...] = ()
     #  说 Responses 协议的型号（`*` = 整家）。其余走 chat。见 responses.py
     responses_models: tuple[str, ...] = ()
     #  收得下图片输入的型号（`*` = 整家）。声明纪律与 responses_models 完全相同：
@@ -181,6 +187,9 @@ PRESETS: dict[str, Preset] = {
         #  Google 官方 SDK 两个名字都认（GEMINI_API_KEY 优先），同 qwen 的双键理由
         key_envs=("GEMINI_API_KEY", "GOOGLE_API_KEY"),
         label="直连 gemini",
+        #  GOOGLE_API_KEY 是 Google 全家通用名（gcloud / Maps / genai 都认），
+        #  不能进子进程剥除名单；GEMINI_API_KEY 专名照剥。见 Preset.shared_key_envs
+        shared_key_envs=("GOOGLE_API_KEY",),
         #  2026-08-24 实测收图：四象限（绿/紫/蓝/橙）四色全中
         vision_models=(WILDCARD,),
         #  ⚠️ 刻意留在 chat：Gemini 不提供 /responses 端点，只有 OpenAI 兼容层
