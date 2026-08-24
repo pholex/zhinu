@@ -358,7 +358,7 @@ class ContextWindowTest(unittest.TestCase):
     def test_known_model_gets_table_window(self) -> None:
         self.assertEqual(self._config("deepseek-v4-flash").context_limit, 1_000_000)
         self.assertEqual(self._config("deepseek-v4-pro").context_limit, 1_000_000)
-        self.assertEqual(self._config("glm-5.2").context_limit, 1_000_000)
+        self.assertEqual(self._config("glm-5.3").context_limit, 1_000_000)
         self.assertEqual(self._config("kimi-k3").context_limit, 1_048_576)
         self.assertEqual(self._config("claude-fable-5").context_limit, 1_000_000)
         self.assertEqual(self._config("qwen3.8-max").context_limit, 1_000_000)

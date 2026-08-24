@@ -39,7 +39,7 @@ DEFAULT_SUMMARY_MODEL = "deepseek-v4-flash"
 #  宁可早压缩，不可撑爆窗口。qwen3.7 无可靠数字，先不入表。
 CONTEXT_WINDOWS: tuple[tuple[str, int], ...] = (
     ("deepseek-v4", 1_000_000),
-    ("glm-5.2", 1_000_000),
+    ("glm-5", 1_000_000),  # 5.2 / 5.3 均 1M（5.3 为现役直连型号）
     ("kimi-k3", 1_048_576),
     ("qwen3.8-max", 1_000_000),
     #  海外直连（前缀按序匹配：haiku 的 200K 例外必须排在通配 claude- 之前）

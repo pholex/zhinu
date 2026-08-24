@@ -300,7 +300,7 @@ class TestOrderAndKeys(ProviderTestCase):
         )
         self.assertEqual(registry.resolve("kimi-k3").provider, "moonshot")
         self.assertEqual(registry.resolve("qwen3.8-max").provider, "qwen")
-        self.assertEqual(registry.resolve("glm-5.2").provider, "zhipu")
+        self.assertEqual(registry.resolve("glm-5.3").provider, "zhipu")
 
     def test_qwen_accepts_dashscope_env_name(self) -> None:
         """阿里生态惯用 DASHSCOPE_API_KEY——为别的工具配过的直接复用。"""
