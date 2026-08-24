@@ -450,6 +450,81 @@ class TestChatPassthrough(unittest.TestCase):
         self.assertIn(REASONING_KEY, history[1])
 
 
+class TestToolSignatures(unittest.TestCase):
+    """Gemini thought_signature 的出网还原（restore_tool_extras）。
+
+    纪律同 _reasoning：产出路由（provider+model 都对上）才还原；签名型号收到
+    别家产的 tool_calls 历史时补占位签名（上游对当前轮缺签名的 function call
+    直接 400）；并行调用只有第一路有签名，原样还原不多补。
+    """
+
+    SIG = {"google": {"thought_signature": "SIG"}}
+
+    def history(self) -> list[dict[str, Any]]:
+        return [
+            {"role": "user", "content": "hi"},
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [
+                    {"id": "a", "type": "function", "function": {"name": "f", "arguments": "{}"}},
+                    {"id": "b", "type": "function", "function": {"name": "f", "arguments": "{}"}},
+                ],
+                responses.TOOL_EXTRAS_KEY: {
+                    "model": "gemini-3.7-flash",
+                    "provider": "gemini",
+                    "extras": {"a": self.SIG},
+                },
+            },
+            {"role": "tool", "tool_call_id": "a", "content": "ok"},
+            {"role": "tool", "tool_call_id": "b", "content": "ok"},
+        ]
+
+    def send(self, model: str, provider: str, history: list[dict[str, Any]]) -> dict[str, Any]:
+        inner = FakeClient(FakeResponses())
+        client = Transport(inner, (), provider=provider, signature_models=("*",))
+        client.chat.completions.create(model=model, messages=history)
+        return inner.chat.completions.calls[0]
+
+    def test_matching_route_restores_signature_verbatim(self) -> None:
+        history = self.history()
+        sent = self.send("gemini-3.7-flash", "gemini", history)
+        calls = sent["messages"][1]["tool_calls"]
+        self.assertEqual(calls[0]["extra_content"], self.SIG)
+        #  并行调用只有第一路带签名（上游原样给的）：第二路不许补占位——
+        #  多补反而偏离模型的原始输出
+        self.assertNotIn("extra_content", calls[1])
+        #  私有键在净化点被摘掉；原始历史不许被就地改写
+        self.assertNotIn(responses.TOOL_EXTRAS_KEY, sent["messages"][1])
+        self.assertIn(responses.TOOL_EXTRAS_KEY, history[1])
+        self.assertNotIn("extra_content", history[1]["tool_calls"][0])
+
+    def test_foreign_history_gets_placeholder_signatures(self) -> None:
+        """会话中途切到签名型号：历史是别家模型产的，没有签名会被 400 拒收。"""
+        history = self.history()
+        history[1][responses.TOOL_EXTRAS_KEY] = {
+            "model": "deepseek-v4-pro",
+            "provider": "deepseek",
+            "extras": {"a": self.SIG},
+        }
+        sent = self.send("gemini-3.7-flash", "gemini", history)
+        for call in sent["messages"][1]["tool_calls"]:
+            self.assertEqual(
+                call["extra_content"],
+                {"google": {"thought_signature": responses.DUMMY_SIGNATURE}},
+            )
+
+    def test_non_signature_model_leaves_foreign_calls_untouched(self) -> None:
+        """非签名型号不补占位；不匹配的签名也不许跨路由塞回去。"""
+        inner = FakeClient(FakeResponses())
+        client = Transport(inner, (), provider="deepseek")
+        client.chat.completions.create(model="deepseek-v4-pro", messages=self.history())
+        sent = inner.chat.completions.calls[0]
+        for call in sent["messages"][1]["tool_calls"]:
+            self.assertNotIn("extra_content", call)
+        self.assertNotIn(responses.TOOL_EXTRAS_KEY, sent["messages"][1])
+
+
 class TestReasoningPassthrough(unittest.TestCase):
     ITEM = {"type": "reasoning", "id": "rs_1", "encrypted_content": "ENC"}
 

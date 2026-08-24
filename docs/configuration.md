@@ -21,13 +21,14 @@ XIAOYU_MODEL=deepseek-v4-flash xiaoyu
 
 ## 直连厂商
 
-内置直连：deepseek / moonshot / qwen / zhipu / xai / openai / anthropic。**键名一律用厂商原生名**（别家工具已配过的直接复用）：
+内置直连：deepseek / moonshot / qwen / zhipu / anthropic / gemini / openai / xai。**键名一律用厂商原生名**（别家工具已配过的直接复用）：
 
 ```ini
 DEEPSEEK_API_KEY=<key>
 MOONSHOT_API_KEY=<key>
 OPENAI_API_KEY=<key>
 ANTHROPIC_API_KEY=<key>
+GEMINI_API_KEY=<key>
 ```
 
 每家走哪种 wire 协议（chat completions / Responses / Anthropic Messages）、哪些型号能看图，都是按型号内置好的，不用管。
@@ -163,6 +164,7 @@ XIAOYU_PROVIDER_MINIMAX_MODELS=minimax-m2,minimax-m2-turbo   # 留空 = 通配
 XIAOYU_PROVIDER_MINIMAX_PROTOCOL=responses                   # 默认 chat；可选 anthropic
 XIAOYU_PROVIDER_MINIMAX_VISION=*                             # 声明视觉能力，默认不发图
 XIAOYU_PROVIDER_MINIMAX_TOOLS=text                           # 默认 native；端点不会 function calling 时设 text
+XIAOYU_PROVIDER_MINIMAX_SIGNATURES=*                         # 工具调用重放需带回 thought_signature 的型号（Gemini 系端点用）
 ```
 
 `_PROTOCOL=anthropic` 也适用于 Bedrock Mantle 一类只挂 Claude 原生协议的端点。视觉是 fail-closed 的：**未声明即不发图**，模型会收到一行"有 N 张图但看不了"的说明而不是被静默丢弃。

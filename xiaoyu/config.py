@@ -46,6 +46,7 @@ CONTEXT_WINDOWS: tuple[tuple[str, int], ...] = (
     ("claude-haiku", 200_000),
     ("claude-", 1_000_000),  # opus-5 / sonnet-5 / fable-5 均 1M（官方文档 2026-08）
     ("gpt-5", 400_000),  # GPT-5 系官方数值
+    ("gemini-3.7-flash", 1_048_576),  # Models API inputTokenLimit（2026-08-24 实测）
     #  ⚠️ grok-4.6 的真实窗口是 500k，这里**故意填 280k**——这一格是压缩预算
     #  而不是规格表（兜底的 180k 同理）。xAI 对 prompt 达到 200k 的请求整单翻倍
     #  计价（$2/$6 → $4/$12，含缓存档），所以按默认 compact_at=0.7 取

@@ -48,7 +48,7 @@ xiaoyu config --show      # 看生效配置与来源（key 永不回显）
 DEEPSEEK_API_KEY=<your-key>
 ```
 
-内置直连 deepseek / moonshot / qwen / zhipu / anthropic / openai / xai，键名一律用厂商原生名。或者走 OpenAI 兼容网关：
+内置直连 deepseek / moonshot / qwen / zhipu / anthropic / gemini / openai / xai，键名一律用厂商原生名。或者走 OpenAI 兼容网关：
 
 ```ini
 XIAOYU_BASE_URL=https://<你的网关>/v1

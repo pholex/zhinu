@@ -54,6 +54,19 @@ REASONING_KEY = "_reasoning"
 #  `role: system`（operator 权威通道，且不破缓存前缀），其余协议照旧当 user 发
 OPERATOR_KEY = "_operator"
 
+#  assistant 消息上的私有键：存这一轮 tool_calls 随流带回的 extra_content
+#  （目前只有 Gemini 用它带 thought_signature——Gemini 3 起工具调用重放时必须
+#  原样带回，缺了当前轮直接 400）。形状是
+#  {"model": 产出模型, "provider": 产出 provider, "extras": {call_id: extra_content}}。
+#  与 _reasoning 同一套纪律：模型私有状态，只在产出它的那条路由上还原，
+#  出网前统一被摘掉（见 restore_tool_extras / strip_private）
+TOOL_EXTRAS_KEY = "_tool_extras"
+
+#  跨模型迁移历史的占位签名（Google 官方文档给的逃生舱）：会话中途切到签名
+#  型号时，历史里别家产的 tool_calls 没有签名，上游会把**当前轮**缺签名的
+#  function call 400 拒收（非当前轮容忍，2026-08-24 实测）；补这个占位串即通过
+DUMMY_SIGNATURE = "context_engineering_is_the_way_to_go"
+
 #  拿回 reasoning 状态所必须的 include。实测 xai / qwen / deepseek 的 Responses
 #  端点都容得下这个参数（不支持推理的模型只是不回而已），所以无条件发。
 _REASONING_INCLUDE = ["reasoning.encrypted_content"]
@@ -76,6 +89,50 @@ def strip_private(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
             message = {k: v for k, v in message.items() if not k.startswith("_")}
         cleaned.append(message)
     return cleaned
+
+
+def restore_tool_extras(
+    messages: list[dict[str, Any]], model: str, provider: str, sign_missing: bool
+) -> list[dict[str, Any]]:
+    """把 `_tool_extras` 私有键还原成 tool_calls[].extra_content（chat 出网前调用）。
+
+    还原纪律同 `_reasoning`：**产出它的那条路由**（provider+model 都对上）才还原，
+    任一对不上整条跳过——thought_signature 是模型私有状态，跨模型塞回去是喂错东西。
+    原样还原，不多不少：并行调用只有第一路有签名（2026-08-24 实测），
+    给其余调用补签名反而偏离模型的原始输出。
+
+    sign_missing（签名型号，见 Provider.signature_models）时，**没有任何可还原
+    签名**的 tool_calls 消息给每路调用补占位签名：这些是别家模型产的历史
+    （会话中途切模型 / 降级链落过来），上游对当前轮缺签名的 function call
+    直接 400——不补，切到签名型号这件事本身就是坏的。
+
+    不改传入的消息（历史是共享数据结构），改动都发生在拷贝上。
+    """
+    out: list[dict[str, Any]] = []
+    for message in messages:
+        calls = message.get("tool_calls")
+        if not calls:
+            out.append(message)
+            continue
+        info = message.get(TOOL_EXTRAS_KEY) or {}
+        extras: dict[str, Any] = {}
+        if info.get("model") == model and (info.get("provider") or "") == provider:
+            extras = info.get("extras") or {}
+        if extras:
+            new_calls = [
+                {**call, "extra_content": extras[call.get("id")]}
+                if call.get("id") in extras
+                else call
+                for call in calls
+            ]
+        elif sign_missing:
+            placeholder = {"google": {"thought_signature": DUMMY_SIGNATURE}}
+            new_calls = [{**call, "extra_content": placeholder} for call in calls]
+        else:
+            out.append(message)
+            continue
+        out.append({**message, "tool_calls": new_calls})
+    return out
 
 
 # ---------- 请求方向：chat completions → Responses ----------
@@ -406,12 +463,15 @@ class _Completions:
         anthropic_client: Any,
         provider: str = "",
         text_tools: Any = None,
+        signs_tools: Any = None,
     ) -> None:
         self._inner = inner
         self._speaks_responses = speaks_responses
         self._speaks_anthropic = speaks_anthropic
         #  型号 → 是否走文本工具协议（见 textcalls.py）。None = 全部原生
         self._text_tools = text_tools or (lambda _model: False)
+        #  型号 → 工具调用重放是否必须带 thought_signature（见 restore_tool_extras）
+        self._signs_tools = signs_tools or (lambda _model: False)
         #  零参 callable：懒构造并缓存（见 Transport.anthropic_client）
         self._anthropic_client = anthropic_client
         #  本传输层所属的 provider：reasoning 回放判定要用（provider+model
@@ -469,6 +529,8 @@ class _Completions:
         #  别让它漏成上游 400（Responses 的 compact_threshold 是另一套，待接）
         extra = {k: v for k, v in extra.items() if k not in ("_compaction", "_task_budget")}
         if not self._speaks_responses(model):
+            #  签名还原要在净化**之前**（_tool_extras 正是它要消费的东西）
+            messages = restore_tool_extras(messages, model, self._provider, self._signs_tools(model))
             #  这里是内核私有键唯一的净化点（为什么必须摘：见 strip_private）
             return self._chat(model, strip_private(messages), stream, stream_options, tools, extra)
         #  ⚠️ Responses 这一路**不能**先 strip：`_reasoning` 正是 to_input 要消费的
@@ -511,9 +573,16 @@ class _Chat:
         anthropic_client: Any,
         provider: str = "",
         text_tools: Any = None,
+        signs_tools: Any = None,
     ) -> None:
         self.completions = _Completions(
-            inner, speaks_responses, speaks_anthropic, anthropic_client, provider, text_tools
+            inner,
+            speaks_responses,
+            speaks_anthropic,
+            anthropic_client,
+            provider,
+            text_tools,
+            signs_tools,
         )
 
 
@@ -540,6 +609,7 @@ class Transport:
         anthropic_factory: Any = None,
         provider: str = "",
         text_tool_models: tuple[str, ...] = (),
+        signature_models: tuple[str, ...] = (),
     ) -> None:
         self._inner = inner
         self.responses_models = tuple(responses_models)
@@ -547,6 +617,9 @@ class Transport:
         #  走文本工具协议的型号（`*` = 整家）。与 wire protocol 正交：它说的是
         #  "这个型号不会 function calling"，不是"说哪种协议"。见 textcalls.py
         self.text_tool_models = tuple(text_tool_models)
+        #  工具调用重放必须带 thought_signature 的型号（`*` = 整家）。
+        #  声明纪律同 responses_models。见 restore_tool_extras
+        self.signature_models = tuple(signature_models)
         self._anthropic_factory = anthropic_factory
         self._anthropic: Any = None
         self.chat = _Chat(
@@ -556,11 +629,16 @@ class Transport:
             self.anthropic_client,
             provider,
             self.uses_text_tools,
+            self.signs_tools,
         )
 
     def uses_text_tools(self, model: str) -> bool:
         """这个型号的工具调用走不走文本协议。声明纪律同 responses_models。"""
         return WILDCARD in self.text_tool_models or model in self.text_tool_models
+
+    def signs_tools(self, model: str) -> bool:
+        """这个型号的工具调用重放是否必须带 thought_signature。"""
+        return WILDCARD in self.signature_models or model in self.signature_models
 
     def tool_mode_for(self, model: str) -> str:
         from .textcalls import NATIVE, TEXT
@@ -599,6 +677,7 @@ class Transport:
             self.anthropic_models,
             self._anthropic_factory,
             text_tool_models=self.text_tool_models,
+            signature_models=self.signature_models,
         )
 
     def __getattr__(self, name: str) -> Any:
@@ -612,7 +691,14 @@ def wrap(
     anthropic_factory: Any = None,
     provider: str = "",
     text_tool_models: tuple[str, ...] = (),
+    signature_models: tuple[str, ...] = (),
 ) -> Transport:
     return Transport(
-        client, responses_models, anthropic_models, anthropic_factory, provider, text_tool_models
+        client,
+        responses_models,
+        anthropic_models,
+        anthropic_factory,
+        provider,
+        text_tool_models,
+        signature_models,
     )

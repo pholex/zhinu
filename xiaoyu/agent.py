@@ -65,7 +65,7 @@ from .messages import (
     supports_server_compaction,
     supports_task_budget,
 )
-from .responses import OPERATOR_KEY, REASONING_KEY
+from .responses import OPERATOR_KEY, REASONING_KEY, TOOL_EXTRAS_KEY
 from .tools import PURPOSE_PARAM, Tool, Toolbox
 
 #  approver(tool_name, args) -> True=允许；(True, 附言)=允许且附言随 tool result
@@ -3146,7 +3146,23 @@ class Agent:
             "content": "".join(content_parts) or None,
         }
         if pending:
-            message["tool_calls"] = [pending[index] for index in sorted(pending)]
+            calls = [pending[index] for index in sorted(pending)]
+            #  分片上攒的 extra_content（Gemini thought_signature）挪进私有键：
+            #  留在 tool_call 里会漏进 wire（strip_private 只摘消息级键）。
+            #  纪律同 _reasoning——签名是模型私有状态，记下产出路由，
+            #  只在同 provider+model 上还原（responses.restore_tool_extras）
+            extras = {
+                call["id"]: extra
+                for call in calls
+                if (extra := call.pop("_extra_content", None)) and call["id"]
+            }
+            message["tool_calls"] = calls
+            if extras:
+                message[TOOL_EXTRAS_KEY] = {
+                    "model": route.model,
+                    "provider": route.provider,
+                    "extras": extras,
+                }
         if any(item.get("type") == "compaction" for item in reasoning):
             #  服务端刚压缩过：块之前的历史它不再看。本轮 usage 锚点是压缩前还是
             #  压缩后的输入，流式事件里分不清——作废它，下轮 usage 重新落锚，
@@ -3231,12 +3247,27 @@ class Agent:
                 content_parts.append(delta.content)
 
             for fragment in delta.tool_calls or []:
+                index = fragment.index
+                if index is None:
+                    #  个别兼容端点（Gemini）的分片不带 index：带新 id 的分片各成
+                    #  一路，其余续接最近一路——否则并行调用会被归进同一格，
+                    #  arguments 拼成一坨坏 JSON（2026-08-24 实测）
+                    index = next(
+                        (i for i, c in pending.items() if fragment.id and c["id"] == fragment.id),
+                        None,
+                    )
+                    if index is None:
+                        index = (max(pending) + 1 if fragment.id else max(pending)) if pending else 0
                 slot = pending.setdefault(
-                    fragment.index,
+                    index,
                     {"id": "", "type": "function", "function": {"name": "", "arguments": ""}},
                 )
                 if fragment.id:
                     slot["id"] = fragment.id
+                #  Gemini 的 thought_signature 随分片挂在 extra_content 上：先攒在
+                #  这一格里，message 落定时挪进 _tool_extras 私有键（见调用方）
+                if extra := getattr(fragment, "extra_content", None):
+                    slot["_extra_content"] = extra
                 if fragment.function is None:
                     continue
                 #  name 各家都是一次给全，先到先得；arguments 一定是分片累加。

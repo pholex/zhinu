@@ -63,6 +63,10 @@ class Preset:
     #  内置厂商目前没有一家需要（名额纪律只收旗舰，旗舰都会 function calling）；
     #  字段留着是让 preset 与通用 env 兜底形状一致。见 textcalls.py
     text_tool_models: tuple[str, ...] = ()
+    #  工具调用重放必须带回 thought_signature 的型号（`*` = 整家）。
+    #  目前只有 Gemini：签名随流藏在 tool_calls[].extra_content 里，重放时缺了
+    #  当前轮直接 400。存取纪律见 responses.restore_tool_extras
+    signature_models: tuple[str, ...] = ()
 
 
 #  ⚠️ 只内置能确认的厂商。猜错的代价是用户配好了却 404——这类数据宁可缺也不能错
@@ -167,6 +171,27 @@ PRESETS: dict[str, Preset] = {
         #  被静默忽略、thinking 不回传。三样对 agent 负载都值钱，见 messages.py）
         anthropic_models=(WILDCARD,),
     ),
+    "gemini": Preset(
+        name="gemini",
+        #  Google 官方 OpenAI 兼容端点（Gemini API）。2026-08-24 实测：
+        #  chat / 流式 / tool_calls / 多轮工具回传 / include_usage /
+        #  reasoning_effort（low/high 都认，low 时思考明显收缩）全通
+        models=("gemini-3.7-flash",),
+        base_url="https://generativelanguage.googleapis.com/v1beta/openai/",
+        #  Google 官方 SDK 两个名字都认（GEMINI_API_KEY 优先），同 qwen 的双键理由
+        key_envs=("GEMINI_API_KEY", "GOOGLE_API_KEY"),
+        label="直连 gemini",
+        #  2026-08-24 实测收图：四象限（绿/紫/蓝/橙）四色全中
+        vision_models=(WILDCARD,),
+        #  ⚠️ 刻意留在 chat：Gemini 不提供 /responses 端点，只有 OpenAI 兼容层
+        #
+        #  ⚠️ Gemini 3 系工具调用重放必须带回 thought_signature（随流藏在
+        #  tool_calls[].extra_content.google.thought_signature），当前轮缺签名
+        #  直接 400（非当前轮容忍，均 2026-08-24 实测）。并行调用只有第一路带
+        #  签名，且分片不带 index（靠 id 归组，内核侧已兜底）。
+        #  签名的存取/还原/占位纪律见 responses.restore_tool_extras
+        signature_models=(WILDCARD,),
+    ),
     "openai": Preset(
         name="openai",
         base_url="https://api.openai.com/v1",
@@ -228,6 +253,8 @@ class Provider:
     anthropic_models: tuple[str, ...] = ()
     #  工具调用走文本协议的型号（`*` = 整家）。见 textcalls.py
     text_tool_models: tuple[str, ...] = ()
+    #  工具调用重放必须带 thought_signature 的型号（`*` = 整家）。见 Preset 同名字段
+    signature_models: tuple[str, ...] = ()
 
     @property
     def wildcard(self) -> bool:
@@ -470,6 +497,7 @@ class Registry:
                 factory,
                 provider=name,
                 text_tool_models=provider.text_tool_models,
+                signature_models=provider.signature_models,
             )
         )
 
@@ -636,7 +664,7 @@ NO_PROVIDER_HINT = (
     "  2. 直连大模型厂商——填一个 key 即可，不需要网关：\n"
     "       DEEPSEEK_API_KEY=<你的-deepseek-key>\n"
     "       （同理：MOONSHOT_API_KEY / QWEN_API_KEY / ZHIPU_API_KEY\n"
-    "         / ANTHROPIC_API_KEY / OPENAI_API_KEY / XAI_API_KEY）\n"
+    "         / ANTHROPIC_API_KEY / OPENAI_API_KEY / XAI_API_KEY / GEMINI_API_KEY）\n"
     "  3. 走 OpenAI 兼容网关（LiteLLM、vLLM、各家官方 API…）：\n"
     "       XIAOYU_BASE_URL=https://<你的网关>/v1  +  XIAOYU_API_KEY=<key>\n"
     "  4. 命令行 --base-url https://<你的网关>/v1\n"
@@ -727,9 +755,10 @@ def _make(name: str, config: Config) -> Provider | None:
             preset.vision_models,
             preset.anthropic_models,
             preset.text_tool_models,
+            preset.signature_models,
         )
 
-    #  通用兜底：XIAOYU_PROVIDER_<NAME>_{BASE_URL,API_KEY,MODELS,PROTOCOL,VISION,TOOLS}
+    #  通用兜底：XIAOYU_PROVIDER_<NAME>_{BASE_URL,API_KEY,MODELS,PROTOCOL,VISION,TOOLS,SIGNATURES}
     upper = name.upper()
     base_url = os.environ.get(f"{_GENERIC_PREFIX}{upper}{_GENERIC_SUFFIX}", "").strip()
     if not base_url:
@@ -752,6 +781,10 @@ def _make(name: str, config: Config) -> Provider | None:
     #  文本协议（textcalls.py）。默认 native。与 PROTOCOL 正交，可以同时设
     tool_mode = os.environ.get(f"{_GENERIC_PREFIX}{upper}_TOOLS", "").strip().lower()
     text_tools = (WILDCARD,) if tool_mode == TEXT_TOOLS else ()
+    #  SIGNATURES=* 整家、或逗号分隔点名：工具调用重放必须带 thought_signature 的
+    #  型号（自建 Gemini 兼容端点用，见 responses.restore_tool_extras）
+    raw_sign = os.environ.get(f"{_GENERIC_PREFIX}{upper}_SIGNATURES", "")
+    signatures = tuple(item.strip() for item in raw_sign.split(",") if item.strip())
     return Provider(
         name,
         base_url,
@@ -762,4 +795,5 @@ def _make(name: str, config: Config) -> Provider | None:
         vision,
         speaks_anthropic,
         text_tools,
+        signatures,
     )
