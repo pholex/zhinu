@@ -118,7 +118,12 @@ def restore_tool_extras(
         extras: dict[str, Any] = {}
         if info.get("model") == model and (info.get("provider") or "") == provider:
             extras = info.get("extras") or {}
-        if extras:
+        #  "有签名可还原"以**盖到这条消息的 call id** 为准，不是 extras 非空：
+        #  id 漂移（历史修复/fork 改写）或捕获缺口下 extras 可能非空却一个都
+        #  对不上——那等于没有签名，得走占位分支，否则当前轮整条不带签名出网，
+        #  正好撞上占位分支要防的那个 400。盖到一部分则只还原盖到的：并行调用
+        #  只有第一路有签名是上游的原始形状，其余留白即原样
+        if extras.keys() & {call.get("id") for call in calls}:
             new_calls = [
                 {**call, "extra_content": extras[call.get("id")]}
                 if call.get("id") in extras
@@ -620,6 +625,10 @@ class Transport:
         #  工具调用重放必须带 thought_signature 的型号（`*` = 整家）。
         #  声明纪律同 responses_models。见 restore_tool_extras
         self.signature_models = tuple(signature_models)
+        #  with_options 副本要原样带走（⚠️ 丢了不是少个标签：副本上 provider
+        #  变 ""，restore_tool_extras 的路由比对永远不中，签名型号的历史会被
+        #  占位签名整段盖掉——真签名换假签名，比不还原更糟）
+        self._provider = provider
         self._anthropic_factory = anthropic_factory
         self._anthropic: Any = None
         self.chat = _Chat(
@@ -676,6 +685,7 @@ class Transport:
             self.responses_models,
             self.anthropic_models,
             self._anthropic_factory,
+            provider=self._provider,
             text_tool_models=self.text_tool_models,
             signature_models=self.signature_models,
         )

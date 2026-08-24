@@ -272,6 +272,34 @@ class TestOrderAndKeys(ProviderTestCase):
             registry = providers.build(config())
         self.assertEqual([p.name for p in registry.providers], [GATEWAY])
 
+    def test_gateway_signature_models_env_override(self) -> None:
+        """网关后面挂着 Gemini 系签名型号：XIAOYU_SIGNATURE_MODELS 点名放行。
+        道理同 XIAOYU_VISION_MODELS——网关后挂了什么只有用户知道，没有这个
+        开关，签名型号走网关路由只能整个换成通用 env provider 重配。"""
+        env = {"XIAOYU_API_KEY": "gw", "XIAOYU_SIGNATURE_MODELS": "gemini-3.7-flash"}
+        with isolated_env(env):
+            registry = providers.build(config())
+            transport = registry.client(GATEWAY)
+        self.assertTrue(transport.signs_tools("gemini-3.7-flash"))
+        self.assertFalse(transport.signs_tools("deepseek-v4-pro"))
+
+    def test_generic_signatures_ignored_loudly_on_non_chat_protocol(self) -> None:
+        """签名的捕获/还原只在 chat 一路存在：_SIGNATURES 配上 PROTOCOL=responses/
+        anthropic 若静默收下，用户会拿着一个不生效的开关去排查每轮 400——
+        必须出声丢弃。"""
+        env = {
+            "XIAOYU_PROVIDER_MINIMAX_BASE_URL": "https://mm.example/v1",
+            "XIAOYU_PROVIDER_MINIMAX_API_KEY": "mm",
+            "XIAOYU_PROVIDER_MINIMAX_PROTOCOL": "responses",
+            "XIAOYU_PROVIDER_MINIMAX_SIGNATURES": "*",
+        }
+        with isolated_env(env), contextlib.redirect_stderr(io.StringIO()) as err:
+            registry = providers.build(config(base_url=""))
+        provider = registry.get("minimax")
+        assert provider is not None
+        self.assertEqual(provider.signature_models, ())
+        self.assertIn("只在 chat 协议生效", err.getvalue())
+
     def test_generic_env_provider_is_discovered(self) -> None:
         #  minimax 是"未内置厂商"的例子（moonshot 已升级为内置 preset，不能再当例子用）
         env = {

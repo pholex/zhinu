@@ -201,6 +201,102 @@ class TestToolCallLoop(AgentTestCase):
             sorted(assistant["tool_calls"][0]), ["function", "id", "type"]
         )
 
+    def test_indexless_late_id_adopts_open_slot(self) -> None:
+        """首分片没给 id、id 随后一片才到：认领已开的空 id 槽续接，不劈成两路
+        ——劈开的两半一半配不上 tool result，一半 arguments 是残缺 JSON。"""
+        first = [
+            chunk(tool_calls=[call_fragment(None, None, "read_file", '{"pa')]),
+            chunk(tool_calls=[call_fragment(None, "a", None, 'th": "calc.py"}')]),
+        ]
+        agent = self.build([first, [chunk(content="好")]])
+        with contextlib.redirect_stdout(io.StringIO()):
+            agent.send("看一下")
+        self.assertEqual([entry["tool"] for entry in agent.trace], ["read_file"])
+        self.assertTrue(agent.trace[0]["ok"])
+        self.assertEqual(agent.messages[3]["tool_call_id"], "a")
+
+    def test_indexless_continuation_follows_last_touched_slot(self) -> None:
+        """带 id 的分片把写入点拉回旧格后，无 id 续片必须跟"最近写过的一格"——
+        跟"编号最大的一格"会把两路调用的 arguments 拼串成坏 JSON。"""
+        first = [
+            chunk(tool_calls=[call_fragment(None, "a", "read_file", '{"pa')]),
+            chunk(tool_calls=[call_fragment(None, "b", "list_files", '{"pattern": "*.py"}')]),
+            chunk(tool_calls=[call_fragment(None, "a", None, 'th": "ca')]),
+            chunk(tool_calls=[call_fragment(None, None, None, 'lc.py"}')]),
+        ]
+        agent = self.build([first, [chunk(content="都看完了")]])
+        with contextlib.redirect_stdout(io.StringIO()):
+            agent.send("并行看两个")
+        calls = agent.messages[2]["tool_calls"]
+        self.assertEqual(
+            [call["function"]["arguments"] for call in calls],
+            ['{"path": "calc.py"}', '{"pattern": "*.py"}'],
+        )
+        self.assertEqual([entry["ok"] for entry in agent.trace], [True, True])
+
+    def test_idless_call_gets_local_id_and_keeps_signature(self) -> None:
+        """id 从头到尾没来的调用：落定时补本地 id——tool result 配对与签名存取
+        都靠 id 做键，空 id 时签名会被静默丢弃、重放反被占位签名顶替。"""
+        from xiaoyu.responses import TOOL_EXTRAS_KEY
+
+        orphan = call_fragment(None, None, "read_file", '{"path": "calc.py"}')
+        orphan.extra_content = {"google": {"thought_signature": "SIG"}}
+        agent = self.build([[chunk(tool_calls=[orphan])], [chunk(content="好")]])
+        with contextlib.redirect_stdout(io.StringIO()):
+            agent.send("看一下")
+        assistant = agent.messages[2]
+        call_id = assistant["tool_calls"][0]["id"]
+        self.assertTrue(call_id)
+        self.assertEqual(
+            assistant[TOOL_EXTRAS_KEY]["extras"],
+            {call_id: {"google": {"thought_signature": "SIG"}}},
+        )
+        self.assertEqual(agent.messages[3]["tool_call_id"], call_id)
+        self.assertTrue(agent.trace[0]["ok"])
+
+    def test_tool_call_extra_content_first_wins(self) -> None:
+        """签名实测只随首个分片来一次：后续分片再挂个 truthy 的 extra_content
+        不能把真签名冲掉（同 name 的先到先得纪律）。"""
+        from xiaoyu.responses import TOOL_EXTRAS_KEY
+
+        signed = call_fragment(0, "call_1", "read_file", '{"path": ')
+        signed.extra_content = {"google": {"thought_signature": "REAL"}}
+        noisy = call_fragment(0, None, None, '"calc.py"}')
+        noisy.extra_content = {"noise": True}
+        agent = self.build(
+            [[chunk(tool_calls=[signed]), chunk(tool_calls=[noisy])], [chunk(content="好")]]
+        )
+        with contextlib.redirect_stdout(io.StringIO()):
+            agent.send("看一下")
+        self.assertEqual(
+            agent.messages[2][TOOL_EXTRAS_KEY]["extras"],
+            {"call_1": {"google": {"thought_signature": "REAL"}}},
+        )
+
+    def test_signature_model_without_signature_warns(self) -> None:
+        """签名型号的调用一枚签名都没捕到＝捕获回归的第一现场，必须出声——
+        重放会被占位签名悄悄顶替（能跑），不出声就是静默丢思维连续性。
+        正常捕到签名则不许有这条噪音。"""
+        from xiaoyu.responses import wrap
+
+        def transport_agent(fragment) -> Agent:
+            inner = FakeClient([[chunk(tool_calls=[fragment])], [chunk(content="好")]])
+            transport = wrap(inner, (), provider="gateway", signature_models=("*",))
+            return Agent(
+                self.config, Toolbox(self.config), registry=Registry.for_client(transport)
+            )
+
+        bare = call_fragment(0, "call_1", "read_file", '{"path": "calc.py"}')
+        with contextlib.redirect_stdout(io.StringIO()) as buffer:
+            transport_agent(bare).send("看一下")
+        self.assertIn("thought_signature", buffer.getvalue())
+
+        signed = call_fragment(0, "call_1", "read_file", '{"path": "calc.py"}')
+        signed.extra_content = {"google": {"thought_signature": "SIG"}}
+        with contextlib.redirect_stdout(io.StringIO()) as buffer:
+            transport_agent(signed).send("看一下")
+        self.assertNotIn("没带回 thought_signature", buffer.getvalue())
+
     def test_malformed_arguments_are_reported_not_crashed(self) -> None:
         first = [chunk(tool_calls=[call_fragment(0, "x", "read_file", "{不是合法 JSON")])]
         agent = self.build([first, [chunk(content="我重试")]])
