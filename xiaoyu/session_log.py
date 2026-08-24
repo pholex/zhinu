@@ -23,7 +23,7 @@ import contextlib
 import json
 import os
 import signal
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -297,6 +297,119 @@ def _head_info(path: Path) -> SessionInfo | None:
         preview=preview or "（无用户消息）",
         session_id=str(meta.get("session_id", "")),
     )
+
+
+# ---------- digest：跨会话的用量账本 ----------
+#
+#  数据源是每个会话文件里的 `usage` 事件——agent 轮末写入的**累计**快照
+#  （见 Agent._log_usage），所以每个文件只需取最后一条，不用重放求和。
+#  没有 usage 事件的文件（旧版本记录的、或一次调用都没发生的）单独计数，
+#  绝不静默略过——沉默会暗示"全都算进来了"。
+
+
+@dataclass
+class WorkspaceUsage:
+    """一个工作区的累计用量。by_model 的 key 是 provider/model 全限定名。"""
+
+    sessions: int = 0
+    #  model -> [calls, prompt_tokens, completion_tokens]（可变，聚合时原地加）
+    by_model: dict[str, list[int]] = field(default_factory=dict)
+
+    def add(self, by_model: dict[str, Any]) -> None:
+        self.sessions += 1
+        for model, entry in by_model.items():
+            if not isinstance(entry, dict):
+                continue
+            bucket = self.by_model.setdefault(str(model), [0, 0, 0])
+            for slot, key in enumerate(("calls", "prompt_tokens", "completion_tokens")):
+                value = entry.get(key)
+                if isinstance(value, int):
+                    bucket[slot] += value
+
+    @property
+    def prompt_tokens(self) -> int:
+        return sum(entry[1] for entry in self.by_model.values())
+
+    @property
+    def completion_tokens(self) -> int:
+        return sum(entry[2] for entry in self.by_model.values())
+
+
+@dataclass
+class UsageDigest:
+    by_workspace: dict[str, WorkspaceUsage] = field(default_factory=dict)
+    no_usage: int = 0  # 没有 usage 事件的会话文件数（旧版本记录 / 零调用）
+    corrupt: int = 0  # 疑似 usage 行但解析失败、被跳过的行数
+
+
+#  usage 事件行的预筛子串（json.dumps 的 `": "` 分隔符是稳定的）：
+#  digest 要扫所有会话文件的每一行，先按子串筛掉消息行，命中的才 json 解析。
+_USAGE_MARK = '"event": "usage"'
+
+
+def _tail_usage(path: Path) -> tuple[dict[str, Any] | None, dict[str, Any] | None, int]:
+    """单次遍历取 (meta, 最后一条 usage 事件, 疑似 usage 行损坏数)。
+
+    损坏计数的口径：含 usage 标记但解析不出来的行（典型是断电截断的尾部
+    半行）。截断发生在标记之前的行探测不到——这属于观察边界，digest 的
+    输出文案只声称"跳过了 N 行疑似用量记录"，不声称抓到了所有损坏。
+    """
+    meta: dict[str, Any] | None = None
+    usage: dict[str, Any] | None = None
+    corrupt = 0
+    try:
+        with path.open(encoding="utf-8", errors="replace") as handle:
+            for index, line in enumerate(handle):
+                is_candidate = _USAGE_MARK in line
+                if meta is None and index < _HEAD_SCAN_LINES:
+                    pass  # 开头几行照常解析找 meta
+                elif not is_candidate:
+                    continue
+                try:
+                    record = json.loads(line)
+                except json.JSONDecodeError:
+                    if is_candidate:
+                        corrupt += 1
+                    continue
+                kind = record.get("event")
+                if kind == "meta" and meta is None:
+                    meta = record
+                elif kind == "usage":
+                    usage = record
+    except OSError:
+        return None, None, 0
+    return meta, usage, corrupt
+
+
+def usage_digest(workspace: str | None = None) -> UsageDigest:
+    """扫全部会话文件，按工作区聚合 token 用量（"配额花在哪了"）。
+
+    文件收集规则与 list_sessions 一致（工作区子目录 + 分区前的存量平铺），
+    但不设条数上限——账本要的就是全量。workspace 过滤以 meta 为准。
+    """
+    digest = UsageDigest()
+    directory = sessions_dir()
+    if not directory.is_dir():
+        return digest
+    candidates = list(directory.glob("*.jsonl"))
+    if workspace:
+        candidates += list((directory / _workspace_slug(workspace)).glob("*.jsonl"))
+    else:
+        candidates += list(directory.glob("*/*.jsonl"))
+    for path in candidates:
+        meta, usage, corrupt = _tail_usage(path)
+        digest.corrupt += corrupt
+        if meta is None:
+            continue  # 没有 meta 的文件连会话都算不上，与 list_sessions 同口径
+        ws = str(meta.get("workspace", ""))
+        if workspace and ws != workspace:
+            continue
+        by_model = usage.get("by_model") if usage else None
+        if not isinstance(by_model, dict) or not by_model:
+            digest.no_usage += 1
+            continue
+        digest.by_workspace.setdefault(ws, WorkspaceUsage()).add(by_model)
+    return digest
 
 
 # ---------- 命名会话（--session-id）：有则续、无则建 ----------
