@@ -3147,6 +3147,12 @@ class Agent:
         }
         if pending:
             calls = [pending[index] for index in sorted(pending)]
+            #  id 一路都没给的调用（无 index 流的病理形状）补本地 id：重放和
+            #  tool result 都靠 tool_call_id 配对，空 id 两头全断（签名也会因
+            #  没有键可挂而丢）。id 只在本会话内闭环消费，本地合成即自洽
+            for position, call in enumerate(calls):
+                if not call["id"]:
+                    call["id"] = f"call_local_{position}"
             #  分片上攒的 extra_content（Gemini thought_signature）挪进私有键：
             #  留在 tool_call 里会漏进 wire（strip_private 只摘消息级键）。
             #  纪律同 _reasoning——签名是模型私有状态，记下产出路由，
@@ -3154,7 +3160,7 @@ class Agent:
             extras = {
                 call["id"]: extra
                 for call in calls
-                if (extra := call.pop("_extra_content", None)) and call["id"]
+                if (extra := call.pop("_extra_content", None))
             }
             message["tool_calls"] = calls
             if extras:
@@ -3163,6 +3169,21 @@ class Agent:
                     "provider": route.provider,
                     "extras": extras,
                 }
+            else:
+                #  签名型号却一枚签名都没捕到：出声。重放时占位签名会保住请求
+                #  （所以不算坏），但那个逃生舱是给"别家历史"的——自己产的调用
+                #  走到那一步就是捕获回归（上游流形状变了/攒取逻辑坏了），
+                #  静默换占位等于悄悄丢掉模型的思维连续性，必须有第一现场
+                signs = getattr(route.client, "signs_tools", None)
+                if signs is not None and signs(route.model):
+                    self.sink.emit(
+                        Notice(
+                            f"[{route.qualified} 的工具调用没带回 thought_signature——"
+                            "重放将以占位签名顶替（能跑，但模型丢失思维连续性）。"
+                            "若持续出现，多半是上游流形状变了，请上报]",
+                            "warn",
+                        )
+                    )
         if any(item.get("type") == "compaction" for item in reasoning):
             #  服务端刚压缩过：块之前的历史它不再看。本轮 usage 锚点是压缩前还是
             #  压缩后的输入，流式事件里分不清——作废它，下轮 usage 重新落锚，
@@ -3198,6 +3219,10 @@ class Agent:
         reasoning: list[dict[str, Any]],
     ) -> None:
         """逐 chunk 消费流式响应，把正文和 tool_call 分片攒进传入的容器。"""
+        #  无 index 分片归组用：最近写过的一格。不能用 max(pending) 代替——
+        #  编号最大 ≠ 最近在写（带 id 的分片可以把写入点拉回旧格），续错格
+        #  就是把 arguments 拼成一坨坏 JSON
+        last_index: int | None = max(pending) if pending else None
         for chunk in stream:
             #  库层嵌入：宿主的 interrupt() 在这个边界被发现。抛
             #  Interrupted（KeyboardInterrupt 子类）复用 _stream_once 里
@@ -3249,24 +3274,34 @@ class Agent:
             for fragment in delta.tool_calls or []:
                 index = fragment.index
                 if index is None:
-                    #  个别兼容端点（Gemini）的分片不带 index：带新 id 的分片各成
-                    #  一路，其余续接最近一路——否则并行调用会被归进同一格，
-                    #  arguments 拼成一坨坏 JSON（2026-08-24 实测）
-                    index = next(
-                        (i for i, c in pending.items() if fragment.id and c["id"] == fragment.id),
-                        None,
-                    )
-                    if index is None:
-                        index = (max(pending) + 1 if fragment.id else max(pending)) if pending else 0
+                    #  个别兼容端点（Gemini）的分片不带 index，按 id 归组
+                    #  （2026-08-24 实测形状：新调用首分片带新 id，续片无 id）：
+                    #  ① 带 id：先找同 id 的一格续接；找不到而最近一格**还没有
+                    #    id**，就认领它——那是"首分片没给 id、id 迟到"的形状，
+                    #    另开新格会把一路调用劈成两半（一半还配不上 result）；
+                    #  ② 无 id：续最近写过的一格（last_index，见上）。
+                    if fragment.id:
+                        index = next(
+                            (i for i, c in pending.items() if c["id"] == fragment.id), None
+                        )
+                        if index is None and last_index is not None and not pending[last_index]["id"]:
+                            index = last_index
+                        if index is None:
+                            index = max(pending) + 1 if pending else 0
+                    else:
+                        index = last_index if last_index is not None else 0
                 slot = pending.setdefault(
                     index,
                     {"id": "", "type": "function", "function": {"name": "", "arguments": ""}},
                 )
+                last_index = index
                 if fragment.id:
                     slot["id"] = fragment.id
                 #  Gemini 的 thought_signature 随分片挂在 extra_content 上：先攒在
-                #  这一格里，message 落定时挪进 _tool_extras 私有键（见调用方）
-                if extra := getattr(fragment, "extra_content", None):
+                #  这一格里，message 落定时挪进 _tool_extras 私有键（见调用方）。
+                #  先到先得（同 name 的纪律）：签名实测只随首个分片来一次，后续
+                #  分片若再挂个别的 truthy blob，不能把真签名冲掉
+                if (extra := getattr(fragment, "extra_content", None)) and "_extra_content" not in slot:
                     slot["_extra_content"] = extra
                 if fragment.function is None:
                     continue

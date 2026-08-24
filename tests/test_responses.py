@@ -524,6 +524,31 @@ class TestToolSignatures(unittest.TestCase):
             self.assertNotIn("extra_content", call)
         self.assertNotIn(responses.TOOL_EXTRAS_KEY, sent["messages"][1])
 
+    def test_stale_extras_that_match_no_call_get_placeholder(self) -> None:
+        """extras 非空但一个 call id 都盖不到（id 漂移/捕获缺口）＝没有签名：
+        必须照走占位分支——否则当前轮整条无签名出网，正是占位分支要防的 400。"""
+        history = self.history()
+        history[1][responses.TOOL_EXTRAS_KEY]["extras"] = {"drifted": self.SIG}
+        sent = self.send("gemini-3.7-flash", "gemini", history)
+        for call in sent["messages"][1]["tool_calls"]:
+            self.assertEqual(
+                call["extra_content"],
+                {"google": {"thought_signature": responses.DUMMY_SIGNATURE}},
+            )
+
+    def test_with_options_copy_keeps_provider_for_restore(self) -> None:
+        """with_options 副本必须原样带走 provider：丢了则副本上路由比对永远不中，
+        签名型号自己产的真签名会被占位签名整段盖掉——比不还原更糟。"""
+        inner = FakeClient(FakeResponses())
+        copy = Transport(
+            inner, (), provider="gemini", signature_models=("*",)
+        ).with_options(timeout=1)
+        copy.chat.completions.create(model="gemini-3.7-flash", messages=self.history())
+        sent = copy._inner.chat.completions.calls[0]
+        calls = sent["messages"][1]["tool_calls"]
+        self.assertEqual(calls[0]["extra_content"], self.SIG)
+        self.assertNotIn("extra_content", calls[1])
+
 
 class TestReasoningPassthrough(unittest.TestCase):
     ITEM = {"type": "reasoning", "id": "rs_1", "encrypted_content": "ENC"}

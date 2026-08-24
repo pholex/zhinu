@@ -18,6 +18,7 @@ DeepSeek 官方名（deepseek-v4-pro / deepseek-v4-flash）和网关侧完全一
 from __future__ import annotations
 
 import os
+import sys
 import threading
 from dataclasses import dataclass, field
 from typing import Any
@@ -724,6 +725,18 @@ def _vision_override(name: str) -> bool:
     return WILDCARD in allowed or name in allowed or name.rpartition("/")[2] in allowed
 
 
+def _signature_override() -> tuple[str, ...]:
+    """`XIAOYU_SIGNATURE_MODELS=gemini-3.7-flash`（`*` = 一律）：网关路由的签名开关。
+
+    道理同 XIAOYU_VISION_MODELS：内置 preset 的 signature_models 只写实测过的，
+    而"我的网关后面挂着 Gemini 系签名型号"是用户当场知道、我们无从知道的事实。
+    没有这个开关，网关路由（XIAOYU_BASE_URL）上的签名型号只有换成通用 env
+    provider 重配一条路，而且 400 的报错完全不会指向这里。
+    """
+    raw = os.environ.get("XIAOYU_SIGNATURE_MODELS", "")
+    return tuple(item.strip() for item in raw.split(",") if item.strip())
+
+
 def _generic_names() -> list[str]:
     """从环境变量里发现未内置的厂商。排序固定，保证顺序可预测。"""
     found = set()
@@ -748,7 +761,14 @@ def _make(name: str, config: Config) -> Provider | None:
         key = find_api_key(GATEWAY_KEY_ENVS)
         if not key:
             return None
-        return Provider(GATEWAY, config.base_url, key, (), "网关")
+        return Provider(
+            GATEWAY,
+            config.base_url,
+            key,
+            (),
+            "网关",
+            signature_models=_signature_override(),
+        )
 
     if preset := PRESETS.get(name):
         key = find_api_key(preset.key_envs)
@@ -794,6 +814,16 @@ def _make(name: str, config: Config) -> Provider | None:
     #  型号（自建 Gemini 兼容端点用，见 responses.restore_tool_extras）
     raw_sign = os.environ.get(f"{_GENERIC_PREFIX}{upper}_SIGNATURES", "")
     signatures = tuple(item.strip() for item in raw_sign.split(",") if item.strip())
+    if signatures and protocol in (RESPONSES, ANTHROPIC):
+        #  签名的捕获/还原只存在于 chat 一路（Gemini 只有 OpenAI 兼容层；
+        #  Responses/Anthropic 的分片结构没有 extra_content 的位置）。不出声
+        #  地收下等于让用户拿着一个不生效的开关去排查每轮 400——出声丢弃
+        print(
+            f"[XIAOYU_PROVIDER_{upper}_SIGNATURES 只在 chat 协议生效"
+            f"（当前 PROTOCOL={protocol}），已忽略]",
+            file=sys.stderr,
+        )
+        signatures = ()
     return Provider(
         name,
         base_url,
