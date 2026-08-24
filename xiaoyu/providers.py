@@ -126,11 +126,15 @@ PRESETS: dict[str, Preset] = {
     "zhipu": Preset(
         name="zhipu",
         base_url="https://open.bigmodel.cn/api/paas/v4",
-        models=("glm-5.2",),
+        #  2026-08-24 换代 5.2 → 5.3（滚动替换，同底座后训练升级）。实测：
+        #  tool_calls / 流式 reasoning_content 均通。注意 5.3 思考不可关，
+        #  reasoning_effort 只认 low/high/max（无 medium），不传=服务端默认 max
+        models=("glm-5.3",),
         key_envs=("ZHIPU_API_KEY",),
         label="直连 zhipu",
-        #  ⚠️ glm-5.2 不收图：chat 端点明确 400「messages.content.type 参数非法，
-        #  取值范围 ['text']」。zhipu 的视觉能力在另外的型号上，我们没内置
+        #  ⚠️ glm-5.3 仍不收图（2026-08-24 复测）：chat 端点同款 400「messages.
+        #  content.type 参数非法，取值范围 ['text']」。zhipu 的视觉能力在另外的
+        #  型号上，我们没内置
     ),
     #  —— 海外直连 ——
     "anthropic": Preset(
@@ -644,7 +648,7 @@ def _order() -> list[str]:
 
 
 def _vision_override(name: str) -> bool:
-    """`XIAOYU_VISION_MODELS=glm-5.2,my-gw-model`（`*` = 一律放行）。
+    """`XIAOYU_VISION_MODELS=glm-5.3,my-gw-model`（`*` = 一律放行）。
 
     内置 preset 的 vision_models 必须实测过才敢写（见 PRESETS 上的 ⚠️），
     而"我的网关后面挂着视觉模型"是用户当场就知道、我们无从知道的事实。
