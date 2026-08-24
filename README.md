@@ -115,7 +115,7 @@ auto 档**放行的依据是沙箱，不是信任**——沙箱不可用时自�
 - **长会话不断片**：上下文快满时分层回收，Ctrl-C 随时可继续，`xiaoyu resume` 恢复历史会话
 - **出错自己扛**：限流 / 瞬时错误自动重试，配了降级链就换模型接着跑
 - **多协议**：按型号自动选 chat completions / Responses / Anthropic Messages，推理状态回传与 prompt caching 都用得上
-- **图片输入**：TUI 里 Ctrl-V 贴截图（Windows 上用 Alt-V——终端把 Ctrl-V 留给了文本粘贴）、拖文件进终端；MCP 工具返回的图也送到模型眼前
+- **图片输入**：TUI 里 Ctrl-V 贴截图（Windows 上用 Alt-V——终端把 Ctrl-V 留给了文本粘贴）、拖文件进终端；一次性模式用 `--image 图.png`（可重复）或 `--paste`（取系统剪贴板）随指令发图；MCP 工具返回的图也送到模型眼前
 - **可扩展**：SKILL.md 技能、`pip install` 即挂载的工具包、MCP server（`mcpServers` 格式与主流 agent 客户端通用，含 OSV 检查与 rug-pull 隔离）；MCP 工具默认走检索模式——不塞满 schema，模型用 `search_tool` 按需检索、`use_tool` 调用，几百个工具也不吃上下文
 - **插件包**：`xiaoyu plugin add aws/agent-toolkit-for-aws --name aws-core` 一行装齐技能 + MCP 声明，`plugin update` 拉新。认 [agent-plugins.org](https://agent-plugins.org) 的跨客户端 bundle 格式，社区已有的包直接能用；MCP 声明默认不装，摊出命令行问过才写
 - **多 agent 织造**：声明式 subagent（`agents/*.toml` 放一个文件就多一个可委托的子 agent，带 worktree 隔离与 resume 续跑）；**七襄·并行织造模式**（Qixiang · Parallel-Weave）——召集多名织手横向并行，一个模板 + N 份材料扇出，按输入顺序聚合成带续跑句柄的 report；**斗巧·竞争织造模式**（Douqiao · Contest-Weave）——多名织手互不相通地独立完成同一任务（`models` 参数可让不同厂商模型各织一匹），判官比对择优，以 N 倍投入换质量上限；**宸枢·统筹织造模式**（Chenshu · Sovereign-Weave）——总枢坐镇规划、分派、监督、汇总，大工程拆成 scope 互不重叠的 mission，worker 在独立分支 worktree 里并行推进，评审过闸后合回主干。见 [docs/multi-agent.md](docs/multi-agent.md)

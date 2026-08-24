@@ -21,6 +21,7 @@ from unittest import mock
 from xiaoyu.agent import Usage
 from xiaoyu.cli import (
     build_parser,
+    collect_image_parts,
     compose_prompt,
     make_headless_deny,
     oneshot_frontend,
@@ -261,6 +262,89 @@ class SessionIdFlagTest(unittest.TestCase):
     def test_bad_name_raises_for_caller_to_report(self) -> None:
         with self.assertRaises(ValueError):
             open_session(self.config, "../etc/passwd")
+
+
+#  与 test_media.py 同一份最小 PNG：magic 过 sniff_mime 即可，不需要真图
+PNG = b"\x89PNG\r\n\x1a\n fake bytes"
+
+
+class ImageFlagTest(unittest.TestCase):
+    """--image/--paste：一次性模式的图片入口。
+
+    纪律与管线内回图相反：这里是用户显式要发图，任何一张落空都整单硬报错，
+    不做"发得出几张算几张"，更不做静默降级——显式意图被吞是最难自查的失败。
+    """
+
+    def test_parser_collects_repeatable_images_and_paste(self) -> None:
+        args = build_parser().parse_args(
+            ["--image", "a.png", "--image", "b.png", "--paste", "看图"]
+        )
+        self.assertEqual(args.images, ["a.png", "b.png"])
+        self.assertTrue(args.paste)
+
+    def test_parser_defaults_off(self) -> None:
+        args = build_parser().parse_args(["干活"])
+        self.assertIsNone(args.images)
+        self.assertFalse(args.paste)
+
+    def test_collects_files_into_parts(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            a, b = Path(tmp) / "a.png", Path(tmp) / "b.png"
+            a.write_bytes(PNG)
+            b.write_bytes(PNG + b" second")
+            parts, problem = collect_image_parts([str(a), str(b)], paste=False)
+        self.assertEqual(problem, "")
+        self.assertEqual(len(parts), 2)
+        for part in parts:
+            self.assertEqual(part["type"], "image_url")
+            self.assertTrue(part["image_url"]["url"].startswith("xiaoyu-media://"))
+
+    def test_missing_file_fails_whole_batch(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            ok = Path(tmp) / "ok.png"
+            ok.write_bytes(PNG)
+            parts, problem = collect_image_parts([str(ok), "/nope/missing.png"], paste=False)
+        self.assertEqual(parts, [])
+        self.assertIn("missing.png", problem)
+
+    def test_paste_reads_clipboard_bitmaps_and_image_files(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            shot = Path(tmp) / "shot.png"
+            shot.write_bytes(PNG + b" from file")
+            other = Path(tmp) / "notes.txt"  # 非图片文件不猜用途，跳过
+            other.write_text("x")
+            clip = SimpleNamespace(images=(PNG,), files=(shot, other), problem="")
+            with mock.patch("xiaoyu.cli.media.clipboard", return_value=clip):
+                parts, problem = collect_image_parts(None, paste=True)
+        self.assertEqual(problem, "")
+        self.assertEqual(len(parts), 2)
+
+    def test_paste_reports_clipboard_problem(self) -> None:
+        clip = SimpleNamespace(images=(), files=(), problem="剪贴板里没有图片")
+        with mock.patch("xiaoyu.cli.media.clipboard", return_value=clip):
+            parts, problem = collect_image_parts(None, paste=True)
+        self.assertEqual(parts, [])
+        self.assertIn("剪贴板里没有图片", problem)
+
+    def test_paste_with_only_non_image_files_fails(self) -> None:
+        """剪贴板有内容但没有一张图：也要硬报错，不能空手静默发纯文本。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            doc = Path(tmp) / "notes.txt"
+            doc.write_text("x")
+            clip = SimpleNamespace(images=(), files=(doc,), problem="")
+            with mock.patch("xiaoyu.cli.media.clipboard", return_value=clip):
+                parts, problem = collect_image_parts(None, paste=True)
+        self.assertEqual(parts, [])
+        self.assertIn("没有图片", problem)
+
+    def test_run_once_passes_parts_through(self) -> None:
+        """run_once 的 user_input 放宽为部件列表后，原样交给 agent.send。"""
+        agent = StubAgent()
+        parts = [{"type": "text", "text": "看图"}, {"type": "image_url", "image_url": {"url": "xiaoyu-media://x.png"}}]
+        with contextlib.redirect_stdout(io.StringIO()):
+            code = run_once(agent, parts)
+        self.assertEqual(code, 0)
+        self.assertEqual(agent.sent, [parts])
 
 
 class JsonlSinkTest(unittest.TestCase):

@@ -100,6 +100,18 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("prompt", nargs="*", help="直接执行一条指令后退出（不进交互模式）")
     add_prompt_flag(parser)
+    parser.add_argument(
+        "--image",
+        dest="images",
+        action="append",
+        metavar="PATH",
+        help="随指令附一张图片，可重复（仅一次性模式；交互模式里 Ctrl-V 直接贴）",
+    )
+    parser.add_argument(
+        "--paste",
+        action="store_true",
+        help="把系统剪贴板里的图片随指令一起发（仅一次性模式）",
+    )
     parser.add_argument("--version", action="version", version=f"xiaoyu {__version__}")
     parser.add_argument("--model", help="模型名，默认 deepseek-v4-pro")
     parser.add_argument("--base-url", dest="base_url", help="OpenAI 兼容端点")
@@ -225,6 +237,47 @@ def prompt_words(args: argparse.Namespace) -> list[str]:
     """
     value = getattr(args, "prompt_opt", None)
     return [value, *args.prompt] if value else list(args.prompt)
+
+
+def collect_image_parts(
+    paths: list[str] | None, paste: bool
+) -> tuple[list[dict[str, Any]], str]:
+    """`--image`/`--paste` → 图片部件列表。(parts, 出错原因)，出错即整单失败。
+
+    这里的报错纪律与管线内回图**刻意相反**：MCP 工具回图而模型看不了，降级成
+    一行文字说明（fail-closed 的温和面，一张图不值得掀翻整轮对话）；而这两个
+    旗标是用户**显式**要发图，任何一张落空都硬报错退出——显式意图被静默吞掉
+    是最难自查的失败形态。所以 -- 一张读不了就整单不发，不做"发得出几张算几张"。
+    """
+    parts: list[dict[str, Any]] = []
+    for raw in paths or []:
+        ref, problem = media.accept_file(Path(raw).expanduser())
+        if problem:
+            return [], f"--image {raw}：{problem}"
+        parts.append(media.image_part(ref))
+    if paste:
+        clip = media.clipboard()
+        if clip.problem:
+            return [], f"--paste：{clip.problem}"
+        #  位图（截图）与"复制的图片文件"都收；剪贴板里其它类型的文件不猜用途
+        pasted = 0
+        for data in clip.images:
+            ref, problem = media.accept(data, "剪贴板图片")
+            if problem:
+                return [], f"--paste：{problem}"
+            parts.append(media.image_part(ref))
+            pasted += 1
+        for path in clip.files:
+            if not media.is_image_path(path):
+                continue
+            ref, problem = media.accept_file(path)
+            if problem:
+                return [], f"--paste：{problem}"
+            parts.append(media.image_part(ref))
+            pasted += 1
+        if not pasted:
+            return [], "--paste：剪贴板里没有图片（截图或复制图片文件后再试）"
+    return parts, ""
 
 
 def add_output_format(parser: argparse.ArgumentParser) -> None:
@@ -2348,6 +2401,12 @@ def main(argv: list[str] | None = None) -> int:
     )
 
     #  wire/acp 模式：stdin 是协议通道，绝不能被当成管道指令读掉
+    if (args.images or args.paste) and (args.wire or args.acp):
+        print(
+            ui.error("--image/--paste 只用于一次性模式（wire/acp 走各自协议里的图片通道）"),
+            file=sys.stderr,
+        )
+        return 2
     if args.wire:
         return wire_main(args, workspace_trusted=trust.trusted)
     if args.acp:
@@ -2375,6 +2434,17 @@ def main(argv: list[str] | None = None) -> int:
         output_schema = load_output_schema(args.output_schema)
     except ValueError as exc:
         print(ui.error(str(exc)), file=sys.stderr)
+        return 2
+    if (args.images or args.paste) and not prompt:
+        print(
+            ui.error("--image/--paste 只用于一次性模式（交互模式里用 Ctrl-V 直接贴图）"),
+            file=sys.stderr,
+        )
+        return 2
+    #  图片先落缓存再装配 agent：路径写错/剪贴板没图这类失败要最快报出来
+    image_parts, image_problem = collect_image_parts(args.images, args.paste)
+    if image_problem:
+        print(ui.error(image_problem), file=sys.stderr)
         return 2
 
     workspace = Path(args.workspace).expanduser() if args.workspace else Path.cwd()
@@ -2429,9 +2499,23 @@ def main(argv: list[str] | None = None) -> int:
     resumed = f"已接上会话 {args.session_id}（{len(restored)} 条消息）" if restored else ""
 
     if prompt:
+        user_input: str | list[dict[str, Any]] = prompt
+        if image_parts:
+            #  显式发图撞上不看图的模型：硬报错，不做管线内那种降级说明
+            if not agent.registry.sees_images(config.model):
+                print(
+                    ui.error(
+                        f"当前模型 {config.model} 未声明视觉能力，--image/--paste 发不出去。"
+                        "换视觉模型（如 --model deepseek-v4-flash-vision-exp），"
+                        "或用 XIAOYU_VISION_MODELS 点名放行网关上的视觉模型"
+                    ),
+                    file=sys.stderr,
+                )
+                return 2
+            user_input = [{"type": "text", "text": prompt}, *image_parts]
         if resumed and args.output_format == "text":
             print(ui.secondary(resumed))
-        return run_once(agent, prompt, args.output_format, output_schema)
+        return run_once(agent, user_input, args.output_format, output_schema)
     print(build_banner(model_label(agent), str(config.workspace)))
     if env_files:
         print(ui.secondary("已加载 " + ", ".join(str(p) for p in env_files)))
@@ -2532,7 +2616,7 @@ def acp_main(args: argparse.Namespace) -> int:
 
 def run_once(
     agent: Agent,
-    prompt: str,
+    user_input: str | list[dict[str, Any]],
     output_format: str = "text",
     output_schema: dict[str, Any] | None = None,
 ) -> int:
@@ -2540,7 +2624,7 @@ def run_once(
     if output_schema is not None:
         agent.set_output_schema(output_schema)
     try:
-        agent.send(prompt)
+        agent.send(user_input)
     except KeyboardInterrupt:
         if agent.session_log:
             agent.session_log.event("interrupt")
