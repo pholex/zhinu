@@ -148,6 +148,59 @@ class TestToolCallLoop(AgentTestCase):
         self.assertEqual([entry["tool"] for entry in agent.trace], ["read_file", "list_files"])
         self.assertEqual([m["role"] for m in agent.messages][-3:], ["tool", "tool", "assistant"])
 
+    def test_indexless_fragments_group_by_id(self) -> None:
+        """Gemini 兼容层的分片不带 index（每路调用整只到齐）：必须按 id 各成一路，
+        否则并行调用的 arguments 会被拼成一坨坏 JSON（2026-08-24 实测形状）。"""
+        first = [
+            chunk(tool_calls=[call_fragment(None, "a", "read_file", '{"path": "calc.py"}')]),
+            chunk(tool_calls=[call_fragment(None, "b", "list_files", '{"pattern": "*.py"}')]),
+        ]
+        agent = self.build([first, [chunk(content="都看完了")]])
+        with contextlib.redirect_stdout(io.StringIO()):
+            agent.send("并行看两个")
+        self.assertEqual([entry["tool"] for entry in agent.trace], ["read_file", "list_files"])
+        calls = agent.messages[2]["tool_calls"]
+        self.assertEqual(
+            [call["function"]["arguments"] for call in calls],
+            ['{"path": "calc.py"}', '{"pattern": "*.py"}'],
+        )
+
+    def test_indexless_fragment_without_id_continues_last_slot(self) -> None:
+        """无 index 也无 id 的分片是续传：接到最近一路上，不另起新调用。"""
+        first = [
+            chunk(tool_calls=[call_fragment(None, "a", "read_file", '{"pa')]),
+            chunk(tool_calls=[call_fragment(None, None, None, 'th": "calc.py"}')]),
+        ]
+        agent = self.build([first, [chunk(content="好")]])
+        with contextlib.redirect_stdout(io.StringIO()):
+            agent.send("看一下")
+        self.assertEqual([entry["tool"] for entry in agent.trace], ["read_file"])
+        self.assertTrue(agent.trace[0]["ok"])
+
+    def test_tool_call_extra_content_lands_in_private_key(self) -> None:
+        """Gemini 的 thought_signature 随分片挂在 extra_content 上：要挪进
+        _tool_extras 私有键（带产出路由标签），tool_calls 本体必须干净。"""
+        from xiaoyu.responses import TOOL_EXTRAS_KEY
+
+        signed = call_fragment(0, "call_1", "read_file", '{"path": "calc.py"}')
+        signed.extra_content = {"google": {"thought_signature": "SIG"}}
+        agent = self.build([[chunk(tool_calls=[signed])], [chunk(content="好")]])
+        with contextlib.redirect_stdout(io.StringIO()):
+            agent.send("看一下")
+        assistant = agent.messages[2]
+        self.assertEqual(
+            assistant[TOOL_EXTRAS_KEY],
+            {
+                "model": "main-model",
+                "provider": "gateway",
+                "extras": {"call_1": {"google": {"thought_signature": "SIG"}}},
+            },
+        )
+        #  签名不许留在 tool_call 里：strip_private 只摘消息级键，留着就漏上网
+        self.assertEqual(
+            sorted(assistant["tool_calls"][0]), ["function", "id", "type"]
+        )
+
     def test_malformed_arguments_are_reported_not_crashed(self) -> None:
         first = [chunk(tool_calls=[call_fragment(0, "x", "read_file", "{不是合法 JSON")])]
         agent = self.build([first, [chunk(content="我重试")]])
