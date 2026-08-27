@@ -221,6 +221,9 @@ class _Pending:
     created_at: float
     done: threading.Event = field(default_factory=threading.Event)
     verdict: Any = None
+    #  HTTP 侧回的字面决定（allow / deny）：permission.resolved 事件照这个报，
+    #  消费方 UI 才分得清"放行"与"拒绝"；超时没人回则是 "timeout"
+    decision: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -555,7 +558,7 @@ class _HttpApprover:
                 "（只会再超时一次）。请在回复里说明你需要哪个工具、想做什么，"
                 "把决定留给编排侧。"
             )
-        loop.call_soon_threadsafe(session.mark_resolved, request.id, "resolved")
+        loop.call_soon_threadsafe(session.mark_resolved, request.id, request.decision or "resolved")
         return request.verdict
 
 
@@ -1507,6 +1510,7 @@ def create_app(cfg: ServeConfig):  # noqa: C901 - 路由表天然长，拆开反
             raise HTTPException(status_code=404, detail=f"没有挂起的审批 {request_id!r}（可能已超时）")
         if decision not in ("allow", "deny"):
             raise HTTPException(status_code=400, detail="decision 只能是 allow 或 deny")
+        request.decision = decision
         request.verdict = (
             Allow(note=reason, updated_args=updated_args) if decision == "allow" else Deny(reason)
         )

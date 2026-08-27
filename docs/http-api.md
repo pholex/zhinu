@@ -118,6 +118,9 @@ curl -X POST $BASE/session/$SID/permissions -H "$AUTH" -H 'content-type: applica
 `updated_args` 非空时整体替换本次调用参数再执行——"批准但改写"的通道
 （典型用法：把命令包一层再放行）。
 
+事件流里对应两条：`permission.requested`（字段同 `pending_approvals` 里的一项）与
+`permission.resolved`（`request_id` + `decision`：`allow` / `deny` / `timeout`）。
+
 **超时按拒绝处理**（`--approval-timeout`，默认 300 秒）。这是 fail closed：
 安全闸门宁可多拦一次，不能在没人应答时静默放行。
 
