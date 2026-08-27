@@ -585,6 +585,60 @@ class TestToken(ServeCase):
         self.assertIn("rss_bytes", body["process"])
 
 
+class TestCors(ServeCase):
+    """浏览器 origin 白名单：只对名单里的 origin 发 CORS 头，默认一个都不发。"""
+
+    token = "s3cr3t"
+    EXT = "chrome-extension://abcdefghijklmnopabcdefghijklmnop"
+
+    def test_no_cors_headers_by_default(self):
+        client = self.start("text: 无所谓\n")
+        response = client.options(
+            "/session",
+            headers={"Origin": self.EXT, "Access-Control-Request-Method": "POST"},
+        )
+        self.assertNotIn("access-control-allow-origin", response.headers)
+        response = client.get("/health", headers={"Origin": self.EXT})
+        self.assertNotIn("access-control-allow-origin", response.headers)
+
+    def test_preflight_and_response_for_allowed_origin(self):
+        client = self.start("text: 无所谓\n", cors_origins=(self.EXT,))
+        response = client.options(
+            "/session",
+            headers={
+                "Origin": self.EXT,
+                "Access-Control-Request-Method": "POST",
+                "Access-Control-Request-Headers": "authorization,content-type",
+                #  Chrome 从扩展/公网 origin 访问回环地址时多带的 PNA 预检
+                "Access-Control-Request-Private-Network": "true",
+            },
+        )
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.headers["access-control-allow-origin"], self.EXT)
+        self.assertIn("authorization", response.headers["access-control-allow-headers"].lower())
+        self.assertEqual(response.headers["access-control-allow-private-network"], "true")
+        #  实际请求：CORS 头照发，token 仍照常校验（CORS 不是鉴权）
+        response = client.post("/session", json={}, headers={"Origin": self.EXT})
+        self.assertEqual(response.status_code, 401)
+        self.assertEqual(response.headers["access-control-allow-origin"], self.EXT)
+        response = client.post("/session", json={}, headers={"Origin": self.EXT, **self.headers()})
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.headers["access-control-allow-origin"], self.EXT)
+
+    def test_other_origin_gets_nothing(self):
+        client = self.start("text: 无所谓\n", cors_origins=(self.EXT,))
+        response = client.options(
+            "/session",
+            headers={
+                "Origin": "https://evil.example",
+                "Access-Control-Request-Method": "POST",
+                "Access-Control-Request-Private-Network": "true",
+            },
+        )
+        self.assertNotIn("access-control-allow-origin", response.headers)
+        self.assertNotIn("access-control-allow-private-network", response.headers)
+
+
 class TestOpenApi(ServeCase):
     def test_schema_covers_the_orchestration_surface(self):
         #  Dify 自定义工具直接吃这份 schema：端点少一个，编排侧就少一块能力

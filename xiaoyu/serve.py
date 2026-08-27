@@ -186,6 +186,10 @@ class ServeConfig:
     #  `~/.xiaoyu/serve/<root slug>/`。persist=False 时全在内存（测试 / 一次性跑）。
     state_dir: Path | None = None
     persist: bool = True
+    #  允许跨源（CORS）的浏览器 origin 白名单，如 `chrome-extension://<id>`、
+    #  `https://console.example.com`。空 = 不发任何 CORS 头（非浏览器客户端不需要）。
+    #  只是"浏览器肯不肯把响应交给页面脚本"的门，不是鉴权——token 仍照常校验。
+    cors_origins: tuple[str, ...] = ()
 
     def resolved_state_dir(self) -> Path:
         if self.state_dir is not None:
@@ -600,6 +604,63 @@ def build_agent(
     return agent, manager
 
 
+def _install_cors(app: Any, origins: tuple[str, ...]) -> None:
+    """给白名单里的浏览器 origin 发 CORS 头（含 Chrome 的 Private Network Access 预检）。
+
+    典型消费方是浏览器扩展 / 自研 Web 控制台：它们的脚本跑在另一个 origin 上，
+    没有这些头浏览器会把响应拦在页面脚本之外（请求其实到了服务端）。
+    非浏览器客户端（curl / n8n / SDK）从不看这些头，所以默认一个都不发。
+
+    `allow_credentials=False`：凭据走 `Authorization` / `X-Xiaoyu-Token` 头，
+    不用 cookie；这样也就不必为 `*` 通配开口子。
+    """
+    from starlette.middleware.cors import CORSMiddleware
+
+    allowed = tuple(o.rstrip("/") for o in origins)
+
+    class _PrivateNetworkAccess:
+        """Chrome 从"公网/扩展"origin 访问回环地址会多发一次 PNA 预检，要求响应带
+        `Access-Control-Allow-Private-Network: true`——CORSMiddleware 不认识它。
+        只对白名单 origin 补，纯 ASGI 包一层，与 CORSMiddleware 各管各的头。"""
+
+        def __init__(self, inner: Any) -> None:
+            self.inner = inner
+
+        async def __call__(self, scope: Any, receive: Any, send: Any) -> None:
+            if scope["type"] != "http":
+                await self.inner(scope, receive, send)
+                return
+            headers = {k.decode("latin-1").lower(): v for k, v in scope.get("headers", [])}
+            origin = headers.get("origin", b"").decode("latin-1").rstrip("/")
+            wants = headers.get("access-control-request-private-network", b"").lower() == b"true"
+            if not (wants and origin in allowed):
+                await self.inner(scope, receive, send)
+                return
+
+            async def send_with_pna(message: Any) -> None:
+                if message["type"] == "http.response.start":
+                    message = {
+                        **message,
+                        "headers": [
+                            *message.get("headers", []),
+                            (b"access-control-allow-private-network", b"true"),
+                        ],
+                    }
+                await send(message)
+
+            await self.inner(scope, receive, send_with_pna)
+
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=list(allowed),
+        allow_credentials=False,
+        allow_methods=["*"],
+        allow_headers=["Authorization", "Content-Type", "X-Xiaoyu-Token"],
+        max_age=600,
+    )
+    app.add_middleware(_PrivateNetworkAccess)
+
+
 def create_app(cfg: ServeConfig):  # noqa: C901 - 路由表天然长，拆开反而更难读
     """构造 FastAPI app。抽成函数是为了让测试与 --print-openapi 不必起服务。"""
     try:
@@ -666,6 +727,8 @@ def create_app(cfg: ServeConfig):  # noqa: C901 - 路由表天然长，拆开反
     )
     #  会话注册表挂到 app.state：测试 / 运维脚本可直接查会话对象（包括私有 MCP manager）
     app.state.sessions = sessions
+    if cfg.cors_origins:
+        _install_cors(app, cfg.cors_origins)
 
     # ---------- 鉴权 ----------
 
