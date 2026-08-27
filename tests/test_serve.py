@@ -309,6 +309,11 @@ class TestApproval(ServeCase):
         TestBasics._wait_for(self, session_id, "finished")
         self.assertIn("tool.completed", self.kinds(session_id))
         self.assertTrue((self.root / "新文件.txt").exists())
+        resolved = [
+            item for item in self.events(session_id, limit=2000) if item["kind"] == "permission.resolved"
+        ]
+        #  事件报的是 HTTP 侧回的字面决定，不是笼统的 "resolved"——UI 靠它区分放行/拒绝
+        self.assertEqual([item["decision"] for item in resolved], ["allow"])
 
     def test_deny_reaches_the_model_and_blocks_the_write(self):
         self.start(self.SCRIPT)
