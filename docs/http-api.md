@@ -328,6 +328,10 @@ agent 对象、会话清单、会话日志默认落盘在 `~/.xiaoyu/serve/<root
 - folder trust 非交互判定（与 `--acp` 同一纪律）：没信任记录的目录不吃工作区级
   `.mcp.json` / `permissions` / `.env`，也绝不在协议通道上发问
 - 要暴露到公网就自己在前面放反代 + TLS。这个服务本身不做 TLS，也不做限流
+- 默认**不发 CORS 头**。浏览器里跑的客户端（浏览器扩展、自研 Web 控制台）要用
+  `--cors-origin chrome-extension://<id>`（可重复）把它的 origin 加进白名单——这只是
+  "浏览器肯不肯把响应交给页面脚本"的门，token 仍照常校验。Chrome 访问回环地址的
+  Private Network Access 预检也一并应答
 
 ---
 

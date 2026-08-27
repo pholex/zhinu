@@ -1330,6 +1330,15 @@ def serve_command(argv: list[str]) -> int:
         "http=只收远端 Streamable HTTP；all=stdio 也收（会在本机、沙箱之外起子进程）",
     )
     parser.add_argument(
+        "--cors-origin",
+        dest="cors_origins",
+        action="append",
+        default=[],
+        metavar="ORIGIN",
+        help="允许跨源访问的浏览器 origin（可重复），如 chrome-extension://<id> 或 "
+        "https://console.example.com。默认不发 CORS 头；非浏览器客户端不需要。token 仍照常校验",
+    )
+    parser.add_argument(
         "--state-dir",
         dest="state_dir",
         help="agent 对象 / 会话清单 / 会话日志的落盘目录，默认 ~/.xiaoyu/serve/<root slug>/",
@@ -1377,6 +1386,7 @@ def serve_command(argv: list[str]) -> int:
         max_sessions=max(1, args.max_sessions),
         mcp=args.mcp,
         agent_mcp=args.agent_mcp,
+        cors_origins=tuple(args.cors_origins),
         state_dir=Path(args.state_dir).expanduser().resolve() if args.state_dir else None,
         persist=args.persist,
     )
