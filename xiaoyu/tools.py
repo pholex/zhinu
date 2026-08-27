@@ -21,6 +21,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -541,6 +542,9 @@ class Toolbox:
         self._spills: dict[str, dict[str, Any]] = {}
         #  连续 read_file 次数，用于引导改用 explore
         self._read_streak = 0
+        #  非 MCP 工具产出的图片（浏览器桥的截图等）：与 MCP 那份一起由 take_media 取走
+        self._media: list[dict[str, Any]] = []
+        self._media_lock = threading.Lock()
         self._register_builtins()
         #  插件工具排在所有内置工具之后（注册顺序 = 请求里的工具顺序 = prompt cache
         #  的前缀资产，内置/扩展分区拼接——插件变动不影响内置前缀）。
@@ -876,12 +880,20 @@ class Toolbox:
         return f"{output}\n\n{note}" if note else output
 
     def take_media(self) -> list[dict[str, Any]]:
-        """本批工具调用产出的图片部件（取完即清）。目前只有 MCP 工具会产出。
+        """本批工具调用产出的图片部件（取完即清）。来源：MCP 工具，以及经 push_media 交图的进程内工具（浏览器桥截图）。
 
         走 Toolbox 中转而不是让 agent 直接问 mcp：子 agent / 受限工具集
         （only=READONLY）根本没有 _mcp，调用方不该为此写分支。
         """
-        return self._mcp.take_media() if self._mcp is not None else []
+        with self._media_lock:
+            own, self._media = self._media, []
+        remote = self._mcp.take_media() if self._mcp is not None else []
+        return own + remote
+
+    def push_media(self, part: dict[str, Any]) -> None:
+        """进程内工具交一张图（`media.image_part(ref)`），下一次 take_media 一并取走。"""
+        with self._media_lock:
+            self._media.append(part)
 
     @property
     def mcp_manager(self) -> Any:

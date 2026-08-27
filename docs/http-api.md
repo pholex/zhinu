@@ -332,6 +332,9 @@ agent 对象、会话清单、会话日志默认落盘在 `~/.xiaoyu/serve/<root
   `--cors-origin chrome-extension://<id>`（可重复）把它的 origin 加进白名单——这只是
   "浏览器肯不肯把响应交给页面脚本"的门，token 仍照常校验。Chrome 访问回环地址的
   Private Network Access 预检也一并应答
+- 浏览器桥（`/session/{id}/browser`）是反过来的：扩展连上来后 agent 能操作**用户登录态的
+  浏览器**。写类动作（开页 / 跳转 / 点击 / 输入）默认走审批回路，只读三件免审；
+  token 在第一帧里校验，会话私有，断线即注销——见 [docs/browser-bridge.md](browser-bridge.md)
 
 ---
 
@@ -355,6 +358,7 @@ agent 对象、会话清单、会话日志默认落盘在 `~/.xiaoyu/serve/<root
 | POST | `/session/{id}/budget` | 改/撤预算（`budget_reached` 后的出路） |
 | POST | `/session/{id}/abort` | 打断这一轮（不杀会话） |
 | POST | `/session/{id}/steer` | 向进行中的一轮插话（会话空闲时 `409`） |
+| WS | `/session/{id}/browser` | 浏览器桥：浏览器扩展连上来，agent 就能读页 / 点击 / 截图（[docs/browser-bridge.md](browser-bridge.md)） |
 | POST | `/mcp` | 同一会话层的 MCP server 面（[docs/mcp-server.md](mcp-server.md)，`--no-mcp` 可关） |
 
 ## 并发与限额

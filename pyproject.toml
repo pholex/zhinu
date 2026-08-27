@@ -49,6 +49,8 @@ browser = [
 serve = [
     "fastapi==0.141.1",
     "uvicorn==0.52.3",
+    # 浏览器桥的 WebSocket（uvicorn 不带 ws 实现，缺它 /session/{id}/browser 握手直接 500）
+    "websockets==17.1",
 ]
 
 [project.urls]
