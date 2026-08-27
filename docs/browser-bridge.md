@@ -24,7 +24,10 @@ xiaoyu serve                                       浏览器扩展
   不放 URL（会进日志）。`hello` 之前的任何其它帧 → 关闭码 `4401`
 - 一个会话同一时刻只接一条桥连接；后来的把先来的顶掉（用户重开侧栏时旧连接可能还没死）
 - 会话关闭 → 服务端发 `bye` 后关闭；扩展断线 → 该会话的浏览器工具立即注销、在途调用报错
-- 心跳：服务端每 20s 发 WebSocket ping，扩展照标准 pong 即可；30s 没 pong 视为断线
+- 心跳：服务端每 20s 发 WebSocket ping（uvicorn 默认），扩展照标准 pong 即可；20s 没 pong 视为断线
+- 关闭码（应用段）：`4401` 未鉴权 / 第一帧不是 hello / 10s 内没发 hello；`4404` 未知会话；
+  `4409` 被更新的连接顶掉；`4410` 会话已关闭。后两种前面都有 `bye`——扩展收到 `bye` 或
+  `error` 就别再重连，其它关闭才按断线重连
 
 ## 报文（JSON 文本帧）
 
@@ -41,15 +44,17 @@ xiaoyu serve                                       浏览器扩展
 服务端 → 扩展：
 
 ```jsonc
-{"type": "hello.ok", "session_id": "…", "registered": ["browser_tabs", …]}  // 实际注册上的（未知名字被忽略并列在 ignored）
+{"type": "hello.ok", "session_id": "…", "registered": ["browser_tabs", …],   // 实际注册上的，顺序按服务端清单
+ "ignored": ["…"], "timeout": 60}                                             // 未知名字；服务端等 result 的秒数
 {"type": "error", "message": "token 不对"}                                   // 随后关闭
 {"type": "call", "id": "c1", "tool": "browser_click", "args": {"ref": "e12"}, "timeout": 60}
-{"type": "bye", "reason": "session closed"}
+{"type": "bye", "reason": "session closed"}                                   // 或 "replaced by a newer connection"
 ```
 
 - `id` 由服务端生成，`result` 原样带回；一个 `call` 恰好对应一个 `result`
-- `timeout`（秒）是服务端等 `result` 的上限，超时按工具错误回给模型；扩展应尽量在此之前
-  回 `ok:false`，而不是让它超时
+- `timeout`（秒）是服务端等 `result` 的上限（`--browser-timeout`，默认 60），超时按工具错误
+  回给模型；扩展应尽量在此之前回 `ok:false`，而不是让它超时。别把它调到 30 以下：
+  `browser_navigate` / `browser_open` 要等页面 load，扩展侧的等待上限就有 20s
 - `content` 是给模型看的文本；`image` 可选，仅 `browser_screenshot` 用
 
 ## 工具清单（v1，名字与 schema 由服务端定义）
@@ -77,6 +82,10 @@ xiaoyu serve                                       浏览器扩展
 
 ## 服务端行为
 
+- `GET /session/{id}/status` 的 `browser` 字段：`null` = 没连桥；否则
+  `{"connected": true, "client": "xiaoyu-chrome/0.1.0", "tools": [...], "in_flight": 0}`
+- 事件流多两种：`browser.connected`（带 `client` / `tools`）与 `browser.disconnected`
+
 - 扩展 `hello` 后，`supports` ∩ 清单 才注册进**该会话**的 Toolbox；模型看到的工具描述、
   schema 全部来自服务端，扩展只声明"我做得了哪些"
 - 调用 = 经 socket 发 `call` → 工作线程阻塞等 `result`（与审批同一等法）→ 文本（及图片）
@@ -92,3 +101,5 @@ xiaoyu serve                                       浏览器扩展
   拿不到用户的登录态，且要用户改启动参数。验证想法可以先挂它当 MCP server
 - **不做「录制回放」/ 宏**：那是另一类产品
 - **不做跨会话共享的浏览器**：会话私有是纪律
+- **不做按工具分别的超时**：一个 `timeout` 覆盖全部；扩展知道每个工具自己要等多久，
+  在上限之前自己回 `ok:false` 即可

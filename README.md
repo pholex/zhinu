@@ -122,7 +122,7 @@ auto 档**放行的依据是沙箱，不是信任**——沙箱不可用时自�
 - **多会话并行**：一个终端跑长任务，另一个终端 `xiaoyu send <会话名> "..."` 递话，对方在下个步骤边界收进上下文；模型自己也会用——直接说"看看还有哪些会话""让 api-1 帮我查一下"，发信前问你一次
 - **可平台化**：三张脸（一次性执行 / 嵌入 SDK / `serve`）共用同一套事件流、审批回路、`output_schema` 结构化收尾与边界；宿主把业务动作包成 MCP server 挂到 agent 对象上，审批走宿主自己的 UI——选型与样本见 [docs/platform.md](docs/platform.md)、[examples/ops-console](examples/ops-console/)
 - **可嵌入**：`import xiaoyu` 顶层导出即公开 API（`Agent` / `AsyncAgent` / `Allow` / `Deny` / 事件类型……，按 semver 维护、破坏性变更走弃用期），把 agent 当执行引擎嵌进你自己的进程（异步审批、事件流、会话复用）；跨语言用 `--wire` 的 stdio JSON-RPC——契约与示例见 [docs/embedding.md](docs/embedding.md)
-- **可编排**：`xiaoyu serve` 起 HTTP API，n8n / Dify / 自研调度直接驱动（异步提交 + 状态轮询 + 事件游标，需要放行的工具调用挂起等 HTTP 回决定）。OpenAPI schema 由代码生成，贴给 Dify 自定义工具即用——见 [docs/http-api.md](docs/http-api.md)。同一服务还在 `/mcp` 挂着 **agent 级 MCP server**（`xiaoyu` / `xiaoyu_reply` / `xiaoyu_close` 三工具，streamable HTTP），LangChain / LangGraph 经官方 `langchain-mcp-adapters` 即插即用，其它 MCP client 同理——见 [docs/mcp-server.md](docs/mcp-server.md)
+- **可编排**：`xiaoyu serve` 起 HTTP API，n8n / Dify / 自研调度直接驱动（异步提交 + 状态轮询 + 事件游标，需要放行的工具调用挂起等 HTTP 回决定）。OpenAPI schema 由代码生成，贴给 Dify 自定义工具即用——见 [docs/http-api.md](docs/http-api.md)。同一服务还在 `/mcp` 挂着 **agent 级 MCP server**（`xiaoyu` / `xiaoyu_reply` / `xiaoyu_close` 三工具，streamable HTTP），LangChain / LangGraph 经官方 `langchain-mcp-adapters` 即插即用，其它 MCP client 同理——见 [docs/mcp-server.md](docs/mcp-server.md)。**浏览器桥**：浏览器扩展连上同一服务，agent 就能在用户登录态的浏览器里读页 / 点击 / 截图，写类动作走审批——见 [docs/browser-bridge.md](docs/browser-bridge.md)
 - **浏览器**：推荐挂 chrome-devtools MCP；内置 `[browser]` 是纯 pip 的兜底，`playwright install chromium` 后即用
 
 ---

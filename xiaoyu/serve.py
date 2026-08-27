@@ -95,8 +95,11 @@ from typing import Any
 #  其余 fastapi 名字（Body/Query/Header/Depends）都只作默认值用，不受影响。
 try:
     from starlette.requests import Request
+    from starlette.websockets import WebSocket, WebSocketDisconnect
 except ImportError:  # pragma: no cover - 没装 [serve] 时 create_app 会先抛 ServeUnavailable
     Request = Any  # type: ignore[assignment,misc]
+    WebSocket = Any  # type: ignore[assignment,misc]
+    WebSocketDisconnect = Exception  # type: ignore[assignment,misc]
 
 from . import diagnostics, folder_trust, mcp, mcp_guard
 from .agent import Agent, Allow, Deny
@@ -104,6 +107,15 @@ from .config import Config, MissingConfig
 from .embedding import AsyncAgent, RunCompleted
 from .events import UIEvent
 from .permissions import Permissions
+from .serve_browser import (
+    CLOSE_NOT_FOUND,
+    CLOSE_REPLACED,
+    CLOSE_UNAUTHORIZED,
+    DEFAULT_CALL_TIMEOUT,
+    HELLO_TIMEOUT,
+    BrowserBridge,
+    token_matches,
+)
 from .serve_state import (
     AgentStore,
     Budget,
@@ -190,6 +202,8 @@ class ServeConfig:
     #  `https://console.example.com`。空 = 不发任何 CORS 头（非浏览器客户端不需要）。
     #  只是"浏览器肯不肯把响应交给页面脚本"的门，不是鉴权——token 仍照常校验。
     cors_origins: tuple[str, ...] = ()
+    #  浏览器桥（/session/{id}/browser）：等扩展回一次调用结果的上限（秒）
+    browser_timeout: float = DEFAULT_CALL_TIMEOUT
 
     def resolved_state_dir(self) -> Path:
         if self.state_dir is not None:
@@ -352,6 +366,8 @@ class _Session:
         self.pending: dict[str, _Pending] = {}
         self._pending_lock = threading.Lock()
         self._task: asyncio.Task | None = None
+        #  浏览器桥（扩展连上才有；断开即 None）。工具随连接注册/注销
+        self.bridge: BrowserBridge | None = None
 
     # ---------- 挂起的审批（跨线程，一律走这三个口） ----------
 
@@ -456,6 +472,7 @@ class _Session:
             "budget": self.budget.to_dict() if self.budget else None,
             "budget_reason": self.budget_reason,
             "pending_approvals": [item.to_dict() for item in self.snapshot_pending()],
+            "browser": self.bridge.info() if self.bridge is not None else None,
             "next_seq": self.next_seq,
             "first_seq": self.first_seq,
             "dropped_events": self.dropped,
@@ -1010,6 +1027,12 @@ def create_app(cfg: ServeConfig):  # noqa: C901 - 路由表天然长，拆开反
         sessions.pop(session.id, None)
         SESSIONS_LIVE.set(len(sessions))
         manifests.delete(session.id)
+        if session.bridge is not None:
+            bridge, session.bridge = session.bridge, None
+            #  close() 自己先 detach（注销工具、放掉在途调用）再发 bye、关连接；
+            #  这里在事件循环上，排个任务即可，不阻塞关会话
+            with contextlib.suppress(RuntimeError):
+                asyncio.get_running_loop().create_task(bridge.close("session closed"))
         if session.agent.session_log:
             session.agent.session_log.close("closed")
         if session.mcp_manager is not None:
@@ -1395,6 +1418,59 @@ def create_app(cfg: ServeConfig):  # noqa: C901 - 路由表天然长，拆开反
                         yield ": keep-alive\n\n"
 
         return StreamingResponse(pump(), media_type="text/event-stream")
+
+    @app.websocket("/session/{session_id}/browser")
+    async def session_browser(ws: WebSocket, session_id: str) -> None:
+        """浏览器桥（docs/browser-bridge.md）。鉴权在第一帧 hello 里：浏览器的 WebSocket
+        发不了自定义头，token 又不该进 URL / 日志。
+
+        `ws: WebSocket` 与上面 `request: Request` 同一个坑：注解必须在模块全局解析得到，
+        否则 FastAPI 把 ws 当查询参数，握手直接被关（close 1000，连 accept 都没有）。"""
+        await ws.accept()
+        try:
+            hello = await asyncio.wait_for(ws.receive_json(), HELLO_TIMEOUT)
+        except (asyncio.TimeoutError, WebSocketDisconnect, ValueError, RuntimeError):
+            with contextlib.suppress(Exception):
+                await ws.close(code=CLOSE_UNAUTHORIZED)
+            return
+        if (
+            not isinstance(hello, dict)
+            or hello.get("type") != "hello"
+            or not token_matches(hello.get("token"), cfg.token)
+        ):
+            with contextlib.suppress(Exception):
+                await ws.send_json({"type": "error", "message": "第一帧必须是 hello，且 token 要对"})
+                await ws.close(code=CLOSE_UNAUTHORIZED)
+            return
+        session = sessions.get(session_id)
+        if session is None:
+            with contextlib.suppress(Exception):
+                await ws.send_json({"type": "error", "message": f"未知 session_id {session_id!r}"})
+                await ws.close(code=CLOSE_NOT_FOUND)
+            return
+        #  一个会话只接一条桥：用户重开侧栏时旧连接可能还没死，后来的顶掉先来的
+        if session.bridge is not None:
+            await session.bridge.close("replaced by a newer connection", code=CLOSE_REPLACED)
+        bridge = BrowserBridge(
+            session.id, session.agent.toolbox, asyncio.get_running_loop(), cfg.browser_timeout
+        )
+        session.bridge = bridge
+        await bridge.attach(ws, hello)
+        session.publish("browser.connected", client=bridge.client, tools=list(bridge.registered))
+        try:
+            while True:
+                frame = await ws.receive_json()
+                if isinstance(frame, dict):
+                    bridge.handle_frame(frame)
+        except WebSocketDisconnect:
+            pass
+        except Exception:  # noqa: BLE001 - 坏 JSON / 连接异常都按断线处理
+            pass
+        finally:
+            if session.bridge is bridge:
+                session.bridge = None
+                bridge.detach("disconnected")
+                session.publish("browser.disconnected")
 
     @app.get(
         "/session/{session_id}/permissions",

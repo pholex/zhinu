@@ -1330,6 +1330,13 @@ def serve_command(argv: list[str]) -> int:
         "http=只收远端 Streamable HTTP；all=stdio 也收（会在本机、沙箱之外起子进程）",
     )
     parser.add_argument(
+        "--browser-timeout",
+        dest="browser_timeout",
+        type=float,
+        default=60.0,
+        help="浏览器桥：等扩展回一次工具调用结果的上限（秒），默认 60（见 docs/browser-bridge.md）",
+    )
+    parser.add_argument(
         "--cors-origin",
         dest="cors_origins",
         action="append",
@@ -1387,6 +1394,7 @@ def serve_command(argv: list[str]) -> int:
         mcp=args.mcp,
         agent_mcp=args.agent_mcp,
         cors_origins=tuple(args.cors_origins),
+        browser_timeout=max(1.0, args.browser_timeout),
         state_dir=Path(args.state_dir).expanduser().resolve() if args.state_dir else None,
         persist=args.persist,
     )
