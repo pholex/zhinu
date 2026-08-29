@@ -334,6 +334,44 @@ STRUCTURED_OUTPUT_NUDGE = (
 #  structured_output 工具名（cli / serve / embedding 三面共用同一个名字）
 STRUCTURED_OUTPUT_TOOL = "structured_output"
 
+#  「只说不做」轻推的回灌文案：模型收尾正文只是一句"我这就去做/一口气跑完"的行动
+#  意图，却没有输出任何 tool_call——文本工具协议下小模型的典型失败（用嘴干活）。
+#  产物对账护栏只抓过去式的假宣称（"已修改 X"），抓不到这种将来式的空承诺。
+#  固定文案，进 SYNTHETIC_USER_TEXTS 被压缩/fork 正确识别。
+PROMISE_WITHOUT_ACTION_NUDGE = (
+    "[系统提示] 你上一条回复只说了你「要做什么」，但本轮没有输出任何 tool_call，"
+    "也就没有真正开始。如果任务还没做完，现在立刻输出工具调用块开始执行，不要只"
+    "描述计划；如果确实已经全部做完，直接给出最终结论。不要再用一句「我这就去做」收尾。"
+)
+
+#  高精度三闸（见 promise_without_action）：短句上限 + 第一人称即将行动的意图 +
+#  排除把决定权交回用户的建议句。cap 取 45：踩过的空承诺都在 10~36 字，真交付几乎
+#  都更长——用长度把"一句话空转"和"有实质内容的收尾"分开。
+PROMISE_CHAR_CAP = 45
+_PROMISE_INTENT = re.compile(
+    r"(现在|这就|马上|立刻|接下来|一口气|我来|我继续|继续|先[^\n]{0,12}(?:然后|再|接着))"
+    r"[^\n]{0,18}?"
+    r"(跑完|跑|做完|做|执行|检查|侦察|扫描|测试|完成|开始|开工|继续|更新计划|收尾)"
+)
+#  排除"把决定权交回用户"的建议句：这是正当的 yield，不是卡壳
+_PROMISE_ADVICE = re.compile(r"你可以|您可以|建议你|建议您|推荐你|你需要|你应该|要不要我|需要我")
+#  正文里带工具调用语法（哪怕没解析成调用）是另一类问题（畸形/裸壳），不归这条管
+_PROMISE_CALLISH = ("<tool_call>", "<function=", "```tool_call")
+
+
+def promise_without_action(text: str) -> bool:
+    """收尾正文是"只说要做、没有工具调用"的空承诺？只做识别；是否该顶回由调用方
+    结合"本轮零工具调用"判定（走到这里的前提就是这一条）。"""
+    stripped = text.strip()
+    if not stripped or len(stripped) > PROMISE_CHAR_CAP:
+        return False
+    if any(marker in stripped for marker in _PROMISE_CALLISH):
+        return False
+    if _PROMISE_ADVICE.search(stripped):
+        return False
+    return bool(_PROMISE_INTENT.search(stripped))
+
+
 #  ---------- 图片代读（vision fallback） ----------
 #  当前模型看不了图、而用户点名了代读模型（XIAOYU_VISION_FALLBACK）时，图片先交给
 #  它换成一段文字，再作为文本进历史——主模型、工具、tool_calls 配对、记账全都不动。
@@ -453,6 +491,7 @@ SYNTHETIC_USER_TEXTS = frozenset(
         CRYSTALLIZE_NUDGE,
         PHANTOM_EDIT_NUDGE,
         STRUCTURED_OUTPUT_NUDGE,
+        PROMISE_WITHOUT_ACTION_NUDGE,
     }
 )
 
@@ -2136,6 +2175,8 @@ class Agent:
         stop_checked = False
         #  结构化输出只催一次：模型坚持用正文收尾就到此为止，消费方拿到 null
         nudged_structured = False
+        #  「只说不做」轻推每轮只顶一次：模型再 narration 一次就放它收尾，不成死循环
+        nudged_promise = False
         #  轮数预算：撞顶可申请延期（见 _offer_extension），总追加量有上限
         steps = 0
         turn_budget = self.config.max_iterations
@@ -2198,6 +2239,23 @@ class Agent:
                             )
                             self._record_operator(PHANTOM_EDIT_NUDGE)
                             continue
+                    #  「只说不做」轻推：正文只是一句行动意图、本轮零工具调用——
+                    #  文本协议下小模型的"用嘴干活"。排在 Stop hook 之前（与产物
+                    #  对账同一位置逻辑：hook 该看到顶回之后的状态）。每轮一次。
+                    if not nudged_promise and promise_without_action(
+                        media.text_of(message.get("content"))
+                    ):
+                        nudged_promise = True
+                        if self.session_log:
+                            self.session_log.event("promise_without_action")
+                        self.sink.emit(
+                            Notice(
+                                "[模型只说了要做什么却没有调用工具，已请它立即开始或如实收尾]",
+                                "warn",
+                            )
+                        )
+                        self._record_operator(PROMISE_WITHOUT_ACTION_NUDGE)
+                        continue
                     #  Stop hook：block 则把理由作为 user 消息顶回去续跑一步
                     if (
                         not stop_checked
