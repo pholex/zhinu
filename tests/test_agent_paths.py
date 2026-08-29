@@ -1493,6 +1493,79 @@ class PhantomEditGuardTest(AgentTestCase):
         self.assertIn(PHANTOM_EDIT_NUDGE, SYNTHETIC_USER_TEXTS)
 
 
+class PromiseWithoutActionTest(AgentTestCase):
+    """「只说不做」轻推：收尾正文只是一句"我这就去做/一口气跑完"的行动意图、本轮
+    零工具调用——顶回一次让它立即开始或如实收尾（每轮最多一次）。"""
+
+    def _nudges(self, agent) -> list[dict]:
+        from xiaoyu.agent import PROMISE_WITHOUT_ACTION_NUDGE
+
+        return [
+            m
+            for m in agent.messages
+            if m.get("role") == "user" and m.get("content") == PROMISE_WITHOUT_ACTION_NUDGE
+        ]
+
+    def test_intent_only_reply_is_nudged_then_continues(self) -> None:
+        script = [
+            [chunk("好，我现在一口气把剩余所有检查跑完。"), usage_chunk(10, 5)],
+            #  被顶回后真正给出结论：本轮结束
+            [chunk("已完成，共发现 2 个高危问题。"), usage_chunk(10, 5)],
+        ]
+        agent = self.build(script)
+        with contextlib.redirect_stdout(io.StringIO()):
+            agent.send("你不用停下来等我，完整做完")
+        self.assertEqual(len(self._nudges(agent)), 1)
+        self.assertEqual(len(self.client.completions.calls), 2)
+
+    def test_nudged_at_most_once_per_turn(self) -> None:
+        script = [
+            [chunk("好，我现在一口气把剩余所有检查跑完。"), usage_chunk(10, 5)],
+            #  模型再 narration 一次：不再顶第二次，放它收尾，不成死循环
+            [chunk("好，继续一口气跑完。"), usage_chunk(10, 5)],
+        ]
+        agent = self.build(script)
+        with contextlib.redirect_stdout(io.StringIO()):
+            agent.send("继续")
+        self.assertEqual(len(self._nudges(agent)), 1)
+        self.assertEqual(len(self.client.completions.calls), 2)
+
+    def test_substantive_reply_not_nudged(self) -> None:
+        agent = self.build([[chunk("`answer` 的值是 42。"), usage_chunk(10, 5)]])
+        with contextlib.redirect_stdout(io.StringIO()):
+            agent.send("answer 是多少")
+        self.assertEqual(self._nudges(agent), [])
+        self.assertEqual(len(self.client.completions.calls), 1)
+
+    def test_advice_to_user_is_a_legit_yield(self) -> None:
+        #  "接下来你可以…"是把决定权交回用户，不是卡壳：不顶回
+        agent = self.build([[chunk("接下来你可以先跑一下测试，再决定要不要修。"), usage_chunk(10, 5)]])
+        with contextlib.redirect_stdout(io.StringIO()):
+            agent.send("下一步")
+        self.assertEqual(self._nudges(agent), [])
+        self.assertEqual(len(self.client.completions.calls), 1)
+
+    def test_real_tool_call_never_reaches_the_guard(self) -> None:
+        #  同一句意图，但这轮真发了工具调用：走的是执行路径，压根不进 not-calls 分支
+        script = [
+            [
+                chunk(tool_calls=[call_fragment(0, "c1", "read_file", json.dumps({"path": "calc.py"}))]),
+                usage_chunk(10, 5),
+            ],
+            [chunk("已读完，结论是 X。"), usage_chunk(10, 5)],
+        ]
+        agent = self.build(script)
+        with contextlib.redirect_stdout(io.StringIO()):
+            agent.send("看看")
+        self.assertEqual(self._nudges(agent), [])
+
+    def test_nudge_is_registered_as_synthetic(self) -> None:
+        from xiaoyu.agent import PROMISE_WITHOUT_ACTION_NUDGE, SYNTHETIC_USER_TEXTS
+
+        self.assertIn(PROMISE_WITHOUT_ACTION_NUDGE, SYNTHETIC_USER_TEXTS)
+        self.assertTrue(PROMISE_WITHOUT_ACTION_NUDGE.startswith("[系统提示]"))
+
+
 class ToolFailureStreakTest(AgentTestCase):
     """失败流：同一工具连续 ERROR（参数各异）第 3 次给"先分析再换道"提示，
     第 5 次起强制收敛；成功或换工具即归零。"""
