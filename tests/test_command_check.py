@@ -6,6 +6,7 @@ import unittest
 
 from xiaoyu.command_check import (
     command_risk,
+    _split_script,
     dangerous_command,
     injection_risk,
     privileged_command,
@@ -168,6 +169,34 @@ class CommandRiskTest(unittest.TestCase):
         self.assertIsNotNone(command_risk("sudo rm -rf /tmp/x"))
         self.assertIsNotNone(command_risk("git -c a.b=c log"))
         self.assertIsNone(command_risk("git status && ls"))
+
+    def test_quoted_connector_not_split_no_false_warning(self):
+        #  引号内的 | && ; 属于参数，不该被当连接符切开（切开会把引号劈成两半
+        #  → 下游 shlex 误判"引号不闭合"）。这是本地模型爱写的交替正则的常见形态。
+        self.assertIsNone(
+            command_risk("grep -oiE 'name=\"[a-z]+\"|formcheck|checkcode' /tmp/a.html | head -20")
+        )
+        self.assertIsNone(command_risk('echo "a && b; c | d"'))
+        #  引号外的连接符照常切成多段
+        self.assertEqual(_split_script("grep x a || grep y b ; ls | wc -l"),
+                         ["grep x a", "grep y b", "ls", "wc -l"])
+
+    def test_quoted_connector_split_keeps_segment_whole(self):
+        self.assertEqual(
+            _split_script("grep -oiE 'a|b|c' f | head"),
+            ["grep -oiE 'a|b|c' f", "head"],
+        )
+
+    def test_genuinely_unbalanced_quote_still_warns(self):
+        #  修复不能把真·不闭合引号也放过：它会一直吃到末尾成一段，shlex 仍如实报
+        self.assertIsNotNone(command_risk('curl -sS -m 10 -A "Mozilla/5.0'))
+
+    def test_escaped_connector_outside_quotes_is_literal(self):
+        self.assertEqual(_split_script(r"echo a \| b"), [r"echo a \| b"])
+
+    def test_dangerous_inside_quotes_not_split_into_false_rm(self):
+        #  引号内的 rm 字样是字面量，不该因切分而被误判——沿用既有 string_literal 精神
+        self.assertIsNone(command_risk('echo "rm -rf / is dangerous"'))
 
 
 if __name__ == "__main__":
