@@ -272,6 +272,38 @@ class TestOrderAndKeys(ProviderTestCase):
             registry = providers.build(config())
         self.assertEqual([p.name for p in registry.providers], [GATEWAY])
 
+    def test_local_gateway_needs_no_key(self) -> None:
+        """本机端点（vLLM / SGLang / Ollama）多半不鉴权：loopback 地址缺 key 时
+        给占位符照常注册，用户不必为 localhost 编一个假 key。"""
+        for url in ("http://localhost:8000/v1", "http://127.0.0.1:11434/v1", "http://[::1]:8000/v1"):
+            with self.subTest(url=url), isolated_env():
+                registry = providers.build(config(base_url=url))
+            self.assertEqual([p.name for p in registry.providers], [GATEWAY])
+            self.assertEqual(registry.get(GATEWAY).api_key, providers.LOCAL_PLACEHOLDER_KEY)
+
+    def test_remote_gateway_still_needs_key(self) -> None:
+        """放开的只有 loopback：远端地址缺 key 仍不注册——漏配 key 的远端端点
+        正是"启动期拦配置错误"要拦的那种，主机名里带 localhost 字样也不算。"""
+        for url in (GW, "https://localhost.example.com/v1", "http://notlocalhost:8000/v1"):
+            with self.subTest(url=url), isolated_env(), self.assertRaises(MissingConfig):
+                providers.build(config(base_url=url))
+
+    def test_local_generic_provider_needs_no_key(self) -> None:
+        """通用 env provider 同一规则：XIAOYU_PROVIDER_LOCAL_BASE_URL 指向本机就免 key，
+        显式给了 key 则以给的为准（本机也可能挂了鉴权反代）。"""
+        env = {
+            "XIAOYU_PROVIDER_LOCAL_BASE_URL": "http://localhost:8000/v1",
+            "XIAOYU_PROVIDER_LOCAL_MODELS": "qwen3-8-27b-fp8",
+        }
+        with isolated_env(env):
+            registry = providers.build(config(base_url=""))
+        self.assertEqual([p.name for p in registry.providers], ["local"])
+        self.assertEqual(registry.resolve("qwen3-8-27b-fp8").provider, "local")
+        self.assertEqual(registry.get("local").api_key, providers.LOCAL_PLACEHOLDER_KEY)
+        with isolated_env({**env, "XIAOYU_PROVIDER_LOCAL_API_KEY": "real"}):
+            registry = providers.build(config(base_url=""))
+        self.assertEqual(registry.get("local").api_key, "real")
+
     def test_gateway_signature_models_env_override(self) -> None:
         """网关后面挂着 Gemini 系签名型号：XIAOYU_SIGNATURE_MODELS 点名放行。
         道理同 XIAOYU_VISION_MODELS——网关后挂了什么只有用户知道，没有这个

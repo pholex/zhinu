@@ -43,7 +43,7 @@ XIAOYU_MODEL=<你网关上的模型名>
 XIAOYU_API_KEY=<key>
 ```
 
-直连和网关至少配一个，两个都配见下方"多 provider"。
+直连和网关至少配一个，两个都配见下方"多 provider"。端点在**本机**（`localhost` / `127.0.0.1` / `::1` / `*.localhost`，如 vLLM、SGLang、Ollama）时 key 可以不填——远端地址缺 key 仍视为没配、不注册。
 
 ## 变量总表
 
@@ -167,6 +167,8 @@ XIAOYU_PROVIDER_MINIMAX_VISION=*                             # 声明视觉能�
 XIAOYU_PROVIDER_MINIMAX_TOOLS=text                           # 默认 native；端点不会 function calling 时设 text
 XIAOYU_PROVIDER_MINIMAX_SIGNATURES=*                         # 工具调用重放需带回 thought_signature 的型号（Gemini 系端点用；仅 chat 协议生效，配上 PROTOCOL=responses/anthropic 会出声忽略）
 ```
+
+本机端点免 key 的规则同网关：`_BASE_URL` 指向 `localhost` 时 `_API_KEY` 可省略（显式给了则以给的为准）。
 
 `_PROTOCOL=anthropic` 也适用于 Bedrock Mantle 一类只挂 Claude 原生协议的端点。视觉是 fail-closed 的：**未声明即不发图**，模型会收到一行"有 N 张图但看不了"的说明而不是被静默丢弃。
 
