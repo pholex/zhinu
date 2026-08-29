@@ -12,7 +12,8 @@ chat-completions 形态（assistant.tool_calls + role=tool 配对），压缩切
 
 **协议**（对模型的约定，见 protocol_note）：要调用工具就输出 ```tool_call 代码块，
 块内一个 JSON 对象 `{"name": …, "arguments": {…}}`；也认部分开源模型训练
-时见过的 `<tool_call>…</tool_call>` 标签。工具结果以 `<tool_result>` 包着、作为
+时见过的 `<tool_call>…</tool_call>` 标签，以及标签内 Qwen 等开源模型原生方言
+`<function=名字>…</function>`（名字在壳上、参数是块内 JSON 或 <parameter> 子标签）。工具结果以 `<tool_result>` 包着、作为
 user 消息回灌——role=tool 在不支持工具的 chat template 上多半直接报错。
 
 **流式解析**的关键是"扣住可能是标记开头的尾巴"：正文逐 chunk 往外发，但凡缓冲区
@@ -28,6 +29,7 @@ function calling 能用就别开它。解析失败的块原样留在正文里，
 from __future__ import annotations
 
 import json
+import re
 import uuid
 from typing import Any, Iterator
 
@@ -252,6 +254,52 @@ def _as_call(item: Any) -> dict[str, Any] | None:
     }
 
 
+#  Qwen 等开源模型的原生工具调用方言：<function=名字> … </function>。名字挂在壳上、
+#  不进 JSON，所以 _as_call 那条（名字必须在 JSON 里）永远抠不出来——训练过原生
+#  function calling 的开源模型（Qwen3 等）会我行我素地用这套而非我们教的格式，
+#  逃生舱得认下来才真兜得住。参数两种编码都见过：块内一个 JSON 对象，或
+#  <parameter=键>值</parameter> 子标签（后者是 Qwen coder 模板的形状）。
+_FUNCTION_OPEN = re.compile(r"<function=([A-Za-z0-9_.\-]+)\s*>")
+_PARAMETER = re.compile(r"<parameter=([A-Za-z0-9_.\-]+)\s*>(.*?)</parameter>", re.DOTALL)
+
+
+def _coerce(raw: str) -> Any:
+    """<parameter> 的值是纯文本：能当 JSON 读就读成真类型（数字/布尔/数组），
+    否则原样留字符串。不猜、不修——读不动就保守当字符串。"""
+    raw = raw.strip()
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError:
+        return raw
+
+
+def _wrapped_calls(body: str) -> list[dict[str, Any]]:
+    """块内 <function=名字> 方言 → tool_call（chat completions 形状）。一个块里
+    多个 <function=> 全收（Qwen 会批量）。未闭合的取到末尾（max_tokens 截断）。"""
+    calls: list[dict[str, Any]] = []
+    for match in _FUNCTION_OPEN.finditer(body):
+        name = match.group(1).strip()
+        if not name:
+            continue
+        rest = body[match.end() :]
+        close = rest.find("</function>")
+        inner = rest[:close] if close >= 0 else rest
+        params = _PARAMETER.findall(inner)
+        if params:
+            arguments: dict[str, Any] = {key: _coerce(val) for key, val in params}
+        else:
+            objects = _json_objects(inner)
+            arguments = objects[0] if objects and isinstance(objects[0], dict) else {}
+        calls.append(
+            {
+                "id": f"call_text_{uuid.uuid4().hex[:12]}",
+                "type": "function",
+                "function": {"name": name, "arguments": json.dumps(arguments, ensure_ascii=False)},
+            }
+        )
+    return calls
+
+
 def _blocks(text: str) -> list[tuple[int, int, str]]:
     """找出全部调用块：(起点, 终点, 块内正文)。两种标记混用也认；
     没闭合的块一直到文末（模型可能在闭合前就被 max_tokens 截断）。"""
@@ -285,7 +333,10 @@ def parse_calls(text: str) -> tuple[str, list[dict[str, Any]]]:
     calls: list[dict[str, Any]] = []
     first_start: int | None = None
     for start, _end, body in _blocks(text):
-        parsed = [call for call in map(_as_call, _json_objects(body)) if call]
+        #  先认原生方言（名字在壳上）；不是这套再走"名字在 JSON 里"的原路
+        parsed = _wrapped_calls(body)
+        if not parsed:
+            parsed = [call for call in map(_as_call, _json_objects(body)) if call]
         if parsed and first_start is None:
             first_start = start
         calls.extend(parsed)
