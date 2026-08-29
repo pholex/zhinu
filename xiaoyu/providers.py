@@ -22,6 +22,7 @@ import sys
 import threading
 from dataclasses import dataclass, field
 from typing import Any
+from urllib.parse import urlsplit
 
 from openai import OpenAI
 
@@ -38,6 +39,29 @@ GATEWAY = "gateway"
 #  通用兜底 provider 的环境变量前缀：XIAOYU_PROVIDER_<NAME>_{BASE_URL,API_KEY,MODELS}
 _GENERIC_PREFIX = "XIAOYU_PROVIDER_"
 _GENERIC_SUFFIX = "_BASE_URL"
+
+#  本机端点（vLLM / SGLang / Ollama…）多半不鉴权，但 OpenAI / Anthropic SDK 构造
+#  client 时拒绝空 key，逼用户为 localhost 编一个假 key 是纯噪音。缺 key 且地址
+#  是 loopback 就填占位符；远端端点仍守"没 key 就不注册"——这条纪律的意义是
+#  把配置错误拦在启动期，而漏配 key 的远端地址正是它要拦的那种错误
+LOCAL_PLACEHOLDER_KEY = "local"
+_LOCAL_HOSTS = frozenset({"localhost", "127.0.0.1", "::1", "0.0.0.0"})
+
+
+def is_local_endpoint(base_url: str) -> bool:
+    """base_url 指向本机（loopback / *.localhost）？只看主机名，端口和路径无关。"""
+    try:
+        host = (urlsplit(base_url.strip()).hostname or "").lower()
+    except ValueError:
+        return False
+    return host in _LOCAL_HOSTS or host.endswith(".localhost")
+
+
+def _key_or_local(env_names: tuple[str, ...], base_url: str) -> str | None:
+    """先按名字找 key；找不到而端点在本机就给占位符，否则 None（不注册）。"""
+    if key := find_api_key(env_names):
+        return key
+    return LOCAL_PLACEHOLDER_KEY if is_local_endpoint(base_url) else None
 
 
 @dataclass(frozen=True)
@@ -677,6 +701,7 @@ NO_PROVIDER_HINT = (
     "         / ANTHROPIC_API_KEY / OPENAI_API_KEY / XAI_API_KEY / GEMINI_API_KEY）\n"
     "  3. 走 OpenAI 兼容网关（LiteLLM、vLLM、各家官方 API…）：\n"
     "       XIAOYU_BASE_URL=https://<你的网关>/v1  +  XIAOYU_API_KEY=<key>\n"
+    "       （本机 localhost 端点可以不给 key）\n"
     "  4. 命令行 --base-url https://<你的网关>/v1\n"
     "（以上可同时配：直连优先，网关自动作为同名模型的兜底）"
 )
@@ -758,7 +783,7 @@ def _make(name: str, config: Config) -> Provider | None:
     if name == GATEWAY:
         if not config.base_url:
             return None
-        key = find_api_key(GATEWAY_KEY_ENVS)
+        key = _key_or_local(GATEWAY_KEY_ENVS, config.base_url)
         if not key:
             return None
         return Provider(
@@ -792,7 +817,7 @@ def _make(name: str, config: Config) -> Provider | None:
     base_url = os.environ.get(f"{_GENERIC_PREFIX}{upper}{_GENERIC_SUFFIX}", "").strip()
     if not base_url:
         return None
-    key = find_api_key((f"{_GENERIC_PREFIX}{upper}_API_KEY",))
+    key = _key_or_local((f"{_GENERIC_PREFIX}{upper}_API_KEY",), base_url)
     if not key:
         return None
     raw_models = os.environ.get(f"{_GENERIC_PREFIX}{upper}_MODELS", "")
