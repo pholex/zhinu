@@ -1518,6 +1518,22 @@ class PromiseWithoutActionTest(AgentTestCase):
         self.assertEqual(len(self._nudges(agent)), 1)
         self.assertEqual(len(self.client.completions.calls), 2)
 
+    def test_longer_intent_with_targets_is_nudged(self) -> None:
+        #  列出要抓的目标时空承诺会更长（截图实测 58 字，一度被 cap=45 漏过）：
+        #  cap 放宽到 100 后照样顶回
+        script = [
+            [
+                chunk("一口气跑完。先把首屏完整 HTML 和 robots/sitemap 抓全，同时开始 PbootCMS 已知漏洞面。"),
+                usage_chunk(10, 5),
+            ],
+            [chunk("已抓完首屏，未发现异常。"), usage_chunk(10, 5)],
+        ]
+        agent = self.build(script)
+        with contextlib.redirect_stdout(io.StringIO()):
+            agent.send("一口气跑完")
+        self.assertEqual(len(self._nudges(agent)), 1)
+        self.assertEqual(len(self.client.completions.calls), 2)
+
     def test_nudged_at_most_once_per_turn(self) -> None:
         script = [
             [chunk("好，我现在一口气把剩余所有检查跑完。"), usage_chunk(10, 5)],
