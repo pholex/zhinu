@@ -64,6 +64,33 @@ def _key_or_local(env_names: tuple[str, ...], base_url: str) -> str | None:
     return LOCAL_PLACEHOLDER_KEY if is_local_endpoint(base_url) else None
 
 
+#  XIAOYU_PROVIDER_<NAME>_MODELS=auto 的哨兵：启动时探一次端点 /v1/models、把它
+#  当前 serve 的 model id 自动注册进来。默认路径仍不探测（见 GATEWAY 注释：加
+#  网络往返、且"列得出"≠"调得通"）——auto 是用户显式点名换取"换 model 免改配置"。
+DISCOVER_SENTINEL = "auto"
+#  独立于 request_timeout 的短超时：这是启动路径上的元数据探测，端点没起来就该
+#  很快失败（loopback 连不上是即时的），绝不能把启动卡在生成级的长超时上。
+_DISCOVER_TIMEOUT = 5.0
+
+
+def _discover_models(base_url: str, api_key: str, label: str) -> tuple[str, ...]:
+    """探端点 /v1/models，返回它当前 serve 的 model id（去重排序）。失败/空 → 空
+    元组：调用方据此**跳过注册**，绝不退化成通配（通配的具名 provider 会把一切
+    模型名都吃掉、劫持网关路由）。失败只出声不抛——启动不该因端点没起来而崩。"""
+    try:
+        page = OpenAI(base_url=base_url, api_key=api_key).with_options(
+            timeout=_DISCOVER_TIMEOUT
+        ).models.list()
+        models = tuple(sorted({m.id for m in page if getattr(m, "id", "").strip()}))
+    except Exception as exc:
+        reason = str(exc).splitlines()[0][:160] or type(exc).__name__
+        print(f"[{label}：/v1/models 探测失败，该 provider 本次未注册：{reason}]", file=sys.stderr)
+        return ()
+    if not models:
+        print(f"[{label}：/v1/models 返回空清单，该 provider 本次未注册]", file=sys.stderr)
+    return models
+
+
 @dataclass(frozen=True)
 class Preset:
     """内置的厂商知识：纯数据，一行一家。"""
@@ -821,7 +848,22 @@ def _make(name: str, config: Config) -> Provider | None:
     if not key:
         return None
     raw_models = os.environ.get(f"{_GENERIC_PREFIX}{upper}_MODELS", "")
-    models = tuple(item.strip() for item in raw_models.split(",") if item.strip())
+    if raw_models.strip().lower() == DISCOVER_SENTINEL:
+        #  auto 只对本机端点开：远端仍守"启动不探测"——远端探测有挂起/往返代价，
+        #  显式点名也不放开（要远端就老实列模型名）。本次该 provider 不注册。
+        if not is_local_endpoint(base_url):
+            print(
+                f"[XIAOYU_PROVIDER_{upper}_MODELS=auto 只对本机 localhost 端点生效；"
+                f"远端端点请显式列出模型名。{name} 本次未注册]",
+                file=sys.stderr,
+            )
+            return None
+        models = _discover_models(base_url, key, f"XIAOYU_PROVIDER_{upper}")
+        if not models:
+            #  探测失败/空：跳过而非退化成通配（通配会劫持网关）
+            return None
+    else:
+        models = tuple(item.strip() for item in raw_models.split(",") if item.strip())
     #  未内置的厂商若说的不是 chat，用 PROTOCOL=responses / PROTOCOL=anthropic
     #  自救（后者也是日后 Bedrock Mantle 一类"Claude 只挂原生协议"端点的逃生舱），
     #  不必等我们补 preset。env 这一档是按家开关（要按型号区分就该来提 preset）

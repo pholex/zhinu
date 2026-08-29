@@ -161,7 +161,7 @@ MCP 子进程的环境是**纯白名单**，所以像 aws-mcp 这类要 SigV4 �
 ```ini
 XIAOYU_PROVIDER_MINIMAX_BASE_URL=https://api.minimaxi.com/v1
 XIAOYU_PROVIDER_MINIMAX_API_KEY=<key>
-XIAOYU_PROVIDER_MINIMAX_MODELS=minimax-m2,minimax-m2-turbo   # 留空 = 通配
+XIAOYU_PROVIDER_MINIMAX_MODELS=minimax-m2,minimax-m2-turbo   # 留空 = 通配；auto = 本机端点自动发现
 XIAOYU_PROVIDER_MINIMAX_PROTOCOL=responses                   # 默认 chat；可选 anthropic
 XIAOYU_PROVIDER_MINIMAX_VISION=*                             # 声明视觉能力，默认不发图
 XIAOYU_PROVIDER_MINIMAX_TOOLS=text                           # 默认 native；端点不会 function calling 时设 text
@@ -169,6 +169,8 @@ XIAOYU_PROVIDER_MINIMAX_SIGNATURES=*                         # 工具调用重�
 ```
 
 本机端点免 key 的规则同网关：`_BASE_URL` 指向 `localhost` 时 `_API_KEY` 可省略（显式给了则以给的为准）。
+
+`_MODELS=auto`：启动时探一次端点 `/v1/models`，把它当前 serve 的 model id 自动注册进来——本机端点换了 model 不用改配置，重启 xiaoyu 即自动跟上（新 id 会出现在 `config --show` 与 `/model` 补全里）。**只对本机 `localhost` 端点生效**（远端仍守「启动不探测」，请显式列模型名）；探测失败或返回空则该 provider 本次不注册（**不会**退化成通配去劫持网关路由）。默认路径依然从不探测 `/v1/models`。
 
 `_PROTOCOL=anthropic` 也适用于 Bedrock Mantle 一类只挂 Claude 原生协议的端点。视觉是 fail-closed 的：**未声明即不发图**，模型会收到一行"有 N 张图但看不了"的说明而不是被静默丢弃。
 

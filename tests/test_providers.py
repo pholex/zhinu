@@ -621,3 +621,80 @@ class TestRouteAndClients(ProviderTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestAutoDiscovery(ProviderTestCase):
+    """XIAOYU_PROVIDER_<NAME>_MODELS=auto：本机端点启动时探 /v1/models 自动注册。
+    探测失败/空、或远端端点都不注册（绝不退化成通配劫持网关）。"""
+
+    LOCAL = "http://localhost:8000/v1"
+
+    def _env(self, **extra) -> dict[str, str]:
+        env = {
+            "XIAOYU_PROVIDER_LOCAL_BASE_URL": self.LOCAL,
+            "XIAOYU_PROVIDER_LOCAL_MODELS": "auto",
+        }
+        env.update(extra)
+        return env
+
+    def test_local_auto_registers_discovered_models(self) -> None:
+        with isolated_env(self._env(XIAOYU_PROVIDER_LOCAL_TOOLS="text", XIAOYU_PROVIDER_LOCAL_VISION="*")):
+            with mock.patch.object(providers, "_discover_models", return_value=("m-new-27b",)) as probe:
+                registry = providers.build(config(base_url=""))
+        probe.assert_called_once()
+        local = registry.get("local")
+        self.assertIsNotNone(local)
+        self.assertEqual(local.models, ("m-new-27b",))
+        self.assertFalse(local.wildcard)  # 具名而非通配：不会吃掉别家模型名
+        self.assertEqual(registry.resolve("m-new-27b").provider, "local")
+        #  换 model 后新 id 出现在清单里，用户 config --show / /model 补全都看得到
+        self.assertIn("m-new-27b", [e.model for e in registry.listing()])
+        #  _TOOLS=text / _VISION=* 仍作用于探测出来的名字
+        transport = registry.client("local")
+        self.assertTrue(local.sees_images("m-new-27b"))
+
+    def test_probe_failure_skips_not_wildcard(self) -> None:
+        #  端点没起来（探测返回空）：跳过注册，绝不变成通配去劫持网关
+        import contextlib, io
+        with isolated_env(self._env(XIAOYU_API_KEY="gw")), contextlib.redirect_stderr(io.StringIO()):
+            with mock.patch.object(providers, "_discover_models", return_value=()):
+                registry = providers.build(config(base_url=GW))
+        self.assertIsNone(registry.get("local"))
+        self.assertEqual([p.name for p in registry.providers], [GATEWAY])
+        #  网关模型仍走网关，没被通配的 local 劫持
+        self.assertEqual(registry.resolve("deepseek-v4-flash").provider, GATEWAY)
+
+    def test_remote_auto_is_refused(self) -> None:
+        import contextlib, io
+        env = {
+            "XIAOYU_PROVIDER_REMOTE_BASE_URL": "https://vllm.example.com/v1",
+            "XIAOYU_PROVIDER_REMOTE_API_KEY": "k",
+            "XIAOYU_PROVIDER_REMOTE_MODELS": "auto",
+            "XIAOYU_API_KEY": "gw",
+        }
+        with isolated_env(env), contextlib.redirect_stderr(io.StringIO()) as err:
+            with mock.patch.object(providers, "_discover_models") as probe:
+                registry = providers.build(config(base_url=GW))
+        probe.assert_not_called()  # 远端根本不探测
+        self.assertIsNone(registry.get("remote"))
+        self.assertIn("只对本机 localhost", err.getvalue())
+
+    def test_discover_models_parses_openai_list_shape(self) -> None:
+        #  探测函数本身：/v1/models 的 {data:[{id}]} → 排序去重的 id 元组
+        import types
+        page = [types.SimpleNamespace(id="b"), types.SimpleNamespace(id="a"), types.SimpleNamespace(id="a")]
+        fake = mock.MagicMock()
+        fake.with_options.return_value.models.list.return_value = page
+        with mock.patch.object(providers, "OpenAI", return_value=fake):
+            got = providers._discover_models(self.LOCAL, "local", "XIAOYU_PROVIDER_LOCAL")
+        self.assertEqual(got, ("a", "b"))
+
+    def test_discover_models_failure_returns_empty(self) -> None:
+        import contextlib, io
+        fake = mock.MagicMock()
+        fake.with_options.return_value.models.list.side_effect = RuntimeError("connection refused")
+        with mock.patch.object(providers, "OpenAI", return_value=fake), \
+             contextlib.redirect_stderr(io.StringIO()) as err:
+            got = providers._discover_models(self.LOCAL, "local", "XIAOYU_PROVIDER_LOCAL")
+        self.assertEqual(got, ())
+        self.assertIn("探测失败", err.getvalue())
