@@ -279,13 +279,51 @@ def _privileged_hit(name: str, argv: list[str]) -> str | None:
 
 
 def _split_script(script: str) -> list[str]:
-    """按连接符把脚本粗切成段。不处理引号——宽松方向宁可多切错切。"""
-    segments = [script]
-    for connector in _CONNECTORS:
-        parts: list[str] = []
-        for piece in segments:
-            parts.extend(piece.split(connector))
-        segments = parts
+    """按连接符把脚本粗切成段——**认引号**：单/双引号内的 && || ; | 属于参数，
+    不当连接符切。裸切（旧实现）会把 `grep 'a|b|c'`、`echo "x && y"` 里引号中的
+    连接符也切开，段内引号被劈成两半 → 下游 shlex 判成"引号不闭合"而误报风险。
+
+    引号规则贴 bash：单引号内无转义、只认闭合的 `'`；双引号内 `\\` 转义下一字符
+    （`\\"` 不算闭合）；引号外 `\\` 也转义下一字符（`\\|` 是字面量不是连接符）。
+    真正不闭合的引号会一直吃到末尾成一段，下游 shlex 仍会如实报"无法解析"——
+    该报的没漏。方向仍宽松：认引号只是别切错，不追求完整 shell 语法。"""
+    segments: list[str] = []
+    buf: list[str] = []
+    quote = ""  # "'" 或 '"'；空 = 不在引号内
+    i, n = 0, len(script)
+    while i < n:
+        ch = script[i]
+        if quote == "'":
+            buf.append(ch)
+            if ch == "'":
+                quote = ""
+            i += 1
+        elif quote == '"':
+            if ch == "\\" and i + 1 < n:
+                buf.append(ch)
+                buf.append(script[i + 1])
+                i += 2
+                continue
+            buf.append(ch)
+            if ch == '"':
+                quote = ""
+            i += 1
+        elif ch == "\\" and i + 1 < n:
+            buf.append(ch)
+            buf.append(script[i + 1])
+            i += 2
+        elif ch in ("'", '"'):
+            quote = ch
+            buf.append(ch)
+            i += 1
+        elif connector := next((c for c in _CONNECTORS if script.startswith(c, i)), None):
+            segments.append("".join(buf))
+            buf = []
+            i += len(connector)
+        else:
+            buf.append(ch)
+            i += 1
+    segments.append("".join(buf))
     return [segment.strip() for segment in segments if segment.strip()]
 
 
