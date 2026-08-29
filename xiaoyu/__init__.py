@@ -18,7 +18,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-__version__ = "0.45.0"
+__version__ = "0.45.1"
 
 #  公开名 → 所在模块。改这张表 = 改公开契约：加名字要同步 docs/embedding.md
 #  的清单（tests/test_public_api.py 锁双向一致），删名字要走弃用期。
