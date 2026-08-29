@@ -174,6 +174,8 @@ XIAOYU_PROVIDER_MINIMAX_SIGNATURES=*                         # 工具调用重�
 
 `_TOOLS=text` 是给**不支持 function calling** 的端点（本地 vLLM / Ollama 上的小模型、带 `tools` 就 400 或静默忽略的老服务）准备的逃生舱：工具说明改为写进 system prompt，模型用 ```` ```tool_call ```` 代码块（也认 `<tool_call>` 标签）发起调用，结果以 `<tool_result>` 文本回灌。翻译只发生在出网那一刻，会话历史仍是标准形态，随时 `/model` 切回原生工具调用的模型。它与 `_PROTOCOL` 正交，可同时设置。原生 function calling 能用就别开它——文本解析天生更脆。
 
+解析器认三种发起格式：我们教的 ```` ```tool_call ```` / `<tool_call>` 里放 `{"name":…,"arguments":…}`，以及训练过原生工具调用的开源模型（Qwen3 等）会自发使用的原生方言 `<tool_call><function=名字>…</function></tool_call>`（名字在壳上，参数用块内 JSON 或 `<parameter=键>值` 子标签）——后者无需你做任何配置，自动认。
+
 ## macOS Keychain
 
 key 可以不落盘。`.env` 里留空即会自动回退去读，service 名就是变量名本身（`.env` / 环境变量 / Keychain 三处同名）：

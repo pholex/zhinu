@@ -174,6 +174,68 @@ class TestParse(unittest.TestCase):
         self.assertEqual(json.loads(calls[0]["function"]["arguments"]), {"path": "a"})
 
 
+    def test_wrapped_dialect_json_body(self) -> None:
+        """Qwen 等开源模型原生方言：名字在 <function=名字> 壳上、参数是块内 JSON 对象。
+        这是本地 Qwen3 实测会自发使用的形状，我们教的 {"name":…} 它并不遵守。"""
+        text = (
+            "好，先侦察。\n" + TAG_OPEN + "\n<function=update_plan>\n"
+            '{"plan": [{"step": "外网侦察", "status": "in_progress"}]}\n'
+            "</function>\n" + TAG_CLOSE
+        )
+        lead, calls = textcalls.parse_calls(text)
+        self.assertEqual(lead, "好，先侦察。")
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0]["function"]["name"], "update_plan")
+        self.assertEqual(
+            json.loads(calls[0]["function"]["arguments"]),
+            {"plan": [{"step": "外网侦察", "status": "in_progress"}]},
+        )
+
+    def test_wrapped_dialect_parameter_tags(self) -> None:
+        """另一种参数编码：<parameter=键>值</parameter>（Qwen coder 模板的形状）。
+        值能当 JSON 读就读成真类型，否则留字符串。"""
+        text = (
+            TAG_OPEN + "\n<function=get_weather>\n"
+            "<parameter=city>\nParis\n</parameter>\n"
+            "<parameter=days>3</parameter>\n"
+            "</function>\n" + TAG_CLOSE
+        )
+        _lead, calls = textcalls.parse_calls(text)
+        self.assertEqual(calls[0]["function"]["name"], "get_weather")
+        self.assertEqual(json.loads(calls[0]["function"]["arguments"]), {"city": "Paris", "days": 3})
+
+    def test_wrapped_multiple_functions_in_one_block(self) -> None:
+        """一个 <tool_call> 块里塞多个 <function=>（Qwen 会批量）：全收。"""
+        text = (
+            TAG_OPEN + "\n<function=read_file>\n{\"path\": \"a\"}\n</function>\n"
+            "<function=read_file>\n{\"path\": \"b\"}\n</function>\n" + TAG_CLOSE
+        )
+        _lead, calls = textcalls.parse_calls(text)
+        self.assertEqual([json.loads(c["function"]["arguments"])["path"] for c in calls], ["a", "b"])
+
+    def test_wrapped_unclosed_function_truncated(self) -> None:
+        """max_tokens 把 </function> 和 </tool_call> 都截掉：JSON 完整就照样认。"""
+        text = TAG_OPEN + "\n<function=read_file>\n{\"path\": \"a\"}"
+        _lead, calls = textcalls.parse_calls(text)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0]["function"]["name"], "read_file")
+
+    def test_taught_format_still_wins_when_no_function_wrapper(self) -> None:
+        """回归：没有 <function=> 壳时仍走"名字在 JSON 里"的原路，行为不变。"""
+        text = FENCE_OPEN + '\n{"name": "read_file", "arguments": {"path": "a"}}\n' + FENCE_CLOSE
+        _lead, calls = textcalls.parse_calls(text)
+        self.assertEqual(calls[0]["function"]["name"], "read_file")
+
+    def test_wrapped_streaming_becomes_tool_fragment(self) -> None:
+        """流式路径也得接住：<tool_call> 一出现就 hold，流末解析成 tool_call 分片，
+        而不是把 <function=> 原文当正文闪给用户。"""
+        parts = ["好，", "先侦察。", TAG_OPEN + "\n<function=update_plan>\n",
+                 '{"plan": []}\n', "</function>\n" + TAG_CLOSE]
+        out = list(textcalls.stream_chunks(iter(chunk(p) for p in parts)))
+        tool = [c for c in out if getattr(c.choices[0].delta, "tool_calls", None)]
+        self.assertEqual(len(tool), 1)
+        self.assertEqual(tool[0].choices[0].delta.tool_calls[0].function.name, "update_plan")
+
 class TestStream(unittest.TestCase):
     def test_plain_text_passes_through_with_held_tail_flushed(self) -> None:
         text, pending, _ = drain(textcalls.stream_chunks(iter([chunk("你好"), chunk("，世界`"), chunk("x")])))
