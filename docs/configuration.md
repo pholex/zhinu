@@ -150,6 +150,11 @@ MCP 子进程的环境是**纯白名单**，所以像 aws-mcp 这类要 SigV4 �
 装完得自己在 `mcp.json` 的 `env` 块里用 `${env:AWS_PROFILE}` 之类显式点名——
 不点名只会得到一个莫名其妙的 401/403。
 
+server 的工具描述 / schema 一变（多半是 `npx xxx@latest` 拉到了新版）就会被整代隔离、
+等 `/mcp approve <name>`。信得过来源、不想每次上游发版都重批的，在该 server 的声明里加
+`"trustToolChanges": true`，变更自动接受并刷新基线（stderr 记一行）；更稳的做法仍是钉死
+版本号，让基线只在你主动升级时才需要重批。
+
 > `xiaoyu plugin` 装的是**内容包**（技能文本 + MCP 声明）。它和 `XIAOYU_ENABLE_PLUGINS`
 > 管的**插件工具**（entry point 组 `xiaoyu.tools`，第三方 Python 包往进程里注册函数）
 > 是两条互不相干的通道，只是恰好都叫 plugin。
