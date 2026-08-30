@@ -347,9 +347,11 @@ class Config:
     #  True = 不再逐个确认写文件/执行命令（--yolo）。与 mode 正交：
     #  它是"什么都不问"，mode 的 auto 档是"沙箱兜得住的才不问"。
     auto_approve: bool = False
-    #  起始交互模式（"default" / "auto" / "plan"，见 modes.py）。
-    #  会话里可以 Shift+Tab 或 /mode 改，改的是 Agent.mode，不回写这里。
-    mode: str = "default"
+    #  起始交互模式（"default" / "auto" / "plan"，见 modes.py）。出厂是 auto
+    #  （= modes.INITIAL，测试锁死两边一致；这里不 import modes 是为了不把配置层
+    #  和模式层缠成环）。会话里可以 Shift+Tab 或 /mode 改，改的是 Agent.mode，
+    #  不回写这里。
+    mode: str = "auto"
     #  bash 命令是否套 macOS Seatbelt 沙箱（只在 macOS 生效，其它平台自动跳过）。
     #  拦的是"写工作区之外"这类不可逆破坏，读与网络默认放行——详见 sandbox.py。
     sandbox: bool = True
@@ -436,7 +438,7 @@ class Config:
         if backend := os.environ.get("XIAOYU_SEARCH_PROVIDER", "").strip():
             cfg.search_provider = backend
         #  个人默认交互模式（default/auto/plan）。命令行 --mode 经 overrides
-        #  在后面覆盖它；写错的值由 Agent 侧 modes.get 归一回默认档（配置
+        #  在后面覆盖它；写错的值由 Agent 侧 modes.get 归一回确认档（配置
         #  写错不炸主循环的既有纪律），这里不重复校验
         if mode := os.environ.get("XIAOYU_MODE", "").strip():
             cfg.mode = mode

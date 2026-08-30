@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import unittest
 
+from xiaoyu import modes
 from xiaoyu.agent import (
     PLAN_MODE_ENTER_NOTE,
     PLAN_MODE_LEAVE_NOTE,
@@ -156,6 +157,38 @@ class ToggleTest(AgentTestCase):
         agent.enter_plan_mode()
         agent.reset()
         self.assertFalse(agent.plan_mode)
+
+    def test_exit_returns_to_mode_before_plan(self):
+        """退出 plan 回到进 plan 前的那档：从 auto 进的回 auto，从确认档进的回确认档。"""
+        for before in (modes.AUTO, modes.DEFAULT):
+            with self.subTest(before=before):
+                agent = self.build(
+                    [tool_call_turn("exit_plan_mode", {"plan": "1. 干活"}), text_turn("开始")],
+                    approver=lambda name, args: True,
+                )
+                agent.set_mode(before)
+                agent.set_mode(modes.PLAN)
+                agent.send("交计划")
+                self.assertEqual(agent.mode, before)
+        #  /clear（reset）同样回到进 plan 前的档
+        agent = self.build([])
+        agent.set_mode(modes.AUTO)
+        agent.enter_plan_mode()
+        agent.reset()
+        self.assertEqual(agent.mode, modes.AUTO)
+
+    def test_exit_without_record_falls_back_to_configured_then_initial(self):
+        """restore 直接落在 plan（没有"进 plan 前"记录）：回配置的起始档；
+        配置起手就是 plan 则回出厂档。"""
+        agent = self.build([])
+        agent.adopt_mode(modes.PLAN)
+        agent.reset()
+        self.assertEqual(agent.mode, modes.get(self.config.mode).name)
+        self.config.mode = modes.PLAN
+        agent = self.build([])
+        agent.adopt_mode(modes.PLAN)
+        agent.reset()
+        self.assertEqual(agent.mode, modes.INITIAL)
 
 
 class PlanFileTest(AgentTestCase):

@@ -88,7 +88,9 @@ class ServeCase(unittest.TestCase):
             #  审批超时压到秒级：用例要能在可接受的时间里验到 fail-closed
             approval_timeout=3.0,
             mcp=self.mcp,
-            **cfg_extra,
+            #  钉确认档：审批线用例要每次写文件都挂起等 /permissions，不能跟着
+            #  出厂起始档（auto）漂；要 auto 的用例按会话传 mode="auto"
+            **{"mode": "default", **cfg_extra},
         )
         client = TestClient(create_app(cfg))
         client.__enter__()

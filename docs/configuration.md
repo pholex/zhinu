@@ -105,7 +105,7 @@ XIAOYU_API_KEY=<key>
 
 | 变量 | 默认值 | 说明 |
 |---|---|---|
-| `XIAOYU_MODE` | `default` | 个人默认交互模式：`default`（逐条确认）/ `auto`（工作区内改文件与沙箱内命令免确认）/ `plan`（只读规划态）。命令行 `--mode` 优先；会话里 Shift+Tab / `/mode` 随时切 |
+| `XIAOYU_MODE` | `auto` | 个人默认交互模式：`auto`（工作区内改文件与沙箱内命令免确认）/ `default`（确认档，逐条确认）/ `plan`（只读规划态）。命令行 `--mode` 优先；会话里 Shift+Tab / `/mode` 随时切 |
 | `XIAOYU_SANDBOX` | 开 | bash 的内核级沙箱（macOS Seatbelt / Linux bubblewrap） |
 | `XIAOYU_SANDBOX_NETWORK` | 开 | 沙箱内是否允许联网（`0` = 断网） |
 | `XIAOYU_SANDBOX_WRITABLE` | — | 追加可写根目录，冒号分隔 |

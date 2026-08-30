@@ -69,6 +69,8 @@ class VerdictAgentTestCase(unittest.TestCase):
             explore_model="cheap-model",
             workspace=self.root,
             auto_approve=False,
+            #  钉确认档：这里测的是审批管线本身，不能跟着出厂起始档（auto）漂
+            mode="default",
             enable_skills=False,
             enable_agents=False,
             enable_hooks=False,

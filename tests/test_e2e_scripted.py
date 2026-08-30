@@ -96,6 +96,10 @@ class E2ECase(unittest.TestCase):
             "XIAOYU_ENABLE_BROWSER": "0",
             #  沙箱可用性因机器而异（bwrap/Seatbelt），e2e 断言的不是沙箱
             "XIAOYU_SANDBOX": "0",
+            #  出厂起始档是 auto（工作区内改文件免确认），e2e 断言的是权限线协议，
+            #  钉在确认档让每次写文件都走一遍 permission 请求；起始档本身由
+            #  test_modes / test_user_config 锁
+            "XIAOYU_MODE": "default",
         }
         #  本机 shell 里若残留 snapshot 相关开关（录制/捕获/strict），会让所有
         #  e2e 子进程行为漂移——一律剔除，要用的套件（snapshot）自己显式再设

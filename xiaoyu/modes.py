@@ -1,8 +1,11 @@
-"""交互模式：默认 / auto / plan —— 一张表定义顺序、标签与放行规则。
+"""交互模式：确认 / auto / plan —— 一张表定义顺序、标签与放行规则。
 
 小羽原先的授权只有两极：**逐条确认**和 `--yolo` 全放行。中间空着，实践里就只有
 两种活法——一路按 y，或者在一次性目录里裸奔。auto 档补的是中间地带：
-常规改动不问，越界时才拦住你。
+常规改动不问，越界时才拦住你。**出厂起始档就是 auto**（`INITIAL`）：沙箱兜得住的
+不问，是绝大多数人打开小羽想要的样子；要每条都过目的人 `XIAOYU_MODE=default` 或
+Shift+Tab 切到确认档。`default` 这个稳定标识沿用（进配置、进日志），只是它不再
+是"默认"，给用户看的标签叫「确认」。
 
 **auto 的前提是沙箱，不是信任。** `sandbox.py` 那层 Seatbelt/bubblewrap 原本只做
 纵深防御的兜底，auto 档把它变成"自动放行的依据"——命令跑在只能写工作区的策略里，
@@ -27,6 +30,9 @@ from . import command_check
 DEFAULT = "default"
 AUTO = "auto"
 PLAN = "plan"
+#  出厂起始档（Config.mode 的默认值、退出 plan 无处可回时的落点）。
+#  名字刻意不叫 DEFAULT：那个是"确认档"的稳定标识，历史包袱，改不得
+INITIAL = AUTO
 
 
 @dataclass(frozen=True)
@@ -41,7 +47,7 @@ class Mode:
 
 
 MODES: tuple[Mode, ...] = (
-    Mode(DEFAULT, "", "默认", "写文件和执行命令逐条确认"),
+    Mode(DEFAULT, "", "确认", "写文件和执行命令逐条确认"),
     Mode(
         AUTO, "⏵⏵", "auto",
         "工作区内改文件、沙箱内跑命令都自动放行；危险命令、提权、写到工作区外仍要你确认",
@@ -61,7 +67,8 @@ BY_NAME: dict[str, Mode] = {item.name: item for item in MODES}
 
 
 def get(name: str) -> Mode:
-    """按名字取模式；名字不认识退回默认档（配置里写错了不该炸主循环）。"""
+    """按名字取模式；名字不认识退回确认档（配置里写错了不该炸主循环，
+    退到最保守的一档而不是出厂的 auto——写错配置不该变成放权）。"""
     return BY_NAME.get(name, BY_NAME[DEFAULT])
 
 
@@ -83,7 +90,8 @@ def label(name: str) -> str:
 
 
 def prompt_prefix(name: str) -> str:
-    """提示符前缀（含尾随空格）；默认档为空。
+    """提示符前缀（含尾随空格）；确认档为空，auto/plan 带标记——auto 虽是出厂
+    起始档，"命令会自动跑"这件事值得一直挂在眼前。
 
     模式标记长在提示符上而不是常驻状态栏——bottom_toolbar 只在输入行挂起时
     存在、模型一跑就消失，那条路小羽走过又拆了（见 tui.py 模块文档）。
@@ -117,7 +125,7 @@ def describe(name: str, *, sandbox_ready: bool = True) -> str:
 def help_text() -> str:
     """`/mode` 不带参数时打印的三档说明。
 
-    对齐按可见宽度算："默认"两个汉字占 4 列而 len() 只有 2，用 len 会错位
+    对齐按可见宽度算："确认"两个汉字占 4 列而 len() 只有 2，用 len 会错位
     （与 keys.help_text 同一个坑、同一个解法）。
     """
     from . import ui
