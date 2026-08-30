@@ -86,6 +86,9 @@ class AgentTestCase(unittest.TestCase):
             explore_model="cheap-model",
             workspace=self.root,
             auto_approve=True,
+            #  基座钉在确认档：这里的测试测的是"该问的都问了"，不能跟着出厂
+            #  起始档（auto）漂；auto 的放行矩阵在 test_modes 里单独锁
+            mode="default",
             #  测试必须与跑测试机器上装的技能库/插件隔离
             enable_skills=False,
             enable_agents=False,

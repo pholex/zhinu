@@ -252,7 +252,9 @@ curl -X POST :8420/agent/agent-3f9c… -d '{"config":{"mode":"plan"}}'  # → ve
 
 - **引用了 agent 的会话不能再单独给 `model` / `mode`**（`400`）——钉版本的意义是"这个
   会话的配置可完整复现"，旁路覆盖会让版本号失去含义。不给 `agent` 就是老路：跟随
-  服务端启动参数，`model` / `mode` 可临时覆盖。
+  服务端启动参数，`model` / `mode` 可临时覆盖。`mode` 谁都没给时与 CLI 一致，起手是
+  `auto`（沙箱兜得住的工具调用不挂起等审批；想每条都过 `/permissions` 就 `--mode default`
+  起服务或按会话传 `"mode": "default"`）。
 - **agent 只能比服务端启动参数更严**：服务端 `--approval ask` 时 agent 不能设
   `allow_all`；不能把沙箱关掉、不能放开沙箱网络。放宽是 `400`，不是静默钳位。
 - `append_system_prompt` 是**叠加**：服务端那份（宿主级身份/纪律）在前，agent 那份

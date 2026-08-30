@@ -948,6 +948,9 @@ class Agent:
         #  求值的工具动态可见性）。requires_approval=True 让
         #  "计划 → 用户批准 → 开始执行"走现成的审批管线，不新增交互形态。
         self.mode: str = modes.get(config.mode).name
+        #  进 plan 前待的那一档：退出 plan 回到它，而不是硬编码回某一档
+        #  （用户从确认档进的就回确认档，从 auto 进的回 auto）
+        self._pre_plan_mode: str = ""
         if self.toolbox.get("exit_plan_mode") is None:
             self.toolbox.register(
                 Tool(
@@ -1446,7 +1449,7 @@ class Agent:
         """切档。返回给用户看的一句话（TUI/明文 REPL 打的是同一句）。
 
         plan 的进出要往历史里注入说明（模型得知道规则变了），其它档不注入：
-        auto 与默认档的差别只在"问不问用户"，模型侧的能力完全一样，
+        auto 与确认档的差别只在"问不问用户"，模型侧的能力完全一样，
         告诉它反而是在暗示"现在没人看着"。
 
         轮次进行中调用时，当前这一步的审批仍按步开头的档位判（见 StepContext），
@@ -1456,6 +1459,8 @@ class Agent:
         if target == self.mode:
             return f"已经在{modes.label(target)}档"
         was_plan = self.mode == modes.PLAN
+        if target == modes.PLAN:
+            self._pre_plan_mode = self.mode
         self.mode = target
         if target == modes.PLAN:
             self._seed_plan_file()
@@ -1481,9 +1486,19 @@ class Agent:
         target = modes.get(name).name
         if target == self.mode:
             return
+        if target == modes.PLAN:
+            self._pre_plan_mode = self.mode
         self.mode = target
         if target == modes.PLAN:
             self._seed_plan_file()
+
+    def _resume_mode(self) -> str:
+        """退出 plan 后回哪一档：进 plan 前的那档；没有记录（restore 直接落在
+        plan、或配置起手就是 plan）则回配置的起始档，配置也是 plan 就回出厂档。"""
+        if self._pre_plan_mode and self._pre_plan_mode != modes.PLAN:
+            return self._pre_plan_mode
+        configured = modes.get(self.config.mode).name
+        return configured if configured != modes.PLAN else modes.INITIAL
 
     def _seed_plan_file(self) -> None:
         """进 plan mode 时确保 plan 文件存在。**绝不截断已有内容**
@@ -1546,9 +1561,9 @@ class Agent:
             return "ERROR: 当前不在 plan mode 中，无需退出。"
         #  不走 set_mode：那会往历史注入"已关闭 plan mode"的说明，而这里的返回值
         #  本身就是给模型的通知，注入等于说两遍
-        self.mode = modes.DEFAULT
+        self.mode = self._resume_mode()
         if self.session_log:
-            self.session_log.event("mode", value=modes.DEFAULT)
+            self.session_log.event("mode", value=self.mode)
             self.session_log.event("plan_mode", on=False)
         #  磁盘为准的替换在 _execute_inner；两头都空 = 没写计划就退。用户已在
         #  审批框放行（他看到的就是空的），照样退出但明说（不硬拦）
@@ -1798,10 +1813,10 @@ class Agent:
         self.plan = []
         #  plan 档必须跟着清：它的规则是以 user 消息注入历史的，历史一空模型就
         #  不知道自己在规划态了，留着就是"关卡还在拦、模型却不明白为什么"。
-        #  auto 档没有这种历史依赖（模型侧能力与默认档完全一样），予以保留——
+        #  auto 档没有这种历史依赖（模型侧能力与确认档完全一样），予以保留——
         #  /clear 清的是对话，不是用户的授权偏好。
         if self.mode == modes.PLAN:
-            self.mode = modes.DEFAULT
+            self.mode = self._resume_mode()
         self.drain_steers()
         self._drain_notifications()
         self._notified_keys.clear()

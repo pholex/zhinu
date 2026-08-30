@@ -1377,7 +1377,7 @@ class Tui:
                 key_bindings=self._key_bindings(),
                 multiline=True,
                 #  续行不打标记、只按提示符实际宽度补空格对齐。
-                #  宽度必须动态取：非默认档提示符带模式标记，比 "› " 宽。
+                #  宽度必须动态取：确认档之外提示符带模式标记，比 "› " 宽。
                 prompt_continuation=lambda width, line_number, is_soft_wrap: " " * width,
                 #  prompt_toolkit 自带的 Ctrl-X Ctrl-E：长指令拉到 $EDITOR 里改
                 enable_open_in_editor=True,
@@ -1516,7 +1516,7 @@ class Tui:
         )
 
     def _prompt_fragments(self) -> list[tuple[str, str]]:
-        """输入行提示符。非默认档在 `›` 前面挂一个模式标记。
+        """输入行提示符。确认档之外在 `›` 前面挂一个模式标记。
 
         做成 callable 而不是固定字符串：Shift+Tab 切档后 `app.invalidate()`
         就能就地重画。**不做常驻状态栏**——bottom_toolbar 只在输入行挂起时存在、

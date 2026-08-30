@@ -33,6 +33,19 @@ def text_turn(text: str) -> list:
 
 
 class TableTest(unittest.TestCase):
+    def test_initial_mode_is_auto_and_config_agrees(self) -> None:
+        """出厂起始档 = auto；Config.mode 的默认值不 import modes，靠这里锁一致。"""
+        from xiaoyu.config import Config
+
+        self.assertEqual(modes.INITIAL, modes.AUTO)
+        cfg = Config(base_url="http://unused", model="m", workspace=Path.cwd())
+        self.assertEqual(cfg.mode, modes.INITIAL)
+
+    def test_default_id_is_labelled_confirm(self) -> None:
+        """稳定标识 default 沿用，但它不再是默认档，标签不能再叫"默认"。"""
+        self.assertEqual(modes.label(modes.DEFAULT), "确认")
+        self.assertNotIn("默认", modes.help_text())
+
     def test_cycle_order(self) -> None:
         """Shift-Tab 的循环顺序：默认 → auto → plan → 默认。"""
         seen = [modes.DEFAULT]

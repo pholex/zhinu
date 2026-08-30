@@ -46,6 +46,8 @@ def make_config(root: Path, **overrides) -> Config:
         explore_model="cheap-model",
         workspace=root,
         auto_approve=True,
+        #  钉确认档：关掉 auto_approve 的用例要真的走审批，不能被出厂 auto 档放行
+        mode="default",
         enable_skills=False,
         enable_agents=False,
         enable_hooks=False,

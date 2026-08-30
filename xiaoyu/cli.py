@@ -150,7 +150,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--mode",
         choices=list(modes.CYCLE),
         default=None,
-        help="起始模式：default=逐条确认；auto=工作区内改文件与沙箱内命令免确认；plan=只读规划态",
+        help="起始模式：auto=工作区内改文件与沙箱内命令免确认（出厂默认）；default=逐条确认；plan=只读规划态",
     )
     parser.add_argument(
         "--yolo",
@@ -832,7 +832,7 @@ def resume_command(argv: list[str]) -> int:
         "--mode",
         choices=list(modes.CYCLE),
         default=None,
-        help="起始模式：default=逐条确认；auto=沙箱兜得住的免确认；plan=只读规划态",
+        help="起始模式：auto=沙箱兜得住的免确认（出厂默认）；default=逐条确认；plan=只读规划态",
     )
     parser.add_argument("--yolo", action="store_true", help="不再逐个确认写文件和执行命令")
     parser.add_argument("--no-tui", dest="no_tui", action="store_true", help="用明文 REPL")
@@ -2861,14 +2861,18 @@ def _repl_memo(agent: Agent, note: str) -> None:
 
 
 def print_mode_notice(agent: Agent) -> None:
-    """非默认档时在开场打一行：这一档到底会不会问你。
+    """开场打一行：这一档到底会不会问你。
 
-    默认档不打——它就是横幅之外的基线，说了是噪音。auto 档而沙箱不可用时
-    `modes.describe` 会自己改口说降级，不必在这里判。
+    确认档不打——每条都问，没什么可预告的。auto 是出厂起始档，但"命令会自动跑"
+    值得每次开场说一句，只是用次要色而不是警告色；沙箱不可用的降级（`modes.describe`
+    自己改口）和 plan 档才用警告色——那两种是用户容易会错意的状态。
     """
     if agent.mode == modes.DEFAULT:
         return
-    print(ui.warning(modes.describe(agent.mode, sandbox_ready=agent.sandbox_ready())))
+    ready = agent.sandbox_ready()
+    text = modes.describe(agent.mode, sandbox_ready=ready)
+    style = ui.secondary if agent.mode == modes.AUTO and ready else ui.warning
+    print(style(text))
 
 
 def background_status(agent: Agent) -> str:

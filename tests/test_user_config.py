@@ -439,7 +439,7 @@ class ModeEnvTest(unittest.TestCase):
 
     def test_blank_env_keeps_builtin_default(self) -> None:
         with mock.patch.dict(os.environ, {"XIAOYU_MODE": "  "}):
-            self.assertEqual(config.Config.from_env(workspace=Path.cwd()).mode, "default")
+            self.assertEqual(config.Config.from_env(workspace=Path.cwd()).mode, "auto")
 
 
 if __name__ == "__main__":

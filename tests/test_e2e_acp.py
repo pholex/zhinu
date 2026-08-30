@@ -862,6 +862,7 @@ class ModeTest(AcpCase):
         )
         response, _ = acp.read_until(self.is_response("new"))
         state = response["result"]["modes"]
+        #  e2e 环境钉 XIAOYU_MODE=default（见 env_for）；出厂起始档 auto 由单元测试锁
         self.assertEqual(state["currentModeId"], "default")
         ids = [m["id"] for m in state["availableModes"]]
         #  与 TUI Shift+Tab 循环同一张表、同一个顺序（modes.CYCLE）
@@ -951,6 +952,7 @@ class ModeTest(AcpCase):
             if u.get("sessionUpdate") == "current_mode_update"
         ]
         self.assertEqual(len(switches), 1, self.update_kinds(skipped))
+        #  退出 plan 回到进 plan 前的那档（e2e 环境起手是确认档）
         self.assertEqual(switches[0]["currentModeId"], "default")
 
 
