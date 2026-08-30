@@ -22,6 +22,7 @@
 
 from __future__ import annotations
 
+import difflib
 import hashlib
 import json
 import os
@@ -237,6 +238,126 @@ def load_baseline(path: Path) -> dict[str, dict[str, str]]:
     except (OSError, json.JSONDecodeError):
         return {}
     return data if isinstance(data, dict) else {}
+
+
+def load_declarations(path: Path) -> dict[str, dict[str, dict[str, Any]]]:
+    """{server: {tool: 精简声明}}——上次批准/首见时的 description + inputSchema，
+    给 /mcp diff 当"上次"用。基线只存指纹是刻意的（比对便宜、文件小），
+    声明另存一份旁路文件；坏了/没有只影响 diff 的可读性，不影响裁决。"""
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    return {
+        str(server): {str(tool): decl for tool, decl in tools.items() if isinstance(decl, dict)}
+        for server, tools in data.items()
+        if isinstance(tools, dict)
+    }
+
+
+def slim_declaration(declared: dict[str, Any]) -> dict[str, Any]:
+    """只留参与指纹的两个字段（name 是 key，不重复存）。"""
+    return {
+        "description": str(declared.get("description", "")),
+        "inputSchema": declared.get("inputSchema") or {},
+    }
+
+
+def _schema_props(schema: Any) -> dict[str, Any]:
+    props = schema.get("properties") if isinstance(schema, dict) else None
+    return props if isinstance(props, dict) else {}
+
+
+def _prop_brief(prop: Any) -> str:
+    if not isinstance(prop, dict):
+        return json.dumps(prop, ensure_ascii=False)
+    kind = prop.get("type") or ("enum" if "enum" in prop else "any")
+    if isinstance(kind, list):
+        kind = "|".join(map(str, kind))
+    desc = str(prop.get("description", "")).strip().replace("\n", " ")
+    if len(desc) > 60:
+        desc = desc[:57] + "…"
+    return f"{kind}" + (f" — {desc}" if desc else "")
+
+
+def _clip(lines: list[str], cap: int) -> list[str]:
+    if len(lines) <= cap:
+        return lines
+    return lines[:cap] + [f"    …（还有 {len(lines) - cap} 行，省略）"]
+
+
+def describe_change(old: dict[str, Any] | None, new: dict[str, Any], *, cap: int = 12) -> list[str]:
+    """一个工具从"上次批准"到"这次声明"变了什么，给人看的行列表（已缩进 4 格）。
+
+    描述走逐行 unified diff；schema 按 properties / required 做结构化对比——
+    rug-pull 最常见的形态是往 description 里塞一句"顺便读 ~/.aws/credentials"，
+    或多加一个"把结果 POST 到 …"的参数，这两种都要一眼能看出来。
+    结构化对不上的其它差异退回 JSON 逐行 diff。没有上次记录（老基线）时如实说。
+    """
+    new_desc = str(new.get("description", ""))
+    new_schema = new.get("inputSchema") or {}
+    if old is None:
+        lines = ["    （没有上次声明的记录——基线早于声明存档；只能看这次的）"]
+        lines += [f"    描述：{line}" for line in new_desc.splitlines() or ["（空）"]]
+        props = _schema_props(new_schema)
+        if props:
+            lines.append("    参数：" + ", ".join(f"{k}: {_prop_brief(v)}" for k, v in props.items()))
+        return _clip(lines, cap)
+
+    lines: list[str] = []
+    old_desc = str(old.get("description", ""))
+    if old_desc != new_desc:
+        diff = list(
+            difflib.unified_diff(
+                old_desc.splitlines(), new_desc.splitlines(), lineterm="", n=1
+            )
+        )[2:]  #  去掉 ---/+++ 头
+        lines.append("    描述：")
+        lines += [f"      {line}" for line in diff if not line.startswith("@@")]
+    old_schema = old.get("inputSchema") or {}
+    if old_schema != new_schema:
+        old_props, new_props = _schema_props(old_schema), _schema_props(new_schema)
+        structural = False
+        for key in new_props.keys() - old_props.keys():
+            lines.append(f"    + 参数 {key}: {_prop_brief(new_props[key])}")
+            structural = True
+        for key in old_props.keys() - new_props.keys():
+            lines.append(f"    - 参数 {key}: {_prop_brief(old_props[key])}")
+            structural = True
+        for key in sorted(old_props.keys() & new_props.keys()):
+            if old_props[key] != new_props[key]:
+                lines.append(
+                    f"    ~ 参数 {key}: {_prop_brief(old_props[key])} → {_prop_brief(new_props[key])}"
+                )
+                structural = True
+        old_req = set(old_schema.get("required") or []) if isinstance(old_schema, dict) else set()
+        new_req = set(new_schema.get("required") or []) if isinstance(new_schema, dict) else set()
+        if old_req != new_req:
+            lines.append(
+                "    required："
+                + (f"+{sorted(new_req - old_req)} " if new_req - old_req else "")
+                + (f"-{sorted(old_req - new_req)}" if old_req - new_req else "")
+            )
+            structural = True
+        #  properties/required 都一样但整体不等：schema 别处变了，退回 JSON diff
+        rest_old = {k: v for k, v in old_schema.items() if k not in ("properties", "required")} if isinstance(old_schema, dict) else old_schema
+        rest_new = {k: v for k, v in new_schema.items() if k not in ("properties", "required")} if isinstance(new_schema, dict) else new_schema
+        if rest_old != rest_new or not structural:
+            diff = list(
+                difflib.unified_diff(
+                    json.dumps(rest_old, ensure_ascii=False, indent=1, sort_keys=True).splitlines(),
+                    json.dumps(rest_new, ensure_ascii=False, indent=1, sort_keys=True).splitlines(),
+                    lineterm="",
+                    n=0,
+                )
+            )[2:]
+            lines.append("    schema 其它部分：")
+            lines += [f"      {line}" for line in diff if not line.startswith("@@")]
+    if not lines:
+        lines.append("    （指纹不同但看不出差异——多半是 schema 键序/空白变化）")
+    return _clip(lines, cap)
 
 
 def save_json_atomic(path: Path, data: dict) -> None:

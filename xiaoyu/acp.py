@@ -407,12 +407,7 @@ def _cmd_mcp(agent: Agent, args: str) -> str:
     manager = mcp.launch(agent.config)
     if manager is None:
         return mcp.McpManager.usage_hint()
-    parts = args.split()
-    if parts and parts[0] == "approve":
-        if len(parts) < 2:
-            return "用法：/mcp approve <server名>（批准变更工具，解除隔离）"
-        return manager.approve(parts[1])
-    return manager.describe()
+    return manager.command(args.split())
 
 
 def _cmd_perm(agent: Agent, args: str) -> str:
