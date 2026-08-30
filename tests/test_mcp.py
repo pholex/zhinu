@@ -7,6 +7,8 @@ FAKE_SERVER），走真实的子进程 + JSON-RPC 握手，验证懒加载、调
 from __future__ import annotations
 
 import base64
+import contextlib
+import io
 import json
 import sys
 import tempfile
@@ -136,6 +138,21 @@ class ConfigParsingTest(unittest.TestCase):
         )
         (spec,) = mcp.load_server_specs(self.workspace)
         self.assertEqual(spec.inherit_env, ["MYAPP_*"])
+
+    def test_trust_tool_changes_parsed_default_off(self):
+        self.write_workspace(
+            {
+                "mcpServers": {
+                    "a": {"command": "cmd", "trustToolChanges": True},
+                    "b": {"command": "cmd"},
+                    "c": {"url": "https://example.com/mcp", "trustToolChanges": True},
+                }
+            }
+        )
+        specs = {spec.name: spec for spec in mcp.load_server_specs(self.workspace)}
+        self.assertTrue(specs["a"].trust_tool_changes)
+        self.assertFalse(specs["b"].trust_tool_changes, "默认必须是关：隔离是默认防线")
+        self.assertTrue(specs["c"].trust_tool_changes, "远端 server 同样认这个字段")
 
     def test_workspace_overrides_user(self):
         self.write_user({"mcpServers": {"a": {"command": "user-cmd"}}})
@@ -1039,9 +1056,13 @@ class RugPullBaselineTest(unittest.TestCase):
         env_patcher.start()
         self.addCleanup(env_patcher.stop)
 
-    def new_manager(self, script: Path) -> mcp.McpManager:
+    def new_manager(self, script: Path, *, trust: bool = False) -> mcp.McpManager:
         spec = mcp.ServerSpec(
-            name="fake", command=sys.executable, args=[str(script)], timeout=15.0
+            name="fake",
+            command=sys.executable,
+            args=[str(script)],
+            timeout=15.0,
+            trust_tool_changes=trust,
         )
         manager = mcp.McpManager([spec])
         manager.start()
@@ -1073,6 +1094,34 @@ class RugPullBaselineTest(unittest.TestCase):
             "mcp__fake__echo", [tool.name for tool in second.ready_tools()]
         )
         self.assertEqual(find_tool(second, "__echo").handler(text="ok"), "echo: ok")
+
+    def test_trusted_server_auto_accepts_changes(self):
+        """trustToolChanges：变更工具不隔离、直接注册，基线跟着刷新，stderr 留一行。"""
+        script = write_fake_server(self.root)
+        first = self.new_manager(script)
+        first.close()
+        before = json.loads((self.userconf / "mcp-approved.json").read_text(encoding="utf-8"))
+
+        write_fake_server(self.root, echo_description="回显文本（上游发了新版）")
+        with contextlib.redirect_stderr(io.StringIO()) as err:
+            second = self.new_manager(script, trust=True)
+        names = [tool.name for tool in second.ready_tools()]
+        self.assertIn("mcp__fake__echo", names, "受信 server 的变更工具必须直接注册")
+        self.assertEqual(second._quarantined.get("fake"), [])
+        self.assertNotIn("隔离", second.describe())
+        self.assertIn("无需批准", second.approve("fake"))
+        self.assertIn("trustToolChanges 自动接受", err.getvalue())
+        self.assertIn("echo", err.getvalue())
+        self.assertEqual(find_tool(second, "__echo").handler(text="ok"), "echo: ok")
+        #  基线已更新为新指纹：下次启动不再报变化
+        after = json.loads((self.userconf / "mcp-approved.json").read_text(encoding="utf-8"))
+        self.assertNotEqual(before["fake"]["echo"], after["fake"]["echo"])
+        self.assertEqual(before["fake"]["boom"], after["fake"]["boom"], "未变的工具指纹不动")
+        second.close()
+        with contextlib.redirect_stderr(io.StringIO()) as err:
+            third = self.new_manager(script, trust=True)
+        self.assertNotIn("自动接受", err.getvalue())
+        self.assertIn("mcp__fake__echo", [tool.name for tool in third.ready_tools()])
 
     def test_approve_unknown_server(self):
         script = write_fake_server(self.root)

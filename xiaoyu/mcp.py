@@ -53,7 +53,8 @@
   才 spawn，连上后与 live 声明对账（新工具补注册、幽灵工具拦调用）。
   解掉"懒加载导致首轮模型看不见工具"的鸡生蛋。XIAOYU_MCP_CACHE=0 关闭。
 - **配置准入 / OSV 恶意包预检 / 工具指纹基线（防 rug-pull）**：见 mcp_guard.py。
-  基线变更的工具隔离不注册，/mcp approve <server> 重新批准。
+  基线变更的工具隔离不注册，/mcp approve <server> 重新批准；server 声明里
+  `"trustToolChanges": true` 的自动接受并刷新基线（只记一行，见 ServerSpec）。
   XIAOYU_MCP_OSV=0 关闭预检。
 - **父进程死亡看门狗**：见 mcp_watchdog.py。进程组隔离的另一半——小羽被
   kill -9 后 server 不再变永久孤儿。XIAOYU_MCP_WATCHDOG=0 关闭。
@@ -134,6 +135,12 @@ class ServerSpec:
     #  自定义头（Authorization / API key 之类）。
     url: str = ""
     headers: dict[str, str] = field(default_factory=dict)
+    #  跳过 rug-pull 隔离：工具描述/schema 相对基线变化时自动接受并刷新基线，只在
+    #  stderr 记一行，不再等 /mcp approve。给"来源可信、又跟着 @latest 走"的 server
+    #  用（每次上游发版都要重批一遍，防线就成了噪音，用户会顺手全批）。不是默认：
+    #  基线的意义正是让上游悄悄改描述这件事被看见；--yolo 也刻意不覆盖它（执行审批
+    #  与供应链是两条轴）。
+    trust_tool_changes: bool = False
 
     @property
     def is_http(self) -> bool:
@@ -409,6 +416,7 @@ def parse_server_mapping(
                     },
                     timeout=float(timeout),
                     disabled=bool(raw.get("disabled", False)),
+                    trust_tool_changes=bool(raw.get("trustToolChanges", False)),
                 )
             )
             continue
@@ -423,6 +431,7 @@ def parse_server_mapping(
                 inherit_env=[
                     str(name) for name in raw.get("inheritEnv") or [] if str(name).strip()
                 ],
+                trust_tool_changes=bool(raw.get("trustToolChanges", False)),
             )
         )
     return specs, problems
@@ -1520,6 +1529,20 @@ class McpManager:
         admitted, quarantined, updates = mcp_guard.admit_tools(
             self._baseline.get(name, {}), declared
         )
+        if quarantined and server.spec.trust_tool_changes:
+            #  trustToolChanges：变更工具照单全收、基线跟着刷新，只留一行痕迹。
+            #  仍走同一条 admit 路径而不是绕过基线——基线要持续跟上，日后把开关
+            #  关掉时才有正确的"上次"可比，而不是从开关打开那天起全是陈年指纹。
+            for item in declared:
+                raw = str(item.get("name", ""))
+                if raw in quarantined:
+                    updates[raw] = mcp_guard.tool_fingerprint(item)
+            admitted, accepted, quarantined = list(declared), quarantined, []
+            print(
+                f"[MCP {name}：{len(accepted)} 个工具的描述/schema 相对上次已变化，"
+                f"按 trustToolChanges 自动接受并刷新基线：{', '.join(accepted[:5])}]",
+                file=sys.stderr,
+            )
         new_decls = {str(item.get("name", "")): item for item in admitted}
         #  跨 server 冲突预检：确定性命名下冲突只可能是别的 server 占了
         #  本 server 的命名空间（如 a__b/c 与 a/b__c）——整代拒绝，大声报错

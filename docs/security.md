@@ -85,6 +85,8 @@ xiaoyu --no-network          # 或 XIAOYU_SANDBOX_NETWORK=0，断掉沙箱内的
 - 子进程**环境白名单**——你的 API key 不会漏给 server 进程。
 - npx / uvx 包启动前查 **OSV 恶意包库**。
 - 内联攻击脚本形状的配置**拒绝启动**。
-- 工具描述 / schema 变更**自动隔离**（防 rug-pull），`/mcp approve` 才恢复。
+- 工具描述 / schema 变更**自动隔离**（防 rug-pull），`/mcp approve` 才恢复。来源可信又跟着
+  `@latest` 走的 server（每次上游发版都得重批一遍）可在声明里加 `"trustToolChanges": true`：
+  变更自动接受并刷新基线，stderr 留一行痕迹。这是逐个 server 的选择，`--yolo` 不覆盖它。
 
 浏览器工具的每个动作都过人工确认——它能以你的身份点任何按钮，**审批就是它的沙箱**。
