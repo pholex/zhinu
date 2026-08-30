@@ -56,7 +56,7 @@ SLASH_COMMANDS: dict[str, str] = {
     "/keys": "按键与输入前缀速查",
     "/tools": "列出已注册的工具",
     "/tasks": "后台任务列表（run_in_background 的命令 / monitor）",
-    "/mcp": "MCP server 状态；/mcp approve <名> 批准变更工具",
+    "/mcp": "MCP server 状态；/mcp diff [名] 看变更工具的差异；/mcp approve [名] 批准（无参 = 全部）",
     "/skills": "列出可用技能；/skills reload 重扫磁盘并刷新索引",
     "/model": "查看或切换模型（/model 名字）",
     "/usage": "本次会话的 token 统计",
@@ -3036,13 +3036,8 @@ def handle_slash(agent: Agent, line: str, select: Any = None) -> bool:
             manager = mcp.launch(agent.config)
             if manager is None:
                 print(ui.secondary("  " + mcp.McpManager.usage_hint().replace("\n", "\n  ")))
-            elif rest and rest[0] == "approve":
-                if len(rest) < 2:
-                    print(ui.warning("  用法：/mcp approve <server名>（批准变更工具，解除隔离）"))
-                else:
-                    print(ui.secondary(f"  {manager.approve(rest[1])}"))
             else:
-                print(ui.secondary("  " + manager.describe().replace("\n", "\n  ")))
+                print(ui.secondary("  " + manager.command(list(rest)).replace("\n", "\n  ")))
     elif command == "/skills":
         if rest and rest[0] == "reload":
             #  显式全量刷新：重扫磁盘 + 重建 system prompt 索引。cache 前缀因此

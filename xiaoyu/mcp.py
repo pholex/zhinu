@@ -53,8 +53,10 @@
   才 spawn，连上后与 live 声明对账（新工具补注册、幽灵工具拦调用）。
   解掉"懒加载导致首轮模型看不见工具"的鸡生蛋。XIAOYU_MCP_CACHE=0 关闭。
 - **配置准入 / OSV 恶意包预检 / 工具指纹基线（防 rug-pull）**：见 mcp_guard.py。
-  基线变更的工具隔离不注册，/mcp approve <server> 重新批准；server 声明里
-  `"trustToolChanges": true` 的自动接受并刷新基线（只记一行，见 ServerSpec）。
+  基线变更的工具隔离不注册，隔离时直接摊出相对上次批准的 diff（声明正文存
+  mcp-approved-decls.json），/mcp diff 看全部、/mcp approve [server] 批准（无参 =
+  全部）；server 声明里 `"trustToolChanges": true` 或全局 XIAOYU_MCP_TRUST_CHANGES=1
+  的自动接受并刷新基线（只记一行，见 ServerSpec）。
   XIAOYU_MCP_OSV=0 关闭预检。
 - **父进程死亡看门狗**：见 mcp_watchdog.py。进程组隔离的另一半——小羽被
   kill -9 后 server 不再变永久孤儿。XIAOYU_MCP_WATCHDOG=0 关闭。
@@ -110,6 +112,12 @@ def _enabled(name: str) -> bool:
     return os.environ.get(name, "").strip().lower() not in ("0", "false", "no", "off")
 
 
+def _opted_in(name: str) -> bool:
+    """环境变量开关：未设置 = 关。给"放松防线"类开关用（XIAOYU_MCP_TRUST_CHANGES）——
+    这类必须显式打开，不能像功能开关那样默认在。"""
+    return os.environ.get(name, "").strip().lower() in ("1", "true", "yes", "on")
+
+
 # ---------- 配置 ----------
 
 
@@ -139,7 +147,7 @@ class ServerSpec:
     #  stderr 记一行，不再等 /mcp approve。给"来源可信、又跟着 @latest 走"的 server
     #  用（每次上游发版都要重批一遍，防线就成了噪音，用户会顺手全批）。不是默认：
     #  基线的意义正是让上游悄悄改描述这件事被看见；--yolo 也刻意不覆盖它（执行审批
-    #  与供应链是两条轴）。
+    #  与供应链是两条轴）。全局版是环境变量 XIAOYU_MCP_TRUST_CHANGES=1（同样默认关）。
     trust_tool_changes: bool = False
 
     @property
@@ -1437,6 +1445,10 @@ class McpManager:
         self._baseline_path = user_config_dir() / "mcp-approved.json"
         self._cache_path = user_config_dir() / "cache" / "mcp-schemas.json"
         self._baseline = mcp_guard.load_baseline(self._baseline_path)
+        #  上次批准/首见时的声明正文（description + inputSchema），/mcp diff 的"上次"。
+        #  与基线同步写；没有它裁决照常，只是 diff 退化成"只能看这次的"
+        self._decls_path = user_config_dir() / "mcp-approved-decls.json"
+        self._decls = mcp_guard.load_declarations(self._decls_path)
         self._cache = self._load_cache() if _enabled("XIAOYU_MCP_CACHE") else {}
 
     def _load_cache(self) -> dict[str, Any]:
@@ -1529,10 +1541,18 @@ class McpManager:
         admitted, quarantined, updates = mcp_guard.admit_tools(
             self._baseline.get(name, {}), declared
         )
-        if quarantined and server.spec.trust_tool_changes:
-            #  trustToolChanges：变更工具照单全收、基线跟着刷新，只留一行痕迹。
-            #  仍走同一条 admit 路径而不是绕过基线——基线要持续跟上，日后把开关
-            #  关掉时才有正确的"上次"可比，而不是从开关打开那天起全是陈年指纹。
+        trusted_by = (
+            "trustToolChanges"
+            if server.spec.trust_tool_changes
+            else "XIAOYU_MCP_TRUST_CHANGES"
+            if _opted_in("XIAOYU_MCP_TRUST_CHANGES")
+            else ""
+        )
+        if quarantined and trusted_by:
+            #  信任开关（逐 server 的 trustToolChanges / 全局环境变量）：变更工具照单
+            #  全收、基线跟着刷新，只留一行痕迹。仍走同一条 admit 路径而不是绕过
+            #  基线——基线要持续跟上，日后把开关关掉时才有正确的"上次"可比，
+            #  而不是从开关打开那天起全是陈年指纹。
             for item in declared:
                 raw = str(item.get("name", ""))
                 if raw in quarantined:
@@ -1540,7 +1560,7 @@ class McpManager:
             admitted, accepted, quarantined = list(declared), quarantined, []
             print(
                 f"[MCP {name}：{len(accepted)} 个工具的描述/schema 相对上次已变化，"
-                f"按 trustToolChanges 自动接受并刷新基线：{', '.join(accepted[:5])}]",
+                f"按 {trusted_by} 自动接受并刷新基线：{', '.join(accepted[:5])}]",
                 file=sys.stderr,
             )
         new_decls = {str(item.get("name", "")): item for item in admitted}
@@ -1559,17 +1579,24 @@ class McpManager:
             )
         self._declared[name] = declared
         if updates:
-            #  TOFU：首见工具并入基线立即落盘
+            #  TOFU / 信任接受：并入基线立即落盘，声明正文同步存档
             self._baseline.setdefault(name, {}).update(updates)
-            with contextlib.suppress(OSError):
-                mcp_guard.save_json_atomic(self._baseline_path, self._baseline)
+            self._record_declarations_locked(name, declared, set(updates))
+            self._save_baseline_locked()
         previously_quarantined = self._quarantined.get(name) or []
         self._quarantined[name] = quarantined
         if quarantined and quarantined != previously_quarantined:
+            #  隔离提示直接把变更摊开（最多 3 个工具、每个 cap 行）——批准该是知情的，
+            #  盲批就是把防线当噪音；全部看 /mcp diff，一键批 /mcp approve
             print(
                 f"[MCP {name}：{len(quarantined)} 个工具的描述/schema 相对上次已变化，"
-                f"已隔离不注册（防 rug-pull）。核对无误后用 /mcp approve {name} 重新批准："
-                f"{', '.join(quarantined[:5])}]",
+                f"已隔离不注册（防 rug-pull）：{', '.join(quarantined[:5])}"
+                f"{'…' if len(quarantined) > 5 else ''}]",
+                file=sys.stderr,
+            )
+            print(
+                self._diff_text_locked(name, limit=3, cap=8)
+                + f"\n  全部差异 /mcp diff {name}；核对无误 /mcp approve {name}",
                 file=sys.stderr,
             )
         #  对齐现役代：其它 server 的工具原样保留；本 server 的按新一代裁决——
@@ -1803,28 +1830,95 @@ class McpManager:
         self._registered[name] = set()
         self._quarantined.pop(name, None)
 
-    def approve(self, name: str) -> str:
-        """/mcp approve：把 server 当前声明的指纹整体写进基线，解除隔离。"""
+    def approve(self, name: str | None = None) -> str:
+        """/mcp approve [server]：把 server 当前声明的指纹整体写进基线，解除隔离。
+        不给名字 = 批准所有有隔离工具的 server（"一键批准"——看过 diff 之后用）。"""
         with self._lock:
-            declared = self._declared.get(name)
-            server = self._servers.get(name)
-            if declared is None or server is None:
+            if name is None:
+                pending = [n for n, names in self._quarantined.items() if names]
+                if not pending:
+                    return "没有被隔离的工具，无需批准"
+                return "\n".join(self._approve_locked(n) for n in pending)
+            return self._approve_locked(name)
+
+    def _approve_locked(self, name: str) -> str:
+        declared = self._declared.get(name)
+        server = self._servers.get(name)
+        if declared is None or server is None:
+            known = ", ".join(self._declared) or "（无）"
+            return f"没有名为 {name!r} 的已连接 server。已知：{known}"
+        count = len(self._quarantined.get(name) or [])
+        if not count:
+            return f"{name} 没有被隔离的工具，无需批准"
+        self._baseline[name] = {
+            str(item.get("name", "")): mcp_guard.tool_fingerprint(item) for item in declared
+        }
+        #  整体批准 = 整体存档：声明里已经消失的工具记录一并清掉
+        self._decls[name] = {}
+        self._record_declarations_locked(name, declared, set(self._baseline[name]))
+        self._save_baseline_locked()
+        #  整代重 swap：解除隔离的注册进来，之前已注册但声明变过的原位换上
+        #  新 schema/描述（否则模型照着旧 schema 调新工具）
+        if error := self._swap_generation_locked(name, server, declared):
+            return f"批准失败：{error}"
+        return f"已批准 {name} 的当前工具集（解除隔离 {count} 个）"
+
+    def diff(self, name: str | None = None) -> str:
+        """/mcp diff [server]：被隔离工具相对上次批准的变更，给人核对用。"""
+        with self._lock:
+            if name is None:
+                pending = [n for n, names in self._quarantined.items() if names]
+                if not pending:
+                    return "没有被隔离的工具"
+                return "\n".join(self._diff_text_locked(n) for n in pending)
+            if name not in self._declared:
                 known = ", ".join(self._declared) or "（无）"
                 return f"没有名为 {name!r} 的已连接 server。已知：{known}"
-            count = len(self._quarantined.get(name) or [])
-            if not count:
-                return f"{name} 没有被隔离的工具，无需批准"
-            self._baseline[name] = {
-                str(item.get("name", "")): mcp_guard.tool_fingerprint(item)
-                for item in declared
-            }
-            with contextlib.suppress(OSError):
-                mcp_guard.save_json_atomic(self._baseline_path, self._baseline)
-            #  整代重 swap：解除隔离的注册进来，之前已注册但声明变过的原位换上
-            #  新 schema/描述（否则模型照着旧 schema 调新工具）
-            if error := self._swap_generation_locked(name, server, declared):
-                return f"批准失败：{error}"
-            return f"已批准 {name} 的当前工具集（解除隔离 {count} 个）"
+            if not self._quarantined.get(name):
+                return f"{name} 没有被隔离的工具"
+            return self._diff_text_locked(name)
+
+    def _diff_text_locked(self, name: str, *, limit: int | None = None, cap: int = 12) -> str:
+        quarantined = self._quarantined.get(name) or []
+        current = {str(item.get("name", "")): item for item in self._declared.get(name) or []}
+        previous = self._decls.get(name, {})
+        shown = quarantined if limit is None else quarantined[:limit]
+        lines = [f"  {name}：{len(quarantined)} 个工具变更"]
+        for raw in shown:
+            lines.append(f"  · {raw}")
+            lines += mcp_guard.describe_change(previous.get(raw), current.get(raw) or {}, cap=cap)
+        if len(shown) < len(quarantined):
+            lines.append(f"  · …另 {len(quarantined) - len(shown)} 个未展开")
+        return "\n".join(lines)
+
+    def _record_declarations_locked(
+        self, name: str, declared: list[dict[str, Any]], tools: set[str]
+    ) -> None:
+        bucket = self._decls.setdefault(name, {})
+        for item in declared:
+            raw = str(item.get("name", ""))
+            if raw in tools:
+                bucket[raw] = mcp_guard.slim_declaration(item)
+
+    def _save_baseline_locked(self) -> None:
+        with contextlib.suppress(OSError):
+            mcp_guard.save_json_atomic(self._baseline_path, self._baseline)
+        with contextlib.suppress(OSError):
+            mcp_guard.save_json_atomic(self._decls_path, self._decls)
+
+    def command(self, parts: list[str]) -> str:
+        """/mcp 子命令统一入口（TUI 与 ACP 共用）：无参 = 状态；approve [名]；diff [名]。"""
+        if not parts:
+            return self.describe()
+        verb, rest = parts[0], parts[1:]
+        if verb == "approve":
+            return self.approve(rest[0] if rest else None)
+        if verb == "diff":
+            return self.diff(rest[0] if rest else None)
+        return (
+            f"未知子命令 {verb!r}。用法：/mcp（状态）· /mcp diff [server]（看隔离工具的变更）"
+            "· /mcp approve [server]（批准，解除隔离；不给名字 = 全部）"
+        )
 
     @staticmethod
     def _log_path(name: str) -> Path:
@@ -1927,7 +2021,7 @@ class McpManager:
                 shown = ", ".join(quarantined[name][:5])
                 lines.append(
                     f"    ⚠ {len(quarantined[name])} 个工具因描述/schema 变更被隔离"
-                    f"（{shown}）—— 核对后 /mcp approve {name}"
+                    f"（{shown}）—— /mcp diff {name} 看变更，核对后 /mcp approve {name}"
                 )
             lines.append(f"    日志：{self._log_path(name)}")
         return "\n".join(lines)
