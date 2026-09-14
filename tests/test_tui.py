@@ -73,6 +73,24 @@ class TestRichSink(unittest.TestCase):
         #  被折叠的行数与查看入口要有交代
         self.assertIn("还有 1 行", out)
 
+    def test_escape_sequences_never_reach_terminal(self) -> None:
+        from xiaoyu.events import Notice, TextDelta, TextEnd, ToolCompleted, ToolPending
+
+        sink, buffer = self.build()
+        hostile = "结果\x1b]52;c;ZXZpbA==\x07\x1b[2J"
+        with contextlib.redirect_stdout(buffer):
+            sink.emit(TextDelta(hostile))
+            sink.emit(TextEnd())
+        sink.emit(ToolPending("bash", {"command": "cat \x1b]0;t\x07"}))
+        sink.emit(ToolCompleted("bash", output=hostile, ok=True, seconds=0.1))
+        sink.emit(Notice(hostile))
+        out = buffer.getvalue()
+        #  rich 自己的样式码也是 ESC 开头：这里的 Console 写 StringIO、无颜色，
+        #  输出里出现的任何 ESC/BEL 都只可能来自未清洗的内容
+        self.assertNotIn("\x1b]", out)
+        self.assertNotIn("\x07", out)
+        self.assertIn("结果", out)
+
     def test_rich_markup_in_args_is_not_interpreted(self) -> None:
         """参数里出现 [red] 这类 rich 标记必须原样显示，不能被吃掉或炸样式。"""
         from xiaoyu.events import ToolPending

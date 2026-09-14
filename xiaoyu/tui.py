@@ -687,14 +687,17 @@ def ask_questions(questions: list[dict[str, Any]], console: Console) -> dict[str
             return None
 
     for number, item in enumerate(questions, start=1):
+        #  问题与选项是模型写的：显示前去掉控制字符（见 ui.strip_controls）。
+        #  答案字典的键仍用问题原文——_ask_user 按原文判定哪些题被跳过
         rows = [
-            (str(option.get("label", "")), str(option.get("description", "")))
+            (ui.strip_controls(str(option.get("label", ""))),
+             ui.strip_controls(str(option.get("description", ""))))
             for option in item["options"]
         ]
         rows.append((OTHER_LABEL, ""))
         other_index = len(rows) - 1
         multi = bool(item.get("multi_select"))
-        title = item["question"] + (f"（{number}/{total}）" if total > 1 else "")
+        title = ui.strip_controls(item["question"]) + (f"（{number}/{total}）" if total > 1 else "")
         draft = ""
         checked: set[int] = set()
         cursor = 0
@@ -740,7 +743,10 @@ def ask_questions(questions: list[dict[str, Any]], console: Console) -> dict[str
         if answer is None:
             break
         answers[item["question"]] = answer
-        console.print(Text(f"  ✔ {item['question']}：{answer}", style="text.secondary"))
+        console.print(
+            Text(f"  ✔ {ui.strip_controls(item['question'])}：{ui.strip_controls(answer)}",
+                 style="text.secondary")
+        )
     return answers
 
 
@@ -813,7 +819,8 @@ class RichSink:
     def emit(self, event: UIEvent) -> None:
         handler = self._handlers.get(type(event))
         if handler is not None:
-            handler(event)
+            #  终端注入面：模型正文与工具输出可能夹带转义序列（见 ui.strip_controls）
+            handler(render.sanitize_event(event))
 
     def quiet_child(self, indent: str = "    ") -> "RichSink":
         """给子 agent 的静默 sink：共用 Console、带缩进、不刷正文、不开 spinner。"""
@@ -1653,13 +1660,16 @@ class Tui:
         #  预览被截断时拿到"补打全文"闭包，挂到菜单的 Ctrl-O 上——
         #  "还有 N 行"在确认框里同样得是可兑现的承诺，不能逼人盲批
         expand: Callable[[], None] | None = None
+        #  预览只用清洗过的副本：写入内容/替换文本是模型给的，可能夹带转义序列；
+        #  授权判定（会话授权、规则建议）仍用原参数
+        shown = render.clean_value(args)
         if name == "write_file":
-            expand = self._preview_write(str(args.get("path", "")), str(args.get("content", "")))
+            expand = self._preview_write(str(shown.get("path", "")), str(shown.get("content", "")))
         elif name == "str_replace":
             expand = self._preview_replace(
-                str(args.get("path", "")),
-                str(args.get("old_str", "")),
-                str(args.get("new_str", "")),
+                str(shown.get("path", "")),
+                str(shown.get("old_str", "")),
+                str(shown.get("new_str", "")),
             )
         elif name == "bash":
             if reason := command_check.command_risk(str(args.get("command", ""))):
@@ -1675,7 +1685,7 @@ class Tui:
         options.append(("deny", "拒绝，并告诉小羽下一步怎么做", "n"))
 
         try:
-            choice = self._inline_select(self._confirm_title(name, args), options, expand)
+            choice = self._inline_select(self._confirm_title(name, shown), options, expand)
         except Exception:  # noqa: BLE001 - 非常规终端起不了菜单：退回文本问答，确认永远可用
             return self._confirm_text(name)
 

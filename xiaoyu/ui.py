@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import contextlib
 import os
+import re
 import shutil
 import sys
 import unicodedata
@@ -121,13 +122,29 @@ def budget(reserve: int = 0, width: int | None = None) -> int:
     return max((width if width is not None else term_width()) - reserve, _MIN_BUDGET)
 
 
+#  终端控制字符：C0（保留 \t \n）、DEL、C1。ESC 开头的序列（改窗口标题、OSC 52
+#  写剪贴板、光标移动清屏）靠 ESC 本身生效，C1 里的 0x9b/0x9d 在部分终端上是
+#  8-bit 的 CSI/OSC。模型正文和工具输出里的这些字符可以来自任何被读到的文件或
+#  网页，原样打到终端就是注入面。
+_TERMINAL_CONTROLS = re.compile(r"[\x00-\x08\x0b-\x1f\x7f-\x9f]")
+
+
+def strip_controls(text: str) -> str:
+    """去掉会被终端解释的控制字符，只留 \\t 和 \\n。
+
+    逐字符删除、不解析序列：流式正文按增量分片到达，一个转义序列可能被切在
+    两片之间，按序列匹配会漏；删掉 ESC 后剩下的 "[31m" 之类只是无害的可见字符。
+    """
+    return _TERMINAL_CONTROLS.sub("", text)
+
+
 def preview(value: object, limit: int = 100) -> str:
     """把工具参数压成一行短预览，**含省略号在内**不超过 limit 个字符。
 
     省略号必须算进预算里：limit 现在就是终端宽度，多吐一个字符这行就折行了，
     "压成一行"的意义随之落空。
     """
-    text = str(value).replace("\n", "⏎")
+    text = strip_controls(str(value).replace("\n", "⏎"))
     if len(text) <= limit:
         return text
     return text[: max(limit - 1, 0)] + "…"

@@ -390,3 +390,37 @@ class TestPlainSink(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TerminalControlStrippingTest(unittest.TestCase):
+    """模型正文与工具输出可能夹带转义序列（来自被读到的文件/网页），打到终端前必须去掉。"""
+
+    HOSTILE = "看\x1b]52;c;ZXZpbA==\x07这里\x1b[2J\x9b31m完"
+
+    def test_strip_controls_keeps_tab_and_newline(self) -> None:
+        from xiaoyu import ui
+
+        self.assertEqual(ui.strip_controls("a\tb\nc\r\x1b[0m\x7f\x9bd"), "a\tb\nc[0md")
+        self.assertNotIn("\x1b", ui.preview(self.HOSTILE))
+
+    def test_plain_sink_strips_text_and_tool_output(self) -> None:
+        buffer = io.StringIO()
+        sink = PlainSink()
+        with contextlib.redirect_stdout(buffer):
+            sink.emit(TextDelta(self.HOSTILE))
+            sink.emit(TextEnd())
+            sink.emit(ToolPending("bash", {"command": "cat \x1b]0;title\x07 x"}))
+            sink.emit(ToolCompleted("bash", output=self.HOSTILE, ok=True, seconds=0.1))
+            sink.emit(Notice("注意\x1b[31m"))
+        out = buffer.getvalue()
+        for control in ("\x1b", "\x07", "\x9b"):
+            self.assertNotIn(control, out)
+        self.assertIn("看", out)
+        self.assertIn("完", out)
+
+    def test_clean_event_is_identity_when_nothing_to_strip(self) -> None:
+        """TextDelta 是逐 token 热路径：干净事件不复制。"""
+        from xiaoyu.render import sanitize_event
+
+        event = ToolPending("bash", {"command": "ls"})
+        self.assertIs(sanitize_event(event), event)
