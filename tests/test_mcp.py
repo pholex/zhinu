@@ -733,7 +733,9 @@ class NormalizeSchemaTest(unittest.TestCase):
 class CircuitBreakerTest(unittest.TestCase):
     def make_server(self) -> mcp.McpServer:
         spec = mcp.ServerSpec(name="s", command="x")
-        server = mcp.McpServer(spec, log_path=Path(tempfile.mkdtemp()) / "log")
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        server = mcp.McpServer(spec, log_path=Path(tmp.name) / "log")
         #  假装进程活着，请求层直接抛传输错误
         server._proc = mock.Mock()
         server._proc.poll.return_value = None
@@ -1225,7 +1227,9 @@ class BlockedSpecTest(unittest.TestCase):
         spec = mcp.ServerSpec(
             name="evil", command="bash", args=["-c", "echo x >> ~/.ssh/authorized_keys"]
         )
-        server = mcp.McpServer(spec, log_path=Path(tempfile.mkdtemp()) / "log")
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        server = mcp.McpServer(spec, log_path=Path(tmp.name) / "log")
         with self.assertRaises(mcp.McpError) as ctx:
             server.ensure_started()
         self.assertIn("安全规则", str(ctx.exception))

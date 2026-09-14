@@ -21,6 +21,38 @@ def div(a, b):
 """
 
 
+def _pid_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def _wait_dead(pid: int, timeout: float = 5.0) -> bool:
+    """孙进程被 SIGKILL 后由 init 回收，给它一点时间。"""
+    import time as time_module
+
+    deadline = time_module.monotonic() + timeout
+    while time_module.monotonic() < deadline:
+        if not _pid_alive(pid):
+            return True
+        time_module.sleep(0.05)
+    return False
+
+
+def _force_kill(pid: int) -> None:
+    """用例失败时别把 sleep 60 留在机器上。"""
+    import signal
+
+    try:
+        os.kill(pid, signal.SIGKILL)
+    except OSError:
+        pass
+
+
 class ToolboxTestCase(unittest.TestCase):
     def setUp(self) -> None:
         self.tmp = tempfile.TemporaryDirectory()
@@ -551,6 +583,70 @@ class TestBashAndSafety(ToolboxTestCase):
         #  整组应已被 SIGKILL；若还活着，wait 会在 5s 后抛 TimeoutExpired
         proc.wait(timeout=5)
         self.assertIsNotNone(proc.poll())
+
+    def _grandchild_pid(self, timeout: float = 10.0) -> int:
+        """等命令把后台孙进程的 pid 写进工作区，返回它（顺手登记兜底清理）。"""
+        import time as time_module
+
+        pid_file = self.root / "child.pid"
+        deadline = time_module.monotonic() + timeout
+        while time_module.monotonic() < deadline:
+            text = pid_file.read_text(encoding="utf-8").strip() if pid_file.exists() else ""
+            if text.isdigit():
+                pid = int(text)
+                self.addCleanup(_force_kill, pid)
+                return pid
+            time_module.sleep(0.05)
+        self.fail("命令没在时限内写出孙进程 pid")
+
+    @unittest.skipIf(os.name == "nt", "POSIX 专属：进程组语义")
+    def test_bash_system_exit_kills_process_tree(self) -> None:
+        """SIGTERM 在等待期间以 SystemExit 抛出时，前台命令树必须被收割。
+
+        session_log 的信号处理器把 SIGTERM 转成 SystemExit；命令跑在独立会话里
+        收不到这个信号，不收割就整树成孤儿一直活着。
+        """
+        from xiaoyu import tools as tools_module
+
+        grandchild: list[int] = []
+
+        def raise_system_exit(proc, pipes, deadline):  # noqa: ANN001
+            grandchild.append(self._grandchild_pid())
+            raise SystemExit(143)
+
+        with mock.patch.object(tools_module, "_wait_bounded", raise_system_exit):
+            with self.assertRaises(SystemExit):
+                self.box.run("bash", {"command": "sleep 60 & echo $! > child.pid; wait"})
+        self.assertTrue(_wait_dead(grandchild[0]), "SystemExit 后孙进程仍然活着")
+        self.assertEqual(tools_module._FOREGROUND_PROCS, set())  # noqa: SLF001
+
+    @unittest.skipIf(os.name == "nt", "POSIX 专属：进程组语义")
+    def test_atexit_reaper_kills_foreground_command_in_other_thread(self) -> None:
+        """子 agent 线程里正跑着前台 bash、主线程退出：atexit 兜底整树收割。"""
+        import threading
+
+        from xiaoyu import tools as tools_module
+
+        results: list[str] = []
+        worker = threading.Thread(
+            target=lambda: results.append(self.box.run(
+                "bash", {"command": "sleep 60 & echo $! > child.pid; wait", "timeout": 120}
+            )),
+            daemon=True,
+        )
+        worker.start()
+        pid = self._grandchild_pid()
+        tools_module._reap_foreground()  # noqa: SLF001
+        worker.join(10)
+        self.assertFalse(worker.is_alive(), "收割后前台 bash 仍在等待")
+        self.assertTrue(_wait_dead(pid), "收割后孙进程仍然活着")
+        self.assertEqual(tools_module._FOREGROUND_PROCS, set())  # noqa: SLF001
+
+    def test_normal_completion_leaves_no_registration(self) -> None:
+        from xiaoyu import tools as tools_module
+
+        self.assertIn("exit_status: 0", self.box.run("bash", {"command": "echo ok"}))
+        self.assertEqual(tools_module._FOREGROUND_PROCS, set())  # noqa: SLF001
 
     def test_bash_huge_output_is_bounded_in_memory(self) -> None:
         """几十 MB 的输出只在内存里留头尾：开头、结尾都在，中间标注丢了多少。"""

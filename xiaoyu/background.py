@@ -22,14 +22,13 @@ from __future__ import annotations
 import contextlib
 import os
 import subprocess
-import tempfile
 import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
 
-from . import diagnostics
+from . import diagnostics, tempdirs
 
 #  仍在跑的后台任务数（monitor + command），/diagnostics 可见
 TASKS_LIVE = diagnostics.Gauge("background.tasks.live")
@@ -158,7 +157,9 @@ class TaskManager:
 
     def _log_file(self, task_id: str) -> Path:
         if self._log_dir is None:
-            self._log_dir = Path(tempfile.mkdtemp(prefix="xiaoyu-bg-"))
+            #  进程拥有的目录：退出时连日志一起删（理由见 tempdirs 模块说明——
+            #  task id 只在本进程的任务表里可寻址，resume 后查不到）
+            self._log_dir = tempdirs.make_dir("xiaoyu-bg-")
         return self._log_dir / f"{task_id}.log"
 
     def start(
@@ -377,11 +378,16 @@ class TaskManager:
         return " · ".join(parts) + " 仍在运行（/tasks 查看，task_output 取输出）"
 
     def shutdown(self) -> None:
-        """会话结束整体回收（atexit / 显式调用均幂等）。"""
+        """会话结束整体回收（atexit / 显式调用均幂等）：先杀进程，再删日志目录。"""
         for task in self.all():
             if not task.done.is_set():
                 task.killed = True
                 kill_tree(task.proc)
+        if self._log_dir is not None:
+            #  Windows 上刚被杀的进程可能还没松开日志句柄，删不掉由 discard 吞掉，
+            #  留给下次启动清扫
+            tempdirs.discard(self._log_dir)
+            self._log_dir = None
 
 
 def _sanitize(description: str) -> str:

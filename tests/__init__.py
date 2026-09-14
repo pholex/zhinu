@@ -18,3 +18,9 @@ atexit.register(_isolated.cleanup)
 #  posix 走 XDG_CONFIG_HOME，Windows 走 APPDATA，两个都指过去
 os.environ["XDG_CONFIG_HOME"] = _isolated.name
 os.environ["APPDATA"] = _isolated.name
+
+#  用例里大量走 cli.main：启动期临时目录清扫会去扫开发机真实的 $TMPDIR，
+#  测试不该有这种外溢副作用——标记为已跑过。清扫本身在 test_tempdirs 里对假 root 测。
+from xiaoyu import tempdirs as _tempdirs  # noqa: E402
+
+_tempdirs._sweep_started = True

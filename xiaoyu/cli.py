@@ -2433,6 +2433,12 @@ def main(argv: list[str] | None = None) -> int:
     from . import crash_guard
 
     crash_guard.install()
+    #  启动期清扫陈旧临时目录（kill -9 / 断电留下的）：每进程一次、后台线程、
+    #  失败吞掉；绝不动在跑会话的目录，边界见 tempdirs 模块说明。同样只在 CLI
+    #  入口挂——嵌入宿主不该被库顺手扫它的临时目录。
+    from . import tempdirs
+
+    tempdirs.sweep_in_background()
     #  子命令拦截：nargs="*" 的 prompt 位置参数和 subparsers 不兼容，手动分流
     if argv and argv[0] == "config":
         return config_command(argv[1:])

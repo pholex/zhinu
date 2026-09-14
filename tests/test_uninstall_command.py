@@ -34,7 +34,9 @@ def _run(argv: list[str]) -> tuple[int, str]:
 
 class UninstallCommandTest(unittest.TestCase):
     def setUp(self) -> None:
-        self.config_dir = Path(tempfile.mkdtemp()) / "xiaoyu"
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.config_dir = Path(tmp.name) / "xiaoyu"
         (self.config_dir / "sessions").mkdir(parents=True)
         for target, kwargs in (
             ("xiaoyu.config.user_config_dir", {"return_value": self.config_dir}),
@@ -72,7 +74,9 @@ class UninstallCommandTest(unittest.TestCase):
         self.assertIn(UNINSTALL_ARGV, self.calls)
 
     def test_removes_editor_bindings(self) -> None:
-        root = Path(tempfile.mkdtemp())
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        root = Path(tmp.name)
         path = root / "keybindings.json"
         path.write_text(
             json.dumps([{"key": "ctrl+k", "command": "保留我"}, editor_setup._BINDING]),
