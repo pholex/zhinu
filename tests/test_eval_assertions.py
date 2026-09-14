@@ -74,22 +74,23 @@ if __name__ == "__main__":
 
 def evaluate(case: Case, mutate, tools: tuple[str, ...], transcript: str = "") -> dict[str, str]:
     """在临时工作区里跑一遍 case 的全部断言，返回 {失败的断言: 说明}。"""
-    root = Path(tempfile.mkdtemp(prefix="xiaoyu-assert-")).resolve()
-    case.setup(root)
-    before = snapshot(root)
-    mutate(root)
-    ctx = Context(
-        workspace=root,
-        before=before,
-        trace=[{"tool": name, "ok": True, "args": {}, "output": ""} for name in tools],
-        transcript=transcript,
-    )
-    failures: dict[str, str] = {}
-    for label, check in case.checks:
-        passed, detail = check(ctx)
-        if not passed:
-            failures[label] = detail
-    return failures
+    with tempfile.TemporaryDirectory(prefix="xiaoyu-assert-") as tmp:
+        root = Path(tmp).resolve()
+        case.setup(root)
+        before = snapshot(root)
+        mutate(root)
+        ctx = Context(
+            workspace=root,
+            before=before,
+            trace=[{"tool": name, "ok": True, "args": {}, "output": ""} for name in tools],
+            transcript=transcript,
+        )
+        failures: dict[str, str] = {}
+        for label, check in case.checks:
+            passed, detail = check(ctx)
+            if not passed:
+                failures[label] = detail
+        return failures
 
 
 class TestCaseDefinitions(unittest.TestCase):
@@ -295,10 +296,14 @@ class TestTestsProbeFallback(unittest.TestCase):
     def _run_probe(self, files: dict[str, str]) -> subprocess.CompletedProcess:
         from xiaoyu.evals.harness import TESTS_PROBE
 
-        workspace = Path(tempfile.mkdtemp(prefix="xiaoyu-probe-fallback-")).resolve()
+        #  探针与被测文件同放一个临时根下（探针在工作区之外），用例结束整根删掉
+        tmp = tempfile.TemporaryDirectory(prefix="xiaoyu-probe-fallback-")
+        self.addCleanup(tmp.cleanup)
+        workspace = Path(tmp.name).resolve() / "workspace"
+        workspace.mkdir()
         for name, content in files.items():
             (workspace / name).write_text(content, encoding="utf-8")
-        probe = workspace.parent / f"{workspace.name}-probe.py"
+        probe = workspace.parent / "probe.py"
         probe.write_text(TESTS_PROBE, encoding="utf-8")
         return subprocess.run(
             [sys.executable, str(probe)],

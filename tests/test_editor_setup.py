@@ -52,7 +52,9 @@ class TestParsing(unittest.TestCase):
 
 class TestPlanning(unittest.TestCase):
     def setUp(self) -> None:
-        self.root = Path(tempfile.mkdtemp())
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.root = Path(tmp.name)
         self.path = self.root / "keybindings.json"
         self.editor = editor_setup.Editor("测试编辑器", "Test")
 
@@ -85,7 +87,9 @@ class TestPlanning(unittest.TestCase):
 
 class TestApply(unittest.TestCase):
     def setUp(self) -> None:
-        self.root = Path(tempfile.mkdtemp())
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.root = Path(tmp.name)
         self.path = self.root / "keybindings.json"
         self.editor = editor_setup.Editor("测试编辑器", "Test")
 
@@ -121,7 +125,9 @@ class TestRemoval(unittest.TestCase):
     """uninstall 侧：只删严格等于 _BINDING 的项，其余一概不动。"""
 
     def setUp(self) -> None:
-        self.root = Path(tempfile.mkdtemp())
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.root = Path(tmp.name)
         self.path = self.root / "keybindings.json"
         self.editor = editor_setup.Editor("测试编辑器", "Test")
         patcher = mock.patch.object(

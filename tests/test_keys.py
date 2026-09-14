@@ -107,7 +107,9 @@ class TestRegistrationMatchesTable(unittest.TestCase):
 
         from prompt_toolkit.key_binding import KeyBindings
 
-        tui = Tui(Permissions(Path(tempfile.mkdtemp())), console=Console(file=io.StringIO()))
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        tui = Tui(Permissions(Path(tmp.name)), console=Console(file=io.StringIO()))
         actual = {tuple(str(key) for key in b.keys) for b in tui._key_bindings().bindings}
 
         #  按表另建一份参照（prompt_toolkit 会把 "enter" 归一成 Keys.ControlM，

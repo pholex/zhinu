@@ -247,7 +247,6 @@ def python_snippet_ok(code: str, note: str = "") -> Check:
 
     def check(ctx: Context) -> tuple[bool, str]:
         script = Path(tempfile.mkdtemp(prefix="xiaoyu-probe-")) / "probe.py"
-        script.write_text(textwrap.dedent(code), encoding="utf-8")
         env = dict(
             os.environ,
             PYTHONPATH=str(ctx.workspace),
@@ -256,6 +255,8 @@ def python_snippet_ok(code: str, note: str = "") -> Check:
             PYTHONUTF8="1",
         )
         try:
+            #  写探针也在 try 里：写失败（磁盘满）同样要把刚建的目录删掉
+            script.write_text(textwrap.dedent(code), encoding="utf-8")
             result = subprocess.run(
                 #  Windows 上没有 python3 命令，用当前解释器最稳
                 [sys.executable, str(script)],

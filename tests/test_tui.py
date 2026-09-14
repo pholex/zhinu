@@ -938,7 +938,9 @@ class TestDedupedHistory(unittest.TestCase):
 
         from xiaoyu.tui import DedupedHistory
 
-        return DedupedHistory(str(Path(tempfile.mkdtemp()) / "hist"))
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        return DedupedHistory(str(Path(tmp.name) / "hist"))
 
     def test_consecutive_duplicates_collapse(self) -> None:
         """反复回车重跑同一条是常态；不去重的话 ↑ 要按十几次才翻得过去。"""

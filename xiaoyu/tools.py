@@ -9,6 +9,7 @@
 
 from __future__ import annotations
 
+import atexit
 import collections
 import contextlib
 import fnmatch
@@ -23,14 +24,13 @@ import shutil
 import unicodedata
 import subprocess
 import sys
-import tempfile
 import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
 
-from . import browser, mcp, sandbox
+from . import browser, mcp, sandbox, tempdirs
 from .background import MONITOR_DEFAULT_TIMEOUT, TaskManager, kill_tree as _kill_tree
 from .config import Config
 from .rewind import RewindStore
@@ -234,6 +234,36 @@ def _wait_bounded(proc: subprocess.Popen, pipes: list[_BoundedPipe], deadline: f
         if pipe.thread.is_alive():
             return False
     return True
+
+
+#  在跑的前台 bash 进程（任意线程）。_bash 进出登记，atexit 兜底整树收割：
+#  子 agent 线程里正跑着命令、主线程收到 SIGTERM 退出时，那条命令的等待不在
+#  主线程栈上，_bash 自己的 except 管不到它。正常完成路径只多一次加锁的集合增删。
+_FOREGROUND_PROCS: set[subprocess.Popen] = set()
+_FOREGROUND_LOCK = threading.Lock()
+
+
+def _register_foreground(proc: subprocess.Popen) -> None:
+    with _FOREGROUND_LOCK:
+        _FOREGROUND_PROCS.add(proc)
+
+
+def _unregister_foreground(proc: subprocess.Popen) -> None:
+    with _FOREGROUND_LOCK:
+        _FOREGROUND_PROCS.discard(proc)
+
+
+def _reap_foreground() -> None:
+    """进程退出兜底：收割所有仍在登记的前台命令树（kill_tree 对已退出进程无害）。"""
+    with _FOREGROUND_LOCK:
+        procs = list(_FOREGROUND_PROCS)
+    for proc in procs:
+        with contextlib.suppress(Exception):
+            _kill_tree(proc)
+
+
+#  导入时注册：排在 tempdirs 的目录清理之前执行（atexit 后注册先跑）
+atexit.register(_reap_foreground)
 
 
 def _partial_chunks(stdout: bytes | str | None, stderr: bytes | str | None) -> str:
@@ -738,7 +768,9 @@ class Toolbox:
         #  用来强制"先读再改"，并检测读完之后文件被外部改动。
         self._reads: dict[Path, float] = {}
         #  超长工具输出的落盘目录（spill）：
-        #  懒创建，进程级临时目录。落盘失败退回纯截断，绝不影响工具本身。
+        #  懒创建，进程级临时目录，进程退出时连内容一起删（tempdirs）——召回靠
+        #  内存里的 _spills 表，resume 后的新进程本来就取不回。
+        #  落盘失败退回纯截断，绝不影响工具本身。
         self._spill_dir: Path | None = None
         self._spill_seq = 0
         #  spill 召回表：短 id（序号字符串）→ 元信息。inline 预览只留头尾 + 一个
@@ -2060,6 +2092,7 @@ class Toolbox:
             return f"ERROR: 无法执行命令：{exc}"
         #  不用 communicate：它把整份输出读进内存，几 GB 的输出能把进程吃爆
         pipes = [_BoundedPipe(proc.stdout), _BoundedPipe(proc.stderr)]
+        _register_foreground(proc)
         try:
             if not _wait_bounded(proc, pipes, started + limit):
                 raise subprocess.TimeoutExpired(argv, limit)
@@ -2087,6 +2120,14 @@ class Toolbox:
                 f"exit_status: 124 (timeout)\n{partial or '(无输出)'}"
             )
             return output + _interactive_auth_hint(partial)
+        except BaseException:
+            #  其余一切非正常退出：SIGTERM 被 session_log 转成的 SystemExit、
+            #  等待期间的任何异常。命令在独立会话里收不到我们的信号，不收割就
+            #  整树成孤儿一直活着——与 Ctrl-C 同理，杀完照常上抛。
+            _kill_tree(proc)
+            raise
+        finally:
+            _unregister_foreground(proc)
 
         chunks = [f"exit_status: {proc.returncode}"]
         if stdout_text := _decode_output(stdout_raw).rstrip():
@@ -2252,7 +2293,7 @@ class Toolbox:
             if self._spill_dir is None:
                 #  resolve 后再存：outside_workspace 的豁免判断用的是 resolve 过的
                 #  路径，macOS 的 /var → /private/var 符号链接会让未解析形态对不上
-                self._spill_dir = Path(tempfile.mkdtemp(prefix="xiaoyu-spill-")).resolve()
+                self._spill_dir = tempdirs.make_dir("xiaoyu-spill-").resolve()
             self._spill_seq += 1
             spill_id = str(self._spill_seq)
             safe_name = "".join(ch if ch.isalnum() else "-" for ch in name)[:40] or "tool"
