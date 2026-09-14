@@ -588,10 +588,13 @@ def client(base_url: str, api_key: str, timeout: float) -> Any:
     """
     import anthropic
 
+    from . import netproxy
+
     base = base_url.rstrip("/").removesuffix("/v1")
     return anthropic.Anthropic(
         base_url=base or base_url,
         api_key=api_key,
         timeout=timeout,
         max_retries=0,
+        http_client=netproxy.http_client("anthropic"),
     )

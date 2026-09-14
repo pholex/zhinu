@@ -153,7 +153,7 @@ class DoctorCommandTest(unittest.TestCase):
         ids = [check["id"] for check in payload["checks"]]
         self.assertEqual(
             ids,
-            ["python", "config_dir", "disk", "providers", "sandbox", "bash_parser", "tools", "mcp_config", "sessions"],
+            ["python", "config_dir", "disk", "providers", "proxy", "sandbox", "bash_parser", "tools", "mcp_config", "sessions"],
         )
         self.assertEqual(code, 1 if payload["status"] == "fail" else 0)
         self.assertIn("gauges", payload["diagnostics"])

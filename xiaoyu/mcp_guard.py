@@ -34,6 +34,8 @@ import urllib.request
 from pathlib import Path
 from typing import Any
 
+from . import netproxy
+
 # ---------- 配置准入 ----------
 
 #  只盯 shell 解释器：准入规则拦的是"配置本身就是一段内联攻击脚本"，
@@ -194,7 +196,7 @@ def osv_malware_check(command: str, args: list[str]) -> str | None:
         method="POST",
     )
     try:
-        with urllib.request.urlopen(request, timeout=_OSV_TIMEOUT) as response:
+        with netproxy.urlopen(request, timeout=_OSV_TIMEOUT) as response:
             body = json.loads(response.read().decode("utf-8", errors="replace"))
     except Exception as exc:  # noqa: BLE001 - fail-open：预检失败不拦启动
         print(f"[MCP OSV 预检失败（放行）：{type(exc).__name__}: {exc}]", file=sys.stderr)

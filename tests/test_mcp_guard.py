@@ -109,7 +109,7 @@ class OsvCheckTest(unittest.TestCase):
 
     def test_malware_hit_returns_reason(self):
         with mock.patch.object(
-            mcp_guard.urllib.request,
+            mcp_guard.netproxy,
             "urlopen",
             return_value=fake_response(
                 {"vulns": [{"id": "MAL-2026-0001", "summary": "窃取 npm token"}]}
@@ -121,7 +121,7 @@ class OsvCheckTest(unittest.TestCase):
 
     def test_plain_cve_ignored(self):
         with mock.patch.object(
-            mcp_guard.urllib.request,
+            mcp_guard.netproxy,
             "urlopen",
             return_value=fake_response({"vulns": [{"id": "GHSA-xxxx", "summary": "普通洞"}]}),
         ):
@@ -130,7 +130,7 @@ class OsvCheckTest(unittest.TestCase):
     def test_verdict_cached_failure_not_cached(self):
         #  成功裁决缓存：第二次不再打网络
         with mock.patch.object(
-            mcp_guard.urllib.request, "urlopen", return_value=fake_response({"vulns": []})
+            mcp_guard.netproxy, "urlopen", return_value=fake_response({"vulns": []})
         ) as fake:
             mcp_guard.osv_malware_check("npx", ["clean-pkg"])
             mcp_guard.osv_malware_check("npx", ["clean-pkg"])
@@ -139,14 +139,14 @@ class OsvCheckTest(unittest.TestCase):
         #  网络抖动固化成长期放行，这正是要避免的）
         mcp_guard._osv_cache.clear()
         with mock.patch.object(
-            mcp_guard.urllib.request, "urlopen", side_effect=OSError("断网")
+            mcp_guard.netproxy, "urlopen", side_effect=OSError("断网")
         ) as fake:
             self.assertIsNone(mcp_guard.osv_malware_check("npx", ["clean-pkg"]))
             self.assertIsNone(mcp_guard.osv_malware_check("npx", ["clean-pkg"]))
         self.assertEqual(fake.call_count, 2)
 
     def test_non_runner_no_network(self):
-        with mock.patch.object(mcp_guard.urllib.request, "urlopen") as fake:
+        with mock.patch.object(mcp_guard.netproxy, "urlopen") as fake:
             self.assertIsNone(mcp_guard.osv_malware_check(sys.executable, ["x.py"]))
         fake.assert_not_called()
 

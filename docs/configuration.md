@@ -186,6 +186,16 @@ XIAOYU_PROVIDER_MINIMAX_SIGNATURES=*                         # 工具调用重�
 
 解析器认三种发起格式：我们教的 ```` ```tool_call ```` / `<tool_call>` 里放 `{"name":…,"arguments":…}`，以及训练过原生工具调用的开源模型（Qwen3 等）会自发使用的原生方言 `<tool_call><function=名字>…</function></tool_call>`（名字在壳上，参数用块内 JSON 或 `<parameter=键>值` 子标签）——后者无需你做任何配置，自动认。
 
+## 出网代理
+
+小羽自己的网络请求（模型调用、`/v1/models` 探测、MCP HTTP 传输、MCP OSV 预检）认标准代理变量 `HTTP_PROXY` / `HTTPS_PROXY` / `ALL_PROXY` / `NO_PROXY`（大小写都认，小写优先）；环境里一个都没有时沿用系统代理设置（macOS 网络偏好 / Windows 注册表）。在此之上有三条规则：
+
+- **本机地址一律直连**：`localhost` / `*.localhost` / `127.0.0.0/8` / `::1` 不走代理，不用为本机模型端点（vLLM、Ollama…）另配 `NO_PROXY`。
+- **用不了的代理变量降级、不崩**：`socks4://`（HTTP 客户端不支持）、`socks5://` 但没装 socksio（修复：`pip install "httpx[socks]"`）、写法解析不了——启动时在 stderr 说一次是哪个变量、为什么、怎么修，然后小羽自身按该变量未设置处理（还有别的代理变量就用别的，都没有就直连）。
+- **子进程拿到的是原值**：bash 工具、MCP stdio server 继承你设的代理变量，小羽不改写它们。
+
+`SOCKS5` 代理只作用于模型请求；MCP HTTP 传输与 OSV 预检基于标准库，只会用 http(s) 代理。`xiaoyu doctor` 的 `proxy` 一项列出解析结果（代理地址里的账号密码会脱敏）。
+
 ## macOS Keychain
 
 key 可以不落盘。`.env` 里留空即会自动回退去读，service 名就是变量名本身（`.env` / 环境变量 / Keychain 三处同名）：
