@@ -825,6 +825,11 @@ class Agent:
         #  管的是"原样重试"，这里管的是"微调参数硬试"）。按轮归零。
         self._fail_streak_tool = ""
         self._fail_streak = 0
+        #  无进展检测：bash 连续失败的输出指纹（抹掉数字/哈希后）与连续次数
+        self._stall_fp, self._stall_count = "", 0
+        #  压缩后的重读比对：压缩发生时 trace 的长度，与剩余的比对次数
+        self._post_compact_mark = 0
+        self._post_compact_window = 0
         #  产物对账护栏的证据：本轮成功执行过的"会改动现场"的工具次数。按轮归零。
         self._turn_mutations = 0
         #  库层嵌入用：宿主可从任意线程/协程调用 interrupt()，线程安全，
@@ -1845,6 +1850,7 @@ class Agent:
         if store is not None:
             store.drop_all()
         self.trace.clear()
+        self._post_compact_window = 0
         self._loaded_skills.clear()
         #  收尾轻推的"每会话一次"随会话重置——recycle 后的新对话有自己的一次机会
         self._crystallize_nudged = False
@@ -1856,6 +1862,7 @@ class Agent:
         self._call_repeats = 0
         self._exec_evidence = 0
         self._fail_streak_tool, self._fail_streak = "", 0
+        self._stall_fp, self._stall_count = "", 0
         self._turn_mutations = 0
         if self.session_log:
             self.session_log.event("clear")
@@ -2190,6 +2197,7 @@ class Agent:
         self._crystallize_skip_logged = False
         #  失败流与改动证据同样按轮归零：上一轮的失败/改动不该影响这一轮的判定
         self._fail_streak_tool, self._fail_streak = "", 0
+        self._stall_fp, self._stall_count = "", 0
         self._turn_mutations = 0
         self.structured_output = None
         #  UserPromptSubmit hook：block 则本轮不发生（不入历史、不调模型）
@@ -2757,6 +2765,7 @@ class Agent:
         if cleared:
             #  锚点之前的消息被改写了，权威值不再对应现状
             self._history_rewritten()
+            self._mark_compaction()
             after_micro = self.context_tokens()
             self.sink.emit(
                 Notice(f"[已清理 {cleared} 条旧工具输出，估算 {estimated} → {after_micro} tok]")
@@ -2785,6 +2794,7 @@ class Agent:
         changed = self.messages is not before_compact
         if changed:
             self._history_rewritten()
+            self._mark_compaction()
         if self.session_log:
             if changed:
                 #  把压缩后的完整历史（不含 system，resume 时用新的）存进事件：
@@ -3516,6 +3526,80 @@ class Agent:
     _FAIL_REFLECT = 3
     _FAIL_CONVERGE = 5
 
+    #  失败输出里随每次运行变化的部分：7 位以上的十六进制串（提交号、容器/临时
+    #  目录 id）与任意数字串（时间戳、耗时、PID、行号、端口）
+    _VOLATILE = re.compile(r"\b[0-9a-f]{7,}\b|\d+")
+    _EXIT_STATUS = re.compile(r"^exit_status: (\d+)", re.M)
+    #  压缩后在多少次成功调用内做"重读压缩前内容"的比对，往回看多少条压缩前的调用
+    _REREAD_WINDOW = 3
+    _REREAD_LOOKBACK = 16
+
+    def _stall_note(self, name: str, raw: str) -> str:
+        """bash 连续失败、且输出除数字/哈希外完全相同时的提示（无进展检测）。
+
+        打转检测只认参数完全相同，失败流只数 ERROR 前缀；而最常见的空转是命令
+        略改（加个 -v、换个 2>&1）或改了代码再跑，拿到的却是只差时间戳的同一个
+        失败——参数不同、bash 非零退出也不带 ERROR 前缀，两道护栏都看不见。
+        中间夹着别的工具调用不清零：改一处再重跑、结果不变，正是要点破的空转。
+        """
+        if name != "bash":
+            return ""
+        match = self._EXIT_STATUS.search(raw[:2000])
+        if match is None or match.group(1) == "0":
+            self._stall_fp, self._stall_count = "", 0
+            return ""
+        fingerprint = self._VOLATILE.sub("#", raw)
+        if fingerprint == self._stall_fp:
+            self._stall_count += 1
+        else:
+            self._stall_fp, self._stall_count = fingerprint, 1
+        if self._stall_count == self._FAIL_REFLECT:
+            return (
+                f"\n\n[提示] bash 已连续 {self._stall_count} 次失败，而且输出除数字、时间戳外"
+                "完全相同——前几次的改动或调整没有带来任何变化。先停下来分析根因"
+                "（读报错指向的代码或配置），不要再微调后重跑。"
+            )
+        if self._stall_count >= self._FAIL_CONVERGE:
+            return (
+                f"\n\n[提示] 已连续 {self._stall_count} 次得到实质相同的失败输出，继续重跑只是消耗。"
+                "请三选一：\n1. 换一种完全不同的方法；\n"
+                "2. 向用户说明卡在哪里、需要什么信息或决定（可用 ask_user）；\n"
+                "3. 如实告诉用户这一步当前无法完成及原因，继续其余工作。"
+            )
+        return ""
+
+    def _mark_compaction(self) -> None:
+        """压缩改写了历史：开启重读比对窗口（见 _reread_note）。"""
+        self._post_compact_mark = len(self.trace)
+        self._post_compact_window = self._REREAD_WINDOW
+
+    def _reread_note(self, name: str, args: dict[str, Any], raw: str) -> str:
+        """压缩后不久，用相同参数重读到与压缩前完全相同的结果时提示一句。
+
+        压缩把读过的内容换成了摘要，模型常常紧接着把刚被摘要掉的文件原样再读
+        一遍，上下文很快又涨回去、再触发压缩。只提示不拦截：摘要是有损的，
+        确实需要细节时重读是正当的；告诉它"内容没变"足以让它自己权衡。
+        """
+        if self._post_compact_window <= 0:
+            return ""
+        self._post_compact_window -= 1
+        if name not in _NON_MUTATING_TOOLS:
+            return ""
+        mark = min(self._post_compact_mark, len(self.trace))
+        for entry in self.trace[max(0, mark - self._REREAD_LOOKBACK) : mark]:
+            previous = str(entry.get("output", ""))
+            if (
+                entry.get("tool") == name
+                and entry.get("args") == args
+                and (previous == raw or previous.startswith(raw + "\n\n"))
+            ):
+                return (
+                    "\n\n[提示] 这次调用与上下文压缩前的一次调用参数相同、结果也完全一致"
+                    "——内容自那以后没有变化。压缩摘要里已有当时的结论，除非需要摘要"
+                    "没保留的细节，不必再重复读取。"
+                )
+        return ""
+
     def _track_failure(self, name: str, ok: bool) -> int:
         """返回该工具当前的连续失败次数（成功即归零）。"""
         if ok:
@@ -3799,6 +3883,13 @@ class Agent:
             output += failure_note
             if self.session_log:
                 self.session_log.event("tool_fail_streak", tool=name, count=streak)
+        #  参数完全相同的原样重跑已由打转检测提示过，这里只管"参数变了、结果没变"
+        if repeats < self._REPEAT_WARN and (stall_note := self._stall_note(name, raw_output)):
+            output += stall_note
+            if self.session_log:
+                self.session_log.event("tool_stall", tool=name, count=self._stall_count)
+        if ok and (reread_note := self._reread_note(name, args, raw_output)):
+            output += reread_note
         if self.hook_engine is not None and self.hook_engine.has("PostToolUse"):
             from .hooks import clip
 
