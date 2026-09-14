@@ -26,6 +26,7 @@ from urllib.parse import urlsplit
 
 from openai import OpenAI
 
+from . import netproxy
 from .config import GATEWAY_KEY_ENVS, Config, MissingConfig, find_api_key
 from .responses import ANTHROPIC, RESPONSES, WILDCARD
 from .responses import wrap as wrap_transport
@@ -78,7 +79,9 @@ def _discover_models(base_url: str, api_key: str, label: str) -> tuple[str, ...]
     元组：调用方据此**跳过注册**，绝不退化成通配（通配的具名 provider 会把一切
     模型名都吃掉、劫持网关路由）。失败只出声不抛——启动不该因端点没起来而崩。"""
     try:
-        page = OpenAI(base_url=base_url, api_key=api_key).with_options(
+        page = OpenAI(
+            base_url=base_url, api_key=api_key, http_client=netproxy.http_client()
+        ).with_options(
             timeout=_DISCOVER_TIMEOUT
         ).models.list()
         models = tuple(sorted({m.id for m in page if getattr(m, "id", "").strip()}))
@@ -552,6 +555,8 @@ class Registry:
                     api_key=provider.api_key,
                     timeout=self._timeout,
                     max_retries=0,
+                    #  代理判定收口在 netproxy：回环直连、坏代理变量降级不炸
+                    http_client=netproxy.http_client(),
                 ),
                 provider.responses_models,
                 provider.anthropic_models,
@@ -739,7 +744,11 @@ def build(config: Config) -> Registry:
 
     "注册了但没 key"会把配置错误推迟到运行期才炸，而且是在用户已经开始对话之后。
     宁可启动时清单里就没有它。
+
+    代理变量也在这里解析一次：未生效的变量（socks4、缺 socksio…）在启动期、
+    进入 TUI 之前就把诊断打出来，而不是等第一次调模型时插进界面里。
     """
+    netproxy.current()
     providers: list[Provider] = []
     for name in _order():
         if (provider := _make(name, config)) is not None:

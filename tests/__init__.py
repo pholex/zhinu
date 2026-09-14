@@ -24,3 +24,10 @@ os.environ["APPDATA"] = _isolated.name
 from xiaoyu import tempdirs as _tempdirs  # noqa: E402
 
 _tempdirs._sweep_started = True
+
+#  开发机平时开着代理：HTTP(S)_PROXY / ALL_PROXY 漏进来的话，打 127.0.0.1 的
+#  假 server 用例、代理诊断的 stderr 断言都会随机器而变。统一清掉，要代理的用例
+#  自己设（见 test_netproxy）。Windows 的环境变量大小写不敏感，逐个 pop 两种写法无害
+for _name in list(os.environ):
+    if _name.lower() in {"http_proxy", "https_proxy", "all_proxy", "no_proxy"}:
+        os.environ.pop(_name, None)

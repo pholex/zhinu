@@ -81,7 +81,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Iterator
 
-from . import diagnostics, mcp_guard, media
+from . import diagnostics, mcp_guard, media, netproxy
 from .config import Config, user_config_dir
 
 #  活着的 MCP 连接数（stdio 子进程 + HTTP 会话），/diagnostics 与 doctor 可见
@@ -506,6 +506,7 @@ class _HttpChannel:
        server 回 404 表示会话被回收，等价于 stdio 那边的进程没了。
     """
 
+    #  出网一律经 netproxy.urlopen：回环直连、代理判定与模型请求同一份策略
     #  SSE 长流不设读超时（本来就长时间没数据），请求往返用 spec.timeout
     _STREAM_TIMEOUT = None
 
@@ -544,7 +545,7 @@ class _HttpChannel:
             method="POST",
         )
         try:
-            with urllib.request.urlopen(request, timeout=timeout) as response:
+            with netproxy.urlopen(request, timeout=timeout) as response:
                 #  会话 id 只在 initialize 的响应里出现，但每次都读一遍无害
                 if new_id := response.headers.get("Mcp-Session-Id"):
                     self.session_id = new_id
@@ -574,7 +575,7 @@ class _HttpChannel:
             self.spec.url, headers=self._headers("text/event-stream"), method="GET"
         )
         try:
-            stream = urllib.request.urlopen(request, timeout=self._STREAM_TIMEOUT)
+            stream = netproxy.urlopen(request, timeout=self._STREAM_TIMEOUT)
         except urllib.error.HTTPError as exc:
             if exc.code in (404, 405, 501):
                 return  # 规范允许不提供这条流
@@ -632,7 +633,7 @@ class _HttpChannel:
             self.spec.url, headers=self._headers("application/json"), method="DELETE"
         )
         with contextlib.suppress(Exception):
-            urllib.request.urlopen(request, timeout=5.0).close()
+            netproxy.urlopen(request, timeout=5.0).close()
 
 
 def _read_sse(response: Any) -> "Iterator[dict[str, Any]]":

@@ -13,7 +13,7 @@
 - 减到 0 就停，不允许负数：配对漏了是 bug，但计量器不该因此变成噪音。
 
 `doctor` 部分只回答"这台机器能不能把小羽跑顺"：Python 版本、配置目录、磁盘、
-provider 凭据**有无**（永不回显值）、沙箱、命令解析器、MCP 配置、会话目录。
+provider 凭据**有无**（永不回显值）、出网代理解析结果、沙箱、命令解析器、MCP 配置、会话目录。
 每项 ok / warn / fail 三档，任一 fail 退出码非零，`--json` 给脚本用。
 """
 
@@ -281,6 +281,25 @@ def check_providers() -> Check:
     )
 
 
+def check_proxy() -> Check:
+    """代理变量解析成了什么：哪些生效、哪些被判不生效（小羽自身按未设置处理）。
+    代理地址里的凭据一律脱敏。这里只读不打 stderr 诊断——doctor 自己就是诊断面。"""
+    from . import netproxy
+
+    plan = netproxy.current(announce=False)
+    details = netproxy.describe(plan)
+    if plan.rejected:
+        names = "、".join(item.var for item in plan.rejected)
+        return Check(
+            "proxy", "warn", f"代理变量未生效：{names}（小羽自身请求按未设置处理）", details,
+            remedy="；".join(dict.fromkeys(item.remedy for item in plan.rejected)),
+        )
+    if not plan.entries:
+        return Check("proxy", "ok", "未配置代理（直连）", details)
+    where = "系统代理设置" if plan.source == "system" else "环境变量"
+    return Check("proxy", "ok", f"代理生效（来自{where}，回环地址直连）", details)
+
+
 def check_sandbox() -> Check:
     from . import sandbox
 
@@ -386,6 +405,7 @@ def run_doctor(workspace: Path | None = None) -> list[Check]:
         check_config_dir(config_dir),
         check_disk({"配置目录": config_dir, "工作区": workspace}),
         check_providers(),
+        check_proxy(),
         check_sandbox(),
         check_bash_parser(),
         check_tools(),
