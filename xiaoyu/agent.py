@@ -598,6 +598,19 @@ def collect_project_docs(
     return kept
 
 
+class _RetryBudget:
+    """一次请求内整条降级链共享的重试次数（每条路由的首次尝试不计）。"""
+
+    def __init__(self, remaining: int) -> None:
+        self.remaining = remaining
+
+    def take(self) -> bool:
+        if self.remaining <= 0:
+            return False
+        self.remaining -= 1
+        return True
+
+
 def _worth_another_provider(
     verdict: errors.Verdict, chain: list[Route], index: int
 ) -> bool:
@@ -802,6 +815,10 @@ class Agent:
         #  打转检测：连续完全相同的 (工具, 参数) 调用计数
         self._last_call_key: tuple[str, str] | None = None
         self._call_repeats = 0
+        #  粘性降级前的首选模型（None = 没有降级在身）与下次回探的时刻
+        self._preferred_model: str | None = None
+        self._preferred_backoff = 0.0
+        self._preferred_retry_at = 0.0
         #  代读模型配错时只提醒一次（每张图提醒一遍等于把配置错误刷成噪音）
         self._vision_warned = False
         #  失败流：同一工具连续返回 ERROR 的次数（参数可以各不相同——打转检测
@@ -2986,8 +3003,15 @@ class Agent:
     _RECOVERY_DELAY = 2.0
     #  单次退避上限（秒）：指数递增和 Retry-After 都不许超过它
     _RECOVERY_MAX_DELAY = 60.0
+    #  一次请求（整条降级链）共享的重试预算：每条路由的首次尝试不计，只计重试。
+    #  不共享时 N 条路由 × 每条 3 次，一次持续故障放大成 3N 个请求、十几分钟退避；
+    #  共享后最坏 N + 4 次，而每条路由仍至少被试一次
+    _RECOVERY_BUDGET = 4
+    #  粘性降级后回探首选模型的冷却（秒）：首次 10 分钟，探测失败翻倍，封顶 2 小时
+    _PREFERRED_PROBE_DELAY = 600.0
+    _PREFERRED_PROBE_MAX = 7200.0
 
-    def switch_model(self, name: str) -> None:
+    def switch_model(self, name: str, *, sticky: bool = False) -> None:
         """切换当前模型（粘性），并在会话日志记一条 model 事件。
 
         所有 config.model 的写点（TUI /model、ACP set_config_option、降级链的
@@ -2998,6 +3022,15 @@ class Agent:
         轮次进行中调用时对当前这一步无效：本步已按开头的快照选好路由
         （见 StepContext），下一步起生效。
         """
+        if sticky and name != self._preferred_model:
+            #  降级链的自动切换：记住首选模型（连环降级只记最初那个），冷却后回探
+            if self._preferred_model is None:
+                self._preferred_model = self.config.model
+                self._preferred_backoff = self._PREFERRED_PROBE_DELAY
+                self._preferred_retry_at = time.monotonic() + self._preferred_backoff
+        else:
+            #  用户/客户端显式换模型（或回探成功切回）：以这次选择为准，不再回探
+            self._preferred_model = None
         self.config.model = name
         if self.session_log:
             self.session_log.event("model", model=name)
@@ -3067,11 +3100,16 @@ class Agent:
         说明是模型级故障（持续限流/持续 5xx），再等下去只是白挨。
         换模型时 self.messages 原样重发，会话状态一点不丢。
         切换是粘性的（改 config.model）：否则主模型宕机期间每次请求都要先
-        白等一轮重试退避才轮到备用模型。恢复用 /model 切回即可。
+        白等一轮重试退避才轮到备用模型。粘性不等于永久：冷却到期后在真实请求上
+        先单发一次首选模型（_probe_preferred），恢复了自动切回；/model 随时可手动切。
+        重试次数全链共享一个预算（_RECOVERY_BUDGET），不随路由条数成倍放大。
         最外层的保底"降级为非 LLM 行为"在 REPL：异常被接住、会话保留，不崩。
         """
+        if (probed := self._probe_preferred(with_tools)) is not None:
+            return probed
         chain = self.model_chain()
         last_error: Exception | None = None
+        budget = _RetryBudget(self._RECOVERY_BUDGET)
         for index, route in enumerate(chain):
             if index:
                 self.sink.emit(
@@ -3083,9 +3121,9 @@ class Agent:
                 )
                 #  粘性写回：能用裸名表达就用裸名，跨 provider 才写全限定名。
                 #  粘性状态仍是单个字符串，/model、banner、SessionLog 都不用改。
-                self.switch_model(self.registry.sticky_name(route))
+                self.switch_model(self.registry.sticky_name(route), sticky=True)
             try:
-                return self._stream_retrying(route, with_tools=with_tools)
+                return self._stream_retrying(route, with_tools=with_tools, budget=budget)
             except Exception as exc:  # noqa: BLE001 - 分类器决定要不要换模型
                 verdict = classify(exc)
                 #  瞬时故障（限流/超时/5xx）值得换；上下文超限该压缩不该换。
@@ -3111,7 +3149,49 @@ class Agent:
             )
         raise last_error
 
-    def _stream_retrying(self, route: Route, with_tools: bool = True) -> dict[str, Any]:
+    def _probe_preferred(self, with_tools: bool) -> dict[str, Any] | None:
+        """粘性降级的冷却到期：在这次真实请求上先单发一次首选模型。
+
+        不另开探测请求——探测就是这一步本来要发的请求，成功了一点不浪费。
+        成功：切回首选并返回这条消息。失败（含空补全）：不重试、冷却翻倍，返回
+        None 让本次照常走当前的降级链。Ctrl-C / 宿主打断不是 Exception，照常上抛。
+        """
+        preferred = self._preferred_model
+        if preferred is None or time.monotonic() < self._preferred_retry_at:
+            return None
+        try:
+            route = self.registry.resolve(preferred)
+        except UnknownModel:
+            self._preferred_model = None
+            return None
+        failure = ""
+        try:
+            message = self._stream_once(route, with_tools=with_tools)
+            if not media.text_of(message.get("content")).strip() and not message.get("tool_calls"):
+                failure = "返回空补全"
+        except Exception as exc:  # noqa: BLE001 - 回探失败只影响回探节奏，不影响本次请求
+            failure = classify(exc).hint
+        if failure:
+            self._preferred_backoff = min(
+                max(self._preferred_backoff, self._PREFERRED_PROBE_DELAY) * 2,
+                self._PREFERRED_PROBE_MAX,
+            )
+            self._preferred_retry_at = time.monotonic() + self._preferred_backoff
+            self.sink.emit(
+                Notice(
+                    f"[首选模型 {route.qualified} 仍不可用（{failure}），"
+                    f"{self._preferred_backoff / 60:.0f} 分钟后再试；本次继续用 {self.config.model}]",
+                    "info",
+                )
+            )
+            return None
+        self.sink.emit(Notice(f"[首选模型 {route.qualified} 已恢复，切回]", "info"))
+        self.switch_model(preferred)
+        return message
+
+    def _stream_retrying(
+        self, route: Route, with_tools: bool = True, budget: "_RetryBudget | None" = None
+    ) -> dict[str, Any]:
         """单个模型内的重试层：分类后退避重试，耗尽或不可重试则抛出。
 
         空补全（无正文、无 tool_calls）也在这层原地重试（这必然是流中断或
@@ -3128,6 +3208,7 @@ class Agent:
                     not media.text_of(message.get("content")).strip()
                     and not message.get("tool_calls")
                     and attempt < self._RECOVERY_ATTEMPTS
+                    and (budget is None or budget.take())
                 ):
                     self.sink.emit(
                         Notice(
@@ -3144,6 +3225,9 @@ class Agent:
                     #  上下文超限：本地估算低估了才会走到这，立刻强制压缩
                     self.maybe_compact(force=True)
                 if not verdict.retryable or attempt == self._RECOVERY_ATTEMPTS:
+                    raise
+                if budget is not None and not budget.take():
+                    #  全链预算用完：交给外层换下一条路由（每条路由仍至少试一次）
                     raise
                 #  服务端给了 Retry-After 就听它的；否则用指数退避。
                 #  再乘 ±25% jitter：
