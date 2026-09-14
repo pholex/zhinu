@@ -321,6 +321,17 @@ class TestStreamTranslation(unittest.TestCase):
         self.assertEqual(text, "半截")
         self.assertEqual((usage.prompt_tokens, usage.completion_tokens), (3, 4))
 
+    def test_content_filter_surfaces_as_finish_reason(self) -> None:
+        """内容过滤要透传成 finish_reason，否则内核只看到空补全、当断流重发。"""
+        chunks = list(responses.stream_chunks(iter([
+            event("response.incomplete",
+                  response=SimpleNamespace(
+                      usage=SimpleNamespace(input_tokens=3, output_tokens=0),
+                      incomplete_details=SimpleNamespace(reason="content_filter"))),
+        ])))
+        reasons = [c.choices[0].finish_reason for c in chunks if c.choices]
+        self.assertEqual(reasons, ["content_filter"])
+
 
 class TestDuckClient(unittest.TestCase):
     def test_stream_call_translates_request_and_response(self) -> None:

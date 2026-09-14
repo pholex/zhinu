@@ -2,13 +2,22 @@
 
 from __future__ import annotations
 
+import contextlib
+import io
+import types
 import unittest
 from unittest import mock
 
 import httpx
 import openai
 
-from xiaoyu.errors import ALL_KINDS, RETRY_AFTER_CAP, classify, retry_after_seconds
+from xiaoyu.errors import (
+    ALL_KINDS,
+    RETRY_AFTER_CAP,
+    ContentFiltered,
+    classify,
+    retry_after_seconds,
+)
 
 from .test_agent_paths import AgentTestCase, chunk, usage_chunk
 
@@ -357,3 +366,37 @@ class FallbackChainTest(AgentTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def filtered_chunk():
+    """chat 流里内容过滤的收尾 chunk：delta 为空，finish_reason=content_filter。"""
+    delta = types.SimpleNamespace(content=None, tool_calls=None)
+    choice = types.SimpleNamespace(delta=delta, finish_reason="content_filter")
+    return types.SimpleNamespace(choices=[choice], usage=None)
+
+
+class ContentFilterTest(AgentTestCase):
+    """内容过滤是拒答不是断流：不能被当成空补全原样重发、也不该换模型。"""
+
+    def test_classified_fatal(self):
+        verdict = classify(ContentFiltered("被拦了"))
+        self.assertEqual(verdict.kind, "fatal")
+        self.assertFalse(verdict.retryable)
+        self.assertIn("被拦了", verdict.hint)
+
+    def test_empty_filtered_completion_raises_without_retry(self):
+        self.config.fallback_models = ["backup-model"]
+        agent = self.build([[filtered_chunk(), usage_chunk(100, 0)]])
+        with mock.patch("xiaoyu.agent.time.sleep"), contextlib.redirect_stdout(io.StringIO()):
+            with self.assertRaises(ContentFiltered):
+                agent.send("hi")
+        #  只打了一次：没有空补全重发，也没有落到备用模型
+        self.assertEqual(len(self.client.completions.calls), 1)
+
+    def test_partial_text_kept_with_warning(self):
+        agent = self.build([[chunk(content="前半段"), filtered_chunk(), usage_chunk(100, 5)]])
+        buffer = io.StringIO()
+        with contextlib.redirect_stdout(buffer):
+            agent.send("hi")
+        self.assertEqual(agent.last_assistant_text(), "前半段")
+        self.assertIn("内容过滤截断", buffer.getvalue())

@@ -3210,6 +3210,7 @@ class Agent:
         #  包住它，前端才有东西可画。ended 走 finally：异常和 Ctrl-C 路径上
         #  活区也必须收掉，否则 spinner 会一直转下去。
         self.sink.emit(RequestStarted(route.model))
+        self._content_filtered = False
         try:
             stream = route.client.chat.completions.create(**request)
             self._consume_stream(route, stream, content_parts, pending, reasoning)
@@ -3234,6 +3235,14 @@ class Agent:
             if content_parts:
                 self.sink.emit(TextEnd())
             self.sink.emit(RequestEnded())
+
+        if self._content_filtered:
+            if not content_parts and not pending:
+                #  拒答不是断流：抛出去由 classify 判 fatal，不重发、不换模型
+                raise errors.ContentFiltered(
+                    f"{route.qualified} 的服务端内容过滤拦下了这次回答"
+                )
+            self.sink.emit(Notice("[回答被服务端内容过滤截断，内容可能不完整]", "warn"))
 
         message: dict[str, Any] = {
             "role": "assistant",
@@ -3357,6 +3366,9 @@ class Agent:
             if not chunk.choices:
                 continue
 
+            #  收尾原因只认内容过滤一种：它决定这次"空补全"是拒答还是断流
+            if getattr(chunk.choices[0], "finish_reason", None) == "content_filter":
+                self._content_filtered = True
             delta = chunk.choices[0].delta
             if delta is None:
                 continue
