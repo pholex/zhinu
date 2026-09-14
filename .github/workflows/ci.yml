@@ -66,6 +66,14 @@ jobs:
       - run: pip install build twine
       - run: python -m build
       - run: twine check dist/*
+      - name: 装好的 wheel 黑盒冒烟（全新 venv、离开源码树跑一遍）
+        #  tests/ 的 e2e 全是从源码树跑，package-data 漏写、packages 清单漏子包
+        #  在那里测不出来——只有装出来的包才暴露。只在这一个平台跑：打包产物是
+        #  纯 Python wheel，与平台无关
+        timeout-minutes: 10
+        env:
+          PYTHONUNBUFFERED: "1"
+        run: python tests/wheel_smoke.py dist
       - name: 敏感信息扫描（发布物里不允许出现密钥特征）
         #  只扫通用密钥特征。内部专有词表不能写进公开 workflow——那本身就是泄漏，
         #  域名/路径类扫描在本地发布流程里做。
