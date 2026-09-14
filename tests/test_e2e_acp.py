@@ -638,6 +638,24 @@ class LoadSessionTest(AcpCase):
         )
         acp.read_until(self.is_response("p1"))
 
+    def test_load_session_written_by_another_process_returns_busy(self):
+        #  进程 1 还开着这个会话（持有写锁）；进程 2 load 同一 sessionId 不能
+        #  两边一起往同一个文件里写——大记录分多次 write 会交错成坏行
+        first = self.start_acp("text: ok\n")
+        session_id = self.new_session(first)
+        second = self.start_acp("text: ok\n")
+        response, _ = self.load(second, session_id)
+        self.assertEqual(response["error"]["code"], -32001)
+        self.assertIn("正被另一个进程", response["error"]["message"])
+        #  进程 1 退出即放锁，进程 2 再 load 就能接上
+        first.close()
+        second.send(
+            {"jsonrpc": "2.0", "id": "load2", "method": "session/load",
+             "params": {"sessionId": session_id, "cwd": str(self.workspace), "mcpServers": []}}
+        )
+        response, _ = second.read_until(self.is_response("load2"))
+        self.assertIn("result", response, response)
+
 
 class ModelConfigTest(AcpCase):
     """session config options：模型下拉框（TUI /model 的协议面，Zed 据此画选择器）。"""

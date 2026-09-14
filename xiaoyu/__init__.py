@@ -57,6 +57,7 @@ _EXPORTS: dict[str, str] = {
     "Notice": "xiaoyu.events",
     #  会话落盘 / resume
     "SessionLog": "xiaoyu.session_log",
+    "SessionLockedError": "xiaoyu.session_log",
     "load_messages": "xiaoyu.session_log",
     "list_sessions": "xiaoyu.session_log",
     #  权限规则
@@ -142,5 +143,10 @@ if TYPE_CHECKING:  # 给类型检查器 / IDE 看的静态视图，运行期不�
         user_rules_path,
         workspace_rules_path,
     )
-    from .session_log import SessionLog, list_sessions, load_messages  # noqa: F401
+    from .session_log import (  # noqa: F401
+        SessionLockedError,
+        SessionLog,
+        list_sessions,
+        load_messages,
+    )
     from .tools import Toolbox  # noqa: F401

@@ -66,6 +66,9 @@ sink，不经协议层，所以不需要任何自定义扩展方法；可选能�
                                 （user_message_chunk / agent_message_chunk /
                                 工具对）之后才回包。找不到的 sessionId 回
                                 INVALID_PARAMS——绝不静默新建一个空会话冒充。
+                                会话文件正被另一个进程写着（写锁抢不到，如终端
+                                里 --session-id 接着同一个会话）回 BUSY，消息带
+                                持锁进程 pid；同进程重载先让出旧句柄的锁。
     session/set_config_option   模型与模式切换。session/new 随包声明
                                 configOptions 两项：category="model"（候选=
                                 switchable_models()）与 category="mode"（三档
@@ -154,6 +157,7 @@ from . import __version__, folder_trust, mcp, mcp_guard, media, modes
 from .config import Config, MissingConfig, load_dotenv, user_env_path
 from .permissions import Permissions, suggest_allow_rule
 from .session_log import (
+    SessionLockedError,
     SessionLog,
     check_session_id,
     find_named,
@@ -1072,22 +1076,27 @@ def build_agent_factory(
             session_log, history = open_named(
                 session_name, config.model, str(config.workspace)
             )
-        view, note = resolve_mcp_view(config, mcp_view, mcp_servers)
-        if note:
-            print(note, file=sys.stderr)
-        agent = Agent(
-            config,
-            Toolbox(config, mcp_view=view),
-            approver=approver,
-            session_log=session_log,
-            permissions=permissions,
-            sink=sink,
-        )
-        if history:
-            #  与 --session-id 续写同款：copy=False，接上下文但不把历史再抄一遍
-            agent.restore(history, copy=False)
-        if follow_mode:
-            agent.adopt_mode(follow_mode)
+        try:
+            view, note = resolve_mcp_view(config, mcp_view, mcp_servers)
+            if note:
+                print(note, file=sys.stderr)
+            agent = Agent(
+                config,
+                Toolbox(config, mcp_view=view),
+                approver=approver,
+                session_log=session_log,
+                permissions=permissions,
+                sink=sink,
+            )
+            if history:
+                #  与 --session-id 续写同款：copy=False，接上下文但不把历史再抄一遍
+                agent.restore(history, copy=False)
+            if follow_mode:
+                agent.adopt_mode(follow_mode)
+        except BaseException:
+            #  装配失败回协议错误，进程还活着：写锁不能占到进程退出
+            session_log.release()
+            raise
         install_exit_logging(session_log)
         return agent, history
 
@@ -1321,6 +1330,11 @@ class AcpServer:
         except LookupError as exc:
             self._fail(req_id, INVALID_PARAMS, str(exc) or f"未知 sessionId {session_id!r}")
             return None
+        except SessionLockedError as exc:
+            #  会话文件正被别的进程续写（如终端里 --session-id 接着同一个会话）：
+            #  资源被占而不是参数错，与"本轮进行中不能重载"同一个错误码
+            self._fail(req_id, BUSY, str(exc))
+            return None
         except Exception as exc:  # noqa: BLE001 - 配置类失败要发给 client，不是炸进程
             self._fail(req_id, INTERNAL_ERROR, f"{type(exc).__name__}: {exc}")
             return None
@@ -1367,11 +1381,24 @@ class AcpServer:
             #  同一 id 正在跑轮还要重载：拒掉，不能从正在写日志的会话脚下抽文件
             self._fail(req_id, BUSY, "该会话本轮进行中，不能重载")
             return
+        old_log = existing.agent.session_log if existing is not None else None
+        if old_log is not None:
+            #  同进程重载：旧句柄马上被顶替，先让出写锁——锁按打开的文件描述算，
+            #  不让的话新句柄会撞上本进程自己持有的锁。只放锁不写 exit：中段的
+            #  exit 事件会破坏"末尾有没有 exit"的判据（见 install_exit_logging）
+            old_log.release()
         session = self._build_session(
             req_id, workspace, session_id, create=False,
             client_servers=self._client_servers(params),
         )
         if session is None:
+            if old_log is not None:
+                #  重载失败，旧会话还在册：把锁拿回来接着用；拿不回（别的进程趁隙
+                #  抢走）就摘掉它——留着一个写不进日志的会话等于静默丢记录
+                try:
+                    old_log.acquire()
+                except SessionLockedError:
+                    self._sessions.pop(session_id, None)
             return
         #  Zed 从 load 回包里读 selectors 与 modes（与 session/new 同款），照给
         self._respond(

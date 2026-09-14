@@ -297,5 +297,21 @@ class ExhaustionTest(E2ECase):
         self.assertIn("ScriptedExhausted", result["error"])
 
 
+class SessionLockCliTest(E2ECase):
+    """`--session-id` 撞上正被别的进程写入的会话：报错退出，不许两边一起写。"""
+
+    def test_locked_named_session_exits_with_readable_error(self):
+        from xiaoyu.session_log import SessionLog
+
+        _, result, code, stderr = self.run_cli("text: 第一轮\n", extra_args=["-s", "nightly"])
+        self.assertEqual(code, 0, stderr)
+        (path,) = (Path(self.tmp) / "config").rglob("*-id-nightly.jsonl")
+        holder = SessionLog(path)  # 模拟另一个进程正续写
+        self.addCleanup(holder.close)
+        _, _, code, stderr = self.run_cli("text: 不该跑到\n", extra_args=["-s", "nightly"])
+        self.assertEqual(code, 2, stderr)
+        self.assertIn("会话 nightly 正被", stderr)
+
+
 if __name__ == "__main__":
     unittest.main()

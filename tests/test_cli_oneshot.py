@@ -255,6 +255,7 @@ class SessionIdFlagTest(unittest.TestCase):
         first, restored = open_session(self.config, "nightly")
         self.assertEqual(restored, [])
         first.append({"role": "user", "content": "第一步"})
+        first.close()  # 真实场景里第二次是另一个进程，前一个已退出、写锁已放
         second, restored = open_session(self.config, "nightly")
         self.assertEqual(second.path, first.path)
         self.assertEqual([m["content"] for m in restored], ["第一步"])

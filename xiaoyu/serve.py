@@ -131,7 +131,7 @@ from .serve_state import (
     public_agent,
     spend_of,
 )
-from .session_log import SessionLog, _workspace_slug, load_messages, sessions_dir
+from .session_log import SessionLockedError, SessionLog, _workspace_slug, load_messages, sessions_dir
 from .tools import Toolbox
 
 #  进程级计量：在册会话数 / 处理中的 HTTP 请求数（GET /diagnostics 读）
@@ -788,6 +788,10 @@ def create_app(cfg: ServeConfig):  # noqa: C901 - 路由表天然长，拆开反
             #  不值得；停机时写一次即可让重启后的编号接得上）
             for session in sessions.values():
                 manifests.save(session.manifest())
+                #  放掉会话日志的写锁（不写 exit：会话没结束，重启后按清单接回）。
+                #  进程真退出时内核也会放，但嵌入宿主可能在同一进程里停了再起
+                if session.agent.session_log is not None:
+                    session.agent.session_log.release()
             pool.shutdown(wait=False, cancel_futures=True)
 
     app = FastAPI(
@@ -1056,11 +1060,14 @@ def create_app(cfg: ServeConfig):  # noqa: C901 - 路由表天然长，拆开反
                     file=sys.stderr,
                 )
                 continue
+            log: SessionLog | None = None
             try:
                 agent_config = dict(manifest.get("agent_config") or {})
                 local = apply_agent_config(agent_config)
-                history = load_messages(log_path)
+                #  先抢写锁再读历史（与 open_named 同序）：别的进程正续写这个会话时
+                #  SessionLockedError 走下面的"跳过"，清单留盘，下次启动再接
                 log = SessionLog(log_path)
+                history = load_messages(log_path)
                 session = assemble(
                     session_id,
                     target,
@@ -1072,6 +1079,8 @@ def create_app(cfg: ServeConfig):  # noqa: C901 - 路由表天然长，拆开反
                     session_log=log,
                 )
             except Exception as exc:  # noqa: BLE001 - 一个坏清单不能拖死整个服务
+                if log is not None:
+                    log.release()  # 装配中途失败：锁不能占到进程退出，别的进程还要接这个会话
                 print(f"serve: 恢复会话 {session_id} 失败，已跳过：{exc}", file=sys.stderr)
                 sessions.pop(session_id, None)
                 SESSIONS_LIVE.set(len(sessions))

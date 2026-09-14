@@ -9,6 +9,11 @@
 - compact 事件携带压缩后的完整历史（replacement）——resume 不必理解
   任何压缩语义，重放时撞到它就整体替换
 - 写失败绝不影响会话本身：所有写入 try/except 全包，坏了就静默停写
+- 写锁：一个会话文件同一时刻只允许一个写句柄（见 SessionLog 的 docstring）。
+  锁在旁车 `<日志>.lock` 上，读日志不受影响；抢不到直接抛 SessionLockedError，
+  由续写入口（CLI --session-id / ACP session/load / serve 重启恢复）各自报错
+- 读回：只有最后一行解析失败静默跳过（崩溃留下的半行）；中段坏行计入
+  load_messages 返回值的 corrupt_lines，Agent.restore 据此提示用户
 - 只由 CLI 注入；eval 和 explore 子 agent 不落盘
 - 退出约定：能记录的退出路径（正常退出、SIGTERM/SIGHUP、未捕获异常）都会
   写一条 exit / error 事件；断电、kill -9、Windows 直接关终端窗口无法记录。
@@ -23,6 +28,8 @@ import contextlib
 import json
 import os
 import signal
+import threading
+import weakref
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -86,11 +93,205 @@ def _workspace_slug(workspace: str) -> str:
     return slug or "-"
 
 
+# ---------- 写锁：一个会话文件同一时刻只有一个写句柄 ----------
+#
+#  为什么要锁：写入是每条记录一次 open("a") 追加，>8KB 的记录会分多次 write。
+#  两个进程续写同一个会话（编辑器经 ACP 与终端 CLI 同时接上同名会话）时，
+#  两边的分片会交错成坏行——读回时丢消息，丢的若是带 tool_calls 的 assistant，
+#  发请求前的历史修复还会顺手删掉对应的 tool 结果，历史被悄悄改写。
+#
+#  怎么锁：对日志旁边单独的 `<日志>.lock` 加内核排他锁（POSIX flock /
+#  Windows msvcrt.locking 锁第 0 字节）。
+#  - 锁旁车而不是日志本身：Windows 的字节锁是强制锁，锁日志会挡住读的一方
+#    （resume 列表、digest、另一个进程抢锁失败前后的读）；
+#  - 内核锁随进程死亡自动释放，不需要 TTL / 续约 / 陈旧锁判定；
+#  - 释放时**不删**锁文件：删除与另一进程"打开旧 inode 并加锁"之间有竞态，
+#    两边会各自锁住不同的 inode 而都以为自己独占；留一个几十字节的文件无害；
+#  - 锁文件里写持有者 pid，只为报错信息可读。pid 从第 1 字节写起——第 0 字节
+#    在 Windows 上被锁着，别的进程读不了那一段。
+
+_WINDOWS = os.name == "nt"
+#  pid 定宽写入：锁文件不截断（Windows 上截断被锁区域的行为不可靠），定宽覆盖即可
+_PID_WIDTH = 20
+
+
+def lock_path(path: Path) -> Path:
+    """会话文件对应的锁文件：`<名字>.jsonl.lock`（不匹配 `*.jsonl`，列举不受影响）。"""
+    return path.with_name(path.name + ".lock")
+
+
+def _session_label(path: Path) -> str:
+    """报错里用的会话称呼：命名会话取名字，匿名会话取文件名。
+
+    文件名是 <时间戳>-<pid>[-id-<名字>]，前两段不含 `-id-`，第一次出现就是分隔符。
+    """
+    _, mark, name = path.stem.partition(_NAMED_MARK)
+    return name if mark else path.name
+
+
+class SessionLockedError(RuntimeError):
+    """会话文件正被另一个写句柄持有（多半是另一个进程）。消息面向用户。"""
+
+    def __init__(self, path: Path, pid: int | None) -> None:
+        self.path = path
+        self.pid = pid
+        if pid is None:
+            who = "另一个进程"
+        elif pid == os.getpid():
+            who = f"本进程（pid {pid}）里另一个写句柄"
+        else:
+            who = f"另一个进程（pid {pid}）"
+        super().__init__(
+            f"会话 {_session_label(path)} 正被{who}写入；"
+            f"先结束那边再续写（锁文件 {lock_path(path)}）"
+        )
+
+
+def _try_lock(fd: int) -> bool:
+    """非阻塞抢排他锁：抢到 True，被别人持有 False；其余 OSError 原样抛出。"""
+    if _WINDOWS:
+        import msvcrt
+
+        #  msvcrt.locking 从当前文件位置起锁 nbytes 字节：先回到第 0 字节
+        os.lseek(fd, 0, os.SEEK_SET)
+        try:
+            msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)  # type: ignore[attr-defined]
+        except OSError:
+            #  被占时报 EACCES/EDEADLOCK；locking 没有别的常见失败形态，一律按被占处理
+            return False
+        return True
+    import fcntl
+
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        return False
+    return True
+
+
+def _write_pid(fd: int, pid: int | None) -> None:
+    """第 0 字节占位，pid 从第 1 字节起定宽写；None = 清空（放锁前抹掉，免得
+    下一个抢锁失败的人读到已退出进程的 pid）。"""
+    body = b"" if pid is None else str(pid).encode("ascii")
+    os.lseek(fd, 0, os.SEEK_SET)
+    os.write(fd, b"\n" + body.ljust(_PID_WIDTH) + b"\n")
+
+
+def _release_lock_fd(fd: int) -> None:
+    """清掉 pid、解锁、关 fd。给 weakref.finalize 用，所以是模块函数且不引用 SessionLog。"""
+    with contextlib.suppress(OSError):
+        _write_pid(fd, None)
+    with contextlib.suppress(OSError):
+        if _WINDOWS:
+            import msvcrt
+
+            os.lseek(fd, 0, os.SEEK_SET)
+            msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)  # type: ignore[attr-defined]
+        else:
+            import fcntl
+
+            fcntl.flock(fd, fcntl.LOCK_UN)
+    with contextlib.suppress(OSError):
+        os.close(fd)
+
+
+def _holder_pid(lock: Path) -> int | None:
+    """读锁文件里的持有者 pid；读不到/没写完/已清空都回 None（只用于报错文案）。"""
+    try:
+        with lock.open("rb") as handle:
+            handle.seek(1)
+            raw = handle.read(_PID_WIDTH + 1).strip()
+    except OSError:
+        return None
+    return int(raw) if raw.isdigit() else None
+
+
 class SessionLog:
+    """一个会话文件的写句柄。
+
+    **构造即抢写锁**（见上方"写锁"一节），抢不到抛 SessionLockedError——
+    续写同一个文件的入口（open_named / ACP session/load / serve 重启恢复）都经
+    这里，谁先拿到谁写，后来者明确报错，不会两边交错写坏文件。
+    锁的持有期 = 句柄的写入期：
+    - close()：写 exit 事件后放锁（正常退出、信号、atexit、ACP 断连、serve 关会话）；
+    - release()：只放锁不写 exit（同进程重载顶替旧句柄、serve 停机后由清单接回）；
+    - 句柄被丢弃（装配中途失败没人 close）：回收时由 finalizer 放锁；
+    - 进程死亡：内核放锁。
+    放锁之后的写入一律丢弃：锁一放别的进程随时可能接手，迟到的记录不能再落进去。
+    子 agent（explore / 委托）不落盘，不持锁。
+    """
+
     def __init__(self, path: Path) -> None:
         self.path = path
         self._broken = False
         self._closed = False
+        #  写入与放锁互斥：serve 关会话（事件循环线程）可能与工作线程的收尾写入并发
+        self._mutex = threading.Lock()
+        self._released = False
+        self._lock_finalizer: weakref.finalize | None = None
+        self.acquire()
+
+    def acquire(self) -> None:
+        """抢写锁（构造时自动调用；release 之后可再调一次重新拿回）。
+
+        抢不到抛 SessionLockedError。锁文件建不出来、或文件系统不支持加锁（部分
+        网络盘）时**无锁降级**照常写：锁是防交错的护栏，不是写日志的前提——
+        与"写失败绝不影响会话"同一纪律。
+        """
+        with self._mutex:
+            if self._lock_finalizer is not None and self._lock_finalizer.alive:
+                return
+            lock = lock_path(self.path)
+            try:
+                lock.parent.mkdir(parents=True, exist_ok=True)
+                fd = os.open(lock, os.O_RDWR | os.O_CREAT | getattr(os, "O_BINARY", 0), 0o644)
+            except OSError:
+                self._released = False
+                return
+            try:
+                locked = _try_lock(fd)
+            except OSError:
+                os.close(fd)
+                self._released = False
+                return
+            if not locked:
+                os.close(fd)
+                raise SessionLockedError(self.path, _holder_pid(lock))
+            with contextlib.suppress(OSError):
+                _write_pid(fd, os.getpid())
+            self._lock_finalizer = weakref.finalize(self, _release_lock_fd, fd)
+            #  进程退出时不必跑：内核会放锁；跑了反而可能抢在 atexit 的 exit 事件之前
+            self._lock_finalizer.atexit = False
+            self._released = False
+        self._seal_torn_tail()
+
+    def release(self) -> None:
+        """放掉写锁并停写（幂等），不写 exit 事件。"""
+        with self._mutex:
+            self._released = True
+            if self._lock_finalizer is not None:
+                self._lock_finalizer()
+
+    def _seal_torn_tail(self) -> None:
+        """续写前给崩溃留下的半行补上换行，并记一条 torn_tail 事件。
+
+        不补的话下一条记录会接在半行后面、跟着一起解析失败。事件是给读回用的
+        标记：紧挨在它前面的坏行是已知的崩溃尾巴，不算中段损坏（见 load_messages）。
+        只在持锁后做——此时没有别的写者，文件末尾就是真的末尾。
+        """
+        try:
+            with self.path.open("rb") as handle:
+                handle.seek(0, os.SEEK_END)
+                if handle.tell() == 0:
+                    return
+                handle.seek(-1, os.SEEK_END)
+                if handle.read(1) == b"\n":
+                    return
+            with self.path.open("ab") as handle:
+                handle.write(b"\n")
+        except OSError:
+            return  # 新会话（文件还不存在）或读写不了：交给 _write 的停写兜底
+        self.event("torn_tail")
 
     @classmethod
     def create(
@@ -141,21 +342,25 @@ class SessionLog:
             return
         self._closed = True
         self.event("exit", reason=reason)
+        self.release()
 
     @staticmethod
     def _now() -> str:
         return datetime.now().isoformat(timespec="seconds")
 
     def _write(self, record: dict[str, Any]) -> None:
-        if self._broken:
-            return
-        try:
-            self.path.parent.mkdir(parents=True, exist_ok=True)
-            with self.path.open("a", encoding="utf-8") as handle:
-                handle.write(json.dumps(record, ensure_ascii=False) + "\n")
-        except OSError:
-            #  磁盘满/权限问题不能影响会话，停写即可
-            self._broken = True
+        with self._mutex:
+            if self._broken or self._released:
+                return
+            try:
+                self.path.parent.mkdir(parents=True, exist_ok=True)
+                with self.path.open("a", encoding="utf-8") as handle:
+                    handle.write(json.dumps(record, ensure_ascii=False) + "\n")
+            except OSError:
+                #  磁盘满/权限问题不能影响会话，停写即可；写不进去的句柄也没理由占着锁
+                self._broken = True
+                if self._lock_finalizer is not None:
+                    self._lock_finalizer()
 
 
 # ---------- 退出事件：进程级钩子 ----------
@@ -446,12 +651,19 @@ def open_named(
     （每份自包含），命名会话则是"一个名字一个文件、反复续写"——脚本按固定
     名字调 N 次不该在盘上留下 N 份越滚越大的副本，那是 O(N²) 的写入量。
     因此接回的历史**不能再抄一遍进文件**（见 Agent.restore 的 copy=False）。
+
+    会话正被别的写句柄持有时抛 SessionLockedError。先抢锁再读历史：读到的
+    就是此刻完整的文件，不会是另一个进程写到一半的样子。
     """
     existing = find_named(session_id, workspace, directory)
     if existing is None:
         return SessionLog.create(model, workspace, directory, session_id=session_id), []
-    messages = load_messages(existing)
     log = SessionLog(existing)
+    try:
+        messages = load_messages(existing)
+    except BaseException:
+        log.release()  # 格式太新 / 读失败：锁不能跟着泄漏到进程退出
+        raise
     #  续写点留痕：这一轮用的是哪个模型、哪个版本（meta 记的是首次创建时的）
     log.event("reopened", version=__version__, model=model, messages=len(messages))
     return log, messages
@@ -589,7 +801,21 @@ def has_orphan_compact(path: Path) -> bool:
     return open_lock
 
 
-def load_messages(path: Path) -> list[dict[str, Any]]:
+class LoadedMessages(list):
+    """load_messages 的返回值：就是消息列表，外加读回时发现的中段损坏。
+
+    corrupt_lines：解析失败被跳过、且影响接回内容的行号（从 1 起）。做成 list
+    子类而不是改返回类型：公开契约里 load_messages 返回 list，嵌入宿主
+    `agent.restore(load_messages(path))` 一行不改就能在 restore 时收到提示。
+    切片会退化成普通 list、丢掉这个属性——要切片的调用方自己带上。
+    """
+
+    def __init__(self, messages: Any = (), corrupt_lines: Any = ()) -> None:
+        super().__init__(messages)
+        self.corrupt_lines: list[int] = list(corrupt_lines)
+
+
+def load_messages(path: Path) -> LoadedMessages:
     """重放一个会话文件，返回可直接接到 system prompt 之后的消息列表。
 
     重放规则（顺序遍历，语义在写入端已经定死）：
@@ -598,18 +824,36 @@ def load_messages(path: Path) -> list[dict[str, Any]]:
     - clear 事件 → 清空；
     - 其余事件（meta / microcompact / 旧格式 compact）→ 跳过。
     遇到比当前实现新的格式版本直接拒绝——静默错乱比失败更糟。
+
+    坏行（解析失败、或解析出来不是对象）一律跳过，但分两种：
+    - **最后一行**、或紧跟着 torn_tail 事件的那一行：崩溃留下的半行，正常形态，静默；
+    - 其余（中段）：多半是并发写交错或磁盘损坏，丢的可能是带 tool_calls 的
+      assistant——发请求前的历史修复会连带删掉对应 tool 结果，用户毫无感知。
+      所以记进返回值的 corrupt_lines，由 Agent.restore 提示出来。
+    compact / clear 会整体重建历史，之前的坏行不影响接回内容，随之清零。
     """
     messages: list[dict[str, Any]] = []
+    corrupt: list[int] = []
+    #  最近一条还没定性的坏行：看下一条有效记录（或文件结束）才知道它是不是尾巴
+    pending_bad = 0
     with path.open(encoding="utf-8", errors="replace") as handle:
-        for line in handle:
-            line = line.strip()
+        for number, raw in enumerate(handle, start=1):
+            line = raw.strip()
             if not line:
                 continue
             try:
                 record = json.loads(line)
             except json.JSONDecodeError:
-                #  尾部半行（写入中断）跳过；resume 的价值在于尽量恢复
+                record = None
+            if not isinstance(record, dict):
+                if pending_bad:
+                    corrupt.append(pending_bad)
+                pending_bad = number
                 continue
+            if pending_bad:
+                if record.get("event") != "torn_tail":
+                    corrupt.append(pending_bad)
+                pending_bad = 0
             if "event" in record:
                 kind = record["event"]
                 if kind == "meta":
@@ -626,9 +870,12 @@ def load_messages(path: Path) -> list[dict[str, Any]]:
                     #  任何回滚语义，撞到即整体替换（旧版本会跳过 rewind 事件，
                     #  resume 出来的历史会多出被回滚的轮次——只影响旧版读新文件）
                     messages = list(record["replacement"])
+                    corrupt = []
                 elif kind == "clear":
                     messages = []
+                    corrupt = []
                 continue
             if "role" in record:
                 messages.append({key: value for key, value in record.items() if key != "ts"})
-    return messages
+    #  循环结束还挂着的 pending_bad 就是最后一行：尾部半行，静默
+    return LoadedMessages(messages, corrupt)

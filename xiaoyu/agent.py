@@ -1918,6 +1918,20 @@ class Agent:
         #  正常退出路径都会先补齐），用"结果未知"文案补齐——修复写进新会话
         #  文件（copy=False 时写进续写的原文件），下次 resume 不必再修。
         self.close_open_tool_calls(self.UNKNOWN_TOOL_OUTCOME)
+        #  读回时的中段坏行（session_log.load_messages 记在返回值上）：被跳过的
+        #  可能是带 tool_calls 的 assistant，发请求前的历史修复还会连带删掉对应
+        #  tool 结果——历史被改写了，必须让用户知道，不能静默
+        corrupt = getattr(messages, "corrupt_lines", None)
+        if corrupt:
+            shown = "、".join(str(number) for number in corrupt[:5])
+            more = f" 等 {len(corrupt)} 处" if len(corrupt) > 5 else ""
+            self.sink.emit(
+                Notice(
+                    f"[会话文件有 {len(corrupt)} 行记录损坏、读不出来（第 {shown} 行{more}），"
+                    "已跳过——接回的历史可能缺了消息，模型可能不记得那部分内容]",
+                    "warn",
+                )
+            )
         #  压缩日志锁的孤儿检测：来源文件里有
         #  compact_start 而无配对的 compact_end = 上次会话死在压缩中途。
         #  历史本身无损（replacement 没写入就还是原文），提示一句即可。
