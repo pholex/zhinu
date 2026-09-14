@@ -98,6 +98,8 @@ CAPABILITY_TOOLS: dict[str, frozenset[str]] = {
 _NAME_RE = re.compile(r"^[a-z][a-z0-9_]{1,31}$")
 _DEFAULT_ITERATIONS = 20
 MAX_ANSWER_CHARS = 4000
+#  失败诊断（异常原文）交给模型前的上限：异常里可能夹整段响应体或 traceback
+MAX_FAILURE_CHARS = 1000
 #  resume 记录的滚动上限与"transcript 不得超过窗口多少"的闸（80%）
 MAX_RUNS = 16
 _SAFE_RESUME_RATIO = 0.8
@@ -706,11 +708,19 @@ def execute_delegation(
         sub_agent.messages[0]["content"] = system_text
         #  精简副本直接作为起始历史：进存档随 resume 续用，无需额外登记
         sub_agent.messages.extend(seed)
+    #  继承来的历史（fork / 精简副本 / resume 存档）末尾可能已有别人的答复：
+    #  本次一个字没产出时，不能把它当成本次的结论（或失败前的部分结论）交回去
+    inherited_answer = sub_agent.last_assistant_text()
     failure = ""
     try:
         sub_agent.send(task)
     except Exception as exc:  # noqa: BLE001 - 委托失败不该打断主流程
         failure = f"{type(exc).__name__}: {exc}"
+        if len(failure) > MAX_FAILURE_CHARS:
+            failure = failure[:MAX_FAILURE_CHARS] + "…（已截断）"
+    answer = sub_agent.last_assistant_text()
+    if answer == inherited_answer:
+        answer = ""
 
     #  -- worktree 收尾：本次新建的，干净就删、有改动就保留报路径；
     #     resume 复用的一律保留 --
@@ -740,7 +750,7 @@ def execute_delegation(
         sink.emit(Notice(f"  🤖 {spec.name} 完成：{len(sub_agent.trace)} 次工具调用"))
     return DelegationResult(
         failure=failure,
-        answer=sub_agent.last_assistant_text(),
+        answer=answer,
         run_id=run_id,
         model=model,
         tool_calls=len(sub_agent.trace),
@@ -801,13 +811,15 @@ def make_subagent_tool(
             )
         footer_lines.extend(result.notes)
         footer = "\n".join(footer_lines)
-        if result.failure:
-            return f"ERROR: 子 agent {spec.name} 失败（{result.failure}）。\n{footer}"
         answer = result.answer
-        if not answer:
-            return f"子 agent {spec.name} 没有给出结论（可能是轮次用尽）。\n{footer}"
         if len(answer) > MAX_ANSWER_CHARS:
             answer = answer[:MAX_ANSWER_CHARS] + "\n…（结论过长已截断）"
+        if result.failure:
+            #  失败前已经查明的东西照样交回：父级据此决定续跑还是换路，不必从零再查
+            partial = f"[失败前的部分结论，未必完整]\n{answer}\n" if answer else ""
+            return f"ERROR: 子 agent {spec.name} 失败（{result.failure}）。\n{partial}{footer}"
+        if not answer:
+            return f"子 agent {spec.name} 没有给出结论（可能是轮次用尽）。\n{footer}"
         return (
             f"[{spec.name} 子 agent 的结论（{result.model}，{result.tool_calls} 次工具调用）]\n"
             f"{answer}\n\n{footer}"

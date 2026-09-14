@@ -40,8 +40,10 @@ from .errors import ContentFiltered
 from .responses import (
     OPERATOR_KEY,
     REASONING_KEY,
+    Choice,
     Chunk,
     Completion,
+    Delta,
     Function,
     Message,
     NonStreamChoice,
@@ -535,7 +537,11 @@ def stream_chunks(events: Iterator[Any]) -> Iterator[Chunk]:
         elif kind == "message_delta":
             if usage := getattr(event, "usage", None):
                 output_tokens = getattr(usage, "output_tokens", 0) or 0
-            if getattr(getattr(event, "delta", None), "stop_reason", None) == "refusal":
+            stop_reason = getattr(getattr(event, "delta", None), "stop_reason", None)
+            if stop_reason == "max_tokens":
+                #  截断翻译成 chat 的 finish_reason=length（与 responses 一路对齐）
+                yield Chunk(choices=[Choice(Delta(), finish_reason="length")])
+            if stop_reason == "refusal":
                 #  安全分类器拒绝：HTTP 200 但没有可用内容。抛出去落到
                 #  errors.classify → fatal（不换模型不重试），详情报给用户
                 raise ContentFiltered(f"Anthropic 拒绝了这次请求：{_refusal_detail(event)}")

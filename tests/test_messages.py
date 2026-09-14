@@ -550,6 +550,10 @@ class TestStreamTranslation(unittest.TestCase):
         self.assertEqual(text, "半截")
         self.assertEqual((usage.prompt_tokens, usage.completion_tokens), (3, 4))
 
+    def test_max_tokens_surfaces_as_length(self) -> None:
+        chunks = list(msgs.stream_chunks(iter([message_delta(stop_reason="max_tokens", output_tokens=4)])))
+        self.assertEqual([c.choices[0].finish_reason for c in chunks if c.choices], ["length"])
+
     def test_ping_and_unknown_events_are_ignored(self) -> None:
         text, pending, _ = self.collect(
             [

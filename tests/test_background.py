@@ -10,6 +10,7 @@ import threading
 import time
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from xiaoyu import background as bg
 from xiaoyu.config import Config
@@ -56,6 +57,20 @@ class TaskManagerTest(unittest.TestCase):
         task = self.manager.start(["/bin/sh", "-c", command], command=command, **kwargs)
         self.assertNotIsInstance(task, str, task)
         return task
+
+    def test_admission_cap_refuses_until_a_slot_frees(self):
+        with mock.patch.object(bg, "MAX_RUNNING_TASKS", 2):
+            first = self.start("sleep 30")
+            self.start("sleep 30")
+            refused = self.manager.start(["/bin/sh", "-c", "sleep 30"], command="sleep 30")
+            self.assertIsInstance(refused, str)
+            self.assertTrue(refused.startswith("ERROR"), refused)
+            self.assertIn(first.task_id, refused)
+            self.assertIn("kill_task", refused)
+            self.manager.kill(first.task_id)
+            #  终止中的任务仍占名额，进程真正退出后才释放
+            self.assertTrue(wait_until(first.done.is_set))
+            self.start("true")
 
     def test_completion_notifies_with_dedup_key(self):
         task = self.start("echo hello")

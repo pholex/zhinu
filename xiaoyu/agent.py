@@ -3308,6 +3308,7 @@ class Agent:
         #  活区也必须收掉，否则 spinner 会一直转下去。
         self.sink.emit(RequestStarted(route.model))
         self._content_filtered = False
+        self._length_truncated = False
         try:
             stream = route.client.chat.completions.create(**request)
             self._consume_stream(route, stream, content_parts, pending, reasoning)
@@ -3341,9 +3342,28 @@ class Agent:
                 )
             self.sink.emit(Notice("[回答被服务端内容过滤截断，内容可能不完整]", "warn"))
 
+        text = "".join(content_parts)
+        if self._length_truncated:
+            #  撞长度上限：arguments 解析不了的调用是被截断的，执行只会换来"参数不是
+            #  合法 JSON"白费一步，丢掉；完整的照常执行。标记写进正文——下一轮模型
+            #  自己也得知道上一条没说完；它同时让这条消息不再"为空"，不会被当成断流
+            #  原样重发（同样的请求重发，只会在同一处再截断一次）
+            dropped = 0
+            for index in sorted(pending):
+                try:
+                    json.loads(pending[index]["function"]["arguments"] or "{}")
+                except json.JSONDecodeError:
+                    del pending[index]
+                    dropped += 1
+            marker = "[输出达到模型长度上限，在此截断" + (
+                f"；{dropped} 个没写完的工具调用已丢弃]" if dropped else "]"
+            )
+            text = f"{text}\n{marker}" if text else marker
+            self.sink.emit(Notice(marker + ("——发「继续」可接着写" if not pending else ""), "warn"))
+
         message: dict[str, Any] = {
             "role": "assistant",
-            "content": "".join(content_parts) or None,
+            "content": text or None,
         }
         if pending:
             calls = [pending[index] for index in sorted(pending)]
@@ -3463,9 +3483,13 @@ class Agent:
             if not chunk.choices:
                 continue
 
-            #  收尾原因只认内容过滤一种：它决定这次"空补全"是拒答还是断流
-            if getattr(chunk.choices[0], "finish_reason", None) == "content_filter":
+            #  收尾原因认两种：内容过滤决定这次"空补全"是拒答还是断流；length 说明
+            #  输出撞了长度上限，最后一个工具调用多半被拦腰截断
+            finish = getattr(chunk.choices[0], "finish_reason", None)
+            if finish == "content_filter":
                 self._content_filtered = True
+            elif finish == "length":
+                self._length_truncated = True
             delta = chunk.choices[0].delta
             if delta is None:
                 continue

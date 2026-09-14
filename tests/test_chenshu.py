@@ -201,6 +201,21 @@ class CommsTest(ChenshuCase):
         with self.assertRaises(ChenshuError):
             self.runtime.send("w1", "w1", "s", "b")  # 不能发给自己
 
+    def test_mail_to_tower_enters_event_stream_before_completion(self):
+        """成员中途发给总枢的信必须先于它的收工事件被 chenshu_wait 看到，
+        否则总枢可能没读到中途发现就去 merge。"""
+        self.runtime.send("w1", "chenshu", "中途发现", "接口签名要改")
+        self.runtime.send("w2", "all", "广播", "所有人可见")
+        self.runtime.send("w1", "w2", "点对点", "不进总枢事件流")
+        self.runtime.send("chenshu", "w1", "指令", "总枢自己发的不回灌")
+        self.runtime.events.put("w1 完成")  # 收工事件在来信之后入队（worker 线程 finally）
+        events = self.runtime.wait(timeout=1)
+        self.assertIn("接口签名要改", events)
+        self.assertIn("广播", events)
+        self.assertNotIn("点对点", events)
+        self.assertNotIn("总枢自己发的", events)
+        self.assertLess(events.index("中途发现"), events.index("w1 完成"))
+
     def test_read_filters_by_caller(self):
         self.runtime.send("w1", "w2", "点对点", "只有 w2 能看")
         self.runtime.send("w2", "all", "广播", "所有人可见")

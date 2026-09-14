@@ -437,6 +437,9 @@ def stream_chunks(events: Iterator[Any]) -> Iterator[Chunk]:
                 #  内容过滤翻译成 chat 的 finish_reason：不透传的话内核只看到
                 #  "一个字没有"，会当成断流原样重发
                 yield Chunk(choices=[Choice(Delta(), finish_reason="content_filter")])
+            elif getattr(details, "reason", None) == "max_output_tokens":
+                #  截断同理：内核靠 length 丢弃残缺工具调用、提示用户，而不是当断流重发
+                yield Chunk(choices=[Choice(Delta(), finish_reason="length")])
             yield Chunk(usage=_usage(getattr(event.response, "usage", None)))
         elif kind in ("response.failed", "error"):
             #  真失败才抛。落到 errors.classify 多半是 fatal（没有 HTTP 状态码可判），

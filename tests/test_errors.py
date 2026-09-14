@@ -19,7 +19,7 @@ from xiaoyu.errors import (
     retry_after_seconds,
 )
 
-from .test_agent_paths import AgentTestCase, chunk, usage_chunk
+from .test_agent_paths import AgentTestCase, call_fragment, chunk, usage_chunk
 
 
 def _response(status: int, headers: dict[str, str] | None = None) -> httpx.Response:
@@ -373,6 +373,56 @@ def filtered_chunk():
     delta = types.SimpleNamespace(content=None, tool_calls=None)
     choice = types.SimpleNamespace(delta=delta, finish_reason="content_filter")
     return types.SimpleNamespace(choices=[choice], usage=None)
+
+
+def length_chunk():
+    """输出撞 max_tokens 的收尾 chunk：finish_reason=length。"""
+    delta = types.SimpleNamespace(content=None, tool_calls=None)
+    choice = types.SimpleNamespace(delta=delta, finish_reason="length")
+    return types.SimpleNamespace(choices=[choice], usage=None)
+
+
+class LengthTruncationTest(AgentTestCase):
+    """被长度上限截断：残缺工具调用不执行、不当空补全重发，轮末告诉用户与模型。"""
+
+    def test_truncated_tool_call_dropped_and_turn_ends(self):
+        agent = self.build([[
+            chunk(content="我来写文件"),
+            chunk(tool_calls=[call_fragment(0, "c1", "write_file", '{"path": "a.py", "content": "def')]),
+            length_chunk(),
+            usage_chunk(100, 50),
+        ]])
+        buffer = io.StringIO()
+        with contextlib.redirect_stdout(buffer):
+            agent.send("写个文件")
+        self.assertEqual(len(self.client.completions.calls), 1)
+        self.assertFalse((self.root / "a.py").exists())
+        last = agent.messages[-1]
+        self.assertEqual(last["role"], "assistant")
+        self.assertFalse(last.get("tool_calls"))
+        self.assertIn("长度上限", last["content"])
+        self.assertIn("长度上限", buffer.getvalue())
+
+    def test_complete_calls_before_the_cut_still_run(self):
+        agent = self.build([
+            [
+                chunk(tool_calls=[call_fragment(0, "c1", "read_file", '{"path": "calc.py"}')]),
+                chunk(tool_calls=[call_fragment(1, "c2", "write_file", '{"path": "b.py", "con')]),
+                length_chunk(),
+            ],
+            [chunk(content="读完了"), usage_chunk(100, 5)],
+        ])
+        with contextlib.redirect_stdout(io.StringIO()):
+            agent.send("读再写")
+        calls = [m for m in agent.messages if m.get("tool_calls")]
+        self.assertEqual([c["id"] for c in calls[0]["tool_calls"]], ["c1"])
+        self.assertEqual(agent.last_assistant_text(), "读完了")
+
+    def test_empty_truncated_completion_not_retried(self):
+        agent = self.build([[length_chunk(), usage_chunk(100, 4096)]])
+        with contextlib.redirect_stdout(io.StringIO()):
+            agent.send("hi")
+        self.assertEqual(len(self.client.completions.calls), 1)
 
 
 class ContentFilterTest(AgentTestCase):
