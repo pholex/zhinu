@@ -10,14 +10,10 @@
 一次性调用：把查询交给搜索后端（模型 + 服务端 web_search），拿回带来源的结论。
 搜索、抓取、筛选全在厂商服务端发生，本地不落任何中间结果。
 
-后端按 XIAOYU_SEARCH_PROVIDER 选（config.search_provider）。两家请求形态相同
-（/responses + tools:[{"type":"web_search"}]），差在质量与价格——2026-08 五题
-对比实测：grok-4.5 正确性 5/5、每题都带结构化引用 URL，但单次约 0.65 元；
-deepseek-v4-flash 4/5（时效敏感题失手）、无结构化引用，单次约 0.02 元。
-⚠️ 2026-09-14 换代到 deepseek-flash 后复测 3 题：服务端 web_search 没有真正执行——
-输出里没有搜索调用项，2 题把调用标记（DSML / <tool_use>）当正文吐出，1 题用训练知识
-作答。旧名 v4-flash 官方已落到同一型号，所以不是改名引入的；deepseek 后端待官方修复。
-（xai 侧 2026-08-13 起由 grok-4.5 换成同代升级款 grok-4.6，形态与价位不变。）
+后端按 XIAOYU_SEARCH_PROVIDER 选（config.search_provider），目前只有 xai
+（grok-4.6：2026-08 五题正确性 5/5、每题带结构化引用，单次约 0.65 元）。
+deepseek 后端 2026-09-14 移除：官方 Responses 文档写明 web_search 等内置工具被忽略，
+复测 deepseek-flash 3 题里服务端 0 次真搜索（2 题把调用标记吐进正文、1 题用训练知识作答）。
 """
 
 from __future__ import annotations
@@ -42,7 +38,6 @@ class SearchBackend:
 
 #  模型选各家里"够用且便宜"的档：搜索是有界辅助任务，不需要旗舰。
 SEARCH_BACKENDS: dict[str, SearchBackend] = {
-    "deepseek": SearchBackend("deepseek", "deepseek-flash"),
     "xai": SearchBackend("xai", "grok-4.6"),
 }
 

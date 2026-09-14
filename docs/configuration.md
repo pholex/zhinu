@@ -87,7 +87,7 @@ XIAOYU_API_KEY=<key>
 | `XIAOYU_ENABLE_SKILLS` | 扫描 `~/.agents/skills/` 与已装插件包下的 SKILL.md |
 | `XIAOYU_SKILLS_DIR` | 覆盖技能扫描目录（`os.pathsep` 分隔）：给了就只认它、不混默认目录（宿主指定技能库 / 测试隔离用） |
 | `XIAOYU_ENABLE_WEB_SEARCH` | `web_search` 工具 |
-| `XIAOYU_SEARCH_PROVIDER` | 搜索走哪家：`deepseek`（默认，便宜）/ `xai`（grok-4.6，更强更贵） |
+| `XIAOYU_SEARCH_PROVIDER` | 搜索走哪家：目前只有 `xai`（默认，grok-4.6，真搜且带引用，单次约 0.65 元；需 `XAI_API_KEY`）。deepseek 官方 Responses 不支持内置搜索，已移除。后端没配 key 时不挂载 `web_search` 工具 |
 | `XIAOYU_ENABLE_BROWSER` | `browser` 浏览器工具（依赖可选 `[browser]` extra 的 playwright，没装时本来就不出现） |
 | `XIAOYU_ENABLE_PLUGINS` | entry point 组 `xiaoyu.tools` 的第三方工具**包**（代码级；和 `xiaoyu plugin` 装的**内容包**不是一回事，见下） |
 | `XIAOYU_ENABLE_MCP` | MCP server 挂载 |

@@ -394,13 +394,13 @@ class TestOrderAndKeys(ProviderTestCase):
             self.assertEqual(anthropic.protocol_for("claude-opus-5"), "anthropic")
             self.assertIsInstance(anthropic._inner, openai.OpenAI)
 
-    def test_deepseek_flash_speaks_responses(self) -> None:
-        """deepseek-flash 实测 /responses 与 chat token 计数一致、回 encrypted reasoning，
-        走 /responses；协议仍按型号声明——没声明的名字（经网关的旧型号等）走 chat。"""
+    def test_deepseek_flash_stays_on_chat(self) -> None:
+        """官方 Responses 不回 encrypted reasoning、include/store 等不支持——走它没有收益，
+        deepseek-flash 留在 chat（没声明 responses_models 即 chat）。"""
         with isolated_env({"DEEPSEEK_API_KEY": "ds"}):
             client = providers.build(config(base_url="")).client("deepseek")
-            self.assertEqual(client.protocol_for("deepseek-flash"), "responses")
-            self.assertEqual(client.protocol_for("没声明的型号"), "chat")
+            self.assertEqual(client.protocol_for("deepseek-flash"), "chat")
+        self.assertEqual(providers.PRESETS["deepseek"].responses_models, ())
 
     def test_deepseek_flash_sees_images(self) -> None:
         """vision_models 只写实测过的：deepseek-flash 四象限图两路四色全中（2026-09-14）；

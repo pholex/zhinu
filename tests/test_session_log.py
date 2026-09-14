@@ -143,6 +143,7 @@ class SessionLogTest(SessionDirTestCase):
         config.enable_explore = False
         config.enable_skills = False
         log = SessionLog.create("m", "/ws")
+        self.addCleanup(log.release)  # Windows 上持有的锁文件挡住临时目录清理
         agent = Agent(config, registry=Registry.for_client(object()), session_log=log)  # client 不会被用到
         agent._record({"role": "user", "content": "任务"})
         agent.reset()
@@ -240,6 +241,7 @@ class UsageDigestTest(SessionDirTestCase):
         config.enable_explore = False
         config.enable_skills = False
         log = SessionLog.create("m", "/ws")
+        self.addCleanup(log.release)  # Windows 上持有的锁文件挡住临时目录清理
         agent = Agent(config, registry=Registry.for_client(object()), session_log=log)
         agent._log_usage()  # 零调用：不写
         agent.usage.add("p/m1", 100, 10)
@@ -262,6 +264,7 @@ class UsageDigestTest(SessionDirTestCase):
         config.enable_explore = False
         config.enable_skills = False
         log = SessionLog.create("m", "/ws")
+        self.addCleanup(log.release)  # Windows 上持有的锁文件挡住临时目录清理
         agent = Agent(config, registry=Registry.for_client(object()), session_log=log)
 
         def dying_turn(user_input):

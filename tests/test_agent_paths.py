@@ -77,6 +77,9 @@ def text_response(content: str, prompt: int = 100, completion: int = 20):
 class AgentTestCase(unittest.TestCase):
     def setUp(self) -> None:
         self.tmp = tempfile.TemporaryDirectory()
+        #  临时目录走 addCleanup（后进先出）：用例里登记的 SessionLog.release 先跑，
+        #  Windows 上被持有的 .jsonl.lock 删不掉——tearDown 里删会先于 release
+        self.addCleanup(self.tmp.cleanup)
         self.root = Path(self.tmp.name).resolve()
         (self.root / "calc.py").write_text("def add(a, b):\n    return a + b\n", encoding="utf-8")
         self.config = Config(
@@ -95,9 +98,6 @@ class AgentTestCase(unittest.TestCase):
             enable_hooks=False,
             enable_plugins=False,
         )
-
-    def tearDown(self) -> None:
-        self.tmp.cleanup()
 
     def build(self, script: list, **kwargs) -> Agent:
         client = FakeClient(script)
@@ -1183,7 +1183,9 @@ class TestRestoreRepair(AgentTestCase):
         from xiaoyu.session_log import SessionLog, has_orphan_compact
 
         log_path = self.root / "log.jsonl"
-        agent = self.build([], session_log=SessionLog(log_path))
+        log = SessionLog(log_path)
+        self.addCleanup(log.release)
+        agent = self.build([], session_log=log)
         with contextlib.redirect_stdout(io.StringIO()):
             agent.maybe_compact(force=True)
         text = log_path.read_text(encoding="utf-8")

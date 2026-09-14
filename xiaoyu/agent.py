@@ -963,8 +963,8 @@ class Agent:
             from .explore import make_explore_tool
 
             self.toolbox.register(make_explore_tool(config, self.registry, self.usage, self.sink))
-        #  web_search：借 deepseek Responses 内置搜索的一次性调用（见 websearch.py 顶部
-        #  关于"为什么不切协议"的说明）。没配 deepseek 直连时 check_fn 让它不进 schemas。
+        #  web_search：借厂商 Responses 内置搜索的一次性调用（后端见 XIAOYU_SEARCH_PROVIDER，
+        #  "为什么不切协议"见 websearch.py 顶部）。选中后端没配直连时 check_fn 让它不进 schemas。
         if config.enable_web_search and self.toolbox.get("web_search") is None:
             from .websearch import make_web_search_tool
 

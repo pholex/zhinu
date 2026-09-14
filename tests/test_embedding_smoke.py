@@ -39,6 +39,9 @@ from tests.test_agent_paths import FakeClient, chunk
 class EmbeddingTestCase(unittest.TestCase):
     def setUp(self) -> None:
         self.tmp = tempfile.TemporaryDirectory()
+        #  临时目录走 addCleanup（后进先出）：用例里登记的 SessionLog.release 先跑，
+        #  Windows 上被持有的 .jsonl.lock 删不掉——tearDown 里删会先于 release
+        self.addCleanup(self.tmp.cleanup)
         self.root = Path(self.tmp.name).resolve()
         self.config = Config(
             base_url="http://unused",
@@ -52,9 +55,6 @@ class EmbeddingTestCase(unittest.TestCase):
             enable_hooks=False,
             enable_plugins=False,
         )
-
-    def tearDown(self) -> None:
-        self.tmp.cleanup()
 
     def build(self, script: list, **kwargs) -> tuple[Agent, FakeClient]:
         client = FakeClient(script)
@@ -200,14 +200,18 @@ class TestRestore(EmbeddingTestCase):
         from xiaoyu.session_log import SessionLog, load_messages
 
         old_path = self.root / "old-session.jsonl"
-        agent1, _ = self.build([[chunk(content="收到，1 号工单")]], session_log=SessionLog(old_path))
+        old_log = SessionLog(old_path)
+        self.addCleanup(old_log.release)
+        agent1, _ = self.build([[chunk(content="收到，1 号工单")]], session_log=old_log)
         agent1.send("记一下：1 号工单")
 
         loaded = load_messages(old_path)
         self.assertEqual([m["role"] for m in loaded], ["user", "assistant"])
 
         new_path = self.root / "new-session.jsonl"
-        agent2, _ = self.build([[chunk(content="还没处理")]], session_log=SessionLog(new_path))
+        new_log = SessionLog(new_path)
+        self.addCleanup(new_log.release)
+        agent2, _ = self.build([[chunk(content="还没处理")]], session_log=new_log)
         agent2.restore(loaded, source=str(old_path))
 
         #  上下文接上：system prompt 之后跟着完整历史

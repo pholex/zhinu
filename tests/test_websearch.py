@@ -13,7 +13,7 @@ from xiaoyu.render import NullSink
 from xiaoyu.websearch import MAX_ANSWER_CHARS, make_web_search_tool
 
 
-def _config(search_provider: str = "deepseek") -> Config:
+def _config(search_provider: str = "xai") -> Config:
     return Config(
         base_url="", model="m", workspace=Path("."), search_provider=search_provider
     )
@@ -45,7 +45,7 @@ def _response(
     )
 
 
-def _registry(response=None, error: Exception | None = None, name: str = "deepseek") -> Registry:
+def _registry(response=None, error: Exception | None = None, name: str = "xai") -> Registry:
     def create(**kwargs):
         if error is not None:
             raise error
@@ -59,7 +59,7 @@ def _registry(response=None, error: Exception | None = None, name: str = "deepse
     )
 
 
-def _tool(registry: Registry, usage: Usage | None = None, provider: str = "deepseek"):
+def _tool(registry: Registry, usage: Usage | None = None, provider: str = "xai"):
     return make_web_search_tool(_config(provider), registry, usage or Usage(), NullSink())
 
 
@@ -69,15 +69,23 @@ class TestWebSearchTool(unittest.TestCase):
         out = _tool(_registry(_response()), usage).handler(query="X 是什么")
         self.assertIn("结论：X", out)
         self.assertIn("联网搜索结论", out)
-        entry = usage.by_model["deepseek/deepseek-flash"]
+        entry = usage.by_model["xai/grok-4.6"]
         self.assertEqual((entry.prompt_tokens, entry.completion_tokens, entry.calls), (100, 20, 1))
 
-    def test_request_uses_flash_and_builtin_tool(self):
+    def test_request_uses_builtin_tool(self):
         registry = _registry(_response())
         _tool(registry).handler(query="q")
-        request = registry.client("deepseek").responses.create.last_request
-        self.assertEqual(request["model"], "deepseek-flash")
+        request = registry.client("xai").responses.create.last_request
+        self.assertEqual(request["model"], "grok-4.6")
         self.assertEqual(request["tools"], [{"type": "web_search"}])
+
+    def test_deepseek_backend_removed(self):
+        """deepseek 官方 Responses 忽略内置 web_search：显式选它也不挂工具，报错指向可选后端。"""
+        tool = _tool(_registry(_response(), name="deepseek"), provider="deepseek")
+        self.assertFalse(tool.available())
+        out = tool.handler(query="q")
+        self.assertTrue(out.startswith("ERROR:"))
+        self.assertIn("xai", out)
 
     def test_xai_backend_switch(self):
         registry = _registry(_response(top_citations=("https://c.com",)), name="xai")
@@ -91,12 +99,21 @@ class TestWebSearchTool(unittest.TestCase):
         self.assertIn("https://c.com", out)
         self.assertIn("xai/grok-4.6", usage.by_model)
 
+    def test_default_backend_is_xai_and_hidden_without_key(self):
+        """默认后端 xai（deepseek-flash 服务端搜索实测不执行）；没配 xai 直连时工具不可见，
+        模型拿不到坏结果也不会对着一个必然报错的工具反复调。"""
+        default = Config(base_url="", model="m", workspace=Path("."))
+        self.assertEqual(default.search_provider, "xai")
+        only_deepseek = _registry(_response(), name="deepseek")
+        tool = make_web_search_tool(default, only_deepseek, Usage(), NullSink())
+        self.assertFalse(tool.available())
+        self.assertIn("XAI_API_KEY", tool.handler(query="q"))
+
     def test_unknown_backend_hidden_and_errors(self):
         tool = _tool(_registry(_response()), provider="bing")
         self.assertFalse(tool.available())
         out = tool.handler(query="q")
         self.assertTrue(out.startswith("ERROR:"))
-        self.assertIn("deepseek", out)
         self.assertIn("xai", out)
 
     def test_backend_provider_not_registered(self):
