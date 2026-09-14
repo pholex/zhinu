@@ -41,7 +41,12 @@ def _isolate_owned(case: unittest.TestCase) -> None:
 
 def _age(path: Path, days: float) -> None:
     stamp = time.time() - days * DAY
-    os.utime(path, (stamp, stamp), follow_symlinks=False)
+    #  Windows 的 utime 不支持 follow_symlinks（传了直接 NotImplementedError）；那边
+    #  用到符号链接的用例本来就跳过，普通目录/文件跟不跟随结果一样
+    if os.utime in os.supports_follow_symlinks:
+        os.utime(path, (stamp, stamp), follow_symlinks=False)
+    else:
+        os.utime(path, (stamp, stamp))
 
 
 class OwnedDirsTest(unittest.TestCase):

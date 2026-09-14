@@ -8,7 +8,7 @@ README 只给最小可跑配置，这里是全量。
 xiaoyu config             # 交互向导：直连 key / 网关端点 / 模型
 xiaoyu config --show      # 看生效配置与每项来源（key 永不回显）
 xiaoyu config --path      # 打印用户级配置文件路径
-xiaoyu config --set XIAOYU_MODEL=deepseek-v4-pro   # 非交互写入，可重复
+xiaoyu config --set XIAOYU_MODEL=deepseek-flash   # 非交互写入，可重复
 ```
 
 用户级 `.env` 的位置：macOS / Linux 在 `~/.config/xiaoyu/.env`（跟随 `$XDG_CONFIG_HOME`），Windows 在 `%APPDATA%\xiaoyu\.env`。也可以手动在任意工作目录放 `.env`（零依赖自解析）。
@@ -16,7 +16,7 @@ xiaoyu config --set XIAOYU_MODEL=deepseek-v4-pro   # 非交互写入，可重复
 优先级：**真实环境变量 > 当前目录 `.env` > 项目根 `.env` > 用户级 `.env`**，所以临时覆盖很方便：
 
 ```bash
-XIAOYU_MODEL=deepseek-v4-flash xiaoyu
+XIAOYU_MODEL=kimi-k3 xiaoyu
 ```
 
 ## 直连厂商
@@ -51,9 +51,9 @@ XIAOYU_API_KEY=<key>
 
 | 变量 | 默认值 | 说明 |
 |---|---|---|
-| `XIAOYU_MODEL` | `deepseek-v4-pro` | 主模型 |
-| `XIAOYU_SUMMARY_MODEL` | `deepseek-v4-flash` | 压缩摘要用的便宜模型 |
-| `XIAOYU_EXPLORE_MODEL` | `deepseek-v4-flash` | `explore` 子 agent 用的模型 |
+| `XIAOYU_MODEL` | `deepseek-flash` | 主模型 |
+| `XIAOYU_SUMMARY_MODEL` | `deepseek-flash` | 压缩摘要用的便宜模型 |
+| `XIAOYU_EXPLORE_MODEL` | `deepseek-flash` | `explore` 子 agent 用的模型 |
 | `XIAOYU_BASE_URL` | — | OpenAI 兼容网关端点 |
 | `XIAOYU_API_KEY` | — | 网关 key（也认 `LITELLM_API_KEY`） |
 | `XIAOYU_FALLBACK_MODELS` | —（不降级） | 备用模型链，逗号分隔，主模型重试耗尽后依次切 |
@@ -218,13 +218,12 @@ Windows 上用 `.env` 或环境变量。
 `/model` 无参看合并后的清单与来源：
 
 ```
-  deepseek-v4-pro    ← 直连 deepseek（同名可兜底：网关）
-  deepseek-v4-flash  ← 直连 deepseek（同名可兜底：网关）
+  deepseek-flash     ← 直连 deepseek（同名可兜底：网关）
   其余任意模型名     ← 网关（转发，不枚举）
-降级链：deepseek/deepseek-v4-pro → gateway/deepseek-v4-pro → …
+降级链：deepseek/deepseek-flash → gateway/deepseek-flash → …
 ```
 
-`provider/model` 是显式寻址，用来点名走哪一家：`/model gateway/deepseek-v4-pro`。点名之后不再自动兜底——既然指定了，就不该被偷偷换掉。
+`provider/model` 是显式寻址，用来点名走哪一家：`/model gateway/deepseek-flash`。点名之后不再自动兜底——既然指定了，就不该被偷偷换掉。
 
 ## 图片代读（当前模型看不了图时）
 
@@ -236,7 +235,7 @@ Windows 上用 `.env` 或环境变量。
 换成一段文字，再作为文本进历史。主模型、工具、消息配对、记账全都不动。
 
 ```ini
-XIAOYU_VISION_FALLBACK=deepseek-v4-flash-vision-exp
+XIAOYU_VISION_FALLBACK=deepseek-flash
 ```
 
 - **默认空**。不预置默认值是刻意的：代读是**有损**的（截图里的像素位置、字体细节、

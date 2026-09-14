@@ -983,7 +983,7 @@ class TestRequestSpinner(unittest.TestCase):
 
         sink = self.build()
         self.assertIsNone(sink._status)
-        sink.emit(RequestStarted("deepseek-v4-pro"))
+        sink.emit(RequestStarted("deepseek-flash"))
         self.assertIsNotNone(sink._status, "等模型期间必须有活区指示")
 
     def test_first_text_delta_takes_down_the_spinner(self) -> None:
@@ -1032,10 +1032,10 @@ class TestRequestSpinner(unittest.TestCase):
 
         from xiaoyu.tui import _RunningLine
 
-        line = _RunningLine("deepseek-v4-pro", verb="思考中")
+        line = _RunningLine("deepseek-flash", verb="思考中")
         line.started = time.monotonic() - 2
         text = line.__rich__().plain
-        self.assertIn("deepseek-v4-pro 思考中", text)
+        self.assertIn("deepseek-flash 思考中", text)
         self.assertIn("2s", text)
         self.assertIn("Ctrl-C 中断", text)
 

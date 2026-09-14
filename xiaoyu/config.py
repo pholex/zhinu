@@ -20,14 +20,15 @@ from pathlib import Path
 # 默认主模型：国产便宜模型优先。
 # 实测（12 个候选各跑 4 个 case）所有模型都能稳定完成当前 eval 集，
 # 差别只在成本 —— 同一任务最贵的比最便宜的高 57 倍。
-# 所以默认取「便宜且实测无工具调用错误」的 deepseek-v4-pro。
+# 所以默认取「便宜且实测无工具调用错误」的 deepseek 型号（2026-09-14 起为 deepseek-flash，
+# 官方模型表收敛后的唯一型号）。
 # ⚠️ 但要清楚：当前 eval 集没有区分度（12/12 全过），这个选择的依据是
 # 成本 + 简单任务通过率，不代表它能胜任难任务。硬活手动升级：
 #   xiaoyu --model <更强的模型>   或 REPL 里 /model <更强的模型>
-DEFAULT_MODEL = "deepseek-v4-pro"
+DEFAULT_MODEL = "deepseek-flash"
 
 # 摘要/检索这类有界的辅助任务用更便宜的模型：不需要工具调用，失败可回退主模型。
-DEFAULT_SUMMARY_MODEL = "deepseek-v4-flash"
+DEFAULT_SUMMARY_MODEL = "deepseek-flash"
 
 #  已知模型的上下文输入窗口（token），按模型名前缀匹配。**这是零往返的快路径
 #  兜底**——权威值是 Models API 的 `max_input_tokens`（`/model` 探测时抓取并
@@ -38,7 +39,7 @@ DEFAULT_SUMMARY_MODEL = "deepseek-v4-flash"
 #  没命中的用保守兜底：Claude 系一般 200k，留点余量取 180k——
 #  宁可早压缩，不可撑爆窗口。qwen3.7 无可靠数字，先不入表。
 CONTEXT_WINDOWS: tuple[tuple[str, int], ...] = (
-    ("deepseek-v4", 1_000_000),
+    ("deepseek-", 1_000_000),  # deepseek-flash 官方 1M；经网关的上一代 v4 系同为 1M
     ("glm-5", 1_000_000),  # 5.2 / 5.3 均 1M（5.3 为现役直连型号）
     ("kimi-k3", 1_048_576),
     ("qwen3.8-max", 1_000_000),
@@ -67,7 +68,7 @@ def context_window(model: str) -> int:
     return FALLBACK_CONTEXT_LIMIT
 
 # explore 子 agent 用的模型：只做只读检索，翻代码最费 token，交给最便宜的。
-DEFAULT_EXPLORE_MODEL = "deepseek-v4-flash"
+DEFAULT_EXPLORE_MODEL = "deepseek-flash"
 
 #  effort 取值并集：none/minimal 是 OpenAI 线专有，xhigh/max 是 Anthropic/GPT-5 线，
 #  low/medium/high 三家通吃。这里只做拼写把关，不按模型裁剪——是否支持由上游裁决
@@ -234,7 +235,7 @@ class Config:
     #  默认打开等于让用户以为主模型看了图，而它看的是一段转述——与
     #  Registry.sees_images 的 fail-closed 同一条诚实纪律；何况默认值要点名某一家
     #  厂商的型号（还得是用户配了 key 的那家），猜错就是又一次静默失败。
-    #  来源 XIAOYU_VISION_FALLBACK，值是模型名（如 deepseek-v4-flash-vision-exp）。
+    #  来源 XIAOYU_VISION_FALLBACK，值是模型名（如 deepseek-flash）。
     vision_fallback_model: str = ""
     #  是否给主 agent 挂 explore 工具（子 agent 自己一定关掉，避免套娃）
     enable_explore: bool = True

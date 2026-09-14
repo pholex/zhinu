@@ -48,7 +48,7 @@ def isolated_env(extra: dict[str, str] | None = None):
 
 def config(**kw) -> Config:
     kw.setdefault("base_url", GW)
-    kw.setdefault("model", "deepseek-v4-pro")
+    kw.setdefault("model", "deepseek-flash")
     kw.setdefault("workspace", Path.cwd())
     #  与其他测试文件同一纪律：不扫测试机的技能库/插件。这里以前没关——
     #  构造 Agent 会经 scan_skills() 摸 Path.home()，在环境被清空的 Windows
@@ -90,19 +90,19 @@ class TestGatewayOnly(ProviderTestCase):
         self.assertEqual([p.name for p in self.registry.providers], [GATEWAY])
 
     def test_any_model_falls_to_gateway(self) -> None:
-        for name in ("deepseek-v4-pro", "gateway-only-model", "没见过的模型"):
+        for name in ("deepseek-flash", "gateway-only-model", "没见过的模型"):
             route = self.registry.resolve(name)
             self.assertEqual(route.provider, GATEWAY)
             self.assertEqual(route.model, name, "透传给网关的必须是原始名字")
 
     def test_no_backups_so_chain_equals_old_behaviour(self) -> None:
         """旧 model_chain 是「主模型 + fallback_models 去重」，这里必须一模一样。"""
-        self.assertEqual(self.registry.backups("deepseek-v4-pro"), [])
-        cfg = config(fallback_models=["b", "deepseek-v4-pro", "c"])
+        self.assertEqual(self.registry.backups("deepseek-flash"), [])
+        cfg = config(fallback_models=["b", "deepseek-flash", "c"])
         agent = Agent(cfg, registry=self.registry, usage=Usage())
         self.assertEqual(
             [route.model for route in agent.model_chain()],
-            ["deepseek-v4-pro", "b", "c"],
+            ["deepseek-flash", "b", "c"],
             "重复项要去掉，顺序要保持——和旧实现同一份语义",
         )
 
@@ -164,30 +164,30 @@ class TestMerge(ProviderTestCase):
         self.assertEqual(
             [route.qualified for route in agent.model_chain()],
             [
-                "deepseek/deepseek-v4-pro",
-                f"{GATEWAY}/deepseek-v4-pro",
+                "deepseek/deepseek-flash",
+                f"{GATEWAY}/deepseek-flash",
                 f"{GATEWAY}/gateway-only-model",
             ],
         )
 
     def test_chain_dedupes_by_provider_and_model(self) -> None:
         """备用链里重复写了主模型/兜底目标时不该重复尝试。"""
-        cfg = config(fallback_models=["deepseek-v4-pro", f"{GATEWAY}/deepseek-v4-pro"])
+        cfg = config(fallback_models=["deepseek-flash", f"{GATEWAY}/deepseek-flash"])
         agent = Agent(cfg, registry=self.registry, usage=Usage())
         self.assertEqual(
             [route.qualified for route in agent.model_chain()],
-            ["deepseek/deepseek-v4-pro", f"{GATEWAY}/deepseek-v4-pro"],
+            ["deepseek/deepseek-flash", f"{GATEWAY}/deepseek-flash"],
         )
 
     def test_unknown_fallback_is_skipped_not_fatal(self) -> None:
         """备用链里写错一个名字，不该让每次请求都炸——网关通配时本来也不会走到这。"""
         registry = Registry([Provider("deepseek", "u", "k", DS_MODELS, "直连 deepseek")])
         agent = Agent(
-            config(model="deepseek-v4-pro", fallback_models=["打错的名字"]),
+            config(model="deepseek-flash", fallback_models=["打错的名字"]),
             registry=registry,
             usage=Usage(),
         )
-        self.assertEqual([r.model for r in agent.model_chain()], ["deepseek-v4-pro"])
+        self.assertEqual([r.model for r in agent.model_chain()], ["deepseek-flash"])
 
     def test_unknown_primary_raises(self) -> None:
         """主模型解析不了是必须立刻看见的配置错误，不能静默。"""
@@ -208,9 +208,9 @@ class TestExplicitAddressing(ProviderTestCase):
         self.registry = providers.build(config())
 
     def test_prefix_pins_the_provider(self) -> None:
-        route = self.registry.resolve(f"{GATEWAY}/deepseek-v4-pro")
+        route = self.registry.resolve(f"{GATEWAY}/deepseek-flash")
         self.assertEqual(route.provider, GATEWAY)
-        self.assertEqual(route.model, "deepseek-v4-pro", "前缀不能跟着发给上游")
+        self.assertEqual(route.model, "deepseek-flash", "前缀不能跟着发给上游")
 
     def test_unknown_prefix_passes_through_whole_name(self) -> None:
         """网关上真有 anthropic/claude-x 这种自带斜杠的模型名，不许误切。"""
@@ -219,14 +219,14 @@ class TestExplicitAddressing(ProviderTestCase):
         self.assertEqual(route.model, "anthropic/claude-x")
 
     def test_pinned_route_gets_no_backup(self) -> None:
-        self.assertEqual(self.registry.backups(f"{GATEWAY}/deepseek-v4-pro"), [])
+        self.assertEqual(self.registry.backups(f"{GATEWAY}/deepseek-flash"), [])
 
     def test_sticky_name_qualifies_only_when_needed(self) -> None:
-        gw = self.registry.resolve(f"{GATEWAY}/deepseek-v4-pro")
+        gw = self.registry.resolve(f"{GATEWAY}/deepseek-flash")
         #  裸名会被直连抢走，所以必须写全限定名，否则 /model 显示的和实际跑的对不上
-        self.assertEqual(self.registry.sticky_name(gw), f"{GATEWAY}/deepseek-v4-pro")
-        direct = self.registry.resolve("deepseek-v4-pro")
-        self.assertEqual(self.registry.sticky_name(direct), "deepseek-v4-pro")
+        self.assertEqual(self.registry.sticky_name(gw), f"{GATEWAY}/deepseek-flash")
+        direct = self.registry.resolve("deepseek-flash")
+        self.assertEqual(self.registry.sticky_name(direct), "deepseek-flash")
 
 
 # ---------- 顺序覆盖、key 解析、通用兜底 ----------
@@ -243,9 +243,9 @@ class TestOrderAndKeys(ProviderTestCase):
             registry = providers.build(config())
         self.assertEqual([p.name for p in registry.providers], [GATEWAY, "deepseek"])
         #  网关通配且排在前面，于是它把所有名字都吃掉——这正是默认不这么排的理由
-        self.assertEqual(registry.resolve("deepseek-v4-pro").provider, GATEWAY)
+        self.assertEqual(registry.resolve("deepseek-flash").provider, GATEWAY)
         #  清单的归属必须跟着翻转，否则 /model 显示的和实际跑的对不上
-        entry = next(e for e in registry.listing() if e.model == "deepseek-v4-pro")
+        entry = next(e for e in registry.listing() if e.model == "deepseek-flash")
         self.assertEqual(entry.owner, GATEWAY)
         self.assertEqual(entry.backups, ("deepseek",), "反过来之后直连成了兜底")
 
@@ -256,7 +256,7 @@ class TestOrderAndKeys(ProviderTestCase):
         """
         with isolated_env({"DEEPSEEK_API_KEY": "ds"}):
             registry = providers.build(config(base_url=""))
-        self.assertEqual(registry.resolve("deepseek-v4-pro").provider, "deepseek")
+        self.assertEqual(registry.resolve("deepseek-flash").provider, "deepseek")
         with self.assertRaises(UnknownModel):
             registry.resolve("gateway-only-model")
 
@@ -313,7 +313,7 @@ class TestOrderAndKeys(ProviderTestCase):
             registry = providers.build(config())
             transport = registry.client(GATEWAY)
         self.assertTrue(transport.signs_tools("gemini-3.7-flash"))
-        self.assertFalse(transport.signs_tools("deepseek-v4-pro"))
+        self.assertFalse(transport.signs_tools("deepseek-flash"))
 
     def test_generic_signatures_ignored_loudly_on_non_chat_protocol(self) -> None:
         """签名的捕获/还原只在 chat 一路存在：_SIGNATURES 配上 PROTOCOL=responses/
@@ -394,24 +394,25 @@ class TestOrderAndKeys(ProviderTestCase):
             self.assertEqual(anthropic.protocol_for("claude-opus-5"), "anthropic")
             self.assertIsInstance(anthropic._inner, openai.OpenAI)
 
-    def test_deepseek_speaks_responses_only_on_flash(self) -> None:
-        """v4-pro 的 /responses 明确"稍后开放"，而它是默认主模型——协议按型号
-        声明就是为了这种一家两制，按家切会当场把主模型切死。
-        vision-exp（flash 底座）实测 /responses 通且回 encrypted reasoning，随 flash 选边。"""
+    def test_deepseek_flash_speaks_responses(self) -> None:
+        """deepseek-flash 实测 /responses 与 chat token 计数一致、回 encrypted reasoning，
+        走 /responses；协议仍按型号声明——没声明的名字（经网关的旧型号等）走 chat。"""
         with isolated_env({"DEEPSEEK_API_KEY": "ds"}):
             client = providers.build(config(base_url="")).client("deepseek")
-            self.assertEqual(client.protocol_for("deepseek-v4-flash"), "responses")
-            self.assertEqual(client.protocol_for("deepseek-v4-flash-vision-exp"), "responses")
-            self.assertEqual(client.protocol_for("deepseek-v4-pro"), "chat")
+            self.assertEqual(client.protocol_for("deepseek-flash"), "responses")
+            self.assertEqual(client.protocol_for("没声明的型号"), "chat")
 
-    def test_deepseek_vision_only_on_vision_exp(self) -> None:
-        """vision_models 只写实测过的：vision-exp 绿/紫两轮全对（2026-08-24），
-        pro/flash 仍不收图（fail-closed，误声明=工具回图时每轮 400）。"""
+    def test_deepseek_flash_sees_images(self) -> None:
+        """vision_models 只写实测过的：deepseek-flash 四象限图两路四色全中（2026-09-14）；
+        没声明的名字仍 fail-closed（误声明=工具回图时每轮 400）。"""
         with isolated_env({"DEEPSEEK_API_KEY": "ds"}):
             registry = providers.build(config(base_url=""))
-            self.assertTrue(registry.sees_images("deepseek-v4-flash-vision-exp"))
-            self.assertFalse(registry.sees_images("deepseek-v4-flash"))
-            self.assertFalse(registry.sees_images("deepseek-v4-pro"))
+            self.assertTrue(registry.sees_images("deepseek-flash"))
+            self.assertFalse(registry.sees_images("没声明的型号"))
+
+    def test_deepseek_preset_is_single_flash(self) -> None:
+        """官方模型表收敛后只内置 deepseek-flash（2026-09-14）。"""
+        self.assertEqual(providers.PRESETS["deepseek"].models, ("deepseek-flash",))
 
     def test_generic_provider_can_opt_into_responses(self) -> None:
         """未内置的厂商也能自救：PROTOCOL=responses，不必等我们补 preset。"""
@@ -553,9 +554,9 @@ class TestCrossProviderFallback(ProviderTestCase):
         agent, gateway = self.build([limited] * 3, [[chunk(content="网关顶上")]])
         self._run(agent)
         self.assertEqual(agent.last_assistant_text(), "网关顶上")
-        self.assertEqual(gateway.completions.calls[0]["model"], "deepseek-v4-pro")
+        self.assertEqual(gateway.completions.calls[0]["model"], "deepseek-flash")
         #  粘性写回必须是全限定名，否则裸名又会被直连抢走，等于没切
-        self.assertEqual(agent.config.model, f"{GATEWAY}/deepseek-v4-pro")
+        self.assertEqual(agent.config.model, f"{GATEWAY}/deepseek-flash")
 
     def test_dead_direct_key_falls_to_gateway(self) -> None:
         """直连 key 过期 / 额度用光——鉴权错误同一家换模型没用，换一家才有用。"""
@@ -594,7 +595,7 @@ class TestCrossProviderFallback(ProviderTestCase):
             [limited] * 3, [[chunk(content="ok"), usage_chunk(100, 10)]]
         )
         self._run(agent)
-        self.assertEqual(list(agent.usage.by_model), [f"{GATEWAY}/deepseek-v4-pro"])
+        self.assertEqual(list(agent.usage.by_model), [f"{GATEWAY}/deepseek-flash"])
 
 
 class TestRetryBudgetAndPreferredProbe(TestCrossProviderFallback):
@@ -612,7 +613,7 @@ class TestRetryBudgetAndPreferredProbe(TestCrossProviderFallback):
             ],
             clients={"deepseek": direct, GATEWAY: gateway},
         )
-        cfg = config(auto_approve=True, fallback_models=["deepseek-v4-flash"])
+        cfg = config(auto_approve=True, fallback_models=["other-model"])
         agent = Agent(cfg, registry=registry, usage=Usage())
         chain = agent.model_chain()
         self.assertGreaterEqual(len(chain), 3)
@@ -634,8 +635,8 @@ class TestRetryBudgetAndPreferredProbe(TestCrossProviderFallback):
         )
         agent = Agent(config(auto_approve=True), registry=registry, usage=Usage())
         self._run(agent)
-        self.assertEqual(agent.config.model, f"{GATEWAY}/deepseek-v4-pro")
-        self.assertEqual(agent._preferred_model, "deepseek-v4-pro")
+        self.assertEqual(agent.config.model, f"{GATEWAY}/deepseek-flash")
+        self.assertEqual(agent._preferred_model, "deepseek-flash")
         return agent, direct, gateway
 
     def test_no_probe_before_cooldown(self) -> None:
@@ -649,7 +650,7 @@ class TestRetryBudgetAndPreferredProbe(TestCrossProviderFallback):
         agent._preferred_retry_at = 0.0
         self._run(agent)
         self.assertEqual(agent.last_assistant_text(), "直连恢复")
-        self.assertEqual(agent.config.model, "deepseek-v4-pro")
+        self.assertEqual(agent.config.model, "deepseek-flash")
         self.assertIsNone(agent._preferred_model)
         self.assertEqual(len(gateway.completions.calls), 1, "回探成功这一步不该再打网关")
 
@@ -660,12 +661,12 @@ class TestRetryBudgetAndPreferredProbe(TestCrossProviderFallback):
         self._run(agent)
         self.assertEqual(len(direct.completions.calls), 4, "回探只单发一次，不走重试")
         self.assertEqual(agent.last_assistant_text(), "网关再顶")
-        self.assertEqual(agent.config.model, f"{GATEWAY}/deepseek-v4-pro")
+        self.assertEqual(agent.config.model, f"{GATEWAY}/deepseek-flash")
         self.assertEqual(agent._preferred_backoff, before * 2)
 
     def test_explicit_switch_cancels_probe(self) -> None:
         agent, _, _ = self.downgraded([])
-        agent.switch_model("deepseek-v4-flash")
+        agent.switch_model("other-model")
         self.assertIsNone(agent._preferred_model)
 
 
@@ -734,7 +735,7 @@ class TestAutoDiscovery(ProviderTestCase):
         self.assertIsNone(registry.get("local"))
         self.assertEqual([p.name for p in registry.providers], [GATEWAY])
         #  网关模型仍走网关，没被通配的 local 劫持
-        self.assertEqual(registry.resolve("deepseek-v4-flash").provider, GATEWAY)
+        self.assertEqual(registry.resolve("deepseek-flash").provider, GATEWAY)
 
     def test_remote_auto_is_refused(self) -> None:
         import contextlib, io

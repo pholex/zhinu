@@ -2603,7 +2603,7 @@ class Agent:
         header = VISION_CAPTION_HEADER.format(
             #  抬头里用**裸名**而不是 provider/model：这段文字会进历史、模型多半会
             #  在回复里复述它，而带斜杠的全限定名长得像路径——实测触发过一次产物
-            #  对账护栏的误报（"补充：…提到了 `deepseek/deepseek-v4-flash-vision-exp`"）。
+            #  对账护栏的误报（"补充：…提到了 `deepseek/deepseek-flash`"）。
             #  哪家代读的是给人看的信息，留在 Notice 里
             count=len(images), model=self.config.model, reader=route.model
         )
@@ -2993,7 +2993,7 @@ class Agent:
     def _summarize(self, transcript: str, prefix: list[dict[str, Any]] | None = None) -> str:
         """让模型把早期对话总结成交接说明。不带工具调用、不流式。
 
-        路由链：先便宜模型（默认 deepseek-v4-flash——摘要是有界任务），
+        路由链：先便宜模型（默认 XIAOYU_SUMMARY_MODEL——摘要是有界任务），
         挂了或退化再回退主模型；主模型腿用前缀重放（见 _summary_call）。
         压缩失败的代价是整段历史带不动，不值得为省这一次调用而放弃。
         """

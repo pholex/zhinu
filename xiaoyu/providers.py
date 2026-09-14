@@ -9,7 +9,7 @@
 3. **少一跳、不加价、key 不过第三方**。
 
 核心规则是**有序合并**：provider 按优先级排队，同名模型先出现者赢。
-DeepSeek 官方名（deepseek-v4-pro / deepseek-v4-flash）和网关侧完全一致，
+DeepSeek 官方名（deepseek-flash）和网关侧完全一致，
 所以 canonical id 直接就是原始 model 名，不需要别名映射表——这是这一层能做薄的关键。
 日后遇到两边命名不一致的厂商，别名表加在 Preset 上（models 改成 dict）即可，
 调用方无感。
@@ -144,7 +144,7 @@ class Preset:
 #  ⚠️ `vision_models` 同样只写实测过的（`experiments/vision_probe.py`）。判据
 #  2026-08-24 起为**单图四象限（绿/紫/蓝/橙）四色全中**（旧判据是绿、紫两张
 #  纯色图两轮全对，当日按新判法全量复跑 12 个在册型号，结论与旧表一致）：
-#  不看 HTTP 200（deepseek-v4-flash 会 200 收下再自称看不见），不用红色
+#  不看 HTTP 200（上一代 deepseek-v4-flash 会 200 收下再自称看不见），不用红色
 #  （蒙也蒙得中），**更不能在提示词里给"看不到就明说"的逃生舱**——那半句让
 #  claude 两个型号 100% 自称看不见，第一版据此把 anthropic 错记成"不收图"。
 #  补新型号照跑一遍。
@@ -152,25 +152,22 @@ PRESETS: dict[str, Preset] = {
     "deepseek": Preset(
         name="deepseek",
         base_url="https://api.deepseek.com/v1",
-        #  vision-exp（2026-08-24 入册）：flash 底座 + 图片输入的实验型号，
-        #  与 flash 同价、同 1M 窗口——deepseek 首个能看图的在册型号。
-        #  实测：chat 与 /responses 两路 tool_calls 都通
-        models=("deepseek-v4-pro", "deepseek-v4-flash", "deepseek-v4-flash-vision-exp"),
+        #  2026-09-14 换代：官方模型表收敛为 deepseek-flash（1M 窗口、工具调用、图片输入），
+        #  v4-flash / v4-flash-vision-exp 官方已下线（旧名仍被接受但落到 flash），
+        #  v4-pro 按用户决定不再内置。实测（直连）：chat 与 /responses 两路流式
+        #  tool_calls 各 3 轮全结构化返回、续轮正常、正文无调用标记泄漏
+        models=("deepseek-flash",),
         #  键名就用厂商原生名，.env / 环境变量 / Keychain 三处同名，用户只记一个
         key_envs=("DEEPSEEK_API_KEY",),
         label="直连 deepseek",
-        #  ⚠️ v4-pro 不进 /responses：实测回"尚未开放"类明确报错，而 v4-pro 是
-        #  默认主模型——这正是协议必须按型号声明、不能按家切的原因。
-        #  flash 实测两边 token 计数完全一致（长短输入都 0 差），换协议不多花钱；
-        #  vision-exp 实测 /responses 通且回 encrypted reasoning（选边的收益所在），
-        #  图片部件经翻译层转成 input_image 后答色正确
-        responses_models=("deepseek-v4-flash", "deepseek-v4-flash-vision-exp"),
-        #  ⚠️ pro / flash 不收图，且**失败方式不同**：v4-pro 的 chat 端点直接 400
-        #  （unknown variant `image_url`），v4-flash 的 /responses 却 200 收下、
-        #  prompt_tokens 只涨 5 个（92→107）、然后答"无法确定"——图被静默丢弃。
-        #  后者正是 vision_probe 不能只看状态码的原因。
-        #  vision-exp 2026-08-24 实测绿/紫两轮全对（chat 与 /responses 都试过）
-        vision_models=("deepseek-v4-flash-vision-exp",),
+        #  走 /responses：实测两边 token 计数完全一致（473 vs 473），换协议不多花钱；
+        #  /responses 回 encrypted reasoning（选边的收益所在）。协议仍按型号声明——
+        #  上一代 v4-pro 就是 /responses 未开放、只能走 chat 的"一家两制"
+        responses_models=("deepseek-flash",),
+        #  2026-09-14 四象限图 chat 与 /responses 两路四色全中。⚠️ 判法别只看状态码：
+        #  上一代 v4-flash 的 /responses 曾 200 收下图、prompt_tokens 只涨 5 个、
+        #  答"无法确定"——图被静默丢弃（见 experiments/vision_probe.py）
+        vision_models=("deepseek-flash",),
     ),
     #  以下三家 2026-08-11 实测过 chat completions 通、模型名正确
     "moonshot": Preset(
@@ -215,7 +212,7 @@ PRESETS: dict[str, Preset] = {
         name="anthropic",
         base_url="https://api.anthropic.com/v1",
         #  只留旗舰与主力两档。claude-haiku-4-5 官方仍在售，但我们不用它（上一代小杯，
-        #  便宜档已由 deepseek-v4-flash 覆盖）——不内置不等于不能用：
+        #  便宜档已由 deepseek-flash 覆盖）——不内置不等于不能用：
         #  网关通配仍能转发，config.CONTEXT_WINDOWS 里的 haiku 200K 例外因此保留
         models=("claude-opus-5", "claude-sonnet-5"),
         key_envs=("ANTHROPIC_API_KEY",),
@@ -400,7 +397,7 @@ class Registry:
         return None
 
     def _pinned(self, name: str) -> tuple[Provider | None, str]:
-        """显式寻址：`deepseek/deepseek-v4-pro` 强制指定去哪家。
+        """显式寻址：`deepseek/deepseek-flash` 强制指定去哪家。
 
         前缀只有**匹配到已注册 provider 名**才算寻址，否则整串透传——
         网关上真有 `anthropic/claude-x` 这种自带斜杠的模型名，不能误切。
@@ -473,7 +470,7 @@ class Registry:
     def vision_reader(self, name: str) -> Route | None:
         """代读路由：名字解析得出、**且它自己收得下图**，才给；否则 None。
 
-        第二个条件不是多余的——代读模型配错（写成 deepseek-v4-flash 这种不收图的）
+        第二个条件不是多余的——代读模型配错（写成一个不收图的型号）
         的症状是每张图都换来一次 400 或一句"无法确定"，而调用方本来就是在处理
         "看不了图"这条降级路径，再炸一次毫无价值。校验直接复用 sees_images 的
         fail-closed：未声明即不能看图，网关上的视觉模型仍用 XIAOYU_VISION_MODELS 点名。

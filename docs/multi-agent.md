@@ -36,7 +36,7 @@ tools = ["read_file", "grep", "list_files", "write_file", "bash"]
 capability_mode = "read-write"    # 可省：粗粒度档位，与 tools 二选一或叠加
 isolation = "worktree"            # 可省：默认在独立 git worktree 里跑
 mcp = ["github"]                  # 可省：继承父会话的哪些 MCP server
-model = "deepseek-v4-pro"         # 可省：默认随主模型
+model = "deepseek-flash"          # 可省：默认随主模型
 effort = "low"                    # 可省：推理深度，默认随主会话（只读探索给 low 省钱）
 max_iterations = 30               # 可省：默认 20
 inherit = "distilled"             # 可省：none（默认）/ distilled（精简副本）/ fork（完整上下文）
@@ -99,7 +99,7 @@ qixiang(
 douqiao(
   spec="architect",
   task="为 X 模块设计缓存失效策略，给出完整方案与取舍理由",
-  models=["deepseek-v4-pro", "kimi-k3", "claude-sonnet-5"],   # 异构竞争，每模型一席
+  models=["deepseek-flash", "kimi-k3", "claude-sonnet-5"],   # 异构竞争，每模型一席
   criteria="正确性优先；其次是实现复杂度"                       # 可省
 )
 ```

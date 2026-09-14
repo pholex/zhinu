@@ -20,11 +20,11 @@ class BoxBannerTest(unittest.TestCase):
     """宽终端：圆角框分栏。"""
 
     def test_box_has_title_meta_and_panels(self):
-        out = build_banner("deepseek-v4-pro", "/tmp/ws", width=100)
+        out = build_banner("deepseek-flash", "/tmp/ws", width=100)
         self.assertIn("╭─", out)
         self.assertIn("╰", out)
         self.assertIn(f"小羽 · Xiaoyu v{xiaoyu.__version__}", out)
-        self.assertIn("deepseek-v4-pro", out)
+        self.assertIn("deepseek-flash", out)
         self.assertIn("/tmp/ws", out)
         self.assertIn("上手提示", out)
         self.assertIn("/help", out)
@@ -56,12 +56,12 @@ class LegacyTiersTest(unittest.TestCase):
     """中窄终端：逐级降级到块字、单行。"""
 
     def test_medium_terminal_block_art_with_feathers(self):
-        out = build_banner("deepseek-v4-pro", "/tmp/ws", width=_BOX_MIN - 2)
+        out = build_banner("deepseek-flash", "/tmp/ws", width=_BOX_MIN - 2)
         self.assertNotIn("╭", out)
         self.assertIn(_ART[0], out)
         self.assertIn(_FEATHERS[0], out)
         self.assertIn(xiaoyu.__version__, out)
-        self.assertIn("deepseek-v4-pro", out)
+        self.assertIn("deepseek-flash", out)
         self.assertIn("/tmp/ws", out)
         self.assertIn("/help", out)
 

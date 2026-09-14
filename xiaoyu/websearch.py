@@ -1,8 +1,8 @@
 """web_search 工具：借厂商 Responses 接口的内置联网搜索。
 
 为什么做成工具而不是把主循环切到 Responses 协议：
-- deepseek 的 Responses 目前只支持 deepseek-v4-flash（v4-pro 计划中），
-  切协议默认模型当场不可用；
+- 各家 Responses 支持面参差（上一代 deepseek-v4-pro 就没开放），切协议会让
+  部分主模型当场不可用；
 - 内核的消息形态（tool_calls 配对不变量、压缩、网关同名兜底）全是 chat-completions
   形态，同一份历史没法在两种 wire format 之间无缝切换，双 transport 不值；
 - 做成工具后**任何主模型**都能用上联网搜索，且搜索模型独立于主模型选择。
@@ -14,6 +14,9 @@
 （/responses + tools:[{"type":"web_search"}]），差在质量与价格——2026-08 五题
 对比实测：grok-4.5 正确性 5/5、每题都带结构化引用 URL，但单次约 0.65 元；
 deepseek-v4-flash 4/5（时效敏感题失手）、无结构化引用，单次约 0.02 元。
+⚠️ 2026-09-14 换代到 deepseek-flash 后复测 3 题：服务端 web_search 没有真正执行——
+输出里没有搜索调用项，2 题把调用标记（DSML / <tool_use>）当正文吐出，1 题用训练知识
+作答。旧名 v4-flash 官方已落到同一型号，所以不是改名引入的；deepseek 后端待官方修复。
 （xai 侧 2026-08-13 起由 grok-4.5 换成同代升级款 grok-4.6，形态与价位不变。）
 """
 
@@ -38,9 +41,8 @@ class SearchBackend:
 
 
 #  模型选各家里"够用且便宜"的档：搜索是有界辅助任务，不需要旗舰。
-#  ⚠️ deepseek 的 Responses 目前只认 flash——v4-pro 上线后也未必要换。
 SEARCH_BACKENDS: dict[str, SearchBackend] = {
-    "deepseek": SearchBackend("deepseek", "deepseek-v4-flash"),
+    "deepseek": SearchBackend("deepseek", "deepseek-flash"),
     "xai": SearchBackend("xai", "grok-4.6"),
 }
 

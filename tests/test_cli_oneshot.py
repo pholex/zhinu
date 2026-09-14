@@ -42,8 +42,8 @@ class StubAgent:
         self.result = result
         self.exc = exc
         self.usage = Usage()
-        self.usage.add("deepseek-v4-pro", 100, 20)
-        self.config = SimpleNamespace(model="deepseek-v4-pro")
+        self.usage.add("deepseek-flash", 100, 20)
+        self.config = SimpleNamespace(model="deepseek-flash")
         self.session_log = SimpleNamespace(
             path=Path("/tmp/session.jsonl"), event=lambda *a, **k: None
         )
@@ -152,7 +152,7 @@ class RunOnceTest(unittest.TestCase):
         self.assertEqual(len(lines), 1)
         payload = json.loads(lines[0])
         self.assertEqual(payload["result"], "搞定了")
-        self.assertEqual(payload["model"], "deepseek-v4-pro")
+        self.assertEqual(payload["model"], "deepseek-flash")
         self.assertEqual(payload["usage"]["turns"], 1)
         #  Windows 上 str(Path("/tmp/...")) 是反斜杠形态，别写死 POSIX 字面量
         self.assertEqual(payload["session_log"], str(Path("/tmp/session.jsonl")))

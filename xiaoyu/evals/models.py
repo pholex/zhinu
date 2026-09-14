@@ -67,7 +67,7 @@ CANDIDATE_NAMES: list[str] = [candidate.name for candidate in CANDIDATES]
 
 
 def _price_of(model: str, prices: dict[str, dict[str, float]] | None = None) -> dict[str, float] | None:
-    """查单价。带 provider 前缀的全限定名（`deepseek/deepseek-v4-pro`）也要能查到——
+    """查单价。带 provider 前缀的全限定名（`deepseek/deepseek-flash`）也要能查到——
     Usage 的 key 自多 provider 起就是全限定名了，这张表还是按裸名建的。
 
     ⚠️ 这只是「查得到」的容错，不是「算得准」：直连和网关同一个模型单价并不相同，
