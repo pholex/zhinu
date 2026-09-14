@@ -561,8 +561,8 @@ class TestBashAndSafety(ToolboxTestCase):
             result = self.box.run(
                 "bash",
                 {"command": (
-                    "python3 -c \"import sys; w=sys.stdout.write; w('HEAD_MARK\\n');"
-                    " [w('中' * 1000 + '\\n') for _ in range(20000)]; w('TAIL_MARK\\n')\""
+                    "python3 -c \"import sys; w=lambda t: sys.stdout.buffer.write(t.encode()); w('HEAD_MARK\\n');"
+                    " [w('\\u4e2d' * 1000 + '\\n') for _ in range(20000)]; w('TAIL_MARK\\n')\""
                 )},
             )
         self.assertIn("exit_status: 0", result)
