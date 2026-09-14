@@ -562,12 +562,13 @@ def path_of(url: str) -> Path | None:
     return cache_dir() / ref
 
 
-def data_url(url: str) -> str:
+def data_url(url: str) -> str | None:
     """引用 → `data:<mime>;base64,...`。不是本地引用就原样返回
     （宿主直接塞 https:// 或现成 data URL 的情况照旧能用）。
 
-    文件丢了（用户删了缓存目录、换了机器 resume 旧会话）同样原样返回——
-    上游会拒掉这个 URL 并给出可读错误，好过内核在这里抛异常打断整轮。
+    本地引用的缓存文件读不出来（用户删了缓存目录、换了机器 resume 旧会话）
+    返回 None，由 inline 换成文本占位。不能原样发引用：厂商不认 xiaoyu-media://，
+    而这条消息在历史里每轮都会重发——会话从此每一轮都被拒。
     """
     path = path_of(url)
     if path is None:
@@ -575,7 +576,7 @@ def data_url(url: str) -> str:
     try:
         data = path.read_bytes()
     except OSError:
-        return url
+        return None
     mime = _EXT_MIME.get(path.suffix.lstrip("."), "image/png")
     return f"data:{mime};base64,{base64.b64encode(data).decode('ascii')}"
 
@@ -598,7 +599,11 @@ def inline(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
         for part in content:
             if isinstance(part, dict) and part.get("type") == IMAGE_PART:
                 url = (part.get("image_url") or {}).get("url", "")
-                part = {**part, "image_url": {**part["image_url"], "url": data_url(url)}}
+                resolved = data_url(url)
+                if resolved is None:
+                    part = text_part("[图片已不可用：本地缓存文件缺失（缓存被清理，或在别的机器上续接了会话）]")
+                else:
+                    part = {**part, "image_url": {**part["image_url"], "url": resolved}}
             parts.append(part)
         expanded.append({**message, "content": parts})
     return expanded

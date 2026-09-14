@@ -7,6 +7,7 @@ content 的地方都要有用例钉住。
 
 from __future__ import annotations
 
+import json
 import base64
 import os
 import tempfile
@@ -93,8 +94,10 @@ class CacheTest(unittest.TestCase):
         self.assertIsNone(media.path_of(media.SCHEME + "nothex.png"))
 
     def test_missing_file_does_not_raise(self):
+        """缓存文件没了不抛，返回 None 交 inline 换文本占位（不能原样把引用发给厂商）。"""
         ref = media.SCHEME + "0" * 64 + ".png"
-        self.assertEqual(media.data_url(ref), ref)
+        self.assertIsNone(media.data_url(ref))
+        self.assertEqual(media.data_url("https://example.com/a.png"), "https://example.com/a.png")
 
     def test_write_failure_returns_empty(self):
         with mock.patch.object(Path, "mkdir", side_effect=OSError("只读盘")):
@@ -354,6 +357,16 @@ class InlineTest(unittest.TestCase):
         self.assertTrue(url.startswith("data:image/png;base64,"))
         #  历史本身不能被就地改写：内核里存的仍是引用
         self.assertTrue(messages[1]["content"][1]["image_url"]["url"].startswith(media.SCHEME))
+
+    def test_missing_cache_file_becomes_text_placeholder(self):
+        """缓存文件没了：不能把 xiaoyu-media:// 原样发给厂商——每轮都被拒，会话卡死。"""
+        message = parts_message()
+        media.path_of(message["content"][1]["image_url"]["url"]).unlink()
+        out = media.inline([message])
+        part = out[0]["content"][1]
+        self.assertEqual(part["type"], "text")
+        self.assertIn("图片已不可用", part["text"])
+        self.assertNotIn(media.SCHEME, json.dumps(out, ensure_ascii=False))
 
     def test_textonly_history_not_copied(self):
         messages = [{"role": "user", "content": "纯文本"}]

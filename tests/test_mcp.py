@@ -813,6 +813,22 @@ class EndToEndTest(unittest.TestCase):
         for name in names:
             self.assertRegex(name, r"^mcp__[A-Za-z0-9_-]+__[A-Za-z0-9_-]+$")
 
+    def test_repeated_cursor_rejects_tool_list(self):
+        """翻页 cursor 转圈：不能白翻 50 页再被误报成"重名工具"。"""
+        self.script.write_text(
+            self.script.read_text(encoding="utf-8").replace(
+                '"result": {"tools": PAGE2}', '"result": {"tools": PAGE2, "nextCursor": "p2"}'
+            ),
+            encoding="utf-8",
+        )
+        server = mcp.McpServer(mcp.ServerSpec(name="loop", command=sys.executable, args=[str(self.script)], timeout=15.0),
+                                log_path=Path(self.tmp.name) / "loop.log")
+        self.addCleanup(server.close)
+        with self.assertRaises(mcp.McpError) as ctx:
+            server.bootstrap()
+        self.assertIn("cursor", str(ctx.exception))
+        self.assertNotIn("重复列出同名工具", str(ctx.exception))
+
     def test_call_roundtrip(self):
         manager = self.make_manager()
         out = self.tool(manager, "__echo").handler(text="你好")

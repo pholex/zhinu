@@ -128,7 +128,7 @@ douqiao(
 2. **chenshu_spawn** 逐个起成员：worker 绑 mission（build 自动创建
    `feat/<slug>` 分支 + 独立 worktree），reviewer 绑评审目标。把依赖已
    解锁的 mission 一口气发满（上限 `XIAOYU_CHENSHU_MAX_WORKERS`，默认 4）。
-3. **chenshu_wait** 阻塞等成员事件（完成/失败，最长 600s）——不轮询。
+3. **chenshu_wait** 阻塞等成员事件（成员发给总枢的来信、完成/失败，按发生顺序，最长 600s）——不轮询。
 4. 评审过闸后 **chenshu_merge** 收回主干。
 5. 全部合并后 **chenshu_teardown** 收枢（干净 worktree 删除，审计轨迹
    永久保留在 `.xiaoyu/chenshu/`）。

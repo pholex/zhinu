@@ -469,6 +469,11 @@ class ChenshuRuntime:
             encoding="utf-8",
         )
         self.log(sender, "inbox.send", to=to, subject=subject)
+        #  发给总枢（含广播）的信同时按发送顺序进事件流：成员线程先 send、收工事件
+        #  在其 finally 里才入队，同一个 FIFO 保证 chenshu_wait 先见来信后见完成——
+        #  否则总枢可能没读到中途发现就去 merge。总枢自己发的不回灌
+        if sender != CHENSHU and to in (CHENSHU, BROADCAST):
+            self.events.put(f"{sender} 来信 → {to} · {subject}\n{ui.preview(body, 400)}")
         return f"已发给 {to}：{subject}"
 
     def read_inbox(self, caller: str, limit: int = _INBOX_LIMIT) -> str:

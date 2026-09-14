@@ -957,6 +957,7 @@ class McpServer:
     def _list_tools(self) -> list[dict[str, Any]]:
         tools: list[dict[str, Any]] = []
         cursor: str | None = None
+        seen: set[str] = set()
         #  分页有界循环：行为不端的 server 无限翻页也拖不死我们
         for _ in range(50):
             params: dict[str, Any] = {"cursor": cursor} if cursor else {}
@@ -968,6 +969,13 @@ class McpServer:
             #  必须是非空字符串才翻下一页：挡住乱返回的 server
             if not isinstance(cursor, str) or not cursor:
                 break
+            #  cursor 转圈：再翻只会把同一批工具重拼一遍，50 页后在重名校验上误报成
+            #  "重复列出同名工具"——当场判列表非法，把真实原因说清楚
+            if cursor in seen:
+                raise McpError(
+                    f"server 在 tools/list 翻页时重复返回同一个 cursor（{cursor[:40]!r}），工具列表判非法"
+                )
+            seen.add(cursor)
         return tools
 
     def call_tool(self, tool: str, args: dict[str, Any]) -> str:

@@ -191,6 +191,34 @@ class KnobTestCase(AgentTestCase):
         )
 
 
+class FailureReportTest(KnobTestCase):
+    SPEC = AgentSpec(name="reader", description="d", system_prompt="工作区 {workspace}", tools=("read_file",))
+
+    def test_failure_keeps_partial_answer_and_bounds_diagnostic(self):
+        script = [
+            [
+                chunk(content="已查明：add 定义在 calc.py"),
+                chunk(tool_calls=[call_fragment(0, "c1", "read_file", '{"path": "calc.py"}')]),
+            ],
+            RuntimeError("炸" * 5000),
+        ]
+        tool = self.make_tool(self.SPEC, script)
+        with contextlib.redirect_stdout(io.StringIO()):
+            result = tool.handler(task="查 add 在哪")
+        self.assertTrue(result.startswith("ERROR"), result)
+        self.assertIn("已查明：add 定义在 calc.py", result)
+        self.assertIn("部分结论", result)
+        self.assertLess(result.count("炸"), 1500)
+        self.assertIn("resume_from:", result)
+
+    def test_failure_without_output_has_no_partial_section(self):
+        tool = self.make_tool(self.SPEC, [RuntimeError("模型炸了")])
+        with contextlib.redirect_stdout(io.StringIO()):
+            result = tool.handler(task="查")
+        self.assertIn("模型炸了", result)
+        self.assertNotIn("部分结论", result)
+
+
 class CapabilityRuntimeTest(KnobTestCase):
     SPEC = AgentSpec(
         name="coder", description="d", system_prompt="工作区 {workspace}",

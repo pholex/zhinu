@@ -138,6 +138,10 @@ class _RateLimiter:
             and time.monotonic() - self.suppressing_since > _AUTO_KILL_SECONDS
         )
 
+#  一个会话同时在跑的后台任务（含 monitor）上限。终止中的也占名额，进程真正
+#  退出才释放——否则"kill 完立刻再起"能绕过上限，残留进程照样堆积
+MAX_RUNNING_TASKS = 10
+
 
 class TaskManager:
     """一个会话的后台任务表。notify 由 Agent 注入（见 agent.__init__）。
@@ -175,6 +179,13 @@ class TaskManager:
     ) -> "BackgroundTask | str":
         """拉起后台进程。成功返回任务；失败返回错误文本（交给模型自愈）。"""
         with self._lock:
+            running = [task for task in self._tasks.values() if not task.done.is_set()]
+            if len(running) >= MAX_RUNNING_TASKS:
+                listed = "；".join(f"{task.task_id}（{task.description}）" for task in running)
+                return (
+                    f"ERROR: 本会话已有 {len(running)} 个后台任务在跑（上限 {MAX_RUNNING_TASKS}，"
+                    f"终止中的也算）：{listed}。先用 kill_task 结束不再需要的，再起新的。"
+                )
             self._counter += 1
             task_id = f"task-{self._counter}"
             if not self._atexit_registered:
