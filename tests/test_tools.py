@@ -599,6 +599,13 @@ class TestBashAndSafety(ToolboxTestCase):
             time_module.sleep(0.05)
         self.fail("命令没在时限内写出孙进程 pid")
 
+    def _without_sandbox(self) -> None:
+        """收割用例要关沙箱：Linux 沙箱（bwrap --unshare-pid）里 `$!` 是 PID 命名空间
+        内的编号，拿到宿主上判活会撞上无关的常驻进程、永远"还活着"。这里验的是前台
+        收割本身；沙箱内整树随 bwrap 退出由 --die-with-parent / PID 命名空间兜底。"""
+        self.config.sandbox = False
+        self.box = Toolbox(self.config)
+
     @unittest.skipIf(os.name == "nt", "POSIX 专属：进程组语义")
     def test_bash_system_exit_kills_process_tree(self) -> None:
         """SIGTERM 在等待期间以 SystemExit 抛出时，前台命令树必须被收割。
@@ -608,6 +615,7 @@ class TestBashAndSafety(ToolboxTestCase):
         """
         from xiaoyu import tools as tools_module
 
+        self._without_sandbox()
         grandchild: list[int] = []
 
         def raise_system_exit(proc, pipes, deadline):  # noqa: ANN001
@@ -627,6 +635,7 @@ class TestBashAndSafety(ToolboxTestCase):
 
         from xiaoyu import tools as tools_module
 
+        self._without_sandbox()
         results: list[str] = []
         worker = threading.Thread(
             target=lambda: results.append(self.box.run(
