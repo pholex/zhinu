@@ -938,6 +938,9 @@ class Agent:
         self._logged_baseline: dict[str, Any] | None = None
         #  发请求时的消息条数，usage 到达时用来落锚
         self._request_len = 0
+        #  上一次真出了回复的路由 (provider, model)：下一次请求换了路由就给新模型补一句
+        #  交代（见 _route_switch_note）。None = 本进程还没出过回复
+        self._last_route: tuple[str, str] | None = None
         self.compactor = Compactor(
             context_limit=config.context_limit,
             compact_at=config.compact_at,
@@ -3258,6 +3261,22 @@ class Agent:
                 delay *= 2
         raise RuntimeError("unreachable")  # for 循环里必然 return 或 raise
 
+    def _route_switch_note(self, route: Route) -> str:
+        """这次请求的路由与上一次出回复的不同 → 给新模型的交代；相同返回空串。
+
+        换模型后新模型读到的 assistant 历史全是前任说的，不交代它就会把前任的自述
+        （"当前模型看不了图"、"我已经改过 X"）当成关于自己的事实。/model、ACP 切换、
+        降级链、回探切回都走请求这一个口子，所以在这里比而不是在各个切换点上发。
+        同家只写型号，跨家写 provider/model。
+        """
+        last = self._last_route
+        if last is None or last == (route.provider, route.model):
+            return ""
+        same = last[0] == route.provider
+        old = last[1] if same else f"{last[0]}/{last[1]}"
+        new = route.model if same else route.qualified
+        return f"[系统提示] 模型已切换：以上 assistant 回复由 {old} 生成，从这里起由 {new} 接续。"
+
     def _stream_once(self, route: Route, with_tools: bool = True) -> dict[str, Any]:
         """流式跑一次模型调用，边打印边攒出完整的 assistant message。
 
@@ -3266,11 +3285,22 @@ class Agent:
         #  发请求前惰性修复历史不变量：
         #  中断路径不需要记得做清理，任何来路的悬空/孤儿都在这里兜住。
         self._repair_history()
-        self._request_len = len(self.messages)
+        #  换路由的交代先只随这次请求发出，**真出了内容才入历史**（settle）：失败的
+        #  请求不留痕，回探首选失败也不会在历史里留一句"已切到首选"的假话
+        switch_note = self._route_switch_note(route)
+        outgoing = self.messages
+        if switch_note:
+            outgoing = [*self.messages, {"role": "user", "content": switch_note, OPERATOR_KEY: True}]
+        self._request_len = len(outgoing)
+
+        def settle() -> None:
+            if switch_note:
+                self._record_operator(switch_note)
+            self._last_route = (route.provider, route.model)
 
         request: dict[str, Any] = {
             "model": route.model,
-            "messages": self.messages,
+            "messages": outgoing,
             "stream": True,
             "stream_options": {"include_usage": True},
         }
@@ -3318,6 +3348,7 @@ class Agent:
             #  拼了一半的 tool_calls 直接丢弃（arguments 多半是残缺 JSON，留着
             #  只会害下一轮）。两条触发路径共用这一段，见 Interrupted 的注释。
             if content_parts:
+                settle()
                 self._record(
                     {
                         "role": "assistant",
@@ -3361,6 +3392,9 @@ class Agent:
             text = f"{text}\n{marker}" if text else marker
             self.sink.emit(Notice(marker + ("——发「继续」可接着写" if not pending else ""), "warn"))
 
+        if text or pending:
+            #  空补全不算出了回复：它会被原地重发，交代留给真出内容的那次
+            settle()
         message: dict[str, Any] = {
             "role": "assistant",
             "content": text or None,
