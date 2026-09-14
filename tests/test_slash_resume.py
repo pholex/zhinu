@@ -114,6 +114,7 @@ class TestSlashResume(SlashResumeTestCase):
     def test_current_session_file_is_excluded(self) -> None:
         self.make_session("20260809-100000-1", preview="别的会话")
         current = SessionLog.create("m", str(self.root))
+        self.addCleanup(current.release)  # Windows 上持有的锁文件挡住临时目录清理
         agent = self.build([], sink=RecordingSink(), session_log=current)
 
         seen: list[list] = []
