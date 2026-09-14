@@ -19,6 +19,7 @@ import locale
 import os
 import re
 import shutil
+import unicodedata
 import subprocess
 import sys
 import tempfile
@@ -61,6 +62,55 @@ _HARDLINE_RULES: tuple[tuple[re.Pattern[str], str], ...] = tuple(
         ),
     ]
 )
+
+
+UNTRUSTED_TAG = "untrusted_content"
+#  在 NFKC 折叠 + 小写之后匹配：全角 ＜ｕｎｔｒｕｓｔｅｄ… 这类形近字符伪造的
+#  开闭标记同样认得出来
+_UNTRUSTED_MARKER = re.compile(rf"<\s*/?\s*{UNTRUSTED_TAG}")
+SANITIZED_MARKER = "[[标记已消毒]]"
+
+
+def neutralize_untrusted_markers(text: str) -> str:
+    """把外部内容里伪造的 <untrusted_content> 开闭标记替换掉。
+
+    不处理的话，网页/MCP 结果里写一行 </untrusted_content> 就能"提前闭合"包裹，
+    让后面的文字看起来像包裹之外的可信内容。逐字符折叠并记下原位置，命中后
+    在原文上替换——折叠会改变长度，不能直接在折叠串上切。
+    """
+    folded: list[str] = []
+    origin: list[int] = []
+    for index, char in enumerate(text):
+        piece = unicodedata.normalize("NFKC", char).lower()
+        folded.append(piece)
+        origin.extend([index] * len(piece))
+    flat = "".join(folded)
+    spans = [
+        (origin[match.start()], origin[match.end() - 1] + 1)
+        for match in _UNTRUSTED_MARKER.finditer(flat)
+    ]
+    if not spans:
+        return text
+    parts: list[str] = []
+    cursor = 0
+    for start, end in spans:
+        if start < cursor:
+            continue
+        parts.append(text[cursor:start])
+        parts.append(SANITIZED_MARKER)
+        cursor = end
+    parts.append(text[cursor:])
+    return "".join(parts)
+
+
+def wrap_untrusted(source: str, text: str) -> str:
+    """外部来源的工具结果 → 带来源的不可信包裹（系统提示里约定了它的含义）。"""
+    label = re.sub(r"[^\w.:/@-]", "_", source)[:120] or "external"
+    return (
+        f'<{UNTRUSTED_TAG} source="{label}">\n'
+        f"{neutralize_untrusted_markers(text)}\n"
+        f"</{UNTRUSTED_TAG}>"
+    )
 
 
 def hardline_violation(command: str) -> str | None:
@@ -364,6 +414,9 @@ class Tool:
     #  可用性探测：返回 False 时不进 schemas、拒绝执行。
     #  每次组装 schemas 都会调用，必须是廉价检查（which / 路径存在 / 列表非空）。
     check_fn: Callable[[], bool] | None = None
+    #  结果来自外部（MCP server、网页、联网搜索）：回灌模型前由 agent 包进
+    #  <untrusted_content>，其中的指令只当数据（见 wrap_untrusted）
+    untrusted: bool = False
 
     def available(self) -> bool:
         if self.check_fn is None:
@@ -864,6 +917,7 @@ class Toolbox:
                     requires_approval=True,
                     #  server 进程退出后工具自动从 schemas 消失、拒绝执行
                     check_fn=remote.check_fn,
+                    untrusted=True,
                 )
             )
 
@@ -1336,6 +1390,7 @@ class Toolbox:
                     "required": ["action"],
                 },
                 handler=self._browser,
+                untrusted=True,
                 requires_approval=True,
                 #  lambda 晚绑定而非直接引用：测试/运行期 monkeypatch
                 #  browser.available 时门控要跟着变。enable_browser 也进门控：
