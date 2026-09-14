@@ -299,6 +299,77 @@ class RecoveryLoopTest(AgentTestCase):
         self.assertEqual(agent.last_assistant_text(), "ok")
 
 
+def switch_notices(agent):
+    return [m for m in agent.messages if "模型已切换" in str(m.get("content"))]
+
+
+class ModelSwitchNoticeTest(AgentTestCase):
+    """换了模型要告诉新模型：以上 assistant 回复不是它说的——否则它会把前任的
+    自述（"当前模型看不了图"之类）当成关于自己的事实。"""
+
+    def test_notice_rides_the_first_request_after_switch(self):
+        agent = self.build([
+            [chunk(content="甲"), usage_chunk(10, 1)],
+            [chunk(content="乙"), usage_chunk(10, 1)],
+            [chunk(content="丙"), usage_chunk(10, 1)],
+        ])
+        with contextlib.redirect_stdout(io.StringIO()):
+            agent.send("一")
+            agent.switch_model("other-model")
+            agent.send("二")
+            agent.send("三")
+        notices = switch_notices(agent)
+        self.assertEqual(len(notices), 1)
+        text = notices[0]["content"]
+        self.assertIn("main-model", text)
+        self.assertIn("other-model", text)
+        #  同一家：只写型号，不写 provider 前缀
+        self.assertNotIn("/", text)
+        #  发给新模型的那次请求里就带着（不是下一次才补）
+        self.assertIn("模型已切换", str(self.client.completions.calls[1]["messages"][-1]["content"]))
+        #  落在第二轮回复之前；注入不算真用户原话
+        position = agent.messages.index(notices[0])
+        self.assertEqual(agent.messages[position + 1]["content"], "乙")
+        self.assertEqual(agent.last_user_text(), "三")
+
+    def test_failed_request_leaves_no_notice(self):
+        agent = self.build([
+            [chunk(content="甲"), usage_chunk(10, 1)],
+            ValueError("boom"),
+            [chunk(content="乙"), usage_chunk(10, 1)],
+        ])
+        with contextlib.redirect_stdout(io.StringIO()):
+            agent.send("一")
+            agent.switch_model("other-model")
+            with self.assertRaises(ValueError):
+                agent.send("二")
+            self.assertEqual(switch_notices(agent), [])
+            agent.send("三")
+        self.assertEqual(len(switch_notices(agent)), 1)
+
+    def test_fallback_switch_is_announced(self):
+        self.config.fallback_models = ["backup-model"]
+        agent = self.build([
+            [chunk(content="主模型答"), usage_chunk(10, 1)],
+            rate_limit_error(),
+            rate_limit_error(),
+            rate_limit_error(),
+            [chunk(content="备用模型顶上"), usage_chunk(10, 1)],
+        ])
+        with mock.patch("xiaoyu.agent.time.sleep"), contextlib.redirect_stdout(io.StringIO()):
+            agent.send("一")
+            agent.send("二")
+        notices = switch_notices(agent)
+        self.assertEqual(len(notices), 1)
+        self.assertIn("backup-model", notices[0]["content"])
+
+    def test_first_request_has_no_notice(self):
+        agent = self.build([[chunk(content="甲"), usage_chunk(10, 1)]])
+        with contextlib.redirect_stdout(io.StringIO()):
+            agent.send("一")
+        self.assertEqual(switch_notices(agent), [])
+
+
 class FallbackChainTest(AgentTestCase):
     """备用模型降级链：retry 内层耗尽后外层切模型，同一份会话原样继续。"""
 

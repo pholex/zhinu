@@ -61,6 +61,8 @@ class ValueSection:
     describe: Callable[[Any], str]
     #  恢复会话时要不要在"当前环境"全量块里复述（窗口编号这种一次性信息不必）
     describe_when_unknown: bool = True
+    #  会话内值变了要不要播报。关掉 = 变更由别处负责交代（见模型节），这里只管全量块
+    describe_changes: bool = True
 
     def snapshot(self, agent: "Agent") -> Snapshot:
         return {"value": self.read(agent)}
@@ -68,7 +70,7 @@ class ValueSection:
     def render(self, previous: Snapshot | None, current: Snapshot) -> str | None:
         if previous is None:
             return self.describe(current["value"]) if self.describe_when_unknown else None
-        if previous.get("value") == current["value"]:
+        if previous.get("value") == current["value"] or not self.describe_changes:
             return None
         return self.describe(current["value"])
 
@@ -148,7 +150,15 @@ def default_sections() -> list[Section]:
         return f"当前档位：{modes.label(name)}" + ("" if ready else "（沙箱不可用）")
 
     return [
-        ValueSection("model", lambda a: a.config.model, lambda v: f"当前模型：{v}"),
+        #  会话内换模型由请求层交代（Agent._route_switch_note）：它在真正发请求的
+        #  那一刻比对"上一次出回复的路由"，降级链中途换、回探切回、请求失败都算得对，
+        #  还能说清"以上回复是谁说的"。这里再播一句"当前模型"只是同一件事说两遍
+        ValueSection(
+            "model",
+            lambda a: a.config.model,
+            lambda v: f"当前模型：{v}",
+            describe_changes=False,
+        ),
         ValueSection(
             "mode",
             lambda a: [a.mode, bool(a.sandbox_ready())],

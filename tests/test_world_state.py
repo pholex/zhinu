@@ -36,16 +36,27 @@ class WorldStateTest(AgentTestCase):
             agent.send("二")
         self.assertEqual(notes(agent), [])
 
-    def test_model_switch_reports_only_model(self) -> None:
+    def test_model_switch_left_to_request_layer(self) -> None:
+        """会话内换模型不走环境播报（请求层的切换交代负责），一次切换只说一遍。"""
         agent = self.build([text_turn(), text_turn()])
         with contextlib.redirect_stdout(io.StringIO()):
             agent.send("一")
             agent.switch_model("other-model")
             agent.send("二")
+        self.assertEqual(notes(agent), [])
+        switched = [m["content"] for m in agent.messages if "模型已切换" in str(m.get("content"))]
+        self.assertEqual(len(switched), 1)
+
+    def test_mode_change_reports_only_mode(self) -> None:
+        agent = self.build([text_turn(), text_turn()])
+        with contextlib.redirect_stdout(io.StringIO()):
+            agent.send("一")
+            agent.set_mode(modes.AUTO)
+            agent.send("二")
         found = notes(agent)
         self.assertEqual(len(found), 1)
-        self.assertIn("当前模型：other-model", found[0])
-        self.assertNotIn("档位", found[0])
+        self.assertIn("档位", found[0])
+        self.assertNotIn("当前模型", found[0])
         self.assertNotIn("工作目录", found[0])
         #  播报排在本轮用户输入之后、模型回复之前
         roles = [m["role"] for m in agent.messages]
@@ -56,13 +67,13 @@ class WorldStateTest(AgentTestCase):
         agent = self.build([text_turn(), text_turn()])
         with contextlib.redirect_stdout(io.StringIO()):
             agent.send("一")
-            agent.switch_model("other-model")
             agent.set_mode(modes.AUTO)
+            agent.config.workspace = agent.config.workspace / "sub"
             agent.send("二")
         found = notes(agent)
         self.assertEqual(len(found), 1)
-        self.assertIn("当前模型：other-model", found[0])
         self.assertIn("档位", found[0])
+        self.assertIn("工作目录", found[0])
 
     def test_unknown_baseline_reports_full_block_once(self) -> None:
         agent = self.build([text_turn(), text_turn()])
@@ -82,6 +93,8 @@ class WorldStateTest(AgentTestCase):
         agent = self.build([text_turn(), text_turn()])
         with contextlib.redirect_stdout(io.StringIO()):
             agent.send("一")
+            agent.set_mode(modes.AUTO)
+            #  切换交代同为 harness 注入：数轮次 / 蒸馏一样要跳过
             agent.switch_model("other-model")
             agent.send("二")
         note = notes(agent)[0]
@@ -90,6 +103,7 @@ class WorldStateTest(AgentTestCase):
         self.assertEqual([agent.messages[i]["content"] for i in starts], ["一", "二"])
         distilled = distill_history(agent.messages, max_tokens=10_000, synthetic_texts=frozenset())
         self.assertFalse(any(world_state.is_world_state_note(m["content"]) for m in distilled))
+        self.assertFalse(any("模型已切换" in str(m["content"]) for m in distilled))
 
     def test_baseline_logged_and_restored(self) -> None:
         log = RecordingLog()
