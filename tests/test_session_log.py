@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+import gc
 import json
 import os
+import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -11,15 +14,20 @@ from unittest import mock
 
 from xiaoyu.session_log import (
     SESSION_FORMAT,
+    LoadedMessages,
+    SessionLockedError,
     SessionLog,
     check_session_id,
     has_orphan_compact,
     list_sessions,
     load_messages,
+    lock_path,
     open_named,
     sessions_dir,
     usage_digest,
 )
+
+ROOT = Path(__file__).resolve().parents[1]
 
 
 class SessionDirTestCase(unittest.TestCase):
@@ -93,9 +101,12 @@ class SessionLogTest(SessionDirTestCase):
 
     def test_write_failure_never_raises(self):
         """磁盘问题只停写，不影响会话。"""
-        log = SessionLog(Path(self.tmp.name))  # 路径是目录 → open 必失败
+        target = Path(self.tmp.name) / "a-directory"
+        target.mkdir()
+        log = SessionLog(target)  # 路径是目录 → open 必失败
         log.append({"role": "user", "content": "x"})  # 不抛即通过
         self.assertTrue(log._broken)
+        SessionLog(target)  # 停写即放锁：写不进去的句柄没理由占着会话
         log.append({"role": "user", "content": "y"})  # 停写后继续调用也安全
 
     def test_close_writes_exit_event_once(self):
@@ -331,6 +342,8 @@ class ResumeTest(SessionDirTestCase):
             handle.write('{"role": "assistant", "cont')  # 写到一半断了
         messages = load_messages(log.path)
         self.assertEqual(len(messages), 1)
+        #  尾部半行是崩溃的正常形态：静默，不计入损坏
+        self.assertEqual(messages.corrupt_lines, [])
 
     def test_list_sessions_reads_head_only(self):
         log_a = SessionLog.create("model-a", "/ws/a")
@@ -393,6 +406,8 @@ class NamedSessionTest(SessionDirTestCase):
         first, _ = open_named("nightly", "m", "/ws")
         first.append({"role": "user", "content": "第一步"})
         first.append({"role": "assistant", "content": "好"})
+        #  真实场景里第二次调用是另一个进程，前一个已退出（写锁随之释放）
+        first.close()
 
         second, messages = open_named("nightly", "m", "/ws")
         self.assertEqual(second.path, first.path)
@@ -400,9 +415,10 @@ class NamedSessionTest(SessionDirTestCase):
         #  续写点留痕，且**没有**把历史再抄一遍
         kinds = [line.get("event") for line in self.read_lines(second)]
         self.assertEqual(kinds.count("reopened"), 1)
-        self.assertEqual(len(self.read_lines(second)), 4)  # meta + 2 条消息 + reopened
+        self.assertEqual(len(self.read_lines(second)), 5)  # meta + 2 条消息 + exit + reopened
 
         second.append({"role": "user", "content": "第二步"})
+        second.close()
         _, again = open_named("nightly", "m", "/ws")
         self.assertEqual([m["content"] for m in again], ["第一步", "好", "第二步"])
 
@@ -445,6 +461,260 @@ class NamedSessionTest(SessionDirTestCase):
         for good in ("nightly", "build-42", "ci_run.1", "A-Z_0.9"):
             self.assertEqual(check_session_id(good), good)
         self.assertEqual(check_session_id("  padded  "), "padded")
+
+
+#  子进程持锁脚本：拿到锁报一声，然后等 stdin（主进程决定它什么时候死）
+_HOLDER_SCRIPT = (
+    "import sys\n"
+    "from pathlib import Path\n"
+    "from xiaoyu.session_log import SessionLog\n"
+    "log = SessionLog(Path(sys.argv[1]))\n"
+    "print('locked', flush=True)\n"
+    "sys.stdin.readline()\n"
+)
+
+
+class SessionLockTest(SessionDirTestCase):
+    """跨进程写锁：同一会话文件同一时刻只允许一个写句柄。
+
+    锁在旁车锁文件上（内核锁，进程死亡自动释放），日志本身不上锁——读的一方不受影响。
+    """
+
+    def test_second_writer_in_same_process_is_refused(self):
+        """flock 按 open file description 算，同进程再开一次也抢不到——
+        ACP 同进程 session/load 必须先让出旧句柄的锁就是这个原因。"""
+        first = SessionLog.create("m", "/ws", session_id="nightly")
+        with self.assertRaises(SessionLockedError) as ctx:
+            SessionLog(first.path)
+        self.assertEqual(ctx.exception.pid, os.getpid())
+        self.assertIn("nightly", str(ctx.exception))
+        self.assertIn(str(os.getpid()), str(ctx.exception))
+        #  读不受影响
+        self.assertEqual(load_messages(first.path), [])
+
+    def test_close_releases_lock_and_keeps_lock_file(self):
+        first = SessionLog.create("m", "/ws")
+        first.append({"role": "user", "content": "任务"})
+        first.close()
+        #  锁文件留着（删了再建有 inode 竞态），且不会被当成会话列出来
+        self.assertTrue(lock_path(first.path).is_file())
+        self.assertEqual(len(list_sessions()), 1)
+        second = SessionLog(first.path)
+        second.append({"role": "assistant", "content": "好"})
+        self.assertEqual([m["content"] for m in load_messages(first.path)], ["任务", "好"])
+
+    def test_writes_after_close_are_dropped(self):
+        """close 放掉锁之后别的进程随时可能接手，迟到的写入不能再落进去——
+        也顺带守住"exit 事件是最后一条"的判据。"""
+        log = SessionLog.create("m", "/ws")
+        log.close()
+        log.append({"role": "user", "content": "迟到"})
+        kinds = [line.get("event") or line.get("role") for line in self.read_lines(log)]
+        self.assertEqual(kinds, ["meta", "exit"])
+
+    def test_release_then_acquire_again(self):
+        """release 不写 exit，只让出锁（ACP 同进程重载用）；acquire 重新拿回。"""
+        log = SessionLog.create("m", "/ws")
+        log.release()
+        other = SessionLog(log.path)
+        with self.assertRaises(SessionLockedError):
+            log.acquire()
+        other.release()
+        log.acquire()
+        log.append({"role": "user", "content": "接着写"})
+        kinds = [line.get("event") or line.get("role") for line in self.read_lines(log)]
+        self.assertEqual(kinds, ["meta", "user"])
+
+    def test_dropped_handle_releases_lock(self):
+        """没人 close 的句柄（装配中途失败被丢掉的）被回收时也要放锁，不能把会话锁死到进程退出。"""
+        path = SessionLog.create("m", "/ws").path
+        gc.collect()
+        SessionLog(path)  # 不抛即通过
+
+    def test_other_process_blocks_until_it_dies(self):
+        path = SessionLog.create("m", "/ws").path
+        gc.collect()
+        env = {**os.environ, "PYTHONPATH": str(ROOT)}
+        proc = subprocess.Popen(
+            [sys.executable, "-c", _HOLDER_SCRIPT, str(path)],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            text=True,
+            encoding="utf-8",
+            env=env,
+            cwd=str(ROOT),
+        )
+        try:
+            self.assertEqual(proc.stdout.readline().strip(), "locked")
+            with self.assertRaises(SessionLockedError) as ctx:
+                SessionLog(path)
+            self.assertEqual(ctx.exception.pid, proc.pid)
+            self.assertIn("另一个进程", str(ctx.exception))
+        finally:
+            #  kill 而不是让它正常退出：锁的释放不能依赖进程收尾代码
+            proc.kill()
+            proc.wait(timeout=15)
+            proc.stdin.close()
+            proc.stdout.close()
+        SessionLog(path)  # 进程一死内核就放锁
+
+    def test_open_named_refuses_locked_session_without_leaking(self):
+        first, _ = open_named("nightly", "m", "/ws")
+        first.append({"role": "user", "content": "第一步"})
+        with self.assertRaises(SessionLockedError):
+            open_named("nightly", "m", "/ws")
+        first.close()
+        second, messages = open_named("nightly", "m", "/ws")
+        self.assertEqual([m["content"] for m in messages], ["第一步"])
+        #  失败那次没留下半截痕迹：只有第二次成功的续写点
+        kinds = [line.get("event") for line in self.read_lines(second)]
+        self.assertEqual(kinds.count("reopened"), 1)
+
+    def test_torn_tail_is_sealed_on_reopen(self):
+        """崩溃留下的半行没有换行符：续写前不补一个换行，下一条记录会粘在半行后面一起坏掉。"""
+        first, _ = open_named("nightly", "m", "/ws")
+        first.append({"role": "user", "content": "第一步"})
+        first.release()  # 模拟进程死掉：不写 exit
+        with first.path.open("a", encoding="utf-8") as handle:
+            handle.write('{"role": "assistant", "cont')
+        second, messages = open_named("nightly", "m", "/ws")
+        self.assertEqual([m["content"] for m in messages], ["第一步"])
+        self.assertEqual(messages.corrupt_lines, [])
+        second.append({"role": "assistant", "content": "续上了"})
+        again = load_messages(second.path)
+        self.assertEqual([m["content"] for m in again], ["第一步", "续上了"])
+        #  崩溃半行是已知的尾巴，续写之后也不算中段损坏
+        self.assertEqual(again.corrupt_lines, [])
+
+
+class _FakeMsvcrt:
+    """msvcrt.locking 的替身：按 (dev, inode) 记谁锁了第 0 字节，语义照 Windows（被占即 OSError）。"""
+
+    LK_UNLCK = 0
+    LK_NBLCK = 2
+
+    def __init__(self) -> None:
+        self.held: dict[tuple[int, int], int] = {}
+        self.calls: list[tuple[int, int, int]] = []
+
+    def locking(self, fd: int, mode: int, nbytes: int) -> None:
+        self.calls.append((mode, nbytes, os.lseek(fd, 0, os.SEEK_CUR)))
+        stat = os.fstat(fd)
+        key = (stat.st_dev, stat.st_ino)
+        if mode == self.LK_NBLCK:
+            if key in self.held:
+                raise OSError(13, "Permission denied")
+            self.held[key] = fd
+        elif mode == self.LK_UNLCK:
+            if self.held.get(key) != fd:
+                raise OSError(13, "Permission denied")
+            del self.held[key]
+
+
+class WindowsLockBranchTest(SessionDirTestCase):
+    """Windows 分支（msvcrt.locking 锁锁文件第 0 字节）在本机用替身跑一遍逻辑。"""
+
+    def setUp(self):
+        super().setUp()
+        from xiaoyu import session_log as session_log_module
+
+        self.fake = _FakeMsvcrt()
+        for patcher in (
+            mock.patch.object(session_log_module, "_WINDOWS", True),
+            mock.patch.dict(sys.modules, {"msvcrt": self.fake}),
+        ):
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        if os.name != "nt":
+            import fcntl
+
+            patcher = mock.patch.object(fcntl, "flock", side_effect=AssertionError("Windows 分支不该碰 flock"))
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def test_mutual_exclusion_release_and_reopen(self):
+        first = SessionLog.create("m", "/ws", session_id="nightly")
+        with self.assertRaises(SessionLockedError) as ctx:
+            SessionLog(first.path)
+        #  pid 写在第 1 字节之后：第 0 字节被锁着，别的进程在 Windows 上读不了它
+        self.assertEqual(ctx.exception.pid, os.getpid())
+        first.close()
+        second = SessionLog(first.path)
+        second.close()
+        self.assertTrue(self.fake.calls)
+        for mode, nbytes, offset in self.fake.calls:
+            self.assertEqual((nbytes, offset), (1, 0))
+        modes = [mode for mode, _, _ in self.fake.calls]
+        #  抢(成) 抢(败) 放 抢(成) 放
+        self.assertEqual(
+            modes,
+            [_FakeMsvcrt.LK_NBLCK, _FakeMsvcrt.LK_NBLCK, _FakeMsvcrt.LK_UNLCK,
+             _FakeMsvcrt.LK_NBLCK, _FakeMsvcrt.LK_UNLCK],
+        )
+        self.assertEqual(self.fake.held, {})
+
+
+class CorruptLineTest(SessionDirTestCase):
+    """读回坏行：只有最后一行（崩溃留下的半行）静默跳过，中段坏行要计数、让用户看见。"""
+
+    def raw(self, log: SessionLog, text: str) -> None:
+        with log.path.open("a", encoding="utf-8") as handle:
+            handle.write(text)
+
+    def test_mid_file_bad_lines_are_counted(self):
+        log = SessionLog.create("m", "/ws")
+        log.append({"role": "user", "content": "任务"})
+        self.raw(log, '{"role": "assistant", "tool_ca\n')  # 交错写坏的一行
+        self.raw(log, "42\n")  # 能解析但不是记录，同样算坏
+        log.append({"role": "assistant", "content": "好"})
+        messages = load_messages(log.path)
+        self.assertIsInstance(messages, list)
+        self.assertEqual([m["content"] for m in messages], ["任务", "好"])
+        self.assertEqual(messages.corrupt_lines, [3, 4])
+
+    def test_bad_line_before_replacement_is_not_reported(self):
+        """compact/clear 之后历史整体重建，之前的坏行不影响接回的内容，不必惊动用户。"""
+        log = SessionLog.create("m", "/ws")
+        self.raw(log, "{broken\n")
+        log.event("clear")
+        log.append({"role": "user", "content": "新任务"})
+        self.assertEqual(load_messages(log.path).corrupt_lines, [])
+
+    def test_restore_surfaces_corruption_as_notice(self):
+        from xiaoyu.agent import Agent
+        from xiaoyu.config import Config
+        from xiaoyu.events import Notice
+        from xiaoyu.providers import Registry
+
+        log = SessionLog.create("m", "/ws")
+        log.append({"role": "user", "content": "任务"})
+        self.raw(log, "{broken\n")
+        log.append({"role": "assistant", "content": "好"})
+        log.close()
+
+        class ListSink:
+            def __init__(self) -> None:
+                self.events: list = []
+
+            def emit(self, event) -> None:
+                self.events.append(event)
+
+        config = Config(base_url="http://unused", model="m", workspace=Path.cwd())
+        config.enable_explore = False
+        config.enable_skills = False
+        sink = ListSink()
+        agent = Agent(config, registry=Registry.for_client(object()), sink=sink)
+        agent.restore(load_messages(log.path), copy=False)
+        notices = [e for e in sink.events if isinstance(e, Notice) and "损坏" in e.text]
+        self.assertEqual(len(notices), 1)
+        self.assertEqual(notices[0].level, "warn")
+        self.assertIn("第 3 行", notices[0].text)
+
+        #  干净的历史不出这条提示
+        clean = ListSink()
+        agent = Agent(config, registry=Registry.for_client(object()), sink=clean)
+        agent.restore(LoadedMessages([{"role": "user", "content": "任务"}]), copy=False)
+        self.assertFalse([e for e in clean.events if isinstance(e, Notice) and "损坏" in e.text])
 
 
 class OrphanCompactTest(unittest.TestCase):

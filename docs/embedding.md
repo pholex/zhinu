@@ -181,6 +181,15 @@ async with contextlib.aclosing(async_agent.stream("任务")) as events:
   `agent.restore(messages, source=str(path))`——与 CLI `xiaoyu resume` 同一条路径；
   默认把历史复制进新会话文件（新文件自包含），`copy=False` 表示续写历史所在的
   那个文件，只接上下文不再抄一遍。`list_sessions(workspace=...)` 列可续的会话。
+- **写锁**：`SessionLog` 构造即对日志旁的 `<日志>.lock` 加跨进程排他锁（内核锁，进程
+  死亡自动释放），同一会话文件同一时刻只允许一个写句柄——另一个进程（或本进程里
+  另一个 `SessionLog`）已持有时抛 `SessionLockedError`（`.pid` 是持有者，消息可直接
+  给用户看）。`close()` 写 exit 后放锁，`release()` 只放锁不写 exit，放锁后的写入
+  一律丢弃；读（`load_messages`、`list_sessions`）不受锁影响。同进程要在同一个文件
+  上换新句柄，先 `release()` 旧的。
+- **坏行**：`load_messages` 的返回值是 `list` 子类，`corrupt_lines` 属性记着中段解析
+  失败被跳过的行号（最后一行的半行是崩溃常态，静默不计）。`restore()` 看到非空会经
+  sink 发一条 warn 级 `Notice`；自己切片再 restore 的，切片会丢掉这个属性。
 - **recycle**：`AsyncAgent.recycle()` / `Agent.reset()`——清对话重开，对象 /
   registry / config 都不重建，trace、已加载技能等状态一并归零。
 - **打断与插话**（线程安全、非阻塞，任意线程可调）：`interrupt()` 在下一个 chunk
@@ -239,7 +248,7 @@ EOF / 连接关闭：挂起审批全部拒绝、打断当前轮、等工作线�
 - **事件**：`UIEvent`、`UISink`、`RequestStarted`、`RequestEnded`、`TextDelta`、
   `TextEnd`、`ToolPending`、`ToolPurpose`、`ToolRunning`、`ToolCompleted`、
   `ToolDenied`、`SteerAccepted`、`PlanUpdated`、`Notice`
-- **会话**：`SessionLog`、`load_messages`、`list_sessions`
+- **会话**：`SessionLog`、`SessionLockedError`、`load_messages`、`list_sessions`
 - **权限**：`Permissions`、`Rule`、`parse_rule`、`suggest_allow_rule`、
   `banned_allow_reason`、`user_rules_path`、`workspace_rules_path`
 - **配置**：`load_dotenv`、`user_env_path`、`MissingConfig`、`MissingApiKey`

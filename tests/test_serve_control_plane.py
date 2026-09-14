@@ -275,6 +275,30 @@ class TestPersistence(ServeCase):
         #  同一会话日志续写（不是新开一份）；被关掉的会话日志作为留痕保留在盘上
         self.assertEqual(len(list((state / "logs").glob(f"*-id-{kept}.jsonl"))), 1)
 
+    def test_session_locked_by_another_writer_is_skipped_not_fatal(self):
+        from xiaoyu.session_log import SessionLog
+
+        state = Path(self.tmp) / "state"
+        self.start(SIMPLE, state_dir=state)
+        kept = self.new_session()
+        first = self.client.post(f"/session/{kept}/prompt", json={"text": "第一轮"}, headers=self.headers()).json()
+        self.assertEqual(first["detail"], "finished")
+        (log_path,) = (state / "logs").glob(f"*-id-{kept}.jsonl")
+        #  停机要放掉会话日志的写锁，否则同一进程里的重启都接不回来
+        self.client.__exit__(None, None, None)
+        holder = SessionLog(log_path)  # 模拟别的进程正续写这个会话
+        self.start(SIMPLE, state_dir=state)
+        listed = self.client.get("/session", headers=self.headers()).json()["sessions"]
+        self.assertEqual(listed, [])
+        self.assertTrue(self.client.get("/health").json()["ok"])
+        #  清单留在盘上：锁是暂时的，删了历史就真没了
+        self.assertTrue((state / "sessions" / f"{kept}.json").is_file())
+        holder.close()
+        self.client.__exit__(None, None, None)
+        self.start(SIMPLE, state_dir=state)
+        listed = self.client.get("/session", headers=self.headers()).json()["sessions"]
+        self.assertEqual([item["session_id"] for item in listed], [kept])
+
     def test_no_persist_keeps_disk_clean(self):
         state = Path(self.tmp) / "state"
         self.start(SIMPLE, state_dir=state, persist=False)

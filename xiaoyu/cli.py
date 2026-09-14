@@ -21,7 +21,9 @@ from . import __version__, command_check, keys, media, modes, peers, providers, 
 from .agent import Agent
 from .banner import build_banner
 from .session_log import (
+    LoadedMessages,
     SessionInfo,
+    SessionLockedError,
     SessionLog,
     check_session_id,
     install_exit_logging,
@@ -933,7 +935,8 @@ def resume_command(argv: list[str]) -> int:
             )
             return 2
         if args.fork < len(starts):
-            loaded = loaded[: starts[args.fork]]
+            #  切片会丢掉读回时的损坏记录，带上它，restore 才能照常提示
+            loaded = LoadedMessages(loaded[: starts[args.fork]], loaded.corrupt_lines)
 
     resume_workspace = Path(chosen.workspace) if Path(chosen.workspace).is_dir() else workspace
     #  会话记录的工作区可能不是 cwd：换了目录就按新目录重新过一遍门
@@ -2556,7 +2559,8 @@ def main(argv: list[str] | None = None) -> int:
             approver, sink, repl_fn, note, asker = make_frontend(permissions, args.no_tui)
         try:
             session_log, restored = open_session(config, args.session_id)
-        except ValueError as exc:  # 会话名不合规 / 会话文件格式比本版新
+        except (ValueError, SessionLockedError) as exc:
+            #  会话名不合规 / 会话文件格式比本版新 / 会话正被另一个进程写入
             print(ui.error(str(exc)), file=sys.stderr)
             return 2
         peer = register_peer(config, interactive=not prompt)
@@ -2652,7 +2656,8 @@ def wire_main(args: argparse.Namespace, workspace_trusted: bool = True) -> int:
         permissions = Permissions.load(config.workspace, include_workspace=workspace_trusted)
         try:
             session_log, restored = open_session(config, args.session_id)
-        except ValueError as exc:  # 会话名不合规 / 会话文件格式比本版新
+        except (ValueError, SessionLockedError) as exc:
+            #  会话名不合规 / 会话文件格式比本版新 / 会话正被另一个进程写入
             print(ui.error(str(exc)), file=sys.stderr)
             return 2
         server = WireServer()
