@@ -329,6 +329,10 @@ agent 对象、会话清单、会话日志默认落盘在 `~/.xiaoyu/serve/<root
 
 - 默认只绑 `127.0.0.1`。绑非回环地址时**必须**给 `--token`（或 `XIAOYU_SERVE_TOKEN`），
   否则拒绝启动
+- 回环且不设 token 时，挡的是**本机浏览器里的网页**：`Host` 不是回环主机名（`127.0.0.1` /
+  `localhost` / `::1` / `host.docker.internal`）一律 `403`，防 DNS rebinding；带 `Origin` 的
+  请求与 WebSocket 握手只放行本服务自己的 origin 和 `--cors-origin` 白名单，防跨站驱动会话。
+  curl / n8n / SDK 这类不带 `Origin` 的客户端不受影响；经反代用别的主机名访问时请加 `--token`
 - `--workspace` 是 root，会话只能落在它或它的子目录里，越界 `400`
 - folder trust 非交互判定（与 `--acp` 同一纪律）：没信任记录的目录不吃工作区级
   `.mcp.json` / `permissions` / `.env`，也绝不在协议通道上发问

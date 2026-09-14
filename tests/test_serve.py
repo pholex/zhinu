@@ -92,7 +92,9 @@ class ServeCase(unittest.TestCase):
             #  出厂起始档（auto）漂；要 auto 的用例按会话传 mode="auto"
             **{"mode": "default", **cfg_extra},
         )
-        client = TestClient(create_app(cfg))
+        #  钉回环 base_url：无 token 时服务端按 Host 白名单挡 DNS rebinding，
+        #  TestClient 缺省的 Host=testserver 会被当成外来主机名拒掉
+        client = TestClient(create_app(cfg), base_url="http://127.0.0.1:8420")
         client.__enter__()
         self.addCleanup(client.__exit__, None, None, None)
         self.client = client
@@ -644,6 +646,60 @@ class TestCors(ServeCase):
         )
         self.assertNotIn("access-control-allow-origin", response.headers)
         self.assertNotIn("access-control-allow-private-network", response.headers)
+
+
+class TestLocalGuard(ServeCase):
+    """无 token 的回环 serve：浏览器是唯一够得着它的"外人"，挡两条路——
+    DNS rebinding（Host 是攻击者域名）与跨站请求 / WebSocket（Origin 是别的站）。"""
+
+    EXT = "chrome-extension://abcdefghijklmnopabcdefghijklmnop"
+
+    def test_rebinding_host_is_refused(self):
+        client = self.start("text: 无所谓\n")
+        for path, call in (("/session", client.post), ("/health", client.get)):
+            response = call(path, headers={"Host": "evil.example:8420"})
+            self.assertEqual(response.status_code, 403, (path, response.text))
+        self.assertEqual(client.app.state.sessions, {})
+
+    def test_local_host_names_pass(self):
+        client = self.start("text: 无所谓\n")
+        #  host.docker.internal：容器里的编排器访问宿主回环的地址（docs 推荐写法）
+        for host in ("127.0.0.1:8420", "localhost:8420", "[::1]:8420", "LOCALHOST", "host.docker.internal:8420"):
+            response = client.get("/health", headers={"Host": host})
+            self.assertEqual(response.status_code, 200, (host, response.text))
+
+    def test_cross_site_origin_is_refused(self):
+        client = self.start("text: 无所谓\n")
+        for origin in ("https://evil.example", "null", "http://127.0.0.1:9999"):
+            response = client.post("/session", json={}, headers={"Origin": origin})
+            self.assertEqual(response.status_code, 403, (origin, response.text))
+        self.assertEqual(client.app.state.sessions, {})
+
+    def test_own_and_whitelisted_origins_pass(self):
+        client = self.start("text: 无所谓\n", cors_origins=(self.EXT,))
+        for origin in ("http://127.0.0.1:8420", "http://localhost:8420", self.EXT):
+            response = client.post("/session", json={}, headers={"Origin": origin})
+            self.assertEqual(response.status_code, 200, (origin, response.text))
+
+    def test_cross_site_websocket_is_refused(self):
+        from starlette.websockets import WebSocketDisconnect
+
+        client = self.start("text: 无所谓\n")
+        session_id = self.new_session()
+        for headers in ({"Origin": "https://evil.example"}, {"Host": "evil.example"}):
+            with self.assertRaises(WebSocketDisconnect, msg=headers):
+                with client.websocket_connect(f"/session/{session_id}/browser", headers=headers) as ws:
+                    ws.send_json({"type": "hello", "token": "", "client": "evil/0"})
+                    ws.receive_json()
+
+    def test_token_mode_is_unchanged(self):
+        #  有 token 时攻击页拿不到凭据，闸不装：反代改写 Host、任意 origin 的持令牌客户端照常可用
+        self.token = "s3cr3t"
+        client = self.start("text: 无所谓\n")
+        response = client.post(
+            "/session", json={}, headers={"Host": "agent.example.com", "Origin": "https://console.example.com", **self.headers()}
+        )
+        self.assertEqual(response.status_code, 200, response.text)
 
 
 class TestOpenApi(ServeCase):
