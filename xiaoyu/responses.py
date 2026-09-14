@@ -311,6 +311,8 @@ class Delta:
 @dataclass
 class Choice:
     delta: Delta
+    #  与 chat chunk 同名字段：目前只在内容过滤时填（内核据此区分"拒答"与"断流"）
+    finish_reason: str | None = None
 
 
 @dataclass
@@ -430,6 +432,11 @@ def stream_chunks(events: Iterator[Any]) -> Iterator[Chunk]:
             #  incomplete（截断、内容过滤）同样走这里而不是抛异常：chat completions
             #  遇到 finish_reason=length 也是正常返回半截正文，抛了反而把已经吐出来的
             #  内容全丢掉——两种协议在这一点上必须表现一致
+            details = getattr(event.response, "incomplete_details", None)
+            if getattr(details, "reason", None) == "content_filter":
+                #  内容过滤翻译成 chat 的 finish_reason：不透传的话内核只看到
+                #  "一个字没有"，会当成断流原样重发
+                yield Chunk(choices=[Choice(Delta(), finish_reason="content_filter")])
             yield Chunk(usage=_usage(getattr(event.response, "usage", None)))
         elif kind in ("response.failed", "error"):
             #  真失败才抛。落到 errors.classify 多半是 fatal（没有 HTTP 状态码可判），

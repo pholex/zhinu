@@ -530,10 +530,18 @@ class TestBashAndSafety(ToolboxTestCase):
             proc = real_popen(*args, **kwargs)  # type: ignore[arg-type]
             spawned.append(proc)
 
-            def interrupt(timeout: float | None = None) -> tuple[bytes, bytes]:
-                raise KeyboardInterrupt
+            real_wait = proc.wait
+            fired: list[bool] = []
 
-            proc.communicate = interrupt  # type: ignore[method-assign]
+            def interrupt(timeout: float | None = None) -> int:
+                #  只在工具等待命令时模拟一次 Ctrl-C；之后的 wait（测试自己的
+                #  断言）走真实实现
+                if not fired:
+                    fired.append(True)
+                    raise KeyboardInterrupt
+                return real_wait(timeout=timeout)
+
+            proc.wait = interrupt  # type: ignore[method-assign]
             return proc
 
         with mock.patch.object(tools_module.subprocess, "Popen", spy_popen):
@@ -543,6 +551,37 @@ class TestBashAndSafety(ToolboxTestCase):
         #  整组应已被 SIGKILL；若还活着，wait 会在 5s 后抛 TimeoutExpired
         proc.wait(timeout=5)
         self.assertIsNotNone(proc.poll())
+
+    def test_bash_huge_output_is_bounded_in_memory(self) -> None:
+        """几十 MB 的输出只在内存里留头尾：开头、结尾都在，中间标注丢了多少。"""
+        from xiaoyu import tools as tools_module
+
+        self.config.max_tool_output = 10_000_000
+        with mock.patch.object(tools_module, "_PIPE_KEEP_BYTES", 1024 * 1024):
+            result = self.box.run(
+                "bash",
+                {"command": (
+                    "python3 -c \"import sys; w=lambda t: sys.stdout.buffer.write(t.encode()); w('HEAD_MARK\\n');"
+                    " [w('\\u4e2d' * 1000 + '\\n') for _ in range(20000)]; w('TAIL_MARK\\n')\""
+                )},
+            )
+        self.assertIn("exit_status: 0", result)
+        self.assertIn("HEAD_MARK", result)
+        self.assertIn("TAIL_MARK", result)
+        self.assertIn("字节未保留", result)
+        #  截断点对齐了 UTF-8 边界：没有退化成 GBK 乱码或替换字符
+        self.assertNotIn("\ufffd", result)
+        self.assertLess(len(result), 2 * 1024 * 1024)
+
+    def test_bounded_pipe_keeps_everything_under_limit(self) -> None:
+        import io
+
+        from xiaoyu.tools import _BoundedPipe
+
+        pipe = _BoundedPipe(io.BytesIO(b"x" * 1000), keep=4096)
+        pipe.thread.join(5)
+        self.assertEqual(pipe.value(), b"x" * 1000)
+        self.assertEqual(pipe.dropped, 0)
 
     def test_decode_output_falls_back_to_gbk(self) -> None:
         """中文 Windows 的 GBK 输出不能解成一串 �——报错可读性就是自愈能力。
@@ -778,3 +817,66 @@ class TestSandboxEscalation(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestEncodingSafeEdits(ToolboxTestCase):
+    """编辑链路只接受能无损解码的文件，并按原编码写回：有损解码后写回会把原文永久写坏。"""
+
+    def setUp(self) -> None:
+        super().setUp()
+        #  候选编码里的 locale 一项钉成 UTF-8：西文 Windows 的 cp1252 什么字节都解得开，
+        #  会让"解不开"的用例在 CI 上失去意义
+        patcher = mock.patch("xiaoyu.tools.locale.getpreferredencoding", return_value="UTF-8")
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def test_gbk_file_round_trips_and_rewinds_byte_exact(self) -> None:
+        target = self.root / "legacy.txt"
+        original = "第一行：你好\n第二行：世界\n".encode("gbk")
+        target.write_bytes(original)
+        shown = self.box.run("read_file", {"path": "legacy.txt"})
+        self.assertIn("gbk", shown)
+        self.assertIn("你好", shown)
+        self.box.rewind.begin("改 GBK 文件")
+        result = self.box.run(
+            "str_replace", {"path": "legacy.txt", "old_str": "世界", "new_str": "小羽"}
+        )
+        self.box.rewind.finish()
+        self.assertFalse(result.startswith("ERROR"), result)
+        self.assertEqual(target.read_bytes(), "第一行：你好\n第二行：小羽\n".encode("gbk"))
+        ok, _ = self.box.rewind.rewind_files(1)
+        self.assertTrue(ok)
+        self.assertEqual(target.read_bytes(), original)
+
+    def test_gbk_file_rejects_text_the_encoding_cannot_hold(self) -> None:
+        target = self.root / "legacy.txt"
+        original = "你好\n".encode("gbk")
+        target.write_bytes(original)
+        self.box.run("read_file", {"path": "legacy.txt"})
+        result = self.box.run(
+            "str_replace", {"path": "legacy.txt", "old_str": "你好", "new_str": "你好😀"}
+        )
+        self.assertTrue(result.startswith("ERROR"), result)
+        self.assertEqual(target.read_bytes(), original)
+
+    def test_undecodable_file_is_shown_lossy_but_never_edited(self) -> None:
+        target = self.root / "blob.txt"
+        original = b"ok \xff\xfe\x80 tail\n"
+        target.write_bytes(original)
+        shown = self.box.run("read_file", {"path": "blob.txt"})
+        self.assertIn("有损显示", shown)
+        result = self.box.run("str_replace", {"path": "blob.txt", "old_str": "ok", "new_str": "no"})
+        self.assertTrue(result.startswith("ERROR"), result)
+        self.assertEqual(target.read_bytes(), original)
+
+    def test_fuzzy_path_keeps_encoding(self) -> None:
+        """精确匹配落空走容错匹配时，同样按原编码写回。"""
+        target = self.root / "legacy.py"
+        target.write_bytes("def f():\n    return '你好'   \n".encode("gbk"))
+        self.box.run("read_file", {"path": "legacy.py"})
+        result = self.box.run(
+            "str_replace",
+            {"path": "legacy.py", "old_str": "    return '你好'\n", "new_str": "    return '世界'\n"},
+        )
+        self.assertFalse(result.startswith("ERROR"), result)
+        self.assertEqual(target.read_bytes().decode("gbk"), "def f():\n    return '世界'\n")

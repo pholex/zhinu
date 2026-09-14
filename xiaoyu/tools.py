@@ -9,8 +9,10 @@
 
 from __future__ import annotations
 
+import collections
 import contextlib
 import fnmatch
+import codecs
 import functools
 import hashlib
 import json
@@ -18,6 +20,7 @@ import locale
 import os
 import re
 import shutil
+import unicodedata
 import subprocess
 import sys
 import tempfile
@@ -62,6 +65,55 @@ _HARDLINE_RULES: tuple[tuple[re.Pattern[str], str], ...] = tuple(
 )
 
 
+UNTRUSTED_TAG = "untrusted_content"
+#  在 NFKC 折叠 + 小写之后匹配：全角 ＜ｕｎｔｒｕｓｔｅｄ… 这类形近字符伪造的
+#  开闭标记同样认得出来
+_UNTRUSTED_MARKER = re.compile(rf"<\s*/?\s*{UNTRUSTED_TAG}")
+SANITIZED_MARKER = "[[标记已消毒]]"
+
+
+def neutralize_untrusted_markers(text: str) -> str:
+    """把外部内容里伪造的 <untrusted_content> 开闭标记替换掉。
+
+    不处理的话，网页/MCP 结果里写一行 </untrusted_content> 就能"提前闭合"包裹，
+    让后面的文字看起来像包裹之外的可信内容。逐字符折叠并记下原位置，命中后
+    在原文上替换——折叠会改变长度，不能直接在折叠串上切。
+    """
+    folded: list[str] = []
+    origin: list[int] = []
+    for index, char in enumerate(text):
+        piece = unicodedata.normalize("NFKC", char).lower()
+        folded.append(piece)
+        origin.extend([index] * len(piece))
+    flat = "".join(folded)
+    spans = [
+        (origin[match.start()], origin[match.end() - 1] + 1)
+        for match in _UNTRUSTED_MARKER.finditer(flat)
+    ]
+    if not spans:
+        return text
+    parts: list[str] = []
+    cursor = 0
+    for start, end in spans:
+        if start < cursor:
+            continue
+        parts.append(text[cursor:start])
+        parts.append(SANITIZED_MARKER)
+        cursor = end
+    parts.append(text[cursor:])
+    return "".join(parts)
+
+
+def wrap_untrusted(source: str, text: str) -> str:
+    """外部来源的工具结果 → 带来源的不可信包裹（系统提示里约定了它的含义）。"""
+    label = re.sub(r"[^\w.:/@-]", "_", source)[:120] or "external"
+    return (
+        f'<{UNTRUSTED_TAG} source="{label}">\n'
+        f"{neutralize_untrusted_markers(text)}\n"
+        f"</{UNTRUSTED_TAG}>"
+    )
+
+
 def hardline_violation(command: str) -> str | None:
     """命中硬性拦截规则时返回原因，否则 None。"""
     for pattern, reason in _HARDLINE_RULES:
@@ -96,6 +148,94 @@ def _decode_output(data: bytes | str | None) -> str:
     return data.decode("utf-8", errors="replace")
 
 
+#  bash 输出在内存里的上限（stdout / stderr 各自）：开头、结尾各留一半，中间丢弃
+#  并计数。远大于 max_tool_output——超出那部分还要落 spill 供 recall 取回；这里只
+#  防几 GB 的输出（cat 大日志、失控的循环打印）把进程内存吃爆。留结尾是因为测试
+#  失败汇总、构建报错都在最后（与 _truncate 同理）。
+_PIPE_KEEP_BYTES = 8 * 1024 * 1024
+_PIPE_READ_CHUNK = 64 * 1024
+
+
+class _BoundedPipe:
+    """后台线程读一路管道，内存里只留头尾（替代 communicate 的无界读取）。"""
+
+    def __init__(self, stream: Any, keep: int | None = None) -> None:
+        #  调用时再读模块常量（默认参数在定义时就绑死，改常量不生效）
+        self._half = max(1, (_PIPE_KEEP_BYTES if keep is None else keep) // 2)
+        self._head = bytearray()
+        self._tail: collections.deque[bytes] = collections.deque()
+        self._tail_size = 0
+        self.dropped = 0
+        self.thread = threading.Thread(target=self._pump, args=(stream,), daemon=True)
+        self.thread.start()
+
+    def _pump(self, stream: Any) -> None:
+        read = getattr(stream, "read1", None) or stream.read
+        try:
+            while chunk := read(_PIPE_READ_CHUNK):
+                room = self._half - len(self._head)
+                if room > 0:
+                    self._head += chunk[:room]
+                    chunk = chunk[room:]
+                if not chunk:
+                    continue
+                self._tail.append(chunk)
+                self._tail_size += len(chunk)
+                #  整块淘汰最旧的尾部，直到再丢一块就不足一半为止
+                while self._tail and self._tail_size - len(self._tail[0]) >= self._half:
+                    old = self._tail.popleft()
+                    self._tail_size -= len(old)
+                    self.dropped += len(old)
+        except (OSError, ValueError):
+            pass  # 进程树被杀、管道被关：已读到的照常交付
+        finally:
+            with contextlib.suppress(OSError, ValueError):
+                stream.close()
+
+    def value(self) -> bytes:
+        tail = b"".join(self._tail)
+        if not self.dropped:
+            return bytes(self._head) + tail
+        head = _trim_partial_utf8(bytes(self._head))
+        #  尾部开头可能落在多字节字符中间：跳过至多 3 个续字节
+        skip = 0
+        while skip < min(3, len(tail)) and tail[skip] & 0xC0 == 0x80:
+            skip += 1
+        marker = f"\n…[输出过大：中间 {self.dropped} 字节未保留（内存上限），以下为结尾]…\n"
+        return head + marker.encode("utf-8") + tail[skip:]
+
+
+def _trim_partial_utf8(data: bytes) -> bytes:
+    """去掉结尾被截断的半个 UTF-8 字符（否则整段严格解码失败、退到 GBK 解成乱码）。"""
+    for back in range(1, min(4, len(data)) + 1):
+        byte = data[-back]
+        if byte & 0xC0 == 0x80:
+            continue
+        if byte >= 0xC0:
+            need = 2 if byte < 0xE0 else 3 if byte < 0xF0 else 4
+            return data[:-back] if back < need else data
+        return data
+    return data
+
+
+def _wait_bounded(proc: subprocess.Popen, pipes: list[_BoundedPipe], deadline: float) -> bool:
+    """等进程退出、两路管道读完，不超过 deadline；超时返回 False。
+
+    先等进程再等管道：进程退出了而孙进程还握着管道（`sleep 30 &`）时，管道的
+    EOF 迟迟不来——这同样算超时，交给调用方整树杀掉，与 communicate(timeout)
+    的语义一致。
+    """
+    try:
+        proc.wait(timeout=max(0.0, deadline - time.monotonic()))
+    except subprocess.TimeoutExpired:
+        return False
+    for pipe in pipes:
+        pipe.thread.join(max(0.0, deadline - time.monotonic()))
+        if pipe.thread.is_alive():
+            return False
+    return True
+
+
 def _partial_chunks(stdout: bytes | str | None, stderr: bytes | str | None) -> str:
     """把 stdout/stderr 拼成给模型看的分段文本，空段不占行。"""
     chunks = []
@@ -104,6 +244,68 @@ def _partial_chunks(stdout: bytes | str | None, stderr: bytes | str | None) -> s
     if err := _decode_output(stderr).strip():
         chunks.append(f"stderr:\n{err}")
     return "\n".join(chunks)
+
+
+class _Undecodable(Exception):
+    """文件在全部候选编码下都解不出无损文本。"""
+
+
+def _edit_encodings() -> list[str]:
+    """编辑链路解码原文的候选编码：UTF-8 优先，其次本地代码页与 GBK。
+
+    GBK 单列一项：中文 Windows 的存量源码/配置就是这个形态，而开发机的本地
+    代码页多半是 UTF-8，只靠 locale 覆盖不到。去重按 codecs 规范名（cp936 即 gbk）。
+    """
+    names: list[str] = []
+    for candidate in ("utf-8", locale.getpreferredencoding(False) or "", "gbk"):
+        try:
+            canonical = codecs.lookup(candidate).name
+        except LookupError:
+            continue
+        if canonical not in names:
+            names.append(canonical)
+    return names
+
+
+def _read_for_edit(target: Path) -> tuple[str, str, bytes]:
+    """严格解码读文件，返回 (文本, 编码, 原始字节)；解不开抛 _Undecodable。
+
+    有损解码（errors="replace"）后再写回，会把无法识别的字节永久替换成 U+FFFD
+    ——GBK 文件改一处就整篇中文变成 �，而且 /rewind 快照里存的也是坏文本，
+    救不回来。所以编辑链路只接受能无损解码的文件，并按原编码写回。
+    换行按 read_text 的通用换行规则归一（\\r\\n、\\r → \\n），与原先的读法一致，
+    old_str 的匹配语义不变。原始字节留给 /rewind 做逐字节恢复。
+    """
+    raw = target.read_bytes()
+    for encoding in _edit_encodings():
+        try:
+            decoded = raw.decode(encoding)
+        except UnicodeDecodeError:
+            continue
+        return decoded.replace("\r\n", "\n").replace("\r", "\n"), encoding, raw
+    raise _Undecodable(str(target))
+
+
+def _undecodable_error(path: str) -> str:
+    return (
+        f"ERROR: {path} 按 UTF-8、GBK 都无法无损解码（可能是二进制或其它编码），"
+        "已拒绝编辑——有损解码后写回会把无法识别的字节永久替换成 �。"
+        "如确需修改，请先向用户确认文件编码，再用 bash 按正确编码处理。"
+    )
+
+
+def _unencodable_error(path: str, text: str, encoding: str) -> str | None:
+    """新内容能否用原文件的编码表示；不能则返回拒绝写入的说明。"""
+    try:
+        text.encode(encoding)
+    except UnicodeEncodeError as exc:
+        return (
+            f"ERROR: {path} 是 {encoding} 编码的文件，新内容里的 "
+            f"{exc.object[exc.start:exc.end]!r} 无法用该编码表示，已拒绝写入"
+            "（强行转码会改变整个文件的编码）。换成该编码能表示的写法再试，"
+            "或先征得用户同意再转换文件编码。"
+        )
+    return None
 
 
 @functools.lru_cache(maxsize=1)
@@ -301,6 +503,9 @@ class Tool:
     #  可用性探测：返回 False 时不进 schemas、拒绝执行。
     #  每次组装 schemas 都会调用，必须是廉价检查（which / 路径存在 / 列表非空）。
     check_fn: Callable[[], bool] | None = None
+    #  结果来自外部（MCP server、网页、联网搜索）：回灌模型前由 agent 包进
+    #  <untrusted_content>，其中的指令只当数据（见 wrap_untrusted）
+    untrusted: bool = False
 
     def available(self) -> bool:
         if self.check_fn is None:
@@ -801,6 +1006,7 @@ class Toolbox:
                     requires_approval=True,
                     #  server 进程退出后工具自动从 schemas 消失、拒绝执行
                     check_fn=remote.check_fn,
+                    untrusted=True,
                 )
             )
 
@@ -1273,6 +1479,7 @@ class Toolbox:
                     "required": ["action"],
                 },
                 handler=self._browser,
+                untrusted=True,
                 requires_approval=True,
                 #  lambda 晚绑定而非直接引用：测试/运行期 monkeypatch
                 #  browser.available 时门控要跟着变。enable_browser 也进门控：
@@ -1335,11 +1542,24 @@ class Toolbox:
         if target.is_dir():
             return f"ERROR: {path} 是目录，不是文件。用 list_files 看目录。"
         try:
-            text = target.read_text(encoding="utf-8", errors="replace")
+            text, encoding, _ = _read_for_edit(target)
+        except _Undecodable:
+            #  只读展示仍给有损文本（总比什么都不给强），但明说有损、编辑会被拒
+            try:
+                text, encoding = target.read_text(encoding="utf-8", errors="replace"), ""
+            except OSError as exc:
+                return f"ERROR: 读取失败 {path}: {exc}"
         except OSError as exc:
             return f"ERROR: 读取失败 {path}: {exc}"
 
         prefix = "(注意：该路径在工作区之外)\n" if outside else ""
+        if not encoding:
+            prefix += (
+                "(注意：该文件含 UTF-8、GBK 都解不开的字节，以下为有损显示，"
+                "� 处是无法识别的字节；str_replace 会拒绝编辑它)\n"
+            )
+        elif encoding != "utf-8":
+            prefix += f"(注意：该文件按 {encoding} 解码显示，str_replace 会按原编码写回)\n"
         if not text:
             self._mark_read(target)
             return f"{prefix}(文件为空：{path})"
@@ -1371,7 +1591,7 @@ class Toolbox:
         #  /rewind 快照：改前内容（新建文件记 None——回滚即删除）
         if existed:
             try:
-                self.rewind.record(target, target.read_text(encoding="utf-8", errors="replace"))
+                self.rewind.record(target, target.read_bytes())
             except OSError:
                 pass
         else:
@@ -1403,7 +1623,9 @@ class Toolbox:
             return guard
 
         try:
-            text = target.read_text(encoding="utf-8", errors="replace")
+            text, encoding, raw = _read_for_edit(target)
+        except _Undecodable:
+            return _undecodable_error(path)
         except OSError as exc:
             return f"ERROR: 读取失败 {path}: {exc}"
 
@@ -1412,7 +1634,9 @@ class Toolbox:
             #  精确匹配落空 → 逐级放宽的容错匹配。
             #  行尾空格 / tab-space 混用 / IDE 弯引号是三类最高频的"看着一样字节不同"，
             #  只要放宽后唯一命中就接受；多处命中仍打回——唯一性护栏不放松。
-            return self._fuzzy_replace(target, path, text, old_str, new_str, outside)
+            return self._fuzzy_replace(
+                target, path, text, old_str, new_str, outside, encoding, raw
+            )
         if count > 1:
             return (
                 f"ERROR: old_str 在 {path} 中出现了 {count} 次，无法确定改哪一处。"
@@ -1430,9 +1654,11 @@ class Toolbox:
             )
         line_no = text.count("\n", 0, offset) + 1
         updated = text.replace(old_str, new_str, 1)
-        self.rewind.record(target, text)
+        if error := _unencodable_error(path, updated, encoding):
+            return error
+        self.rewind.record(target, raw)
         try:
-            target.write_text(updated, encoding="utf-8")
+            target.write_text(updated, encoding=encoding)
         except OSError as exc:
             return f"ERROR: 写入失败 {path}: {exc}"
         self._mark_read(target)
@@ -1453,6 +1679,8 @@ class Toolbox:
         old_str: str,
         new_str: str,
         outside: bool,
+        encoding: str = "utf-8",
+        raw: bytes | None = None,
     ) -> str:
         """old_str 精确匹配落空后的容错路径。找不到时回显 old_str 帮模型自查。"""
         found = fuzzy_find_lines(text, old_str)
@@ -1502,9 +1730,11 @@ class Toolbox:
             + text_lines[found.line_index + found.line_count :]
         )
         updated = "\n".join(updated_lines)
-        self.rewind.record(target, text)
+        if error := _unencodable_error(path, updated, encoding):
+            return error
+        self.rewind.record(target, raw if raw is not None else text.encode(encoding))
         try:
-            target.write_text(updated, encoding="utf-8")
+            target.write_text(updated, encoding=encoding)
         except OSError as exc:
             return f"ERROR: 写入失败 {path}: {exc}"
         self._mark_read(target)
@@ -1828,8 +2058,12 @@ class Toolbox:
             )
         except OSError as exc:
             return f"ERROR: 无法执行命令：{exc}"
+        #  不用 communicate：它把整份输出读进内存，几 GB 的输出能把进程吃爆
+        pipes = [_BoundedPipe(proc.stdout), _BoundedPipe(proc.stderr)]
         try:
-            stdout_raw, stderr_raw = proc.communicate(timeout=limit)
+            if not _wait_bounded(proc, pipes, started + limit):
+                raise subprocess.TimeoutExpired(argv, limit)
+            stdout_raw, stderr_raw = pipes[0].value(), pipes[1].value()
         except KeyboardInterrupt:
             #  Ctrl-C 的 SIGINT 只到前台进程组（我们自己）；子进程在独立会话里
             #  收不到，不杀就成遗孤继续跑、还握着管道。中断语义必须是
@@ -1840,10 +2074,8 @@ class Toolbox:
             _kill_tree(proc)
             #  整树已杀、管道随之关闭，这里只回收已缓冲的输出；再收不到就放弃，
             #  绝不能为了一点残余输出重新陷入无限期等待。
-            try:
-                stdout_raw, stderr_raw = proc.communicate(timeout=10)
-            except (subprocess.TimeoutExpired, OSError, ValueError):
-                stdout_raw, stderr_raw = b"", b""
+            _wait_bounded(proc, pipes, time.monotonic() + 10)
+            stdout_raw, stderr_raw = pipes[0].value(), pipes[1].value()
             elapsed = time.monotonic() - started
             #  超时不是 error：超时前的输出往往已经包含答案（比如测试
             #  跑完了只是进程没退出）。提示前置 + 部分输出照样给模型，exit 124 是

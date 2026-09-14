@@ -12,6 +12,8 @@ checkpoint 设计，按小羽体量裁剪：
   ≥N 的点，出错则整批保留供重试。
 - **外部改动检测**：恢复前把当前磁盘内容与最近一份 after 快照比对，不一致
   说明轮次之外有人改过（用户手改/别的进程），列出来让用户确认再动手。
+- **快照存原始字节，不解码**：编码（GBK 等）与换行（CRLF）原样恢复——存解码
+  后的文本再按 UTF-8 写回，恢复本身就会改掉文件编码。
 - 对话与文件可分开回滚（conversation_only / files_only / all 三态）。
   只回对话时快照点保留——文件没动，之后仍可单独回滚文件。
 
@@ -37,9 +39,9 @@ class RewindPoint:
     prompt_text: str  # 该轮用户输入原文（对话回滚按它定位截断点）
     started_at: float = field(default_factory=time.time)
     #  路径（绝对） → 本轮首次改动前的内容；None = 当时不存在（新建文件）
-    files: dict[str, str | None] = field(default_factory=dict)
+    files: dict[str, bytes | None] = field(default_factory=dict)
     #  轮次结束时的内容（只覆盖本轮碰过的文件），外部改动检测用
-    after: dict[str, str | None] = field(default_factory=dict)
+    after: dict[str, bytes | None] = field(default_factory=dict)
     #  超限没拍下的文件：这些文件无法经本点回滚
     skipped: list[str] = field(default_factory=list)
 
@@ -78,7 +80,7 @@ class RewindStore:
 
     # ---------- 捕获（tools 的写路径调用） ----------
 
-    def record(self, path: Path, before: str | None) -> None:
+    def record(self, path: Path, before: bytes | None) -> None:
         """记一份"改前内容"。不在轮次内（工具被 REPL 外壳直接调）就静默跳过；
         每轮每文件只记第一次（首写获胜——目标是本轮开始前的状态）。"""
         if self._current is None:
@@ -86,7 +88,7 @@ class RewindStore:
         raw = str(path)
         if raw in self._current.files or raw in self._current.skipped:
             return
-        if before is not None and len(before.encode("utf-8", "ignore")) > MAX_FILE_BYTES:
+        if before is not None and len(before) > MAX_FILE_BYTES:
             self._current.skipped.append(raw)
             return
         self._current.files[raw] = before
@@ -99,9 +101,9 @@ class RewindStore:
     def get(self, index: int) -> RewindPoint | None:
         return next((p for p in self._points if p.index == index), None)
 
-    def files_from(self, index: int) -> dict[str, str | None]:
+    def files_from(self, index: int) -> dict[str, bytes | None]:
         """≥index 的所有点里，每个文件**最早**的 before 快照（恢复用）。"""
-        merged: dict[str, str | None] = {}
+        merged: dict[str, bytes | None] = {}
         for point in self._points:
             if point.index < index:
                 continue
@@ -111,7 +113,7 @@ class RewindStore:
 
     def conflicts(self, index: int) -> list[str]:
         """恢复目标里"当前磁盘内容 ≠ 最近一份 after 快照"的文件（外部改过）。"""
-        latest_after: dict[str, str | None] = {}
+        latest_after: dict[str, bytes | None] = {}
         for point in self._points:
             if point.index < index:
                 continue
@@ -151,7 +153,7 @@ class RewindStore:
                         removed += 1
                 else:
                     path.parent.mkdir(parents=True, exist_ok=True)
-                    path.write_text(before, encoding="utf-8")
+                    path.write_bytes(before)
                     restored += 1
             except OSError as exc:
                 errors.append(f"{raw}: {exc}")
@@ -171,8 +173,8 @@ class RewindStore:
         self._current = None
 
 
-def _read_or_none(path: Path) -> str | None:
+def _read_or_none(path: Path) -> bytes | None:
     try:
-        return path.read_text(encoding="utf-8", errors="replace")
+        return path.read_bytes()
     except OSError:
         return None

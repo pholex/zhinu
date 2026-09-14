@@ -13,6 +13,16 @@ import httpx
 import openai
 
 
+class ContentFiltered(RuntimeError):
+    """服务端内容过滤/安全分类器拒答（HTTP 200、没有可用内容）。
+
+    三种协议的形态各异（chat 的 finish_reason=content_filter、Responses 的
+    incomplete reason、Anthropic 的 stop_reason=refusal），传输层与流消费层
+    统一抛这一个类型。它不是故障：同一请求原样重发或换模型，结果多半相同，
+    还会把拒答放大成连环请求——分类为 fatal，直接报给用户。
+    """
+
+
 @dataclass(frozen=True)
 class Verdict:
     kind: str  # 取值必须在 ALL_KINDS 里
@@ -66,6 +76,11 @@ def _status_code(exc: Exception) -> int | None:
 
 
 def classify(exc: Exception) -> Verdict:
+    if isinstance(exc, ContentFiltered):
+        return Verdict(
+            "fatal", False, False,
+            f"{exc}（重发或换模型多半同样被拦，请调整请求内容）",
+        )
     text = str(exc).lower()
     status = _status_code(exc)
 

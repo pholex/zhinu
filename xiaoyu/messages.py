@@ -36,6 +36,7 @@ from __future__ import annotations
 import json
 from typing import Any, Iterator
 
+from .errors import ContentFiltered
 from .responses import (
     OPERATOR_KEY,
     REASONING_KEY,
@@ -537,7 +538,7 @@ def stream_chunks(events: Iterator[Any]) -> Iterator[Chunk]:
             if getattr(getattr(event, "delta", None), "stop_reason", None) == "refusal":
                 #  安全分类器拒绝：HTTP 200 但没有可用内容。抛出去落到
                 #  errors.classify → fatal（不换模型不重试），详情报给用户
-                raise RuntimeError(f"Anthropic 拒绝了这次请求：{_refusal_detail(event)}")
+                raise ContentFiltered(f"Anthropic 拒绝了这次请求：{_refusal_detail(event)}")
         elif kind == "message_stop":
             #  usage 收尾 chunk：choices 留空——内核见空 choices 就跳过，
             #  与 OpenAI chat 流最后那个纯 usage chunk 形状一致

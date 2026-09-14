@@ -597,6 +597,78 @@ class TestCrossProviderFallback(ProviderTestCase):
         self.assertEqual(list(agent.usage.by_model), [f"{GATEWAY}/deepseek-v4-pro"])
 
 
+class TestRetryBudgetAndPreferredProbe(TestCrossProviderFallback):
+    """重试不随路由条数成倍放大；粘性降级冷却到期后回探首选模型。"""
+
+    def limited(self) -> openai.RateLimitError:
+        return openai.RateLimitError("429", response=_response(429), body=None)
+
+    def test_retry_budget_is_shared_across_chain(self) -> None:
+        direct, gateway = FakeClient([self.limited()] * 20), FakeClient([self.limited()] * 20)
+        registry = Registry(
+            [
+                Provider("deepseek", "u", "k", DS_MODELS, "直连 deepseek"),
+                Provider(GATEWAY, "u", "k", (), "网关"),
+            ],
+            clients={"deepseek": direct, GATEWAY: gateway},
+        )
+        cfg = config(auto_approve=True, fallback_models=["deepseek-v4-flash"])
+        agent = Agent(cfg, registry=registry, usage=Usage())
+        chain = agent.model_chain()
+        self.assertGreaterEqual(len(chain), 3)
+        with self.assertRaises(openai.RateLimitError):
+            self._run(agent)
+        total = len(direct.completions.calls) + len(gateway.completions.calls)
+        #  每条路由至少一次 + 全链共享的重试预算；旧行为是 3 × 路由数
+        self.assertEqual(total, len(chain) + agent._RECOVERY_BUDGET)
+
+    def downgraded(self, direct_after: list) -> tuple[Agent, FakeClient, FakeClient]:
+        direct = FakeClient([self.limited()] * 3 + direct_after)
+        gateway = FakeClient([[chunk(content="网关顶上")], [chunk(content="网关再顶")]])
+        registry = Registry(
+            [
+                Provider("deepseek", "u", "k", DS_MODELS, "直连 deepseek"),
+                Provider(GATEWAY, "u", "k", (), "网关"),
+            ],
+            clients={"deepseek": direct, GATEWAY: gateway},
+        )
+        agent = Agent(config(auto_approve=True), registry=registry, usage=Usage())
+        self._run(agent)
+        self.assertEqual(agent.config.model, f"{GATEWAY}/deepseek-v4-pro")
+        self.assertEqual(agent._preferred_model, "deepseek-v4-pro")
+        return agent, direct, gateway
+
+    def test_no_probe_before_cooldown(self) -> None:
+        agent, direct, gateway = self.downgraded([])
+        self._run(agent)
+        self.assertEqual(len(direct.completions.calls), 3, "冷却内不该碰首选模型")
+        self.assertEqual(agent.last_assistant_text(), "网关再顶")
+
+    def test_probe_after_cooldown_switches_back(self) -> None:
+        agent, direct, gateway = self.downgraded([[chunk(content="直连恢复")]])
+        agent._preferred_retry_at = 0.0
+        self._run(agent)
+        self.assertEqual(agent.last_assistant_text(), "直连恢复")
+        self.assertEqual(agent.config.model, "deepseek-v4-pro")
+        self.assertIsNone(agent._preferred_model)
+        self.assertEqual(len(gateway.completions.calls), 1, "回探成功这一步不该再打网关")
+
+    def test_failed_probe_backs_off_without_retrying(self) -> None:
+        agent, direct, gateway = self.downgraded([self.limited()])
+        agent._preferred_retry_at = 0.0
+        before = agent._preferred_backoff
+        self._run(agent)
+        self.assertEqual(len(direct.completions.calls), 4, "回探只单发一次，不走重试")
+        self.assertEqual(agent.last_assistant_text(), "网关再顶")
+        self.assertEqual(agent.config.model, f"{GATEWAY}/deepseek-v4-pro")
+        self.assertEqual(agent._preferred_backoff, before * 2)
+
+    def test_explicit_switch_cancels_probe(self) -> None:
+        agent, _, _ = self.downgraded([])
+        agent.switch_model("deepseek-v4-flash")
+        self.assertIsNone(agent._preferred_model)
+
+
 class TestRouteAndClients(ProviderTestCase):
     ENV = {"XIAOYU_API_KEY": "gw", "DEEPSEEK_API_KEY": "ds"}
 

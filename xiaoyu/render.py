@@ -12,6 +12,7 @@ tool.denied）在明文渲染下刻意无输出——它们是给 TUI 活区（s
 
 from __future__ import annotations
 
+import dataclasses
 import json
 import sys
 from typing import Any, Callable
@@ -182,7 +183,7 @@ class PlainSink:
     def emit(self, event: UIEvent) -> None:
         handler = self._handlers.get(type(event))
         if handler is not None:
-            handler(event)
+            handler(sanitize_event(event))
 
     def _request_started(self, event: RequestStarted) -> None:
         """等模型时给一行提示——但只在有人盯着终端看的时候。
@@ -250,6 +251,32 @@ class PlainSink:
 
     def _notice(self, event: Notice) -> None:
         print(ui.styled(self._NOTICE_TOKENS[event.level], event.text))
+
+
+def clean_value(value: Any) -> Any:
+    """递归去掉字符串（含 dict / list 里嵌套的）中的终端控制字符，见 ui.strip_controls。"""
+    if isinstance(value, str):
+        return ui.strip_controls(value)
+    if isinstance(value, dict):
+        return {key: clean_value(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [clean_value(item) for item in value]
+    return value
+
+
+def sanitize_event(event: UIEvent) -> UIEvent:
+    """给终端渲染用的事件副本：字符串字段（含 args / plan 里嵌套的）去掉控制字符。
+
+    只在打到终端的 sink 里用：wire / JSON / ACP 的消费方拿原文，由它们自己渲染。
+    绝大多数事件不含控制字符，这时原样返回、不复制——TextDelta 是逐 token 的热路径。
+    """
+    changes = {}
+    for spec in dataclasses.fields(event):
+        current = getattr(event, spec.name)
+        cleaned = clean_value(current)
+        if cleaned != current:
+            changes[spec.name] = cleaned
+    return dataclasses.replace(event, **changes) if changes else event
 
 
 class NullSink:

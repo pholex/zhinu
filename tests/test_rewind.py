@@ -27,9 +27,9 @@ class StoreTest(unittest.TestCase):
     def test_first_write_wins_within_turn(self):
         target = self.path("a.txt", "v0")
         self.store.begin("改 a")
-        self.store.record(target, "v0")
+        self.store.record(target, b"v0")
         target.write_text("v1", encoding="utf-8")
-        self.store.record(target, "v1")  # 同轮第二次：忽略
+        self.store.record(target, b"v1")  # 同轮第二次：忽略
         target.write_text("v2", encoding="utf-8")
         self.store.finish()
         ok, _ = self.store.rewind_files(1)
@@ -40,13 +40,13 @@ class StoreTest(unittest.TestCase):
         existing = self.path("keep.txt", "old")
         created = self.root / "new.txt"
         self.store.begin("第一轮")
-        self.store.record(existing, "old")
+        self.store.record(existing, b"old")
         existing.write_text("turn1", encoding="utf-8")
         self.store.finish()
         self.store.begin("第二轮")
         self.store.record(created, None)
         created.write_text("hello", encoding="utf-8")
-        self.store.record(existing, "turn1")
+        self.store.record(existing, b"turn1")
         existing.write_text("turn2", encoding="utf-8")
         self.store.finish()
         #  回到第 1 轮前：existing 取"最早"的 before（old），created 删除
@@ -60,7 +60,7 @@ class StoreTest(unittest.TestCase):
         target = self.path("a.txt", "v0")
         for turn in ("一", "二"):
             self.store.begin(turn)
-            before = target.read_text(encoding="utf-8")
+            before = target.read_bytes()
             self.store.record(target, before)
             target.write_text(f"after-{turn}", encoding="utf-8")
             self.store.finish()
@@ -72,7 +72,7 @@ class StoreTest(unittest.TestCase):
     def test_conflict_detection_on_external_edit(self):
         target = self.path("a.txt", "v0")
         self.store.begin("改")
-        self.store.record(target, "v0")
+        self.store.record(target, b"v0")
         target.write_text("v1", encoding="utf-8")
         self.store.finish()
         self.assertEqual(self.store.conflicts(1), [])
@@ -82,13 +82,13 @@ class StoreTest(unittest.TestCase):
     def test_oversized_file_skipped(self):
         target = self.path("big.txt", "x")
         self.store.begin("大文件")
-        self.store.record(target, "y" * (rw.MAX_FILE_BYTES + 1))
+        self.store.record(target, b"y" * (rw.MAX_FILE_BYTES + 1))
         self.store.finish()
         self.assertEqual(self.store.points()[0].files, {})
         self.assertEqual(self.store.skipped_from(1), [str(target)])
 
     def test_record_outside_turn_is_noop(self):
-        self.store.record(self.path("a.txt", "v0"), "v0")
+        self.store.record(self.path("a.txt", "v0"), b"v0")
         self.assertEqual(self.store.points(), [])
 
     def test_cap_evicts_oldest(self):

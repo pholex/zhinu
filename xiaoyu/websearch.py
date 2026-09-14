@@ -136,6 +136,7 @@ def make_web_search_tool(
             "required": ["query"],
         },
         handler=web_search,
+        untrusted=True,
         #  只读互联网、不改本地；查询发往用户自己配了 key 的厂商官方端点，
         #  信任级别与主对话相同，逐次确认只会让模型不用它。
         requires_approval=False,
