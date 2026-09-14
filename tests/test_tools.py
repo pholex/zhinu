@@ -843,7 +843,10 @@ class TestEncodingSafeEdits(ToolboxTestCase):
         )
         self.box.rewind.finish()
         self.assertFalse(result.startswith("ERROR"), result)
-        self.assertEqual(target.read_bytes(), "第一行：你好\n第二行：小羽\n".encode("gbk"))
+        #  写回走文本模式：Windows 上换行按平台约定落成 CRLF（与改造前一致），比编码不比换行
+        self.assertEqual(
+            target.read_bytes().replace(b"\r\n", b"\n"), "第一行：你好\n第二行：小羽\n".encode("gbk")
+        )
         ok, _ = self.box.rewind.rewind_files(1)
         self.assertTrue(ok)
         self.assertEqual(target.read_bytes(), original)
@@ -879,4 +882,6 @@ class TestEncodingSafeEdits(ToolboxTestCase):
             {"path": "legacy.py", "old_str": "    return '你好'\n", "new_str": "    return '世界'\n"},
         )
         self.assertFalse(result.startswith("ERROR"), result)
-        self.assertEqual(target.read_bytes().decode("gbk"), "def f():\n    return '世界'\n")
+        self.assertEqual(
+            target.read_bytes().decode("gbk").replace("\r\n", "\n"), "def f():\n    return '世界'\n"
+        )
