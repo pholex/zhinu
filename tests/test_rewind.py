@@ -148,7 +148,7 @@ class AgentRewindTest(unittest.TestCase):
         self.tmp = tf.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
         config = Config(
-            base_url="http://localhost:9", model="deepseek-v4-pro",
+            base_url="http://localhost:9", model="deepseek-flash",
             workspace=Path(self.tmp.name).resolve(),
             enable_plugins=False, enable_mcp=False, enable_skills=False,
             enable_explore=False, enable_web_search=False,

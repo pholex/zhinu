@@ -69,14 +69,14 @@ class TestWebSearchTool(unittest.TestCase):
         out = _tool(_registry(_response()), usage).handler(query="X 是什么")
         self.assertIn("结论：X", out)
         self.assertIn("联网搜索结论", out)
-        entry = usage.by_model["deepseek/deepseek-v4-flash"]
+        entry = usage.by_model["deepseek/deepseek-flash"]
         self.assertEqual((entry.prompt_tokens, entry.completion_tokens, entry.calls), (100, 20, 1))
 
     def test_request_uses_flash_and_builtin_tool(self):
         registry = _registry(_response())
         _tool(registry).handler(query="q")
         request = registry.client("deepseek").responses.create.last_request
-        self.assertEqual(request["model"], "deepseek-v4-flash")
+        self.assertEqual(request["model"], "deepseek-flash")
         self.assertEqual(request["tools"], [{"type": "web_search"}])
 
     def test_xai_backend_switch(self):

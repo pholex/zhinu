@@ -9,7 +9,7 @@
     capability_mode = "read-write"               # 可省：粗粒度档位，与 tools 二选一或叠加
     isolation = "worktree"                       # 可省：默认在独立 git worktree 里跑
     mcp = ["github"]                             # 可省：继承父会话的哪些 MCP server
-    model = "deepseek-v4-pro"                    # 可省：默认随主模型
+    model = "deepseek-flash"                     # 可省：默认随主模型
     effort = "low"                               # 可省：推理深度，默认随主会话
     max_iterations = 30                          # 可省：默认 20
     inherit = "distilled"                        # 可省：带父会话的精简历史起步

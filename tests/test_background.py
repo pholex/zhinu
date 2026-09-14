@@ -270,7 +270,7 @@ class AgentWiringTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             config = Config(
                 base_url="http://localhost:9",
-                model="deepseek-v4-pro",
+                model="deepseek-flash",
                 workspace=Path(tmp).resolve(),
                 enable_plugins=False,
                 enable_mcp=False,

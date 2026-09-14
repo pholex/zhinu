@@ -396,12 +396,12 @@ class TestDuckClient(unittest.TestCase):
         self.assertEqual(client.marker, "inner+{'timeout': 1.0}")
 
     def test_protocol_is_decided_per_model(self) -> None:
-        """协议按型号定：同一家常常只有部分型号开了 Responses（deepseek 就是
-        flash 通、pro 不通，而 pro 是默认主模型——按家切会当场切死）。"""
+        """协议按型号定：同一家常常只有部分型号开了 Responses（上一代 deepseek 就是
+        flash 通、pro 不通，而 pro 当时是默认主模型——按家切会当场切死）。"""
         inner = FakeClient(FakeResponses())
-        partial = responses.wrap(inner, ("deepseek-v4-flash",))
-        self.assertEqual(partial.protocol_for("deepseek-v4-flash"), "responses")
-        self.assertEqual(partial.protocol_for("deepseek-v4-pro"), "chat")
+        partial = responses.wrap(inner, ("deepseek-flash",))
+        self.assertEqual(partial.protocol_for("deepseek-flash"), "responses")
+        self.assertEqual(partial.protocol_for("chat-only-model"), "chat")
         whole = responses.wrap(inner, (responses.WILDCARD,))
         self.assertEqual(whole.protocol_for("随便什么名字"), "responses")
         #  没声明 = 整家走 chat（净化仍然照做，见 TestChatPassthrough）
@@ -410,14 +410,14 @@ class TestDuckClient(unittest.TestCase):
     def test_partial_provider_routes_each_model_to_its_own_protocol(self) -> None:
         """同一个 client 上两个型号各走各的路，不能串。"""
         inner = FakeClient(FakeResponses(events=[completed()]))
-        client = responses.wrap(inner, ("deepseek-v4-flash",))
+        client = responses.wrap(inner, ("deepseek-flash",))
         list(client.chat.completions.create(
-            model="deepseek-v4-flash", messages=[{"role": "user", "content": "hi"}], stream=True))
+            model="deepseek-flash", messages=[{"role": "user", "content": "hi"}], stream=True))
         client.chat.completions.create(
-            model="deepseek-v4-pro", messages=[{"role": "user", "content": "hi"}])
-        self.assertEqual([c["model"] for c in inner.responses.calls], ["deepseek-v4-flash"])
+            model="chat-only-model", messages=[{"role": "user", "content": "hi"}])
+        self.assertEqual([c["model"] for c in inner.responses.calls], ["deepseek-flash"])
         self.assertEqual(
-            [c["model"] for c in inner.chat.completions.calls], ["deepseek-v4-pro"]
+            [c["model"] for c in inner.chat.completions.calls], ["chat-only-model"]
         )
 
 
@@ -432,7 +432,7 @@ class TestChatPassthrough(unittest.TestCase):
 
     def test_request_is_forwarded_verbatim(self) -> None:
         sent = self.send(
-            model="deepseek-v4-pro",
+            model="chat-only-model",
             messages=[{"role": "user", "content": "hi"}],
             stream=True,
             stream_options={"include_usage": True},
@@ -441,7 +441,7 @@ class TestChatPassthrough(unittest.TestCase):
         self.assertEqual(
             sent,
             {
-                "model": "deepseek-v4-pro",
+                "model": "chat-only-model",
                 "messages": [{"role": "user", "content": "hi"}],
                 "stream": True,
                 "stream_options": {"include_usage": True},
@@ -461,7 +461,7 @@ class TestChatPassthrough(unittest.TestCase):
             {"role": "user", "content": "hi"},
             {"role": "assistant", "content": "ok", REASONING_KEY: {"model": "m", "items": [{}]}},
         ]
-        sent = self.send(model="deepseek-v4-pro", messages=history)
+        sent = self.send(model="chat-only-model", messages=history)
         self.assertEqual(
             sent["messages"],
             [{"role": "user", "content": "hi"}, {"role": "assistant", "content": "ok"}],
@@ -523,7 +523,7 @@ class TestToolSignatures(unittest.TestCase):
         """会话中途切到签名型号：历史是别家模型产的，没有签名会被 400 拒收。"""
         history = self.history()
         history[1][responses.TOOL_EXTRAS_KEY] = {
-            "model": "deepseek-v4-pro",
+            "model": "chat-only-model",
             "provider": "deepseek",
             "extras": {"a": self.SIG},
         }
@@ -538,7 +538,7 @@ class TestToolSignatures(unittest.TestCase):
         """非签名型号不补占位；不匹配的签名也不许跨路由塞回去。"""
         inner = FakeClient(FakeResponses())
         client = Transport(inner, (), provider="deepseek")
-        client.chat.completions.create(model="deepseek-v4-pro", messages=self.history())
+        client.chat.completions.create(model="chat-only-model", messages=self.history())
         sent = inner.chat.completions.calls[0]
         for call in sent["messages"][1]["tool_calls"]:
             self.assertNotIn("extra_content", call)

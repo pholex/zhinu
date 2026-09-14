@@ -356,15 +356,14 @@ class ContextWindowTest(unittest.TestCase):
         return config.Config(base_url="", model=model, workspace=Path.cwd())
 
     def test_known_model_gets_table_window(self) -> None:
-        self.assertEqual(self._config("deepseek-v4-flash").context_limit, 1_000_000)
-        self.assertEqual(self._config("deepseek-v4-pro").context_limit, 1_000_000)
+        self.assertEqual(self._config("deepseek-flash").context_limit, 1_000_000)
         self.assertEqual(self._config("glm-5.3").context_limit, 1_000_000)
         self.assertEqual(self._config("kimi-k3").context_limit, 1_048_576)
         self.assertEqual(self._config("claude-fable-5").context_limit, 1_000_000)
         self.assertEqual(self._config("qwen3.8-max").context_limit, 1_000_000)
 
     def test_qualified_name_strips_provider_prefix(self) -> None:
-        self.assertEqual(self._config("gateway/deepseek-v4-pro").context_limit, 1_000_000)
+        self.assertEqual(self._config("gateway/deepseek-flash").context_limit, 1_000_000)
 
     def test_unknown_model_falls_back(self) -> None:
         self.assertEqual(
@@ -374,13 +373,13 @@ class ContextWindowTest(unittest.TestCase):
 
     def test_limit_follows_model_switch(self) -> None:
         """/model 切换、粘性降级都只改 config.model，上限必须跟着走。"""
-        cfg = self._config("deepseek-v4-pro")
+        cfg = self._config("deepseek-flash")
         cfg.model = "unlisted-model"
         self.assertEqual(cfg.context_limit, config.FALLBACK_CONTEXT_LIMIT)
 
     def test_explicit_override_beats_table(self) -> None:
         """XIAOYU_CONTEXT_LIMIT / 直接赋值是一刀切：换模型也不回落查表。"""
-        cfg = self._config("deepseek-v4-pro")
+        cfg = self._config("deepseek-flash")
         cfg.context_limit = 50_000
         self.assertEqual(cfg.context_limit, 50_000)
         cfg.model = "unlisted-model"

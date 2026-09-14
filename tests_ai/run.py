@@ -12,7 +12,7 @@
 用法（在仓库根目录）：
     .venv/bin/python tests_ai/run.py              # 全部 test_*.md
     .venv/bin/python tests_ai/run.py layering     # 名字含 layering 的
-    XIAOYU_MODEL=deepseek-v4-pro .venv/bin/python tests_ai/run.py
+    XIAOYU_MODEL=deepseek-flash .venv/bin/python tests_ai/run.py
 
 要求环境已配好模型 key（吃仓库 .env，与日常跑 xiaoyu 相同）。
 """

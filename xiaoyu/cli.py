@@ -116,7 +116,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="把系统剪贴板里的图片随指令一起发（仅一次性模式）",
     )
     parser.add_argument("--version", action="version", version=f"xiaoyu {__version__}")
-    parser.add_argument("--model", help="模型名，默认 deepseek-v4-pro")
+    parser.add_argument("--model", help="模型名，默认 deepseek-flash")
     parser.add_argument("--base-url", dest="base_url", help="OpenAI 兼容端点")
     parser.add_argument("--workspace", help="工作区根目录，默认当前目录")
     parser.add_argument(
@@ -325,7 +325,7 @@ def config_command(argv: list[str]) -> int:
         dest="pairs",
         action="append",
         metavar="KEY=VALUE",
-        help="非交互写入一项配置，可重复（如 --set XIAOYU_MODEL=deepseek-v4-pro）",
+        help="非交互写入一项配置，可重复（如 --set XIAOYU_MODEL=deepseek-flash）",
     )
     args = parser.parse_args(argv)
 
@@ -2603,7 +2603,7 @@ def main(argv: list[str] | None = None) -> int:
                     print(
                         ui.error(
                             f"当前模型 {config.model} 未声明视觉能力，--image/--paste 发不出去。"
-                            "换视觉模型（如 --model deepseek-v4-flash-vision-exp）；"
+                            "换视觉模型（如 --model deepseek-flash）；"
                             "或用 XIAOYU_VISION_FALLBACK 点名一个代读模型；"
                             "或用 XIAOYU_VISION_MODELS 点名放行网关上的视觉模型"
                         ),

@@ -3,7 +3,7 @@
 跑法：
     .venv/bin/xiaoyu-eval                      # 跑全部 case
     .venv/bin/xiaoyu-eval --case targeted_edit # 只跑一个
-    .venv/bin/xiaoyu-eval --model deepseek-v4-pro --repeat 3
+    .venv/bin/xiaoyu-eval --model deepseek-flash --repeat 3
 
 结果同时打到终端并存到当前目录 xiaoyu-eval-results/*.json，方便比较"改 prompt / 换模型前后"的差异。
 

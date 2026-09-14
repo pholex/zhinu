@@ -254,7 +254,7 @@ class TestEventSerialization(unittest.TestCase):
             ToolDenied("bash", by="rule"),
             PlanUpdated([{"step": "x", "status": "pending"}], "原因"),
             Notice("[提示]", "warn"),
-            RequestStarted("deepseek-v4-pro"),
+            RequestStarted("deepseek-flash"),
             RequestEnded(),
         ]
         kinds = set()
@@ -298,9 +298,9 @@ class TestPlainSink(unittest.TestCase):
 
         buffer = TtyBuffer()
         with contextlib.redirect_stdout(buffer):
-            sink.emit(RequestStarted("deepseek-v4-pro"))
+            sink.emit(RequestStarted("deepseek-flash"))
         out = buffer.getvalue()
-        self.assertIn("deepseek-v4-pro", out)
+        self.assertIn("deepseek-flash", out)
         self.assertIn("思考中", out)
 
     def test_osc133_anchors_only_on_terminal(self) -> None:

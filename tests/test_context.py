@@ -520,15 +520,15 @@ class TestUsageAccounting(unittest.TestCase):
         usage = Usage()
         usage.add("pricey-model", 1000, 200)
         usage.add("pricey-model", 1500, 300)
-        usage.add("deepseek-v4-flash", 8000, 400)
+        usage.add("deepseek-flash", 8000, 400)
 
         self.assertEqual(usage.turns, 3)
         self.assertEqual(usage.prompt_tokens, 10500)
         self.assertEqual(usage.completion_tokens, 900)
-        self.assertEqual(usage.by_model["deepseek-v4-flash"].calls, 1)
+        self.assertEqual(usage.by_model["deepseek-flash"].calls, 1)
         self.assertEqual(usage.by_model["pricey-model"].calls, 2)
         #  摘要跑在便宜模型上这件事必须能看出来，否则算不出省了多少
-        self.assertIn("deepseek-v4-flash", str(usage))
+        self.assertIn("deepseek-flash", str(usage))
 
     def test_empty(self) -> None:
         from xiaoyu.agent import Usage
