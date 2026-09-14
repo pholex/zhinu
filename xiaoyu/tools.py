@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import contextlib
 import fnmatch
+import codecs
 import functools
 import hashlib
 import json
@@ -104,6 +105,68 @@ def _partial_chunks(stdout: bytes | str | None, stderr: bytes | str | None) -> s
     if err := _decode_output(stderr).strip():
         chunks.append(f"stderr:\n{err}")
     return "\n".join(chunks)
+
+
+class _Undecodable(Exception):
+    """文件在全部候选编码下都解不出无损文本。"""
+
+
+def _edit_encodings() -> list[str]:
+    """编辑链路解码原文的候选编码：UTF-8 优先，其次本地代码页与 GBK。
+
+    GBK 单列一项：中文 Windows 的存量源码/配置就是这个形态，而开发机的本地
+    代码页多半是 UTF-8，只靠 locale 覆盖不到。去重按 codecs 规范名（cp936 即 gbk）。
+    """
+    names: list[str] = []
+    for candidate in ("utf-8", locale.getpreferredencoding(False) or "", "gbk"):
+        try:
+            canonical = codecs.lookup(candidate).name
+        except LookupError:
+            continue
+        if canonical not in names:
+            names.append(canonical)
+    return names
+
+
+def _read_for_edit(target: Path) -> tuple[str, str, bytes]:
+    """严格解码读文件，返回 (文本, 编码, 原始字节)；解不开抛 _Undecodable。
+
+    有损解码（errors="replace"）后再写回，会把无法识别的字节永久替换成 U+FFFD
+    ——GBK 文件改一处就整篇中文变成 �，而且 /rewind 快照里存的也是坏文本，
+    救不回来。所以编辑链路只接受能无损解码的文件，并按原编码写回。
+    换行按 read_text 的通用换行规则归一（\\r\\n、\\r → \\n），与原先的读法一致，
+    old_str 的匹配语义不变。原始字节留给 /rewind 做逐字节恢复。
+    """
+    raw = target.read_bytes()
+    for encoding in _edit_encodings():
+        try:
+            decoded = raw.decode(encoding)
+        except UnicodeDecodeError:
+            continue
+        return decoded.replace("\r\n", "\n").replace("\r", "\n"), encoding, raw
+    raise _Undecodable(str(target))
+
+
+def _undecodable_error(path: str) -> str:
+    return (
+        f"ERROR: {path} 按 UTF-8、GBK 都无法无损解码（可能是二进制或其它编码），"
+        "已拒绝编辑——有损解码后写回会把无法识别的字节永久替换成 �。"
+        "如确需修改，请先向用户确认文件编码，再用 bash 按正确编码处理。"
+    )
+
+
+def _unencodable_error(path: str, text: str, encoding: str) -> str | None:
+    """新内容能否用原文件的编码表示；不能则返回拒绝写入的说明。"""
+    try:
+        text.encode(encoding)
+    except UnicodeEncodeError as exc:
+        return (
+            f"ERROR: {path} 是 {encoding} 编码的文件，新内容里的 "
+            f"{exc.object[exc.start:exc.end]!r} 无法用该编码表示，已拒绝写入"
+            "（强行转码会改变整个文件的编码）。换成该编码能表示的写法再试，"
+            "或先征得用户同意再转换文件编码。"
+        )
+    return None
 
 
 @functools.lru_cache(maxsize=1)
@@ -1335,11 +1398,24 @@ class Toolbox:
         if target.is_dir():
             return f"ERROR: {path} 是目录，不是文件。用 list_files 看目录。"
         try:
-            text = target.read_text(encoding="utf-8", errors="replace")
+            text, encoding, _ = _read_for_edit(target)
+        except _Undecodable:
+            #  只读展示仍给有损文本（总比什么都不给强），但明说有损、编辑会被拒
+            try:
+                text, encoding = target.read_text(encoding="utf-8", errors="replace"), ""
+            except OSError as exc:
+                return f"ERROR: 读取失败 {path}: {exc}"
         except OSError as exc:
             return f"ERROR: 读取失败 {path}: {exc}"
 
         prefix = "(注意：该路径在工作区之外)\n" if outside else ""
+        if not encoding:
+            prefix += (
+                "(注意：该文件含 UTF-8、GBK 都解不开的字节，以下为有损显示，"
+                "� 处是无法识别的字节；str_replace 会拒绝编辑它)\n"
+            )
+        elif encoding != "utf-8":
+            prefix += f"(注意：该文件按 {encoding} 解码显示，str_replace 会按原编码写回)\n"
         if not text:
             self._mark_read(target)
             return f"{prefix}(文件为空：{path})"
@@ -1371,7 +1447,7 @@ class Toolbox:
         #  /rewind 快照：改前内容（新建文件记 None——回滚即删除）
         if existed:
             try:
-                self.rewind.record(target, target.read_text(encoding="utf-8", errors="replace"))
+                self.rewind.record(target, target.read_bytes())
             except OSError:
                 pass
         else:
@@ -1403,7 +1479,9 @@ class Toolbox:
             return guard
 
         try:
-            text = target.read_text(encoding="utf-8", errors="replace")
+            text, encoding, raw = _read_for_edit(target)
+        except _Undecodable:
+            return _undecodable_error(path)
         except OSError as exc:
             return f"ERROR: 读取失败 {path}: {exc}"
 
@@ -1412,7 +1490,9 @@ class Toolbox:
             #  精确匹配落空 → 逐级放宽的容错匹配。
             #  行尾空格 / tab-space 混用 / IDE 弯引号是三类最高频的"看着一样字节不同"，
             #  只要放宽后唯一命中就接受；多处命中仍打回——唯一性护栏不放松。
-            return self._fuzzy_replace(target, path, text, old_str, new_str, outside)
+            return self._fuzzy_replace(
+                target, path, text, old_str, new_str, outside, encoding, raw
+            )
         if count > 1:
             return (
                 f"ERROR: old_str 在 {path} 中出现了 {count} 次，无法确定改哪一处。"
@@ -1430,9 +1510,11 @@ class Toolbox:
             )
         line_no = text.count("\n", 0, offset) + 1
         updated = text.replace(old_str, new_str, 1)
-        self.rewind.record(target, text)
+        if error := _unencodable_error(path, updated, encoding):
+            return error
+        self.rewind.record(target, raw)
         try:
-            target.write_text(updated, encoding="utf-8")
+            target.write_text(updated, encoding=encoding)
         except OSError as exc:
             return f"ERROR: 写入失败 {path}: {exc}"
         self._mark_read(target)
@@ -1453,6 +1535,8 @@ class Toolbox:
         old_str: str,
         new_str: str,
         outside: bool,
+        encoding: str = "utf-8",
+        raw: bytes | None = None,
     ) -> str:
         """old_str 精确匹配落空后的容错路径。找不到时回显 old_str 帮模型自查。"""
         found = fuzzy_find_lines(text, old_str)
@@ -1502,9 +1586,11 @@ class Toolbox:
             + text_lines[found.line_index + found.line_count :]
         )
         updated = "\n".join(updated_lines)
-        self.rewind.record(target, text)
+        if error := _unencodable_error(path, updated, encoding):
+            return error
+        self.rewind.record(target, raw if raw is not None else text.encode(encoding))
         try:
-            target.write_text(updated, encoding="utf-8")
+            target.write_text(updated, encoding=encoding)
         except OSError as exc:
             return f"ERROR: 写入失败 {path}: {exc}"
         self._mark_read(target)

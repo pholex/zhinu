@@ -778,3 +778,66 @@ class TestSandboxEscalation(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestEncodingSafeEdits(ToolboxTestCase):
+    """编辑链路只接受能无损解码的文件，并按原编码写回：有损解码后写回会把原文永久写坏。"""
+
+    def setUp(self) -> None:
+        super().setUp()
+        #  候选编码里的 locale 一项钉成 UTF-8：西文 Windows 的 cp1252 什么字节都解得开，
+        #  会让"解不开"的用例在 CI 上失去意义
+        patcher = mock.patch("xiaoyu.tools.locale.getpreferredencoding", return_value="UTF-8")
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def test_gbk_file_round_trips_and_rewinds_byte_exact(self) -> None:
+        target = self.root / "legacy.txt"
+        original = "第一行：你好\n第二行：世界\n".encode("gbk")
+        target.write_bytes(original)
+        shown = self.box.run("read_file", {"path": "legacy.txt"})
+        self.assertIn("gbk", shown)
+        self.assertIn("你好", shown)
+        self.box.rewind.begin("改 GBK 文件")
+        result = self.box.run(
+            "str_replace", {"path": "legacy.txt", "old_str": "世界", "new_str": "小羽"}
+        )
+        self.box.rewind.finish()
+        self.assertFalse(result.startswith("ERROR"), result)
+        self.assertEqual(target.read_bytes(), "第一行：你好\n第二行：小羽\n".encode("gbk"))
+        ok, _ = self.box.rewind.rewind_files(1)
+        self.assertTrue(ok)
+        self.assertEqual(target.read_bytes(), original)
+
+    def test_gbk_file_rejects_text_the_encoding_cannot_hold(self) -> None:
+        target = self.root / "legacy.txt"
+        original = "你好\n".encode("gbk")
+        target.write_bytes(original)
+        self.box.run("read_file", {"path": "legacy.txt"})
+        result = self.box.run(
+            "str_replace", {"path": "legacy.txt", "old_str": "你好", "new_str": "你好😀"}
+        )
+        self.assertTrue(result.startswith("ERROR"), result)
+        self.assertEqual(target.read_bytes(), original)
+
+    def test_undecodable_file_is_shown_lossy_but_never_edited(self) -> None:
+        target = self.root / "blob.txt"
+        original = b"ok \xff\xfe\x80 tail\n"
+        target.write_bytes(original)
+        shown = self.box.run("read_file", {"path": "blob.txt"})
+        self.assertIn("有损显示", shown)
+        result = self.box.run("str_replace", {"path": "blob.txt", "old_str": "ok", "new_str": "no"})
+        self.assertTrue(result.startswith("ERROR"), result)
+        self.assertEqual(target.read_bytes(), original)
+
+    def test_fuzzy_path_keeps_encoding(self) -> None:
+        """精确匹配落空走容错匹配时，同样按原编码写回。"""
+        target = self.root / "legacy.py"
+        target.write_bytes("def f():\n    return '你好'   \n".encode("gbk"))
+        self.box.run("read_file", {"path": "legacy.py"})
+        result = self.box.run(
+            "str_replace",
+            {"path": "legacy.py", "old_str": "    return '你好'\n", "new_str": "    return '世界'\n"},
+        )
+        self.assertFalse(result.startswith("ERROR"), result)
+        self.assertEqual(target.read_bytes().decode("gbk"), "def f():\n    return '世界'\n")
