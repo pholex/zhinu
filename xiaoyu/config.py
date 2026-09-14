@@ -248,9 +248,11 @@ class Config:
     #  前者只查代码不上网，后者要行为确定）
     enable_web_search: bool = True
     #  web_search 用哪家的内置搜索（websearch.SEARCH_BACKENDS 的键）。
-    #  默认 deepseek：单次约 2 分钱；xai（grok-4.6）搜索质量更强、引用更全，
-    #  但单次约 35 倍价（token 贵 + 每次搜索按次收费）——2026-08 对比实测见 playbook。
-    search_provider: str = "deepseek"
+    #  目前只有 xai（2026-09-14 起）：deepseek 官方 Responses 忽略 web_search 等内置工具，
+    #  实测服务端不真正搜索，后端已移除。grok-4.6 实测真搜且带引用，单次约 0.65 元
+    #  （token 贵 + 每次搜索按次收费，2026-08 对比实测见 playbook）。没配 XAI_API_KEY 时
+    #  web_search 不进 schemas（见 websearch 的 check_fn），不会拿到坏结果
+    search_provider: str = "xai"
     #  是否挂 browser 浏览器工具（依赖可选 extra `[browser]` 的 playwright，
     #  没装时即便开着也不出现，见 tools.py 的 check_fn 门控）。单独给开关是因为
     #  可用性绑在「宿主装没装某个包」上：装了 playwright 又用不到浏览器的机器

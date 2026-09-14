@@ -160,10 +160,11 @@ PRESETS: dict[str, Preset] = {
         #  键名就用厂商原生名，.env / 环境变量 / Keychain 三处同名，用户只记一个
         key_envs=("DEEPSEEK_API_KEY",),
         label="直连 deepseek",
-        #  走 /responses：实测两边 token 计数完全一致（473 vs 473），换协议不多花钱；
-        #  /responses 回 encrypted reasoning（选边的收益所在）。协议仍按型号声明——
-        #  上一代 v4-pro 就是 /responses 未开放、只能走 chat 的"一家两制"
-        responses_models=("deepseek-flash",),
+        #  ⚠️ 刻意留在 chat：官方 Responses 文档（2026-09-14）写明 include 不支持、不回
+        #  encrypted reasoning、web_search 等内置工具被忽略，store / previous_response_id /
+        #  truncation 等也不支持——走 /responses 的唯一收益（加密推理回放）不存在，还多一层
+        #  "今天被忽略、明天可能 400"的风险。实测两路 token 计数一致（473 vs 473），
+        #  小羽全管线 /responses 四轮工具调用也跑通过，只是没有理由选它
         #  2026-09-14 四象限图 chat 与 /responses 两路四色全中。⚠️ 判法别只看状态码：
         #  上一代 v4-flash 的 /responses 曾 200 收下图、prompt_tokens 只涨 5 个、
         #  答"无法确定"——图被静默丢弃（见 experiments/vision_probe.py）
