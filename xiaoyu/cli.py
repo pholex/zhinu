@@ -1343,7 +1343,8 @@ def serve_command(argv: list[str]) -> int:
         default=[],
         metavar="ORIGIN",
         help="允许跨源访问的浏览器 origin（可重复），如 chrome-extension://<id> 或 "
-        "https://console.example.com。默认不发 CORS 头；非浏览器客户端不需要。token 仍照常校验",
+        "https://console.example.com。默认不发 CORS 头；非浏览器客户端不需要。token 仍照常校验；"
+        "无 token 时名单外的浏览器 origin 一律 403",
     )
     parser.add_argument(
         "--state-dir",

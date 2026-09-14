@@ -63,6 +63,8 @@ serve 是**跑在别处的编排器**（HTTP，一对多、可跨机、可轮询
 
 安全边界（这个服务会执行任意命令，边界必须是硬的）：
 - 默认只绑 127.0.0.1。绑到非回环地址时**必须**给 token，否则拒绝启动。
+- 回环且无 token 时，本机浏览器是唯一够得着它的外人：Host 白名单挡 DNS rebinding，
+  Origin 白名单挡跨站请求 / WebSocket（见 `_install_local_guard`）。
 - `--workspace` 是 root：session 只能落在它或它的子目录里，越界 400。
 - folder trust 按信任表非交互判定（headless 纪律，与 acp 一致）：没信任
   记录的目录不吃工作区级 .mcp.json/permissions/.env，也绝不在协议通道上发问。
@@ -87,6 +89,7 @@ import uuid
 from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
 #  Request 必须在**模块全局**里解析得到，不能只在 create_app 内部 import：
 #  本文件有 `from __future__ import annotations`，路由函数的注解是字符串，
@@ -201,6 +204,7 @@ class ServeConfig:
     #  允许跨源（CORS）的浏览器 origin 白名单，如 `chrome-extension://<id>`、
     #  `https://console.example.com`。空 = 不发任何 CORS 头（非浏览器客户端不需要）。
     #  只是"浏览器肯不肯把响应交给页面脚本"的门，不是鉴权——token 仍照常校验。
+    #  无 token 时它兼作 Origin 白名单：名单外的浏览器 origin 一律 403（_install_local_guard）。
     cors_origins: tuple[str, ...] = ()
     #  浏览器桥（/session/{id}/browser）：等扩展回一次调用结果的上限（秒）
     browser_timeout: float = DEFAULT_CALL_TIMEOUT
@@ -624,6 +628,69 @@ def build_agent(
     return agent, manager
 
 
+LOOPBACK_NAMES = frozenset({"127.0.0.1", "localhost", "::1"})
+#  容器里的编排器经 Docker Desktop 访问宿主回环时用的主机名（print_openapi 推荐的写法）。
+#  公网 DNS 注册不到这个名字，攻击页没法让浏览器带着它发请求。
+DOCKER_HOST_NAME = "host.docker.internal"
+
+
+def _hostname(netloc: str) -> str:
+    """Host 头的值 → 小写主机名（剥端口与 IPv6 方括号）；解析不了返回空串。"""
+    try:
+        return (urlsplit("//" + netloc).hostname or "") if netloc else ""
+    except ValueError:
+        return ""
+
+
+def _install_local_guard(app: Any, cfg: ServeConfig) -> None:
+    """无 token 时的浏览器侧闸。这个服务能执行任意命令，而无 token 的回环 serve
+    唯一够得着它的"外人"是用户本机浏览器里跑的网页，两条路都得堵：
+
+    - **DNS rebinding**：攻击者域名先解析到自己、再改解析到 127.0.0.1，页面脚本
+      就成了"同源"请求，CORS 根本不起作用。但浏览器发出的 Host 仍是攻击者域名——
+      只收回环主机名即可挡住（端口不看：rebinding 控制不了主机名，端口映射/反代会改端口）。
+    - **跨站请求 / WebSocket**：Host 正确，但 Origin 是别的站。简单 POST 与 WebSocket
+      握手都不走 CORS 预检，请求会真的执行——只放行本服务自己的 origin（/docs 页）
+      与 `--cors-origin` 白名单。不带 Origin 的是非浏览器客户端（curl / n8n / SDK），照常放行。
+
+    有 token 时不装：攻击页拿不到凭据，而反代改写 Host、持令牌的任意 origin 客户端都得照常能用。
+    """
+    hosts = LOOPBACK_NAMES | {DOCKER_HOST_NAME}
+    origins = {f"http://{name}:{cfg.port}" for name in ("127.0.0.1", "localhost", "[::1]")}
+    origins |= {o.rstrip("/") for o in cfg.cors_origins}
+
+    class _LocalGuard:
+        def __init__(self, inner: Any) -> None:
+            self.inner = inner
+
+        async def __call__(self, scope: Any, receive: Any, send: Any) -> None:
+            if scope["type"] not in ("http", "websocket"):
+                await self.inner(scope, receive, send)
+                return
+            headers = {k.decode("latin-1").lower(): v.decode("latin-1") for k, v in scope.get("headers", [])}
+            origin = headers.get("origin")
+            if _hostname(headers.get("host", "")) not in hosts:
+                reason = "Host 不是本机地址（疑似 DNS rebinding）。无 token 的 serve 只接受回环主机名；经其它主机名访问请加 --token"
+            elif origin is not None and origin.rstrip("/") not in origins:
+                reason = f"跨站 origin {origin!r} 不在白名单。浏览器客户端用 --cors-origin 放行，或给服务加 --token"
+            else:
+                await self.inner(scope, receive, send)
+                return
+            if scope["type"] == "websocket":
+                #  accept 之前发 close：服务器回 HTTP 403，握手不成立
+                await send({"type": "websocket.close", "code": 1008, "reason": "forbidden"})
+                return
+            body = json.dumps({"detail": reason}, ensure_ascii=False).encode("utf-8")
+            await send({
+                "type": "http.response.start",
+                "status": 403,
+                "headers": [(b"content-type", b"application/json"), (b"content-length", str(len(body)).encode())],
+            })
+            await send({"type": "http.response.body", "body": body})
+
+    app.add_middleware(_LocalGuard)
+
+
 def _install_cors(app: Any, origins: tuple[str, ...]) -> None:
     """给白名单里的浏览器 origin 发 CORS 头（含 Chrome 的 Private Network Access 预检）。
 
@@ -749,6 +816,8 @@ def create_app(cfg: ServeConfig):  # noqa: C901 - 路由表天然长，拆开反
     app.state.sessions = sessions
     if cfg.cors_origins:
         _install_cors(app, cfg.cors_origins)
+    if not cfg.token:
+        _install_local_guard(app, cfg)
 
     # ---------- 鉴权 ----------
 
