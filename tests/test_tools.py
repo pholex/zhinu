@@ -530,10 +530,18 @@ class TestBashAndSafety(ToolboxTestCase):
             proc = real_popen(*args, **kwargs)  # type: ignore[arg-type]
             spawned.append(proc)
 
-            def interrupt(timeout: float | None = None) -> tuple[bytes, bytes]:
-                raise KeyboardInterrupt
+            real_wait = proc.wait
+            fired: list[bool] = []
 
-            proc.communicate = interrupt  # type: ignore[method-assign]
+            def interrupt(timeout: float | None = None) -> int:
+                #  只在工具等待命令时模拟一次 Ctrl-C；之后的 wait（测试自己的
+                #  断言）走真实实现
+                if not fired:
+                    fired.append(True)
+                    raise KeyboardInterrupt
+                return real_wait(timeout=timeout)
+
+            proc.wait = interrupt  # type: ignore[method-assign]
             return proc
 
         with mock.patch.object(tools_module.subprocess, "Popen", spy_popen):
@@ -543,6 +551,37 @@ class TestBashAndSafety(ToolboxTestCase):
         #  整组应已被 SIGKILL；若还活着，wait 会在 5s 后抛 TimeoutExpired
         proc.wait(timeout=5)
         self.assertIsNotNone(proc.poll())
+
+    def test_bash_huge_output_is_bounded_in_memory(self) -> None:
+        """几十 MB 的输出只在内存里留头尾：开头、结尾都在，中间标注丢了多少。"""
+        from xiaoyu import tools as tools_module
+
+        self.config.max_tool_output = 10_000_000
+        with mock.patch.object(tools_module, "_PIPE_KEEP_BYTES", 1024 * 1024):
+            result = self.box.run(
+                "bash",
+                {"command": (
+                    "python3 -c \"import sys; w=sys.stdout.write; w('HEAD_MARK\\n');"
+                    " [w('中' * 1000 + '\\n') for _ in range(20000)]; w('TAIL_MARK\\n')\""
+                )},
+            )
+        self.assertIn("exit_status: 0", result)
+        self.assertIn("HEAD_MARK", result)
+        self.assertIn("TAIL_MARK", result)
+        self.assertIn("字节未保留", result)
+        #  截断点对齐了 UTF-8 边界：没有退化成 GBK 乱码或替换字符
+        self.assertNotIn("\ufffd", result)
+        self.assertLess(len(result), 2 * 1024 * 1024)
+
+    def test_bounded_pipe_keeps_everything_under_limit(self) -> None:
+        import io
+
+        from xiaoyu.tools import _BoundedPipe
+
+        pipe = _BoundedPipe(io.BytesIO(b"x" * 1000), keep=4096)
+        pipe.thread.join(5)
+        self.assertEqual(pipe.value(), b"x" * 1000)
+        self.assertEqual(pipe.dropped, 0)
 
     def test_decode_output_falls_back_to_gbk(self) -> None:
         """中文 Windows 的 GBK 输出不能解成一串 �——报错可读性就是自愈能力。

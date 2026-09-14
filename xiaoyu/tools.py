@@ -9,6 +9,7 @@
 
 from __future__ import annotations
 
+import collections
 import contextlib
 import fnmatch
 import codecs
@@ -145,6 +146,94 @@ def _decode_output(data: bytes | str | None) -> str:
         except (UnicodeDecodeError, LookupError):
             continue
     return data.decode("utf-8", errors="replace")
+
+
+#  bash 输出在内存里的上限（stdout / stderr 各自）：开头、结尾各留一半，中间丢弃
+#  并计数。远大于 max_tool_output——超出那部分还要落 spill 供 recall 取回；这里只
+#  防几 GB 的输出（cat 大日志、失控的循环打印）把进程内存吃爆。留结尾是因为测试
+#  失败汇总、构建报错都在最后（与 _truncate 同理）。
+_PIPE_KEEP_BYTES = 8 * 1024 * 1024
+_PIPE_READ_CHUNK = 64 * 1024
+
+
+class _BoundedPipe:
+    """后台线程读一路管道，内存里只留头尾（替代 communicate 的无界读取）。"""
+
+    def __init__(self, stream: Any, keep: int | None = None) -> None:
+        #  调用时再读模块常量（默认参数在定义时就绑死，改常量不生效）
+        self._half = max(1, (_PIPE_KEEP_BYTES if keep is None else keep) // 2)
+        self._head = bytearray()
+        self._tail: collections.deque[bytes] = collections.deque()
+        self._tail_size = 0
+        self.dropped = 0
+        self.thread = threading.Thread(target=self._pump, args=(stream,), daemon=True)
+        self.thread.start()
+
+    def _pump(self, stream: Any) -> None:
+        read = getattr(stream, "read1", None) or stream.read
+        try:
+            while chunk := read(_PIPE_READ_CHUNK):
+                room = self._half - len(self._head)
+                if room > 0:
+                    self._head += chunk[:room]
+                    chunk = chunk[room:]
+                if not chunk:
+                    continue
+                self._tail.append(chunk)
+                self._tail_size += len(chunk)
+                #  整块淘汰最旧的尾部，直到再丢一块就不足一半为止
+                while self._tail and self._tail_size - len(self._tail[0]) >= self._half:
+                    old = self._tail.popleft()
+                    self._tail_size -= len(old)
+                    self.dropped += len(old)
+        except (OSError, ValueError):
+            pass  # 进程树被杀、管道被关：已读到的照常交付
+        finally:
+            with contextlib.suppress(OSError, ValueError):
+                stream.close()
+
+    def value(self) -> bytes:
+        tail = b"".join(self._tail)
+        if not self.dropped:
+            return bytes(self._head) + tail
+        head = _trim_partial_utf8(bytes(self._head))
+        #  尾部开头可能落在多字节字符中间：跳过至多 3 个续字节
+        skip = 0
+        while skip < min(3, len(tail)) and tail[skip] & 0xC0 == 0x80:
+            skip += 1
+        marker = f"\n…[输出过大：中间 {self.dropped} 字节未保留（内存上限），以下为结尾]…\n"
+        return head + marker.encode("utf-8") + tail[skip:]
+
+
+def _trim_partial_utf8(data: bytes) -> bytes:
+    """去掉结尾被截断的半个 UTF-8 字符（否则整段严格解码失败、退到 GBK 解成乱码）。"""
+    for back in range(1, min(4, len(data)) + 1):
+        byte = data[-back]
+        if byte & 0xC0 == 0x80:
+            continue
+        if byte >= 0xC0:
+            need = 2 if byte < 0xE0 else 3 if byte < 0xF0 else 4
+            return data[:-back] if back < need else data
+        return data
+    return data
+
+
+def _wait_bounded(proc: subprocess.Popen, pipes: list[_BoundedPipe], deadline: float) -> bool:
+    """等进程退出、两路管道读完，不超过 deadline；超时返回 False。
+
+    先等进程再等管道：进程退出了而孙进程还握着管道（`sleep 30 &`）时，管道的
+    EOF 迟迟不来——这同样算超时，交给调用方整树杀掉，与 communicate(timeout)
+    的语义一致。
+    """
+    try:
+        proc.wait(timeout=max(0.0, deadline - time.monotonic()))
+    except subprocess.TimeoutExpired:
+        return False
+    for pipe in pipes:
+        pipe.thread.join(max(0.0, deadline - time.monotonic()))
+        if pipe.thread.is_alive():
+            return False
+    return True
 
 
 def _partial_chunks(stdout: bytes | str | None, stderr: bytes | str | None) -> str:
@@ -1969,8 +2058,12 @@ class Toolbox:
             )
         except OSError as exc:
             return f"ERROR: 无法执行命令：{exc}"
+        #  不用 communicate：它把整份输出读进内存，几 GB 的输出能把进程吃爆
+        pipes = [_BoundedPipe(proc.stdout), _BoundedPipe(proc.stderr)]
         try:
-            stdout_raw, stderr_raw = proc.communicate(timeout=limit)
+            if not _wait_bounded(proc, pipes, started + limit):
+                raise subprocess.TimeoutExpired(argv, limit)
+            stdout_raw, stderr_raw = pipes[0].value(), pipes[1].value()
         except KeyboardInterrupt:
             #  Ctrl-C 的 SIGINT 只到前台进程组（我们自己）；子进程在独立会话里
             #  收不到，不杀就成遗孤继续跑、还握着管道。中断语义必须是
@@ -1981,10 +2074,8 @@ class Toolbox:
             _kill_tree(proc)
             #  整树已杀、管道随之关闭，这里只回收已缓冲的输出；再收不到就放弃，
             #  绝不能为了一点残余输出重新陷入无限期等待。
-            try:
-                stdout_raw, stderr_raw = proc.communicate(timeout=10)
-            except (subprocess.TimeoutExpired, OSError, ValueError):
-                stdout_raw, stderr_raw = b"", b""
+            _wait_bounded(proc, pipes, time.monotonic() + 10)
+            stdout_raw, stderr_raw = pipes[0].value(), pipes[1].value()
             elapsed = time.monotonic() - started
             #  超时不是 error：超时前的输出往往已经包含答案（比如测试
             #  跑完了只是进程没退出）。提示前置 + 部分输出照样给模型，exit 124 是
