@@ -9,25 +9,35 @@
   **保守方向**：拿不准就报风险（多问一次的代价可接受）。
 
 - ``dangerous_command``：回答"这条命令是不是破坏性操作"（强制 rm 等）。
-  攻击面在包装层：`sudo rm -rf`、`env X=1 rm -rf`、`bash -c 'rm -rf …'`、
-  `trap 'rm -rf …' EXIT` 都包着同一个 rm。识别时要**宽松解析、递归剥 wrapper**，
+  攻击面在包装层：`sudo -u root rm -rf`、`env -S 'rm -rf …'`、`bash -c 'rm -rf …'`、
+  `echo "$(rm -rf …)"` 都包着同一个 rm。识别时要**宽松解析、递归剥 wrapper**，
   尽量从复杂写法里挖出字面量命令。识别不出来不要紧——识别不出的命令本来
   就进不了 allow 通道（injection_risk / 前缀不匹配兜底），最终仍会走人工确认。
 
 - ``privileged_command``：回答"这条命令要不要提权"（sudo/doas/su/pkexec）。
   与 ``dangerous_command`` 同方向（宽松解析、剥同一批 wrapper），只是命中的
-  是另一类东西，所以剥法抽成了共用的 ``_peel_wrapper`` / ``_inner_scripts``。
+  是另一类东西，所以扫描骨架抽成了共用的 ``_scan_script`` / ``_scan_segment``。
   给 auto 档用：沙箱能拦住越权写盘，但提权是唯一可能捅穿它的动作，得有人看着。
+
+剥 wrapper 的关键是**认得每个 wrapper 的选项语法**：`sudo -u root rm` 里的 root
+是选项值不是命令名，`timeout 5 rm` 的 5 是 DURATION。只跳过 `-` 开头的 token 会把
+选项值当成命令，里面真正的 rm 就漏了。选项表见 ``_WRAPPERS``；表外的选项按
+fail-safe 处理（带值 / 不带值两种解释都扫），扫不完（嵌套过深、分叉过多）按有风险报。
 """
 
 from __future__ import annotations
 
 import re
 import shlex
+from dataclasses import dataclass, field
 
 #  递归剥 wrapper 的深度上限：
 #  防止构造出的嵌套命令把解析拖死
 _MAX_WRAPPER_DEPTH = 8
+#  嵌套层里被扫描的节点总数上限：表外选项会分叉出两种解释，层层嵌套时分叉相乘，
+#  靠它兜底。只数嵌套层——几百行的扁平脚本（heredoc 写文件）不该因为长而被判风险
+_MAX_SCAN_NODES = 512
+_TOO_COMPLEX = "命令嵌套过深或写法分叉过多，无法完整分析（按有风险处理）"
 
 
 def _split(segment: str) -> list[str]:
@@ -143,6 +153,13 @@ def injection_risk(segment: str) -> str | None:
 def injection_risk_argv(argv: list[str]) -> str | None:
     """injection_risk 的 argv 版：调用方已有可靠分词（bash_ast）时直接用，
     不再经 shlex 二次解析（二次解析会把引号里的内容又拆开）。"""
+    try:
+        return _injection_risk_argv(argv, 0)
+    except _TooComplex:
+        return _TOO_COMPLEX
+
+
+def _injection_risk_argv(argv: list[str], depth: int) -> str | None:
     if not argv:
         return None
     name = _base_name(argv[0])
@@ -192,6 +209,17 @@ def injection_risk_argv(argv: list[str]) -> str | None:
         return None
     if name == "xargs":
         return "xargs 会执行任意后续命令"
+    #  wrapper 不能替里面的命令洗白：`timeout 60 git -c core.pager=sh log` 被
+    #  `timeout 60 git*` 放行的话，git 的注入口就绕过去了。剥开逐个候选再查
+    if (peeled := _peel_wrapper(name, argv)) is not None:
+        commands, scripts = peeled
+        if scripts:
+            return f"{name} 的选项里带着一段脚本，前缀规则看不见里面跑什么"
+        for inner in commands:
+            if depth + 1 > _MAX_WRAPPER_DEPTH:
+                raise _TooComplex
+            if reason := _injection_risk_argv(_strip_shell_prefix(inner), depth + 1):
+                return reason
     return None
 
 
@@ -225,18 +253,322 @@ def _git_risk(args: list[str]) -> str | None:
     return None
 
 
-# ---------- 危险命令（递归剥 wrapper） ----------
+# ---------- wrapper 选项表 ----------
 
-#  透传型 wrapper：剥掉第一个 token 继续看真正的命令
-_PASSTHROUGH_WRAPPERS = {"sudo", "doas", "nice", "nohup", "time", "timeout", "stdbuf", "command"}
+#  选项的五种语法（剥法各不相同）：
+#  - value：必带值，`-u root` / `-uroot` / `--user root` / `--user=root`，值不是命令；
+#  - optional：值可选，只认粘连（`-m/proc/1/ns/mnt`、`--mount=…`），不吃下一个 token；
+#  - flag：不带值；
+#  - script：值是一段 shell 源码（`su -c '…'`），要重新当脚本扫；
+#  - split：值按空白拆成参数、插回原位继续当本 wrapper 的参数（`env -S '…'`）。
+#  **拿不准的选项宁可不写进表**：表外选项两种解释都扫，最多多报；把带值选项
+#  错写成 flag 则会把选项值当命令、真命令漏掉——这正是本表要修的那类洞。
+
+
+@dataclass(frozen=True)
+class _WrapperSpec:
+    """一个 wrapper 的命令行语法。options：选项名 → 语法；单字母是短选项，多字母是长选项（不写 --）。"""
+
+    options: dict[str, str] = field(default_factory=dict)
+    positionals: int = 0  # 命令之前的位置参数个数：timeout 的 DURATION、chroot 的 NEWROOT、flock 的锁文件
+    assignments: bool = False  # env：命令之前可以有 NAME=VALUE
+    numeric: bool = False  # nice 的老写法 `nice -10 cmd`
+    post_script: bool = False  # flock：锁文件之后可以是 `-c '脚本'`
+    shell_tail: bool = False  # su：选项可以出现在用户名之后（GNU 重排），用户名之后的参数整体交给 shell
+
+
+def _spec(*, value: str = "", optional: str = "", flag: str = "", script: str = "",
+          split: str = "", **extra) -> _WrapperSpec:
+    """用空格分隔的选项串建表，免得每个选项写一遍语法名。"""
+    options: dict[str, str] = {}
+    for kind, names in (("value", value), ("optional", optional), ("flag", flag),
+                        ("script", script), ("split", split)):
+        for option in names.split():
+            options[option] = kind
+    return _WrapperSpec(options, **extra)
+
+
+_SU_OPTIONS = dict(
+    value="g G s w group supp-group shell whitelist-environment",
+    flag="f l m p P fast login preserve-environment pty help version",
+    script="c command session-command",
+)
+
+#  wrapper → 语法（元组：一个命令有两种调用形态时两种都扫，如 runuser）。
+#  依据各自 man 手册（GNU coreutils / util-linux / sudo / systemd / BSD 变体取并集）。
+_WRAPPERS: dict[str, tuple[_WrapperSpec, ...]] = {
+    #  -h 既是 --help 又是 --host=host，-c 各版本含义不一：故意不写，走 fail-safe
+    "sudo": (_spec(
+        value="C D R T U g p r t u chdir chroot close-from command-timeout group host "
+              "login-class other-user prompt role type user",
+        optional="preserve-env",
+        flag="A B E H K N P S V b e i k l n s v askpass background bell edit help list login "
+             "non-interactive preserve-groups remove-timestamp reset-timestamp set-home shell "
+             "stdin validate version",
+    ),),
+    "doas": (_spec(value="C u", flag="L n s"),),
+    "run0": (_spec(
+        value="D g u area background chdir description group lightweight machine nice property "
+              "setenv shell-prompt-prefix slice unit user",
+        flag="no-ask-password pipe pty slice-inherit help version",
+    ),),
+    "pkexec": (_spec(value="u user", flag="disable-internal-agent keep-cwd help version"),),
+    #  GNU env 与 BSD env 取并集：-P altpath / -L|-U user 是 BSD 的带值选项
+    "env": (_spec(
+        value="C L P U a u argv0 chdir unset",
+        optional="block-signal default-signal ignore-signal",
+        flag="0 i v debug ignore-environment list-signal-handling null help version",
+        split="S split-string",
+        assignments=True,
+    ),),
+    "nice": (_spec(value="n adjustment", flag="help version", numeric=True),),
+    "ionice": (_spec(value="P c n p u class classdata pgid pid uid",
+                     flag="t ignore help version"),),
+    "nohup": (_spec(flag="help version"),),
+    "timeout": (_spec(value="k s kill-after signal",
+                      flag="f p v foreground preserve-status verbose help version",
+                      positionals=1),),
+    "stdbuf": (_spec(value="e i o error input output", flag="help version"),),
+    "command": (_spec(flag="p v V"),),
+    "exec": (_spec(value="a", flag="c l"),),
+    #  GNU time 与 BSD time 取并集（bash 关键字 time 只认 -p）
+    "time": (_spec(value="f o format output",
+                   flag="a h l p q v V append portability quiet verbose help version"),),
+    "setsid": (_spec(flag="c f w ctty fork wait help version"),),
+    "chroot": (_spec(value="G g u groups userspec", flag="n skip-chdir help version",
+                     positionals=1),),
+    "flock": (_spec(
+        value="E w conflict-exit-code timeout wait",
+        flag="F e n o s u x close exclusive nb no-fork nonblock shared unlock verbose help version",
+        script="c command",
+        positionals=1, post_script=True,
+    ),),
+    "su": (_spec(**_SU_OPTIONS, shell_tail=True),),
+    #  runuser 两种形态：`runuser -u user -- cmd …`（argv 形态）与 su 兼容形态
+    "runuser": (
+        _spec(value="u user " + _SU_OPTIONS["value"], flag=_SU_OPTIONS["flag"],
+              script=_SU_OPTIONS["script"]),
+        _spec(value="u user " + _SU_OPTIONS["value"], flag=_SU_OPTIONS["flag"],
+              script=_SU_OPTIONS["script"], shell_tail=True),
+    ),
+    "nsenter": (_spec(
+        value="G S W t setgid setuid target wdns",
+        optional="C T U i m n p r u w cgroup ipc mount net pid root time user uts wd",
+        flag="F N Z a c e all env follow-context join-cgroup keep-caps no-fork "
+             "preserve-credentials user-parent help version",
+    ),),
+    "unshare": (_spec(
+        value="G R S l w boottime load-interp map-group map-groups map-user map-users monotonic "
+              "propagation root setgid setgroups setuid wd",
+        optional="C T U i m n p u cgroup ipc kill-child mount mount-binfmt mount-proc net pid "
+                 "time user uts",
+        flag="c f r fork keep-caps map-auto map-current-user map-root-user help version",
+    ),),
+    "setpriv": (_spec(
+        value="ambient-caps apparmor-profile bounding-set egid euid groups inh-caps "
+              "landlock-access landlock-rule pdeathsig regid reuid rgid ruid securebits "
+              "seccomp-filter selinux-label",
+        flag="d clear-groups dump init-groups keep-groups nnp no-new-privs reset-env help version",
+    ),),
+    "systemd-run": (_spec(
+        value="C E H M p u capsule description gid host job-mode machine nice on-active on-boot "
+              "on-calendar on-startup on-unit-active on-unit-inactive path-property property "
+              "service-type setenv slice socket-property timer-property uid unit "
+              "working-directory",
+        flag="G P S d q r t collect no-ask-password no-block on-clock-change "
+             "on-timezone-change pipe pty quiet remain-after-exit same-dir scope send-sighup "
+             "shell slice-inherit system user wait help version",
+    ),),
+    #  GNU xargs 与 BSD xargs 取并集（-J/-R/-S 是 BSD 的带值选项）
+    "xargs": (_spec(
+        value="E I J L P R S a d n s arg-file delimiter max-args max-chars max-procs "
+              "process-slot-var",
+        optional="e i l eof max-lines replace",
+        flag="0 o p r t x exit interactive no-run-if-empty null open-tty show-limits verbose "
+             "help version",
+    ),),
+    "strace": (_spec(value="E I O P S U X a b e o p s u output",
+                     flag="C D F T V Z c d f h i k n q r t v w x y z"),),
+    "ltrace": (_spec(value="A D F a e l n o p s u x output",
+                     flag="C L S T V b c f h i r t w"),),
+    "chrt": (_spec(
+        value="D P T sched-deadline sched-period sched-runtime",
+        flag="R a b d e f i m o p r v all-tasks batch deadline ext fifo idle max other pid "
+             "reset-on-fork rr verbose help version",
+        positionals=1,
+    ),),
+    "taskset": (_spec(flag="a c p all-tasks cpu-list pid help version", positionals=1),),
+}
+
+#  所有 wrapper 名：permissions 的会话授权与 allow 探针都从这里取，加一个 wrapper 三处同时受益
+WRAPPER_NAMES = frozenset(_WRAPPERS)
+
+_NICE_NUMERIC = re.compile(r"-[+-]?\d+")
+
+
+class _TooComplex(ValueError):
+    """扫描超出深度 / 工作量上限：调用方按"有风险"处理，绝不当作安全。"""
+
+
+def unwrap_argv(argv: list[str]) -> list[list[str]] | None:
+    """剥一层 wrapper，返回里面可能被执行的命令 argv（选项里带的脚本包成 `sh -c 脚本`）。
+
+    不是 wrapper 返回 None；表外选项分叉过多时抛 ValueError（调用方按有风险处理）。
+    给 permissions 判 allow 规则模式用——它要看 `nice -n 5 *` 剥开以后放行的是什么。
+    """
+    if not argv:
+        return None
+    peeled = _peel_wrapper(_base_name(argv[0]), argv)
+    if peeled is None:
+        return None
+    commands, scripts = peeled
+    return commands + [["sh", "-c", script] for script in scripts]
+
+
+def _long_kind(spec: _WrapperSpec, name: str) -> str | None:
+    """长选项的语法。GNU getopt 接受无歧义缩写（`su --comm '…'`），按前缀匹配；
+    缩写能对上脚本类选项就当脚本（宁可多扫），其余有歧义的返回 None（表外）。"""
+    if kind := spec.options.get(name):
+        return kind if len(name) > 1 else None
+    if not name:
+        return None
+    kinds = {kind for option, kind in spec.options.items()
+             if len(option) > 1 and option.startswith(name)}
+    for preferred in ("script", "split"):
+        if preferred in kinds:
+            return preferred
+    return kinds.pop() if len(kinds) == 1 else None
+
+
+def _option_steps(argv: list[str], index: int,
+                  spec: _WrapperSpec) -> list[tuple[int, list[str], list[str]]]:
+    """解析 argv[index] 这个选项，返回每种可能解释的 (下一个 token 下标, 脚本值, 拆分值)。
+
+    表内选项只有一种解释；表外选项两种都给（带值吃掉下一个 token / 不带值）。
+    """
+    token = argv[index]
+    following = argv[index + 1] if index + 1 < len(argv) else None
+    after_value = index + 2 if following is not None else index + 1
+
+    def carried(kind: str, value: str | None, step: int) -> tuple[int, list[str], list[str]]:
+        found = [] if value is None else [value]
+        return (step, found if kind == "script" else [], found if kind == "split" else [])
+
+    if token.startswith("--"):
+        name, equals, attached = token[2:].partition("=")
+        kind = _long_kind(spec, name)
+        if kind in ("script", "split"):
+            return [carried(kind, attached if equals else following,
+                            index + 1 if equals else after_value)]
+        if kind == "value":
+            return [(index + 1 if equals else after_value, [], [])]
+        if kind in ("flag", "optional") or equals:
+            return [(index + 1, [], [])]
+        #  表外长选项：带值、不带值两种解释都走
+        return [(index + 1, [], []), (after_value, [], [])]
+
+    steps: list[tuple[int, list[str], list[str]]] = []
+    #  短选项聚合（-Eu root）：逐字母走，遇到带值字母为止；它的值是本 token 剩余部分或下一个 token
+    for offset in range(1, len(token)):
+        letter, rest = token[offset], token[offset + 1:]
+        kind = spec.options.get(letter)
+        if kind == "flag":
+            continue
+        if kind == "optional":
+            steps.append((index + 1, [], []))
+            return steps
+        if kind in ("value", "script", "split"):
+            steps.append(carried(kind, rest or following, index + 1 if rest else after_value))
+            return steps
+        #  表外字母：先记"它带值"这种解释，再当不带值继续往后走
+        steps.append((index + 1 if rest else after_value, [], []))
+    steps.append((index + 1, [], []))
+    return steps
+
+
+def _split_env_payload(payload: str) -> list[str]:
+    """`env -S` 的值拆成参数。GNU 有自己的转义（`\\_` 是分词空格、`\\c` 截断其后），
+    近似成 shlex；shlex 解析不了就按空白粗切（宽松方向）。"""
+    payload = payload.split("\\c", 1)[0].replace("\\_", " ")
+    return _split(payload) or payload.split()
+
+
+def _peel_wrapper(name: str, argv: list[str]) -> tuple[list[list[str]], list[str]] | None:
+    """wrapper 剥掉外层，返回 (里面可能被执行的命令 argv 列表, 选项里携带的脚本列表)。
+
+    不是 wrapper 则返回 None（注意与"是 wrapper 但里面是空"的 `([], [])` 区分）。
+    剥法只写这一处：危险命令、提权、注入三套判定共用，加一个 wrapper 三边同时受益。
+
+    做法是在 (下标, 还差几个位置参数, 是否已过 --, 已收集的位置参数) 状态上走一遍：
+    表外选项分叉成两条路，每条路走到命令位就记一个候选——宁可多扫几个候选，不漏真命令。
+    """
+    specs = _WRAPPERS.get(name)
+    if specs is None:
+        return None
+    commands: list[list[str]] = []
+    scripts: list[str] = []
+    for spec in specs:
+        seen: set[tuple[int, int, bool, tuple[str, ...]]] = set()
+        pending = [(1, spec.positionals, False, ())]
+        while pending:
+            state = pending.pop()
+            if state in seen:
+                continue
+            seen.add(state)
+            if len(seen) > _MAX_SCAN_NODES:
+                raise _TooComplex
+            index, need, ended, tail = state
+            if index >= len(argv):
+                #  su 形态：第一个位置参数是用户名，其后的参数原样交给 shell（`su root -- -c '…'`）
+                if spec.shell_tail and len(tail) > 1:
+                    commands.append(["sh", *tail[1:]])
+                continue
+            token = argv[index]
+            if not ended and token == "--":
+                pending.append((index + 1, need, True, tail))
+            elif not ended and token == "-":
+                #  env 的 `-` 等于 -i，su 的 `-` 等于 -l：都是开关
+                pending.append((index + 1, need, ended, tail))
+            elif not ended and token.startswith("-"):
+                if spec.numeric and _NICE_NUMERIC.fullmatch(token):
+                    pending.append((index + 1, need, ended, tail))
+                    continue
+                for step, found_scripts, found_splits in _option_steps(argv, index, spec):
+                    scripts.extend(found_scripts)
+                    for payload in found_splits:
+                        #  拆出来的参数插回原位，连同其后的参数重新当 env 的参数剥一遍
+                        commands.append([argv[0], *_split_env_payload(payload), *argv[step:]])
+                    pending.append((step, need, ended, tail))
+            elif spec.assignments and "=" in token.lstrip("="):
+                pending.append((index + 1, need, ended, tail))
+            elif spec.shell_tail:
+                pending.append((index + 1, need, ended, (*tail, token)))
+            elif need > 0:
+                pending.append((index + 1, need - 1, ended, tail))
+            elif spec.post_script and token in ("-c", "--command"):
+                if index + 1 < len(argv):
+                    scripts.append(argv[index + 1])
+            else:
+                commands.append(argv[index:])
+    return commands, scripts
+
+
+# ---------- 危险命令 / 提权（递归剥 wrapper） ----------
+
 #  会把一段 shell 源码当参数的 shell：-c / -lc 后面那坨要重新按脚本解析
 _SHELLS = {"bash", "sh", "zsh", "dash", "ksh", "fish"}
-#  提权入口。sudo/doas 同时也在 _PASSTHROUGH_WRAPPERS 里——两张表各答各的问题：
+#  提权入口。sudo/doas/run0 同时也在 _WRAPPERS 里——两张表各答各的问题：
 #  查危险命令时要剥开 sudo 看里面包着什么，查提权时看见 sudo 本身就已经命中。
-_PRIVILEGE_ESCALATORS = {"sudo", "doas", "su", "pkexec", "runas"}
+_PRIVILEGE_ESCALATORS = {"sudo", "doas", "su", "pkexec", "runas", "run0"}
 
-#  脚本再切分用的连接符（与 permissions._SEGMENT_SPLIT 同源，避免循环引用手动内联）
-_CONNECTORS = ("&&", "||", ";", "|", "\n")
+#  脚本再切分用的连接符（与 permissions._SEGMENT_SPLIT 同源，避免循环引用手动内联）。
+#  单个 & 是后台符，同样隔开两条命令；但 2>&1、&> 里的 & 属于重定向，不切
+_CONNECTORS = ("&&", "||", ";", "|", "&", "\n")
+
+#  命令名之前的 shell 语法外壳：子 shell/分组、流程关键字、变量赋值、前置重定向
+_SHELL_KEYWORDS = frozenset({"!", "{", "if", "then", "else", "elif", "do", "while", "until"})
+_ASSIGNMENT = re.compile(r"[A-Za-z_][A-Za-z0-9_]*\+?=")
+_REDIRECTION = re.compile(r"\d*(?:&>>?|>>?|>&|>\||<<<|<<-?|<>|<&|<)")
 
 
 def command_risk(command: str) -> str | None:
@@ -253,23 +585,19 @@ def dangerous_command(command: str) -> str | None:
     """从命令里挖出破坏性操作（当前主要是强制 rm）。返回原因或 None。
 
     宽松方向：尽量识别，识别不出不代表安全（安全判定另有 allow/确认兜底）。
+    扫不完（嵌套过深、分叉过多）返回原因——宁可多问一次，不能当安全放行。
     """
-    for segment in _split_script(command):
-        if reason := _dangerous_segment(_split(segment), depth=0):
-            return reason
-    return None
+    return _scan_command(command, _dangerous_hit)
 
 
 def privileged_command(command: str) -> str | None:
     """命令里出现提权入口（sudo/doas/su/pkexec）时返回原因，否则 None。
 
-    与 `dangerous_command` 同样是宽松方向：`bash -c 'sudo …'`、`xargs sudo …`
-    这类包起来的写法也要挖出来。识别不出不代表安全——沙箱与逐次确认仍在。
+    与 `dangerous_command` 同样是宽松方向：`bash -c 'sudo …'`、`env -S 'sudo …'`、
+    `echo "$(sudo …)"` 这类包起来的写法也要挖出来。识别不出不代表安全——
+    沙箱与逐次确认仍在。
     """
-    for segment in _split_script(command):
-        if reason := _scan_segment(_split(segment), 0, _privileged_hit):
-            return reason
-    return None
+    return _scan_command(command, _privileged_hit)
 
 
 def _privileged_hit(name: str, argv: list[str]) -> str | None:
@@ -316,7 +644,9 @@ def _split_script(script: str) -> list[str]:
             quote = ch
             buf.append(ch)
             i += 1
-        elif connector := next((c for c in _CONNECTORS if script.startswith(c, i)), None):
+        elif (connector := next((c for c in _CONNECTORS if script.startswith(c, i)), None)) and not (
+            connector == "&" and ((i > 0 and script[i - 1] in "<>") or script.startswith("&>", i))
+        ):
             segments.append("".join(buf))
             buf = []
             i += len(connector)
@@ -327,68 +657,179 @@ def _split_script(script: str) -> list[str]:
     return [segment.strip() for segment in segments if segment.strip()]
 
 
-def _peel_wrapper(name: str, argv: list[str]) -> list[str] | None:
-    """透传型 wrapper（sudo/env/xargs/timeout…）剥掉外层，返回里面真正的 argv。
+def _closing_paren(script: str, start: int) -> int:
+    """从 start（`$(` 之后）找配对的 `)`，找不到返回 len(script)（取到末尾，宽松方向）。
 
-    不是 wrapper 则返回 None（注意与"是 wrapper 但里面是空"的 `[]` 区分）。
-    剥法只写这一处：危险命令与提权两套判定共用，加一个 wrapper 两边同时受益。
+    用显式栈而不是递归：病态的深层嵌套不能把 Python 调用栈打爆。
+    双引号内的括号是字面量，但双引号里的 `$(` 照样开新一层。"""
+    stack = ["("]
+    i, n = start, len(script)
+    while i < n:
+        ch, top = script[i], stack[-1]
+        if top == "'":
+            if ch == "'":
+                stack.pop()
+        elif ch == "\\":
+            i += 1
+        elif top == '"':
+            if ch == '"':
+                stack.pop()
+            elif script.startswith("$(", i):
+                stack.append("(")
+                i += 1
+        elif ch in ("'", '"'):
+            stack.append(ch)
+        elif ch == "(":
+            stack.append("(")
+        elif ch == ")":
+            stack.pop()
+            if not stack:
+                return i
+        i += 1
+    return n
+
+
+def _substitutions(script: str) -> list[str]:
+    """脚本里会被执行的命令替换体：`$(…)`、反引号、进程替换 `<(…)` / `>(…)`。
+
+    单引号内不展开（`echo '$(rm -rf /)'` 只是字面量），双引号内照样展开，
+    `\\$(` 是转义的字面量。只取最外层——里面再嵌套的由递归扫描接着挖。
     """
-    if name in _PASSTHROUGH_WRAPPERS or name == "xargs":
-        #  timeout/stdbuf/xargs 带自己的选项参数，粗剥即可：跳过所有 -开头 token
-        rest = argv[1:]
-        while rest and rest[0].startswith("-"):
-            rest = rest[1:]
-        #  timeout 的第一个位置参数是秒数
-        if name == "timeout" and rest:
-            rest = rest[1:]
-        return rest
-    if name == "env":
-        rest = argv[1:]
-        while rest and (rest[0] in ("-i", "--ignore-environment", "-u", "--")
-                        or "=" in rest[0] and not rest[0].startswith("-")):
-            if rest[0] in ("-u",):
-                rest = rest[2:]
-            else:
-                rest = rest[1:]
-        return rest
-    return None
+    bodies: list[str] = []
+    quote = ""
+    i, n = 0, len(script)
+    while i < n:
+        ch = script[i]
+        if quote == "'":
+            if ch == "'":
+                quote = ""
+            i += 1
+        elif ch == "\\":
+            i += 2
+        elif ch == "`":
+            end = i + 1
+            while end < n and script[end] != "`":
+                end += 2 if script[end] == "\\" else 1
+            bodies.append(script[i + 1:end])
+            i = end + 1
+        elif script.startswith("$(", i) or (not quote and ch in "<>" and script.startswith("(", i + 1)):
+            end = _closing_paren(script, i + 2)
+            bodies.append(script[i + 2:end])
+            i = end + 1
+        else:
+            if ch == '"':
+                quote = "" if quote else '"'
+            elif ch == "'" and not quote:
+                quote = "'"
+            i += 1
+    return bodies
+
+
+def _strip_shell_prefix(argv: list[str]) -> list[str]:
+    """剥掉命令名之前的 shell 语法外壳：`(rm …)`、`then rm …`、`FOO=1 rm …`、`2>/dev/null rm …`。
+
+    不剥的话 argv[0] 是 `(rm` / `then` / `FOO=1`，按名字写的检查全部落空。
+    """
+    while argv:
+        head = argv[0]
+        if head.startswith("("):
+            head = head.lstrip("(")
+            argv = [head, *argv[1:]] if head else argv[1:]
+        elif head in _SHELL_KEYWORDS or _ASSIGNMENT.match(head):
+            argv = argv[1:]
+        elif match := _REDIRECTION.match(head):
+            #  `>/dev/null` 目标粘在一起只占一个 token；`> /dev/null` 要连目标一起跳
+            argv = argv[1:] if match.end() < len(head) else argv[2:]
+        else:
+            break
+    return argv
 
 
 def _inner_scripts(name: str, argv: list[str]) -> list[str]:
-    """参数里被当作 shell 源码的那部分：`bash -c '…'`、`trap '…' EXIT`。
+    """参数里被当作 shell 源码的那部分：`bash -c '…'`、`trap '…' EXIT`、`eval '…'`。
 
-    返回的每一项都要重新走一遍 `_split_script` + 对应的段判定。
+    返回的每一项都要重新当脚本扫一遍。
     """
     if name in _SHELLS:
-        #  bash -c 'script' / bash -lc 'script'
-        for index, arg in enumerate(argv[1:], start=1):
-            if arg.startswith("-") and "c" in arg.lstrip("-"):
-                if index + 1 < len(argv):
-                    return [argv[index + 1]]
-                break
-        return []
+        #  -c 只是开关，脚本是它之后的第一个非选项参数，中间可能夹着带值选项
+        #  （`bash -o pipefail -c …`、`bash --rcfile x -c …`）。分不清哪个才是脚本，
+        #  就把 -c 之后的非选项参数都当脚本扫（宽松方向，多扫的是 $0/$1 这类参数）
+        scripts: list[str] = []
+        seen_c = False
+        for arg in argv[1:]:
+            if arg.startswith("--command="):
+                scripts.append(arg.split("=", 1)[1])  # fish --command=…
+            elif arg == "--command" or (
+                arg.startswith("-") and not arg.startswith("--") and "c" in arg[1:]
+            ):
+                seen_c = True
+            elif seen_c and not arg.startswith(("-", "+")):
+                scripts.append(arg)
+        return scripts
     if name == "trap" and len(argv) >= 2:
         #  trap 'action' SIGNAL：action 是一段 shell 源码
         return [argv[1]]
+    if name == "eval" and len(argv) >= 2:
+        #  eval 把全部参数拼成一段源码执行
+        return [" ".join(argv[1:])]
     return []
 
 
-def _scan_segment(argv: list[str], depth: int, hit) -> str | None:
-    """通用的段扫描：剥 wrapper、下钻 shell 源码，每层拿 `hit` 问一次。
+class _Budget:
+    """一次判定的扫描工作量：每下钻一层记一个节点，超深度或超总量抛 _TooComplex。"""
+
+    def __init__(self) -> None:
+        self.nodes = 0
+
+    def descend(self, depth: int) -> int:
+        self.nodes += 1
+        if depth + 1 > _MAX_WRAPPER_DEPTH or self.nodes > _MAX_SCAN_NODES:
+            raise _TooComplex
+        return depth + 1
+
+
+def _scan_command(command: str, hit) -> str | None:
+    """危险命令与提权的共用入口；扫不完按有风险返回（fail-safe）。"""
+    try:
+        return _scan_script(command, 0, hit, _Budget())
+    except _TooComplex:
+        return _TOO_COMPLEX
+
+
+def _scan_script(script: str, depth: int, hit, budget: _Budget) -> str | None:
+    """扫一段 shell 源码：先挖命令替换体（递归当脚本扫），再逐段扫。"""
+    for body in _substitutions(script):
+        if reason := _scan_script(body, budget.descend(depth), hit, budget):
+            return reason
+    for segment in _split_script(script):
+        if reason := _scan_segment(_split(segment), depth, hit, budget):
+            return reason
+    return None
+
+
+def _scan_segment(argv: list[str], depth: int, hit, budget: _Budget) -> str | None:
+    """通用的段扫描：剥语法外壳、剥 wrapper、下钻 shell 源码，每层拿 `hit` 问一次。
 
     `hit(name, argv) -> str | None` 是两套判定唯一不同的地方。
     """
-    if not argv or depth > _MAX_WRAPPER_DEPTH:
+    argv = _strip_shell_prefix(argv)
+    if not argv:
         return None
     name = _base_name(argv[0])
     if reason := hit(name, argv):
         return reason
-    if (inner := _peel_wrapper(name, argv)) is not None:
-        return _scan_segment(inner, depth + 1, hit)
-    for script in _inner_scripts(name, argv):
-        for segment in _split_script(script):
-            if reason := _scan_segment(_split(segment), depth + 1, hit):
+    if (peeled := _peel_wrapper(name, argv)) is not None:
+        commands, scripts = peeled
+        for inner in commands:
+            if reason := _scan_segment(inner, budget.descend(depth), hit, budget):
                 return reason
+        for script in scripts:
+            if reason := _scan_script(script, budget.descend(depth), hit, budget):
+                return reason
+        return None
+    for script in _inner_scripts(name, argv):
+        if reason := _scan_script(script, budget.descend(depth), hit, budget):
+            return reason
     return None
 
 
@@ -396,10 +837,6 @@ def _dangerous_hit(name: str, argv: list[str]) -> str | None:
     if name == "rm" and _rm_has_force(argv[1:]):
         return "强制删除（rm -f/-rf）"
     return None
-
-
-def _dangerous_segment(argv: list[str], depth: int) -> str | None:
-    return _scan_segment(argv, depth, _dangerous_hit)
 
 
 def _rm_has_force(args: list[str]) -> bool:
