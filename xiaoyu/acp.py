@@ -154,7 +154,7 @@ import time
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, TextIO
+from typing import Any, Callable, Iterator, TextIO
 
 from . import __version__, folder_trust, fsguard, mcp, mcp_guard, media, modes
 from .config import Config, MissingConfig, load_dotenv, user_env_path
@@ -1194,6 +1194,63 @@ class AcpServer:
 
     # ---------- 主循环 ----------
 
+    #  POSIX 下读 stdin 的单次最长阻塞（秒）：到点回一次字节码，挂起的信号处理器最迟晚这么久执行
+    _STDIN_POLL = 0.5
+
+    def _stdin_fd(self) -> int | None:
+        """能 select 的 stdin 文件描述符；Windows（select 不认管道）或没有 fd 的注入对象返回 None。"""
+        import io
+        import os
+
+        if os.name == "nt":
+            return None
+        try:
+            return self._stdin.fileno()
+        except (AttributeError, OSError, ValueError, io.UnsupportedOperation):
+            return None
+
+    def _stdin_lines(self) -> Iterator[str]:
+        """协议输入逐行产出（行尾带 \\n，最后一段没有换行照样交出）。
+
+        POSIX 下不在 stdin 上无限期阻塞读：信号若恰好落在"离开字节码、还没进入
+        read 系统调用"的窗口，C 层只挂起一个标记，read 不会被 EINTR 打断，Python
+        处理器要等 stdin 来数据才跑——收了 SIGTERM 进程却不退（CI 上抓到过：栈停在
+        这个读循环、处理器没执行）。改为 select 带超时等可读再 os.read：每个超时都
+        回到字节码，挂起的处理器最迟晚 _STDIN_POLL 执行。拿不到 fd 的 stdin（嵌入
+        宿主 / 测试注入的对象）与 Windows 照旧逐行迭代。
+        """
+        fd = self._stdin_fd()
+        if fd is None:
+            yield from self._stdin
+            return
+        import codecs
+        import os
+        import select
+
+        decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
+        #  当前行已到达的分片：只切新到的这一块，超长单行（整张图的 base64）也是线性的
+        parts: list[str] = []
+        while True:
+            ready, _, _ = select.select([fd], [], [], self._STDIN_POLL)
+            if not ready:
+                continue
+            chunk = os.read(fd, 65536)
+            if not chunk:
+                tail = "".join(parts) + decoder.decode(b"", final=True)
+                if tail:
+                    yield tail
+                return
+            text = decoder.decode(chunk)
+            if "\n" not in text:
+                parts.append(text)
+                continue
+            head, *middle, rest = text.split("\n")
+            parts.append(head)
+            yield "".join(parts) + "\n"
+            for line in middle:
+                yield line + "\n"
+            parts = [rest] if rest else []
+
     def serve(self) -> int:
         #  stdout 接管：协议流的唯一写口是 _send（走构造时捕获的 self._stdout）。
         #  服务期间把 sys.stdout 指到 stderr——进程内任何漏网的 print（插件、
@@ -1203,7 +1260,7 @@ class AcpServer:
         original_stdout = sys.stdout
         sys.stdout = sys.stderr
         try:
-            for raw in self._stdin:
+            for raw in self._stdin_lines():
                 line = raw.strip()
                 if not line:
                     continue

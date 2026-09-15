@@ -67,6 +67,9 @@ class WireProcess:
             return self.proc.wait(timeout=timeout)
         except subprocess.TimeoutExpired:
             pass
+        #  取栈之前先拍信号现场（Linux）：SigPnd/ShdPnd 里还挂着 = 信号被屏蔽没送达；
+        #  已不在其中而处理器没跑 = 信号送达时主线程不在字节码上、之后又阻塞进了系统调用
+        signal_state = self._proc_signal_state()
         if os.name != "nt":
             with contextlib.suppress(OSError):
                 self.proc.send_signal(signal.SIGABRT)
@@ -78,9 +81,25 @@ class WireProcess:
         if self._stderr_reader is not None:
             self._stderr_reader.join(timeout=5)
         raise AssertionError(
-            f"子进程 {timeout:g}s 内没有退出（已 SIGABRT 取栈后收掉），stderr 尾部：\n"
+            f"子进程 {timeout:g}s 内没有退出（已 SIGABRT 取栈后收掉）。\n"
+            f"信号现场：{signal_state}\nstderr 尾部：\n"
             + self.stderr_tail()
         )
+
+    def _proc_signal_state(self) -> str:
+        """挂住那一刻 /proc/<pid>/status 里的信号位图与内核等待点（只有 Linux 读得到）。"""
+        base = Path(f"/proc/{self.proc.pid}")
+        try:
+            fields = [
+                line.strip()
+                for line in (base / "status").read_text(encoding="ascii", errors="replace").splitlines()
+                if line.startswith(("SigPnd", "ShdPnd", "SigBlk", "SigIgn", "SigCgt"))
+            ]
+        except OSError:
+            return "（无 /proc，非 Linux）"
+        with contextlib.suppress(OSError):
+            fields.append("wchan: " + (base / "wchan").read_text(encoding="ascii", errors="replace").strip())
+        return " · ".join(fields)
 
     def send(self, message: dict[str, Any]) -> None:
         assert self.proc.stdin is not None
