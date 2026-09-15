@@ -18,7 +18,7 @@ from unittest import mock
 from xiaoyu.agent import Agent
 from xiaoyu.cli import handle_slash
 from xiaoyu.config import Config
-from xiaoyu.providers import Registry
+from xiaoyu.providers import Provider, Registry
 from xiaoyu.tools import Toolbox
 
 
@@ -1040,6 +1040,89 @@ class EmptyReplyGuardTest(AgentTestCase):
             agent.send("改一下代码")
         self.assertEqual(len(self.client.completions.calls), 6)
         self.assertIn("空回复", buffer.getvalue())
+
+
+class EmptyCompletionRecoveryTest(AgentTestCase):
+    """空补全重发的两条修正：绕开网关响应缓存、确定性空补全直接换路由。
+
+    网关开着响应缓存时，一次空补全会被缓存住，原样重发只拿回同一个空结果；
+    流式命中还会把 usage 改写成 completion_tokens=0（2026-09-15 实测）。
+    """
+
+    def build_on(self, script: list, *, response_cache: bool) -> Agent:
+        client = FakeClient(script)
+        provider = Provider("gateway", "https://gw.example/v1", "k", (), "网关", response_cache=response_cache)
+        registry = Registry([provider], clients={"gateway": client})
+        self.client = client
+        return Agent(self.config, Toolbox(self.config), registry=registry)
+
+    def test_gateway_retry_bypasses_response_cache(self) -> None:
+        """只有重发带绕过参数：首发照常可命中缓存，不改变正常请求的成本面。"""
+        agent = self.build_on([[chunk(content=None)], [chunk(content="重发拿到的")]], response_cache=True)
+        with contextlib.redirect_stdout(io.StringIO()):
+            agent.send("hi")
+        first, second = self.client.completions.calls
+        self.assertNotIn("extra_body", first)
+        self.assertEqual(second["extra_body"], {"cache": {"no-cache": True}})
+        self.assertEqual(agent.last_assistant_text(), "重发拿到的")
+
+    def test_direct_provider_retry_sends_no_cache_field(self) -> None:
+        """没有响应缓存能力的端点（直连厂商）绝不发这个字段：未知请求体字段可能 400。"""
+        empty = [chunk(content=None)]
+        agent = self.build_on([empty, empty, [chunk(content="好了")]], response_cache=False)
+        with contextlib.redirect_stdout(io.StringIO()):
+            agent.send("hi")
+        self.assertEqual(len(self.client.completions.calls), 3)
+        for call in self.client.completions.calls:
+            self.assertNotIn("extra_body", call)
+
+    def test_two_zero_token_empties_switch_route(self) -> None:
+        """连续两次 completion_tokens=0 的空补全：不再原地发第三次，直接进降级链。"""
+        self.config.fallback_models = ["backup-model"]
+        empty = [chunk(content=None), usage_chunk(100, 0)]
+        agent = self.build_on(
+            [empty, empty, [chunk(content="备用顶上"), usage_chunk(100, 5)]], response_cache=True
+        )
+        buffer = io.StringIO()
+        with contextlib.redirect_stdout(buffer):
+            agent.send("hi")
+        models = [call["model"] for call in self.client.completions.calls]
+        self.assertEqual(models, ["main-model", "main-model", "backup-model"])
+        self.assertEqual(agent.last_assistant_text(), "备用顶上")
+        #  换到新路由是首发，不带绕过参数
+        self.assertNotIn("extra_body", self.client.completions.calls[2])
+
+    def test_empty_without_usage_keeps_retry_count(self) -> None:
+        """没有 usage 判不出是不是确定性空补全：维持原地重试 3 次，不提前换路由。"""
+        self.config.fallback_models = ["backup-model"]
+        empty = [chunk(content=None)]
+        agent = self.build([empty, empty, empty, [chunk(content="补上的结论")]])
+        with contextlib.redirect_stdout(io.StringIO()):
+            agent.send("hi")
+        models = [call["model"] for call in self.client.completions.calls]
+        self.assertEqual(models, ["main-model"] * 4)
+        self.assertEqual(agent.last_assistant_text(), "补上的结论")
+
+    def test_empty_with_nonzero_tokens_keeps_retry_count(self) -> None:
+        """产出过 token 的空补全（例如推理吃掉了输出）不算确定性，照常原地重试。"""
+        self.config.fallback_models = ["backup-model"]
+        empty = [chunk(content=None), usage_chunk(100, 16)]
+        agent = self.build([empty, empty, empty, [chunk(content="补上的结论")]])
+        with contextlib.redirect_stdout(io.StringIO()):
+            agent.send("hi")
+        models = [call["model"] for call in self.client.completions.calls]
+        self.assertEqual(models, ["main-model"] * 4)
+
+    def test_deterministic_empty_on_last_route_falls_back_to_nudge(self) -> None:
+        """链上没有下一条路由：空消息交回 send() 的空回复护栏，而不是抛错。"""
+        empty = [chunk(content=None), usage_chunk(100, 0)]
+        agent = self.build([empty, empty, [chunk(content="补上的结论")]])
+        with contextlib.redirect_stdout(io.StringIO()):
+            agent.send("hi")
+        self.assertEqual(len(self.client.completions.calls), 3)
+        user_texts = [str(m.get("content")) for m in agent.messages if m.get("role") == "user"]
+        self.assertTrue(any("回复是空的" in text for text in user_texts))
+        self.assertEqual(agent.last_assistant_text(), "补上的结论")
 
 
 class PlanClaimGuardTest(AgentTestCase):

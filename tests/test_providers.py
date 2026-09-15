@@ -315,6 +315,31 @@ class TestOrderAndKeys(ProviderTestCase):
         self.assertTrue(transport.signs_tools("gemini-3.7-flash"))
         self.assertFalse(transport.signs_tools("deepseek-flash"))
 
+    def test_gateway_response_cache_bypass_detection(self) -> None:
+        """空补全重发绕网关缓存的能力判定：远端网关默认开；网关位指向官方直连
+        端点或本机端点默认关；XIAOYU_GATEWAY_CACHE_BYPASS 显式指定时优先。"""
+        vendor = providers.PRESETS["deepseek"].base_url
+        cases = [
+            (GW, {}, True),
+            (vendor, {}, False),
+            ("http://localhost:8000/v1", {}, False),
+            (GW, {"XIAOYU_GATEWAY_CACHE_BYPASS": "0"}, False),
+            (vendor, {"XIAOYU_GATEWAY_CACHE_BYPASS": "1"}, True),
+        ]
+        for url, env, expected in cases:
+            with self.subTest(url=url, env=env), isolated_env({"XIAOYU_API_KEY": "gw", **env}):
+                registry = providers.build(config(base_url=url))
+                self.assertEqual(registry.get(GATEWAY).response_cache, expected)
+                body = registry.cache_bypass(Route(GATEWAY, "deepseek-flash"))
+                self.assertEqual(body, {"cache": {"no-cache": True}} if expected else None)
+
+    def test_direct_provider_never_bypasses_cache(self) -> None:
+        """直连厂商没有这项能力：官方端点对未知请求体字段可能 400。"""
+        with isolated_env({"DEEPSEEK_API_KEY": "ds", "XIAOYU_API_KEY": "gw"}):
+            registry = providers.build(config())
+        self.assertFalse(registry.get("deepseek").response_cache)
+        self.assertIsNone(registry.cache_bypass(Route("deepseek", "deepseek-flash")))
+
     def test_generic_signatures_ignored_loudly_on_non_chat_protocol(self) -> None:
         """签名的捕获/还原只在 chat 一路存在：_SIGNATURES 配上 PROTOCOL=responses/
         anthropic 若静默收下，用户会拿着一个不生效的开关去排查每轮 400——

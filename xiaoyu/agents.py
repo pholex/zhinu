@@ -77,7 +77,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
 
-from . import compaction, media, tokens, ui, worktree
+from . import compaction, fsguard, media, tokens, ui, worktree
 from .config import EFFORT_LEVELS, Config, user_config_dir
 from .events import Notice, UISink
 from .tools import Tool, Toolbox
@@ -286,6 +286,8 @@ def _parse_spec(path: Path, source: str) -> tuple[AgentSpec | None, list[str]]:
     if not _NAME_RE.match(name):
         return None, [f"{path.name}: 文件名须为小写字母/数字/下划线（2-32 字符）"]
     try:
+        #  glob 不看文件类型：仓库里的 *.toml 可以是指向设备的链接
+        fsguard.require_regular(path)
         data = tomllib.loads(path.read_text(encoding="utf-8", errors="replace"))
     except (OSError, tomllib.TOMLDecodeError) as exc:
         return None, [f"{path.name}: 解析失败：{exc}"]

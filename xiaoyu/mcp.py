@@ -1044,12 +1044,14 @@ class McpServer:
         self._closing = True
         self._shutdown_proc()
 
-    def restart(self) -> list[dict[str, Any]]:
+    def restart(self, spec: ServerSpec | None = None) -> list[dict[str, Any]]:
         """断线后重启一代：收掉旧进程，重置协议状态，重新 spawn → 握手 → 列工具。
 
         serverName 不变 + 确定性命名 = 新一代的工具名逐字复现。
-        成功返回新一代声明并清掉 start_error；失败抛 McpError（进程已收干净，
-        调用方可按预算再试）。只应由 manager 的重连线程调用。
+        spec 非 None = 声明随这一代一起换（/mcp reconnect 重读配置后的新
+        headers / env / 命令）。成功返回新一代声明并清掉 start_error 与
+        fatal_error；失败抛 McpError（进程已收干净，调用方可按预算再试）。
+        只应由 manager 调用：重连线程与 /mcp reconnect，二者按 server 互斥。
         """
         with self._start_lock:
             if self._closing:
@@ -1060,6 +1062,9 @@ class McpServer:
             thread = self._drain_thread
             if thread is not None:
                 thread.join(timeout=5.0)
+            if spec is not None:
+                #  旧代按旧声明收干净之后再换：传输类型也可能跟着变了（stdio ↔ HTTP）
+                self.spec = spec
             with self._cond:
                 self._dead = False
                 self._responses.clear()
@@ -1069,11 +1074,10 @@ class McpServer:
             self._breaker_until = 0.0
             #  协商结果属于上一代：新一代的 server 可能已经升/降级，必须重新协商
             self.protocol_version = ""
-            if self._http is not None:
-                #  HTTP 换一条全新通道：会话 id、协商版本、关闭标志都属于上一代。沿用旧会话 id
-                #  去 initialize，严格的 server 回 404（重连永远连不上）；沿用关闭
-                #  标志，新长流上的 list_changed 会被静默丢弃
-                self._http = _HttpChannel(self.spec)
+            #  HTTP 换一条全新通道：会话 id、协商版本、关闭标志都属于上一代。沿用旧会话 id
+            #  去 initialize，严格的 server 回 404（重连永远连不上）；沿用关闭
+            #  标志，新长流上的 list_changed 会被静默丢弃。按（可能已换的）声明判传输
+            self._http = _HttpChannel(self.spec) if self.spec.is_http else None
             try:
                 self._start_locked()
             except McpError:
@@ -1088,6 +1092,9 @@ class McpServer:
                 raise McpError("server 已关闭，不再重启")
             self.started = True
             self.start_error = None
+            self.fatal_error = None
+            #  收旧进程时已减计数，新一代活了要加回来（否则每重启一次少记一个）
+            self._count_live(True)
             return self.live_declared
 
     def _count_live(self, alive: bool) -> None:
@@ -1168,7 +1175,8 @@ class McpServer:
         if self.fatal_error:
             return (
                 f"ERROR: MCP server {self.spec.name} 已停用：{_redact(self.fatal_error)}。"
-                "不会自动重试——不要再调用这个 server 的工具，告知用户修复。"
+                "不会自动重试——不要再调用这个 server 的工具，告知用户修复后执行 "
+                f"/mcp reconnect {self.spec.name} 恢复。"
             )
         if not self.alive():
             #  提示只说真话：重连线程确实在跑才说"正在重连"（HTTP 断线、重连关闭、
@@ -1210,7 +1218,10 @@ class McpServer:
                 self._failures = 0
             text = f"ERROR: MCP 调用失败（{self.spec.name}/{tool}）：{_redact(str(exc))}"
             if exc.kind == "auth":
-                return text + "。认证被拒，不会自动重试——不要再调用这个 server 的工具，告知用户检查凭据。"
+                return text + (
+                    "。认证被拒，不会自动重试——不要再调用这个 server 的工具，告知用户检查凭据，"
+                    f"修好后执行 /mcp reconnect {self.spec.name} 恢复。"
+                )
             if exc.outcome_unknown:
                 #  请求已送达却没拿到可信应答：写操作可能已经做了，模型惯性重试
                 #  就是把一次副作用做成两次
@@ -1610,7 +1621,8 @@ def _make_remote_tool(
         except McpError as exc:
             return (
                 f"ERROR: MCP server {server.spec.name} 启动失败：{exc}。"
-                f"排障看日志：{server.log_path}"
+                f"排障看日志：{server.log_path}；告知用户修好后执行 "
+                f"/mcp reconnect {server.spec.name} 恢复"
             )
         #  缓存与现实对账（每 server 一次）：server 新增的工具补注册
         manager.reconcile(server)
@@ -1655,8 +1667,16 @@ class McpManager:
     RECONNECT_MAX_DELAY = 30.0
     RECONNECT_MAX_ATTEMPTS = 10
 
-    def __init__(self, specs: list[ServerSpec]) -> None:
+    def __init__(
+        self,
+        specs: list[ServerSpec],
+        spec_loader: Callable[[], list[ServerSpec]] | None = None,
+    ) -> None:
         self._specs = specs
+        #  重读配置的函数（/mcp reconnect 用）：必须是启动时同一条加载路径
+        #  （folder trust 门 + 加载期准入 + ${env:VAR} 展开），由 launch 接线。
+        #  None = 清单是宿主直接给的，热恢复沿用现有声明
+        self._spec_loader = spec_loader
         self._lock = threading.Lock()
         self._servers: dict[str, McpServer] = {}
         #  name → "loading" | "ready" | "cached" | "failed: …" | "blocked: …" | "closed"
@@ -1936,12 +1956,25 @@ class McpManager:
             if self._closed:
                 return
             self._resync_dirty.add(name)
-            if name in self._resync_running:
+            #  重连（后台或 /mcp reconnect）在动这个 server：只记 dirty 不起线程，
+            #  换代完成后由重连方补发（见 _resume_resync_locked）——两边同时
+            #  fetch/swap 同一个 server 正是要避免的
+            if name in self._resync_running or name in self._reconnecting:
                 return
             self._resync_running.add(name)
             self._spawn_service_locked(
                 lambda: self._resync_worker(server), f"xiaoyu-mcp-resync-{name}"
             )
+
+    def _resume_resync_locked(self, server: McpServer) -> None:
+        """重连期间被压下的 list_changed：换代成功后补一次 re-sync。持锁调用。"""
+        name = server.spec.name
+        if self._closed or name not in self._resync_dirty or name in self._resync_running:
+            return
+        self._resync_running.add(name)
+        self._spawn_service_locked(
+            lambda: self._resync_worker(server), f"xiaoyu-mcp-resync-{name}"
+        )
 
     def _resync_worker(self, server: McpServer) -> None:
         """代际事务的动态变更侧：fetch 新一代（锁外）→ swap（锁内）。
@@ -1989,12 +2022,13 @@ class McpManager:
             self._failed_hard.add(name)
             server.fatal_error = reason
             self._drop_generation_locked(name)
-            self._states[name] = f"failed: {reason}（不会自动重试；修好后重启会话恢复）"
+            self._states[name] = f"failed: {reason}（不会自动重试；修好后 /mcp reconnect {name}）"
         server.on_disconnect = None
         server.on_tools_changed = None
         server.on_failure = None
         print(
-            f"[MCP {name}：{reason}。工具已整代下线，不会自动重试；修好后重启会话恢复]",
+            f"[MCP {name}：{reason}。工具已整代下线，不会自动重试；"
+            f"修好后 /mcp reconnect {name} 恢复]",
             file=sys.stderr,
         )
 
@@ -2037,7 +2071,7 @@ class McpManager:
                         self._drop_generation_locked(name)
                         self._states[name] = (
                             f"failed: 连续 {self.RECONNECT_MAX_ATTEMPTS} 次重连失败，"
-                            "已放弃（工具已整代下线；修好 server 后重启会话恢复）"
+                            f"已放弃（工具已整代下线；修好 server 后 /mcp reconnect {name}）"
                         )
                     #  解除监督：耗尽后不再对这个进程尸体反复立案
                     server.on_disconnect = None
@@ -2095,6 +2129,8 @@ class McpManager:
             with self._lock:
                 self._reconnecting.discard(name)
                 server.reconnecting = False
+                if succeeded:
+                    self._resume_resync_locked(server)
             #  成功与 discard 之间的窄窗：新进程立刻又崩，EOF 回调被
             #  _reconnecting 挡掉——这里补判一次，两种时序都兜住
             if succeeded and not server.alive() and not self._closed:
@@ -2182,8 +2218,189 @@ class McpManager:
         with contextlib.suppress(OSError):
             mcp_guard.save_json_atomic(self._decls_path, self._decls)
 
+    # ---- 热恢复：/mcp reconnect ----
+
+    def reconnect(self, name: str | None = None) -> str:
+        """/mcp reconnect [server]：修好凭据/配置后不重启会话就能恢复的入口。
+
+        重读这一个 server 的声明（与启动同一条加载路径，门一道不少）→ 重建通道 →
+        走与后台重连同一套代际事务：成功整代 swap、基线裁决照旧（变更工具照样
+        隔离）；失败不换进坏代，状态亮出新原因，再次认证被拒仍标停用。
+        认证被拒停用的、重连预算耗尽整代下线的、启动即失败的都能手动拉起；
+        对在线的 server 做一次干净重启。不给名字 = 重连全部失败的 server。
+
+        在调用方线程同步执行（握手上限 INIT_TIMEOUT）。与后台重连、re-sync、
+        另一次手动重连按 server 互斥：已有人在动就直接拒绝，不排队也不并发 restart。
+        """
+        if name is None:
+            with self._lock:
+                targets = [
+                    spec.name for spec in self._specs if self._needs_recovery_locked(spec.name)
+                ]
+            if not targets:
+                return "没有处于失败状态的 server，无需重连（重启在线的 server：/mcp reconnect <server>）"
+            return "\n".join(self._reconnect_one(target) for target in targets)
+        return self._reconnect_one(name)
+
+    def _needs_recovery_locked(self, name: str) -> bool:
+        """无参 /mcp reconnect 的挑选口径：失败态、懒启动失败、或进程已退却没人在重连。"""
+        state = self._states.get(name, "")
+        server = self._servers.get(name)
+        if state.startswith("failed") or (server is not None and server.start_error):
+            return True
+        #  自动重连关着（XIAOYU_MCP_RECONNECT=0）时，进程退出后状态停在 ready
+        return state == "ready" and server is not None and not server.alive()
+
+    def _reload_spec(self, name: str) -> tuple[ServerSpec | None, str]:
+        """重读配置取这一个 server 的最新声明 → (spec, 附注)；拿不到时 spec 为 None、
+        附注是给用户的原因。
+
+        加载函数就是启动时那一个（launch 接线）：folder trust 门、加载期准入
+        规则、${env:VAR} 重新展开一样不少，启动期准入与 OSV 预检随后在 restart
+        里再过一遍——热恢复不是绕开这些闸的后门。只刷新点名的这一个；配置里
+        新增的 server 不在这里拉起（本会话的 server 清单在启动时定）。
+        """
+        with self._lock:
+            current = next((spec for spec in self._specs if spec.name == name), None)
+            known = ", ".join(spec.name for spec in self._specs) or "（无）"
+        if current is None:
+            return None, f"没有名为 {name!r} 的 server。已知：{known}"
+        if self._spec_loader is None:
+            return current, ""
+        try:
+            latest = {spec.name: spec for spec in self._spec_loader()}
+        except Exception as exc:  # noqa: BLE001 - 配置读坏了只拒绝这一次重连
+            return None, f"{name}：重读 MCP 配置失败（{type(exc).__name__}: {exc}），未重连"
+        spec = latest.get(name)
+        if spec is None:
+            return None, (
+                f"{name}：配置里已找不到可用的声明（被删除、disabled、被安全规则拦截，"
+                "或工作区未受信任——原因见上方提示），未重连"
+            )
+        return spec, "" if spec == current else "配置已更新"
+
+    def _reconnect_one(self, name: str) -> str:
+        spec, note = self._reload_spec(name)
+        if spec is None:
+            return note
+        with self._lock:
+            if self._closed:
+                return f"{name}：MCP 已关闭，不再重连"
+            #  互斥：_reconnecting 兼作手动重连的占位——占住期间后台重连不立案、
+            #  list_changed 只记 dirty；反过来别人占着就拒绝，绝不两个 restart 并发
+            if name in self._reconnecting:
+                return f"{name} 正在重连中（{self._states.get(name, '')}），稍后用 /mcp 看结果"
+            if name in self._resync_running:
+                return f"{name} 正在刷新工具列表，稍后再试"
+            self._reconnecting.add(name)
+            server = self._servers.get(name)
+            was_live = server is not None and server.alive() and not server.fatal_error
+            if server is not None:
+                #  摘掉代际钩子：旧代收尾的 EOF、握手期间的认证失败都由本流程收口，
+                #  不许另起重连线程或重复落笔停用
+                server.on_disconnect = None
+                server.on_tools_changed = None
+                server.on_failure = None
+                #  懒启动失败时 ensure_started 会 close 它，关闭标志会让 restart 拒绝。
+                #  锁内确认 manager 未关闭后复位是安全的：close() 先在锁内立 _closed、
+                #  之后才逐个 close server，这里的复位必然在那之前
+                server._closing = False
+            self._failed_hard.discard(name)
+            self._states[name] = "reconnecting: 手动重连中"
+            self._specs = [spec if item.name == name else item for item in self._specs]
+        if server is None:
+            #  从未登记过（启动即失败 / 首代被回滚）：没有旧代工具绑在旧对象上，新建即可
+            server = McpServer(spec, log_path=self._log_path(name))
+        succeeded = False
+        try:
+            try:
+                declared = server.restart(spec)
+                if reason := declared_violation(declared):
+                    server._shutdown_proc()
+                    raise McpError(reason)
+            except McpError as exc:
+                return self._recover_failed(name, server, exc)
+            succeeded = True
+            return self._recover_succeeded(name, server, spec, declared, note, was_live)
+        finally:
+            with self._lock:
+                self._reconnecting.discard(name)
+                if succeeded:
+                    self._resume_resync_locked(server)
+
+    def _recover_succeeded(
+        self,
+        name: str,
+        server: McpServer,
+        spec: ServerSpec,
+        declared: list[dict[str, Any]],
+        note: str,
+        was_live: bool,
+    ) -> str:
+        with self._lock:
+            closed = self._closed
+            if not closed:
+                self._servers[name] = server
+                #  手动恢复 = 新的一段连接，重连预算从头计
+                server.reconnect_attempts = 0
+                self._reconciled.add(name)
+                error = self._swap_generation_locked(name, server, declared)
+                if error:
+                    #  冲突预检不过：与后台重连同口径，上一代（若还在）原样保留
+                    self._states[name] = f"degraded: {error}"
+                else:
+                    self._states[name] = "ready"
+                    self._write_cache_locked(spec, server)
+                self._supervise_locked(server)
+                count = len(self._registered.get(name) or ())
+                held = len(self._quarantined.get(name) or ())
+        if closed:
+            #  与 close() 赛跑输了：刚拉起的新一代收掉，不留孤儿
+            server.close()
+            return f"{name}：MCP 已关闭，不再重连"
+        detail = "，".join(part for part in (f"{count} 个工具", note) if part)
+        text = f"{'已重启' if was_live else '已恢复'} {name}（{detail}）"
+        if error:
+            text += f"，但本代未能挂载：{error}"
+        if held:
+            text += (
+                f"\n{held} 个工具因描述/schema 变更被隔离——/mcp diff {name} 看变更，"
+                f"核对后 /mcp approve {name}"
+            )
+        return text
+
+    def _recover_failed(self, name: str, server: McpServer, exc: McpError) -> str:
+        reason = _redact(str(exc))
+        auth = exc.kind == "auth"
+        with self._lock:
+            if self._closed:
+                return f"{name}：MCP 已关闭，不再重连"
+            #  旧代已在 restart 里收掉：下线登记、失败原因一并落笔。对象留在表里，
+            #  下次 /mcp reconnect 复用它（绑在它上面的旧工具对象跟着原位复活）
+            self._servers[name] = server
+            self._drop_generation_locked(name)
+            server.fatal_error = reason if auth else None
+            if auth:
+                self._failed_hard.add(name)
+            if server.start_error:
+                server.start_error = reason
+            self._states[name] = (
+                f"failed: {reason}（{'不会自动重试；' if auth else ''}修好后 /mcp reconnect {name}）"
+            )
+        text = f"{name} 重连失败：{reason}"
+        if auth:
+            text += (
+                "。认证仍被拒：核对 mcp.json 里这个 server 的 headers / env。凭据走 ${env:VAR} 的，"
+                "在别的终端 export 的变量本进程看不到，.env 的改动也只在启动时读——"
+                "把凭据写进配置文件，或设好后重启会话"
+            )
+        elif not server.spec.is_http:
+            text += f"。排障看日志：{server.log_path}"
+        return text
+
     def command(self, parts: list[str]) -> str:
-        """/mcp 子命令统一入口（TUI 与 ACP 共用）：无参 = 状态；approve [名]；diff [名]。"""
+        """/mcp 子命令统一入口（TUI 与 ACP 共用）：无参 = 状态；approve [名]；diff [名]；
+        reconnect [名]。"""
         if not parts:
             return self.describe()
         verb, rest = parts[0], parts[1:]
@@ -2191,9 +2408,12 @@ class McpManager:
             return self.approve(rest[0] if rest else None)
         if verb == "diff":
             return self.diff(rest[0] if rest else None)
+        if verb == "reconnect":
+            return self.reconnect(rest[0] if rest else None)
         return (
             f"未知子命令 {verb!r}。用法：/mcp（状态）· /mcp diff [server]（看隔离工具的变更）"
             "· /mcp approve [server]（批准，解除隔离；不给名字 = 全部）"
+            "· /mcp reconnect [server]（修好后重读配置热恢复；不给名字 = 全部失败的）"
         )
 
     @staticmethod
@@ -2281,17 +2501,23 @@ class McpManager:
             detail = f"{counts.get(name, 0)} 个工具"
             if server and server.server_info:
                 detail += f" · {server.server_info}"
-            if server and server.start_error:
-                lines.append(f"  {name}: 启动失败: {server.start_error}")
+            if server and server.start_error and not state.startswith("reconnecting"):
+                lines.append(
+                    f"  {name}: 启动失败: {server.start_error}（修好后 /mcp reconnect {name}）"
+                )
             elif state == "ready":
                 if server and not server.alive():
                     detail += "（连接已断开）" if server.spec.is_http else "（进程已退出）"
+                    detail += f"—— /mcp reconnect {name} 手动拉起"
                 lines.append(f"  {name}: 就绪 · {detail}")
             elif state == "cached":
                 lines.append(f"  {name}: 就绪（schema 缓存，进程按首次调用启动）· {detail}")
             elif state == "loading":
                 lines.append(f"  {name}: 启动中…（就绪后工具自动挂载）")
             else:
+                if state.startswith("failed") and "/mcp reconnect" not in state:
+                    #  启动即失败等老路径的原因里没带入口：统一补上
+                    state += f"（修好后 /mcp reconnect {name}）"
                 lines.append(f"  {name}: {state}")
             if name in quarantined:
                 shown = ", ".join(quarantined[name][:5])
@@ -2378,33 +2604,41 @@ def launch(config: Config, extra_specs: list[ServerSpec] | None = None) -> McpMa
     的同名条目更贴近此刻的意图。带 extra_specs 时走不缓存的路径（理由见
     _extra_managers），返回的 manager 由调用方 close，at-exit 也会兜底。
     """
-    if extra_specs:
-        merged = {spec.name: spec for spec in load_server_specs(
+    def discover() -> list[ServerSpec]:
+        #  每次调用现读现判：/mcp reconnect 重读配置走的也是这里，trust 门与准入
+        #  规则与启动时同一份，不另写一套
+        return load_server_specs(
             config.workspace,
             config.extra_env,
+            #  getattr 兜底：嵌入宿主可能拿旧版 Config 对象构造（没有这个字段）
             include_project=getattr(config, "workspace_trusted", True),
-        )}
-        merged.update({spec.name: spec for spec in extra_specs})
-        return launch_specs(list(merged.values()))
+        )
+
+    if extra_specs:
+        extras = {spec.name: spec for spec in extra_specs}
+
+        def merged() -> list[ServerSpec]:
+            specs = {spec.name: spec for spec in discover()}
+            specs.update(extras)
+            return list(specs.values())
+
+        return launch_specs(merged(), spec_loader=merged)
     manager = _managers.get(config.workspace)
     if manager is not None:
         return manager
-    specs = load_server_specs(
-        config.workspace,
-        config.extra_env,
-        #  getattr 兜底：嵌入宿主可能拿旧版 Config 对象构造（没有这个字段）
-        include_project=getattr(config, "workspace_trusted", True),
-    )
+    specs = discover()
     if not specs:
         return None
-    manager = McpManager(specs)
+    manager = McpManager(specs, spec_loader=discover)
     manager.start()
     _managers[config.workspace] = manager
     _ensure_atexit()
     return manager
 
 
-def launch_specs(specs: list[ServerSpec]) -> McpManager:
+def launch_specs(
+    specs: list[ServerSpec], spec_loader: Callable[[], list[ServerSpec]] | None = None
+) -> McpManager:
     """按给定 specs 现起一个 manager 并登记到 at-exit 清扫。
 
     嵌入宿主自带 server 清单时的入口：自己 `McpManager(specs)` 也能跑，但那份
@@ -2417,8 +2651,11 @@ def launch_specs(specs: list[ServerSpec]) -> McpManager:
     的语义是"回到配置发现"，于是操作者自己 mcp.json 里的 server 泄进了一个
     本不该看到它们的会话。空 manager 不起任何子进程，代价为零；让"零个 server"
     与"没有指定视图"这两件事在类型上就分得开，比在 docstring 里叮嘱可靠。
+
+    spec_loader：/mcp reconnect 重读声明用的函数（见 McpManager）；不给则热恢复
+    沿用这份清单里的声明。
     """
-    manager = McpManager(specs)
+    manager = McpManager(specs, spec_loader=spec_loader)
     manager.start()
     _extra_managers.append(manager)
     _ensure_atexit()

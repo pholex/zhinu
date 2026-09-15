@@ -23,6 +23,8 @@
 是选项值不是命令名，`timeout 5 rm` 的 5 是 DURATION。只跳过 `-` 开头的 token 会把
 选项值当成命令，里面真正的 rm 就漏了。选项表见 ``_WRAPPERS``；表外的选项按
 fail-safe 处理（带值 / 不带值两种解释都扫），扫不完（嵌套过深、分叉过多）按有风险报。
+同一套剥法也覆盖"把后续参数交给 shell"的工具（watch 拼接参数、script -c、sg），
+find 的 -exec/-execdir/-ok/-okdir 命令段单独切出来递归扫。
 """
 
 from __future__ import annotations
@@ -214,7 +216,7 @@ def _injection_risk_argv(argv: list[str], depth: int) -> str | None:
     if (peeled := _peel_wrapper(name, argv)) is not None:
         commands, scripts = peeled
         if scripts:
-            return f"{name} 的选项里带着一段脚本，前缀规则看不见里面跑什么"
+            return f"{name} 会把一段源码交给 shell 执行，前缀规则看不见里面跑什么"
         for inner in commands:
             if depth + 1 > _MAX_WRAPPER_DEPTH:
                 raise _TooComplex
@@ -260,7 +262,9 @@ def _git_risk(args: list[str]) -> str | None:
 #  - optional：值可选，只认粘连（`-m/proc/1/ns/mnt`、`--mount=…`），不吃下一个 token；
 #  - flag：不带值；
 #  - script：值是一段 shell 源码（`su -c '…'`），要重新当脚本扫；
-#  - split：值按空白拆成参数、插回原位继续当本 wrapper 的参数（`env -S '…'`）。
+#  - split：值按空白拆成参数、插回原位继续当本 wrapper 的参数（`env -S '…'`）；
+#  - exec：不带值的开关，打开后命令直接 exec、不再拼成 shell 源码（`watch -x`）。
+#  可选值（optional）只认粘连：`--mount=file` / `-mfile`，`--mount file` 里的 file 是下一个参数。
 #  **拿不准的选项宁可不写进表**：表外选项两种解释都扫，最多多报；把带值选项
 #  错写成 flag 则会把选项值当命令、真命令漏掉——这正是本表要修的那类洞。
 
@@ -271,51 +275,70 @@ class _WrapperSpec:
 
     options: dict[str, str] = field(default_factory=dict)
     positionals: int = 0  # 命令之前的位置参数个数：timeout 的 DURATION、chroot 的 NEWROOT、flock 的锁文件
-    assignments: bool = False  # env：命令之前可以有 NAME=VALUE
+    assignments: bool = False  # env / sudo：命令之前可以有 NAME=VALUE
     numeric: bool = False  # nice 的老写法 `nice -10 cmd`
     post_script: bool = False  # flock：锁文件之后可以是 `-c '脚本'`
     shell_tail: bool = False  # su：选项可以出现在用户名之后（GNU 重排），用户名之后的参数整体交给 shell
+    permute: bool = False  # util-linux script：非选项参数只是日志文件名，选项可以跟在它后面，命令只从 -c 来
+    joined_script: bool = False  # watch：命令参数用空格拼成一段交给 sh -c（打开 exec 开关才直接 exec）
+    command_is_script: bool = False  # sg：命令位上的参数是交给 sh -c 的源码，不是 argv
+    single_dash_long: bool = False  # macOS arch：多字母选项只写一个横线（`-arch arm64`、`-x86_64`）
 
 
 def _spec(*, value: str = "", optional: str = "", flag: str = "", script: str = "",
-          split: str = "", **extra) -> _WrapperSpec:
+          split: str = "", exec_flag: str = "", **extra) -> _WrapperSpec:
     """用空格分隔的选项串建表，免得每个选项写一遍语法名。"""
     options: dict[str, str] = {}
     for kind, names in (("value", value), ("optional", optional), ("flag", flag),
-                        ("script", script), ("split", split)):
+                        ("script", script), ("split", split), ("exec", exec_flag)):
         for option in names.split():
             options[option] = kind
     return _WrapperSpec(options, **extra)
 
 
 _SU_OPTIONS = dict(
-    value="g G s w group supp-group shell whitelist-environment",
-    flag="f l m p P fast login preserve-environment pty help version",
+    value="G g s w group shell supp-group whitelist-environment",
+    flag="P T V f h l m p fast login no-pty preserve-environment pty help version",
     script="c command session-command",
 )
 
+#  chrt 的优先级只在是纯数字时才吃（新版允许 SCHED_OTHER/BATCH/IDLE 省略），吃与不吃两种形态都扫
+_CHRT_OPTIONS = dict(
+    value="D P T U X clamp-max clamp-min sched-deadline sched-period sched-runtime",
+    flag="G O R V a b d e f h i m o p r v all-tasks batch deadline deadline-overrun ext fifo "
+         "idle max other pid reclaim-grub reset-on-fork rr verbose help version",
+)
+
 #  wrapper → 语法（元组：一个命令有两种调用形态时两种都扫，如 runuser）。
-#  依据各自 man 手册（GNU coreutils / util-linux / sudo / systemd / BSD 变体取并集）。
+#  逐项对照手册与上游 getopt 源码复核（util-linux / coreutils / sudo / systemd / procps /
+#  shadow / polkit / OpenBSD doas；FreeBSD 与 macOS 的变体取并集）。
 _WRAPPERS: dict[str, tuple[_WrapperSpec, ...]] = {
-    #  -h 既是 --help 又是 --host=host，-c 各版本含义不一：故意不写，走 fail-safe
+    #  故意不写：-h 在 getopt 里是可选值（-hhost），但后面跟非选项参数时 sudo 也会把它吃成
+    #  主机名，两种都可能；-c 新版是 login class（带值），各实现未必一致。表外按两种解释都扫
     "sudo": (_spec(
-        value="C D R T U g p r t u chdir chroot close-from command-timeout group host "
-              "login-class other-user prompt role type user",
+        value="C D R T U a g p r t u auth-type chdir chroot close-from command-timeout group "
+              "host login-class other-user prompt role type user",
         optional="preserve-env",
         flag="A B E H K N P S V b e i k l n s v askpass background bell edit help list login "
-             "non-interactive preserve-groups remove-timestamp reset-timestamp set-home shell "
-             "stdin validate version",
+             "no-update non-interactive preserve-groups remove-timestamp reset-timestamp "
+             "set-home shell stdin validate version",
+        assignments=True,  # sudo [VAR=value] command
     ),),
-    "doas": (_spec(value="C u", flag="L n s"),),
+    #  -C config 只校验不执行，照样按带值剥、扫后面的命令（多扫无害）
+    "doas": (_spec(value="C a u", flag="L n s"),),
     "run0": (_spec(
         value="D g u area background chdir description group lightweight machine nice property "
               "setenv shell-prompt-prefix slice unit user",
-        flag="no-ask-password pipe pty slice-inherit help version",
+        flag="K V h i k n v empower login no-ask-password no-pager non-interactive pipe pty "
+             "pty-late remove-timestamp reset-timestamp same-root-dir slice-inherit validate "
+             "via-shell help version",
     ),),
+    #  pkexec 不走 getopt：只认独立的 `--user X` / `-u X`，遇到别的参数就当 PROGRAM。
+    #  按 getopt 剥（多认了粘连/等号/-- 写法）只会多扫
     "pkexec": (_spec(value="u user", flag="disable-internal-agent keep-cwd help version"),),
     #  GNU env 与 BSD env 取并集：-P altpath / -L|-U user 是 BSD 的带值选项
     "env": (_spec(
-        value="C L P U a u argv0 chdir unset",
+        value="C L P U a u argv0 chdir env0-from unset",
         optional="block-signal default-signal ignore-signal",
         flag="0 i v debug ignore-environment list-signal-handling null help version",
         split="S split-string",
@@ -323,10 +346,10 @@ _WRAPPERS: dict[str, tuple[_WrapperSpec, ...]] = {
     ),),
     "nice": (_spec(value="n adjustment", flag="help version", numeric=True),),
     "ionice": (_spec(value="P c n p u class classdata pgid pid uid",
-                     flag="t ignore help version"),),
+                     flag="V h t ignore help version"),),
     "nohup": (_spec(flag="help version"),),
     "timeout": (_spec(value="k s kill-after signal",
-                      flag="f p v foreground preserve-status verbose help version",
+                      flag="f h p v foreground preserve-status verbose help version",
                       positionals=1),),
     "stdbuf": (_spec(value="e i o error input output", flag="help version"),),
     "command": (_spec(flag="p v V"),),
@@ -334,12 +357,14 @@ _WRAPPERS: dict[str, tuple[_WrapperSpec, ...]] = {
     #  GNU time 与 BSD time 取并集（bash 关键字 time 只认 -p）
     "time": (_spec(value="f o format output",
                    flag="a h l p q v V append portability quiet verbose help version"),),
-    "setsid": (_spec(flag="c f w ctty fork wait help version"),),
+    "setsid": (_spec(flag="V c f h w ctty fork wait help version"),),
+    #  GNU chroot 只有长选项，-G/-g/-u/-n 是 BSD/macOS 的
     "chroot": (_spec(value="G g u groups userspec", flag="n skip-chdir help version",
                      positionals=1),),
     "flock": (_spec(
-        value="E w conflict-exit-code timeout wait",
-        flag="F e n o s u x close exclusive nb no-fork nonblock shared unlock verbose help version",
+        value="E w conflict-exit-code fd length start timeout wait",
+        flag="F V e h n o s u x close exclusive fcntl nb no-fork nonblocking shared unlock "
+             "verbose help version",
         script="c command",
         positionals=1, post_script=True,
     ),),
@@ -351,33 +376,37 @@ _WRAPPERS: dict[str, tuple[_WrapperSpec, ...]] = {
         _spec(value="u user " + _SU_OPTIONS["value"], flag=_SU_OPTIONS["flag"],
               script=_SU_OPTIONS["script"], shell_tail=True),
     ),
+    #  故意不写 -W/--wdns：上游现为可选值（只认 -Wdir / --wdns=dir），引入时是否如此拿不准
     "nsenter": (_spec(
-        value="G S W t setgid setuid target wdns",
+        value="G N S t net-socket setgid setuid target",
         optional="C T U i m n p r u w cgroup ipc mount net pid root time user uts wd",
-        flag="F N Z a c e all env follow-context join-cgroup keep-caps no-fork "
+        flag="F V Z a c e h all env follow-context join-cgroup keep-caps no-fork "
              "preserve-credentials user-parent help version",
     ),),
+    #  短选项 -m/-u/-i/-n/-p/-C/-T/-U 不带值，只有对应的长选项有可选值（--mount=file）
     "unshare": (_spec(
         value="G R S l w boottime load-interp map-group map-groups map-user map-users monotonic "
-              "propagation root setgid setgroups setuid wd",
-        optional="C T U i m n p u cgroup ipc kill-child mount mount-binfmt mount-proc net pid "
-                 "time user uts",
-        flag="c f r fork keep-caps map-auto map-current-user map-root-user help version",
+              "owner propagation root setgid setgroups setuid wd whitelist-env",
+        optional="cgroup ipc kill-child mount mount-binfmt mount-proc net pid time user uts",
+        flag="C T U V c f h i m n p r u clear-env forward-signals fork keep-caps map-auto "
+             "map-current-user map-root-user map-subids help version",
     ),),
     "setpriv": (_spec(
         value="ambient-caps apparmor-profile bounding-set egid euid groups inh-caps "
-              "landlock-access landlock-rule pdeathsig regid reuid rgid ruid securebits "
-              "seccomp-filter selinux-label",
-        flag="d clear-groups dump init-groups keep-groups nnp no-new-privs reset-env help version",
+              "landlock-access landlock-rule list-landlock-rights pdeathsig ptracer regid reuid "
+              "rgid ruid securebits seccomp-filter selinux-label",
+        flag="V d h clear-groups dump init-groups keep-groups landlock-support list-caps "
+             "list-landlock-access nnp no-new-privs reset-env help version",
     ),),
     "systemd-run": (_spec(
-        value="C E H M p u capsule description gid host job-mode machine nice on-active on-boot "
-              "on-calendar on-startup on-unit-active on-unit-inactive path-property property "
-              "service-type setenv slice socket-property timer-property uid unit "
-              "working-directory",
-        flag="G P S d q r t collect no-ask-password no-block on-clock-change "
-             "on-timezone-change pipe pty quiet remain-after-exit same-dir scope send-sighup "
-             "shell slice-inherit system user wait help version",
+        value="C E H M p u background capsule description expand-environment gid host job-mode "
+              "json machine nice on-active on-boot on-calendar on-startup on-unit-active "
+              "on-unit-inactive output path-property property root-directory service-type "
+              "setenv slice socket-property timer-property uid unit working-directory",
+        flag="G P R S T d h q r t v collect ignore-failure no-ask-password no-block no-pager "
+             "on-clock-change on-timezone-change pipe pty pty-late quiet remain-after-exit "
+             "same-dir same-root-dir scope send-sighup shell slice-inherit system tty user "
+             "verbose wait help version",
     ),),
     #  GNU xargs 与 BSD xargs 取并集（-J/-R/-S 是 BSD 的带值选项）
     "xargs": (_spec(
@@ -388,16 +417,40 @@ _WRAPPERS: dict[str, tuple[_WrapperSpec, ...]] = {
              "help version",
     ),),
     "strace": (_spec(value="E I O P S U X a b e o p s u output",
-                     flag="C D F T V Z c d f h i k n q r t v w x y z"),),
-    "ltrace": (_spec(value="A D F a e l n o p s u x output",
-                     flag="C L S T V b c f h i r t w"),),
-    "chrt": (_spec(
-        value="D P T sched-deadline sched-period sched-runtime",
-        flag="R a b d e f i m o p r v all-tasks batch deadline ext fifo idle max other pid "
-             "reset-on-fork rr verbose help version",
-        positionals=1,
+                     flag="A C D F N T V Y Z c d f h i k n q r t v w x y z"),),
+    "ltrace": (_spec(
+        value="A D F a d e l n o p s u w x align config debug indent library max-depth output "
+              "where",
+        flag="C L S T V b c f h i r t demangle help no-signals version",
     ),),
-    "taskset": (_spec(flag="a c p all-tasks cpu-list pid help version", positionals=1),),
+    "chrt": (_spec(**_CHRT_OPTIONS, positionals=1), _spec(**_CHRT_OPTIONS)),
+    "taskset": (_spec(flag="V a c h p all-tasks cpu-list pid help version", positionals=1),),
+    #  procps watch：命令参数用空格拼成一段交给 `sh -c`，-x/--exec 才直接 exec
+    "watch": (_spec(
+        value="n q s equexit interval shotsdir",
+        optional="d differences",
+        flag="C b c e f g h p r t v w beep chgexit color errexit follow help no-color "
+             "no-rerun no-title no-wrap precise version",
+        exec_flag="x exec",
+        joined_script=True,
+    ),),
+    #  script 两种形态都扫：util-linux `script [选项] [file]`（命令只从 -c 来）；
+    #  BSD/macOS `script [-adeFfkpqrw] [-t time] [file [command ...]]`
+    "script": (
+        _spec(value="B E I O T m o echo log-in log-io log-out log-timing logging-format "
+                    "output-limit",
+              optional="t timing",
+              flag="V a e f h q append flush force help quiet return version",
+              script="c command", permute=True),
+        _spec(value="T t", flag="F a d e f k p q r w", positionals=1),
+    ),
+    #  shadow 的 sg：`sg [-|-l] group [[-c] command]`，command 交给 /bin/sh -c
+    "sg": (_spec(flag="l", script="c", positionals=1, command_is_script=True),),
+    #  macOS：`caffeinate [-dimsu] [-t timeout] [-w pid] [utility arguments...]`
+    "caffeinate": (_spec(value="t w", flag="d i m s u"),),
+    #  macOS：`arch [-32] [-64] [[-arch_name | -arch arch_name]...] [-c] [-d env]... [-e env=value]... prog`
+    "arch": (_spec(value="arch d e", flag="32 64 arm64 arm64e c h i386 x86_64 x86_64h",
+                   single_dash_long=True),),
 }
 
 #  所有 wrapper 名：permissions 的会话授权与 allow 探针都从这里取，加一个 wrapper 三处同时受益
@@ -454,6 +507,15 @@ def _option_steps(argv: list[str], index: int,
         found = [] if value is None else [value]
         return (step, found if kind == "script" else [], found if kind == "split" else [])
 
+    if spec.single_dash_long and not token.startswith("--"):
+        #  arch 的 `-arch arm64` / `-x86_64`：整串对上多字母选项才按长选项剥，否则退回短选项聚合
+        name, equals, _ = token[1:].partition("=")
+        kind = spec.options.get(name) if len(name) > 1 else None
+        if kind == "value" and not equals:
+            return [(after_value, [], [])]
+        if kind is not None:
+            return [(index + 1, [], [])]
+
     if token.startswith("--"):
         name, equals, attached = token[2:].partition("=")
         kind = _long_kind(spec, name)
@@ -462,7 +524,7 @@ def _option_steps(argv: list[str], index: int,
                             index + 1 if equals else after_value)]
         if kind == "value":
             return [(index + 1 if equals else after_value, [], [])]
-        if kind in ("flag", "optional") or equals:
+        if kind in ("flag", "optional", "exec") or equals:
             return [(index + 1, [], [])]
         #  表外长选项：带值、不带值两种解释都走
         return [(index + 1, [], []), (after_value, [], [])]
@@ -472,7 +534,7 @@ def _option_steps(argv: list[str], index: int,
     for offset in range(1, len(token)):
         letter, rest = token[offset], token[offset + 1:]
         kind = spec.options.get(letter)
-        if kind == "flag":
+        if kind in ("flag", "exec"):
             continue
         if kind == "optional":
             steps.append((index + 1, [], []))
@@ -486,11 +548,127 @@ def _option_steps(argv: list[str], index: int,
     return steps
 
 
+#  env -S 里的控制字符转义与 ${VARNAME}
+_ENV_SPLIT_CONTROLS = {"f": "\f", "n": "\n", "r": "\r", "t": "\t", "v": "\v"}
+_ENV_SPLIT_VARIABLE = re.compile(r"\$\{[A-Za-z_][A-Za-z0-9_]*\}")
+
+
 def _split_env_payload(payload: str) -> list[str]:
-    """`env -S` 的值拆成参数。GNU 有自己的转义（`\\_` 是分词空格、`\\c` 截断其后），
-    近似成 shlex；shlex 解析不了就按空白粗切（宽松方向）。"""
-    payload = payload.split("\\c", 1)[0].replace("\\_", " ")
-    return _split(payload) or payload.split()
+    """`env -S` 的值拆成参数，规则照 GNU env 手册（coreutils 的实现同此）。
+
+    GNU env 对不合法的串（引号不闭合、非法转义、双引号里的 `\\c`）直接报错退出、
+    什么都不执行；这里退回按空白粗切——只会多扫，不会漏。BSD/macOS env 的 -S
+    规则大同小异（多认 `\\<空白>`），差异处同样落到宽松方向。
+    """
+    args = _parse_env_split(payload)
+    return args if args is not None else payload.split()
+
+
+def _parse_env_split(payload: str) -> list[str] | None:
+    """GNU env -S 分词；不合法返回 None。
+
+    - 引号外空白分词；单引号内只有 `\\\\`、`\\'` 是转义，双引号内照常转义；
+    - `\\_` 引号外是分词、双引号内是空格；`\\c` 截断其后；`\\f \\n \\r \\t \\v` 是控制字符；
+      `\\" \\# \\$ \\' \\\\` 是字面量，其余转义不合法；
+    - 参数开头的 `#` 注释掉其后；
+    - 单引号外的 `${VAR}` 会展开——值要到运行时才知道，原样保留字面量（与脚本里的 $VAR 同口径）。
+    """
+    args: list[str] = []
+    single = double = False
+    separated = True  # 上一个字符是分隔符：下一个字符开始新参数
+    i, n = 0, len(payload)
+
+    def put(text: str) -> None:
+        nonlocal separated
+        if separated:
+            args.append("")
+            separated = False
+        args[-1] += text
+
+    while i < n:
+        ch = payload[i]
+        if ch == "'" and not double:
+            single = not single
+            put("")  # 空引号 '' 也是一个参数
+            i += 1
+        elif ch == '"' and not single:
+            double = not double
+            put("")
+            i += 1
+        elif ch in " \t\n\v\f\r" and not (single or double):
+            separated = True
+            i += 1
+        elif ch == "#" and separated:
+            break
+        elif ch == "\\":
+            following = payload[i + 1] if i + 1 < n else ""
+            if single and following not in ("\\", "'"):
+                put("\\")
+                i += 1
+                continue
+            if following in ('"', "#", "$", "'", "\\"):
+                put(following)
+            elif following == "_":
+                if double:
+                    put(" ")
+                else:
+                    separated = True
+            elif following == "c":
+                if double:
+                    return None
+                break
+            elif following in _ENV_SPLIT_CONTROLS:
+                put(_ENV_SPLIT_CONTROLS[following])
+            else:
+                return None
+            i += 2
+        elif ch == "$" and not single:
+            match = _ENV_SPLIT_VARIABLE.match(payload, i)
+            if match is None:
+                return None  # GNU 只认 ${VARNAME}
+            put(match.group(0))
+            i = match.end()
+        else:
+            put(ch)
+            i += 1
+    else:
+        if single or double:
+            return None
+    return args
+
+
+def _exec_switch(token: str, spec: _WrapperSpec) -> bool | None:
+    """这个选项 token 会不会打开 exec 开关（watch -x）。
+
+    表外字母可能带值、把后面的 x 吞成它的值，有歧义的长选项缩写也说不准：两可时返回 None。
+    """
+    if token.startswith("--"):
+        name = token[2:].partition("=")[0]
+        kind = _long_kind(spec, name)
+        if kind is None and name:
+            ambiguous = any(len(option) > 1 and option.startswith(name) and option_kind == "exec"
+                            for option, option_kind in spec.options.items())
+            return None if ambiguous else False
+        return kind == "exec"
+    uncertain = False
+    for letter in token[1:]:
+        kind = spec.options.get(letter)
+        if kind == "exec":
+            return None if uncertain else True
+        if kind is None:
+            uncertain = True
+        elif kind != "flag":
+            break  # 带值字母之后是它的值，不再是开关
+    return False
+
+
+def _merge_exec(current: bool | None, switch: bool | None) -> bool | None:
+    """exec 开关的三态合并：任一处确定打开就是打开，有两可就两可。"""
+    if current is True or switch is True:
+        return True
+    if current is None or switch is None:
+        return None
+    return False
 
 
 def _peel_wrapper(name: str, argv: list[str]) -> tuple[list[list[str]], list[str]] | None:
@@ -508,8 +686,10 @@ def _peel_wrapper(name: str, argv: list[str]) -> tuple[list[list[str]], list[str
     commands: list[list[str]] = []
     scripts: list[str] = []
     for spec in specs:
-        seen: set[tuple[int, int, bool, tuple[str, ...]]] = set()
-        pending = [(1, spec.positionals, False, ())]
+        #  状态：(下标, 还差几个位置参数, 是否已过 --, su 形态收集的尾巴, exec 开关三态)
+        seen: set[tuple[int, int, bool, tuple[str, ...], bool | None]] = set()
+        pending: list[tuple[int, int, bool, tuple[str, ...], bool | None]] = [
+            (1, spec.positionals, False, (), False)]
         while pending:
             state = pending.pop()
             if state in seen:
@@ -517,7 +697,7 @@ def _peel_wrapper(name: str, argv: list[str]) -> tuple[list[list[str]], list[str
             seen.add(state)
             if len(seen) > _MAX_SCAN_NODES:
                 raise _TooComplex
-            index, need, ended, tail = state
+            index, need, ended, tail, exec_mode = state
             if index >= len(argv):
                 #  su 形态：第一个位置参数是用户名，其后的参数原样交给 shell（`su root -- -c '…'`）
                 if spec.shell_tail and len(tail) > 1:
@@ -525,31 +705,44 @@ def _peel_wrapper(name: str, argv: list[str]) -> tuple[list[list[str]], list[str
                 continue
             token = argv[index]
             if not ended and token == "--":
-                pending.append((index + 1, need, True, tail))
+                pending.append((index + 1, need, True, tail, exec_mode))
             elif not ended and token == "-":
-                #  env 的 `-` 等于 -i，su 的 `-` 等于 -l：都是开关
-                pending.append((index + 1, need, ended, tail))
+                #  env 的 `-` 等于 -i，su 的 `-` 等于 -l，sg 的 `-` 是登录环境：都是开关
+                pending.append((index + 1, need, ended, tail, exec_mode))
             elif not ended and token.startswith("-"):
                 if spec.numeric and _NICE_NUMERIC.fullmatch(token):
-                    pending.append((index + 1, need, ended, tail))
+                    pending.append((index + 1, need, ended, tail, exec_mode))
                     continue
+                if spec.joined_script:
+                    exec_mode = _merge_exec(exec_mode, _exec_switch(token, spec))
                 for step, found_scripts, found_splits in _option_steps(argv, index, spec):
                     scripts.extend(found_scripts)
                     for payload in found_splits:
                         #  拆出来的参数插回原位，连同其后的参数重新当 env 的参数剥一遍
                         commands.append([argv[0], *_split_env_payload(payload), *argv[step:]])
-                    pending.append((step, need, ended, tail))
+                    pending.append((step, need, ended, tail, exec_mode))
             elif spec.assignments and "=" in token.lstrip("="):
-                pending.append((index + 1, need, ended, tail))
+                pending.append((index + 1, need, ended, tail, exec_mode))
             elif spec.shell_tail:
-                pending.append((index + 1, need, ended, (*tail, token)))
+                pending.append((index + 1, need, ended, (*tail, token), exec_mode))
+            elif spec.permute:
+                #  util-linux script：非选项参数是日志文件名，后面还可以跟选项
+                pending.append((index + 1, need, ended, tail, exec_mode))
             elif need > 0:
-                pending.append((index + 1, need - 1, ended, tail))
+                pending.append((index + 1, need - 1, ended, tail, exec_mode))
             elif spec.post_script and token in ("-c", "--command"):
                 if index + 1 < len(argv):
                     scripts.append(argv[index + 1])
+            elif spec.command_is_script:
+                #  sg 只把紧跟的那一个参数交给 sh -c、其后的忽略；整段拼起来扫是宽松方向
+                scripts.append(" ".join(argv[index:]))
             else:
-                commands.append(argv[index:])
+                rest = argv[index:]
+                #  watch：没开 exec 就是 `sh -c "参数用空格拼起来"`；开没开说不准时两种都扫
+                if spec.joined_script and exec_mode is not True:
+                    scripts.append(" ".join(rest))
+                if not spec.joined_script or exec_mode is not False:
+                    commands.append(rest)
     return commands, scripts
 
 
@@ -745,27 +938,137 @@ def _strip_shell_prefix(argv: list[str]) -> list[str]:
     return argv
 
 
+#  sh 家族（-c 是开关）里带独立值的短选项：`-o 选项名` 各家都认，`-O shopt 名` 是 bash 的。
+#  "未必带值"的字母两种读法都走：-O 在别的 shell 未必认，ksh93 的 -R 文件、mksh 的 -T 终端同理
+_SHELL_VALUE_LETTERS = {"bash": "oO"}
+_SHELL_MAYBE_VALUE_LETTERS = {"bash": "", "ksh": "ORT"}
+_SHELL_VALUE_LONG = frozenset({"--rcfile", "--init-file"})  # bash 的长选项不认 = 写法
+#  fish：-c/--command 与 -C/--init-command 的值就是脚本（可以给多个）；其余带值选项的值跳过
+_FISH_SCRIPT_OPTIONS = {"c": "command", "C": "init-command"}
+_FISH_VALUE_OPTIONS = {"d": "debug", "f": "features", "o": "debug-output", "p": "profile"}
+_FISH_VALUE_LONG = ("profile-startup",)
+
+
+def _posix_shell_scripts(name: str, argv: list[str]) -> list[str]:
+    """`sh [选项] -c 脚本 [$0 [$1 …]]`：只有 -c 之后第一个非选项参数是脚本。
+
+    手册语义：选项在第一个非选项参数处结束。有 -c 时它是脚本、其后是 $0 $1…；
+    没有 -c 时它是脚本文件（`bash script.sh`，文件内容不扫），`-s` 从 stdin 读同理。
+    带值短选项（-o pipefail）的值不算非选项参数；拿不准带不带值的字母两种读法都扫。
+    """
+    value_letters = _SHELL_VALUE_LETTERS.get(name, "o")
+    maybe_letters = _SHELL_MAYBE_VALUE_LETTERS.get(name, "O")
+    scripts: list[str] = []
+    seen: set[tuple[int, bool]] = set()
+    pending = [(1, False)]
+    while pending:
+        state = pending.pop()
+        if state in seen:
+            continue
+        seen.add(state)
+        if len(seen) > _MAX_SCAN_NODES:
+            raise _TooComplex
+        index, has_c = state
+        if index >= len(argv):
+            continue
+        token = argv[index]
+        if token in ("--", "-"):
+            #  选项结束（bash 里单个 - 等于 --）：下一个参数是脚本或脚本文件
+            if has_c and index + 1 < len(argv):
+                scripts.append(argv[index + 1])
+        elif token.startswith("--"):
+            pending.append((index + (2 if token in _SHELL_VALUE_LONG else 1), has_c))
+        elif len(token) > 1 and token[0] in "-+":
+            #  聚合短选项：-c 置位；每个带值字母按顺序各吃掉后面一个参数（-eo pipefail）
+            consumed = {0}
+            for letter in token[1:]:
+                if letter in value_letters:
+                    consumed = {count + 1 for count in consumed}
+                elif letter in maybe_letters:
+                    consumed |= {count + 1 for count in consumed}
+            sets_c = token[0] == "-" and "c" in token[1:]
+            for count in consumed:
+                pending.append((index + 1 + count, has_c or sets_c))
+        elif has_c:
+            scripts.append(token)
+    return list(dict.fromkeys(scripts))
+
+
+def _fish_scripts(argv: list[str]) -> list[str]:
+    """fish 的 -c/-C 值是脚本，其后的位置参数是 $argv。
+
+    不在第一个位置参数处停：`fish file -c …` 里 -c 算不算选项取决于实现，照样扫（宽松方向）。
+    """
+    script_long = tuple(_FISH_SCRIPT_OPTIONS.values())
+    value_long = (*_FISH_VALUE_OPTIONS.values(), *_FISH_VALUE_LONG)
+    scripts: list[str] = []
+    index = 1
+    while index < len(argv):
+        token = argv[index]
+        following = argv[index + 1] if index + 1 < len(argv) else None
+        if token == "--":
+            break
+        if token.startswith("--"):
+            name, equals, attached = token[2:].partition("=")
+            is_script = bool(name) and any(option.startswith(name) for option in script_long)
+            takes_value = is_script or (bool(name) and any(option.startswith(name)
+                                                           for option in value_long))
+            value = attached if equals else (following if takes_value else None)
+            if is_script and value is not None:
+                scripts.append(value)
+            index += 2 if takes_value and not equals else 1
+            continue
+        if token.startswith("-") and len(token) > 1:
+            step = 1
+            for offset in range(1, len(token)):
+                letter, rest = token[offset], token[offset + 1:]
+                if letter in _FISH_SCRIPT_OPTIONS or letter in _FISH_VALUE_OPTIONS:
+                    value = rest or following
+                    if letter in _FISH_SCRIPT_OPTIONS and value is not None:
+                        scripts.append(value)
+                    step = 1 if rest else 2
+                    break
+            index += step
+            continue
+        index += 1
+    return scripts
+
+
+#  find 的执行类动作：其后到 `;`（或紧跟在 `{}` 后的 `+`）为止是一条命令
+_FIND_EXEC_ACTIONS = frozenset({"-exec", "-execdir", "-ok", "-okdir"})
+
+
+def _find_exec_commands(argv: list[str]) -> list[list[str]]:
+    """find 表达式里 -exec/-execdir/-ok/-okdir 带的命令段。
+
+    `{}` 当普通参数；`+` 只有紧跟 `{}` 时才是结束符（`-exec chmod + x {} +` 里第一个 + 是参数）；
+    找不到结束符就取到末尾（宽松方向）。`-delete` 不在这里：它与不带 -f 的 rm 同口径，
+    不算强制删除，靠 injection_risk 挡住免确认。
+    """
+    commands: list[list[str]] = []
+    index = 1
+    while index < len(argv):
+        if argv[index] not in _FIND_EXEC_ACTIONS:
+            index += 1
+            continue
+        start = index = index + 1
+        while index < len(argv) and not (
+            argv[index] == ";" or (argv[index] == "+" and index > start and argv[index - 1] == "{}")
+        ):
+            index += 1
+        if index > start:
+            commands.append(argv[start:index])
+        index += 1
+    return commands
+
+
 def _inner_scripts(name: str, argv: list[str]) -> list[str]:
     """参数里被当作 shell 源码的那部分：`bash -c '…'`、`trap '…' EXIT`、`eval '…'`。
 
     返回的每一项都要重新当脚本扫一遍。
     """
     if name in _SHELLS:
-        #  -c 只是开关，脚本是它之后的第一个非选项参数，中间可能夹着带值选项
-        #  （`bash -o pipefail -c …`、`bash --rcfile x -c …`）。分不清哪个才是脚本，
-        #  就把 -c 之后的非选项参数都当脚本扫（宽松方向，多扫的是 $0/$1 这类参数）
-        scripts: list[str] = []
-        seen_c = False
-        for arg in argv[1:]:
-            if arg.startswith("--command="):
-                scripts.append(arg.split("=", 1)[1])  # fish --command=…
-            elif arg == "--command" or (
-                arg.startswith("-") and not arg.startswith("--") and "c" in arg[1:]
-            ):
-                seen_c = True
-            elif seen_c and not arg.startswith(("-", "+")):
-                scripts.append(arg)
-        return scripts
+        return _fish_scripts(argv) if name == "fish" else _posix_shell_scripts(name, argv)
     if name == "trap" and len(argv) >= 2:
         #  trap 'action' SIGNAL：action 是一段 shell 源码
         return [argv[1]]
@@ -825,6 +1128,11 @@ def _scan_segment(argv: list[str], depth: int, hit, budget: _Budget) -> str | No
                 return reason
         for script in scripts:
             if reason := _scan_script(script, budget.descend(depth), hit, budget):
+                return reason
+        return None
+    if name == "find":
+        for inner in _find_exec_commands(argv):
+            if reason := _scan_segment(inner, budget.descend(depth), hit, budget):
                 return reason
         return None
     for script in _inner_scripts(name, argv):

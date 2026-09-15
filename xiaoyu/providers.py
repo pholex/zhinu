@@ -317,6 +317,10 @@ class Provider:
     text_tool_models: tuple[str, ...] = ()
     #  工具调用重放必须带 thought_signature 的型号（`*` = 整家）。见 Preset 同名字段
     signature_models: tuple[str, ...] = ()
+    #  端点开着响应缓存、且认得"跳过缓存读取"的请求体字段（见 CACHE_BYPASS_BODY）。
+    #  只有网关会置位（见 _gateway_cache_bypass）：直连厂商的官方端点对未知
+    #  请求体字段可能直接 400，绝不能发
+    response_cache: bool = False
 
     @property
     def wildcard(self) -> bool:
@@ -498,6 +502,16 @@ class Registry:
         except UnknownModel:
             pass
         return route.qualified
+
+    def cache_bypass(self, route: Route) -> dict[str, Any] | None:
+        """这条路由重发时用来绕开响应缓存的 extra_body；端点没有这项能力返回 None。
+
+        能力判定收在 provider 层（Provider.response_cache），内核不认域名。
+        """
+        provider = self.get(route.provider)
+        if provider is None or not provider.response_cache:
+            return None
+        return {key: dict(value) for key, value in CACHE_BYPASS_BODY.items()}
 
     def _route(self, provider: Provider, model: str) -> Route:
         return Route(provider.name, model, self.client(provider.name))
@@ -796,6 +810,43 @@ def _signature_override() -> tuple[str, ...]:
     return tuple(item.strip() for item in raw.split(",") if item.strip())
 
 
+#  跳过网关响应缓存读取的请求体字段（经 SDK 的 extra_body 并进 JSON）。
+#  2026-09-15 对自建 LiteLLM 网关实测（stream 与非 stream 各一组）：
+#  - 同一请求连发两次，第二次 id 与正文逐字相同、响应头带 x-litellm-cache-key、
+#    耗时 ~2ms——命中缓存；流式命中时 usage 还被改写成 completion_tokens=0；
+#  - 请求体带 `cache: {"no-cache": true}` 重发：新 id、无 cache-key 头、真实
+#    耗时，200 不报错——确实绕过读取（新结果照常写回缓存，覆盖旧条目）；
+#  - 请求头 `Cache-Control: no-cache` **不生效**，照样命中。
+CACHE_BYPASS_BODY: dict[str, Any] = {"cache": {"no-cache": True}}
+
+
+def _gateway_cache_bypass(base_url: str) -> bool:
+    """网关路由的空补全重试要不要带 CACHE_BYPASS_BODY。
+
+    默认开：网关位（XIAOYU_BASE_URL）的主流形态是带响应缓存的 LiteLLM，
+    空补全一旦被缓存，原样重发只会拿回同一个空结果、白耗重试预算。
+    两类地址默认关：① 主机名与内置直连厂商相同——用户把网关位指向了官方
+    端点，未知请求体字段可能 400；② 本机端点（vLLM / Ollama…）没有响应缓存
+    可绕。`XIAOYU_GATEWAY_CACHE_BYPASS=0/1` 显式指定时以它为准（网关不是
+    LiteLLM、又会拒绝未知字段时的逃生口）。
+    """
+    raw = os.environ.get("XIAOYU_GATEWAY_CACHE_BYPASS", "").strip().lower()
+    if raw in ("0", "false", "no", "off"):
+        return False
+    if raw in ("1", "true", "yes", "on"):
+        return True
+    if is_local_endpoint(base_url):
+        return False
+    try:
+        host = (urlsplit(base_url.strip()).hostname or "").lower()
+    except ValueError:
+        return False
+    vendor_hosts = {
+        (urlsplit(preset.base_url).hostname or "").lower() for preset in PRESETS.values()
+    }
+    return bool(host) and host not in vendor_hosts
+
+
 def _generic_names() -> list[str]:
     """从环境变量里发现未内置的厂商。排序固定，保证顺序可预测。"""
     found = set()
@@ -827,6 +878,7 @@ def _make(name: str, config: Config) -> Provider | None:
             (),
             "网关",
             signature_models=_signature_override(),
+            response_cache=_gateway_cache_bypass(config.base_url),
         )
 
     if preset := PRESETS.get(name):

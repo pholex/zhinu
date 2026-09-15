@@ -206,6 +206,137 @@ class WrapperPeelingTest(unittest.TestCase):
         self.assertIsNone(injection_risk("nice -n 10 make"))
 
 
+class WrapperTableTest(unittest.TestCase):
+    """选项表按手册/源码复核后的边界：带值、可选值、位置参数、单横线长选项。"""
+
+    def test_value_options_are_not_commands(self):
+        from xiaoyu.command_check import unwrap_argv
+
+        self.assertEqual(unwrap_argv(["nsenter", "-N", "3", "ls"]), [["ls"]])
+        self.assertEqual(unwrap_argv(["ltrace", "-w", "3", "ls"]), [["ls"]])
+        self.assertEqual(unwrap_argv(["arch", "-arch", "arm64", "ls"]), [["ls"]])
+        self.assertEqual(unwrap_argv(["caffeinate", "-t", "60", "ls"]), [["ls"]])
+
+    def test_chrt_priority_only_when_numeric(self):
+        from xiaoyu.command_check import unwrap_argv
+
+        self.assertIn(["ls"], unwrap_argv(["chrt", "-o", "ls"]))
+        self.assertIn(["ls"], unwrap_argv(["chrt", "-f", "10", "ls"]))
+
+    def test_sudo_assignments_skipped(self):
+        from xiaoyu.command_check import unwrap_argv
+
+        self.assertEqual(unwrap_argv(["sudo", "FOO=1", "ls"]), [["ls"]])
+
+
+class CommandCarrierTest(unittest.TestCase):
+    """把后续参数当命令/脚本执行的工具：watch、script、sg、find -exec。"""
+
+    def test_watch_joins_arguments_into_shell_script(self):
+        from xiaoyu.command_check import unwrap_argv
+
+        self.assertEqual(unwrap_argv(["watch", "-n", "1", "echo", "a;", "ls"]),
+                         [["sh", "-c", "echo a; ls"]])
+        #  -x 直接 exec，不经 shell
+        self.assertEqual(unwrap_argv(["watch", "-x", "echo", "a;", "ls"]),
+                         [["echo", "a;", "ls"]])
+
+    def test_script_both_forms(self):
+        from xiaoyu.command_check import unwrap_argv
+
+        self.assertIn(["sh", "-c", "make"], unwrap_argv(["script", "-qc", "make", "log"]))
+        self.assertIn(["make", "test"], unwrap_argv(["script", "-q", "/dev/null", "make", "test"]))
+
+    def test_sg_command_is_script(self):
+        from xiaoyu.command_check import unwrap_argv
+
+        self.assertEqual(unwrap_argv(["sg", "docker", "-c", "docker ps"]), [["sh", "-c", "docker ps"]])
+        self.assertEqual(unwrap_argv(["sg", "docker", "docker ps"]), [["sh", "-c", "docker ps"]])
+
+    def test_find_exec_segments(self):
+        from xiaoyu.command_check import _find_exec_commands
+
+        self.assertEqual(
+            _find_exec_commands(["find", ".", "-exec", "rm", "-f", "{}", ";", "-print",
+                                 "-execdir", "echo", "{}", "+"]),
+            [["rm", "-f", "{}"], ["echo", "{}"]],
+        )
+        #  {} 之后才认 + 为结束：单独的 + 是命令参数
+        self.assertEqual(_find_exec_commands(["find", "-exec", "chmod", "+", "x", "{}", "+"]),
+                         [["chmod", "+", "x", "{}"]])
+        #  没有结束符：取到末尾
+        self.assertEqual(_find_exec_commands(["find", "-ok", "rm", "{}"]), [["rm", "{}"]])
+        self.assertEqual(_find_exec_commands(["find", ".", "-name", "x"]), [])
+
+    def test_find_delete_is_injection_not_forced_rm(self):
+        self.assertIsNone(dangerous_command("find . -delete"))
+        self.assertIsNotNone(injection_risk("find . -delete"))
+
+
+class ShellScriptArgumentTest(unittest.TestCase):
+    """`sh -c 脚本 $0 $1…`：只有 -c 之后第一个非选项参数是脚本。"""
+
+    def test_only_first_operand_is_script(self):
+        from xiaoyu.command_check import _inner_scripts
+
+        self.assertEqual(_inner_scripts("bash", ["bash", "-c", "echo", "rm -rf ~", "x"]), ["echo"])
+        self.assertEqual(_inner_scripts("sh", ["sh", "-eo", "pipefail", "-c", "ls", "a"]), ["ls"])
+        self.assertEqual(_inner_scripts("bash", ["bash", "-co", "pipefail", "ls"]), ["ls"])
+        self.assertEqual(_inner_scripts("bash", ["bash", "--rcfile", "x", "-c", "ls"]), ["ls"])
+        self.assertEqual(_inner_scripts("bash", ["bash", "-c", "--", "ls", "a"]), ["ls"])
+
+    def test_script_file_and_stdin_forms_unchanged(self):
+        from xiaoyu.command_check import _inner_scripts
+
+        self.assertEqual(_inner_scripts("bash", ["bash", "script.sh", "-c", "ls"]), [])
+        self.assertEqual(_inner_scripts("bash", ["bash", "-s", "ls"]), [])
+        self.assertEqual(_inner_scripts("bash", ["bash"]), [])
+
+    def test_ambiguous_letters_scan_both_readings(self):
+        from xiaoyu.command_check import _inner_scripts
+
+        #  ksh 的 -R 在 ksh93 带值，其他实现未必：两种读法的脚本都扫
+        scripts = _inner_scripts("ksh", ["ksh", "-R", "x", "-c", "ls"])
+        self.assertIn("ls", scripts)
+
+    def test_fish_command_values(self):
+        from xiaoyu.command_check import _inner_scripts
+
+        self.assertEqual(_inner_scripts("fish", ["fish", "-c", "echo", "rm -rf ~"]), ["echo"])
+        self.assertEqual(_inner_scripts("fish", ["fish", "-C", "a", "--command=b", "-cc"]),
+                         ["a", "b", "c"])
+
+
+class EnvSplitStringTest(unittest.TestCase):
+    """`env -S` 按 GNU env 的规则拆分（引号、\\_、\\c、#、${VAR}）。"""
+
+    def split(self, payload):
+        from xiaoyu.command_check import _split_env_payload
+
+        return _split_env_payload(payload)
+
+    def test_quotes_and_separators(self):
+        self.assertEqual(self.split("rm -rf '/a b'"), ["rm", "-rf", "/a b"])
+        self.assertEqual(self.split('echo "a\\_b"\\_c'), ["echo", "a b", "c"])
+        self.assertEqual(self.split("a\\_b"), ["a", "b"])
+
+    def test_backslash_c_terminates_outside_quotes_only(self):
+        self.assertEqual(self.split("rm -rf x \\c y"), ["rm", "-rf", "x"])
+        #  单引号内 \c 是字面量（只有 \\ 和 \' 特殊）
+        self.assertEqual(self.split("sh -c 'printf \\c; rm'"), ["sh", "-c", "printf \\c; rm"])
+
+    def test_comment_and_escapes(self):
+        self.assertEqual(self.split("rm -rf #x y"), ["rm", "-rf"])
+        self.assertEqual(self.split("a#b"), ["a#b"])
+        self.assertEqual(self.split("rm -r\\f"), ["rm", "-r\f"])
+        self.assertEqual(self.split("echo ${HOME}/x"), ["echo", "${HOME}/x"])
+
+    def test_invalid_payload_falls_back_to_lenient_split(self):
+        #  GNU env 遇到这些会直接报错退出（什么都不执行）；宽松拆分只会多扫
+        self.assertEqual(self.split("rm -rf 'x"), ["rm", "-rf", "'x"])
+        self.assertEqual(self.split("rm \\q -rf"), ["rm", "\\q", "-rf"])
+
+
 class CommandRiskTest(unittest.TestCase):
     def test_combines_both_directions(self):
         self.assertIsNotNone(command_risk("sudo rm -rf /tmp/x"))

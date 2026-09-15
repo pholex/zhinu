@@ -22,7 +22,6 @@ import os
 import re
 import shutil
 import signal
-import stat
 import unicodedata
 import subprocess
 import sys
@@ -32,7 +31,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
 
-from . import browser, mcp, sandbox, tempdirs
+from . import browser, fsguard, mcp, sandbox, tempdirs
 from .background import MONITOR_DEFAULT_TIMEOUT, TaskManager, kill_tree as _kill_tree
 from .config import Config
 from .rewind import RewindStore
@@ -303,27 +302,20 @@ def _edit_encodings() -> list[str]:
 #  分段读（offset/limit）也不例外——几百 MB 的日志能把进程吃爆，内容也塞不进上下文。
 _READ_MAX_BYTES = 50 * 1024 * 1024
 
-_SPECIAL_FILE_KINDS = (
-    (stat.S_ISFIFO, "FIFO（命名管道）"),
-    (stat.S_ISCHR, "字符设备"),
-    (stat.S_ISBLK, "块设备"),
-    (stat.S_ISSOCK, "socket"),
-)
-
 
 def _unreadable_file_error(target: Path, shown: str, size_cap: bool = True) -> str | None:
     """整读前的闸：非普通文件、或超过大小上限，返回拒绝说明；可读返回 None。
 
-    exists/is_dir 挡不住特殊文件：读 FIFO 会一直阻塞到有人写入（工具调用永久
-    挂死、连超时都没有），读 /dev/zero 这类设备读不到头。stat 跟随符号链接，
-    链接指向 FIFO 同样拦下。size_cap=False 只查类型（覆盖写不整读原文）。
+    类型判定在 fsguard（rewind 快照、贴图入口共用同一个闸）：读 FIFO 会永久
+    阻塞、读设备读不到头，stat 跟随符号链接，链接指向 FIFO 同样拦下。
+    size_cap=False 只查类型（覆盖写不整读原文）。
     """
     try:
         info = os.stat(target)
     except OSError as exc:
         return f"ERROR: 读取失败 {shown}: {exc}"
-    if not stat.S_ISREG(info.st_mode):
-        kind = next((name for test, name in _SPECIAL_FILE_KINDS if test(info.st_mode)), "非普通文件")
+    kind = fsguard.non_regular_kind(info.st_mode)
+    if kind is not None:
         return (
             f"ERROR: {shown} 是{kind}，不是普通文件，已拒绝读取——读它可能永久阻塞"
             "等待数据，或读出没有尽头的内容。确需查看请用 bash 并加超时与字节上限"

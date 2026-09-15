@@ -149,7 +149,10 @@ xiaoyu plugin remove aws-core                                 # 删目录 + 摘�
 
 MCP 子进程的环境是**纯白名单**，所以像 aws-mcp 这类要 SigV4 凭证的 server，
 装完得自己在 `mcp.json` 的 `env` 块里用 `${env:AWS_PROFILE}` 之类显式点名——
-不点名只会得到一个莫名其妙的 401/403。
+不点名只会得到一个莫名其妙的 401/403。远端 server 被 401/403 拒绝会整代停用、不自动重试；
+把 `mcp.json` 里的 headers / env 改好后 `/mcp reconnect <name>` 热恢复，不必重启会话（不给名字 =
+全部失败的；对在线的 server 就是干净重启一次）。它重读的是配置文件：在别的终端 export 的变量、
+会话启动后才改的 `.env`，本进程都看不到，那两种仍得重启会话。
 
 server 的工具描述 / schema 一变（多半是 `npx xxx@latest` 拉到了新版）就会被整代隔离，
 启动时直接摊出变了什么（描述逐行 diff、参数增删改），`/mcp diff <name>` 看全部，核对后
