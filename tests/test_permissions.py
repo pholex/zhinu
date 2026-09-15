@@ -82,6 +82,17 @@ class DecideTest(unittest.TestCase):
         self.assertEqual(perms.decide("bash", {"command": "echo x > ~/.zshrc"}), "ask")
         self.assertEqual(perms.decide("bash", {"command": "git log `rm x`"}), "ask")
 
+    def test_wrapper_cannot_launder_destructive_or_injected_commands(self):
+        #  直接构造（绕过落盘校验）的过宽 wrapper 规则不放行任何东西
+        wide = self.perms("allow bash(nice *)")
+        for command in ("nice -n 5 rm -rf ~", "nice -n 5 bash -c evil", "nice -n 10 make"):
+            self.assertEqual(wide.decide("bash", {"command": command}), "ask", command)
+        #  窄规则放行本意的命令，但 wrapper 洗不白里面的注入口与破坏性操作
+        narrow = self.perms("allow bash(timeout 60 git*)")
+        self.assertEqual(narrow.decide("bash", {"command": "timeout 60 git status"}), "allow")
+        for command in ("timeout 60 git -c core.pager=sh log", "timeout 60 git status && rm -rf ~"):
+            self.assertEqual(narrow.decide("bash", {"command": command}), "ask", command)
+
     def test_path_glob_relative_to_workspace(self):
         perms = self.perms("allow write_file(src/*)")
         self.assertEqual(perms.decide("write_file", {"path": "src/a.py"}), "allow")
@@ -135,7 +146,8 @@ class CommandKeyGrantTest(unittest.TestCase):
         self.assertEqual(command_keys("npm -v"), ("npm",))  # 选项不是子命令
         self.assertEqual(command_keys("git add . && git status | head"), ("git add", "git status", "head"))
         #  wrapper / shell -c / 批量执行器永远推不出键
-        for command in ("sudo ls", "bash -c ls", "sh -c 'rm x'", "env FOO=1 ls", "xargs rm", "timeout 5 ls"):
+        for command in ("sudo ls", "bash -c ls", "sh -c 'rm x'", "env FOO=1 ls", "xargs rm", "timeout 5 ls",
+                        "nice -n 5 ls", "setsid ls", "flock /tmp/l ls", "eval ls"):
             self.assertIsNone(command_keys(command), command)
         #  危险命令、看不懂的形状也不给键
         self.assertIsNone(command_keys("rm -rf build"))
@@ -372,6 +384,32 @@ class BannedAllowTest(unittest.TestCase):
             perms.add_persistent(parse_rule(line))
         self.assertEqual(len(perms.rules), 3)
 
+    def test_wrapper_rules_rejected_in_any_option_spelling(self):
+        """wrapper 包任意命令的模式：不管选项值怎么写都拒绝落盘。"""
+        perms = Permissions(self.workspace)
+        for line in (
+            "allow bash(nice *)",
+            "allow bash(nice -n 5 *)",
+            "allow bash(nice --adjustment=5 *)",
+            "allow bash(timeout *)",
+            "allow bash(timeout 30 *)",
+            "allow bash(timeout -s KILL *)",
+            "allow bash(sudo -u root *)",
+            "allow bash(setsid *)",
+            "allow bash(chroot /srv *)",
+            "allow bash(nice -n 5 python *)",
+            "allow bash(nice -n 5 sudo *)",
+            "allow bash(su -c *)",
+        ):
+            with self.assertRaises(ValueError, msg=line):
+                perms.add_persistent(parse_rule(line))
+
+    def test_narrow_wrapper_rules_still_allowed(self):
+        perms = Permissions(self.workspace)
+        for line in ("allow bash(timeout 60 pytest*)", "allow bash(nice -n 10 make*)"):
+            perms.add_persistent(parse_rule(line))
+        self.assertEqual(len(perms.rules), 2)
+
     def test_deny_rules_never_restricted(self):
         perms = Permissions(self.workspace)
         perms.add_persistent(parse_rule("deny bash(python *)"))
@@ -555,6 +593,8 @@ class SuggestAllowRuleTest(unittest.TestCase):
         界面不该提供一个落盘时才报错的选项。"""
         self.assertIsNone(self.suggest("bash", {"command": "python -c 'print(1)'"}))
         self.assertIsNone(self.suggest("bash", {"command": "sudo whoami"}))
+        #  `nice -n 10 make` 推导出的 `nice *` 会放行 nice 包的任意命令
+        self.assertIsNone(self.suggest("bash", {"command": "nice -n 10 make"}))
 
     def test_file_tool_scoped_to_directory(self):
         rule = self.suggest("write_file", {"path": "src/app/x.py"})

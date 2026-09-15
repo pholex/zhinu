@@ -107,12 +107,18 @@ class AutoApprovesTest(unittest.TestCase):
 
     def test_dangerous_command_still_asks(self) -> None:
         """沙箱救不了工作区内的 rm -rf：写权限本来就是开的。"""
-        for command in ("rm -rf build", "bash -lc 'rm -rf .'", "xargs rm -f"):
+        for command in (
+            "rm -rf build", "bash -lc 'rm -rf .'", "xargs rm -f",
+            #  带值选项的 wrapper、选项里的脚本、命令替换都藏不住 rm
+            "nice -n 5 rm -rf .", "timeout -s KILL 5 rm -rf .", "env -S 'rm -rf .'",
+            "su -c 'rm -rf .'", 'echo "$(rm -rf .)"', "(rm -rf .)",
+        ):
             with self.subTest(command=command):
                 self.assertFalse(self.approves("bash", {"command": command}))
 
     def test_privileged_command_still_asks(self) -> None:
-        for command in ("sudo apt install foo", "bash -lc 'sudo ls'", "su - root"):
+        for command in ("sudo apt install foo", "bash -lc 'sudo ls'", "su - root",
+                        "env -S 'sudo id'", "nice -n 5 sudo id", "echo `sudo id`"):
             with self.subTest(command=command):
                 self.assertFalse(self.approves("bash", {"command": command}))
 

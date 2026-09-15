@@ -1,0 +1,90 @@
+{"cmd": "sudo -u root rm -rf ~", "guard": "dangerous", "expect": "block", "note": "sudo -u 带值"}
+{"cmd": "sudo --user root rm -rf ~", "guard": "dangerous", "expect": "block", "note": "sudo 长选项独立值"}
+{"cmd": "sudo --user=root rm -rf ~", "guard": "dangerous", "expect": "block", "note": "sudo 长选项等号值"}
+{"cmd": "sudo -uroot rm -rf ~", "guard": "dangerous", "expect": "block", "note": "sudo 短选项粘连值"}
+{"cmd": "sudo -Eu root rm -rf ~", "guard": "dangerous", "expect": "block", "note": "sudo 短选项聚合，末位带值"}
+{"cmd": "doas -u root rm -rf ~", "guard": "dangerous", "expect": "block", "note": "doas -u 带值"}
+{"cmd": "nice -n 10 rm -rf ~", "guard": "dangerous", "expect": "block", "note": "nice -n 带值"}
+{"cmd": "nice -n10 rm -rf ~", "guard": "dangerous", "expect": "block", "note": "nice 粘连值"}
+{"cmd": "nice --adjustment=5 rm -rf ~", "guard": "dangerous", "expect": "block", "note": "nice 长选项等号值"}
+{"cmd": "nice -10 rm -rf ~", "guard": "dangerous", "expect": "block", "note": "nice 老式数字写法"}
+{"cmd": "ionice -c 3 rm -rf ~", "guard": "dangerous", "expect": "block", "note": "ionice -c 带值"}
+{"cmd": "ionice -c3 -n 7 rm -rf ~", "guard": "dangerous", "expect": "block", "note": "ionice 粘连 + 独立值"}
+{"cmd": "timeout -s KILL 5 rm -rf ~", "guard": "dangerous", "expect": "block", "note": "timeout -s 带值 + DURATION"}
+{"cmd": "timeout --signal=KILL -k 1 5 rm -rf ~", "guard": "dangerous", "expect": "block", "note": "timeout 混合写法"}
+{"cmd": "timeout --kill-after 1 5 rm -rf ~", "guard": "dangerous", "expect": "block", "note": "timeout 长选项独立值"}
+{"cmd": "stdbuf -o L rm -rf ~", "guard": "dangerous", "expect": "block", "note": "stdbuf -o 独立值"}
+{"cmd": "stdbuf --output=L rm -rf ~", "guard": "dangerous", "expect": "block", "note": "stdbuf 长选项等号值"}
+{"cmd": "env -a x rm -rf ~", "guard": "dangerous", "expect": "block", "note": "env -a argv0 带值"}
+{"cmd": "env -u HOME rm -rf ~", "guard": "dangerous", "expect": "block", "note": "env -u 带值"}
+{"cmd": "env --unset=HOME rm -rf ~", "guard": "dangerous", "expect": "block", "note": "env 长选项等号值"}
+{"cmd": "env -C /tmp rm -rf ~", "guard": "dangerous", "expect": "block", "note": "env -C 带值"}
+{"cmd": "nsenter -t 1 -m rm -rf ~", "guard": "dangerous", "expect": "block", "note": "nsenter -t 带值、-m 可选值"}
+{"cmd": "nsenter --target=1 --mount rm -rf ~", "guard": "dangerous", "expect": "block", "note": "nsenter 长选项"}
+{"cmd": "unshare -r rm -rf ~", "guard": "dangerous", "expect": "block", "note": "unshare 包裹"}
+{"cmd": "unshare --map-user=0 -w /tmp rm -rf ~", "guard": "dangerous", "expect": "block", "note": "unshare 带值选项"}
+{"cmd": "setsid -f rm -rf ~", "guard": "dangerous", "expect": "block", "note": "setsid 包裹"}
+{"cmd": "chroot / rm -rf ~", "guard": "dangerous", "expect": "block", "note": "chroot NEWROOT 位置参数"}
+{"cmd": "chroot --userspec=root:root / rm -rf ~", "guard": "dangerous", "expect": "block", "note": "chroot 选项 + NEWROOT"}
+{"cmd": "flock /tmp/l rm -rf ~", "guard": "dangerous", "expect": "block", "note": "flock 锁文件位置参数"}
+{"cmd": "flock -w 5 /tmp/l rm -rf ~", "guard": "dangerous", "expect": "block", "note": "flock -w 带值"}
+{"cmd": "pkexec --user root rm -rf ~", "guard": "dangerous", "expect": "block", "note": "pkexec --user 带值"}
+{"cmd": "setpriv --reuid=0 -- rm -rf ~", "guard": "dangerous", "expect": "block", "note": "setpriv 等号值 + --"}
+{"cmd": "systemd-run --scope -p CPUQuota=10% rm -rf ~", "guard": "dangerous", "expect": "block", "note": "systemd-run -p 带值"}
+{"cmd": "runuser -u root -- rm -rf ~", "guard": "dangerous", "expect": "block", "note": "runuser -u 命令形态"}
+{"cmd": "command -p rm -rf ~", "guard": "dangerous", "expect": "block", "note": "command -p"}
+{"cmd": "exec -a x rm -rf ~", "guard": "dangerous", "expect": "block", "note": "exec -a 带值"}
+{"cmd": "time -o /tmp/t rm -rf ~", "guard": "dangerous", "expect": "block", "note": "GNU time -o 带值"}
+{"cmd": "xargs -n 1 rm -rf", "guard": "dangerous", "expect": "block", "note": "xargs -n 带值"}
+{"cmd": "xargs -I {} rm -rf {}", "guard": "dangerous", "expect": "block", "note": "xargs -I 带值"}
+{"cmd": "strace -o /tmp/log rm -rf ~", "guard": "dangerous", "expect": "block", "note": "strace -o 带值"}
+{"cmd": "nice --bogus 5 rm -rf ~", "guard": "dangerous", "expect": "block", "note": "未知长选项：两种解释都查（fail-safe）"}
+{"cmd": "sudo -Z 5 rm -rf ~", "guard": "dangerous", "expect": "block", "note": "未知短选项：两种解释都查（fail-safe）"}
+{"cmd": "sudo -u root env -S 'nice -n 5 rm -rf ~'", "guard": "dangerous", "expect": "block", "note": "多层嵌套带值选项"}
+{"cmd": "env -S 'rm -rf ~'", "guard": "dangerous", "expect": "block", "note": "env -S 拆分字符串"}
+{"cmd": "env --split-string='rm -rf ~'", "guard": "dangerous", "expect": "block", "note": "env --split-string="}
+{"cmd": "env -S 'rm -rf' ~", "guard": "dangerous", "expect": "block", "note": "env -S 后面还跟参数"}
+{"cmd": "env -S 'rm\\_-rf\\_~'", "guard": "dangerous", "expect": "block", "note": "env -S 的 \\_ 分词转义"}
+{"cmd": "su -c \"rm -rf ~\"", "guard": "dangerous", "expect": "block", "note": "su -c 脚本"}
+{"cmd": "su root -c 'rm -rf ~'", "guard": "dangerous", "expect": "block", "note": "su 选项在用户名之后"}
+{"cmd": "su - root --command='rm -rf ~'", "guard": "dangerous", "expect": "block", "note": "su --command="}
+{"cmd": "su --comm 'rm -rf ~'", "guard": "dangerous", "expect": "block", "note": "su 长选项缩写"}
+{"cmd": "su root -- -c 'rm -rf ~'", "guard": "dangerous", "expect": "block", "note": "su 用户名后的参数交给 shell"}
+{"cmd": "runuser -l root -c 'rm -rf ~'", "guard": "dangerous", "expect": "block", "note": "runuser su 形态 -c"}
+{"cmd": "flock /tmp/l -c 'rm -rf ~'", "guard": "dangerous", "expect": "block", "note": "flock -c 脚本"}
+{"cmd": "bash --rcfile /dev/null -c 'rm -rf ~'", "guard": "dangerous", "expect": "block", "note": "bash 带值长选项在 -c 之前"}
+{"cmd": "eval 'rm -rf ~'", "guard": "dangerous", "expect": "block", "note": "eval 源码"}
+{"cmd": "nice -n 5 bash -c 'rm -rf ~'", "guard": "dangerous", "expect": "block", "note": "带值 wrapper 包 bash -c"}
+{"cmd": "echo \"$(rm -rf /x)\"", "guard": "dangerous", "expect": "block", "note": "双引号内 $(…)"}
+{"cmd": "echo $(rm -rf /x)", "guard": "dangerous", "expect": "block", "note": "裸 $(…)"}
+{"cmd": "echo `rm -rf /x`", "guard": "dangerous", "expect": "block", "note": "反引号"}
+{"cmd": "echo \"$(echo $(rm -rf /x))\"", "guard": "dangerous", "expect": "block", "note": "嵌套 $(…)"}
+{"cmd": "cat <(rm -rf /x)", "guard": "dangerous", "expect": "block", "note": "进程替换"}
+{"cmd": "sleep 1 & rm -rf ~", "guard": "dangerous", "expect": "block", "note": "后台 & 之后的段"}
+{"cmd": "FOO=1 rm -rf ~", "guard": "dangerous", "expect": "block", "note": "前置变量赋值"}
+{"cmd": "2>/dev/null rm -rf ~", "guard": "dangerous", "expect": "block", "note": "前置重定向"}
+{"cmd": "(rm -rf ~)", "guard": "dangerous", "expect": "block", "note": "子 shell"}
+{"cmd": "if true; then rm -rf ~; fi", "guard": "dangerous", "expect": "block", "note": "then 关键字之后"}
+{"cmd": "nice -n 10 make", "guard": "dangerous", "expect": "allow", "note": "带值 wrapper 包无害命令"}
+{"cmd": "timeout 5 pytest", "guard": "dangerous", "expect": "allow", "note": "timeout 包测试"}
+{"cmd": "sudo -u postgres psql -c 'select 1'", "guard": "dangerous", "expect": "allow", "note": "psql -c 不是 shell"}
+{"cmd": "echo '$(rm -rf /)'", "guard": "dangerous", "expect": "allow", "note": "单引号内 $( 不展开"}
+{"cmd": "echo \"\\$(rm -rf /)\"", "guard": "dangerous", "expect": "allow", "note": "转义的 $( 不展开"}
+{"cmd": "env -u rm printf -f", "guard": "dangerous", "expect": "allow", "note": "-u 的值 rm 不是命令"}
+{"cmd": "sudo -u rm printf -rf", "guard": "dangerous", "expect": "allow", "note": "-u 的值 rm 不是命令"}
+{"cmd": "su -c 'ls -la'", "guard": "dangerous", "expect": "allow", "note": "su -c 无害脚本"}
+{"cmd": "env -S 'echo hi'", "guard": "dangerous", "expect": "allow", "note": "env -S 无害"}
+{"cmd": "flock /tmp/l make", "guard": "dangerous", "expect": "allow", "note": "flock 包无害命令"}
+{"cmd": "runuser -u nobody -- whoami", "guard": "dangerous", "expect": "allow", "note": "runuser 包无害命令"}
+{"cmd": "git commit -m \"fix rm -rf handling\"", "guard": "dangerous", "expect": "allow", "note": "引号里提到 rm"}
+{"cmd": "echo 'a & rm -rf x'", "guard": "dangerous", "expect": "allow", "note": "单引号里的 &"}
+{"cmd": "make 2>&1 | tee log", "guard": "dangerous", "expect": "allow", "note": "2>&1 不是后台符"}
+{"cmd": "FOO=1 make", "guard": "dangerous", "expect": "allow", "note": "前置赋值包无害命令"}
+{"cmd": "env -S 'sudo id'", "guard": "privileged", "expect": "block", "note": "env -S 藏 sudo"}
+{"cmd": "nice -n 5 sudo id", "guard": "privileged", "expect": "block", "note": "带值 wrapper 包 sudo"}
+{"cmd": "timeout -s KILL 5 sudo id", "guard": "privileged", "expect": "block", "note": "timeout 带值包 sudo"}
+{"cmd": "echo \"$(sudo id)\"", "guard": "privileged", "expect": "block", "note": "命令替换里 sudo"}
+{"cmd": "flock /tmp/l -c 'sudo id'", "guard": "privileged", "expect": "block", "note": "flock -c 藏 sudo"}
+{"cmd": "run0 id", "guard": "privileged", "expect": "block", "note": "run0"}
+{"cmd": "env -u sudo printf ok", "guard": "privileged", "expect": "allow", "note": "-u 的值 sudo 不是命令"}
+{"cmd": "nice -n 5 make", "guard": "privileged", "expect": "allow", "note": "无提权"}
