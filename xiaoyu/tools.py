@@ -21,6 +21,7 @@ import locale
 import os
 import re
 import shutil
+import signal
 import stat
 import unicodedata
 import subprocess
@@ -442,6 +443,57 @@ def _interactive_auth_hint(output: str) -> str:
         "阻塞等待只会超时：把链接原样展示给用户、请其完成授权，等用户答复后"
         "再用查询状态类命令确认，不要重复干等或反复重跑。"
     )
+
+
+#  信号终止的释义，按信号**名**索引：编号随平台不同（SIGBUS 在 Linux 是 7、
+#  macOS 是 10），运行时经 signal.Signals 换算。只收常见的几种——128+N 形态
+#  程序自己也能 exit 出来，表外的编号宁可不释义也不乱贴标签。
+#  SIGINT 不在表里：那是用户中断，另有处理。
+_SIGNAL_EXIT_NOTES = {
+    "SIGKILL": "常见原因：内存不足被系统杀掉，或超时被强杀",
+    "SIGTERM": "收到终止请求（kill、外部超时或关停）",
+    "SIGSEGV": "段错误，程序崩溃",
+    "SIGABRT": "程序主动中止（断言失败或致命运行时错误）",
+    "SIGBUS": "总线错误（非法内存访问，如映射的文件被截断）",
+    "SIGPIPE": "向已关闭的管道写入（如下游 head 已提前退出）",
+    "SIGHUP": "所在终端或会话断开",
+    "SIGFPE": "算术错误（如整数除零）",
+    "SIGILL": "非法指令（二进制损坏或 CPU 架构不符）",
+    "SIGQUIT": "收到退出信号",
+    "SIGXCPU": "超出 CPU 时间限制",
+    "SIGXFSZ": "超出文件大小限制",
+}
+
+
+def _signal_exit_hint(returncode: int) -> str:
+    """信号类退出码的一行释义；不是信号终止返回空串。
+
+    模型只看到 `exit_status: 137` 或 `-9` 时容易当成命令自身报错去改代码，
+    其实多半是被 OOM 杀了。负数是 Popen 确知"被信号 N 杀"，措辞确定；
+    128+N 是 shell 转述子进程的死因，程序也可能自己 exit 这个值，措辞留余地。
+    Windows 退出码没有这层约定，不释义。
+    """
+    if os.name == "nt":
+        return ""
+    if returncode < 0:
+        signum, definite = -returncode, True
+    elif returncode > 128:
+        signum, definite = returncode - 128, False
+    else:
+        return ""
+    try:
+        name = signal.Signals(signum).name
+    except ValueError:
+        return ""
+    if name == "SIGINT":
+        return ""
+    note = _SIGNAL_EXIT_NOTES.get(name)
+    if definite:
+        detail = f"——{note}" if note else ""
+        return f"\n[提示] 进程被 {name}({signum}) 终止{detail}。"
+    if note is None:
+        return ""
+    return f"\n[提示] 退出码 {returncode} 通常表示进程被 {name}({signum}) 终止——{note}。"
 
 
 @functools.lru_cache(maxsize=1)
@@ -2184,7 +2236,8 @@ class Toolbox:
             chunks.append(f"stderr:\n{stderr_text}")
         if len(chunks) == 1:
             chunks.append("(无输出)")
-        output = "\n".join(chunks)
+        #  超时杀掉的已在上面带着 exit 124 提前返回，这里的信号只可能来自外部
+        output = "\n".join(chunks) + _signal_exit_hint(proc.returncode)
         if escalation:
             #  升权执行的结果打标：用户和模型都要看得出"这次是升权跑的"
             output = f"[沙箱：本次调用已按 {escalation} 升权执行，仅本次生效]\n" + output

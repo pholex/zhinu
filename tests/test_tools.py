@@ -403,6 +403,38 @@ class TestBashAndSafety(ToolboxTestCase):
     def test_bash_reports_failure(self) -> None:
         result = self.box.run("bash", {"command": "exit 3"})
         self.assertIn("exit_status: 3", result)
+        self.assertNotIn("信号", result)
+
+    @unittest.skipIf(os.name == "nt", "信号退出码是 POSIX 语义")
+    def test_bash_killed_by_signal_is_explained(self) -> None:
+        result = self.box.run("bash", {"command": "kill -9 $$"})
+        self.assertIn("SIGKILL", result)
+        self.assertIn("内存不足", result)
+
+    @unittest.skipIf(os.name == "nt", "信号退出码是 POSIX 语义")
+    def test_signal_exit_hints(self) -> None:
+        from xiaoyu.tools import _signal_exit_hint
+
+        #  负数 = Popen 确知被信号杀：措辞确定
+        hint = _signal_exit_hint(-9)
+        self.assertIn("被 SIGKILL(9) 终止", hint)
+        self.assertIn("内存不足", hint)
+        self.assertNotIn("通常", hint)
+        #  128+N = shell 转述：程序也可能自己 exit 137，措辞留余地
+        hint = _signal_exit_hint(137)
+        self.assertIn("通常表示", hint)
+        self.assertIn("SIGKILL(9)", hint)
+        self.assertIn("SIGSEGV(11)", _signal_exit_hint(139))
+        #  SIGINT 是用户中断，正常退出码与普通失败都不加释义
+        for code in (130, -2, 1, 0, 3, 255):
+            self.assertEqual(_signal_exit_hint(code), "", code)
+
+    def test_signal_exit_hints_skipped_on_windows(self) -> None:
+        from xiaoyu import tools
+
+        with mock.patch.object(tools.os, "name", "nt"):
+            self.assertEqual(tools._signal_exit_hint(-9), "")
+            self.assertEqual(tools._signal_exit_hint(137), "")
 
     def test_bash_timeout(self) -> None:
         result = self.box.run("bash", {"command": "sleep 5", "timeout": 1})
