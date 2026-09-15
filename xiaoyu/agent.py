@@ -956,6 +956,8 @@ class Agent:
         #  上一次真出了回复的路由 (provider, model)：下一次请求换了路由就给新模型补一句
         #  交代（见 _route_switch_note）。None = 本进程还没出过回复
         self._last_route: tuple[str, str] | None = None
+        #  拒收"跳过缓存读取"字段（400/422）的 provider：本会话对它们不再带（见 _stream_retrying）
+        self._cache_bypass_refused: set[str] = set()
         self.compactor = Compactor(
             context_limit=config.context_limit,
             compact_at=config.compact_at,
@@ -3297,7 +3299,8 @@ class Agent:
 
         空补全的重发带两条修正：
         - 网关开着响应缓存时，重发附带"跳过缓存读取"（Registry.cache_bypass）——
-          否则拿回的只是被缓存住的同一个空结果；
+          否则拿回的只是被缓存住的同一个空结果；网关不认这个字段（400/422）就本会话
+          对它停带、这次不计次原样重发；
         - 连续 _DETERMINISTIC_EMPTY 次空补全且 usage 明确报 completion_tokens=0：
           模型在这条路由上就是一个字不出，再发也一样，抛 _DeterministicEmpty
           让外层直接换下一条路由（不耗重试预算）。没有 usage 判不出，维持原样重发。
@@ -3308,7 +3311,9 @@ class Agent:
         #  上一次是空补全 → 这次重发要绕开网关缓存；zero_streak 数连续的 0 token 空补全
         after_empty = False
         zero_streak = 0
-        for attempt in range(1, self._RECOVERY_ATTEMPTS + 1):
+        attempt = 0
+        while attempt < self._RECOVERY_ATTEMPTS:
+            attempt += 1
             try:
                 message = self._stream_once(route, with_tools=with_tools, bypass_cache=after_empty)
                 if not media.text_of(message.get("content")).strip() and not message.get("tool_calls"):
@@ -3339,6 +3344,25 @@ class Agent:
                 #  中间夹了一次报错就不算"连续"
                 zero_streak = 0
                 verdict = classify(exc)
+                if (
+                    after_empty
+                    and not verdict.should_compact
+                    and getattr(exc, "status_code", None) in (400, 422)
+                    and self._cache_bypass_body(route) is not None
+                ):
+                    #  网关位对非本机、非官方主机默认带绕过字段，猜错时（严格的 OpenAI 兼容
+                    #  端点不认未知字段）这次重发会 400/422：本会话对这家停带，不计次原样重发。
+                    #  加进 _cache_bypass_refused 后条件不再成立，同一家至多走这里一次
+                    self._cache_bypass_refused.add(route.provider)
+                    self.sink.emit(
+                        Notice(
+                            f"[{route.provider} 不接受跳过响应缓存的请求字段，本会话重发不再携带"
+                            "（可设 XIAOYU_GATEWAY_CACHE_BYPASS=0 关掉）]",
+                            "warn",
+                        )
+                    )
+                    attempt -= 1
+                    continue
                 if verdict.should_compact:
                     #  上下文超限：本地估算低估了才会走到这，立刻强制压缩
                     self.maybe_compact(force=True)
@@ -3365,6 +3389,12 @@ class Agent:
                 time.sleep(wait)
                 delay *= 2
         raise RuntimeError("unreachable")  # for 循环里必然 return 或 raise
+
+    def _cache_bypass_body(self, route: Route) -> dict[str, Any] | None:
+        """这条路由空补全重发时并进请求体的"跳过缓存读取"字段；不该带返回 None。"""
+        if route.provider in self._cache_bypass_refused:
+            return None
+        return self.registry.cache_bypass(route)
 
     def _route_switch_note(self, route: Route) -> str:
         """这次请求的路由与上一次出回复的不同 → 给新模型的交代；相同返回空串。
@@ -3434,7 +3464,7 @@ class Agent:
             request[COMPACTION_KEY] = {
                 "trigger": int(self.config.compact_at * self.config.context_limit),
             }
-        if bypass_cache and (body := self.registry.cache_bypass(route)) is not None:
+        if bypass_cache and (body := self._cache_bypass_body(route)) is not None:
             #  只在空补全重发时绕开网关响应缓存：首发照常可命中——正常回复被缓存
             #  是省钱的，给每个请求都关掉读取等于白白放弃命中率、改变成本面。
             #  走 extra_body 并进请求体：三条协议的 SDK 都认这个参数

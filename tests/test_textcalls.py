@@ -281,6 +281,22 @@ class TestStream(unittest.TestCase):
         self.assertEqual(sorted(pending), [0, 1])
         self.assertNotEqual(pending[0]["id"], pending[1]["id"])
 
+    def test_finish_reason_on_text_chunk_survives_rebuild(self) -> None:
+        """vLLM 把 length 挂在最后一个正文分片上：重建分片后流末要补发，内核才认得出截断。"""
+        body = FENCE_OPEN + '\n{"name": "read_file", "arguments": {"path": "a'
+        last = chunk(body)
+        last.choices[0].finish_reason = "length"
+        out = list(textcalls.stream_chunks(iter([chunk("好的。"), last])))
+        reasons = [getattr(item.choices[0], "finish_reason", None) for item in out if item.choices]
+        self.assertEqual([reason for reason in reasons if reason], ["length"])
+        self.assertEqual(out[-1].choices[0].finish_reason, "length", "收尾原因必须在所有分片之后")
+        text, _pending, _ = drain(iter(out))
+        self.assertTrue(text.startswith("好的。"))
+
+    def test_no_finish_chunk_when_upstream_sent_none(self) -> None:
+        out = list(textcalls.stream_chunks(iter([chunk("你好")])))
+        self.assertTrue(all(getattr(item.choices[0], "finish_reason", None) is None for item in out))
+
 
 class FakeChat:
     def __init__(self, script):

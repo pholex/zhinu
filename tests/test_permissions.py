@@ -409,15 +409,27 @@ class BannedAllowTest(unittest.TestCase):
             "allow bash(caffeinate -i *)",
             "allow bash(arch -arm64 *)",
             "allow bash(chrt -o *)",
+            #  wrapper 名本身带通配：unwrap 认不出名字，要代入匹配得上的 wrapper 名再判
+            "allow bash(*nice -n 5 *)",
+            "allow bash(n?ce -n 5 *)",
+            "allow bash([s]udo -u root *)",
+            "allow bash(sudo* -u root *)",
+            "allow bash(/usr/bin/ni*e *)",
         ):
             with self.assertRaises(ValueError, msg=line):
                 perms.add_persistent(parse_rule(line))
 
     def test_narrow_wrapper_rules_still_allowed(self):
         perms = Permissions(self.workspace)
-        for line in ("allow bash(timeout 60 pytest*)", "allow bash(nice -n 10 make*)"):
+        for line in (
+            "allow bash(timeout 60 pytest*)",
+            "allow bash(nice -n 10 make*)",
+            #  开头带通配但代入 wrapper 后仍是具体命令，或根本匹配不上 wrapper：照常放行
+            "allow bash(n?ce -n 10 make*)",
+            "allow bash(py?est *)",
+        ):
             perms.add_persistent(parse_rule(line))
-        self.assertEqual(len(perms.rules), 2)
+        self.assertEqual(len(perms.rules), 4)
 
     def test_deny_rules_never_restricted(self):
         perms = Permissions(self.workspace)

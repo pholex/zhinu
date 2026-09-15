@@ -480,9 +480,12 @@ def unwrap_argv(argv: list[str]) -> list[list[str]] | None:
 
 def _long_kind(spec: _WrapperSpec, name: str) -> str | None:
     """长选项的语法。GNU getopt 接受无歧义缩写（`su --comm '…'`），按前缀匹配；
-    缩写能对上脚本类选项就当脚本（宁可多扫），其余有歧义的返回 None（表外）。"""
-    if kind := spec.options.get(name):
-        return kind if len(name) > 1 else None
+    缩写能对上脚本类选项就当脚本（宁可多扫），其余有歧义的返回 None（表外）。
+    单字母名同时是短选项键（`su --c` 的 c）也照样按前缀找长选项：短选项表里有它
+    不代表 `--c` 就是那个短选项，它在 getopt 眼里是 `--command` 的缩写。"""
+    kind = spec.options.get(name)
+    if kind and len(name) > 1:
+        return kind
     if not name:
         return None
     kinds = {kind for option, kind in spec.options.items()
