@@ -23,6 +23,14 @@ class ContentFiltered(RuntimeError):
     """
 
 
+class StreamTruncated(RuntimeError):
+    """流在工具调用参数写到一半时结束，且没有任何收尾信号（finish_reason / usage）。
+
+    这是断流不是模型输出：执行残缺调用只会换来"参数不是合法 JSON"白费一步。
+    分类为 transient，复用可重试网络错误的预算与退避原地重发。
+    """
+
+
 @dataclass(frozen=True)
 class Verdict:
     kind: str  # 取值必须在 ALL_KINDS 里
@@ -64,7 +72,29 @@ _QUOTA_MARKERS = (
     "monthly usage limit",
     "budget has been exceeded",
     "out of budget",
+    #  余额类：DeepSeek 402 的 "Insufficient Balance"、Anthropic 400 的
+    #  "Your credit balance is too low"、HTTP 402 的标准原因短语
+    "insufficient balance",
+    "credit balance is too low",
+    "payment required",
+    #  OpenAI 系结构化错误码（兼容聚合端点也照抄）：余额耗尽与组织/项目级
+    #  spend/usage 上限。码在异常文本里也常原样出现，按子串兜一次
+    "credit_balance_exhausted",
+    "_spend_limit_exceeded",
+    "_usage_limit_exceeded",
+    "billing_hard_limit_reached",
 )
+
+#  "billing" 单词太宽：限流文案里常附一句"去 billing 页面提额"之类的链接。
+#  只在文案不像限流时才认它是额度问题（限流等得起，误判成 quota 会跳过退避
+#  直接放弃这一路）
+_BILLING_MARKER = "billing"
+_THROTTLE_WORDS = ("rate limit", "rate_limit", "throttl", "too many requests")
+
+#  结构化错误码（exc.code / body.error.code）的精确值与后缀：流式里冒出来的
+#  错误常常只有 body，str(exc) 里不一定带码
+_QUOTA_CODES = ("insufficient_quota", "credit_balance_exhausted", "billing_hard_limit_reached")
+_QUOTA_CODE_SUFFIXES = ("_spend_limit_exceeded", "_usage_limit_exceeded")
 
 
 def _status_code(exc: Exception) -> int | None:
@@ -75,12 +105,47 @@ def _status_code(exc: Exception) -> int | None:
     return status if isinstance(status, int) else None
 
 
+def _error_code(exc: Exception) -> str:
+    """异常携带的结构化错误码（小写），取不到返回空串。
+
+    openai 的 APIError 把 body 里的 code 挂在 `.code` 上；鸭子型或转写过的
+    异常只剩 `.body`，按 `{"code": …}` 与 `{"error": {"code": …}}` 两种形状各取一次。
+    """
+    code = getattr(exc, "code", None)
+    if not isinstance(code, str) or not code:
+        body = getattr(exc, "body", None)
+        if isinstance(body, dict):
+            inner = body.get("error")
+            code = body.get("code") or (inner.get("code") if isinstance(inner, dict) else None)
+    return code.lower() if isinstance(code, str) else ""
+
+
+def _is_quota(exc: Exception, text: str, status: int | None) -> bool:
+    #  402 Payment Required 无论文案都是额度问题
+    if status == 402:
+        return True
+    code = _error_code(exc)
+    if code and (code in _QUOTA_CODES or code.endswith(_QUOTA_CODE_SUFFIXES)):
+        return True
+    if any(marker in text for marker in _QUOTA_MARKERS):
+        return True
+    return (
+        _BILLING_MARKER in text
+        and status != 429
+        and not isinstance(exc, openai.RateLimitError)
+        and not any(word in text for word in _THROTTLE_WORDS)
+    )
+
+
 def classify(exc: Exception) -> Verdict:
     if isinstance(exc, ContentFiltered):
         return Verdict(
             "fatal", False, False,
             f"{exc}（重发或换模型多半同样被拦，请调整请求内容）",
         )
+    if isinstance(exc, StreamTruncated):
+        #  先于文本判定：断流描述里的措辞不该撞上任何 marker
+        return Verdict("transient", True, False, "流在工具参数写到一半时断开")
     text = str(exc).lower()
     status = _status_code(exc)
 
@@ -90,7 +155,7 @@ def classify(exc: Exception) -> Verdict:
     ):
         return Verdict("auth", False, False, "鉴权失败，请检查 XIAOYU_API_KEY 和端点")
 
-    if any(marker in text for marker in _QUOTA_MARKERS):
+    if _is_quota(exc, text, status):
         #  额度耗尽：同一路重试无解，但降级链上换一家值得试（agent.py 放行）
         return Verdict("quota", False, False, "额度/配额已用尽（重试无用，充值或 /model 换路由）")
 

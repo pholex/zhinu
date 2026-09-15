@@ -3393,6 +3393,7 @@ class Agent:
         self.sink.emit(RequestStarted(route.model))
         self._content_filtered = False
         self._length_truncated = False
+        self._stream_finished = False
         try:
             stream = route.client.chat.completions.create(**request)
             self._consume_stream(route, stream, content_parts, pending, reasoning)
@@ -3418,6 +3419,20 @@ class Agent:
             if content_parts:
                 self.sink.emit(TextEnd())
             self.sink.emit(RequestEnded())
+
+        if not self._stream_finished:
+            #  流结束了却没有任何收尾信号（finish_reason / usage 都没见到），而某个
+            #  工具调用的 arguments 不是合法 JSON：这是断流拦腰截断，不是模型写坏了。
+            #  执行只会白费一步，抛给 _stream_retrying 按瞬时错误退避重发。
+            #  纯文本断流、完整参数的调用不在此列（前者保持现状，后者照常执行）
+            for call in pending.values():
+                try:
+                    json.loads(call["function"]["arguments"] or "{}")
+                except json.JSONDecodeError:
+                    raise errors.StreamTruncated(
+                        f"{route.qualified} 的流在工具调用 {call['function']['name'] or '?'} "
+                        "的参数写到一半时结束，没有收尾信号"
+                    ) from None
 
         if self._content_filtered:
             if not content_parts and not pending:
@@ -3527,6 +3542,28 @@ class Agent:
         reasoning: list[dict[str, Any]],
     ) -> None:
         """逐 chunk 消费流式响应，把正文和 tool_call 分片攒进传入的容器。"""
+        #  arguments 分片先进 list、流结束时一次 join：写大文件时参数被切成上万片，
+        #  挂在 dict 里的字符串 += 享受不到原地拼接优化，是 O(n²)。join 放 finally：
+        #  中断/异常路径上 pending 也保持"arguments 是完整字符串"的形状，
+        #  调用方任何一条路径读到的都与逐片 += 一致
+        arg_parts: dict[int, list[str]] = {}
+        try:
+            self._consume_chunks(route, stream, content_parts, pending, reasoning, arg_parts)
+        finally:
+            for index, parts in arg_parts.items():
+                function = pending[index]["function"]
+                function["arguments"] = function["arguments"] + "".join(parts)
+
+    def _consume_chunks(
+        self,
+        route: Route,
+        stream: Any,
+        content_parts: list[str],
+        pending: dict[int, dict[str, Any]],
+        reasoning: list[dict[str, Any]],
+        arg_parts: dict[int, list[str]],
+    ) -> None:
+        """_consume_stream 的逐 chunk 循环体；arguments 分片攒进 arg_parts。"""
         #  无 index 分片归组用：最近写过的一格。不能用 max(pending) 代替——
         #  编号最大 ≠ 最近在写（带 id 的分片可以把写入点拉回旧格），续错格
         #  就是把 arguments 拼成一坨坏 JSON
@@ -3539,6 +3576,9 @@ class Agent:
                 self._interrupt_flag.clear()
                 raise Interrupted("宿主请求打断")
             if getattr(chunk, "usage", None):
+                #  收到 usage 即视为正常收尾：有些端点不发 finish_reason，只在
+                #  最后给一个纯 usage chunk（断流判定见 _stream_once）
+                self._stream_finished = True
                 prompt_tokens = chunk.usage.prompt_tokens or 0
                 self.usage.add(
                     route.qualified,
@@ -3574,6 +3614,8 @@ class Agent:
             #  收尾原因认两种：内容过滤决定这次"空补全"是拒答还是断流；length 说明
             #  输出撞了长度上限，最后一个工具调用多半被拦腰截断
             finish = getattr(chunk.choices[0], "finish_reason", None)
+            if finish:
+                self._stream_finished = True
             if finish == "content_filter":
                 self._content_filtered = True
             elif finish == "length":
@@ -3620,11 +3662,12 @@ class Agent:
                     slot["_extra_content"] = extra
                 if fragment.function is None:
                     continue
-                #  name 各家都是一次给全，先到先得；arguments 一定是分片累加。
+                #  name 各家都是一次给全，先到先得；arguments 一定是分片累加
+                #  （攒进 arg_parts，由 _consume_stream 收尾 join）。
                 if fragment.function.name and not slot["function"]["name"]:
                     slot["function"]["name"] = fragment.function.name
                 if fragment.function.arguments:
-                    slot["function"]["arguments"] += fragment.function.arguments
+                    arg_parts.setdefault(index, []).append(fragment.function.arguments)
 
     # ---------- 工具执行 ----------
 

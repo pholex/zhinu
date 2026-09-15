@@ -277,6 +277,16 @@ class TestStreamTranslation(unittest.TestCase):
         _, _, usage = self.collect([text_delta("x"), completed(11, 22)])
         self.assertEqual((usage.prompt_tokens, usage.completion_tokens), (11, 22))
 
+    def test_completed_without_usage_still_signals_finish(self) -> None:
+        """不回 usage 的兼容端点：收尾事件补一个 stop，内核才不会把它当断流重发。"""
+        chunks = list(
+            responses.stream_chunks(iter([event("response.completed", response=SimpleNamespace(usage=None))]))
+        )
+        self.assertEqual([c.choices[0].finish_reason for c in chunks if c.choices], ["stop"])
+        #  有 usage 时形状不变：不多发 stop
+        with_usage = list(responses.stream_chunks(iter([completed(1, 2)])))
+        self.assertEqual([c for c in with_usage if c.choices], [])
+
     def test_usage_chunk_carries_no_choices(self) -> None:
         """收尾 usage chunk 的 choices 必须为空——内核靠它跳过，形状同 chat 流末尾。"""
         chunks = list(responses.stream_chunks(iter([completed(1, 2)])))
@@ -468,6 +478,78 @@ class TestChatPassthrough(unittest.TestCase):
         )
         #  原始历史不许被就地改写：内核还要拿它继续对话
         self.assertIn(REASONING_KEY, history[1])
+
+
+def broken_arguments_history() -> list[dict[str, Any]]:
+    """模型曾吐过坏参数的历史：每路调用都已回了结果（坏的那几路是 ERROR）。"""
+    calls = [
+        ("bad", "{不是合法 JSON"),
+        #  字符串里夹裸换行：严格 json.loads 拒收，strict=False 能读
+        ("ctrl", '{"content": "a\nb"}'),
+        ("ok", '{"path": "calc.py"}'),
+        ("empty", ""),
+        ("array", "[1, 2]"),
+    ]
+    return [
+        {"role": "user", "content": "改文件"},
+        {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [
+                {"id": call_id, "type": "function", "function": {"name": "write_file", "arguments": raw}}
+                for call_id, raw in calls
+            ],
+        },
+        *[
+            {"role": "tool", "tool_call_id": call_id, "content": "ERROR: 参数不是合法 JSON"}
+            for call_id, _ in calls
+        ],
+        {"role": "user", "content": "再试一次"},
+    ]
+
+
+EXPECTED_ARGUMENTS = ["{}", '{"content": "a\\nb"}', '{"path": "calc.py"}', "{}", "{}"]
+
+
+class TestBrokenToolArguments(unittest.TestCase):
+    """历史里的坏工具参数：出网副本修成合法 JSON 对象串，历史本身不动。"""
+
+    def test_chat_path_sends_repaired_arguments(self) -> None:
+        history = broken_arguments_history()
+        inner = FakeClient(FakeResponses())
+        Transport(inner, responses.CHAT).chat.completions.create(
+            model="chat-only-model", messages=history
+        )
+        sent = inner.chat.completions.calls[0]["messages"]
+        self.assertEqual(
+            [call["function"]["arguments"] for call in sent[1]["tool_calls"]], EXPECTED_ARGUMENTS
+        )
+        #  tool 结果里的 ERROR 保留：模型仍知道那次调用失败了
+        self.assertTrue(all("ERROR" in m["content"] for m in sent if m["role"] == "tool"))
+        #  历史不许被就地改写（会话日志要留模型原话）
+        self.assertEqual(history, broken_arguments_history())
+
+    def test_responses_path_sends_repaired_arguments(self) -> None:
+        history = broken_arguments_history()
+        api = FakeResponses(events=[completed()])
+        responses_transport(api).chat.completions.create(
+            model="responses-model", messages=history, stream=True
+        )
+        items = [item for item in api.calls[0]["input"] if item.get("type") == "function_call"]
+        self.assertEqual([item["arguments"] for item in items], EXPECTED_ARGUMENTS)
+        self.assertEqual(history, broken_arguments_history())
+
+    def test_clean_history_is_reused_without_copies(self) -> None:
+        history = [
+            {"role": "user", "content": "hi"},
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [{"id": "a", "function": {"name": "f", "arguments": '{"x": 1}'}}],
+            },
+        ]
+        repaired = responses.repair_tool_arguments(history)
+        self.assertIs(repaired[1], history[1])
 
 
 class TestToolSignatures(unittest.TestCase):

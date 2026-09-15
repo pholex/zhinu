@@ -15,6 +15,7 @@ from xiaoyu.errors import (
     ALL_KINDS,
     RETRY_AFTER_CAP,
     ContentFiltered,
+    StreamTruncated,
     classify,
     retry_after_seconds,
 )
@@ -117,6 +118,54 @@ class ClassifyTest(unittest.TestCase):
             self.assertFalse(verdict.retryable, exc)
             self.assertFalse(verdict.should_compact, exc)
 
+    def test_balance_and_spend_limit_are_quota(self):
+        """余额/消费上限耗尽：以前掉进 fatal，降级链不放行、不切网关兜底。"""
+        request = httpx.Request("POST", "http://unused")
+        samples = [
+            #  DeepSeek 余额不足：HTTP 402
+            openai.APIStatusError("Insufficient Balance", response=_response(402), body=None),
+            #  Anthropic 余额不足是 400 invalid_request_error
+            _DuckStatusError(
+                "Your credit balance is too low to access the Anthropic API. "
+                "Please go to Plans & Billing to upgrade or purchase credits.",
+                400,
+            ),
+            RuntimeError("402 Payment Required"),
+            RuntimeError("billing_not_active: Your account is not active, please check your billing details"),
+        ]
+        #  流式里冒出来的错误只带 body，文本里没有码
+        for code in (
+            "credit_balance_exhausted",
+            "organization_spend_limit_exceeded",
+            "project_spend_limit_exceeded",
+            "organization_usage_limit_exceeded",
+        ):
+            samples.append(
+                openai.APIError("request rejected", request, body={"code": code, "message": "x"})
+            )
+            duck = RuntimeError("request rejected")
+            duck.body = {"error": {"code": code}}
+            samples.append(duck)
+        for exc in samples:
+            with self.subTest(exc=exc):
+                verdict = classify(exc)
+                self.assertEqual(verdict.kind, "quota")
+                self.assertFalse(verdict.retryable)
+
+    def test_billing_link_in_rate_limit_text_stays_rate_limit(self):
+        """限流文案里顺手附的 billing 链接不能把限流误判成额度耗尽（那会跳过退避）。"""
+        for exc in (
+            openai.RateLimitError(
+                "Rate limit reached for requests. Visit https://platform.openai.com/account/billing "
+                "to increase your limits.",
+                response=_response(429),
+                body=None,
+            ),
+            RuntimeError("Rate limit exceeded; see the billing page to raise limits"),
+        ):
+            with self.subTest(exc=exc):
+                self.assertEqual(classify(exc).kind, "rate_limit")
+
 
 class _DuckStatusError(Exception):
     """anthropic SDK 异常的最小鸭子型：同为 Stainless 生成，带 status_code 与
@@ -134,6 +183,7 @@ class AnthropicShapedTest(unittest.TestCase):
     def test_status_codes_classify(self):
         cases = {
             401: "auth",
+            402: "quota",  # Payment Required：无论文案都是额度问题
             403: "auth",
             429: "rate_limit",
             500: "transient",
@@ -521,3 +571,84 @@ class ContentFilterTest(AgentTestCase):
             agent.send("hi")
         self.assertEqual(agent.last_assistant_text(), "前半段")
         self.assertIn("内容过滤截断", buffer.getvalue())
+
+
+def finish_chunk(reason: str = "tool_calls"):
+    delta = types.SimpleNamespace(content=None, tool_calls=None)
+    choice = types.SimpleNamespace(delta=delta, finish_reason=reason)
+    return types.SimpleNamespace(choices=[choice], usage=None)
+
+
+HALF_WRITE = '{"path": "a.py", "content": "de'
+
+
+class StreamTruncationTest(AgentTestCase):
+    """流在工具参数写到一半时结束、没有任何收尾信号：断流，原地重发而不是执行残缺调用。"""
+
+    def test_classified_transient(self):
+        verdict = classify(StreamTruncated("断了"))
+        self.assertEqual(verdict.kind, "transient")
+        self.assertTrue(verdict.retryable)
+
+    def test_half_arguments_without_finish_or_usage_are_retried(self):
+        agent = self.build([
+            [chunk(tool_calls=[call_fragment(0, "c1", "write_file", HALF_WRITE)])],
+            [
+                chunk(tool_calls=[call_fragment(0, "c2", "write_file", '{"path": "a.py", "content": "done"}')]),
+                usage_chunk(100, 10),
+            ],
+            [chunk(content="写好了"), usage_chunk(100, 5)],
+        ])
+        with mock.patch("xiaoyu.agent.time.sleep") as fake_sleep, contextlib.redirect_stdout(io.StringIO()):
+            agent.send("写个文件")
+        self.assertEqual(len(self.client.completions.calls), 3)
+        #  走的是可重试错误的退避路径
+        fake_sleep.assert_called_once()
+        self.assertEqual((self.root / "a.py").read_text(encoding="utf-8"), "done")
+        #  残缺调用没进历史，也没换来一条"参数不是合法 JSON"
+        ids = [c["id"] for m in agent.messages for c in m.get("tool_calls") or []]
+        self.assertEqual(ids, ["c2"])
+        self.assertFalse(any("不是合法 JSON" in str(m.get("content")) for m in agent.messages))
+
+    def test_half_arguments_with_usage_are_not_retried(self):
+        """收到过 usage 就是正常结束（有的端点不发 finish_reason）：坏 JSON 走原报错路径。"""
+        agent = self.build([
+            [chunk(tool_calls=[call_fragment(0, "c1", "write_file", HALF_WRITE)]), usage_chunk(100, 10)],
+            [chunk(content="我重试"), usage_chunk(100, 5)],
+        ])
+        with mock.patch("xiaoyu.agent.time.sleep") as fake_sleep, contextlib.redirect_stdout(io.StringIO()):
+            agent.send("写个文件")
+        self.assertEqual(len(self.client.completions.calls), 2)
+        fake_sleep.assert_not_called()
+        self.assertIn("不是合法 JSON", agent.messages[3]["content"])
+
+    def test_half_arguments_with_finish_reason_are_not_retried(self):
+        agent = self.build([
+            [chunk(tool_calls=[call_fragment(0, "c1", "write_file", HALF_WRITE)]), finish_chunk()],
+            [chunk(content="我重试")],
+        ])
+        with mock.patch("xiaoyu.agent.time.sleep") as fake_sleep, contextlib.redirect_stdout(io.StringIO()):
+            agent.send("写个文件")
+        self.assertEqual(len(self.client.completions.calls), 2)
+        fake_sleep.assert_not_called()
+        self.assertIn("不是合法 JSON", agent.messages[3]["content"])
+
+    def test_complete_arguments_without_finish_still_run(self):
+        """参数完整的调用哪怕没有收尾信号也照常执行（只拦残缺的）。"""
+        agent = self.build([
+            [chunk(tool_calls=[call_fragment(0, "c1", "read_file", '{"path": "calc.py"}')])],
+            [chunk(content="读完了")],
+        ])
+        with contextlib.redirect_stdout(io.StringIO()):
+            agent.send("读")
+        self.assertEqual(len(self.client.completions.calls), 2)
+        self.assertIn("def add", agent.trace[0]["output"])
+
+    def test_retries_exhausted_raise_stream_truncated(self):
+        agent = self.build([
+            [chunk(tool_calls=[call_fragment(0, f"c{n}", "write_file", HALF_WRITE)])] for n in range(3)
+        ])
+        with mock.patch("xiaoyu.agent.time.sleep"), contextlib.redirect_stdout(io.StringIO()):
+            with self.assertRaises(StreamTruncated):
+                agent.send("写个文件")
+        self.assertFalse((self.root / "a.py").exists())
