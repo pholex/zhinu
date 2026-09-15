@@ -123,6 +123,101 @@ class SessionLogTest(SessionDirTestCase):
         self.assertEqual(len(exits), 1)
         self.assertEqual(exits[0]["reason"], "signal:SIGTERM")
 
+    def install_hooks_for_test(self, log: SessionLog):
+        """走 install_exit_logging 拿到它注册的信号处理器，但不真改本进程的
+        信号处置与 atexit；在册表与模块状态用例结束即还原。"""
+        import signal
+
+        from xiaoyu import session_log as session_log_module
+
+        handlers: dict[int, object] = {}
+        for patcher in (
+            mock.patch.dict(session_log_module._exit_logs, clear=True),
+            mock.patch.object(session_log_module, "_exit_hooks_installed", False),
+            #  create=True：状态变量名是实现细节，这里只负责用例后复原
+            mock.patch.object(session_log_module, "_signal_reason", None, create=True),
+            mock.patch.object(session_log_module.atexit, "register"),
+            mock.patch.object(
+                session_log_module.signal, "signal",
+                side_effect=lambda sig, handler: handlers.setdefault(sig, handler),
+            ),
+        ):
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        session_log_module.install_exit_logging(log)
+        return handlers[signal.SIGTERM]
+
+    def test_signal_landing_in_locked_write_does_not_deadlock(self):
+        #  信号处理器跑在主线程、打断的可能正是持着 _mutex 的那段写入。_mutex
+        #  不可重入：处理器再阻塞地抢它就是自己等自己，SIGTERM 之后进程永远退不出
+        import signal
+        import threading
+
+        from xiaoyu import session_log as session_log_module
+
+        log = SessionLog.create("test-model", "/ws")
+        on_signal = self.install_hooks_for_test(log)
+        codes: list[object] = []
+
+        def deliver() -> None:
+            try:
+                on_signal(signal.SIGTERM, None)
+            except SystemExit as exc:
+                codes.append(exc.code)
+
+        #  模拟"被打断的写入正持着锁"；处理器放到别的线程跑，修坏了只卡住那个线程
+        log._mutex.acquire()
+        worker = threading.Thread(target=deliver, daemon=True)
+        worker.start()
+        worker.join(timeout=5)
+        stuck = worker.is_alive()
+        log._mutex.release()
+        worker.join(timeout=5)
+        self.assertFalse(stuck, "信号处理器卡在 _mutex 上")
+        self.assertEqual(codes, [128 + signal.SIGTERM])
+        #  处理器没写成的 exit 由解栈路径（收尾方 / atexit）补，reason 仍按信号记
+        session_log_module._close_registered("normal")
+        exits = [r for r in self.read_lines(log) if r.get("event") == "exit"]
+        self.assertEqual([r["reason"] for r in exits], ["signal:SIGTERM"])
+
+    def test_interrupt_anywhere_in_write_propagates(self):
+        #  信号处理器抛的 SystemExit 可能落在写入里的任意一处，都必须原样传出去、
+        #  日志照常可写。逐个函数入口注入（call 事件）：解释器正是在函数入口、
+        #  循环回跳、调用返回处处理挂起的信号。不用 line 事件——它会落在 with
+        #  退出序列里 __exit__ 之前这种真实信号到不了的位置，测出假的锁泄漏。
+        #  老写法 fdopen 建 TextIOWrapper 时被打断，io.open 已关掉 fd，调用方再关
+        #  一次报 EBADF：这个 OSError 顶掉 SystemExit、又被停写兜底吞掉——进程
+        #  收了 SIGTERM 却接着跑，日志还被判成坏了
+        log = SessionLog.create("test-model", "/ws")
+        landed = 0
+        for point in range(1, 100_000):
+            seen = 0
+
+            def tracer(frame, event, arg):
+                nonlocal seen
+                if event == "call":
+                    seen += 1
+                    if seen == point:
+                        raise SystemExit(143)
+                return None
+
+            raised = False
+            sys.settrace(tracer)
+            try:
+                log.event("mode", value=str(point))
+            except SystemExit:
+                raised = True
+            finally:
+                sys.settrace(None)
+            self.assertFalse(log._broken, f"第 {point} 个执行点被打断后日志停写了（SystemExit 被吞）")
+            self.assertFalse(log._mutex.locked(), f"第 {point} 个执行点被打断后 _mutex 没放")
+            if not raised:
+                break  # 注入点已越过一次写入的全部执行点
+            landed += 1
+        self.assertGreater(landed, 10)
+        #  中途打断的写入不留半行：每行都能解析
+        self.read_lines(log)
+
     def test_exit_event_is_ignored_on_replay(self):
         """exit / error 事件不参与 resume 重放。"""
         log = SessionLog.create("m", "/ws")

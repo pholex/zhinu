@@ -1458,7 +1458,8 @@ class ExitLoggingTest(AcpCase):
         self.touch(acp, first)
         self.touch(acp, second)
         acp.proc.send_signal(signal.SIGTERM)
-        acp.proc.wait(timeout=15)
+        #  挂住时 wait 会带回子进程全部线程栈（CI 上偶发超时，裸 TimeoutExpired 无从查起）
+        acp.wait(timeout=15)
         files = self.session_files()
         self.assertEqual(len(files), 2, files)
         for path in files:

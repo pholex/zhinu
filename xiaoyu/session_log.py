@@ -341,9 +341,13 @@ class SessionLog:
     def release(self) -> None:
         """放掉写锁并停写（幂等），不写 exit 事件。"""
         with self._mutex:
-            self._released = True
-            if self._lock_finalizer is not None:
-                self._lock_finalizer()
+            self._release_locked()
+
+    def _release_locked(self) -> None:
+        """持 _mutex 调用：release 的本体。"""
+        self._released = True
+        if self._lock_finalizer is not None:
+            self._lock_finalizer()
 
     def _seal_torn_tail(self) -> None:
         """续写前给崩溃留下的半行补上换行，并记一条 torn_tail 事件。
@@ -428,8 +432,28 @@ class SessionLog:
         if self._closed:
             return
         self._closed = True
-        self.event("exit", reason=reason)
+        #  信号退出的解栈路径（acp/serve 的收尾、atexit）上关的会话一律按信号记：
+        #  处理器没能当场关掉的会话由这里补，reason 不能被收尾方的 disconnect/normal 顶掉
+        self.event("exit", reason=_signal_reason or reason)
         self.release()
+
+    def _close_from_signal(self, reason: str) -> None:
+        """信号处理器专用的 close：_mutex 被占就不等，留给退出的解栈路径补记。
+
+        处理器跑在主线程上，打断的是主线程当时正在执行的任意位置——包括
+        _write 持着 _mutex 的那一段。_mutex 不可重入，处理器再阻塞地抢它就是
+        自己等自己，进程永远退不出（写日志期间发 SIGTERM 实测几乎必挂）。
+        抢不到时照常由处理器 raise SystemExit：被打断的写入随解栈放锁，随后
+        收尾方或 atexit 的 close 取 _signal_reason 落 exit。
+        """
+        if self._closed or not self._mutex.acquire(blocking=False):
+            return
+        try:
+            self._closed = True
+            self._write_locked({"ts": self._now(), "event": "exit", "reason": reason})
+            self._release_locked()
+        finally:
+            self._mutex.release()
 
     @staticmethod
     def _now() -> str:
@@ -437,16 +461,20 @@ class SessionLog:
 
     def _write(self, record: dict[str, Any]) -> None:
         with self._mutex:
-            if self._broken or self._released:
+            self._write_locked(record)
+
+    def _write_locked(self, record: dict[str, Any]) -> None:
+        """持 _mutex 调用：_write 的本体（信号处理器以非阻塞方式拿到锁后也走这里）。"""
+        if self._broken or self._released:
+            return
+        if self._pending is not None:
+            if record.get("event") == "exit":
+                #  空壳会话收尾：什么都没发生过，exit 也不落，盘上不留痕
                 return
-            if self._pending is not None:
-                if record.get("event") == "exit":
-                    #  空壳会话收尾：什么都没发生过，exit 也不落，盘上不留痕
-                    return
-                self._pending.append(record)
-                self._materialize_locked()
-                return
-            self._append_locked([record])
+            self._pending.append(record)
+            self._materialize_locked()
+            return
+        self._append_locked([record])
 
     def _materialize_locked(self) -> None:
         """持 _mutex 调用：抢锁并把攒着的记录按原顺序写出。"""
@@ -461,18 +489,26 @@ class SessionLog:
         self._append_locked(records)
 
     def _append_locked(self, records: list[dict[str, Any]]) -> None:
-        """持 _mutex 调用：追加若干条记录；失败即停写并放锁。"""
+        """持 _mutex 调用：追加若干条记录；失败即停写并放锁。
+
+        直接对 fd 写字节，不套 os.fdopen：fdopen 中途被打断（信号处理器的
+        SystemExit 正落在建 TextIOWrapper 里）时 io.open 已替我们关了 fd，
+        调用方再关一次报 EBADF——这个 OSError 顶掉 SystemExit、又被下面的
+        停写兜底吞掉，进程收了 SIGTERM 却接着跑（实测）。现在 fd 只有一个
+        所有者，finally 里关一次。换行照旧按平台（原先文本模式的换行转换）。
+        """
+        data = "".join(
+            json.dumps(record, ensure_ascii=False) + os.linesep for record in records
+        ).encode("utf-8")
         try:
             _ensure_private_dir(self.path.parent)
             fd = _open_private(self.path, os.O_WRONLY | os.O_APPEND)
             try:
-                handle = os.fdopen(fd, "a", encoding="utf-8")
-            except BaseException:
+                view = memoryview(data)
+                while view:  # os.write 可能短写
+                    view = view[os.write(fd, view):]
+            finally:
                 os.close(fd)
-                raise
-            with handle:
-                for record in records:
-                    handle.write(json.dumps(record, ensure_ascii=False) + "\n")
         except OSError:
             #  磁盘满/权限问题不能影响会话，停写即可；写不进去的句柄也没理由占着锁
             self._broken = True
@@ -487,12 +523,35 @@ class SessionLog:
 #  install_exit_logging 的 docstring。
 _exit_logs: dict[Path, SessionLog] = {}
 _exit_hooks_installed = False
+#  进程正在因信号退出时的 reason（"signal:SIGTERM"）；None = 没收到过。
+#  处理器当场关不掉的会话（_mutex 被占）靠它在解栈路径上仍按信号记
+_signal_reason: str | None = None
 
 
 def _close_registered(reason: str) -> None:
     """关掉在册的全部日志，用同一个 reason。close 幂等，重复触发无害。"""
     for log in list(_exit_logs.values()):
         log.close(reason)
+
+
+def _on_signal(signum: int, frame: Any) -> None:
+    """SIGTERM / SIGHUP / SIGBREAK 的处理器：给在册会话落 exit 后照常退出。
+
+    **绝不阻塞等锁**：处理器跑在主线程、可能正打断主线程持着某个会话 _mutex
+    的写入，阻塞地抢就是死锁（进程收了 SIGTERM 却永远退不出）。锁空闲的
+    会话当场关；被占的留给 SystemExit 解栈之后的收尾方 / atexit，reason
+    经 _signal_reason 保持为信号。
+    """
+    global _signal_reason
+    try:
+        name = signal.Signals(signum).name
+    except ValueError:
+        name = str(signum)
+    _signal_reason = f"signal:{name}"
+    for log in list(_exit_logs.values()):
+        log._close_from_signal(_signal_reason)
+    #  记完照常退出：128+signum 是 shell 的信号退出码约定
+    raise SystemExit(128 + signum)
 
 
 def install_exit_logging(log: SessionLog | None) -> None:
@@ -524,15 +583,6 @@ def install_exit_logging(log: SessionLog | None) -> None:
         return
     _exit_hooks_installed = True
     atexit.register(_close_registered, "normal")
-
-    def _on_signal(signum: int, frame: Any) -> None:
-        try:
-            name = signal.Signals(signum).name
-        except ValueError:
-            name = str(signum)
-        _close_registered(f"signal:{name}")
-        #  记完照常退出：128+signum 是 shell 的信号退出码约定
-        raise SystemExit(128 + signum)
 
     for name in ("SIGTERM", "SIGHUP", "SIGBREAK"):
         sig = getattr(signal, name, None)
