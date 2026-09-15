@@ -20,6 +20,7 @@ import subprocess
 import uuid
 from pathlib import Path
 
+from . import gitsafe
 from .config import user_config_dir
 
 _GIT_TIMEOUT = 60.0
@@ -40,9 +41,12 @@ def git_root(path: Path) -> Path | None:
 def _run_git(args: list[str], cwd: Path) -> subprocess.CompletedProcess[str]:
     from .tools import _subprocess_hardening
 
+    #  宿主自动跑的 git：仓库自带的 .git/config 与 hooks 一律不认（见 gitsafe）
+    argv, env = gitsafe.prepare(args, cwd)
     return subprocess.run(
-        ["git", *args],
+        argv,
         cwd=cwd,
+        env=env,
         capture_output=True,
         text=True,
         encoding="utf-8",

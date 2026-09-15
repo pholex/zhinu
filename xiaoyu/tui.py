@@ -1595,9 +1595,13 @@ class Tui:
         root = self.permissions.workspace
         files: list[str] = []
         with contextlib.suppress(Exception):
+            from . import gitsafe
+
+            #  敲 @ 就会跑：仓库自带的 core.fsmonitor 等不能借机执行（见 gitsafe）
+            argv, env = gitsafe.prepare(["ls-files", "--cached", "--others", "--exclude-standard"], root)
             proc = subprocess.run(
-                ["git", "ls-files", "--cached", "--others", "--exclude-standard"],
-                cwd=root, capture_output=True, text=True,
+                argv,
+                cwd=root, env=env, capture_output=True, text=True,
                 #  git 输出恒 UTF-8；Windows 的 locale 编码解非 ASCII 文件名会抛，
                 #  抛了会被外层 suppress 吞掉、悄悄退化成 os.walk（更慢且少剪枝）
                 encoding="utf-8", errors="replace", timeout=5,
