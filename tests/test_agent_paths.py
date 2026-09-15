@@ -136,6 +136,43 @@ class TestToolCallLoop(AgentTestCase):
         self.assertEqual(agent.usage.by_model["gateway/main-model"].calls, 2)
         self.assertEqual(agent.usage.prompt_tokens, 1200)
 
+    def test_many_argument_fragments_assemble_identically(self) -> None:
+        """参数改为分片进 list、流末 join：拆成逐字符的上千片、两路交错下发，
+        拼出来必须与整串一字不差（含多字节字符）。"""
+        big = json.dumps({"path": "big.txt", "content": "写大文件\n" * 300}, ensure_ascii=False)
+        small = json.dumps({"path": "calc.py"})
+        fragments = [chunk(tool_calls=[call_fragment(0, "w", "write_file", "")])]
+        fragments.append(chunk(tool_calls=[call_fragment(1, "r", "read_file", "")]))
+        for position in range(max(len(big), len(small))):
+            if position < len(big):
+                fragments.append(chunk(tool_calls=[call_fragment(0, None, None, big[position])]))
+            if position < len(small):
+                fragments.append(chunk(tool_calls=[call_fragment(1, None, None, small[position])]))
+        fragments.append(usage_chunk(100, 10))
+        agent = self.build([fragments, [chunk(content="写好了"), usage_chunk(100, 5)]])
+        with contextlib.redirect_stdout(io.StringIO()):
+            agent.send("写个大文件")
+        calls = next(m for m in agent.messages if m.get("tool_calls"))["tool_calls"]
+        self.assertEqual([c["function"]["arguments"] for c in calls], [big, small])
+        #  私有攒片状态不许漏进落定的 tool_call（它会随历史出网）
+        self.assertEqual(sorted(calls[0]), ["function", "id", "type"])
+        self.assertEqual((self.root / "big.txt").read_text(encoding="utf-8"), "写大文件\n" * 300)
+
+    def test_interrupted_stream_still_joins_argument_fragments(self) -> None:
+        """中断打在流中途：pending 里的 arguments 仍是已收到分片 join 后的完整串，
+        与逐片 += 时的语义一致（调用方据此丢弃残缺调用）。"""
+
+        def interrupted():
+            yield chunk(tool_calls=[call_fragment(0, "c1", "write_file", '{"pa')])
+            yield chunk(tool_calls=[call_fragment(0, None, None, 'th": "a.p')])
+            raise KeyboardInterrupt
+
+        agent = self.build([])
+        pending: dict = {}
+        with self.assertRaises(KeyboardInterrupt):
+            agent._consume_stream(agent.model_chain()[0], interrupted(), [], pending, [])
+        self.assertEqual(pending[0]["function"]["arguments"], '{"path": "a.p')
+
     def test_parallel_tool_calls(self) -> None:
         first = [
             chunk(

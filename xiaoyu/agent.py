@@ -3487,6 +3487,28 @@ class Agent:
         reasoning: list[dict[str, Any]],
     ) -> None:
         """逐 chunk 消费流式响应，把正文和 tool_call 分片攒进传入的容器。"""
+        #  arguments 分片先进 list、流结束时一次 join：写大文件时参数被切成上万片，
+        #  挂在 dict 里的字符串 += 享受不到原地拼接优化，是 O(n²)。join 放 finally：
+        #  中断/异常路径上 pending 也保持"arguments 是完整字符串"的形状，
+        #  调用方任何一条路径读到的都与逐片 += 一致
+        arg_parts: dict[int, list[str]] = {}
+        try:
+            self._consume_chunks(route, stream, content_parts, pending, reasoning, arg_parts)
+        finally:
+            for index, parts in arg_parts.items():
+                function = pending[index]["function"]
+                function["arguments"] = function["arguments"] + "".join(parts)
+
+    def _consume_chunks(
+        self,
+        route: Route,
+        stream: Any,
+        content_parts: list[str],
+        pending: dict[int, dict[str, Any]],
+        reasoning: list[dict[str, Any]],
+        arg_parts: dict[int, list[str]],
+    ) -> None:
+        """_consume_stream 的逐 chunk 循环体；arguments 分片攒进 arg_parts。"""
         #  无 index 分片归组用：最近写过的一格。不能用 max(pending) 代替——
         #  编号最大 ≠ 最近在写（带 id 的分片可以把写入点拉回旧格），续错格
         #  就是把 arguments 拼成一坨坏 JSON
@@ -3580,11 +3602,12 @@ class Agent:
                     slot["_extra_content"] = extra
                 if fragment.function is None:
                     continue
-                #  name 各家都是一次给全，先到先得；arguments 一定是分片累加。
+                #  name 各家都是一次给全，先到先得；arguments 一定是分片累加
+                #  （攒进 arg_parts，由 _consume_stream 收尾 join）。
                 if fragment.function.name and not slot["function"]["name"]:
                     slot["function"]["name"] = fragment.function.name
                 if fragment.function.arguments:
-                    slot["function"]["arguments"] += fragment.function.arguments
+                    arg_parts.setdefault(index, []).append(fragment.function.arguments)
 
     # ---------- 工具执行 ----------
 

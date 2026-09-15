@@ -474,9 +474,10 @@ def stream_chunks(events: Iterator[Any]) -> Iterator[Chunk]:
                     function=Function(name=getattr(block, "name", "") or "", arguments=""),
                 )
             elif block_type == "thinking":
+                #  thinking 分片先进 list、块结束时 join（长思考分片多，逐片 += 是 O(n²)）
                 open_blocks[event.index] = {
                     "kind": "thinking",
-                    "thinking": getattr(block, "thinking", "") or "",
+                    "thinking": [getattr(block, "thinking", "") or ""],
                     "signature": getattr(block, "signature", "") or "",
                 }
             elif block_type == "redacted_thinking":
@@ -500,7 +501,7 @@ def stream_chunks(events: Iterator[Any]) -> Iterator[Chunk]:
                 yield _tool_chunk(event.index, function=Function(arguments=delta.partial_json))
             elif delta_type == "thinking_delta":
                 if state := open_blocks.get(event.index):
-                    state["thinking"] += delta.thinking
+                    state["thinking"].append(delta.thinking)
             elif delta_type == "signature_delta":
                 if state := open_blocks.get(event.index):
                     state["signature"] = delta.signature
@@ -519,7 +520,7 @@ def stream_chunks(events: Iterator[Any]) -> Iterator[Chunk]:
                     reasoning=[
                         {
                             "type": "thinking",
-                            "thinking": state["thinking"],
+                            "thinking": "".join(state["thinking"]),
                             "signature": state["signature"],
                         }
                     ]
