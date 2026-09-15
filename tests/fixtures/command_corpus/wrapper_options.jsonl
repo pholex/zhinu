@@ -49,6 +49,8 @@
 {"cmd": "su root -c 'rm -rf ~'", "guard": "dangerous", "expect": "block", "note": "su 选项在用户名之后"}
 {"cmd": "su - root --command='rm -rf ~'", "guard": "dangerous", "expect": "block", "note": "su --command="}
 {"cmd": "su --comm 'rm -rf ~'", "guard": "dangerous", "expect": "block", "note": "su 长选项缩写"}
+{"cmd": "su --c 'rm -rf ~' root", "guard": "dangerous", "expect": "block", "note": "长选项缩写到单字母、恰好与短选项同名"}
+{"cmd": "runuser --c 'rm -rf ~' root", "guard": "dangerous", "expect": "block", "note": "runuser 同上"}
 {"cmd": "su root -- -c 'rm -rf ~'", "guard": "dangerous", "expect": "block", "note": "su 用户名后的参数交给 shell"}
 {"cmd": "runuser -l root -c 'rm -rf ~'", "guard": "dangerous", "expect": "block", "note": "runuser su 形态 -c"}
 {"cmd": "flock /tmp/l -c 'rm -rf ~'", "guard": "dangerous", "expect": "block", "note": "flock -c 脚本"}
