@@ -470,6 +470,78 @@ class TestChatPassthrough(unittest.TestCase):
         self.assertIn(REASONING_KEY, history[1])
 
 
+def broken_arguments_history() -> list[dict[str, Any]]:
+    """模型曾吐过坏参数的历史：每路调用都已回了结果（坏的那几路是 ERROR）。"""
+    calls = [
+        ("bad", "{不是合法 JSON"),
+        #  字符串里夹裸换行：严格 json.loads 拒收，strict=False 能读
+        ("ctrl", '{"content": "a\nb"}'),
+        ("ok", '{"path": "calc.py"}'),
+        ("empty", ""),
+        ("array", "[1, 2]"),
+    ]
+    return [
+        {"role": "user", "content": "改文件"},
+        {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [
+                {"id": call_id, "type": "function", "function": {"name": "write_file", "arguments": raw}}
+                for call_id, raw in calls
+            ],
+        },
+        *[
+            {"role": "tool", "tool_call_id": call_id, "content": "ERROR: 参数不是合法 JSON"}
+            for call_id, _ in calls
+        ],
+        {"role": "user", "content": "再试一次"},
+    ]
+
+
+EXPECTED_ARGUMENTS = ["{}", '{"content": "a\\nb"}', '{"path": "calc.py"}', "{}", "{}"]
+
+
+class TestBrokenToolArguments(unittest.TestCase):
+    """历史里的坏工具参数：出网副本修成合法 JSON 对象串，历史本身不动。"""
+
+    def test_chat_path_sends_repaired_arguments(self) -> None:
+        history = broken_arguments_history()
+        inner = FakeClient(FakeResponses())
+        Transport(inner, responses.CHAT).chat.completions.create(
+            model="chat-only-model", messages=history
+        )
+        sent = inner.chat.completions.calls[0]["messages"]
+        self.assertEqual(
+            [call["function"]["arguments"] for call in sent[1]["tool_calls"]], EXPECTED_ARGUMENTS
+        )
+        #  tool 结果里的 ERROR 保留：模型仍知道那次调用失败了
+        self.assertTrue(all("ERROR" in m["content"] for m in sent if m["role"] == "tool"))
+        #  历史不许被就地改写（会话日志要留模型原话）
+        self.assertEqual(history, broken_arguments_history())
+
+    def test_responses_path_sends_repaired_arguments(self) -> None:
+        history = broken_arguments_history()
+        api = FakeResponses(events=[completed()])
+        responses_transport(api).chat.completions.create(
+            model="responses-model", messages=history, stream=True
+        )
+        items = [item for item in api.calls[0]["input"] if item.get("type") == "function_call"]
+        self.assertEqual([item["arguments"] for item in items], EXPECTED_ARGUMENTS)
+        self.assertEqual(history, broken_arguments_history())
+
+    def test_clean_history_is_reused_without_copies(self) -> None:
+        history = [
+            {"role": "user", "content": "hi"},
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [{"id": "a", "function": {"name": "f", "arguments": '{"x": 1}'}}],
+            },
+        ]
+        repaired = responses.repair_tool_arguments(history)
+        self.assertIs(repaired[1], history[1])
+
+
 class TestToolSignatures(unittest.TestCase):
     """Gemini thought_signature 的出网还原（restore_tool_extras）。
 
