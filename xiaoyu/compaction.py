@@ -100,6 +100,16 @@ def is_degenerate_summary(summary: str) -> bool:
     return len(summary.strip()) < MIN_SUMMARY_CHARS
 
 
+class TruncatedSummary(RuntimeError):
+    """摘要撞输出上限被截断（finish_reason=length）。
+
+    退化下限只拦得住过短的输出，几千字的半截摘要照样过得去——而交接说明是
+    增量维护的：半截落盘后下一轮被当"此前摘要"继续维护，缺掉的后几节
+    （未完成事项、当前状态、下一步）逐轮丢失且无从察觉。与退化同罪：换路由重试，
+    全链截断就放弃本次压缩、历史原样保留。
+    """
+
+
 #  分界标记消毒（插零宽空格打断，不删内容）：
 #  摘要正文若原样复读了 CONTEXT_PREFIX（复述上一份摘要的开头、引用指令），
 #  下次压缩 split_head 会把它认成真的分界标记、从假标记处切开历史。
@@ -163,7 +173,63 @@ def microcompact(
         result.append({**message, "content": stub})
         cleared += 1
         saved += len(content) - len(stub)
-    return result, cleared, saved
+    #  工具截图批量老化同属这一层（不花模型调用、可重新获取），且不受 keep_recent 保护
+    result, aged = age_tool_images(result)
+    return result, cleared + aged, saved
+
+
+# ---------- 工具截图批量老化 ----------
+
+#  工具回图（截图循环）数超过高水位时，一次性剔到只剩最新 TOOL_IMAGE_KEEP 张。
+#  为什么要老化：图片按引用存在历史里，出网前每次都展开成完整 base64——旧截图
+#  会随每一次请求重复上传，直到撞请求体上限；留在 keep_recent 尾部的图又让摘要
+#  压缩收效甚微、触发 ineffective 熔断，自动压缩就此停摆。
+#  为什么是批量而不是逐张：每剔一张，prompt 缓存就从被剔处断开；来一张剔一张
+#  等于每轮都断。高水位 6 / 保留 3 = 每攒 4 张才断一次缓存。保留 3 张够看
+#  "操作前 / 操作后 / 最新"的对比，更早的截图对当前一步几乎没有信息量——
+#  真需要时重新截一张比一路扛着便宜。
+TOOL_IMAGE_HIGH_WATER = 6
+TOOL_IMAGE_KEEP = 3
+
+_AGED_IMAGE_TEXT = "[较早的工具截图已移除以节省上下文。若还需要看当时的画面，请重新截图]"
+
+
+def age_tool_images(
+    messages: list[dict[str, Any]],
+    high_water: int = TOOL_IMAGE_HIGH_WATER,
+    keep: int = TOOL_IMAGE_KEEP,
+) -> tuple[list[dict[str, Any]], int]:
+    """工具回图超过高水位时，把最新 keep 张之外的换成文字占位。返回 (新消息列表, 老化张数)。
+
+    只认带 media.TOOL_MEDIA_KEY 标记的消息——用户贴的图永不老化，也不计入水位。
+    未超水位原样返回同一个列表（不拷贝）：调用方据此判断历史没被改写。
+    只换部件、不删消息，tool_calls 配对与角色交替都不受影响。
+    """
+    positions = [
+        (index, offset)
+        for index, message in enumerate(messages)
+        if message.get(media.TOOL_MEDIA_KEY) and media.is_parts(message.get("content"))
+        for offset, part in enumerate(message["content"])
+        if isinstance(part, dict) and part.get("type") == media.IMAGE_PART
+    ]
+    if len(positions) <= high_water:
+        return messages, 0
+    doomed = set(positions[: len(positions) - keep]) if keep > 0 else set(positions)
+    touched = {index for index, _ in doomed}
+    result: list[dict[str, Any]] = []
+    for index, message in enumerate(messages):
+        if index not in touched:
+            result.append(message)
+            continue
+        parts: list[dict[str, Any]] = []
+        for offset, part in enumerate(message["content"]):
+            if (index, offset) not in doomed:
+                parts.append(part)
+            elif not (parts and parts[-1].get("text") == _AGED_IMAGE_TEXT):
+                #  同一条里连着的几张只留一句占位
+                parts.append(media.text_part(_AGED_IMAGE_TEXT))
+        result.append({**message, "content": parts})
+    return result, len(doomed)
 
 
 # ---------- 机械锚点索引（摘要旁的逐字标识符备份） ----------
@@ -213,6 +279,30 @@ def anchor_index(messages: list[dict[str, Any]]) -> str:
     if len(block) > _ANCHORS_CHAR_CAP:
         block = block[:_ANCHORS_CHAR_CAP] + "…"
     return block
+
+
+# ---------- 计划快照（摘要旁的当前计划原文） ----------
+
+
+def plan_snapshot(plan: list[dict[str, str]] | None) -> str:
+    """当前计划的逐字快照；无计划或已全部完成返回空串。
+
+    计划状态只活在 update_plan 的调用参数里，调用一旦落进被压区，模型只剩
+    摘要里的转述——"同一时刻恰好一条 in_progress"守不住，易重列或偏离。
+    与锚点索引同一思路：机械附加原文（零模型调用），不交给摘要释义。
+    全部完成的计划不附：它不再指导下一步，附上只会诱导模型重复收尾。
+    """
+    items = [
+        item for item in plan or []
+        if isinstance(item, dict) and str(item.get("step") or "").strip()
+    ]
+    if not items or all(item.get("status") == "completed" for item in items):
+        return ""
+    lines = [f"- [{item.get('status')}] {item['step']}" for item in items]
+    return (
+        "\n\n【当前计划】以下是压缩时刻计划的原文（机械附加，未经改写）。"
+        "继续时沿用它推进、用 update_plan 更新状态，不要重列：\n" + "\n".join(lines)
+    )
 
 
 def split_head(content: str) -> tuple[str, str]:
@@ -316,6 +406,7 @@ class Compactor:
         transcript_cap: int = MAX_TRANSCRIPT_CHARS,
         synthetic_user_texts: frozenset[str] = frozenset(),
         user_voice_tokens: int = USER_VOICE_TOKENS,
+        plan_provider: Callable[[], list[dict[str, str]]] | None = None,
     ) -> None:
         self.context_limit = context_limit
         self.compact_at = compact_at
@@ -326,6 +417,8 @@ class Compactor:
         self.synthetic_user_texts = synthetic_user_texts
         #  用户原话备份的预算（0 = 关闭）
         self.user_voice_tokens = user_voice_tokens
+        #  压缩时刻取当前计划（None = 无 agent 上下文，不附计划快照）
+        self.plan_provider = plan_provider
         self.state = CompactionState()
 
     # ---------- 判断 ----------
@@ -456,8 +549,13 @@ class Compactor:
                 "\n\n【索引】以下标识符逐字取自被压缩的原文（机械提取，未经改写）：\n"
                 + sanitize_summary(anchors)
             )
+        #  当前计划原文紧跟索引（同样机械附加、同样消毒）：计划步骤是模型写的，
+        #  万一复读了分界标记也不能借它复活
+        plan = sanitize_summary(plan_snapshot(self.plan_provider() if self.plan_provider else None))
         #  消毒后再拼分界标记：正文里复读的标记被打断，split_head 永远只认这里拼的这一个
-        summary_block = CONTEXT_PREFIX + sanitize_summary(summary.strip()) + anchors + voice
+        summary_block = (
+            CONTEXT_PREFIX + sanitize_summary(summary.strip()) + anchors + plan + voice
+        )
         if has_task:
             head = {"role": "user", "content": f"{original}\n\n{summary_block}"}
         else:
@@ -521,6 +619,13 @@ def merge_consecutive_users(messages: list[dict[str, Any]]) -> list[dict[str, An
                 "role": "user",
                 "content": _joined(previous.get("content"), message.get("content")),
             }
+            #  工具图标记只在"合并后所有图都是工具图"时保留：混进用户贴图就整条
+            #  不再老化（宁可少剔，不可误剔用户原话）
+            with_images = [
+                side for side in (previous, message) if media.images_of(side.get("content"))
+            ]
+            if with_images and all(side.get(media.TOOL_MEDIA_KEY) for side in with_images):
+                merged[-1][media.TOOL_MEDIA_KEY] = True
             continue
         merged.append(message)
     return merged

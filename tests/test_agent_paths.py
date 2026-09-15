@@ -74,6 +74,13 @@ def text_response(content: str, prompt: int = 100, completion: int = 20):
     )
 
 
+def truncated_response(content: str):
+    """撞输出上限的非流式响应：正文照常返回，finish_reason=length。"""
+    response = text_response(content)
+    response.choices[0].finish_reason = "length"
+    return response
+
+
 class AgentTestCase(unittest.TestCase):
     def setUp(self) -> None:
         self.tmp = tempfile.TemporaryDirectory()
@@ -135,6 +142,43 @@ class TestToolCallLoop(AgentTestCase):
         self.assertEqual(agent.messages[3]["tool_call_id"], "call_1")
         self.assertEqual(agent.usage.by_model["gateway/main-model"].calls, 2)
         self.assertEqual(agent.usage.prompt_tokens, 1200)
+
+    def test_many_argument_fragments_assemble_identically(self) -> None:
+        """参数改为分片进 list、流末 join：拆成逐字符的上千片、两路交错下发，
+        拼出来必须与整串一字不差（含多字节字符）。"""
+        big = json.dumps({"path": "big.txt", "content": "写大文件\n" * 300}, ensure_ascii=False)
+        small = json.dumps({"path": "calc.py"})
+        fragments = [chunk(tool_calls=[call_fragment(0, "w", "write_file", "")])]
+        fragments.append(chunk(tool_calls=[call_fragment(1, "r", "read_file", "")]))
+        for position in range(max(len(big), len(small))):
+            if position < len(big):
+                fragments.append(chunk(tool_calls=[call_fragment(0, None, None, big[position])]))
+            if position < len(small):
+                fragments.append(chunk(tool_calls=[call_fragment(1, None, None, small[position])]))
+        fragments.append(usage_chunk(100, 10))
+        agent = self.build([fragments, [chunk(content="写好了"), usage_chunk(100, 5)]])
+        with contextlib.redirect_stdout(io.StringIO()):
+            agent.send("写个大文件")
+        calls = next(m for m in agent.messages if m.get("tool_calls"))["tool_calls"]
+        self.assertEqual([c["function"]["arguments"] for c in calls], [big, small])
+        #  私有攒片状态不许漏进落定的 tool_call（它会随历史出网）
+        self.assertEqual(sorted(calls[0]), ["function", "id", "type"])
+        self.assertEqual((self.root / "big.txt").read_text(encoding="utf-8"), "写大文件\n" * 300)
+
+    def test_interrupted_stream_still_joins_argument_fragments(self) -> None:
+        """中断打在流中途：pending 里的 arguments 仍是已收到分片 join 后的完整串，
+        与逐片 += 时的语义一致（调用方据此丢弃残缺调用）。"""
+
+        def interrupted():
+            yield chunk(tool_calls=[call_fragment(0, "c1", "write_file", '{"pa')])
+            yield chunk(tool_calls=[call_fragment(0, None, None, 'th": "a.p')])
+            raise KeyboardInterrupt
+
+        agent = self.build([])
+        pending: dict = {}
+        with self.assertRaises(KeyboardInterrupt):
+            agent._consume_stream(agent.model_chain()[0], interrupted(), [], pending, [])
+        self.assertEqual(pending[0]["function"]["arguments"], '{"path": "a.p')
 
     def test_parallel_tool_calls(self) -> None:
         first = [
@@ -301,7 +345,12 @@ class TestToolCallLoop(AgentTestCase):
         self.assertNotIn("没带回 thought_signature", buffer.getvalue())
 
     def test_malformed_arguments_are_reported_not_crashed(self) -> None:
-        first = [chunk(tool_calls=[call_fragment(0, "x", "read_file", "{不是合法 JSON")])]
+        #  带 usage 收尾：流正常结束、坏 JSON 是模型自己写的，走报错路径。
+        #  没有任何收尾信号的同形状是断流，会被原地重发（见 test_errors 的 StreamTruncationTest）
+        first = [
+            chunk(tool_calls=[call_fragment(0, "x", "read_file", "{不是合法 JSON")]),
+            usage_chunk(100, 10),
+        ]
         agent = self.build([first, [chunk(content="我重试")]])
         with contextlib.redirect_stdout(io.StringIO()):
             agent.send("试试")
@@ -685,6 +734,35 @@ class TestSummaryFallback(AgentTestCase):
         with contextlib.redirect_stdout(io.StringIO()):
             agent.maybe_compact(force=True)
         self.assertEqual(agent.messages, before)
+
+    def test_truncated_summary_triggers_fallback(self) -> None:
+        """撞输出上限的半截摘要再长也不算成功：换下一条路由。
+
+        增量交接说明会被下一轮当"此前摘要"继续维护，半截落盘的丢失会逐轮累积。
+        """
+        half = GOOD_SUMMARY * 20
+        agent = self.build([truncated_response(half), text_response(GOOD_SUMMARY)])
+        buffer = io.StringIO()
+        with contextlib.redirect_stdout(buffer):
+            summary = agent._summarize("一段历史")
+        self.assertEqual(summary, GOOD_SUMMARY)
+        self.assertIn("截断", buffer.getvalue())
+
+    def test_all_truncated_keeps_history(self) -> None:
+        """全链截断：放弃本次压缩、历史原样保留（与摘要全挂同一出口）。"""
+        #  长度远超退化下限、又比被压原文短：不看 finish_reason 就会被当成功摘要落盘
+        half = GOOD_SUMMARY * 3
+        #  降级阶梯两次 ×（便宜腿 1 + 主模型重放腿 1 + 主模型转写腿 1）= 六次，全部截断
+        agent = self.build([truncated_response(half) for _ in range(6)])
+        for index in range(10):
+            agent.messages.append({"role": "user", "content": f"第 {index} 轮"})
+            agent.messages.append({"role": "assistant", "content": f"回答 {index}" + "阿" * 1500})
+        before = list(agent.messages)
+        with contextlib.redirect_stdout(io.StringIO()):
+            note = agent.maybe_compact(force=True)
+        self.assertEqual(agent.messages, before)
+        self.assertIn("压缩失败", note)
+        self.assertNotIn(half, str(agent.messages))
 
 
 # ---------- REPL 斜杠命令 ----------
@@ -1113,6 +1191,20 @@ class TestPrefixReplaySummary(AgentTestCase):
         self.assertEqual(summary, GOOD_SUMMARY)
         used = [call["model"] for call in self.client.completions.calls]
         self.assertEqual(used, ["cheap-model", "main-model", "main-model"])
+
+    def test_truncated_replay_falls_back_to_transcript_on_same_route(self) -> None:
+        """重放姿势被截断与退化同罪：掉回转写姿势再试本路由（转写输入更短）。"""
+        agent = self.build(
+            [
+                RuntimeError("502"),
+                truncated_response(GOOD_SUMMARY * 20),
+                text_response(GOOD_SUMMARY),
+            ]
+        )
+        with contextlib.redirect_stdout(io.StringIO()):
+            summary = agent._summarize("一段历史", list(self.PREFIX))
+        self.assertEqual(summary, GOOD_SUMMARY)
+        self.assertEqual(len(self.client.completions.calls[2]["messages"]), 1)
 
     def test_no_prefix_means_no_replay(self) -> None:
         """不带前缀（compact 降级阶梯等）时主模型腿也走转写姿势。"""

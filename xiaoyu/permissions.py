@@ -40,10 +40,11 @@ _ALLOW_UNSAFE_MARKERS = ("$(", "`", ">")
 
 #  「绝不允许被 allow 的 bash 规则」探针：
 #  一条持久 allow 规则若能放行其中任意一条，就等于永久废掉整套权限系统——
-#  它们全是"任意代码执行"的入口（shell、解释器 -c/-e、env/sudo 包装、npm run
-#  跑 package.json 里的任意脚本、强制 rm）。判定方式不是黑名单前缀比对，
+#  它们全是"任意代码执行"的入口（shell、解释器 -c/-e、env/sudo/nice 等 wrapper
+#  包装、npm run 跑 package.json 里的任意脚本、强制 rm）。判定方式不是黑名单前缀比对，
 #  而是拿探针去 fnmatch 试规则本身：`allow bash(python *)` 会命中
 #  "python -c …" 探针而被拒，`allow bash(python -m pytest*)` 则不会。
+#  wrapper 带选项值的写法（`nice -n 5 *`）探针枚举不完，另由 _wrapped_pattern_reason 按结构判。
 _BANNED_ALLOW_PROBES = (
     "bash -c evil", "bash -lc evil", "sh -c evil", "zsh -c evil", "dash -c evil",
     "ksh -c evil", "fish -c evil", "cmd /c evil", "powershell -Command evil",
@@ -52,10 +53,16 @@ _BANNED_ALLOW_PROBES = (
     "node -e evil", "deno eval evil", "bun -e evil",
     "perl -e evil", "ruby -e evil", "php -r evil", "lua -e evil",
     "julia -e evil", "Rscript -e evil", "osascript -e evil",
-    "env evil", "sudo evil", "doas evil", "xargs evil",
+    "eval evil",
+    #  透传 wrapper（env/sudo/nice/timeout/setsid/xargs…）：`nice *` 等于放行 `nice bash -c …`。
+    #  名单取自 command_check 的 wrapper 选项表，那边加一个 wrapper 这里自动跟上
+    *(f"{name} evil" for name in sorted(command_check.WRAPPER_NAMES)),
     "npm run evil", "pnpm run evil", "yarn run evil", "npx evil", "bunx evil",
     "rm -rf /",
 )
+
+#  剥 wrapper 模式时的递归上限（`nice sudo timeout 5 *` 这类层层包的模式），超限按拒绝处理
+_MAX_PATTERN_DEPTH = 8
 
 
 def banned_allow_reason(rule: "Rule") -> str | None:
@@ -75,6 +82,52 @@ def banned_allow_reason(rule: "Rule") -> str | None:
             return (f"该模式会放行「{probe.split(' evil')[0].strip()}」这类任意代码执行入口，"
                     "等于永久绕过整套权限系统。请写更窄的规则"
                     "（如 allow bash(python -m pytest*)），或在确认框答 a 做会话级放行。")
+    return _wrapped_pattern_reason(rule.spec, 0)
+
+
+def _has_glob(token: str) -> bool:
+    return any(char in token for char in "*?[")
+
+
+def _wrapped_pattern_reason(spec: str, depth: int) -> str | None:
+    """wrapper 开头的模式（`nice -n 5 *`、`sudo -u root *`、`timeout 30 *`）按结构判。
+
+    探针只写得出 `nice evil` 这种最短形态，wrapper 的选项值却千变万化（-n 5 / -n5 /
+    --adjustment=5），枚举不完。所以用 command_check 同一张选项表剥开 wrapper，
+    看里面放行的是什么：
+    - 里面的命令模式能匹配任意命令（纯通配）或命中探针 → 借 wrapper 放行任意代码执行；
+    - 通配符落在选项值 / 位置参数里（`timeout -s KILL *`）→ 它能连命令本身一起吞掉；
+    - 剥出来的还是 wrapper（`nice sudo *`）→ 接着剥。
+    """
+    tokens = spec.split()
+    try:
+        inners = command_check.unwrap_argv(tokens)
+    except ValueError:
+        inners = [["*"]]  # 选项分叉多到剥不完：按最宽的情况处理
+    if inners is None:
+        return None
+    reason = (f"该模式会借「{tokens[0]}」放行里面的任意命令，等于永久绕过整套权限系统。"
+              "请写到具体命令（如 allow bash(timeout 60 pytest*)），或在确认框答 a 做会话级放行。")
+    if depth >= _MAX_PATTERN_DEPTH:
+        return reason
+    if not inners and any(_has_glob(token) for token in tokens[1:]):
+        return reason
+    for inner in inners:
+        #  候选是模式的尾巴时，前面被当成选项/位置参数吃掉的部分不许带通配；
+        #  不是尾巴（env -S 拆出来的、su -c 的脚本）就整条模式都不许带通配
+        is_tail = 0 < len(inner) < len(tokens) and tokens[len(tokens) - len(inner):] == inner
+        consumed = tokens[1:len(tokens) - len(inner)] if is_tail else tokens[1:]
+        if any(_has_glob(token) for token in consumed):
+            return reason
+        text = " ".join(inner)
+        if not text:
+            continue
+        if fnmatch.fnmatch("evil", text) or any(
+            fnmatch.fnmatch(probe, text) for probe in _BANNED_ALLOW_PROBES
+        ):
+            return reason
+        if _wrapped_pattern_reason(text, depth + 1):
+            return reason
     return None
 
 
@@ -86,12 +139,13 @@ _MULTIWORD_PREFIXES = frozenset({
     "uv", "go", "poetry", "gh", "brew", "conda", "make",
 })
 
-#  会话授权不给键的命令头：透传 wrapper / 会把参数当脚本跑的 shell / 批量执行器。
-#  它们"放行一次"时用户看的是里面那条命令，下次里面换成别的就不是同一件事了——
-#  这类头永远逐次确认，不进会话授权。
+#  会话授权不给键的命令头：透传 wrapper（含批量执行器 xargs）/ 会把参数当脚本跑的
+#  shell 与 eval/trap。它们"放行一次"时用户看的是里面那条命令，下次里面换成别的
+#  就不是同一件事了——这类头永远逐次确认，不进会话授权。
 _NO_SESSION_KEY = frozenset(
-    {"sudo", "doas", "nice", "nohup", "time", "timeout", "stdbuf", "command", "env", "xargs"}
+    command_check.WRAPPER_NAMES
     | {"bash", "sh", "zsh", "dash", "ksh", "fish"}
+    | {"eval", "trap"}
 )
 
 
@@ -398,10 +452,15 @@ class Permissions:
         if name != "bash":
             return any(self._match_path(rule.spec, args.get("path")) for rule in rules)
 
+        #  会放行任意代码执行入口的模式（nice * / python * …）不参与放行：文件加载与
+        #  add_persistent 已经拦过一道，这里兜住直接构造 Permissions 传进来的规则
+        rules = [rule for rule in rules if banned_allow_reason(rule) is None]
+        if not rules:
+            return False
         command = str(args.get("command", "")).strip()
         if not command:
             return False
-        #  破坏性操作（强制 rm 等，含 sudo/env/bash -c/trap 包装）不吃 allow 规则：
+        #  破坏性操作（强制 rm 等，含 sudo -u/env -S/bash -c/$(…) 包装）不吃 allow 规则：
         #  用户批准的是"这类命令"，不是"关掉所有确认"。仍可执行，但要问过人。
         if command_check.dangerous_command(command):
             return False

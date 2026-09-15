@@ -640,9 +640,12 @@ class LoadSessionTest(AcpCase):
 
     def test_load_session_written_by_another_process_returns_busy(self):
         #  进程 1 还开着这个会话（持有写锁）；进程 2 load 同一 sessionId 不能
-        #  两边一起往同一个文件里写——大记录分多次 write 会交错成坏行
+        #  两边一起往同一个文件里写——大记录分多次 write 会交错成坏行。
+        #  先跑一轮：session/new 延迟落盘，没发过 prompt 的会话盘上还没有文件
         first = self.start_acp("text: ok\n")
         session_id = self.new_session(first)
+        self.prompt(first, session_id, "问题")
+        first.read_until(self.is_response("p1"))
         second = self.start_acp("text: ok\n")
         response, _ = self.load(second, session_id)
         self.assertEqual(response["error"]["code"], -32001)
@@ -654,6 +657,48 @@ class LoadSessionTest(AcpCase):
              "params": {"sessionId": session_id, "cwd": str(self.workspace), "mcpServers": []}}
         )
         response, _ = second.read_until(self.is_response("load2"))
+        self.assertIn("result", response, response)
+
+
+class DeferredSessionLogTest(AcpCase):
+    """session/new 延迟落盘：只开会话不发 prompt 的探测不在盘上留空壳。"""
+
+    def session_files(self) -> list[Path]:
+        return sorted((Path(self.tmp) / "config").rglob("*.jsonl*"))
+
+    def test_probe_without_prompt_leaves_no_session_file(self):
+        acp = self.start_acp("text: ok\n")
+        self.new_session(acp)
+        self.new_session(acp)
+        acp.close()
+        #  会话文件与锁文件都不该有（exit 事件也不落）
+        self.assertEqual(self.session_files(), [])
+
+    def test_prompt_materializes_and_lists(self):
+        from unittest import mock
+
+        from xiaoyu.session_log import list_sessions
+
+        acp = self.start_acp("text: 回答\n")
+        session_id = self.new_session(acp)
+        self.prompt(acp, session_id, "真问题")
+        acp.read_until(self.is_response("p1"))
+        acp.close()
+        (path,) = [p for p in self.session_files() if p.suffix == ".jsonl"]
+        self.assertIn(session_id, path.name)
+        config = str(Path(self.tmp) / "config")
+        with mock.patch.dict(os.environ, {"XDG_CONFIG_HOME": config, "APPDATA": config}):
+            infos = list_sessions(workspace=str(self.workspace))
+        self.assertEqual([(i.session_id, i.preview) for i in infos], [(session_id, "真问题")])
+
+    def test_load_same_process_before_prompt_still_found(self):
+        acp = self.start_acp("text: ok\n")
+        session_id = self.new_session(acp)
+        acp.send(
+            {"jsonrpc": "2.0", "id": "load", "method": "session/load",
+             "params": {"sessionId": session_id, "cwd": str(self.workspace), "mcpServers": []}}
+        )
+        response, _ = acp.read_until(self.is_response("load"))
         self.assertIn("result", response, response)
 
 
@@ -1022,6 +1067,9 @@ class CommandTest(AcpCase):
     def test_load_advertises_commands(self):
         first = self.start_acp("text: ok\n")
         session_id = self.new_session(first)
+        #  跑一轮再退：session/new 延迟落盘，空会话跨进程 load 不到
+        self.prompt(first, session_id, "问题")
+        first.read_until(self.is_response("p1"))
         first.close()
         second = self.start_acp("text: ok\n")
         second.send(
@@ -1381,6 +1429,16 @@ class ExitLoggingTest(AcpCase):
         """本次测试的临时家目录下所有会话文件（env_for 把配置目录圈在 tmp 里）。"""
         return sorted(Path(self.tmp).rglob("*.jsonl"))
 
+    def touch(self, acp: WireProcess, session_id: str) -> None:
+        """让会话真正落盘：session/new 延迟落盘，什么都没发生的会话连 exit
+        都不写。切一次模式即留痕，不必消耗脚本里的模型回答。"""
+        req_id = f"touch-{session_id}"
+        acp.send(
+            {"jsonrpc": "2.0", "id": req_id, "method": "session/set_mode",
+             "params": {"sessionId": session_id, "modeId": "plan"}}
+        )
+        acp.read_until(self.is_response(req_id))
+
     @staticmethod
     def exit_reasons(path: Path) -> list[str]:
         return [
@@ -1397,6 +1455,8 @@ class ExitLoggingTest(AcpCase):
         first = self.new_session(acp)
         second = self.new_session(acp)
         self.assertNotEqual(first, second)
+        self.touch(acp, first)
+        self.touch(acp, second)
         acp.proc.send_signal(signal.SIGTERM)
         acp.proc.wait(timeout=15)
         files = self.session_files()
@@ -1408,7 +1468,7 @@ class ExitLoggingTest(AcpCase):
         #  client EOF 不经任何别的收尾，_shutdown 不落 exit 的话只能等 atexit
         #  记成 normal——断连与用户主动退出就分不开了
         acp = self.start_acp("text: ok\n")
-        self.new_session(acp)
+        self.touch(acp, self.new_session(acp))
         acp.close()
         files = self.session_files()
         self.assertEqual(len(files), 1, files)

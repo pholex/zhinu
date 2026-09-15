@@ -200,6 +200,12 @@ def _write_json(path: Path, payload: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(path.suffix + f".{os.getpid()}.tmp")
     tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    #  agent 配置里的 MCP server 可能带 env/headers 令牌：POSIX 上仅本人可读，
+    #  rename 前收紧，落位的那一刻就是 0600（Windows 无此语义，忽略失败）
+    try:
+        os.chmod(tmp, 0o600)
+    except OSError:
+        pass
     os.replace(tmp, path)
 
 

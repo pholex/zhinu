@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import contextlib
 import faulthandler
+import os
 import sys
 import traceback
 from datetime import datetime
@@ -61,11 +62,12 @@ def _write(header: str, exc: BaseException | None) -> None:
         if len(merged) > _MAX_BYTES:
             merged = "[……早期崩溃记录已截断……]\n" + merged[-_MAX_BYTES:]
         _log_path.write_text(merged, encoding="utf-8")
+        #  异常消息里可能带着请求参数、密钥片段：POSIX 上收紧到仅本人可读
+        #  （外层 suppress 兜住 Windows 等 chmod 语义不同的失败）
+        os.chmod(_log_path, 0o600)
 
 
 def _pid() -> int:
-    import os
-
     return os.getpid()
 
 

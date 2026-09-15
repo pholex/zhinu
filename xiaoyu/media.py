@@ -247,6 +247,13 @@ def as_parts(content: Any) -> list[dict[str, Any]]:
     return [text_part(text)] if text else []
 
 
+#  user 消息上的私有键：标记"这条里的图是工具回的，不是用户贴的"。
+#  下划线开头 = 内核私有，出网前被摘掉（chat 走 strip_private，Messages /
+#  Responses 的转换只取已知字段）。工具截图老化只认它：用户贴的图是用户原话
+#  的一部分，永不老化（见 compaction.age_tool_images）
+TOOL_MEDIA_KEY = "_tool_media"
+
+
 def images_of(content: Any) -> list[dict[str, Any]]:
     if not isinstance(content, list):
         return []

@@ -5,8 +5,17 @@ from __future__ import annotations
 import contextlib
 import io
 import unittest
+from unittest import mock
 
-from xiaoyu.compaction import SUMMARY_INSTRUCTION, microcompact
+from xiaoyu import media
+from xiaoyu.compaction import (
+    SUMMARY_INSTRUCTION,
+    TOOL_IMAGE_HIGH_WATER,
+    TOOL_IMAGE_KEEP,
+    age_tool_images,
+    merge_consecutive_users,
+    microcompact,
+)
 
 from .test_agent_paths import AgentTestCase
 
@@ -174,6 +183,166 @@ class SummaryInstructionTest(unittest.TestCase):
         #  渲染转写腿用【此前的压缩摘要】节标签，前缀重放腿用分界标记原文开头
         self.assertIn("此前的压缩摘要", SUMMARY_INSTRUCTION)
         self.assertIn("以下是另一个模型对本会话早期内容做的交接摘要", PREFIX_SUMMARY_INSTRUCTION)
+
+
+def tool_image(ref: str) -> dict:
+    """工具回图那条 user 消息（带私有标记，形状同 Agent._attach_media）。"""
+    return {
+        "role": "user",
+        "content": [
+            media.text_part("[上一步的工具返回了 1 张图片，如下]"),
+            media.image_part(ref),
+        ],
+        media.TOOL_MEDIA_KEY: True,
+    }
+
+
+def screenshot_loop(count: int) -> list[dict]:
+    """浏览器截图循环：每轮一次工具调用 + 一条工具回图。"""
+    messages: list[dict] = [
+        {"role": "system", "content": "s"},
+        {"role": "user", "content": "任务"},
+    ]
+    for index in range(count):
+        messages += tool_exchange(f"c{index}", "browser_screenshot", "图片见下一条")
+        messages.append(tool_image(f"xiaoyu-media://shot{index}.png"))
+    return messages
+
+
+def image_urls(messages: list[dict]) -> list[str]:
+    return [
+        part["image_url"]["url"]
+        for message in messages
+        for part in media.images_of(message.get("content"))
+    ]
+
+
+class ToolImageAgingTest(unittest.TestCase):
+    """工具截图批量老化：超高水位一次剔到只剩最新几张，用户贴图不动。"""
+
+    def test_over_high_water_keeps_latest(self):
+        messages = screenshot_loop(TOOL_IMAGE_HIGH_WATER + 1)
+        result, aged = age_tool_images(messages)
+        self.assertEqual(aged, TOOL_IMAGE_HIGH_WATER + 1 - TOOL_IMAGE_KEEP)
+        #  留下的是最新的几张，顺序不变
+        expected = [f"xiaoyu-media://shot{i}.png" for i in range(7 - TOOL_IMAGE_KEEP, 7)]
+        self.assertEqual(image_urls(result), expected)
+        placeholders = [m for m in result if "重新截图" in media.text_of(m.get("content"))]
+        self.assertEqual(len(placeholders), aged)
+        #  消息结构不变：条数、角色、标记都在（老化只换部件，不删消息）
+        self.assertEqual([m.get("role") for m in result], [m.get("role") for m in messages])
+        self.assertTrue(all(m.get(media.TOOL_MEDIA_KEY) for m in placeholders))
+
+    def test_at_high_water_untouched(self):
+        """未达高水位不动（返回原列表）：逐张剔会让 prompt 缓存每轮断在被剔处。"""
+        messages = screenshot_loop(TOOL_IMAGE_HIGH_WATER)
+        result, aged = age_tool_images(messages)
+        self.assertEqual(aged, 0)
+        self.assertIs(result, messages)
+
+    def test_batch_then_stable(self):
+        """剔完一批后要再攒到高水位以上才动第二次——不是来一张剔一张。"""
+        messages, aged = age_tool_images(screenshot_loop(TOOL_IMAGE_HIGH_WATER + 1))
+        self.assertTrue(aged)
+        for index in range(TOOL_IMAGE_HIGH_WATER - TOOL_IMAGE_KEEP):
+            messages = [*messages, tool_image(f"xiaoyu-media://more{index}.png")]
+            same, again = age_tool_images(messages)
+            self.assertEqual(again, 0)
+            self.assertIs(same, messages)
+
+    def test_user_pasted_images_never_aged(self):
+        messages = screenshot_loop(TOOL_IMAGE_HIGH_WATER + 3)
+        pasted = {
+            "role": "user",
+            "content": [media.text_part("看这张"), media.image_part("xiaoyu-media://mine.png")],
+        }
+        messages.insert(2, pasted)
+        result, _ = age_tool_images(messages)
+        self.assertIn("xiaoyu-media://mine.png", image_urls(result))
+        self.assertEqual(result[2], pasted)
+
+    def test_user_images_do_not_count_toward_high_water(self):
+        messages = screenshot_loop(TOOL_IMAGE_HIGH_WATER)
+        for index in range(5):
+            messages.append(
+                {"role": "user", "content": [media.image_part(f"xiaoyu-media://p{index}.png")]}
+            )
+        result, aged = age_tool_images(messages)
+        self.assertEqual(aged, 0)
+        self.assertIs(result, messages)
+
+    def test_microcompact_ages_tail_images_too(self):
+        """keep_recent 尾部的图同样老化：尾部锁住的图会让摘要压缩收效甚微、触发熔断。"""
+        messages = screenshot_loop(TOOL_IMAGE_HIGH_WATER + 1)
+        result, cleared, _ = microcompact(messages, keep_recent=len(messages))
+        self.assertEqual(len(image_urls(result)), TOOL_IMAGE_KEEP)
+        self.assertEqual(cleared, TOOL_IMAGE_HIGH_WATER + 1 - TOOL_IMAGE_KEEP)
+
+    def test_idempotent(self):
+        once, _ = age_tool_images(screenshot_loop(TOOL_IMAGE_HIGH_WATER + 1))
+        twice, aged = age_tool_images(once)
+        self.assertEqual(aged, 0)
+        self.assertEqual(once, twice)
+
+    def test_merge_keeps_marker_only_when_all_images_are_tool_images(self):
+        head = {"role": "user", "content": "任务 + 摘要"}
+        merged = merge_consecutive_users([head, tool_image("xiaoyu-media://a.png")])
+        self.assertTrue(merged[0].get(media.TOOL_MEDIA_KEY))
+        pasted = {"role": "user", "content": [media.image_part("xiaoyu-media://mine.png")]}
+        mixed = merge_consecutive_users([pasted, tool_image("xiaoyu-media://a.png")])
+        self.assertFalse(mixed[0].get(media.TOOL_MEDIA_KEY))
+
+
+class ToolMediaMarkerOffWireTest(unittest.TestCase):
+    """私有标记止于内核边界：三种协议的出网载荷里都不能出现。"""
+
+    MESSAGES = [
+        {"role": "system", "content": "s"},
+        {"role": "user", "content": "任务"},
+        tool_image("xiaoyu-media://gone.png"),
+    ]
+
+    def test_chat_payload(self):
+        from xiaoyu import responses
+
+        from .test_responses import FakeClient, FakeResponses
+
+        inner = FakeClient(FakeResponses())
+        responses.wrap(inner, ()).chat.completions.create(model="m", messages=list(self.MESSAGES))
+        sent = inner.chat.completions.calls[0]["messages"]
+        self.assertNotIn(media.TOOL_MEDIA_KEY, str(sent))
+
+    def test_messages_and_responses_payloads(self):
+        from xiaoyu import messages as msgs
+        from xiaoyu import responses
+
+        anthropic = msgs.to_request("m", list(self.MESSAGES), None, False, {})
+        self.assertNotIn(media.TOOL_MEDIA_KEY, str(anthropic))
+        native = responses.to_request("m", list(self.MESSAGES), None, {})
+        self.assertNotIn(media.TOOL_MEDIA_KEY, str(native))
+
+
+class AgentToolImageAgingTest(AgentTestCase):
+    """工具回图入历史时带标记，攒过高水位当场批量老化（不必等压缩阈值）。"""
+
+    def test_attach_marks_and_ages(self):
+        from xiaoyu import providers
+        from xiaoyu.agent import Agent
+        from xiaoyu.tools import Toolbox
+
+        registry = providers.Registry(
+            [providers.Provider("gateway", "", "", (), "网关", (), ("*",))],
+            clients={"gateway": mock.MagicMock()},
+        )
+        agent = Agent(self.config, Toolbox(self.config), registry=registry)
+        for index in range(TOOL_IMAGE_HIGH_WATER + 1):
+            ref = f"xiaoyu-media://shot{index}.png"
+            agent.toolbox.take_media = lambda ref=ref: [media.image_part(ref)]  # type: ignore[method-assign]
+            with contextlib.redirect_stdout(io.StringIO()):
+                agent._attach_media()
+            self.assertTrue(agent.messages[-1].get(media.TOOL_MEDIA_KEY))
+        self.assertEqual(len(image_urls(agent.messages)), TOOL_IMAGE_KEEP)
+        self.assertIn(f"xiaoyu-media://shot{TOOL_IMAGE_HIGH_WATER}.png", image_urls(agent.messages))
 
 
 if __name__ == "__main__":

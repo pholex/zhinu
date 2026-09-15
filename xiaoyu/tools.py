@@ -21,6 +21,8 @@ import locale
 import os
 import re
 import shutil
+import signal
+import stat
 import unicodedata
 import subprocess
 import sys
@@ -297,6 +299,45 @@ def _edit_encodings() -> list[str]:
     return names
 
 
+#  read_file / str_replace 整读文件的大小上限。两者都是整份读进内存再解码、
+#  分段读（offset/limit）也不例外——几百 MB 的日志能把进程吃爆，内容也塞不进上下文。
+_READ_MAX_BYTES = 50 * 1024 * 1024
+
+_SPECIAL_FILE_KINDS = (
+    (stat.S_ISFIFO, "FIFO（命名管道）"),
+    (stat.S_ISCHR, "字符设备"),
+    (stat.S_ISBLK, "块设备"),
+    (stat.S_ISSOCK, "socket"),
+)
+
+
+def _unreadable_file_error(target: Path, shown: str, size_cap: bool = True) -> str | None:
+    """整读前的闸：非普通文件、或超过大小上限，返回拒绝说明；可读返回 None。
+
+    exists/is_dir 挡不住特殊文件：读 FIFO 会一直阻塞到有人写入（工具调用永久
+    挂死、连超时都没有），读 /dev/zero 这类设备读不到头。stat 跟随符号链接，
+    链接指向 FIFO 同样拦下。size_cap=False 只查类型（覆盖写不整读原文）。
+    """
+    try:
+        info = os.stat(target)
+    except OSError as exc:
+        return f"ERROR: 读取失败 {shown}: {exc}"
+    if not stat.S_ISREG(info.st_mode):
+        kind = next((name for test, name in _SPECIAL_FILE_KINDS if test(info.st_mode)), "非普通文件")
+        return (
+            f"ERROR: {shown} 是{kind}，不是普通文件，已拒绝读取——读它可能永久阻塞"
+            "等待数据，或读出没有尽头的内容。确需查看请用 bash 并加超时与字节上限"
+            f"（如 timeout 5 head -c 4096 {shown}）。"
+        )
+    if size_cap and info.st_size > _READ_MAX_BYTES:
+        return (
+            f"ERROR: {shown} 有 {info.st_size / 1048576:.1f} MiB，超过整读上限 "
+            f"{_READ_MAX_BYTES / 1048576:.0f} MiB，已拒绝读取。请先用 grep 定位关键内容，"
+            "再用 bash 的 head / tail / sed -n '起,止p' 取需要的片段。"
+        )
+    return None
+
+
 def _read_for_edit(target: Path) -> tuple[str, str, bytes]:
     """严格解码读文件，返回 (文本, 编码, 原始字节)；解不开抛 _Undecodable。
 
@@ -402,6 +443,57 @@ def _interactive_auth_hint(output: str) -> str:
         "阻塞等待只会超时：把链接原样展示给用户、请其完成授权，等用户答复后"
         "再用查询状态类命令确认，不要重复干等或反复重跑。"
     )
+
+
+#  信号终止的释义，按信号**名**索引：编号随平台不同（SIGBUS 在 Linux 是 7、
+#  macOS 是 10），运行时经 signal.Signals 换算。只收常见的几种——128+N 形态
+#  程序自己也能 exit 出来，表外的编号宁可不释义也不乱贴标签。
+#  SIGINT 不在表里：那是用户中断，另有处理。
+_SIGNAL_EXIT_NOTES = {
+    "SIGKILL": "常见原因：内存不足被系统杀掉，或超时被强杀",
+    "SIGTERM": "收到终止请求（kill、外部超时或关停）",
+    "SIGSEGV": "段错误，程序崩溃",
+    "SIGABRT": "程序主动中止（断言失败或致命运行时错误）",
+    "SIGBUS": "总线错误（非法内存访问，如映射的文件被截断）",
+    "SIGPIPE": "向已关闭的管道写入（如下游 head 已提前退出）",
+    "SIGHUP": "所在终端或会话断开",
+    "SIGFPE": "算术错误（如整数除零）",
+    "SIGILL": "非法指令（二进制损坏或 CPU 架构不符）",
+    "SIGQUIT": "收到退出信号",
+    "SIGXCPU": "超出 CPU 时间限制",
+    "SIGXFSZ": "超出文件大小限制",
+}
+
+
+def _signal_exit_hint(returncode: int) -> str:
+    """信号类退出码的一行释义；不是信号终止返回空串。
+
+    模型只看到 `exit_status: 137` 或 `-9` 时容易当成命令自身报错去改代码，
+    其实多半是被 OOM 杀了。负数是 Popen 确知"被信号 N 杀"，措辞确定；
+    128+N 是 shell 转述子进程的死因，程序也可能自己 exit 这个值，措辞留余地。
+    Windows 退出码没有这层约定，不释义。
+    """
+    if os.name == "nt":
+        return ""
+    if returncode < 0:
+        signum, definite = -returncode, True
+    elif returncode > 128:
+        signum, definite = returncode - 128, False
+    else:
+        return ""
+    try:
+        name = signal.Signals(signum).name
+    except ValueError:
+        return ""
+    if name == "SIGINT":
+        return ""
+    note = _SIGNAL_EXIT_NOTES.get(name)
+    if definite:
+        detail = f"——{note}" if note else ""
+        return f"\n[提示] 进程被 {name}({signum}) 终止{detail}。"
+    if note is None:
+        return ""
+    return f"\n[提示] 退出码 {returncode} 通常表示进程被 {name}({signum}) 终止——{note}。"
 
 
 @functools.lru_cache(maxsize=1)
@@ -1573,6 +1665,8 @@ class Toolbox:
             return f"ERROR: 文件不存在：{path}"
         if target.is_dir():
             return f"ERROR: {path} 是目录，不是文件。用 list_files 看目录。"
+        if error := _unreadable_file_error(target, path):
+            return error
         try:
             text, encoding, _ = _read_for_edit(target)
         except _Undecodable:
@@ -1620,6 +1714,9 @@ class Toolbox:
             guard = self._guard_known(target, path)
             if guard:
                 return guard
+            #  快照要 read_bytes 原文、写入要 open 它：FIFO 两步都会阻塞死
+            if error := _unreadable_file_error(target, path, size_cap=False):
+                return error
         #  /rewind 快照：改前内容（新建文件记 None——回滚即删除）
         if existed:
             try:
@@ -1653,6 +1750,9 @@ class Toolbox:
         guard = self._guard_known(target, path)
         if guard:
             return guard
+        #  读过之后路径可能被换成了 FIFO/设备：闸门之后的整读同样要拦
+        if error := _unreadable_file_error(target, path):
+            return error
 
         try:
             text, encoding, raw = _read_for_edit(target)
@@ -2136,7 +2236,8 @@ class Toolbox:
             chunks.append(f"stderr:\n{stderr_text}")
         if len(chunks) == 1:
             chunks.append("(无输出)")
-        output = "\n".join(chunks)
+        #  超时杀掉的已在上面带着 exit 124 提前返回，这里的信号只可能来自外部
+        output = "\n".join(chunks) + _signal_exit_hint(proc.returncode)
         if escalation:
             #  升权执行的结果打标：用户和模型都要看得出"这次是升权跑的"
             output = f"[沙箱：本次调用已按 {escalation} 升权执行，仅本次生效]\n" + output

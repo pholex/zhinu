@@ -1119,10 +1119,13 @@ class SteerPoller:
       回显本来就有 tty echo；
     - 斜杠命令不特判：运行中敲 `/...` 也会作为插话交给模型（提示语义上
       它就是"对模型说的话"；命令请等本轮结束）；
+    - 多行粘贴合并成一条：规范模式逐行交付，窗口内连着到达的行并成整段；
     - Windows 没有 select-on-stdin：整个 poller 禁用，保留旧的"收尾预填"路径。
     """
 
     _POLL = 0.1
+    #  粘贴合并窗口：读到一行后这么久内还有数据，就并进同一条插话
+    _PASTE_WINDOW = 0.05
 
     def __init__(self, agent: Agent) -> None:
         self.agent = agent
@@ -1179,10 +1182,43 @@ class SteerPoller:
                 return
             if not data:
                 return
-            text = data.decode("utf-8", errors="replace")
-            for line in text.replace("\r\n", "\n").replace("\r", "\n").split("\n"):
-                if line.strip():
-                    self.agent.steer(line)
+            data, eof = self._gather_burst(fd, data)
+            self._deliver(data)
+            if eof:
+                return
+
+    def _gather_burst(self, fd: int, data: bytes) -> tuple[bytes, bool]:
+        """读到一行后，窗口内还有数据就接着读，返回 (合并后的字节, 是否已 EOF)。
+
+        规范模式下每次 read 最多交出一行：粘贴 N 行会连着到达，逐次 steer 就成了
+        N 条插话。人手敲完一行再敲下一行远慢于窗口，正常交互只多等这一个窗口。
+        窗口期间被 pause/stop 就停手，已读到的照常交付。
+        """
+        import select
+
+        while not self._paused.is_set() and not self._stop.is_set():
+            try:
+                readable, _, _ = select.select([fd], [], [], self._PASTE_WINDOW)
+                if not readable:
+                    return data, False
+                more = os.read(fd, 4096)
+            except Exception:  # noqa: BLE001 - 读不动就交付已有的并收工
+                return data, True
+            if not more:
+                return data, True
+            data += more
+        return data, False
+
+    def _deliver(self, data: bytes) -> None:
+        """整段作为**一条**插话：保留内部换行（含空行），只去首尾空行。"""
+        text = data.decode("utf-8", errors="replace")
+        lines = text.replace("\r\n", "\n").replace("\r", "\n").split("\n")
+        while lines and not lines[0].strip():
+            lines.pop(0)
+        while lines and not lines[-1].strip():
+            lines.pop()
+        if lines:
+            self.agent.steer("\n".join(lines))
 
 
 class Tui:
@@ -1595,9 +1631,13 @@ class Tui:
         root = self.permissions.workspace
         files: list[str] = []
         with contextlib.suppress(Exception):
+            from . import gitsafe
+
+            #  敲 @ 就会跑：仓库自带的 core.fsmonitor 等不能借机执行（见 gitsafe）
+            argv, env = gitsafe.prepare(["ls-files", "--cached", "--others", "--exclude-standard"], root)
             proc = subprocess.run(
-                ["git", "ls-files", "--cached", "--others", "--exclude-standard"],
-                cwd=root, capture_output=True, text=True,
+                argv,
+                cwd=root, env=env, capture_output=True, text=True,
                 #  git 输出恒 UTF-8；Windows 的 locale 编码解非 ASCII 文件名会抛，
                 #  抛了会被外层 suppress 吞掉、悄悄退化成 os.walk（更慢且少剪枝）
                 encoding="utf-8", errors="replace", timeout=5,

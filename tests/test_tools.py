@@ -91,6 +91,72 @@ class TestReadWrite(ToolboxTestCase):
     def test_offset_beyond_end_is_an_error(self) -> None:
         self.assertIn("超出范围", self.box.run("read_file", {"path": "calc.py", "offset": 999}))
 
+    def _run_bounded(self, name: str, args: dict, fifo: Path) -> str:
+        """子线程里跑工具并限时 join：修复失效时读 FIFO 会永久阻塞，
+        不能让它拖垮整个套件。超时后以非阻塞方式开写端再关掉，给读者送 EOF。"""
+        import threading
+
+        box: dict[str, str] = {}
+        worker = threading.Thread(
+            target=lambda: box.setdefault("result", self.box.run(name, args)), daemon=True
+        )
+        worker.start()
+        worker.join(timeout=3.0)
+        if worker.is_alive():
+            try:
+                os.close(os.open(fifo, os.O_WRONLY | os.O_NONBLOCK))
+            except OSError:
+                pass
+            worker.join(timeout=3.0)
+            self.fail(f"{name} 读 FIFO 挂住了")
+        return box["result"]
+
+    @unittest.skipUnless(hasattr(os, "mkfifo"), "FIFO 仅 POSIX")
+    def test_read_fifo_returns_error_immediately(self) -> None:
+        fifo = self.root / "pipe"
+        os.mkfifo(fifo)
+        result = self._run_bounded("read_file", {"path": "pipe"}, fifo)
+        self.assertTrue(result.startswith("ERROR:"), result)
+        self.assertIn("FIFO", result)
+
+    @unittest.skipUnless(hasattr(os, "mkfifo"), "FIFO 仅 POSIX")
+    def test_read_symlink_to_fifo_is_blocked(self) -> None:
+        fifo = self.root / "pipe"
+        os.mkfifo(fifo)
+        (self.root / "link").symlink_to(fifo)
+        result = self._run_bounded("read_file", {"path": "link"}, fifo)
+        self.assertIn("FIFO", result)
+
+    @unittest.skipUnless(hasattr(os, "mkfifo"), "FIFO 仅 POSIX")
+    def test_str_replace_on_fifo_does_not_hang(self) -> None:
+        fifo = self.root / "pipe"
+        os.mkfifo(fifo)
+        #  假装读过（比如读完之后路径被换成了 FIFO），闸门之后的读取也不能挂
+        self.box._reads[fifo] = float("inf")
+        result = self._run_bounded(
+            "str_replace", {"path": "pipe", "old_str": "a", "new_str": "b"}, fifo
+        )
+        self.assertIn("FIFO", result)
+
+    @unittest.skipUnless(os.path.exists("/dev/null"), "字符设备用例依赖 /dev/null")
+    def test_read_device_is_refused(self) -> None:
+        result = self.box.run("read_file", {"path": "/dev/null"})
+        self.assertTrue(result.startswith("ERROR:"), result)
+        self.assertIn("字符设备", result)
+
+    def test_oversized_file_is_refused(self) -> None:
+        from xiaoyu import tools
+
+        with mock.patch.object(tools, "_READ_MAX_BYTES", 16):
+            result = self.box.run("read_file", {"path": "calc.py"})
+            self.assertTrue(result.startswith("ERROR:"), result)
+            self.assertIn("grep", result)
+            edit = self.box.run(
+                "str_replace", {"path": "calc.py", "old_str": "a + b", "new_str": "a - b"}
+            )
+            self.assertTrue(edit.startswith("ERROR:"), edit)
+        self.assertEqual(self.read(), SAMPLE)
+
     def test_partial_read_does_not_authorize_overwrite(self) -> None:
         """只读了一段就允许覆盖整个文件，会丢掉没读到的部分。"""
         self.box.run("read_file", {"path": "calc.py", "offset": 1, "limit": 2})
@@ -337,6 +403,38 @@ class TestBashAndSafety(ToolboxTestCase):
     def test_bash_reports_failure(self) -> None:
         result = self.box.run("bash", {"command": "exit 3"})
         self.assertIn("exit_status: 3", result)
+        self.assertNotIn("信号", result)
+
+    @unittest.skipIf(os.name == "nt", "信号退出码是 POSIX 语义")
+    def test_bash_killed_by_signal_is_explained(self) -> None:
+        result = self.box.run("bash", {"command": "kill -9 $$"})
+        self.assertIn("SIGKILL", result)
+        self.assertIn("内存不足", result)
+
+    @unittest.skipIf(os.name == "nt", "信号退出码是 POSIX 语义")
+    def test_signal_exit_hints(self) -> None:
+        from xiaoyu.tools import _signal_exit_hint
+
+        #  负数 = Popen 确知被信号杀：措辞确定
+        hint = _signal_exit_hint(-9)
+        self.assertIn("被 SIGKILL(9) 终止", hint)
+        self.assertIn("内存不足", hint)
+        self.assertNotIn("通常", hint)
+        #  128+N = shell 转述：程序也可能自己 exit 137，措辞留余地
+        hint = _signal_exit_hint(137)
+        self.assertIn("通常表示", hint)
+        self.assertIn("SIGKILL(9)", hint)
+        self.assertIn("SIGSEGV(11)", _signal_exit_hint(139))
+        #  SIGINT 是用户中断，正常退出码与普通失败都不加释义
+        for code in (130, -2, 1, 0, 3, 255):
+            self.assertEqual(_signal_exit_hint(code), "", code)
+
+    def test_signal_exit_hints_skipped_on_windows(self) -> None:
+        from xiaoyu import tools
+
+        with mock.patch.object(tools.os, "name", "nt"):
+            self.assertEqual(tools._signal_exit_hint(-9), "")
+            self.assertEqual(tools._signal_exit_hint(137), "")
 
     def test_bash_timeout(self) -> None:
         result = self.box.run("bash", {"command": "sleep 5", "timeout": 1})

@@ -164,6 +164,48 @@ class PrivilegedCommandTest(unittest.TestCase):
             self.assertIsNone(privileged_command(command), command)
 
 
+class WrapperPeelingTest(unittest.TestCase):
+    """wrapper 选项表：选项值不是命令名，表外选项与病态嵌套走 fail-safe。
+    覆盖面样本在 fixtures/command_corpus/wrapper_options.jsonl，这里测边界。"""
+
+    def test_unwrap_skips_option_values(self):
+        from xiaoyu.command_check import unwrap_argv
+
+        self.assertEqual(unwrap_argv(["sudo", "-u", "root", "ls"]), [["ls"]])
+        self.assertEqual(unwrap_argv(["timeout", "-s", "KILL", "5", "ls", "-l"]), [["ls", "-l"]])
+        self.assertEqual(unwrap_argv(["su", "-c", "id"]), [["sh", "-c", "id"]])
+        self.assertIsNone(unwrap_argv(["ls", "-l"]))
+
+    def test_unknown_option_scans_both_readings(self):
+        from xiaoyu.command_check import unwrap_argv
+
+        inners = unwrap_argv(["nice", "--bogus", "5", "ls"])
+        self.assertIn(["ls"], inners)
+        self.assertIn(["5", "ls"], inners)
+
+    def test_pathological_nesting_fails_safe(self):
+        #  扫不完不能当安全：嵌套过深按有风险返回，且不能把调用栈打爆
+        deep_wrappers = "nice " * 40 + "ls"
+        deep_substitution = "echo " + "$(" * 300 + "ls" + ")" * 300
+        for command in (deep_wrappers, deep_substitution):
+            self.assertIsNotNone(dangerous_command(command))
+            self.assertIsNotNone(privileged_command(command))
+        self.assertIsNotNone(injection_risk(deep_wrappers))
+
+    def test_long_flat_script_is_not_too_complex(self):
+        #  工作量上限只数嵌套层：几千行的扁平脚本（heredoc 写文件）不该因为长而被判风险
+        script = "\n".join(f"echo line {i}" for i in range(3000))
+        self.assertIsNone(dangerous_command(script))
+        self.assertIsNone(privileged_command(script))
+
+    def test_wrapper_does_not_hide_injection(self):
+        self.assertIsNotNone(injection_risk("timeout 60 git -c core.pager=sh log"))
+        self.assertIsNotNone(injection_risk("nice -n 5 find . -delete"))
+        self.assertIsNotNone(injection_risk("su -c 'git status'"))
+        self.assertIsNone(injection_risk("timeout 60 git status"))
+        self.assertIsNone(injection_risk("nice -n 10 make"))
+
+
 class CommandRiskTest(unittest.TestCase):
     def test_combines_both_directions(self):
         self.assertIsNotNone(command_risk("sudo rm -rf /tmp/x"))

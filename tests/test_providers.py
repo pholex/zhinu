@@ -580,6 +580,17 @@ class TestCrossProviderFallback(ProviderTestCase):
         #  直连只被打了一次（无退避重试），网关一次成功
         self.assertEqual(len(gateway.completions.calls), 1)
 
+    def test_insufficient_balance_402_direct_falls_to_gateway(self) -> None:
+        """直连余额不足（DeepSeek 的 402）归 quota：不在直连上退避，切网关兜底。
+        以前落进 fatal，降级链直接不放行、整轮报错。"""
+        broke = openai.APIStatusError("Insufficient Balance", response=_response(402), body=None)
+        agent, gateway = self.build([broke], [[chunk(content="网关顶上")]])
+        with mock.patch("xiaoyu.agent.time.sleep") as fake_sleep, contextlib.redirect_stdout(io.StringIO()):
+            agent.send("hi")
+        self.assertEqual(agent.last_assistant_text(), "网关顶上")
+        self.assertEqual(len(gateway.completions.calls), 1)
+        fake_sleep.assert_not_called()
+
     def test_auth_failure_on_last_provider_still_raises(self) -> None:
         """没有别家可试时鉴权错误照旧直接抛——那是配置问题，不该假装在恢复。"""
         dead = openai.AuthenticationError("401", response=_response(401), body=None)

@@ -421,4 +421,9 @@ def to_completion(response: Any) -> Completion:
     text = media.text_of(getattr(choice.message, "content", None))
     lead, calls = parse_calls(text)
     message = Message(content=lead or None, tool_calls=calls or None)
-    return Completion(choices=[NonStreamChoice(message)], usage=getattr(response, "usage", None))
+    #  finish_reason 原样带过：摘要调用靠 length 识别截断
+    finish = getattr(choice, "finish_reason", None)
+    return Completion(
+        choices=[NonStreamChoice(message, finish_reason=finish)],
+        usage=getattr(response, "usage", None),
+    )

@@ -35,7 +35,11 @@ from .compaction import (
     MIN_SUMMARY_CHARS,
     PREFIX_SUMMARY_INSTRUCTION,
     SUMMARY_INSTRUCTION,
+    TOOL_IMAGE_HIGH_WATER,
+    TOOL_IMAGE_KEEP,
     Compactor,
+    TruncatedSummary,
+    age_tool_images,
     is_degenerate_summary,
     microcompact,
 )
@@ -949,6 +953,9 @@ class Agent:
             #  harness 注入的伪 user 消息（收尾/nudge/plan mode），压缩时不算"用户原话"。
             #  plan mode 进场说明是按会话格式化的（含 plan 文件路径），追加实文
             synthetic_user_texts=SYNTHETIC_USER_TEXTS | {self._plan_enter_note},
+            #  压缩后附当前计划原文：update_plan 调用落进被压区也不丢逐字状态。
+            #  惰性取值——self.plan 在后面才初始化，且随 update_plan 整体替换
+            plan_provider=lambda: self.plan,
         )
         #  子 agent 不再挂 explore，避免无限套娃
         #  嵌套闸（与 allow_explore 解耦）：allow_explore 管 explore/new_context 这类
@@ -2692,8 +2699,21 @@ class Agent:
                     media.text_part(f"[上一步的工具返回了 {count} 张图片，如下]"),
                     *parts,
                 ],
+                #  工具图标记：老化只动它，用户贴的图不动（出网前被摘掉）
+                media.TOOL_MEDIA_KEY: True,
             }
         )
+        #  截图循环不等压缩阈值：图按固定 token 估算，请求体可能先于估算撞上限。
+        #  批量老化（见 age_tool_images），未过高水位时历史原样不动、缓存不断
+        self.messages, aged = age_tool_images(self.messages)
+        if aged:
+            self._history_rewritten()
+            self.sink.emit(
+                Notice(
+                    f"[工具截图超过 {TOOL_IMAGE_HIGH_WATER} 张，较早的 {aged} 张已换成文字占位"
+                    f"（保留最新 {TOOL_IMAGE_KEEP} 张）]"
+                )
+            )
 
     # ---------- 上下文管理 ----------
 
@@ -2973,9 +2993,10 @@ class Agent:
                         response.usage.completion_tokens or 0,
                     )
                 content = response.choices[0].message.content or ""
-                if not is_degenerate_summary(content):
+                if not self._summary_truncated(response) and not is_degenerate_summary(content):
                     return content
-                #  重放姿势退化（比如模型执意调工具）：掉回转写姿势再试本路由
+                #  重放姿势退化（比如模型执意调工具）或被截断：掉回转写姿势再试本路由
+                #  ——转写输入更短，要交接的内容少了，输出也更可能落在上限之内
         prompt = f"{SUMMARY_INSTRUCTION}\n\n---\n\n{transcript}"
         response = route.client.chat.completions.create(
             model=route.model,
@@ -2988,7 +3009,20 @@ class Agent:
                 response.usage.prompt_tokens or 0,
                 response.usage.completion_tokens or 0,
             )
-        return response.choices[0].message.content or ""
+        content = response.choices[0].message.content or ""
+        if self._summary_truncated(response):
+            #  半截摘要再长也不能当成功（见 TruncatedSummary）：抛给 _summarize 换路由
+            raise TruncatedSummary(
+                f"{route.qualified} 的摘要撞输出上限被截断（已产出 {len(content)} 字符）"
+            )
+        return content
+
+    @staticmethod
+    def _summary_truncated(response: Any) -> bool:
+        """非流式响应是否撞了输出上限。三种协议都已归一成 finish_reason=length
+        （Messages 的 max_tokens、Responses 的 incomplete: max_output_tokens）。"""
+        choices = getattr(response, "choices", None) or []
+        return bool(choices) and getattr(choices[0], "finish_reason", None) == "length"
 
     def _summarize(self, transcript: str, prefix: list[dict[str, Any]] | None = None) -> str:
         """让模型把早期对话总结成交接说明。不带工具调用、不流式。
@@ -3002,6 +3036,12 @@ class Agent:
         for route in self.summary_models():
             try:
                 content = self._summary_call(route, transcript, prefix or [])
+            except TruncatedSummary as exc:
+                last_error = exc
+                self.sink.emit(
+                    Notice(f"  摘要模型 {route.qualified} 输出被截断（半截摘要不落盘），回退下一个")
+                )
+                continue
             except Exception as exc:  # noqa: BLE001 - 换下一个模型再试
                 last_error = exc
                 self.sink.emit(
@@ -3353,6 +3393,7 @@ class Agent:
         self.sink.emit(RequestStarted(route.model))
         self._content_filtered = False
         self._length_truncated = False
+        self._stream_finished = False
         try:
             stream = route.client.chat.completions.create(**request)
             self._consume_stream(route, stream, content_parts, pending, reasoning)
@@ -3378,6 +3419,20 @@ class Agent:
             if content_parts:
                 self.sink.emit(TextEnd())
             self.sink.emit(RequestEnded())
+
+        if not self._stream_finished:
+            #  流结束了却没有任何收尾信号（finish_reason / usage 都没见到），而某个
+            #  工具调用的 arguments 不是合法 JSON：这是断流拦腰截断，不是模型写坏了。
+            #  执行只会白费一步，抛给 _stream_retrying 按瞬时错误退避重发。
+            #  纯文本断流、完整参数的调用不在此列（前者保持现状，后者照常执行）
+            for call in pending.values():
+                try:
+                    json.loads(call["function"]["arguments"] or "{}")
+                except json.JSONDecodeError:
+                    raise errors.StreamTruncated(
+                        f"{route.qualified} 的流在工具调用 {call['function']['name'] or '?'} "
+                        "的参数写到一半时结束，没有收尾信号"
+                    ) from None
 
         if self._content_filtered:
             if not content_parts and not pending:
@@ -3487,6 +3542,28 @@ class Agent:
         reasoning: list[dict[str, Any]],
     ) -> None:
         """逐 chunk 消费流式响应，把正文和 tool_call 分片攒进传入的容器。"""
+        #  arguments 分片先进 list、流结束时一次 join：写大文件时参数被切成上万片，
+        #  挂在 dict 里的字符串 += 享受不到原地拼接优化，是 O(n²)。join 放 finally：
+        #  中断/异常路径上 pending 也保持"arguments 是完整字符串"的形状，
+        #  调用方任何一条路径读到的都与逐片 += 一致
+        arg_parts: dict[int, list[str]] = {}
+        try:
+            self._consume_chunks(route, stream, content_parts, pending, reasoning, arg_parts)
+        finally:
+            for index, parts in arg_parts.items():
+                function = pending[index]["function"]
+                function["arguments"] = function["arguments"] + "".join(parts)
+
+    def _consume_chunks(
+        self,
+        route: Route,
+        stream: Any,
+        content_parts: list[str],
+        pending: dict[int, dict[str, Any]],
+        reasoning: list[dict[str, Any]],
+        arg_parts: dict[int, list[str]],
+    ) -> None:
+        """_consume_stream 的逐 chunk 循环体；arguments 分片攒进 arg_parts。"""
         #  无 index 分片归组用：最近写过的一格。不能用 max(pending) 代替——
         #  编号最大 ≠ 最近在写（带 id 的分片可以把写入点拉回旧格），续错格
         #  就是把 arguments 拼成一坨坏 JSON
@@ -3499,6 +3576,9 @@ class Agent:
                 self._interrupt_flag.clear()
                 raise Interrupted("宿主请求打断")
             if getattr(chunk, "usage", None):
+                #  收到 usage 即视为正常收尾：有些端点不发 finish_reason，只在
+                #  最后给一个纯 usage chunk（断流判定见 _stream_once）
+                self._stream_finished = True
                 prompt_tokens = chunk.usage.prompt_tokens or 0
                 self.usage.add(
                     route.qualified,
@@ -3534,6 +3614,8 @@ class Agent:
             #  收尾原因认两种：内容过滤决定这次"空补全"是拒答还是断流；length 说明
             #  输出撞了长度上限，最后一个工具调用多半被拦腰截断
             finish = getattr(chunk.choices[0], "finish_reason", None)
+            if finish:
+                self._stream_finished = True
             if finish == "content_filter":
                 self._content_filtered = True
             elif finish == "length":
@@ -3580,11 +3662,12 @@ class Agent:
                     slot["_extra_content"] = extra
                 if fragment.function is None:
                     continue
-                #  name 各家都是一次给全，先到先得；arguments 一定是分片累加。
+                #  name 各家都是一次给全，先到先得；arguments 一定是分片累加
+                #  （攒进 arg_parts，由 _consume_stream 收尾 join）。
                 if fragment.function.name and not slot["function"]["name"]:
                     slot["function"]["name"] = fragment.function.name
                 if fragment.function.arguments:
-                    slot["function"]["arguments"] += fragment.function.arguments
+                    arg_parts.setdefault(index, []).append(fragment.function.arguments)
 
     # ---------- 工具执行 ----------
 
