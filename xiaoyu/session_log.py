@@ -474,10 +474,10 @@ class SessionLog:
                 for record in records:
                     handle.write(json.dumps(record, ensure_ascii=False) + "\n")
         except OSError:
-                #  磁盘满/权限问题不能影响会话，停写即可；写不进去的句柄也没理由占着锁
-                self._broken = True
-                if self._lock_finalizer is not None:
-                    self._lock_finalizer()
+            #  磁盘满/权限问题不能影响会话，停写即可；写不进去的句柄也没理由占着锁
+            self._broken = True
+            if self._lock_finalizer is not None:
+                self._lock_finalizer()
 
 
 # ---------- 退出事件：进程级钩子 ----------
