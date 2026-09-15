@@ -176,6 +176,67 @@ class SplitLinesTest(unittest.TestCase):
         self.assertIn("单行过长已截断", lines[0])
 
 
+class ReadNewTest(unittest.TestCase):
+    """日志按字节偏移增量读：多字节字符横跨读块边界不能被切成 �。"""
+
+    def setUp(self):
+        import tempfile
+
+        self.tmp = tempfile.TemporaryDirectory()
+        self.path = Path(self.tmp.name) / "log.txt"
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def _drain(self, chunk: int, flush_last: bool = False) -> str:
+        """按小块反复读到文件尾，拼出全部文本。"""
+        offset, out = 0, ""
+        size = self.path.stat().st_size
+        for _ in range(size * 2 + 4):
+            text, offset = bg.TaskManager._read_new(self.path, offset, chunk=chunk)
+            out += text
+            if offset >= size:
+                break
+        return out
+
+    def test_multibyte_char_across_read_boundary(self):
+        # 汉字 3 字节；块长 4 让"文""输""出"都被切在块中间
+        content = "a中文输出b\n"
+        self.path.write_bytes(content.encode("utf-8"))
+        out = self._drain(chunk=4)
+        self.assertNotIn("�", out)
+        self.assertEqual(out, content)
+
+    def test_partial_tail_waits_for_next_poll(self):
+        data = "中".encode("utf-8")
+        self.path.write_bytes(data[:2])
+        text, offset = bg.TaskManager._read_new(self.path, 0)
+        #  进程还在跑：残缺尾巴留到下次，偏移不越过它
+        self.assertEqual((text, offset), ("", 0))
+        self.path.write_bytes(data + b"\n")
+        text, offset = bg.TaskManager._read_new(self.path, offset)
+        self.assertEqual((text, offset), ("中\n", 4))
+
+    def test_flush_decodes_everything(self):
+        data = "中".encode("utf-8")
+        self.path.write_bytes(data[:2])
+        text, offset = bg.TaskManager._read_new(self.path, 0, flush=True)
+        #  进程已结束的最后一读：残缺字节再也等不来后半截，照有损解码交出去
+        self.assertEqual(offset, 2)
+        self.assertEqual(text, "�")
+
+    def test_ascii_and_garbage_unchanged(self):
+        self.path.write_bytes(b"plain ascii\n")
+        self.assertEqual(
+            bg.TaskManager._read_new(self.path, 0), ("plain ascii\n", 12)
+        )
+        #  尾部三个孤立续字节不是"未完成序列"，照常推进，绝不卡在原地
+        self.path.write_bytes(b"x\x80\x80\x80")
+        text, offset = bg.TaskManager._read_new(self.path, 0)
+        self.assertEqual(offset, 4)
+        self.assertTrue(text.startswith("x"))
+
+
 @unittest.skipUnless(POSIX, "用例依赖 POSIX shell")
 class ToolboxBackgroundTest(unittest.TestCase):
     def setUp(self):

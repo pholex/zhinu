@@ -183,6 +183,68 @@ class PollerTest(unittest.TestCase):
             os.close(slave)
             os.close(master)
 
+    def _start_on_pipe(self) -> tuple[_FakeSteerTarget, int]:
+        """用 os.pipe 冒充 stdin 起轮询线程，返回 (插话收集器, 写端)。"""
+        import threading
+
+        from xiaoyu import tui
+
+        read_fd, write_fd = os.pipe()
+        target = _FakeSteerTarget()
+        patcher = mock.patch.object(
+            tui.sys, "stdin", mock.Mock(fileno=lambda: read_fd, isatty=lambda: True)
+        )
+        patcher.start()
+        poller = tui.SteerPoller(target)  # type: ignore[arg-type]
+        thread = threading.Thread(target=poller._loop, daemon=True)
+        thread.start()
+
+        def cleanup() -> None:
+            poller._stop.set()
+            #  关写端 → 读端 EOF，线程立刻收工
+            try:
+                os.close(write_fd)
+            except OSError:
+                pass
+            thread.join(timeout=2.0)
+            patcher.stop()
+            os.close(read_fd)
+
+        self.addCleanup(cleanup)
+        return target, write_fd
+
+    @staticmethod
+    def _wait_lines(target: _FakeSteerTarget, count: int, timeout: float = 5.0) -> None:
+        deadline = time.monotonic() + timeout
+        while len(target.lines) < count and time.monotonic() < deadline:
+            time.sleep(0.01)
+
+    def test_burst_of_lines_becomes_one_steer(self):
+        """粘贴多行：规范模式下逐行到达，窗口内连着来的合并成一条插话。"""
+        from xiaoyu import tui
+
+        #  窗口放大到 0.5s，行间 20ms 的间隔在繁忙机器上也稳落在窗口内
+        with mock.patch.object(tui.SteerPoller, "_PASTE_WINDOW", 0.5):
+            target, write_fd = self._start_on_pipe()
+            for line in ("第一行", "", "第三行"):
+                os.write(write_fd, f"{line}\n".encode())
+                time.sleep(0.02)
+            self._wait_lines(target, 1)
+            self.assertEqual(target.lines, ["第一行\n\n第三行"])
+
+    def test_lines_apart_beyond_window_stay_separate(self):
+        from xiaoyu import tui
+
+        with mock.patch.object(tui.SteerPoller, "_PASTE_WINDOW", 0.05):
+            target, write_fd = self._start_on_pipe()
+            os.write(write_fd, "先跑测试\n".encode())
+            self._wait_lines(target, 1)
+            #  间隔远大于窗口：用户分两次说的话仍是两条
+            time.sleep(0.3)
+            os.write(write_fd, "再改文档\n".encode())
+            self._wait_lines(target, 2)
+            self.assertEqual(target.lines, ["先跑测试", "再改文档"])
+
     def test_not_supported_without_tty(self):
         from xiaoyu import tui
 

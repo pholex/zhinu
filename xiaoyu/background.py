@@ -282,7 +282,7 @@ class TaskManager:
         limiter = _RateLimiter()
         while True:
             finished = task.done.is_set()
-            chunk, offset = self._read_new(task.log_path, offset)
+            chunk, offset = self._read_new(task.log_path, offset, flush=finished)
             pending += chunk
             lines, pending = self._split_lines(pending, flush=finished)
             if lines and self.notify is not None:
@@ -312,13 +312,24 @@ class TaskManager:
             time.sleep(_POLL_SECONDS)
 
     @staticmethod
-    def _read_new(path: Path, offset: int) -> tuple[str, int]:
+    def _read_new(
+        path: Path, offset: int, flush: bool = False, chunk: int = 1_048_576
+    ) -> tuple[str, int]:
+        """从 offset 读一块新字节解码；偏移只推进到完整 UTF-8 字符边界。
+
+        按字节块读，中文这类多字节字符很容易横跨读块或两次轮询的边界，
+        直接 errors="replace" 会把它切成 �。尾部未完成的序列留到下次再读；
+        flush=True（进程已结束的最后一读）后半截再也等不来，照有损解码全部交出。
+        """
         try:
             with path.open("rb") as handle:
                 handle.seek(offset)
-                data = handle.read(1_048_576)
+                #  块长至少 4：装得下最长的 UTF-8 字符，否则尾巴永远收不齐、偏移原地踏步
+                data = handle.read(max(4, chunk))
         except OSError:
             return "", offset
+        if not flush:
+            data = data[: len(data) - _incomplete_utf8_tail(data)]
         return data.decode("utf-8", errors="replace"), offset + len(data)
 
     @staticmethod
@@ -399,6 +410,29 @@ class TaskManager:
             #  留给下次启动清扫
             tempdirs.discard(self._log_dir)
             self._log_dir = None
+
+
+def _incomplete_utf8_tail(data: bytes) -> int:
+    """data 尾部未完成的 UTF-8 序列字节数（0~3）。
+
+    只认合法形态：从尾部往回最多看 3 个字节，跳过续字节（10xxxxxx）找到
+    前导字节，它声明的长度比实际拿到的多才算"没收齐"。ASCII、孤立续字节、
+    非法前导一律返回 0——垃圾字节照常推进交给有损解码，绝不卡住偏移。
+    """
+    for back in range(1, min(3, len(data)) + 1):
+        byte = data[-back]
+        if 0x80 <= byte <= 0xBF:
+            continue
+        if 0xC2 <= byte <= 0xDF:
+            need = 2
+        elif 0xE0 <= byte <= 0xEF:
+            need = 3
+        elif 0xF0 <= byte <= 0xF4:
+            need = 4
+        else:
+            return 0
+        return back if need > back else 0
+    return 0
 
 
 def _sanitize(description: str) -> str:
