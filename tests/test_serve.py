@@ -762,6 +762,35 @@ class TestOpenApi(ServeCase):
             print_openapi(cfg)
         self.assertIn("--public-url", err.getvalue())
 
+    def test_live_openapi_servers_follow_public_url(self):
+        """--public-url 起服务时，运行中的 /openapi.json 也要带 servers。
+
+        之前它只作用于 --print-openapi：反代后面起着的服务 schema 里没有 base URL，
+        Dify 按 URL 导入发不出请求，而 systemd 里写的 --public-url 静默无效。"""
+        client = self.start("text: 无所谓\n", public_url="https://agent.example.com")
+        schema = client.get("/openapi.json").json()
+        self.assertEqual(schema["servers"][0]["url"], "https://agent.example.com")
+
+    def test_live_openapi_without_public_url_has_no_servers(self):
+        #  不设就保持 FastAPI 默认：/docs 同源调试不能被一个猜出来的地址带偏
+        client = self.start("text: 无所谓\n")
+        self.assertNotIn("servers", client.get("/openapi.json").json())
+
+    def test_print_openapi_uses_config_public_url(self):
+        #  CLI 只把 --public-url 放进 ServeConfig；导出路径得认它，且不再打回环提示
+        from xiaoyu.serve import ServeConfig, print_openapi
+
+        import contextlib
+        import io
+        import json as _json
+
+        cfg = ServeConfig(root=self.root, public_url="https://agent.example.com")
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            self.assertEqual(print_openapi(cfg), 0)
+        self.assertEqual(_json.loads(out.getvalue())["servers"][0]["url"], "https://agent.example.com")
+        self.assertNotIn("--public-url", err.getvalue())
+
 
 if __name__ == "__main__":
     unittest.main()
