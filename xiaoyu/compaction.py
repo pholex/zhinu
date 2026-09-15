@@ -173,7 +173,63 @@ def microcompact(
         result.append({**message, "content": stub})
         cleared += 1
         saved += len(content) - len(stub)
-    return result, cleared, saved
+    #  工具截图批量老化同属这一层（不花模型调用、可重新获取），且不受 keep_recent 保护
+    result, aged = age_tool_images(result)
+    return result, cleared + aged, saved
+
+
+# ---------- 工具截图批量老化 ----------
+
+#  工具回图（截图循环）数超过高水位时，一次性剔到只剩最新 TOOL_IMAGE_KEEP 张。
+#  为什么要老化：图片按引用存在历史里，出网前每次都展开成完整 base64——旧截图
+#  会随每一次请求重复上传，直到撞请求体上限；留在 keep_recent 尾部的图又让摘要
+#  压缩收效甚微、触发 ineffective 熔断，自动压缩就此停摆。
+#  为什么是批量而不是逐张：每剔一张，prompt 缓存就从被剔处断开；来一张剔一张
+#  等于每轮都断。高水位 6 / 保留 3 = 每攒 4 张才断一次缓存。保留 3 张够看
+#  "操作前 / 操作后 / 最新"的对比，更早的截图对当前一步几乎没有信息量——
+#  真需要时重新截一张比一路扛着便宜。
+TOOL_IMAGE_HIGH_WATER = 6
+TOOL_IMAGE_KEEP = 3
+
+_AGED_IMAGE_TEXT = "[较早的工具截图已移除以节省上下文。若还需要看当时的画面，请重新截图]"
+
+
+def age_tool_images(
+    messages: list[dict[str, Any]],
+    high_water: int = TOOL_IMAGE_HIGH_WATER,
+    keep: int = TOOL_IMAGE_KEEP,
+) -> tuple[list[dict[str, Any]], int]:
+    """工具回图超过高水位时，把最新 keep 张之外的换成文字占位。返回 (新消息列表, 老化张数)。
+
+    只认带 media.TOOL_MEDIA_KEY 标记的消息——用户贴的图永不老化，也不计入水位。
+    未超水位原样返回同一个列表（不拷贝）：调用方据此判断历史没被改写。
+    只换部件、不删消息，tool_calls 配对与角色交替都不受影响。
+    """
+    positions = [
+        (index, offset)
+        for index, message in enumerate(messages)
+        if message.get(media.TOOL_MEDIA_KEY) and media.is_parts(message.get("content"))
+        for offset, part in enumerate(message["content"])
+        if isinstance(part, dict) and part.get("type") == media.IMAGE_PART
+    ]
+    if len(positions) <= high_water:
+        return messages, 0
+    doomed = set(positions[: len(positions) - keep]) if keep > 0 else set(positions)
+    touched = {index for index, _ in doomed}
+    result: list[dict[str, Any]] = []
+    for index, message in enumerate(messages):
+        if index not in touched:
+            result.append(message)
+            continue
+        parts: list[dict[str, Any]] = []
+        for offset, part in enumerate(message["content"]):
+            if (index, offset) not in doomed:
+                parts.append(part)
+            elif not (parts and parts[-1].get("text") == _AGED_IMAGE_TEXT):
+                #  同一条里连着的几张只留一句占位
+                parts.append(media.text_part(_AGED_IMAGE_TEXT))
+        result.append({**message, "content": parts})
+    return result, len(doomed)
 
 
 # ---------- 机械锚点索引（摘要旁的逐字标识符备份） ----------
@@ -531,6 +587,13 @@ def merge_consecutive_users(messages: list[dict[str, Any]]) -> list[dict[str, An
                 "role": "user",
                 "content": _joined(previous.get("content"), message.get("content")),
             }
+            #  工具图标记只在"合并后所有图都是工具图"时保留：混进用户贴图就整条
+            #  不再老化（宁可少剔，不可误剔用户原话）
+            with_images = [
+                side for side in (previous, message) if media.images_of(side.get("content"))
+            ]
+            if with_images and all(side.get(media.TOOL_MEDIA_KEY) for side in with_images):
+                merged[-1][media.TOOL_MEDIA_KEY] = True
             continue
         merged.append(message)
     return merged

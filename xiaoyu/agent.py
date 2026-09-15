@@ -35,8 +35,11 @@ from .compaction import (
     MIN_SUMMARY_CHARS,
     PREFIX_SUMMARY_INSTRUCTION,
     SUMMARY_INSTRUCTION,
+    TOOL_IMAGE_HIGH_WATER,
+    TOOL_IMAGE_KEEP,
     Compactor,
     TruncatedSummary,
+    age_tool_images,
     is_degenerate_summary,
     microcompact,
 )
@@ -2693,8 +2696,21 @@ class Agent:
                     media.text_part(f"[上一步的工具返回了 {count} 张图片，如下]"),
                     *parts,
                 ],
+                #  工具图标记：老化只动它，用户贴的图不动（出网前被摘掉）
+                media.TOOL_MEDIA_KEY: True,
             }
         )
+        #  截图循环不等压缩阈值：图按固定 token 估算，请求体可能先于估算撞上限。
+        #  批量老化（见 age_tool_images），未过高水位时历史原样不动、缓存不断
+        self.messages, aged = age_tool_images(self.messages)
+        if aged:
+            self._history_rewritten()
+            self.sink.emit(
+                Notice(
+                    f"[工具截图超过 {TOOL_IMAGE_HIGH_WATER} 张，较早的 {aged} 张已换成文字占位"
+                    f"（保留最新 {TOOL_IMAGE_KEEP} 张）]"
+                )
+            )
 
     # ---------- 上下文管理 ----------
 
