@@ -115,6 +115,44 @@ _WINDOWS = os.name == "nt"
 _PID_WIDTH = 20
 
 
+#  会话文件与目录的权限：JSONL 里有工具输出，可能带着密钥——POSIX 上仅本人可读写。
+#  umask 只会再收紧、不会放宽，所以创建时直接给 0600 / 0700 即可生效；
+#  Windows 上 mode 参数与 chmod 基本无语义，失败一律忽略（与用户级 .env 同一纪律）。
+_FILE_MODE = 0o600
+_DIR_MODE = 0o700
+
+
+def _ensure_private_dir(directory: Path) -> None:
+    """建会话目录：本进程新建出来的每一层都给 0700。
+
+    已存在的层不动——可能是嵌入宿主显式传的目录，替宿主改权限是越界。
+    建不出来原样抛 OSError，由写入端的停写兜底。
+    """
+    missing: list[Path] = []
+    probe = directory
+    while not probe.exists() and probe.parent != probe:
+        missing.append(probe)
+        probe = probe.parent
+    for level in reversed(missing):
+        #  并发创建（两个会话同时首写同一工作区子目录）：别人先建了就用别人的
+        with contextlib.suppress(FileExistsError):
+            level.mkdir(mode=_DIR_MODE)
+
+
+def _open_private(path: Path, flags: int) -> int:
+    """按 0600 打开（不存在即创建）会话相关文件，返回 fd。
+
+    已存在但权限比 0600 宽的（旧版本按 umask 建出来的 0644）顺手收紧；
+    收紧失败（文件不归本 uid 等）不影响写入。
+    """
+    fd = os.open(path, flags | os.O_CREAT | getattr(os, "O_BINARY", 0), _FILE_MODE)
+    if not _WINDOWS:
+        with contextlib.suppress(OSError):
+            if os.fstat(fd).st_mode & 0o077:
+                os.fchmod(fd, _FILE_MODE)
+    return fd
+
+
 def lock_path(path: Path) -> Path:
     """会话文件对应的锁文件：`<名字>.jsonl.lock`（不匹配 `*.jsonl`，列举不受影响）。"""
     return path.with_name(path.name + ".lock")
@@ -219,9 +257,15 @@ class SessionLog:
     - 进程死亡：内核放锁。
     放锁之后的写入一律丢弃：锁一放别的进程随时可能接手，迟到的记录不能再落进去。
     子 agent（explore / 委托）不落盘，不持锁。
+
+    defer=True（只经 create 使用）= 延迟落盘：meta 先攒在内存里，锁文件与日志
+    文件都不建，直到第一条真正的记录（消息、模型/模式切换等任何非 exit 事件）
+    到来才抢锁、连同 meta 一起写出；也可 materialize() 显式落盘。什么都没发生
+    就 close 的会话不在盘上留任何东西——ACP client 定时 initialize + session/new
+    探测模型列表，不延迟的话一台机器会攒下成百个只有 meta 的空壳会话。
     """
 
-    def __init__(self, path: Path) -> None:
+    def __init__(self, path: Path, *, defer: bool = False) -> None:
         self.path = path
         self._broken = False
         self._closed = False
@@ -229,6 +273,8 @@ class SessionLog:
         self._mutex = threading.Lock()
         self._released = False
         self._lock_finalizer: weakref.finalize | None = None
+        #  延迟落盘期间攒着的记录；None = 已落盘（或从未延迟）
+        self._pending: list[dict[str, Any]] | None = [] if defer else None
         self.acquire()
 
     def acquire(self) -> None:
@@ -236,34 +282,61 @@ class SessionLog:
 
         抢不到抛 SessionLockedError。锁文件建不出来、或文件系统不支持加锁（部分
         网络盘）时**无锁降级**照常写：锁是防交错的护栏，不是写日志的前提——
-        与"写失败绝不影响会话"同一纪律。
+        与"写失败绝不影响会话"同一纪律。延迟落盘还没落的句柄不抢锁，
+        等真正落盘时再抢。
         """
         with self._mutex:
-            if self._lock_finalizer is not None and self._lock_finalizer.alive:
-                return
-            lock = lock_path(self.path)
-            try:
-                lock.parent.mkdir(parents=True, exist_ok=True)
-                fd = os.open(lock, os.O_RDWR | os.O_CREAT | getattr(os, "O_BINARY", 0), 0o644)
-            except OSError:
+            if self._pending is not None:
                 self._released = False
                 return
-            try:
-                locked = _try_lock(fd)
-            except OSError:
-                os.close(fd)
-                self._released = False
+            if not self._acquire_locked():
                 return
-            if not locked:
-                os.close(fd)
-                raise SessionLockedError(self.path, _holder_pid(lock))
-            with contextlib.suppress(OSError):
-                _write_pid(fd, os.getpid())
-            self._lock_finalizer = weakref.finalize(self, _release_lock_fd, fd)
-            #  进程退出时不必跑：内核会放锁；跑了反而可能抢在 atexit 的 exit 事件之前
-            self._lock_finalizer.atexit = False
-            self._released = False
         self._seal_torn_tail()
+
+    def _acquire_locked(self) -> bool:
+        """持 _mutex 调用。返回 True = 本次新拿到了锁（调用方该补崩溃尾巴）；
+        早已持有、或无锁降级回 False。抢不到抛 SessionLockedError。"""
+        if self._lock_finalizer is not None and self._lock_finalizer.alive:
+            return False
+        lock = lock_path(self.path)
+        try:
+            _ensure_private_dir(lock.parent)
+            fd = _open_private(lock, os.O_RDWR)
+        except OSError:
+            self._released = False
+            return False
+        try:
+            locked = _try_lock(fd)
+        except OSError:
+            os.close(fd)
+            self._released = False
+            return False
+        if not locked:
+            os.close(fd)
+            raise SessionLockedError(self.path, _holder_pid(lock))
+        with contextlib.suppress(OSError):
+            _write_pid(fd, os.getpid())
+        self._lock_finalizer = weakref.finalize(self, _release_lock_fd, fd)
+        #  进程退出时不必跑：内核会放锁；跑了反而可能抢在 atexit 的 exit 事件之前
+        self._lock_finalizer.atexit = False
+        self._released = False
+        return True
+
+    @property
+    def materialized(self) -> bool:
+        """会话文件是否已经（或将按常规）落盘；延迟落盘还没落时为 False。"""
+        return self._pending is None
+
+    def materialize(self) -> None:
+        """延迟落盘的会话立即落盘（已落盘、已放锁或已停写时什么都不做）。
+
+        给"客户端还没发 prompt 就要按 id 找回文件"的路径用——例如 ACP 同进程
+        session/new 之后紧接着 session/load 同一个 id：load 靠 find_named 找文件。
+        """
+        with self._mutex:
+            if self._pending is None or self._broken or self._released:
+                return
+            self._materialize_locked()
 
     def release(self) -> None:
         """放掉写锁并停写（幂等），不写 exit 事件。"""
@@ -287,8 +360,11 @@ class SessionLog:
                 handle.seek(-1, os.SEEK_END)
                 if handle.read(1) == b"\n":
                     return
-            with self.path.open("ab") as handle:
-                handle.write(b"\n")
+            fd = _open_private(self.path, os.O_WRONLY | os.O_APPEND)
+            try:
+                os.write(fd, b"\n")
+            finally:
+                os.close(fd)
         except OSError:
             return  # 新会话（文件还不存在）或读写不了：交给 _write 的停写兜底
         self.event("torn_tail")
@@ -300,6 +376,8 @@ class SessionLog:
         workspace: str,
         directory: Path | None = None,
         session_id: str = "",
+        *,
+        defer: bool = False,
     ) -> "SessionLog":
         """directory 缺省时按工作区分子目录；嵌入宿主显式传目录即可完全隔离
         （常驻宿主的会话不再与 CLI 手动会话混在一起）。
@@ -307,22 +385,31 @@ class SessionLog:
         session_id 非空 = 命名会话（`--session-id`）：名字进文件名也进 meta。
         进文件名是为了免读文件就能定位，进 meta 是因为文件名的 `-id-` 段会被
         名字里的 `-id-` 骗到（`a-id-b` 与 `b`），最终认定以 meta 为准。
+
+        defer=True = 延迟落盘（见类 docstring）：文件名与 started_at 仍取创建
+        时刻，只是第一条真正的记录到来之前盘上什么都没有。
         """
         stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
         if directory is None:
             directory = sessions_dir() / _workspace_slug(workspace)
         mark = f"{_NAMED_MARK}{session_id}" if session_id else ""
-        log = cls(directory / f"{stamp}-{os.getpid()}{mark}.jsonl")
+        log = cls(directory / f"{stamp}-{os.getpid()}{mark}.jsonl", defer=defer)
         fields: dict[str, Any] = {"session_id": session_id} if session_id else {}
-        log.event(
-            "meta",
-            format=SESSION_FORMAT,
-            version=__version__,
-            model=model,
-            workspace=workspace,
-            started_at=datetime.now().isoformat(timespec="seconds"),
+        meta = {
+            "ts": cls._now(),
+            "event": "meta",
+            "format": SESSION_FORMAT,
+            "version": __version__,
+            "model": model,
+            "workspace": workspace,
+            "started_at": datetime.now().isoformat(timespec="seconds"),
             **fields,
-        )
+        }
+        if log._pending is not None:
+            #  meta 本身不算"发生过什么"：只攒着，不触发落盘
+            log._pending.append(meta)
+        else:
+            log._write(meta)
         return log
 
     def append(self, message: dict[str, Any]) -> None:
@@ -352,11 +439,41 @@ class SessionLog:
         with self._mutex:
             if self._broken or self._released:
                 return
+            if self._pending is not None:
+                if record.get("event") == "exit":
+                    #  空壳会话收尾：什么都没发生过，exit 也不落，盘上不留痕
+                    return
+                self._pending.append(record)
+                self._materialize_locked()
+                return
+            self._append_locked([record])
+
+    def _materialize_locked(self) -> None:
+        """持 _mutex 调用：抢锁并把攒着的记录按原顺序写出。"""
+        records, self._pending = self._pending or [], None
+        try:
+            self._acquire_locked()
+        except SessionLockedError:
+            #  名字带新造的 uuid / 时间戳 + pid，理论上撞不上；真撞上了宁可停写，
+            #  也不和另一个写者交错写坏同一个文件
+            self._broken = True
+            return
+        self._append_locked(records)
+
+    def _append_locked(self, records: list[dict[str, Any]]) -> None:
+        """持 _mutex 调用：追加若干条记录；失败即停写并放锁。"""
+        try:
+            _ensure_private_dir(self.path.parent)
+            fd = _open_private(self.path, os.O_WRONLY | os.O_APPEND)
             try:
-                self.path.parent.mkdir(parents=True, exist_ok=True)
-                with self.path.open("a", encoding="utf-8") as handle:
+                handle = os.fdopen(fd, "a", encoding="utf-8")
+            except BaseException:
+                os.close(fd)
+                raise
+            with handle:
+                for record in records:
                     handle.write(json.dumps(record, ensure_ascii=False) + "\n")
-            except OSError:
+        except OSError:
                 #  磁盘满/权限问题不能影响会话，停写即可；写不进去的句柄也没理由占着锁
                 self._broken = True
                 if self._lock_finalizer is not None:

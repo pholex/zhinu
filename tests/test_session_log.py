@@ -152,6 +152,92 @@ class SessionLogTest(SessionDirTestCase):
         self.assertEqual(lines[2]["event"], "clear")
 
 
+@unittest.skipIf(os.name == "nt", "Windows 上 POSIX 权限位无语义")
+class SessionFilePermissionTest(SessionDirTestCase):
+    """会话 JSONL 含工具输出、可能带密钥：文件 0600、自建目录 0700。"""
+
+    @staticmethod
+    def mode(path: Path) -> int:
+        return path.stat().st_mode & 0o777
+
+    def test_new_session_file_and_dirs_are_owner_only(self):
+        log = SessionLog.create("m", "/ws/perm")
+        self.addCleanup(log.release)
+        self.assertEqual(self.mode(log.path), 0o600)
+        self.assertEqual(self.mode(lock_path(log.path)), 0o600)
+        #  xiaoyu 自己建出来的每一层目录都是 0700
+        self.assertEqual(self.mode(log.path.parent), 0o700)
+        self.assertEqual(self.mode(sessions_dir()), 0o700)
+
+    def test_existing_wide_file_tightened_on_append(self):
+        directory = sessions_dir() / "-ws-old"
+        directory.mkdir(parents=True)
+        path = directory / "19990101-000000-1.jsonl"
+        path.write_text(json.dumps({"event": "meta", "workspace": "/ws/old"}) + "\n", encoding="utf-8")
+        os.chmod(path, 0o644)
+        log = SessionLog(path)
+        self.addCleanup(log.release)
+        log.append({"role": "user", "content": "hi"})
+        self.assertEqual(self.mode(path), 0o600)
+        self.assertEqual(self.read_lines(log)[-1]["content"], "hi")
+
+    def test_host_directory_permissions_untouched(self):
+        """宿主显式传的已存在目录不替它改权限，只管自己建的文件。"""
+        target = Path(self.tmp.name) / "host"
+        target.mkdir()
+        os.chmod(target, 0o755)
+        log = SessionLog.create("m", "/ws", directory=target)
+        self.addCleanup(log.release)
+        self.assertEqual(self.mode(target), 0o755)
+        self.assertEqual(self.mode(log.path), 0o600)
+
+
+class DeferredSessionTest(SessionDirTestCase):
+    """defer=True：什么都没发生的会话不在盘上留任何东西。"""
+
+    def test_empty_session_leaves_nothing_on_disk(self):
+        log = SessionLog.create("m", "/ws/probe", session_id="sess-probe", defer=True)
+        self.assertFalse(log.materialized)
+        self.assertFalse(log.path.exists())
+        self.assertFalse(lock_path(log.path).exists())
+        log.close()
+        #  exit 事件也不落：整个会话目录都不该被建出来
+        self.assertFalse(sessions_dir().exists())
+        self.assertEqual(list_sessions(workspace="/ws/probe"), [])
+
+    def test_first_record_materializes_with_meta_first(self):
+        log = SessionLog.create("m", "/ws/probe", session_id="sess-real", defer=True)
+        self.addCleanup(log.release)
+        log.event("mode", value="plan")
+        self.assertTrue(log.materialized)
+        lines = self.read_lines(log)
+        self.assertEqual([line.get("event") for line in lines], ["meta", "mode"])
+        self.assertEqual(lines[0]["session_id"], "sess-real")
+        #  落盘即持锁：另一个写句柄抢不到
+        with self.assertRaises(SessionLockedError):
+            SessionLog(log.path)
+        log.append({"role": "user", "content": "问题"})
+        (info,) = list_sessions(workspace="/ws/probe")
+        self.assertEqual(info.preview, "问题")
+
+    def test_explicit_materialize_then_close_records_exit(self):
+        log = SessionLog.create("m", "/ws/probe", defer=True)
+        log.materialize()
+        self.assertTrue(log.path.exists())
+        log.close()
+        self.assertEqual([line.get("event") for line in self.read_lines(log)], ["meta", "exit"])
+
+    def test_released_pending_session_can_be_reacquired(self):
+        log = SessionLog.create("m", "/ws/probe", defer=True)
+        log.release()
+        log.append({"role": "user", "content": "丢弃"})  # 放锁后的写入一律丢弃
+        self.assertFalse(log.path.exists())
+        log.acquire()
+        log.append({"role": "user", "content": "留下"})
+        self.addCleanup(log.release)
+        self.assertEqual(self.read_lines(log)[-1]["content"], "留下")
+
+
 class UsageDigestTest(SessionDirTestCase):
     """`xiaoyu sessions digest` 的地基：跨会话聚合轮末 usage 快照。"""
 

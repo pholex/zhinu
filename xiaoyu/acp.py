@@ -59,7 +59,10 @@ sink，不经协议层，所以不需要任何自定义扩展方法；可选能�
                                 要求，不能回 error——client 取消不是错误）。
     session/load                重开旧会话（Zed 重启后续聊的通道）。ACP sessionId
                                 直接当命名会话名落盘（session/new 即建名为
-                                sess-<hex> 的命名会话），load 时 find_named 定位
+                                sess-<hex> 的命名会话；延迟落盘，首条记录到来
+                                才建文件，只开会话不发 prompt 不留空壳——跨进程
+                                load 这种会话回 INVALID_PARAMS，同进程 load 先
+                                落盘再找回），load 时 find_named 定位
                                 同一文件、load_messages 重建 agent.messages
                                 （restore copy=False：续写原文件，不翻倍抄历史），
                                 并按规范把整段对话回放成 session/update 流
@@ -1050,8 +1053,11 @@ def build_agent_factory(
         history: list[dict[str, Any]] = []
         follow_mode = ""
         if create:
+            #  延迟落盘：有 client 每隔几十秒 initialize + session/new 探测模型
+            #  列表、从不发 prompt，立刻写 meta 的话一台机器攒下成百个空壳会话。
+            #  第一条真正的记录（prompt、切模型/模式）到来才建文件；空壳收尾不留痕
             session_log = SessionLog.create(
-                config.model, str(config.workspace), session_id=session_name
+                config.model, str(config.workspace), session_id=session_name, defer=True
             )
         else:
             try:
@@ -1383,6 +1389,9 @@ class AcpServer:
             return
         old_log = existing.agent.session_log if existing is not None else None
         if old_log is not None:
+            #  session/new 后还没发 prompt 就 load 同一个 id：延迟落盘的会话此刻
+            #  盘上还没有文件，find_named 找不到会误报"未知 sessionId"——先落盘
+            old_log.materialize()
             #  同进程重载：旧句柄马上被顶替，先让出写锁——锁按打开的文件描述算，
             #  不让的话新句柄会撞上本进程自己持有的锁。只放锁不写 exit：中段的
             #  exit 事件会破坏"末尾有没有 exit"的判据（见 install_exit_logging）

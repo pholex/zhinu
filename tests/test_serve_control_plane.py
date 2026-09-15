@@ -6,6 +6,8 @@
 
 from __future__ import annotations
 
+import os
+import tempfile
 import unittest
 from pathlib import Path
 from typing import Any
@@ -68,6 +70,16 @@ class TestSpendLogic(unittest.TestCase):
 
 
 @unittest.skipUnless(HAS_FASTAPI, "需要可选额外 [serve]（fastapi + uvicorn）")
+@unittest.skipIf(os.name == "nt", "Windows 上 POSIX 权限位无语义")
+class TestStateFilePermissions(unittest.TestCase):
+    def test_agent_record_is_owner_only(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = AgentStore(Path(tmp) / "agents")
+            record = store.create("a", {})
+            path = Path(tmp) / "agents" / f"{record['agent_id']}.json"
+            self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+
+
 class TestAgents(ServeCase):
     def create_agent(self, name: str = "a", **config: Any) -> dict[str, Any]:
         response = self.client.post(
