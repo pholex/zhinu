@@ -298,7 +298,11 @@ class HardenArgvTest(unittest.TestCase):
         from xiaoyu import gitsafe
 
         _, env = gitsafe.prepare(["status"], None, env={"GIT_CONFIG_COUNT": "abc"})
-        self.assertEqual(env["GIT_CONFIG_KEY_0"], "core.fsmonitor")
+        #  不断言 KEY_0 是哪一项：机器上 system/global 配了 safe.directory（CI runner
+        #  就有）时它会被转回、排在钉值前面。只验"从 0 起连续编号、计数合法"
+        self.assertTrue(env["GIT_CONFIG_COUNT"].isdigit())
+        keys = [env[f"GIT_CONFIG_KEY_{i}"] for i in range(int(env["GIT_CONFIG_COUNT"]))]
+        self.assertIn("core.fsmonitor", keys)
 
     def test_network_mode_keeps_user_config(self):
         from xiaoyu import gitsafe
