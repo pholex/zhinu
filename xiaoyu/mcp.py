@@ -27,10 +27,11 @@
   fetch+build 新一代，失败保留上一代原样继续服务；成功才整体 swap（原位替换 +
   删除 + 追加，顺序稳定）。代际间指纹变化的工具走 rug-pull 隔离（见 mcp_guard），
   /mcp approve 后换上新声明。
-- **断线自动重连**（预算按 outage 计）：进程意外退出后指数退避重连
-  （0.5s 起倍增至 30s），一次 outage 内最多 10 次；连接存活超过 30s 视为
-  outage 结束、预算重置。效果：偶发崩溃可无限恢复，崩溃循环（哪怕偶尔连上）
-  仍会耗尽上限整代下线。XIAOYU_MCP_RECONNECT=0 关闭。
+- **断线自动重连**（预算按 outage 计）：进程意外退出（HTTP：会话失效 / 连接
+  失败 / 中途断开）后指数退避重连（0.5s 起倍增至 30s），一次 outage 内最多
+  10 次；连接存活超过 30s 视为 outage 结束、预算重置。效果：偶发崩溃可无限
+  恢复，崩溃循环（哪怕偶尔连上）仍会耗尽上限整代下线。HTTP 认证被拒不重连、
+  直接停用；超时与 5xx 只报错不判死（分类见 McpError）。XIAOYU_MCP_RECONNECT=0 关闭。
 - **${env:VAR} 展开**：command/args/env 值里的 ${env:VAR}（兼容 ${VAR}）
   启动时替换成环境变量值。未定义的保留字面量原样：server 拿到
   明显错误的 ${FOO} 会报出清楚的错，拿到空串只会报玄学 401。
@@ -67,6 +68,7 @@ from __future__ import annotations
 import atexit
 import contextlib
 import hashlib
+import http.client
 import json
 import os
 import re
@@ -103,8 +105,38 @@ _DESCRIPTION_CAP = 1_000
 WORKSPACE_FILE = ".mcp.json"
 
 
+#  McpError.kind 的取值 = 出错后的去向。HTTP 传输全部分类；stdio 只分
+#  timeout / dropped（请求在飞时超时 / 进程退出），其余沿用未分类（空串）。
+#    connect          请求没送到（拒绝连接 / DNS / 建连超时）      → 判断线，走重连
+#    session_expired  带会话的请求被回 404（规范：须重新 initialize）→ 判断线，走重连
+#    dropped          请求发出后连接中断（重置 / 对端关闭 / 进程退出）→ 判断线，走重连；结果不确定
+#    auth             401 / 403                                    → 停用，不重试
+#    timeout          请求发出后等应答超时                          → 只报错；结果不确定
+#    server           5xx                                          → 只报错；结果不确定
+#    malformed        应答解析不了                                  → 只报错；结果不确定
+#    http             其余 4xx（server 明确拒收，请求没执行）         → 只报错
+_RECONNECT_KINDS = frozenset({"connect", "session_expired", "dropped"})
+#  "结果不确定"：请求已送达 server 却没拿到可信应答——tools/call 的副作用可能
+#  已经发生，自动重试可能把一次写操作做成两次
+_OUTCOME_UNKNOWN_KINDS = frozenset({"dropped", "timeout", "server", "malformed"})
+
+
 class McpError(RuntimeError):
-    """MCP 协议层错误（超时 / server 退出 / JSON-RPC error 响应）。"""
+    """MCP 协议层错误（超时 / server 退出 / JSON-RPC error 响应）。
+
+    kind 是错误分类（取值与去向见上表），status 是 HTTP 状态码（非 HTTP 错误为
+    None）。两者都是带默认值的关键字参数：`McpError("文本")` 的老写法原样可用，
+    未分类的错误走旧语义。
+    """
+
+    def __init__(self, message: str = "", *, kind: str = "", status: int | None = None) -> None:
+        super().__init__(message)
+        self.kind = kind
+        self.status = status
+
+    @property
+    def outcome_unknown(self) -> bool:
+        return self.kind in _OUTCOME_UNKNOWN_KINDS
 
 
 def _enabled(name: str) -> bool:
@@ -544,28 +576,71 @@ class _HttpChannel:
             headers=self._headers("application/json, text/event-stream"),
             method="POST",
         )
+        name = self.spec.name
+        #  两段式异常分类：错误发生在"请求送达之前"还是"之后"，决定了 tools/call
+        #  的结果是否不确定（见 McpError 分类表）。urllib 只把发请求阶段（DNS、
+        #  建连、写请求）的 OSError 包成 URLError；等响应头与读响应体阶段的异常
+        #  原样抛出——这条边界就是"送没送到"的判据。
         try:
-            with netproxy.urlopen(request, timeout=timeout) as response:
-                #  会话 id 只在 initialize 的响应里出现，但每次都读一遍无害
-                if new_id := response.headers.get("Mcp-Session-Id"):
-                    self.session_id = new_id
-                kind = (response.headers.get("Content-Type") or "").split(";")[0].strip()
-                if response.status == 202:
-                    return []  # 通知被接收，无响应体
-                if kind == "text/event-stream":
-                    return list(_read_sse(response))
-                raw = response.read().decode("utf-8", "replace").strip()
-                if not raw:
-                    return []
-                message = json.loads(raw)
-                return [message] if isinstance(message, dict) else list(message)
+            response = netproxy.urlopen(request, timeout=timeout)
         except urllib.error.HTTPError as exc:
-            if exc.code == 404 and self.session_id:
-                raise McpError("远端会话已失效（HTTP 404），需要重连") from exc
-            detail = _redact(exc.read().decode("utf-8", "replace")[:200]) if exc.fp else ""
-            raise McpError(f"HTTP {exc.code} {exc.reason}{'：' + detail if detail else ''}") from exc
-        except (urllib.error.URLError, OSError, json.JSONDecodeError) as exc:
-            raise McpError(f"请求 {self.spec.name} 失败：{exc}") from exc
+            raise self._http_error(exc) from exc
+        except urllib.error.URLError as exc:
+            raise McpError(f"连接 {name} 失败：{exc.reason}", kind="connect") from exc
+        except TimeoutError as exc:
+            raise McpError(f"等待 {name} 应答超时（{timeout:g}s）", kind="timeout") from exc
+        except (http.client.HTTPException, OSError) as exc:
+            raise McpError(f"与 {name} 的连接在应答前中断：{exc}", kind="dropped") from exc
+        with response:
+            try:
+                return self._read_messages(response)
+            except TimeoutError as exc:
+                raise McpError(f"读取 {name} 的应答超时（{timeout:g}s）", kind="timeout") from exc
+            except (http.client.HTTPException, OSError) as exc:
+                raise McpError(f"读取 {name} 的应答时连接中断：{exc}", kind="dropped") from exc
+            except ValueError as exc:  # JSONDecodeError 是它的子类
+                raise McpError(f"{name} 的应答不是合法 JSON：{exc}", kind="malformed") from exc
+
+    def _read_messages(self, response: Any) -> list[dict[str, Any]]:
+        #  会话 id 只在 initialize 的响应里出现，但每次都读一遍无害
+        if new_id := response.headers.get("Mcp-Session-Id"):
+            self.session_id = new_id
+        kind = (response.headers.get("Content-Type") or "").split(";")[0].strip()
+        if response.status == 202:
+            return []  # 通知被接收，无响应体
+        if kind == "text/event-stream":
+            return list(_read_sse(response))
+        raw = response.read().decode("utf-8", "replace").strip()
+        if not raw:
+            return []
+        message = json.loads(raw)
+        if isinstance(message, dict):
+            return [message]
+        return [item for item in message if isinstance(item, dict)] if isinstance(message, list) else []
+
+    def _http_error(self, exc: urllib.error.HTTPError) -> McpError:
+        """非 2xx 状态码 → 分好类的 McpError（去向见 McpError 分类表）。"""
+        code = exc.code
+        detail = ""
+        if exc.fp:
+            with contextlib.suppress(Exception):
+                detail = _redact(exc.read().decode("utf-8", "replace")[:200]).strip()
+        with contextlib.suppress(Exception):
+            exc.close()
+        suffix = f"：{detail}" if detail else ""
+        if code == 404 and self.session_id:
+            return McpError(
+                "远端会话已失效（HTTP 404），需要重新握手", kind="session_expired", status=code
+            )
+        if code in (401, 403):
+            return McpError(
+                f"认证失败（HTTP {code} {exc.reason}）{suffix}——"
+                "检查 mcp.json 里这个 server 的 headers 凭据",
+                kind="auth",
+                status=code,
+            )
+        kind = "server" if code >= 500 else "http"
+        return McpError(f"HTTP {code} {exc.reason}{suffix}", kind=kind, status=code)
 
     # ---- server→client 长流 ----
 
@@ -709,8 +784,15 @@ class McpServer:
         #  on_tools_changed ← notifications/tools/list_changed（读线程上发火，
         #  接线方绝不能在回调里同步发请求——响应正是读线程自己派发的，会自锁死）
         self.on_tools_changed: Callable[[], None] | None = None
-        #  on_disconnect ← stdout EOF（进程意外退出）。主动 close 不触发。
+        #  on_disconnect ← stdout EOF（进程意外退出）/ HTTP 断线类错误（会话失效、
+        #  连接失败、连接中途断开，见 McpError 分类表）。主动 close 不触发。
         self.on_disconnect: Callable[[], None] | None = None
+        #  on_failure(原因) ← 不可恢复的失败（HTTP 401/403）：不走重连，由 manager
+        #  整代下线并亮出原因。fatal_error 同时记住原因，调用与 check 据此拦截
+        self.on_failure: Callable[[str], None] | None = None
+        self.fatal_error: str | None = None
+        #  manager 的重连线程是否在跑（调用失败的提示据此说真话，不凭钩子是否接线猜）
+        self.reconnecting = False
         self._closing = False
         #  是否已计入 CONNECTIONS_LIVE（启动成功 +1、收进程 -1，重启不重复计）
         self._counted = False
@@ -896,6 +978,11 @@ class McpServer:
             #  熔断是"进程活着但请求连败"的防线，新一代从零开始
             self._failures = 0
             self._breaker_until = 0.0
+            if self._http is not None:
+                #  HTTP 换一条全新通道：会话 id、关闭标志都属于上一代。沿用旧会话 id
+                #  去 initialize，严格的 server 回 404（重连永远连不上）；沿用关闭
+                #  标志，新长流上的 list_changed 会被静默丢弃
+                self._http = _HttpChannel(self.spec)
             try:
                 self._start_locked()
             except McpError:
@@ -987,12 +1074,24 @@ class McpServer:
         紧接着取走。每次调用先清空：上一次的图绝不能粘到这一次的结果上。
         """
         self.last_media = []
+        if self.fatal_error:
+            return (
+                f"ERROR: MCP server {self.spec.name} 已停用：{_redact(self.fatal_error)}。"
+                "不会自动重试——不要再调用这个 server 的工具，告知用户修复。"
+            )
         if not self.alive():
+            #  提示只说真话：重连线程确实在跑才说"正在重连"（HTTP 断线、重连关闭、
+            #  预算耗尽都不是这个状态）
             hint = (
                 "后台正在自动重连，稍后重试或先做别的事。"
-                if self.on_disconnect is not None and not self._closing
+                if self.reconnecting and not self._closing
                 else ""
             )
+            if self._http is not None:
+                return (
+                    f"ERROR: MCP server {self.spec.name} 的连接已断开（{self.spec.url}），"
+                    f"无法调用。{hint}"
+                )
             return (
                 f"ERROR: MCP server {self.spec.name} 进程已退出，无法调用。{hint}"
                 f"排障看日志：{self.log_path}"
@@ -1018,7 +1117,19 @@ class McpServer:
             if self._failures >= self._BREAKER_THRESHOLD:
                 self._breaker_until = time.monotonic() + self._BREAKER_COOLDOWN
                 self._failures = 0
-            return f"ERROR: MCP 调用失败（{self.spec.name}/{tool}）：{_redact(str(exc))}"
+            text = f"ERROR: MCP 调用失败（{self.spec.name}/{tool}）：{_redact(str(exc))}"
+            if exc.kind == "auth":
+                return text + "。认证被拒，不会自动重试——不要再调用这个 server 的工具，告知用户检查凭据。"
+            if exc.outcome_unknown:
+                #  请求已送达却没拿到可信应答：写操作可能已经做了，模型惯性重试
+                #  就是把一次副作用做成两次
+                text += (
+                    "。调用结果不确定：请求可能已送达 server，副作用可能已经发生——"
+                    "不要自动重试，先核实结果或告知用户。"
+                )
+            if self.reconnecting and not self._closing:
+                text += "（连接已断开，后台正在自动重连）"
+            return text
         self._failures = 0
         text, self.last_media = _render_result(result)
         return text
@@ -1033,11 +1144,12 @@ class McpServer:
         deadline = time.monotonic() + timeout
         with self._cond:
             while request_id not in self._responses:
+                #  走到这里请求已经发出：此后的退出/超时都是"结果不确定"
                 if self._dead:
-                    raise McpError(self._exit_reason())
+                    raise McpError(self._exit_reason(), kind="dropped")
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
-                    raise McpError(f"{method} 超时（{timeout:g}s）")
+                    raise McpError(f"{method} 超时（{timeout:g}s）", kind="timeout")
                 self._cond.wait(remaining)
             reply = self._responses.pop(request_id)
         if "error" in reply:
@@ -1130,17 +1242,46 @@ class McpServer:
         channel = self._http
         if channel is None:
             raise McpError("server 未启动")
-        timeout = self.spec.timeout if payload.get("method") != "initialize" else INIT_TIMEOUT
+        method = payload.get("method")
+        timeout = self.spec.timeout if method != "initialize" else INIT_TIMEOUT
         try:
             with self._write_lock:
                 messages = channel.post(payload, timeout)
-        except McpError:
-            with self._cond:
-                self._dead = True
-                self._cond.notify_all()
+        except McpError as exc:
+            self._http_failed(channel, method, exc)
             raise
         for message in messages:
             self._dispatch(message)
+
+    def _http_failed(self, channel: _HttpChannel, method: Any, exc: McpError) -> None:
+        """HTTP 往返出错后的去向，按 exc.kind 分流（见 McpError 分类表）：
+        断线类判死并报断线（manager 走与 stdio 同一套重连与预算）；认证失败
+        判死并报停用（不重试）；其余只往上抛，不判死——一次 5xx 或读超时就
+        永久拉黑整组工具代价太大，连败由 call_tool 的熔断兜底。
+
+        initialize 的错误一律只往上抛：启动失败与 restart 失败各有调用方兜底
+        （后者计入重连预算），这里再报断线会和重连线程自己打架。
+        换代守卫：restart 已换上新通道时，旧通道迟到的失败不能把新一代标死。
+        """
+        if method == "initialize" or self._http is not channel or self._closing:
+            return
+        if exc.kind == "auth":
+            with self._cond:
+                self.fatal_error = str(exc)
+                self._dead = True
+                self._cond.notify_all()
+            failure = self.on_failure
+            if failure is not None:
+                failure(str(exc))
+            return
+        if exc.kind not in _RECONNECT_KINDS:
+            return
+        with self._cond:
+            self._dead = True
+            self._cond.notify_all()
+        callback = self.on_disconnect
+        if callback is not None:
+            callback()
 
     def _answer_server_request(self, message: dict[str, Any]) -> None:
         """server 反向发来的请求：ping 回 pong，其余一律 method-not-found。
@@ -1394,7 +1535,7 @@ def _make_remote_tool(
         return text
 
     def check() -> bool:
-        if server.start_error:
+        if server.start_error or server.fatal_error:
             return False
         if not server.started:
             #  缓存待启动：必须可见，否则模型永远不会发起那第一次调用
@@ -1448,6 +1589,8 @@ class McpManager:
         self._resync_dirty: set[str] = set()
         self._resync_running: set[str] = set()
         self._reconnecting: set[str] = set()
+        #  已不可恢复地失败（认证被拒）的 server：不再立案重连
+        self._failed_hard: set[str] = set()
         #  close 时置位：重连线程的退避等待立即醒来退场
         self._close_event = threading.Event()
         #  工具指纹基线（防 rug-pull）与 schema 缓存都放用户配置目录
@@ -1679,9 +1822,11 @@ class McpManager:
         """server 就绪后接线代际钩子（幂等）。持锁调用。"""
         server.connected_at = time.monotonic()
         server.on_tools_changed = lambda: self._schedule_resync(server)
+        #  不可恢复的失败与重连开关无关：关了重连也得把"认证被拒"亮出来
+        server.on_failure = lambda reason: self._fail_permanently(server, reason)
         if _enabled("XIAOYU_MCP_RECONNECT"):
             server.on_disconnect = lambda: self._schedule_reconnect(server)
-            if not server.alive():
+            if not server.alive() and not server.fatal_error:
                 #  接线前就崩了（EOF 已经过去，回调当时还是 None）：补一枪。
                 #  必须在独立线程发——_schedule_reconnect 要拿本锁
                 threading.Thread(target=server.on_disconnect, daemon=True).start()
@@ -1739,13 +1884,38 @@ class McpManager:
                 else:
                     self._write_cache_locked(server.spec, server)
 
+    def _fail_permanently(self, server: McpServer, reason: str) -> None:
+        """不可恢复的失败（认证被拒）：整代下线、状态亮原因、解除监督，不重试。
+
+        幂等：同一次失败可能从两条路到达（restart 里 tools/list 被拒触发钩子，
+        restart 随后抛错又经重连线程再报一次），只有第一次落笔并提示。
+        """
+        name = server.spec.name
+        reason = _redact(reason)
+        with self._lock:
+            if self._closed or name in self._failed_hard:
+                return
+            self._failed_hard.add(name)
+            server.fatal_error = reason
+            self._drop_generation_locked(name)
+            self._states[name] = f"failed: {reason}（不会自动重试；修好后重启会话恢复）"
+        server.on_disconnect = None
+        server.on_tools_changed = None
+        server.on_failure = None
+        print(
+            f"[MCP {name}：{reason}。工具已整代下线，不会自动重试；修好后重启会话恢复]",
+            file=sys.stderr,
+        )
+
     def _schedule_reconnect(self, server: McpServer) -> None:
-        """进程意外退出 → 重连线程（每 server 同时至多一个 = 一次 outage）。"""
+        """断线（进程意外退出 / HTTP 断线类错误）→ 重连线程（每 server 同时至多
+        一个 = 一次 outage）。"""
         name = server.spec.name
         with self._lock:
-            if self._closed or name in self._reconnecting:
+            if self._closed or name in self._reconnecting or name in self._failed_hard:
                 return
             self._reconnecting.add(name)
+            server.reconnecting = True
             self._states[name] = "reconnecting"
             self._spawn_service_locked(
                 lambda: self._reconnect_worker(server), f"xiaoyu-mcp-reconnect-{name}"
@@ -1803,6 +1973,11 @@ class McpManager:
                 try:
                     declared = server.restart()
                 except McpError as exc:
+                    if exc.kind == "auth":
+                        #  重连撞上认证被拒（凭据过期/被吊销）：再试多少次都一样，
+                        #  立即停手，不烧预算也不刷屏
+                        self._fail_permanently(server, str(exc))
+                        return
                     print(
                         f"[MCP {name}：重连失败"
                         f"（第 {attempt}/{self.RECONNECT_MAX_ATTEMPTS} 次）：{exc}]",
@@ -1828,6 +2003,7 @@ class McpManager:
         finally:
             with self._lock:
                 self._reconnecting.discard(name)
+                server.reconnecting = False
             #  成功与 discard 之间的窄窗：新进程立刻又崩，EOF 回调被
             #  _reconnecting 挡掉——这里补判一次，两种时序都兜住
             if succeeded and not server.alive() and not self._closed:
@@ -2018,7 +2194,7 @@ class McpManager:
                 lines.append(f"  {name}: 启动失败: {server.start_error}")
             elif state == "ready":
                 if server and not server.alive():
-                    detail += "（进程已退出）"
+                    detail += "（连接已断开）" if server.spec.is_http else "（进程已退出）"
                 lines.append(f"  {name}: 就绪 · {detail}")
             elif state == "cached":
                 lines.append(f"  {name}: 就绪（schema 缓存，进程按首次调用启动）· {detail}")

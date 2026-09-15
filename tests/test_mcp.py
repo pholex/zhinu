@@ -237,11 +237,26 @@ class _McpHttpHandler(BaseHTTPRequestHandler):
     offer_stream = False     # GET 是否给一条 SSE 长流
     record: dict = {}
     stop = threading.Event()
+    #  会话表：initialize 逐个发 sess-http-1、-2…；404 回收与 DELETE 从表里摘掉。
+    #  带着表里没有的会话 id 来（含 initialize）一律 404——严格 server 的真实行为
+    sessions: set = set()
+    issued = 0
+    #  非 initialize 请求的剧本：非空时每个带 id 的请求弹出一个动作决定怎么答——
+    #  "404" 回收会话 / "401" / "500" / "hang" 挂起不答 / "drop" 不答直接断连接
+    actions: list = []
+    #  initialize 的状态码（200 = 正常握手）
+    init_status = 200
 
     def log_message(self, *args):  # 别把请求日志打进测试输出
         pass
 
     # ---- 出站 ----
+
+    def _send_status(self, code: int, body: bytes = b"") -> None:
+        self.send_response(code)
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
 
     def _send_json(self, payload: dict, extra: dict[str, str] | None = None) -> None:
         body = json.dumps(payload).encode()
@@ -276,23 +291,42 @@ class _McpHttpHandler(BaseHTTPRequestHandler):
         cls.record.setdefault("headers", []).append(
             {key.lower(): value for key, value in self.headers.items()}
         )
+        session = self.headers.get("Mcp-Session-Id")
+        if session is not None and session not in cls.sessions:
+            self._send_status(404)
+            return
         if method == "initialize":
+            if cls.init_status != 200:
+                self._send_status(cls.init_status, b"invalid token")
+                return
+            cls.issued += 1
+            new_session = f"sess-http-{cls.issued}"
+            cls.sessions.add(new_session)
             reply = {"jsonrpc": "2.0", "id": message["id"], "result": {
                 "protocolVersion": "2025-06-18",
                 "capabilities": {"tools": {}},
                 "serverInfo": {"name": "fake-http", "version": "1"},
             }}
-            self._send_json(reply, {"Mcp-Session-Id": "sess-http-1"})
+            self._send_json(reply, {"Mcp-Session-Id": new_session})
             return
-        if cls.require_session and self.headers.get("Mcp-Session-Id") != "sess-http-1":
-            self.send_response(400)
-            self.send_header("Content-Length", "0")
-            self.end_headers()
+        if cls.require_session and session is None:
+            self._send_status(400)
             return
         if not message.get("id"):  # 通知：202 无响应体
-            self.send_response(202)
-            self.send_header("Content-Length", "0")
-            self.end_headers()
+            self._send_status(202)
+            return
+        if cls.actions:
+            action = cls.actions.pop(0)
+            if action == "404":
+                cls.sessions.discard(session)
+                self._send_status(404)
+            elif action in ("401", "500"):
+                self._send_status(int(action), b"nope")
+            elif action == "hang":
+                cls.stop.wait(3)
+                self.close_connection = True
+            elif action == "drop":
+                self.close_connection = True
             return
         if method == "tools/list":
             result = {"tools": [{
@@ -324,14 +358,14 @@ class _McpHttpHandler(BaseHTTPRequestHandler):
         cls.stop.wait(10)
 
     def do_DELETE(self) -> None:
-        type(self).record["deleted"] = True
-        self.send_response(200)
-        self.send_header("Content-Length", "0")
-        self.end_headers()
+        cls = type(self)
+        cls.record["deleted"] = True
+        cls.sessions.discard(self.headers.get("Mcp-Session-Id"))
+        self._send_status(200)
 
 
-class HttpTransportTest(unittest.TestCase):
-    """远端 server（Streamable HTTP）：真 HTTP 往返，不打桩传输层。"""
+class _HttpServerCase(unittest.TestCase):
+    """起一个本地假 HTTP MCP server 的夹具（本类不含用例）。"""
 
     def setUp(self):
         _McpHttpHandler.mode = "json"
@@ -339,25 +373,40 @@ class HttpTransportTest(unittest.TestCase):
         _McpHttpHandler.offer_stream = False
         _McpHttpHandler.record = {}
         _McpHttpHandler.stop = threading.Event()
-        self.httpd = ThreadingHTTPServer(("127.0.0.1", 0), _McpHttpHandler)
-        thread = threading.Thread(target=self.httpd.serve_forever, daemon=True)
-        thread.start()
+        _McpHttpHandler.sessions = set()
+        _McpHttpHandler.issued = 0
+        _McpHttpHandler.actions = []
+        _McpHttpHandler.init_status = 200
+        self.serve()
         self.url = f"http://127.0.0.1:{self.httpd.server_address[1]}/mcp"
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
 
         def teardown():
             _McpHttpHandler.stop.set()
-            self.httpd.shutdown()
-            self.httpd.server_close()
+            self.stop_serving()
 
         self.addCleanup(teardown)
 
-    def make_server(self, **kwargs) -> mcp.McpServer:
-        spec = mcp.ServerSpec(name="remote", command="", url=self.url, timeout=15.0, **kwargs)
+    def serve(self, port: int = 0) -> None:
+        self.httpd = ThreadingHTTPServer(("127.0.0.1", port), _McpHttpHandler)
+        threading.Thread(target=self.httpd.serve_forever, daemon=True).start()
+
+    def stop_serving(self) -> None:
+        if self.httpd is not None:
+            self.httpd.shutdown()
+            self.httpd.server_close()
+            self.httpd = None
+
+    def make_server(self, timeout: float = 15.0, **kwargs) -> mcp.McpServer:
+        spec = mcp.ServerSpec(name="remote", command="", url=self.url, timeout=timeout, **kwargs)
         server = mcp.McpServer(spec, Path(self.tmp.name) / "remote.log")
         self.addCleanup(server.close)
         return server
+
+
+class HttpTransportTest(_HttpServerCase):
+    """远端 server（Streamable HTTP）：真 HTTP 往返，不打桩传输层。"""
 
     def test_handshake_list_and_call_over_json(self):
         server = self.make_server()
@@ -427,6 +476,151 @@ class HttpTransportTest(unittest.TestCase):
         with self.assertRaises(mcp.McpError) as caught:
             server.bootstrap()
         self.assertIn("回环", str(caught.exception))
+
+
+class HttpFailureTest(_HttpServerCase):
+    """HTTP 传输出错后的去向：断线类走重连、认证失败停用、短暂错误只报错不判死。
+
+    修之前任何一次错误都把 server 永久判死、且不报断线：整组工具在本会话里
+    无声消失。这里每条都断言"状态 + 给模型的提示"两件事。
+    """
+
+    def setUp(self):
+        super().setUp()
+        root = Path(self.tmp.name).resolve()
+        patcher = mock.patch.object(mcp, "user_config_dir", lambda: root / "userconf")
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        #  首个退避 0.2s：足够让调用方先拿到"正在重连"的提示，又不拖慢用例
+        for attr, value in (
+            ("RECONNECT_INITIAL_DELAY", 0.2),
+            ("RECONNECT_MAX_DELAY", 1.0),
+            ("RECONNECT_MAX_ATTEMPTS", 8),
+        ):
+            p = mock.patch.object(mcp.McpManager, attr, value)
+            p.start()
+            self.addCleanup(p.stop)
+
+    def make_manager(self) -> mcp.McpManager:
+        spec = mcp.ServerSpec(name="remote", command="", url=self.url, timeout=15.0)
+        manager = mcp.McpManager([spec])
+        manager.start()
+        self.addCleanup(manager.close)
+        manager.wait_ready(20.0)
+        self.assertEqual(manager._states["remote"], "ready")
+        return manager
+
+    def wait_until(self, predicate, timeout: float = 15.0, message: str = "等待超时"):
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if predicate():
+                return
+            time.sleep(0.02)
+        self.fail(message)
+
+    def wait_reconnected(self, manager: mcp.McpManager) -> None:
+        server = manager._servers["remote"]
+        self.wait_until(
+            lambda: manager._states["remote"] == "ready" and server.alive(),
+            message=f"未能重连：{manager._states['remote']}",
+        )
+
+    def test_session_expired_reconnects_and_tools_come_back(self):
+        manager = self.make_manager()
+        echo = find_tool(manager, "__echo")
+        _McpHttpHandler.actions = ["404"]
+        out = echo.handler(text="x")
+        self.assertIn("会话已失效", out)
+        self.assertIn("后台正在自动重连", out)
+        #  404 = server 没执行这次请求，结果是确定的
+        self.assertNotIn("不确定", out)
+        self.wait_reconnected(manager)
+        self.assertTrue(echo.check_fn())
+        self.assertEqual(find_tool(manager, "__echo").handler(text="回"), "远端回显：回")
+        #  重新握手不能带上一代的会话 id：严格 server 对未知会话回 404，永远连不上
+        record = _McpHttpHandler.record
+        inits = [h for m, h in zip(record["methods"], record["headers"]) if m == "initialize"]
+        self.assertEqual(len(inits), 2)
+        self.assertNotIn("mcp-session-id", inits[1])
+
+    def test_connection_lost_then_server_back_reconnects(self):
+        manager = self.make_manager()
+        port = self.httpd.server_address[1]
+        self.stop_serving()
+        _McpHttpHandler.sessions = set()  # server 重启，会话全丢
+        out = find_tool(manager, "__echo").handler(text="x")
+        self.assertIn("连接", out)
+        self.assertIn("后台正在自动重连", out)
+        self.assertNotIn("不确定", out, "连不上 = 请求没送到，结果是确定的")
+        self.serve(port)
+        self.wait_reconnected(manager)
+        self.assertEqual(find_tool(manager, "__echo").handler(text="回"), "远端回显：回")
+
+    def test_connection_dropped_mid_call_warns_and_reconnects(self):
+        manager = self.make_manager()
+        _McpHttpHandler.actions = ["drop"]
+        out = find_tool(manager, "__echo").handler(text="x")
+        self.assertIn("调用结果不确定", out)
+        self.assertIn("不要自动重试", out)
+        self.assertIn("后台正在自动重连", out)
+        self.wait_reconnected(manager)
+
+    def test_auth_rejected_mid_session_disables_without_retry(self):
+        manager = self.make_manager()
+        echo = find_tool(manager, "__echo")
+        _McpHttpHandler.actions = ["401"]
+        with contextlib.redirect_stderr(io.StringIO()) as err:
+            out = echo.handler(text="x")
+        self.assertIn("认证失败", out)
+        self.assertIn("不会自动重试", out)
+        self.assertIn("认证失败", err.getvalue(), "停用必须有用户可见的提示")
+        self.assertTrue(manager._states["remote"].startswith("failed:"))
+        self.assertIn("认证失败", manager.describe())
+        self.assertFalse(echo.check_fn())
+        self.assertEqual(manager.ready_tools(), [])
+        time.sleep(0.5)  # 盖过一轮退避：确认没有发起重连
+        self.assertEqual(_McpHttpHandler.record["methods"].count("initialize"), 1)
+        self.assertIn("已停用", echo.handler(text="y"))
+
+    def test_auth_rejected_at_handshake_is_explicit(self):
+        _McpHttpHandler.init_status = 401
+        server = self.make_server()
+        with self.assertRaises(mcp.McpError) as caught:
+            server.bootstrap()
+        self.assertEqual(caught.exception.kind, "auth")
+        self.assertEqual(caught.exception.status, 401)
+        self.assertIn("认证失败", str(caught.exception))
+
+    def test_call_timeout_is_not_fatal_and_warns_uncertain(self):
+        server = self.make_server(timeout=0.5)
+        server.bootstrap()
+        _McpHttpHandler.actions = ["hang"]
+        out = server.call_tool("echo", {"text": "x"})
+        self.assertIn("超时", out)
+        self.assertIn("调用结果不确定", out)
+        self.assertIn("不要自动重试", out)
+        self.assertTrue(server.alive(), "一次读超时不能把 server 判死")
+        self.assertEqual(server.call_tool("echo", {"text": "ok"}), "远端回显：ok")
+
+    def test_5xx_on_call_is_not_fatal_and_warns_uncertain(self):
+        server = self.make_server()
+        server.bootstrap()
+        _McpHttpHandler.actions = ["500"]
+        out = server.call_tool("echo", {"text": "x"})
+        self.assertIn("HTTP 500", out)
+        self.assertIn("调用结果不确定", out)
+        self.assertTrue(server.alive())
+        self.assertEqual(server.call_tool("echo", {"text": "ok"}), "远端回显：ok")
+
+    def test_5xx_on_list_is_transient(self):
+        server = self.make_server()
+        server.bootstrap()
+        _McpHttpHandler.actions = ["500"]
+        with self.assertRaises(mcp.McpError) as caught:
+            server._list_tools()
+        self.assertEqual(caught.exception.kind, "server")
+        self.assertTrue(server.alive())
+        self.assertEqual([t["name"] for t in server._list_tools()], ["echo"])
 
 
 class LaunchSpecsTest(unittest.TestCase):
@@ -1382,6 +1576,9 @@ class GenerationTest(unittest.TestCase):
         server = manager._servers["gen"]
         out = find_tool(manager, "__die").handler()
         self.assertTrue(out.startswith("ERROR:"), out)
+        #  请求在飞时进程退出：副作用可能已发生，必须告诉模型别自动重试
+        self.assertIn("调用结果不确定", out)
+        self.assertIn("不要自动重试", out)
         self.wait_until(lambda: not server.alive(), message="进程未按预期退出")
 
     def test_crash_reconnects_with_identical_names(self):
