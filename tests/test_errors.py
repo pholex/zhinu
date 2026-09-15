@@ -117,6 +117,54 @@ class ClassifyTest(unittest.TestCase):
             self.assertFalse(verdict.retryable, exc)
             self.assertFalse(verdict.should_compact, exc)
 
+    def test_balance_and_spend_limit_are_quota(self):
+        """余额/消费上限耗尽：以前掉进 fatal，降级链不放行、不切网关兜底。"""
+        request = httpx.Request("POST", "http://unused")
+        samples = [
+            #  DeepSeek 余额不足：HTTP 402
+            openai.APIStatusError("Insufficient Balance", response=_response(402), body=None),
+            #  Anthropic 余额不足是 400 invalid_request_error
+            _DuckStatusError(
+                "Your credit balance is too low to access the Anthropic API. "
+                "Please go to Plans & Billing to upgrade or purchase credits.",
+                400,
+            ),
+            RuntimeError("402 Payment Required"),
+            RuntimeError("billing_not_active: Your account is not active, please check your billing details"),
+        ]
+        #  流式里冒出来的错误只带 body，文本里没有码
+        for code in (
+            "credit_balance_exhausted",
+            "organization_spend_limit_exceeded",
+            "project_spend_limit_exceeded",
+            "organization_usage_limit_exceeded",
+        ):
+            samples.append(
+                openai.APIError("request rejected", request, body={"code": code, "message": "x"})
+            )
+            duck = RuntimeError("request rejected")
+            duck.body = {"error": {"code": code}}
+            samples.append(duck)
+        for exc in samples:
+            with self.subTest(exc=exc):
+                verdict = classify(exc)
+                self.assertEqual(verdict.kind, "quota")
+                self.assertFalse(verdict.retryable)
+
+    def test_billing_link_in_rate_limit_text_stays_rate_limit(self):
+        """限流文案里顺手附的 billing 链接不能把限流误判成额度耗尽（那会跳过退避）。"""
+        for exc in (
+            openai.RateLimitError(
+                "Rate limit reached for requests. Visit https://platform.openai.com/account/billing "
+                "to increase your limits.",
+                response=_response(429),
+                body=None,
+            ),
+            RuntimeError("Rate limit exceeded; see the billing page to raise limits"),
+        ):
+            with self.subTest(exc=exc):
+                self.assertEqual(classify(exc).kind, "rate_limit")
+
 
 class _DuckStatusError(Exception):
     """anthropic SDK 异常的最小鸭子型：同为 Stainless 生成，带 status_code 与
@@ -134,6 +182,7 @@ class AnthropicShapedTest(unittest.TestCase):
     def test_status_codes_classify(self):
         cases = {
             401: "auth",
+            402: "quota",  # Payment Required：无论文案都是额度问题
             403: "auth",
             429: "rate_limit",
             500: "transient",
