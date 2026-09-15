@@ -1906,6 +1906,11 @@ class Agent:
             else:
                 self.messages.append(message)
         if messages:
+            #  工具截图老化不写回会话日志，重放出来的是老化前的全部原图——接回后
+            #  补做一次（TOOL_MEDIA_KEY 随消息原样落盘，重放后照样认得出工具图；
+            #  未过高水位原样不动）。CLI / TUI /resume、ACP session/load、serve、
+            #  嵌入宿主的 restore 都走这里
+            self.messages, _ = age_tool_images(self.messages)
             #  整段历史是装进来的，不是这个会话一条条长出来的：按改写计
             self._history_rewritten()
         if self.session_log and source:

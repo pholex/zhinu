@@ -344,6 +344,43 @@ class AgentToolImageAgingTest(AgentTestCase):
         self.assertEqual(len(image_urls(agent.messages)), TOOL_IMAGE_KEEP)
         self.assertIn(f"xiaoyu-media://shot{TOOL_IMAGE_HIGH_WATER}.png", image_urls(agent.messages))
 
+    def test_restore_from_session_log_re_ages(self):
+        """老化不写回会话日志：resume 重放出全部原图，接回时要再老化一次。"""
+        from xiaoyu import providers, session_log
+        from xiaoyu.agent import Agent
+        from xiaoyu.tools import Toolbox
+
+        log = session_log.SessionLog.create("m", str(self.root), directory=self.root / "sessions")
+        self.addCleanup(log.release)
+        pasted = {
+            "role": "user",
+            "content": [media.text_part("看这张"), media.image_part("xiaoyu-media://mine.png")],
+        }
+        history = screenshot_loop(TOOL_IMAGE_HIGH_WATER + 1)[1:]  # 去掉 system
+        history.insert(1, pasted)
+        for message in history:
+            log.append(message)
+        loaded = session_log.load_messages(log.path)
+        #  私有标记随消息原样落盘：重放后照样认得出工具图
+        self.assertEqual(
+            sum(1 for m in loaded if m.get(media.TOOL_MEDIA_KEY)), TOOL_IMAGE_HIGH_WATER + 1
+        )
+
+        registry = providers.Registry(
+            [providers.Provider("gateway", "", "", (), "网关", (), ("*",))],
+            clients={"gateway": mock.MagicMock()},
+        )
+        agent = Agent(self.config, Toolbox(self.config), registry=registry)
+        with contextlib.redirect_stdout(io.StringIO()):
+            agent.restore(loaded, copy=False)
+        urls = image_urls(agent.messages)
+        #  工具图只剩最新几张，用户贴的图不动也不计数
+        self.assertEqual(len(urls), TOOL_IMAGE_KEEP + 1)
+        self.assertIn("xiaoyu-media://mine.png", urls)
+        self.assertIn(f"xiaoyu-media://shot{TOOL_IMAGE_HIGH_WATER}.png", urls)
+        placeholders = [m for m in agent.messages if "重新截图" in media.text_of(m.get("content"))]
+        self.assertEqual(len(placeholders), TOOL_IMAGE_HIGH_WATER + 1 - TOOL_IMAGE_KEEP)
+
 
 if __name__ == "__main__":
     unittest.main()
