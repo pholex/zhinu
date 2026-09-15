@@ -14,6 +14,9 @@ checkpoint 设计，按小羽体量裁剪：
   说明轮次之外有人改过（用户手改/别的进程），列出来让用户确认再动手。
 - **快照存原始字节，不解码**：编码（GBK 等）与换行（CRLF）原样恢复——存解码
   后的文本再按 UTF-8 写回，恢复本身就会改掉文件编码。
+- **特殊文件不碰**：追踪的路径在轮次之外被换成 FIFO / 设备时，快照读取先 stat
+  拦下（不 open，免得永久阻塞），冲突检测把它列为外部改动，恢复时原样跳过并
+  报失败——不往 FIFO 里写，也不删别人建的节点。
 - 对话与文件可分开回滚（conversation_only / files_only / all 三态）。
   只回对话时快照点保留——文件没动，之后仍可单独回滚文件。
 
@@ -26,6 +29,8 @@ from __future__ import annotations
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
+
+from . import fsguard
 
 #  最多保留多少个快照点（超出淘汰最旧）
 MAX_POINTS = 64
@@ -122,7 +127,8 @@ class RewindStore:
         for raw in self.files_from(index):
             if raw not in latest_after:
                 continue  # 本轮还没收尾（不应发生）——没有 after 可比，不报
-            if _read_or_none(Path(raw)) != latest_after[raw]:
+            #  被换成特殊文件的一律算外部改动：工具只会写出普通文件
+            if _special_kind(Path(raw)) or _read_or_none(Path(raw)) != latest_after[raw]:
                 clashing.append(raw)
         return sorted(clashing)
 
@@ -146,6 +152,12 @@ class RewindStore:
         restored, removed, errors = 0, 0, []
         for raw, before in targets.items():
             path = Path(raw)
+            kind = _special_kind(path)
+            if kind is not None:
+                #  写 FIFO 会阻塞到有读者、删掉又可能误伤外部建的节点：原样不动，
+                #  记成失败（快照整批保留），用户移走它之后可重试
+                errors.append(f"{raw}: 现在是{kind}，不是普通文件，未恢复（移走后可重试）")
+                continue
             try:
                 if before is None:
                     if path.exists():
@@ -173,8 +185,25 @@ class RewindStore:
         self._current = None
 
 
-def _read_or_none(path: Path) -> bytes | None:
+def _special_kind(path: Path) -> str | None:
+    """路径当前若是 FIFO / 设备这类非普通文件，返回类别名；普通文件、不存在都给 None。"""
     try:
+        fsguard.require_regular(path)
+    except fsguard.NotRegularFile as exc:
+        return exc.kind
+    except OSError:
+        return None
+    return None
+
+
+def _read_or_none(path: Path) -> bytes | None:
+    """读当前内容；读不了给 None。
+
+    先 stat 再 open：工具写过的路径在轮次之外可能被换成 FIFO（或指向设备的
+    链接），直接 read_bytes 会把轮次收尾 / 冲突检测永久挂死、或读不到头。
+    """
+    try:
+        fsguard.require_regular(path)
         return path.read_bytes()
     except OSError:
         return None

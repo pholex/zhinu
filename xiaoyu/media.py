@@ -39,6 +39,7 @@ from typing import Any
 from urllib.parse import urlparse
 from urllib.request import url2pathname
 
+from . import fsguard
 from .config import user_config_dir
 
 #  引用 scheme。刻意不用 `file://`：万一某条路径忘了展开，带自定义 scheme 的
@@ -321,14 +322,29 @@ def accept(data: bytes, source: str = "") -> tuple[str, str]:
     if not mime:
         return "", f"{source or '这个文件'}不是能识别的图片格式（PNG/JPEG/GIF/WEBP）"
     if len(data) > MAX_IMAGE_BYTES:
-        mb = len(data) / 1024 / 1024
-        return "", f"图片 {mb:.1f} MB，超过 {MAX_IMAGE_BYTES // 1024 // 1024} MB 上限"
+        return "", _oversize_problem(len(data))
     ref = store(data, mime)
     return (ref, "") if ref else ("", "写图片缓存失败（磁盘满或只读？）")
 
 
+def _oversize_problem(size: int) -> str:
+    return f"图片 {size / 1024 / 1024:.1f} MB，超过 {MAX_IMAGE_BYTES // 1024 // 1024} MB 上限"
+
+
 def accept_file(path: Path) -> tuple[str, str]:
-    """文件路径 → (引用, 出错原因)。"""
+    """文件路径 → (引用, 出错原因)。
+
+    读之前先 stat：用户拖进来 / --image 点名的若是 FIFO，read_bytes 会一直阻塞
+    （输入框跟着冻死），设备文件读不到头；超体积的也不必整份读进内存再拒。
+    """
+    try:
+        info = fsguard.require_regular(path)
+    except fsguard.NotRegularFile as exc:
+        return "", f"{path.name} 是{exc.kind}，不是普通文件，不能当图片发送"
+    except OSError as exc:
+        return "", f"读不了 {path.name}：{exc.strerror or exc}"
+    if info.st_size > MAX_IMAGE_BYTES:
+        return "", _oversize_problem(info.st_size)
     try:
         data = path.read_bytes()
     except OSError as exc:

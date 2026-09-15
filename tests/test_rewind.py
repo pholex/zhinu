@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import os
+import stat
 import tempfile
 import unittest
 from pathlib import Path
@@ -9,6 +11,8 @@ from pathlib import Path
 from xiaoyu import rewind as rw
 from xiaoyu.config import Config
 from xiaoyu.tools import Toolbox
+
+from .fifo_support import call_bounded, needs_fifo
 
 
 class StoreTest(unittest.TestCase):
@@ -98,6 +102,35 @@ class StoreTest(unittest.TestCase):
         points = self.store.points()
         self.assertEqual(len(points), rw.MAX_POINTS)
         self.assertEqual(points[0].index, 6)
+
+
+@needs_fifo
+class SpecialFileTest(unittest.TestCase):
+    """追踪的路径在轮次之外被换成 FIFO：收尾、冲突检测、恢复都不许挂死。"""
+
+    def test_tracked_file_swapped_for_fifo(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            target = Path(tmp).resolve() / "a.txt"
+            target.write_text("v0", encoding="utf-8")
+            store = rw.RewindStore()
+            store.begin("改")
+            store.record(target, b"v0")
+            #  模型写完后又用 bash 把它换成了命名管道
+            target.unlink()
+            os.mkfifo(target)
+            call_bounded(self, store.finish, target)
+            #  工具只写普通文件，变成 FIFO 必是外部改动
+            self.assertEqual(call_bounded(self, lambda: store.conflicts(1), target), [str(target)])
+            ok, summary = call_bounded(self, lambda: store.rewind_files(1), target)
+            self.assertFalse(ok)
+            self.assertIn("FIFO", summary)
+            #  原样不动、快照保留：移走之后可以重试
+            self.assertTrue(stat.S_ISFIFO(os.stat(target).st_mode))
+            self.assertEqual(len(store.points()), 1)
+            target.unlink()
+            ok, summary = store.rewind_files(1)
+            self.assertTrue(ok, summary)
+            self.assertEqual(target.read_text(encoding="utf-8"), "v0")
 
 
 class ToolboxCaptureTest(unittest.TestCase):

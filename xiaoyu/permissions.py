@@ -25,7 +25,7 @@ import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from . import bash_ast, command_check
+from . import bash_ast, command_check, fsguard
 from .config import user_config_dir
 
 #  复合命令的分隔符：按这些切开后逐段判定。
@@ -307,6 +307,8 @@ _TEST_LINE = re.compile(r"^#test\s+(allow|deny|ask)\s+([A-Za-z_][\w-]*)\s+(.+)$"
 
 def _parse_rules_file(path: Path) -> tuple[list[Rule], list[RuleTest]]:
     try:
+        #  工作区规则文件来自仓库：指向设备的链接整读读不到头，按读不了处理
+        fsguard.require_regular(path)
         raw = path.read_text(encoding="utf-8")
     except OSError:
         return [], []

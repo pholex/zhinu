@@ -17,6 +17,8 @@ from unittest import mock
 
 from xiaoyu import compaction, media, providers, responses, session_log, tokens
 
+from .fifo_support import call_bounded, needs_fifo
+
 PNG = b"\x89PNG\r\n\x1a\n fake bytes"
 
 
@@ -136,6 +138,26 @@ class AcceptTest(unittest.TestCase):
             ref, problem = media.accept_file(path)
             self.assertEqual(problem, "")
             self.assertTrue(media.data_url(ref).startswith("data:image/png;base64,"))
+
+    @needs_fifo
+    def test_accept_file_refuses_fifo_without_blocking(self):
+        """拖进来的若是命名管道，read_bytes 会一直等写者，输入框跟着冻死。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            fifo = Path(tmp) / "shot.png"
+            os.mkfifo(fifo)
+            ref, problem = call_bounded(self, lambda: media.accept_file(fifo), fifo)
+        self.assertEqual(ref, "")
+        self.assertIn("FIFO", problem)
+
+    def test_accept_file_rejects_oversize_before_reading(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            big = Path(tmp) / "big.png"
+            with big.open("wb") as handle:
+                handle.truncate(media.MAX_IMAGE_BYTES + 1)  # 稀疏文件，不真写几 MB
+            with mock.patch.object(Path, "read_bytes", side_effect=AssertionError("不该整读")):
+                ref, problem = media.accept_file(big)
+        self.assertEqual(ref, "")
+        self.assertIn("上限", problem)
 
     def test_accept_file_missing(self):
         ref, problem = media.accept_file(Path("/nope/missing.png"))
