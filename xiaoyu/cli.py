@@ -1352,7 +1352,8 @@ def serve_command(argv: list[str]) -> int:
     parser.add_argument(
         "--state-dir",
         dest="state_dir",
-        help="agent 对象 / 会话清单 / 会话日志的落盘目录，默认 ~/.xiaoyu/serve/<root slug>/",
+        help="agent 对象 / 会话清单 / 会话日志的落盘目录，默认用户配置目录下的 serve/<root slug>/"
+        "（Linux/macOS 为 ~/.config/xiaoyu/serve/…）",
     )
     parser.add_argument(
         "--no-persist",
@@ -1369,8 +1370,8 @@ def serve_command(argv: list[str]) -> int:
         "--public-url",
         dest="public_url",
         default="",
-        help="写进 schema servers 的地址。编排器在容器里时必填"
-        "（Docker Desktop 常用 http://host.docker.internal:8420）",
+        help="对外地址，写进 OpenAPI schema 的 servers（运行中的 /openapi.json 与 --print-openapi 都用）。"
+        "编排器在容器里或经反代访问时填（Docker Desktop 常用 http://host.docker.internal:8420）",
     )
     args = parser.parse_args(argv)
 
@@ -1401,10 +1402,11 @@ def serve_command(argv: list[str]) -> int:
         browser_timeout=max(1.0, args.browser_timeout),
         state_dir=Path(args.state_dir).expanduser().resolve() if args.state_dir else None,
         persist=args.persist,
+        public_url=args.public_url,
     )
     try:
         if args.print_openapi:
-            return print_openapi(cfg, args.public_url)
+            return print_openapi(cfg)
         if args.host in ("127.0.0.1", "::1", "localhost") or args.token:
             print(ui.success(f"xiaoyu serve → http://{args.host}:{args.port}  (root: {root})"))
             extra = " · MCP /mcp" if args.mcp else ""

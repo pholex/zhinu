@@ -162,6 +162,10 @@ Dify 的 Code 节点跑在沙箱里起不了子进程，所以**必须走 HTTP**
 xiaoyu serve --print-openapi --public-url http://host.docker.internal:8420 > xiaoyu.json
 ```
 
+起服务时同样带上 `--public-url`（如反代后的 `https://agent.example.com`），运行中的
+`/openapi.json` 就也带 `servers`，编排器可以直接按 URL 导入，不必离线导出。不带时运行中的
+schema 不含 `servers`，只适合同源访问（`/docs` 调试）。
+
 **2. 导入**：Dify →「工具」→「自定义」→「创建自定义工具」→ 粘贴 `xiaoyu.json` →
 鉴权方式选 **API Key**，Header 名 `Authorization`，值 `Bearer <你的 token>`。
 
@@ -309,7 +313,9 @@ curl -X POST :8420/session/sess-…/budget -d '{"budget":null}'                #
 
 ## 重启恢复
 
-agent 对象、会话清单、会话日志默认落盘在 `~/.xiaoyu/serve/<root slug>/`
+agent 对象、会话清单、会话日志默认落盘在用户配置目录下的 `serve/<root slug>/`——
+Linux/macOS 为 `~/.config/xiaoyu/serve/<root slug>/`（设了 `XDG_CONFIG_HOME` 则跟随它），
+Windows 为 `%APPDATA%\xiaoyu\serve\<root slug>\`；启动后 `GET /health` 的 `state_dir` 字段给出实际路径
 （`--state-dir` 改位置，`--no-persist` 全放内存）。serve 重启后：
 
 - 会话自动接回（`detail=recovered`），历史来自会话日志（`Agent.restore`，未配对的

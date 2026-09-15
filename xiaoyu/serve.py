@@ -35,7 +35,7 @@ serve 是**跑在别处的编排器**（HTTP，一对多、可跨机、可轮询
     POST   /agent/{id}                    更新 → 新版本；已在跑的会话仍钉着旧版本
     DELETE /agent/{id}                    归档（只读、不再接受新会话；不删）
 
-会话清单与 agent 对象默认落盘在 `~/.xiaoyu/serve/<root slug>/`，serve 重启后
+会话清单与 agent 对象默认落盘在用户配置目录的 `serve/<root slug>/`，serve 重启后
 会话自动接回（历史来自会话日志，事件游标接着编号）。细节见 serve_state.py。
 
 为什么同步与异步两个 prompt 端点都要有：coding agent 一轮动辄几分钟，编排器
@@ -198,9 +198,15 @@ class ServeConfig:
     #  默认就能让服务端跑任意命令。
     agent_mcp: str = "off"
     #  控制面状态（agent 对象、会话清单、会话日志）落在哪。None = 按 root 推：
-    #  `~/.xiaoyu/serve/<root slug>/`。persist=False 时全在内存（测试 / 一次性跑）。
+    #  用户配置目录下的 `serve/<root slug>/`（与 sessions/ 同级；Linux/macOS 即
+    #  `~/.config/xiaoyu/serve/…`，Windows 为 `%APPDATA%\xiaoyu\serve\…`）。
+    #  persist=False 时全在内存（测试 / 一次性跑）。
     state_dir: Path | None = None
     persist: bool = True
+    #  对外地址（反代域名、host.docker.internal 等），写进 OpenAPI schema 的 `servers`。
+    #  设了则运行中的 /openapi.json 也带上——Dify/n8n 可直接按 URL 导入；空 = 运行中的
+    #  schema 不带 servers（FastAPI 默认，同源访问够用），--print-openapi 按监听地址推。
+    public_url: str = ""
     #  允许跨源（CORS）的浏览器 origin 白名单，如 `chrome-extension://<id>`、
     #  `https://console.example.com`。空 = 不发任何 CORS 头（非浏览器客户端不需要）。
     #  只是"浏览器肯不肯把响应交给页面脚本"的门，不是鉴权——token 仍照常校验。
@@ -796,6 +802,9 @@ def create_app(cfg: ServeConfig):  # noqa: C901 - 路由表天然长，拆开反
 
     app = FastAPI(
         lifespan=lifespan,
+        #  不设就传 None（FastAPI 默认不出 servers）；设了则运行中的 schema 与
+        #  --print-openapi 一致，编排器按 URL 导入也拿得到 base URL
+        servers=[{"url": cfg.public_url, "description": "xiaoyu serve"}] if cfg.public_url else None,
         title="xiaoyu HTTP API",
         version=__import__("xiaoyu").__version__,
         description=(
@@ -1711,15 +1720,16 @@ def print_openapi(cfg: ServeConfig, public_url: str = "") -> int:
     它们只能拿到相对路径，导进去也发不出请求。FastAPI 默认不生成这一段
     （它假设调用方就在同一个 origin 下），所以这里显式补。
 
-    `public_url` 缺省按监听地址推。**编排器多半跑在容器里**，那时 127.0.0.1
-    是容器自己而不是本机——所以推出来是回环地址时额外打一行提示，别让人
-    照抄一个在 Dify 里必然连不上的地址。
+    `public_url`（参数优先，其次 `cfg.public_url`）缺省按监听地址推。**编排器多半
+    跑在容器里**，那时 127.0.0.1 是容器自己而不是本机——所以推出来是回环地址时
+    额外打一行提示，别让人照抄一个在 Dify 里必然连不上的地址。
     """
     app = create_app(cfg)
     schema = app.openapi()
-    url = public_url or f"http://{cfg.host}:{cfg.port}"
+    explicit = public_url or cfg.public_url
+    url = explicit or f"http://{cfg.host}:{cfg.port}"
     schema["servers"] = [{"url": url, "description": "xiaoyu serve"}]
-    if not public_url and cfg.host in ("127.0.0.1", "::1", "localhost", "0.0.0.0"):
+    if not explicit and cfg.host in ("127.0.0.1", "::1", "localhost", "0.0.0.0"):
         print(
             f"提示：schema 里的 servers 填的是 {url}。若 Dify / n8n 跑在容器里，"
             "这个地址指向的是容器自己——请用 --public-url 指定它们真正能访问到的地址"
