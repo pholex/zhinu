@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import contextlib
 import io
+import os
 import unittest
 from unittest import mock
 
@@ -754,6 +755,62 @@ class TestTuiFrontend(AgentTestCase):
                 result = inline_select("要修改 calc.py 吗？", options, expand=lambda: calls.append(1))
         self.assertEqual(result, "one")
         self.assertEqual(calls, [1])
+
+    def prompt_lines(self, tui, *batches: str, count: int) -> list[str]:
+        """用管道输入真实驱动输入行（带小羽自己的按键表），返回每次提交的文本。
+
+        每个 batch 在上一次提交返回后才写进管道，模拟"两批输入之间隔着人手的
+        时间"；同一个 batch 内的按键一次写入，模拟终端一次交付的一批输入。
+        """
+        from prompt_toolkit import PromptSession
+        from prompt_toolkit.application import create_app_session
+        from prompt_toolkit.input.defaults import create_pipe_input
+        from prompt_toolkit.output import DummyOutput
+
+        results: list[str] = []
+        pending = list(batches)
+        with create_pipe_input() as pipe:
+            with create_app_session(input=pipe, output=DummyOutput()):
+                session = PromptSession(key_bindings=tui._key_bindings(), multiline=True)
+                for _ in range(count):
+                    if pending:
+                        pipe.send_text(pending.pop(0))
+                    results.append(session.prompt("› "))
+        return results
+
+    def test_enter_inside_unbracketed_paste_inserts_newline(self) -> None:
+        """bracketed paste 失效（tmux 未透传等）时，粘贴里的换行以回车按键到达：
+        同一批里回车后面还有按键 → 当换行插入，整段只提交一次。"""
+        tui = self.make_tui()
+        self.assertEqual(
+            self.prompt_lines(tui, "line1\rline2\r\rline3\r", count=1),
+            ["line1\nline2\n\nline3"],
+        )
+
+    @unittest.skipUnless(os.name == "posix", "分块读取补强只在 posix 生效")
+    def test_enter_at_read_chunk_boundary_still_pasted(self) -> None:
+        """大段粘贴被分多次 read：回车恰好是一批的最后一个字节时，stdin 里还有
+        后续数据，同样当换行。prompt_toolkit 每次读 1024 字节。"""
+        tui = self.make_tui()
+        head = "a" * 1023
+        self.assertEqual(
+            self.prompt_lines(tui, f"{head}\rtail\r", count=1), [f"{head}\ntail"]
+        )
+
+    def test_enter_in_separate_batches_submits_each(self) -> None:
+        """人手敲的回车与下一次按键分属不同批次：照常逐条提交。"""
+        tui = self.make_tui()
+        self.assertEqual(
+            self.prompt_lines(tui, "先跑测试\r", "/help\r", count=2), ["先跑测试", "/help"]
+        )
+
+    def test_bracketed_paste_still_folds_and_submits(self) -> None:
+        """正常的 bracketed paste 路径不受影响：整段进缓冲区，回车提交展开后的原文。"""
+        tui = self.make_tui()
+        body = "\n".join(f"第 {n} 行" for n in range(10))
+        self.assertEqual(
+            self.prompt_lines(tui, f"\x1b[200~{body}\x1b[201~\r", count=1), [body]
+        )
 
     def test_confirm_session_choice_grants_session(self) -> None:
         tui = self.make_tui()

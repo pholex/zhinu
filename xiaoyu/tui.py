@@ -422,6 +422,47 @@ def _register(handlers: dict[str, Any], *categories: str) -> KeyBindings:
     return bindings
 
 
+def _enter_is_pasted(event: Any) -> bool:
+    """这个回车是不是粘贴里夹带的换行（而不是人按的提交）。
+
+    正常终端靠 bracketed paste 把整段粘贴包成一个事件；tmux 未透传、部分
+    输入法与远程终端下这层包装丢了，粘贴里的换行就以回车按键到达，逐行提交。
+    判据是"回车后面还有同一批到达的输入"：终端一次交付的字节在
+    prompt_toolkit 里会整批 feed 进 key_processor 的队列再逐键处理，人手按键
+    间隔远大于一次读取，回车跑到这里时队列必然已空；只有粘贴、程序化输入
+    才会让回车身后还排着按键。
+
+    - 队列里的光标位置应答（CPR）是终端对重绘的回话，不算输入；
+    - 大段粘贴会被分成多次 read（每次 1024 字节），回车恰好落在一批末尾时
+      队列是空的：posix 下再无等待地看一眼 stdin 是否仍可读，可读就照
+      prompt_toolkit 自己的路径读进来排进队列再判——零等待，正常回车不多耽搁
+      一毫秒；
+    - Windows 的输入层自带粘贴识别（同批里夹换行的文本合成一次粘贴事件），
+      只做队列判断，不碰 stdin。
+    """
+    from prompt_toolkit.keys import Keys
+
+    processor = event.key_processor
+
+    def queued() -> bool:
+        return any(press.key != Keys.CPRResponse for press in processor.input_queue)
+
+    if queued():
+        return True
+    if os.name != "posix":
+        return False
+    app_input = event.app.input
+    try:
+        import select
+
+        if not select.select([app_input.fileno()], [], [], 0)[0]:
+            return False
+        processor.feed_multiple(app_input.read_keys())
+    except Exception:  # noqa: BLE001 - 看不了就按普通回车提交，绝不能吞掉用户的回车
+        return False
+    return queued()
+
+
 def apply_theme(console: Console) -> None:
     """把语义 token 挂到 Console 上，之后 `style="status.error"` 才认得。
 
@@ -1437,6 +1478,11 @@ class Tui:
 
         def _submit(event: Any) -> None:
             buffer = event.current_buffer
+            if _enter_is_pasted(event):
+                #  粘贴里的换行（bracketed paste 失效时以回车按键到达）：
+                #  插成换行，整段粘贴完才由最后那个回车提交
+                buffer.insert_text("\n")
+                return
             state = buffer.complete_state
             if state and state.current_completion:
                 #  菜单里有选中的候选：先把它落定成真实文本再提交。
