@@ -110,6 +110,7 @@ from .events import (
     UIEvent,
 )
 from .permissions import Permissions, parse_rule, suggest_allow_rule
+from .session_log import _ensure_private_dir, _open_private
 from . import render
 from .render import args_preview
 
@@ -1413,9 +1414,15 @@ class Tui:
     def _input_session(self) -> PromptSession:
         if self._session is None:
             history_dir = user_config_dir()
-            history_dir.mkdir(parents=True, exist_ok=True)
+            #  历史里是用户敲过 / 贴过的原文，可能带密钥：与会话日志同一口径——
+            #  新建的目录层 0700，文件在 FileHistory 按 umask 建出 0644 之前先以 0600
+            #  预建（旧版留下的宽权限顺手收紧）。Windows 上权限无语义，失败忽略
+            _ensure_private_dir(history_dir)
+            history_file = history_dir / "input_history"
+            with contextlib.suppress(OSError):
+                os.close(_open_private(history_file, os.O_WRONLY | os.O_APPEND))
             self._session = PromptSession(
-                history=DedupedHistory(str(history_dir / "input_history")),
+                history=DedupedHistory(str(history_file)),
                 completer=SlashCompleter(self),
                 key_bindings=self._key_bindings(),
                 multiline=True,
