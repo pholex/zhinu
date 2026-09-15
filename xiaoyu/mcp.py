@@ -100,6 +100,16 @@ CALL_TIMEOUT = 120.0
 #  工具描述超长会白吃每轮请求的 token：MCP server 的描述质量参差，硬顶一刀。
 _DESCRIPTION_CAP = 1_000
 
+#  远端 server 不可信：应答读进内存之前先设上限，超了当场拒收。
+#  普通应答整体 10 MiB（有 Content-Length 先看声明，没有就分块累计）；
+#  SSE 按单个事件计 10 MiB（事件结束清零——长流本身不设总量上限）；
+#  错误状态码的应答体只读开头 4 KiB，拿来给报错配个说明就够了。
+_HTTP_BODY_CAP = 10 * 1024 * 1024
+_SSE_EVENT_CAP = 10 * 1024 * 1024
+_HTTP_ERROR_BODY_CAP = 4 * 1024
+#  分块读的块大小（单行不带换行时也按这个粒度读，不会一口吞下整行）
+_READ_CHUNK = 64 * 1024
+
 #  配置文件名：工作区级用 .mcp.json（多家客户端通用的既成事实标准，
 #  同一个仓库配一次全家通用）；用户级放配置目录下的 mcp.json。
 WORKSPACE_FILE = ".mcp.json"
@@ -114,11 +124,12 @@ WORKSPACE_FILE = ".mcp.json"
 #    timeout          请求发出后等应答超时                          → 只报错；结果不确定
 #    server           5xx                                          → 只报错；结果不确定
 #    malformed        应答解析不了                                  → 只报错；结果不确定
+#    too_large        应答体超过上限（见 _HTTP_BODY_CAP 一组常量）    → 只报错；结果不确定
 #    http             其余 4xx（server 明确拒收，请求没执行）         → 只报错
 _RECONNECT_KINDS = frozenset({"connect", "session_expired", "dropped"})
 #  "结果不确定"：请求已送达 server 却没拿到可信应答——tools/call 的副作用可能
 #  已经发生，自动重试可能把一次写操作做成两次
-_OUTCOME_UNKNOWN_KINDS = frozenset({"dropped", "timeout", "server", "malformed"})
+_OUTCOME_UNKNOWN_KINDS = frozenset({"dropped", "timeout", "server", "malformed", "too_large"})
 
 
 class McpError(RuntimeError):
@@ -610,7 +621,7 @@ class _HttpChannel:
             return []  # 通知被接收，无响应体
         if kind == "text/event-stream":
             return list(_read_sse(response))
-        raw = response.read().decode("utf-8", "replace").strip()
+        raw = _read_capped(response).decode("utf-8", "replace").strip()
         if not raw:
             return []
         message = json.loads(raw)
@@ -623,8 +634,10 @@ class _HttpChannel:
         code = exc.code
         detail = ""
         if exc.fp:
+            #  只读开头：错误体同样来自不可信的远端，展示也只用得上前 200 字
             with contextlib.suppress(Exception):
-                detail = _redact(exc.read().decode("utf-8", "replace")[:200]).strip()
+                head = exc.read(_HTTP_ERROR_BODY_CAP)
+                detail = _redact(head.decode("utf-8", "replace")[:200]).strip()
         with contextlib.suppress(Exception):
             exc.close()
         suffix = f"：{detail}" if detail else ""
@@ -711,6 +724,31 @@ class _HttpChannel:
             netproxy.urlopen(request, timeout=5.0).close()
 
 
+def _read_capped(response: Any) -> bytes:
+    """读普通应答体，超过 _HTTP_BODY_CAP 即拒收（McpError kind=too_large）。
+
+    有 Content-Length 的先看声明，超了一个字节都不读；没有（或声明撒谎）就
+    分块累计，越线当场停手——绝不先整个读进内存再量长度。
+    """
+    cap = _HTTP_BODY_CAP
+    declared = (response.headers.get("Content-Length") or "").strip()
+    if declared.isdigit() and int(declared) > cap:
+        raise McpError(
+            f"应答体声明 {int(declared)} 字节，超过上限 {cap} 字节，拒收", kind="too_large"
+        )
+    chunks: list[bytes] = []
+    total = 0
+    while True:
+        #  多要 1 字节：读满上限时还得分得清"正好"与"超了"
+        chunk = response.read(min(_READ_CHUNK, cap + 1 - total))
+        if not chunk:
+            return b"".join(chunks)
+        total += len(chunk)
+        if total > cap:
+            raise McpError(f"应答体超过上限 {cap} 字节，拒收", kind="too_large")
+        chunks.append(chunk)
+
+
 def _read_sse(response: Any) -> "Iterator[dict[str, Any]]":
     """SSE 流 → JSON-RPC 消息，**边读边吐**（生成器）。
 
@@ -719,13 +757,34 @@ def _read_sse(response: Any) -> "Iterator[dict[str, Any]]":
 
     多行 data 按规范用 \n 拼接。解析不出 JSON 的块跳过——server 拿注释行做
     心跳是常见做法，不该把心跳当协议错误。
+
+    内存有界：readline 带上限按块读，没有换行的超长行也只会一块一块进来；
+    一个事件（上一个空行之后读到的全部字节）超过 _SSE_EVENT_CAP 即拒收。
+    还没攒到 data 时（心跳、event:/id: 行）计数随行清零，长流挂一整天也不误伤。
+    不用 `for line in response`：那是不限长的 readline，一行不换行就读到内存爆。
     """
     buffer: list[str] = []
-    for raw in response:
-        line = raw.decode("utf-8", "replace") if isinstance(raw, bytes) else raw
-        line = line.rstrip("\r\n")
-        if line.startswith(":"):
-            continue  # 注释/心跳
+    pending = bytearray()  # 当前行已读到、还没见到换行的部分
+    size = 0  # 当前事件已读字节
+    while True:
+        cap = _SSE_EVENT_CAP
+        chunk = response.readline(min(_READ_CHUNK, cap + 1 - size))
+        if chunk:
+            size += len(chunk)
+            if size > cap:
+                raise McpError(f"SSE 单个事件超过上限 {cap} 字节，拒收", kind="too_large")
+            if not chunk.endswith(b"\n"):
+                pending += chunk
+                continue
+            raw = bytes(pending) + chunk
+            pending.clear()
+        elif pending:
+            #  流在一行中间结束：残留的半行照常当最后一行处理
+            raw = bytes(pending)
+            pending.clear()
+        else:
+            break
+        line = raw.decode("utf-8", "replace").rstrip("\r\n")
         if line == "":
             if buffer:
                 try:
@@ -735,9 +794,13 @@ def _read_sse(response: Any) -> "Iterator[dict[str, Any]]":
                 if isinstance(message, dict):
                     yield message
                 buffer = []
+            size = 0
             continue
         if line.startswith("data:"):
             buffer.append(line[5:].lstrip())
+        #  注释/心跳与 event:/id: 行都不攒内容：还没开始攒 data 就不累计
+        if not buffer:
+            size = 0
     if buffer:
         try:
             message = json.loads("\n".join(buffer))

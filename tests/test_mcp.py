@@ -246,6 +246,8 @@ class _McpHttpHandler(BaseHTTPRequestHandler):
     actions: list = []
     #  initialize 的状态码（200 = 正常握手）
     init_status = 200
+    #  超大应答类动作的数据量（用例把客户端上限临时调小到它之下）
+    big = 100 * 1024
 
     def log_message(self, *args):  # 别把请求日志打进测试输出
         pass
@@ -257,6 +259,42 @@ class _McpHttpHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
+
+    def _send_oversized(self, action: str, message: dict) -> None:
+        """big_json 带 Content-Length / big_stream 不带长度读到断开 /
+        big_sse_line 不换行的超长 data 行 / big_sse_event 许多短行攒成的超大事件 /
+        sse_many 许多小事件（单个不超限、总量超限）后跟正常应答 / big_error 超大 500 错误体。"""
+        cls = type(self)
+        if action == "big_error":
+            self._send_status(500, b"x" * 100 + b"TAIL-MARKER" + b"y" * cls.big)
+            return
+        sse = action.startswith(("big_sse", "sse_"))
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream" if sse else "application/json")
+        if action == "big_json":
+            body = b'{"pad": "' + b"a" * cls.big + b'"}'
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
+        self.send_header("Connection", "close")
+        self.end_headers()
+        self.close_connection = True
+        if action == "big_stream":
+            self.wfile.write(b'{"pad": "' + b"a" * cls.big + b'"}')
+        elif action == "big_sse_line":
+            self.wfile.write(b"data: " + b"a" * cls.big)
+        elif action == "big_sse_event":
+            line = b'data: "' + b"a" * 1000 + b'"\n'
+            self.wfile.write(line * (cls.big // len(line) + 1))
+        elif action == "sse_many":
+            for i in range(20):
+                notice = {"jsonrpc": "2.0", "method": "notifications/progress",
+                          "params": {"progress": i, "pad": "x" * 100}}
+                self.wfile.write(f": ping\n\ndata: {json.dumps(notice)}\n\n".encode())
+            reply = {"jsonrpc": "2.0", "id": message["id"],
+                     "result": {"content": [{"type": "text", "text": "多事件"}]}}
+            self.wfile.write(f"data: {json.dumps(reply)}\n\n".encode())
 
     def _send_json(self, payload: dict, extra: dict[str, str] | None = None) -> None:
         body = json.dumps(payload).encode()
@@ -327,6 +365,10 @@ class _McpHttpHandler(BaseHTTPRequestHandler):
                 self.close_connection = True
             elif action == "drop":
                 self.close_connection = True
+            else:
+                #  超大应答类动作：客户端读够上限就断开，写端撞 BrokenPipe 属预期
+                with contextlib.suppress(OSError):
+                    self._send_oversized(action, message)
             return
         if method == "tools/list":
             result = {"tools": [{
@@ -621,6 +663,69 @@ class HttpFailureTest(_HttpServerCase):
         self.assertEqual(caught.exception.kind, "server")
         self.assertTrue(server.alive())
         self.assertEqual([t["name"] for t in server._list_tools()], ["echo"])
+
+
+class HttpBodyCapTest(_HttpServerCase):
+    """远端应答体有上限：超大 body / 超大 SSE 事件 / 超大错误体都明确拒收。
+
+    上限在用例里临时调小到 64 KiB、数据给 100 KiB：验证的是"分块累计、越线
+    即停"的逻辑，不必真的搬 10 MiB。
+    """
+
+    def setUp(self):
+        super().setUp()
+        for name, value in (
+            ("_HTTP_BODY_CAP", 64 * 1024),
+            ("_SSE_EVENT_CAP", 64 * 1024),
+            ("_HTTP_ERROR_BODY_CAP", 16),
+        ):
+            patcher = mock.patch.object(mcp, name, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        #  超时给短：修之前超大 body 能读完，只会因为"没有应答"干等满超时
+        self.server = self.make_server(timeout=2.0)
+        self.server.bootstrap()
+
+    def assert_too_large(self, action: str, needle: str) -> mcp.McpError:
+        _McpHttpHandler.actions = [action]
+        with self.assertRaises(mcp.McpError) as caught:
+            self.server._list_tools()
+        self.assertEqual(caught.exception.kind, "too_large", str(caught.exception))
+        self.assertIn(needle, str(caught.exception))
+        #  超限是这一次应答的问题，server 本身不判死
+        self.assertTrue(self.server.alive())
+        return caught.exception
+
+    def test_declared_oversized_body_rejected_up_front(self):
+        _McpHttpHandler.actions = ["big_json"]
+        out = self.server.call_tool("echo", {"text": "x"})
+        self.assertIn("声明", out)
+        self.assertIn("超过上限", out)
+        self.assertIn("调用结果不确定", out)
+
+    def test_streamed_oversized_body_rejected(self):
+        error = self.assert_too_large("big_stream", "应答体超过上限")
+        self.assertNotIn("声明", str(error))
+
+    def test_sse_line_without_newline_is_capped(self):
+        self.assert_too_large("big_sse_line", "SSE 单个事件超过上限")
+
+    def test_sse_event_of_many_lines_is_capped(self):
+        self.assert_too_large("big_sse_event", "SSE 单个事件超过上限")
+
+    def test_sse_cap_resets_between_events(self):
+        """上限按单个事件计：一串小事件总量远超上限也照常收完。"""
+        _McpHttpHandler.actions = ["sse_many"]
+        with mock.patch.object(mcp, "_SSE_EVENT_CAP", 512):
+            self.assertEqual(self.server.call_tool("echo", {"text": "x"}), "多事件")
+
+    def test_error_body_read_is_bounded(self):
+        _McpHttpHandler.actions = ["big_error"]
+        out = self.server.call_tool("echo", {"text": "x"})
+        self.assertIn("HTTP 500", out)
+        self.assertIn("xxxx", out)
+        #  标记在第 100 字节之后：只读了上限（16 字节）就看不到它
+        self.assertNotIn("TAIL-MARKER", out)
 
 
 class LaunchSpecsTest(unittest.TestCase):
