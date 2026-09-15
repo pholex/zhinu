@@ -35,7 +35,11 @@ from .compaction import (
     MIN_SUMMARY_CHARS,
     PREFIX_SUMMARY_INSTRUCTION,
     SUMMARY_INSTRUCTION,
+    TOOL_IMAGE_HIGH_WATER,
+    TOOL_IMAGE_KEEP,
     Compactor,
+    TruncatedSummary,
+    age_tool_images,
     is_degenerate_summary,
     microcompact,
 )
@@ -949,6 +953,9 @@ class Agent:
             #  harness 注入的伪 user 消息（收尾/nudge/plan mode），压缩时不算"用户原话"。
             #  plan mode 进场说明是按会话格式化的（含 plan 文件路径），追加实文
             synthetic_user_texts=SYNTHETIC_USER_TEXTS | {self._plan_enter_note},
+            #  压缩后附当前计划原文：update_plan 调用落进被压区也不丢逐字状态。
+            #  惰性取值——self.plan 在后面才初始化，且随 update_plan 整体替换
+            plan_provider=lambda: self.plan,
         )
         #  子 agent 不再挂 explore，避免无限套娃
         #  嵌套闸（与 allow_explore 解耦）：allow_explore 管 explore/new_context 这类
@@ -2692,8 +2699,21 @@ class Agent:
                     media.text_part(f"[上一步的工具返回了 {count} 张图片，如下]"),
                     *parts,
                 ],
+                #  工具图标记：老化只动它，用户贴的图不动（出网前被摘掉）
+                media.TOOL_MEDIA_KEY: True,
             }
         )
+        #  截图循环不等压缩阈值：图按固定 token 估算，请求体可能先于估算撞上限。
+        #  批量老化（见 age_tool_images），未过高水位时历史原样不动、缓存不断
+        self.messages, aged = age_tool_images(self.messages)
+        if aged:
+            self._history_rewritten()
+            self.sink.emit(
+                Notice(
+                    f"[工具截图超过 {TOOL_IMAGE_HIGH_WATER} 张，较早的 {aged} 张已换成文字占位"
+                    f"（保留最新 {TOOL_IMAGE_KEEP} 张）]"
+                )
+            )
 
     # ---------- 上下文管理 ----------
 
@@ -2973,9 +2993,10 @@ class Agent:
                         response.usage.completion_tokens or 0,
                     )
                 content = response.choices[0].message.content or ""
-                if not is_degenerate_summary(content):
+                if not self._summary_truncated(response) and not is_degenerate_summary(content):
                     return content
-                #  重放姿势退化（比如模型执意调工具）：掉回转写姿势再试本路由
+                #  重放姿势退化（比如模型执意调工具）或被截断：掉回转写姿势再试本路由
+                #  ——转写输入更短，要交接的内容少了，输出也更可能落在上限之内
         prompt = f"{SUMMARY_INSTRUCTION}\n\n---\n\n{transcript}"
         response = route.client.chat.completions.create(
             model=route.model,
@@ -2988,7 +3009,20 @@ class Agent:
                 response.usage.prompt_tokens or 0,
                 response.usage.completion_tokens or 0,
             )
-        return response.choices[0].message.content or ""
+        content = response.choices[0].message.content or ""
+        if self._summary_truncated(response):
+            #  半截摘要再长也不能当成功（见 TruncatedSummary）：抛给 _summarize 换路由
+            raise TruncatedSummary(
+                f"{route.qualified} 的摘要撞输出上限被截断（已产出 {len(content)} 字符）"
+            )
+        return content
+
+    @staticmethod
+    def _summary_truncated(response: Any) -> bool:
+        """非流式响应是否撞了输出上限。三种协议都已归一成 finish_reason=length
+        （Messages 的 max_tokens、Responses 的 incomplete: max_output_tokens）。"""
+        choices = getattr(response, "choices", None) or []
+        return bool(choices) and getattr(choices[0], "finish_reason", None) == "length"
 
     def _summarize(self, transcript: str, prefix: list[dict[str, Any]] | None = None) -> str:
         """让模型把早期对话总结成交接说明。不带工具调用、不流式。
@@ -3002,6 +3036,12 @@ class Agent:
         for route in self.summary_models():
             try:
                 content = self._summary_call(route, transcript, prefix or [])
+            except TruncatedSummary as exc:
+                last_error = exc
+                self.sink.emit(
+                    Notice(f"  摘要模型 {route.qualified} 输出被截断（半截摘要不落盘），回退下一个")
+                )
+                continue
             except Exception as exc:  # noqa: BLE001 - 换下一个模型再试
                 last_error = exc
                 self.sink.emit(

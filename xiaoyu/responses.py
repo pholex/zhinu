@@ -339,6 +339,8 @@ class Message:
 @dataclass
 class NonStreamChoice:
     message: Message
+    #  与 chat 非流式 choice 同名字段：截断时为 "length"（摘要调用据此拒收半截摘要）
+    finish_reason: str | None = None
 
 
 @dataclass
@@ -459,9 +461,17 @@ def _failure(event: Any) -> str:
 
 
 def to_completion(response: Any) -> Completion:
-    """非流式响应 → chat completions 形状（`_summarize` 走这条路）。"""
+    """非流式响应 → chat completions 形状（`_summarize` 走这条路）。
+
+    截断（incomplete: max_output_tokens）与流式一路同样翻成 finish_reason=length。"""
+    details = getattr(response, "incomplete_details", None)
+    finish = "length" if getattr(details, "reason", None) == "max_output_tokens" else None
     return Completion(
-        choices=[NonStreamChoice(Message(content=getattr(response, "output_text", "") or ""))],
+        choices=[
+            NonStreamChoice(
+                Message(content=getattr(response, "output_text", "") or ""), finish_reason=finish
+            )
+        ],
         usage=_usage(getattr(response, "usage", None)),
     )
 
