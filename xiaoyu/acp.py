@@ -156,7 +156,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, TextIO
 
-from . import __version__, folder_trust, mcp, mcp_guard, media, modes
+from . import __version__, folder_trust, fsguard, mcp, mcp_guard, media, modes
 from .config import Config, MissingConfig, load_dotenv, user_env_path
 from .permissions import Permissions, suggest_allow_rule
 from .session_log import (
@@ -229,6 +229,8 @@ _TOOL_KINDS = {
 }
 
 _TITLE_LIMIT = 80
+#  write_file 预览读旧内容的上限：再大的文件 client 也渲染不动，只给位置不给 diff
+_PREVIEW_MAX_BYTES = 1024 * 1024
 
 
 def _text_content(text: str) -> dict[str, Any]:
@@ -652,11 +654,24 @@ class AcpSink:
                     }
                 ]
             elif name == "write_file":
+                target = Path(self._absolute(path))
                 old: str | None = None
                 try:
-                    old = Path(self._absolute(path)).read_text(encoding="utf-8")
+                    #  路径由模型给出：FIFO 整读会把事件线程永久挂死、设备读不到头，
+                    #  超大文件塞进预览也没法看——这几类只给位置、不给 diff
+                    info = fsguard.require_regular(target)
+                except FileNotFoundError:
+                    info = None  # 新文件：oldText=null 即 ACP 的"新建"语义
                 except OSError:
-                    pass  # 新文件：oldText=null 即 ACP 的"新建"语义
+                    return extras
+                if info is not None:
+                    if info.st_size > _PREVIEW_MAX_BYTES:
+                        return extras
+                    try:
+                        old = target.read_text(encoding="utf-8")
+                    except (OSError, UnicodeDecodeError):
+                        #  非 UTF-8 的旧文件给不出文本 diff；oldText=null 会被当成新建，不能用
+                        return extras
                 extras["content"] = [
                     {
                         "type": "diff",
