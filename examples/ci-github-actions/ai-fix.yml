@@ -1,6 +1,7 @@
-# 给 issue 打上 ai-fix 标签 → 小羽在 runner 上修 → workflow 开 PR（修不了就回帖说明）。
+# 给 issue 打上 ai-fix 标签 → 小羽在 runner 上修 → workflow 独立跑测试 → 开 PR
+# （修不了、或验证没过，就回帖说明）。
 #
-# 用法：拷到你仓库的 .github/workflows/ai-fix.yml，
+# 用法：拷到你仓库的 .github/workflows/ai-fix.yml，改下面 job 级 env 里的测试命令，
 #       在 Settings → Secrets and variables → Actions 里配 DEEPSEEK_API_KEY。
 # 设计取舍与安全边界见 docs/ci.md，改之前先读一遍。
 name: ai-fix
@@ -23,6 +24,10 @@ jobs:
       contents: write
       pull-requests: write
       issues: write
+    env:
+      #  改成你仓库的：验证用的测试命令，和测试文件的 git pathspec
+      TEST_CMD: python -m unittest discover -v
+      TEST_PATHSPEC: ":(glob)**/test_*.py"
     steps:
       - uses: actions/checkout@v7
         with:
@@ -55,11 +60,27 @@ jobs:
                 --budget-tokens 400000 > "$RUNNER_TEMP/result.json"
           echo "fixed=$(jq -r '.output.fixed' "$RUNNER_TEMP/result.json")" >> "$GITHUB_OUTPUT"
 
-      - name: 开 PR
+      #  fixed 是模型自报。开 PR 之前由 workflow 自己跑一遍测试，不拿自报当验收
+      - name: 独立验证
+        id: verify
         if: steps.agent.outputs.fixed == 'true'
+        run: |
+          #  模型开着 --yolo，也能把测试改松让它"通过"：动过的已有测试文件要在 PR 里点名
+          changed=$(git diff --name-only HEAD -- "$TEST_PATHSPEC" | paste -sd ' ' -)
+          echo "changed_tests=$changed" >> "$GITHUB_OUTPUT"
+          if bash -c "$TEST_CMD" > "$RUNNER_TEMP/verify.log" 2>&1; then
+            echo "passed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "passed=false" >> "$GITHUB_OUTPUT"
+          fi
+          tail -n 50 "$RUNNER_TEMP/verify.log"
+
+      - name: 开 PR
+        if: steps.verify.outputs.passed == 'true'
         env:
           GH_TOKEN: ${{ github.token }}
           ISSUE_NUMBER: ${{ github.event.issue.number }}
+          CHANGED_TESTS: ${{ steps.verify.outputs.changed_tests }}
         run: |
           #  -A 会连带模型跑测试留下的产物（__pycache__、构建目录）——仓库需有对应的 .gitignore
           git add -A
@@ -75,26 +96,42 @@ jobs:
           git commit -m "fix: #$ISSUE_NUMBER"
           git push --force "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" "$branch"
           jq -r '.output.summary' "$RUNNER_TEMP/result.json" > "$RUNNER_TEMP/body.md"
+          if [ -n "$CHANGED_TESTS" ]; then
+            printf '\n\n> ⚠️ 本次改动了已有测试文件：%s——review 时确认没有把测试改松。\n' "$CHANGED_TESTS" >> "$RUNNER_TEMP/body.md"
+          fi
           printf '\n\nCloses #%s\n' "$ISSUE_NUMBER" >> "$RUNNER_TEMP/body.md"
           gh pr view "$branch" > /dev/null 2>&1 \
             || gh pr create --head "$branch" --title "fix: #$ISSUE_NUMBER" --body-file "$RUNNER_TEMP/body.md"
 
-      - name: 修不了就回帖说明
-        if: steps.agent.outputs.fixed == 'false'
+      - name: 修不了或验证没过就回帖说明
+        if: steps.agent.outputs.fixed == 'false' || steps.verify.outputs.passed == 'false'
         env:
           GH_TOKEN: ${{ github.token }}
           ISSUE_NUMBER: ${{ github.event.issue.number }}
+          PASSED: ${{ steps.verify.outputs.passed }}
         run: |
-          jq -r '"小羽没能自动修复：\n\n" + .output.summary' "$RUNNER_TEMP/result.json" > "$RUNNER_TEMP/comment.md"
+          if [ "$PASSED" = "false" ]; then
+            {
+              printf '小羽报告已修复，但独立验证没通过（`%s`），没有开 PR。\n\n' "$TEST_CMD"
+              printf '<details><summary>测试输出（末 50 行）</summary>\n\n```\n'
+              tail -n 50 "$RUNNER_TEMP/verify.log"
+              printf '```\n\n</details>\n\n小羽的说明：\n\n'
+              jq -r '.output.summary' "$RUNNER_TEMP/result.json"
+            } > "$RUNNER_TEMP/comment.md"
+          else
+            jq -r '"小羽没能自动修复：\n\n" + .output.summary' "$RUNNER_TEMP/result.json" > "$RUNNER_TEMP/comment.md"
+          fi
           gh issue comment "$ISSUE_NUMBER" --repo "$GITHUB_REPOSITORY" --body-file "$RUNNER_TEMP/comment.md"
+          #  验证没过要让这次运行标红，别被当成一次成功
+          [ "$PASSED" != "false" ]
 
-      #  失败也留档：收尾对象 + 会话日志（完整工具调用与输出）。
+      #  失败也留档：收尾对象 + 会话日志（完整工具调用与输出）+ 验证输出。
       #  ⚠️ 公开仓库的 artifact 所有人可下载，会话日志可能含命令输出，见 docs/ci.md「留档」
       - name: 收集留档
         if: always()
         run: |
           mkdir -p "$RUNNER_TEMP/xiaoyu"
-          cp "$RUNNER_TEMP/result.json" "$RUNNER_TEMP/xiaoyu/" 2> /dev/null || true
+          cp "$RUNNER_TEMP/result.json" "$RUNNER_TEMP/verify.log" "$RUNNER_TEMP/xiaoyu/" 2> /dev/null || true
           log=$(jq -r '.session_log // empty' "$RUNNER_TEMP/result.json" 2> /dev/null || true)
           if [ -n "$log" ] && [ -f "$log" ]; then cp "$log" "$RUNNER_TEMP/xiaoyu/"; fi
 

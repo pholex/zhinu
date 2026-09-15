@@ -1,8 +1,8 @@
 # ci-github-actions：issue 打标签，小羽修，workflow 开 PR
 
 一个无人值守的最小样本：给 issue 打上 `ai-fix` 标签，GitHub Actions 起一台用完即弃的
-runner，小羽读 issue、改代码、跑测试，按 JSON Schema 交回结论；workflow 据此开 PR，
-或者在 issue 下回帖说明为什么没修。
+runner，小羽读 issue、改代码、跑测试，按 JSON Schema 交回结论；workflow 自己再跑一遍
+测试，通过才开 PR，否则在 issue 下回帖说明为什么没修、或者验证哪里没过。
 
 | 文件 | 作用 |
 |---|---|
@@ -18,7 +18,7 @@ gh api -X PUT repos/<owner>/<repo>/actions/permissions/workflow \
   -f default_workflow_permissions=read -F can_approve_pull_request_reviews=true
 ```
 
-三个值得照抄的结构（原因见 [docs/ci.md](../../docs/ci.md)）：
+四个值得照抄的结构（原因见 [docs/ci.md](../../docs/ci.md)）：
 
 1. **模型改文件，workflow 发布**——小羽那一步只拿模型 key，`persist-credentials: false`
    让它碰不到仓库写凭证；push 和开 PR 是后面独立一步。
@@ -26,3 +26,6 @@ gh api -X PUT repos/<owner>/<repo>/actions/permissions/workflow \
    不拼进 `run:`。
 3. **按结论分支，不按退出码**——`--output-schema` 让模型交 `{fixed, summary}`，
    开 PR 还是回帖由 `fixed` 决定。
+4. **模型自报不当验收**——`fixed=true` 之后 workflow 自己跑 `TEST_CMD`，没过不开 PR；
+   改动过的已有测试文件在 PR 描述里点名。拷走时改 job 级 `env` 里的 `TEST_CMD` /
+   `TEST_PATHSPEC`，并确保默认分支本身是绿的。
