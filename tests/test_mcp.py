@@ -10,6 +10,7 @@ import base64
 import contextlib
 import io
 import json
+import os
 import sys
 import tempfile
 import threading
@@ -18,6 +19,7 @@ import time
 import unittest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from types import SimpleNamespace
 from unittest import mock
 
 from xiaoyu import mcp, media
@@ -247,6 +249,8 @@ class _McpHttpHandler(BaseHTTPRequestHandler):
     #  initialize 的状态码（200 = 正常握手）与回包里的协商版本
     init_status = 200
     init_version = "2025-06-18"
+    #  非空 = 只认这个 Authorization 头，其余请求（含 initialize）一律 401（凭据轮换）
+    require_auth = ""
     #  超大应答类动作的数据量（用例把客户端上限临时调小到它之下）
     big = 100 * 1024
 
@@ -330,6 +334,9 @@ class _McpHttpHandler(BaseHTTPRequestHandler):
         cls.record.setdefault("headers", []).append(
             {key.lower(): value for key, value in self.headers.items()}
         )
+        if cls.require_auth and self.headers.get("Authorization") != cls.require_auth:
+            self._send_status(401, b"invalid token")
+            return
         session = self.headers.get("Mcp-Session-Id")
         if session is not None and session not in cls.sessions:
             self._send_status(404)
@@ -421,6 +428,7 @@ class _HttpServerCase(unittest.TestCase):
         _McpHttpHandler.actions = []
         _McpHttpHandler.init_status = 200
         _McpHttpHandler.init_version = "2025-06-18"
+        _McpHttpHandler.require_auth = ""
         self.serve()
         self.url = f"http://127.0.0.1:{self.httpd.server_address[1]}/mcp"
         self.tmp = tempfile.TemporaryDirectory()
@@ -693,6 +701,172 @@ class HttpFailureTest(_HttpServerCase):
         self.assertEqual(caught.exception.kind, "server")
         self.assertTrue(server.alive())
         self.assertEqual([t["name"] for t in server._list_tools()], ["echo"])
+
+    # ---- 热恢复：/mcp reconnect ----
+
+    def auth_fail(self, manager: mcp.McpManager) -> None:
+        """剧本回一次 401，把 remote 打成停用态。"""
+        _McpHttpHandler.actions = ["401"]
+        with contextlib.redirect_stderr(io.StringIO()):
+            out = find_tool(manager, "__echo").handler(text="x")
+        self.assertIn("/mcp reconnect remote", out, "给模型的提示要指向热恢复入口")
+        self.assertTrue(manager._states["remote"].startswith("failed:"))
+
+    def inits(self) -> int:
+        return _McpHttpHandler.record["methods"].count("initialize")
+
+    def launch_workspace(self, auth: str) -> tuple:
+        """经 mcp.launch 从工作区 .mcp.json 起 manager（带配置重读函数的真实接线）。"""
+        workspace = Path(self.tmp.name).resolve() / "ws"
+        workspace.mkdir(exist_ok=True)
+
+        def declare(url: str, authorization: str) -> None:
+            (workspace / ".mcp.json").write_text(
+                json.dumps({"mcpServers": {"remote": {
+                    "url": url, "headers": {"Authorization": authorization},
+                }}}),
+                encoding="utf-8",
+            )
+
+        declare(self.url, auth)
+        self.addCleanup(mcp.shutdown_all)
+        config = Config(base_url="x", model="x", workspace=workspace, enable_plugins=False)
+        manager = mcp.launch(config)
+        self.assertIsNotNone(manager)
+        manager.wait_ready(20.0)
+        self.assertEqual(manager._states["remote"], "ready")
+        return manager, config, declare
+
+    def test_reconnect_recovers_after_credentials_fixed(self):
+        manager = self.make_manager()
+        echo = find_tool(manager, "__echo")
+        self.auth_fail(manager)
+        stopped = echo.handler(text="y")
+        self.assertIn("已停用", stopped)
+        self.assertIn("/mcp reconnect remote", stopped)
+        self.assertNotIn("重启会话", stopped)
+        self.assertIn("/mcp reconnect remote", manager.describe())
+        #  凭据修好（剧本已空，server 恢复正常应答）→ 热恢复
+        out = manager.command(["reconnect", "remote"])
+        self.assertIn("已恢复 remote", out)
+        self.assertEqual(manager._states["remote"], "ready")
+        self.assertNotIn("remote", manager._failed_hard)
+        self.assertEqual(find_tool(manager, "__echo").handler(text="回"), "远端回显：回")
+        #  停用前拿到的工具对象绑的是同一个 server：跟着复活，不留僵尸
+        self.assertTrue(echo.check_fn())
+        self.assertEqual(echo.handler(text="旧"), "远端回显：旧")
+        self.assertEqual(self.inits(), 2)
+        #  监督已重新接线：再被拒一次照样停用
+        self.auth_fail(manager)
+
+    def test_reconnect_still_rejected_stays_failed(self):
+        manager = self.make_manager()
+        self.auth_fail(manager)
+        _McpHttpHandler.init_status = 401
+        out = manager.reconnect("remote")
+        self.assertIn("remote 重连失败", out)
+        self.assertIn("认证失败", out)
+        self.assertIn("export", out, "要说清别的终端里 export 的变量本进程看不到")
+        state = manager._states["remote"]
+        self.assertTrue(state.startswith("failed:"), state)
+        self.assertIn("/mcp reconnect remote", state)
+        self.assertIn("remote", manager._failed_hard)
+        self.assertEqual(manager.ready_tools(), [])
+        time.sleep(0.5)  # 盖过一轮退避：失败后也不许转去后台重试
+        self.assertEqual(self.inits(), 2)
+        #  修好之后无参 = 重连全部失败的
+        _McpHttpHandler.init_status = 200
+        self.assertIn("已恢复 remote", manager.command(["reconnect"]))
+        self.assertEqual(manager._states["remote"], "ready")
+        self.assertTrue(manager.command(["reconnect"]).startswith("没有处于失败状态"))
+
+    def test_reconnect_rereads_config_and_expands_env_again(self):
+        with mock.patch.dict(os.environ, {"XY_TEST_MCP_TOKEN": "old"}):
+            _McpHttpHandler.require_auth = "Bearer old"
+            manager, _, _ = self.launch_workspace("Bearer ${env:XY_TEST_MCP_TOKEN}")
+            #  凭据轮换：server 只认新 token，现役代被拒停用
+            _McpHttpHandler.require_auth = "Bearer new"
+            with contextlib.redirect_stderr(io.StringIO()):
+                find_tool(manager, "__echo").handler(text="x")
+            self.assertTrue(manager._states["remote"].startswith("failed:"))
+            #  新 token 进了本进程环境（宿主注入 / 本进程内设置）：${env:VAR} 重新展开
+            os.environ["XY_TEST_MCP_TOKEN"] = "new"
+            out = manager.reconnect("remote")
+        self.assertIn("已恢复 remote", out)
+        self.assertIn("配置已更新", out)
+        self.assertEqual(manager._specs[0].headers["Authorization"], "Bearer new")
+        self.assertEqual(find_tool(manager, "__echo").handler(text="新"), "远端回显：新")
+
+    def test_reconnect_reload_does_not_bypass_gates(self):
+        manager, config, declare = self.launch_workspace("Bearer t")
+        #  配置被改成明文公网地址：加载期准入拦下，拒绝重连，现役代原样不动
+        declare("http://example.com/mcp", "Bearer t")
+        with contextlib.redirect_stderr(io.StringIO()) as err:
+            out = manager.reconnect("remote")
+        self.assertIn("找不到可用的声明", out)
+        self.assertIn("被安全规则拦截", err.getvalue())
+        self.assertEqual(manager._states["remote"], "ready")
+        self.assertEqual(self.inits(), 1)
+        #  工作区未受信任：工作区 .mcp.json 整个不认，与启动时同一道门
+        declare(self.url, "Bearer t")
+        config.workspace_trusted = False
+        with contextlib.redirect_stderr(io.StringIO()) as err:
+            out = manager.reconnect("remote")
+        self.assertIn("找不到可用的声明", out)
+        self.assertIn("未受信任", err.getvalue())
+        self.assertEqual(self.inits(), 1)
+        config.workspace_trusted = True
+        self.assertIn("已重启 remote", manager.reconnect("remote"))
+        self.assertEqual(self.inits(), 2)
+
+    def test_reconnect_refused_while_background_reconnect_runs(self):
+        manager = self.make_manager()
+        port = self.httpd.server_address[1]
+        self.stop_serving()
+        _McpHttpHandler.sessions = set()
+        find_tool(manager, "__echo").handler(text="x")
+        self.wait_until(lambda: "remote" in manager._reconnecting, message="后台重连未立案")
+        out = manager.reconnect("remote")
+        self.assertIn("正在重连中", out)
+        self.assertTrue(manager._states["remote"].startswith("reconnecting"))
+        self.serve(port)
+        self.wait_reconnected(manager)
+
+    def test_concurrent_manual_reconnects_restart_once(self):
+        manager = self.make_manager()
+        server = manager._servers["remote"]
+        original = server.restart
+        entered, release = threading.Event(), threading.Event()
+        calls: list = []
+
+        def slow_restart(spec=None):
+            calls.append(spec)
+            entered.set()
+            release.wait(10)
+            return original(spec)
+
+        results: list[str] = []
+        with mock.patch.object(server, "restart", side_effect=slow_restart):
+            first = threading.Thread(target=lambda: results.append(manager.reconnect("remote")))
+            first.start()
+            self.assertTrue(entered.wait(10))
+            self.assertIn("正在重连中", manager.reconnect("remote"))
+            #  占位期间：断线通知不立案后台重连，list_changed 只记 dirty 不起线程
+            manager._schedule_reconnect(server)
+            self.assertFalse(server.reconnecting)
+            manager._schedule_resync(server)
+            self.assertNotIn("remote", manager._resync_running)
+            release.set()
+            first.join(20)
+        self.assertEqual(len(calls), 1)
+        self.assertIn("已重启 remote", results[0])
+        self.assertEqual(manager._states["remote"], "ready")
+        #  换代完成后补发被压下的 re-sync
+        self.wait_until(
+            lambda: "remote" not in manager._resync_dirty
+            and "remote" not in manager._resync_running,
+            message="被压下的 re-sync 没有补发",
+        )
 
 
 class HttpBodyCapTest(_HttpServerCase):
@@ -1836,6 +2010,82 @@ class GenerationTest(unittest.TestCase):
             "mcp__gen__gone",
             [schema["function"]["name"] for schema in box.schemas()],
         )
+
+    def test_reconnect_revives_generation_after_budget_exhausted(self):
+        manager = self.make_manager()
+        before = sorted(self.names(manager))
+        self.die_file.write_text("x", encoding="utf-8")
+        self.crash(manager)
+        self.wait_until(
+            lambda: manager._states["gen"].startswith("failed:"),
+            message=f"未按预期放弃：{manager._states['gen']}",
+        )
+        status = manager.describe()
+        self.assertIn("/mcp reconnect gen", status)
+        self.assertNotIn("重启会话", status)
+        #  server 修好之前手动重连：原因如实回报，状态仍是失败，不换进坏代
+        out = manager.reconnect("gen")
+        self.assertIn("gen 重连失败", out)
+        self.assertIn("排障看日志", out)
+        self.assertTrue(manager._states["gen"].startswith("failed:"))
+        self.assertEqual(self.names(manager), [])
+        #  修好后无参 = 重连全部失败的
+        self.die_file.unlink()
+        self.assertIn("已恢复 gen", manager.command(["reconnect"]))
+        self.assertEqual(manager._states["gen"], "ready")
+        self.assertEqual(sorted(self.names(manager)), before)
+        self.assertEqual(find_tool(manager, "__echo").handler(text="回"), "echo: 回")
+
+    def test_reconnect_ready_server_restarts_cleanly(self):
+        manager = self.make_manager()
+        server = manager._servers["gen"]
+        old = server._proc
+        self.assertIn("已重启 gen", manager.reconnect("gen"))
+        self.assertIsNot(server._proc, old)
+        self.assertIsNotNone(old.poll(), "旧进程必须收干净")
+        time.sleep(0.3)
+        self.assertEqual(manager._states["gen"], "ready")
+        self.assertEqual(server.reconnect_attempts, 0, "旧进程收尾的 EOF 不许另起后台重连")
+        self.assertEqual(find_tool(manager, "__echo").handler(text="新"), "echo: 新")
+        #  监督已重新接线：之后意外崩溃照常自动重连
+        self.crash(manager)
+        self.wait_until(lambda: manager._states["gen"] == "ready" and server.alive())
+
+    def test_reconnect_unknown_server(self):
+        manager = self.make_manager()
+        self.assertIn("没有名为 'nope'", manager.reconnect("nope"))
+
+
+class McpSlashWiringTest(unittest.TestCase):
+    """/mcp reconnect 从两个前端的斜杠命令接到 manager.command。"""
+
+    @staticmethod
+    def agent() -> SimpleNamespace:
+        return SimpleNamespace(config=SimpleNamespace(enable_mcp=True))
+
+    def test_repl_slash_passes_reconnect_through(self):
+        from xiaoyu.cli import SLASH_COMMANDS, handle_slash
+
+        manager = mock.Mock()
+        manager.command.return_value = "已恢复 remote（1 个工具）"
+        with mock.patch.object(mcp, "launch", return_value=manager), contextlib.redirect_stdout(
+            io.StringIO()
+        ) as out:
+            self.assertFalse(handle_slash(self.agent(), "/mcp reconnect remote"))
+        manager.command.assert_called_once_with(["reconnect", "remote"])
+        self.assertIn("已恢复 remote", out.getvalue())
+        self.assertIn("/mcp reconnect", SLASH_COMMANDS["/mcp"])
+
+    def test_acp_command_passes_reconnect_through(self):
+        from xiaoyu import acp
+
+        manager = mock.Mock()
+        manager.command.return_value = "已恢复 remote（1 个工具）"
+        with mock.patch.object(mcp, "launch", return_value=manager):
+            self.assertEqual(acp._cmd_mcp(self.agent(), "reconnect remote"), "已恢复 remote（1 个工具）")
+        manager.command.assert_called_once_with(["reconnect", "remote"])
+        (entry,) = [c for c in acp.available_commands() if c["name"] == "mcp"]
+        self.assertIn("reconnect", entry["input"]["hint"])
 
 
 class NamespaceConflictTest(unittest.TestCase):
