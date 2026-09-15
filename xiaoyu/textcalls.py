@@ -35,8 +35,10 @@ from typing import Any, Iterator
 
 from . import media
 from .responses import (
+    Choice,
     Chunk,
     Completion,
+    Delta,
     Message,
     NonStreamChoice,
     _text_chunk,
@@ -370,7 +372,19 @@ def stream_chunks(chunks: Iterator[Any]) -> Iterator[Chunk]:
     usage / reasoning 这类没有正文的 chunk 原样放行（内核按 getattr 取，不关心
     来源）。上游若意外给了原生 tool_calls 分片也放行——那说明端点其实会
     function calling，配置开错了，但不该因此丢掉一次正确的调用。
+
+    正文分片会被重建成新 chunk，挂在上面的 finish_reason 随之丢失——vLLM 等端点把
+    length / content_filter 挂在最后一个正文分片上，内核靠它识别截断与拒答。
+    所以记下来，流末单独补发一个只带收尾原因的 chunk。
     """
+    finish: list[str] = []
+    yield from _rebuild_chunks(chunks, finish)
+    if finish:
+        yield Chunk(choices=[Choice(Delta(), finish_reason=finish[-1])])
+
+
+def _rebuild_chunks(chunks: Iterator[Any], finish: list[str]) -> Iterator[Chunk]:
+    """stream_chunks 的本体；正文分片上的 finish_reason 追加进 finish。"""
     buffer = ""
     emitted = 0
     holding = False
@@ -381,6 +395,8 @@ def stream_chunks(chunks: Iterator[Any]) -> Iterator[Chunk]:
         if not text:
             yield chunk
             continue
+        if reason := getattr(choices[0], "finish_reason", None):
+            finish.append(reason)
         buffer += text
         if holding:
             continue
