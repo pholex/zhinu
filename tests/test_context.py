@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import contextlib
+import io
 import unittest
 
 from xiaoyu import tokens
@@ -16,6 +18,8 @@ from xiaoyu.compaction import (
     sanitize_summary,
     split_head,
 )
+
+from .test_agent_paths import GOOD_SUMMARY, AgentTestCase, text_response
 
 
 def conversation() -> list[dict]:
@@ -687,6 +691,63 @@ class TestCompactSkipsTinyRegion(unittest.TestCase):
         self.assertEqual(out, messages)
         self.assertIn("跳过", note)
         self.assertEqual(calls, [])
+
+
+class TestPlanSnapshot(unittest.TestCase):
+    """压缩后机械附加当前计划原文：update_plan 调用落进被压区也不丢逐字状态。"""
+
+    PLAN = [
+        {"step": "读完 calc.py", "status": "completed"},
+        {"step": "补上 div 的除零", "status": "in_progress"},
+        {"step": "跑一遍测试", "status": "pending"},
+    ]
+
+    def compact_with(self, provider) -> str:
+        compactor = Compactor(
+            context_limit=1000, compact_at=0.7, keep_recent=5,
+            summarizer=lambda _t, _p: "摘要", plan_provider=provider,
+        )
+        original = conversation()
+        original[3]["content"] = "填充 " * 400
+        messages, note = compactor.compact(original)
+        self.assertIn("已压缩", note)
+        return messages[1]["content"]
+
+    def test_unfinished_plan_appended_verbatim(self) -> None:
+        content = self.compact_with(lambda: [dict(item) for item in self.PLAN])
+        self.assertIn("【当前计划】", content)
+        for item in self.PLAN:
+            self.assertIn(f"[{item['status']}] {item['step']}", content)
+        #  属于摘要块：排在分界标记之后
+        self.assertGreater(content.index("【当前计划】"), content.index(CONTEXT_PREFIX))
+
+    def test_all_completed_not_appended(self) -> None:
+        done = [{"step": item["step"], "status": "completed"} for item in self.PLAN]
+        self.assertNotIn("【当前计划】", self.compact_with(lambda: done))
+
+    def test_no_plan_or_no_provider_is_safe(self) -> None:
+        """子 agent / 无 agent 上下文的 Compactor：计划为空安全跳过。"""
+        self.assertNotIn("【当前计划】", self.compact_with(lambda: []))
+        self.assertNotIn("【当前计划】", self.compact_with(None))
+
+
+class TestAgentPlanSurvivesCompaction(AgentTestCase):
+    """Agent 把自己的 self.plan 交给 Compactor：压缩后首条摘要消息带计划原文。"""
+
+    def test_agent_plan_lands_in_summary_head(self) -> None:
+        agent = self.build([text_response(GOOD_SUMMARY)])
+        with contextlib.redirect_stdout(io.StringIO()):
+            agent._update_plan(TestPlanSnapshot.PLAN)
+        agent.messages.append({"role": "user", "content": "任务"})
+        for index in range(40):
+            agent.messages.append({"role": "user", "content": f"要求 {index}"})
+            agent.messages.append({"role": "assistant", "content": "回答" + "阿" * 400})
+        with contextlib.redirect_stdout(io.StringIO()):
+            note = agent.maybe_compact(force=True)
+        self.assertIn("已压缩", note)
+        head = agent.messages[1]["content"]
+        self.assertIn("[in_progress] 补上 div 的除零", head)
+        self.assertIn("[pending] 跑一遍测试", head)
 
 
 if __name__ == "__main__":

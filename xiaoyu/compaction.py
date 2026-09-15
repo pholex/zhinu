@@ -281,6 +281,30 @@ def anchor_index(messages: list[dict[str, Any]]) -> str:
     return block
 
 
+# ---------- 计划快照（摘要旁的当前计划原文） ----------
+
+
+def plan_snapshot(plan: list[dict[str, str]] | None) -> str:
+    """当前计划的逐字快照；无计划或已全部完成返回空串。
+
+    计划状态只活在 update_plan 的调用参数里，调用一旦落进被压区，模型只剩
+    摘要里的转述——"同一时刻恰好一条 in_progress"守不住，易重列或偏离。
+    与锚点索引同一思路：机械附加原文（零模型调用），不交给摘要释义。
+    全部完成的计划不附：它不再指导下一步，附上只会诱导模型重复收尾。
+    """
+    items = [
+        item for item in plan or []
+        if isinstance(item, dict) and str(item.get("step") or "").strip()
+    ]
+    if not items or all(item.get("status") == "completed" for item in items):
+        return ""
+    lines = [f"- [{item.get('status')}] {item['step']}" for item in items]
+    return (
+        "\n\n【当前计划】以下是压缩时刻计划的原文（机械附加，未经改写）。"
+        "继续时沿用它推进、用 update_plan 更新状态，不要重列：\n" + "\n".join(lines)
+    )
+
+
 def split_head(content: str) -> tuple[str, str]:
     """把首条用户消息拆成 (原始任务, 上一次的摘要)。
 
@@ -382,6 +406,7 @@ class Compactor:
         transcript_cap: int = MAX_TRANSCRIPT_CHARS,
         synthetic_user_texts: frozenset[str] = frozenset(),
         user_voice_tokens: int = USER_VOICE_TOKENS,
+        plan_provider: Callable[[], list[dict[str, str]]] | None = None,
     ) -> None:
         self.context_limit = context_limit
         self.compact_at = compact_at
@@ -392,6 +417,8 @@ class Compactor:
         self.synthetic_user_texts = synthetic_user_texts
         #  用户原话备份的预算（0 = 关闭）
         self.user_voice_tokens = user_voice_tokens
+        #  压缩时刻取当前计划（None = 无 agent 上下文，不附计划快照）
+        self.plan_provider = plan_provider
         self.state = CompactionState()
 
     # ---------- 判断 ----------
@@ -522,8 +549,13 @@ class Compactor:
                 "\n\n【索引】以下标识符逐字取自被压缩的原文（机械提取，未经改写）：\n"
                 + sanitize_summary(anchors)
             )
+        #  当前计划原文紧跟索引（同样机械附加、同样消毒）：计划步骤是模型写的，
+        #  万一复读了分界标记也不能借它复活
+        plan = sanitize_summary(plan_snapshot(self.plan_provider() if self.plan_provider else None))
         #  消毒后再拼分界标记：正文里复读的标记被打断，split_head 永远只认这里拼的这一个
-        summary_block = CONTEXT_PREFIX + sanitize_summary(summary.strip()) + anchors + voice
+        summary_block = (
+            CONTEXT_PREFIX + sanitize_summary(summary.strip()) + anchors + plan + voice
+        )
         if has_task:
             head = {"role": "user", "content": f"{original}\n\n{summary_block}"}
         else:

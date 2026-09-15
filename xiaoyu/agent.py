@@ -953,6 +953,9 @@ class Agent:
             #  harness 注入的伪 user 消息（收尾/nudge/plan mode），压缩时不算"用户原话"。
             #  plan mode 进场说明是按会话格式化的（含 plan 文件路径），追加实文
             synthetic_user_texts=SYNTHETIC_USER_TEXTS | {self._plan_enter_note},
+            #  压缩后附当前计划原文：update_plan 调用落进被压区也不丢逐字状态。
+            #  惰性取值——self.plan 在后面才初始化，且随 update_plan 整体替换
+            plan_provider=lambda: self.plan,
         )
         #  子 agent 不再挂 explore，避免无限套娃
         #  嵌套闸（与 allow_explore 解耦）：allow_explore 管 explore/new_context 这类
