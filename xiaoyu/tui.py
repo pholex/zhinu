@@ -423,6 +423,47 @@ def _register(handlers: dict[str, Any], *categories: str) -> KeyBindings:
     return bindings
 
 
+def _enter_is_pasted(event: Any) -> bool:
+    """这个回车是不是粘贴里夹带的换行（而不是人按的提交）。
+
+    正常终端靠 bracketed paste 把整段粘贴包成一个事件；tmux 未透传、部分
+    输入法与远程终端下这层包装丢了，粘贴里的换行就以回车按键到达，逐行提交。
+    判据是"回车后面还有同一批到达的输入"：终端一次交付的字节在
+    prompt_toolkit 里会整批 feed 进 key_processor 的队列再逐键处理，人手按键
+    间隔远大于一次读取，回车跑到这里时队列必然已空；只有粘贴、程序化输入
+    才会让回车身后还排着按键。
+
+    - 队列里的光标位置应答（CPR）是终端对重绘的回话，不算输入；
+    - 大段粘贴会被分成多次 read（每次 1024 字节），回车恰好落在一批末尾时
+      队列是空的：posix 下再无等待地看一眼 stdin 是否仍可读，可读就照
+      prompt_toolkit 自己的路径读进来排进队列再判——零等待，正常回车不多耽搁
+      一毫秒；
+    - Windows 的输入层自带粘贴识别（同批里夹换行的文本合成一次粘贴事件），
+      只做队列判断，不碰 stdin。
+    """
+    from prompt_toolkit.keys import Keys
+
+    processor = event.key_processor
+
+    def queued() -> bool:
+        return any(press.key != Keys.CPRResponse for press in processor.input_queue)
+
+    if queued():
+        return True
+    if os.name != "posix":
+        return False
+    app_input = event.app.input
+    try:
+        import select
+
+        if not select.select([app_input.fileno()], [], [], 0)[0]:
+            return False
+        processor.feed_multiple(app_input.read_keys())
+    except Exception:  # noqa: BLE001 - 看不了就按普通回车提交，绝不能吞掉用户的回车
+        return False
+    return queued()
+
+
 def apply_theme(console: Console) -> None:
     """把语义 token 挂到 Console 上，之后 `style="status.error"` 才认得。
 
@@ -1105,19 +1146,125 @@ class SlashCompleter(Completer):
             yield Completion(f"@{path}", start_position=-len(token), display=path)
 
 
+class _LineEditor:
+    """非规范模式下的最小行编辑（SteerPoller 在 macOS/BSD 上自管回显时用）。
+
+    只做插话真正用得到的：可见字符回显、退格按显示宽度擦除（中文/emoji 占
+    两列，组合附加符号随前一个字一起删）、^U 清行、^W 删词、回车成行。
+    方向键之类的转义序列整段吞掉——规范模式下它们会以 `^[[A` 的字面混进
+    插话里。其余控制字符忽略。擦除只在当前屏幕行内有效（`\\b` 退不回上一
+    行），与内核规范模式一致。
+    """
+
+    def __init__(self, erase: Any = b"\x7f", kill: Any = b"\x15", werase: Any = b"\x17") -> None:
+        import codecs
+
+        self._decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
+        #  用户 stty 自定义的擦除/清行/删词键也认；DEL 与 ^H 两种退格恒认
+        self._erase = {"\x7f", "\x08", *self._control(erase)}
+        self._kill = {"\x15", *self._control(kill)}
+        self._werase = {"\x17", *self._control(werase)}
+        #  转义序列状态："" / "esc" / "csi" / "ss3"
+        self._escape = ""
+        self.current: list[str] = []
+        self.lines: list[str] = []
+
+    @staticmethod
+    def _control(value: Any) -> set[str]:
+        """termios 的 cc 槽位 → 控制字符。被禁用的槽位（macOS 是 0xff、
+        Linux 是 0）不算，否则敲个 ÿ 或 Ctrl-Space 就把字删了。"""
+        if isinstance(value, bytes) and len(value) == 1:
+            value = value[0]
+        if isinstance(value, int) and (0 < value < 0x20 or value == 0x7F):
+            return {chr(value)}
+        return set()
+
+    def pending_text(self) -> str:
+        return "".join(self.current)
+
+    def feed(self, data: bytes) -> str:
+        """喂入一批字节（多字节字符可以被拆在两批里），返回要回显的文本。
+        按过回车的行进 `self.lines`。"""
+        return "".join(self._key(ch) for ch in self._decoder.decode(data))
+
+    def _key(self, ch: str) -> str:
+        if self._escape == "esc":
+            if ch in "[O":
+                self._escape = "csi" if ch == "[" else "ss3"
+                return ""
+            #  单按 Esc / Alt 组合：丢掉 Esc，字符照常处理
+            self._escape = ""
+        elif self._escape == "ss3":
+            self._escape = ""
+            return ""
+        elif self._escape == "csi":
+            if ch >= " ":
+                if "\x40" <= ch <= "\x7e":
+                    self._escape = ""
+                return ""
+            #  序列没收尾就来了控制字符（回车等）：放弃序列，字符照常处理
+            self._escape = ""
+        if ch == "\x1b":
+            self._escape = "esc"
+            return ""
+        if ch in "\r\n":
+            self.lines.append(self.pending_text())
+            self.current.clear()
+            return "\r\n"
+        if ch in self._erase:
+            return self._rubout(1)
+        if ch in self._kill:
+            return self._rubout(len(self.current))
+        if ch in self._werase:
+            count = 0
+            while count < len(self.current) and self.current[-1 - count].isspace():
+                count += 1
+            while count < len(self.current) and not self.current[-1 - count].isspace():
+                count += 1
+            return self._rubout(count)
+        if ch == "\t":
+            #  制表符原样进文本，回显成一格：终端里 tab 的宽度随列变，删的时候算不准
+            self.current.append(ch)
+            return " "
+        if ch < " " or ch == "\x7f":
+            return ""
+        self.current.append(ch)
+        return ch
+
+    def _rubout(self, count: int) -> str:
+        """删掉末尾 count 个字（组合附加符号不单独计数），返回擦除屏幕的序列。"""
+        import unicodedata
+
+        width = 0
+        while count > 0 and self.current:
+            ch = self.current.pop()
+            cells = 0 if unicodedata.combining(ch) else (1 if ch == "\t" else ui.display_width(ch))
+            width += cells
+            if cells:
+                count -= 1
+        return "\b" * width + " " * width + "\b" * width
+
+
 class SteerPoller:
     """模型作答期间的后台 stdin 行读取：整行（按过回车）→ `agent.steer()`。
 
     小羽全同步，`agent.send()` 期间主线程被占住，没有任何输入循环在跑——
     这个小线程补上"运行中还能说话"的通道（配 pause/resume 纪律）。要点：
 
-    - 终端处于规范模式：select 只在**整行完成**（用户按了回车）时可读，
+    - 默认让终端处于规范模式：select 只在**整行完成**（用户按了回车）时可读，
       半截输入留在内核行缓冲，既不会被这里偷走，也照常出现在下一轮 prompt；
+    - macOS/BSD 例外，改为自管行编辑（见 `_LineEditor`）：那里规范模式单行
+      上限 MAX_CANON=1024 字节，粘贴一行超长插话时内核连回车一起丢弃，整行
+      卡死在缓冲里，用户毫无察觉。运行期关掉 ICANON/ECHO（保留 ISIG，Ctrl-C
+      照常发信号），回显与退格/^U/^W 由这里接管；pause/stop 在返回前把
+      termios 原样还回去，半截输入由 stop() 交还调用方预填进下一轮；
     - **审批确认框期间必须 pause()**——确认菜单是 prompt_toolkit Application
-      在主线程接管终端，这里不停手就会吃掉用户的选择按键；
-    - 线程自己不打印任何东西（rich Live 归主线程独占）：确认反馈由
-      steer.accepted 事件在消费点（agent 线程=主线程）打出，敲字时的即时
-      回显本来就有 tty echo；
+      在主线程接管终端，这里不停手就会吃掉用户的选择按键；pause 可嵌套，
+      最外层 resume 才恢复；
+    - 线程不打印回显之外的任何东西（rich Live 归主线程独占）：确认反馈由
+      steer.accepted 事件在消费点（agent 线程=主线程）打出；敲字时的即时
+      回显规范模式下是 tty echo，自管模式下由这里写回终端，与内核回显一样
+      直接落在光标处；
     - 斜杠命令不特判：运行中敲 `/...` 也会作为插话交给模型（提示语义上
       它就是"对模型说的话"；命令请等本轮结束）；
     - 多行粘贴合并成一条：规范模式逐行交付，窗口内连着到达的行并成整段；
@@ -1133,6 +1280,20 @@ class SteerPoller:
         self._stop = threading.Event()
         self._paused = threading.Event()
         self._thread: threading.Thread | None = None
+        #  pause 可嵌套：计数归零才真正恢复
+        self._pause_depth = 0
+        #  自管行编辑的状态；_editor 为 None 就是规范模式老路
+        self._editor: _LineEditor | None = None
+        #  读线程"读+处理"与 pause/resume/stop 改终端状态互斥：pause 返回时
+        #  线程保证不在读，终端已还原
+        self._lock = threading.Lock()
+        self._fd = -1
+        self._echo_fd = -1
+        self._saved: list[Any] | None = None
+        self._raw: list[Any] | None = None
+        self._alive = False
+        self._sigcont_hooked = False
+        self._prev_sigcont: Any = None
 
     @staticmethod
     def supported() -> bool:
@@ -1145,24 +1306,226 @@ class SteerPoller:
         except ImportError:  # pragma: no cover - posix 必有 select
             return False
 
+    @staticmethod
+    def wants_own_editing() -> bool:
+        """规范模式单行上限小到粘贴就会撞上的平台才自管行编辑。
+
+        macOS/BSD 的 MAX_CANON 是 1024 且溢出时连回车一起丢；Linux 是 4096，
+        溢出只截断不卡死——那里保持内核行规程，不为少见的超长行扩大改动面。
+        """
+        return sys.platform == "darwin" or "bsd" in sys.platform
+
     def start(self) -> None:
         if not self.supported() or self._thread is not None:
             return
-        self._thread = threading.Thread(target=self._loop, daemon=True, name="steer-poller")
+        target = self._loop
+        if self.wants_own_editing() and self._enter_editing():
+            target = self._edit_loop
+        self._alive = True
+        self._thread = threading.Thread(target=target, daemon=True, name="steer-poller")
         self._thread.start()
 
-    def stop(self) -> None:
+    def stop(self) -> str:
+        """停线程、还原终端，返回还没按回车的半截输入（调用方预填进下一轮）。"""
         if self._thread is None:
-            return
+            return ""
         self._stop.set()
         self._thread.join(timeout=1.0)
         self._thread = None
+        if self._editor is None:
+            return ""
+        self._unhook_sigcont()
+        #  线程卡死也不能把终端留在非规范模式：拿不到锁照样还原
+        locked = self._lock.acquire(timeout=1.0)
+        try:
+            if not self._paused.is_set():
+                #  线程收工到这里之间敲的键还在内核队列里（仍是非规范模式，
+                #  立即可读）：读干净再还原，否则切回规范模式后它们会被内核重显一遍
+                self._drain_into_editor()
+            self._deliver_lines()
+            self._set_tty(self._saved)
+            return self._editor.pending_text()
+        finally:
+            if locked:
+                self._lock.release()
 
     def pause(self) -> None:
-        self._paused.set()
+        with self._lock:
+            self._pause_depth += 1
+            if self._pause_depth > 1:
+                return
+            self._paused.set()
+            if self._editor is not None:
+                #  确认框接管前：已成行的插话先交出去，终端还原成起手时的样子
+                self._deliver_lines()
+                self._set_tty(self._saved)
 
     def resume(self) -> None:
-        self._paused.clear()
+        with self._lock:
+            if self._pause_depth == 0:
+                return
+            self._pause_depth -= 1
+            if self._pause_depth:
+                return
+            if self._editor is not None and self._alive and not self._stop.is_set():
+                self._set_tty(self._raw)
+            self._paused.clear()
+
+    # ---------- 自管行编辑（macOS/BSD） ----------
+
+    def _enter_editing(self) -> bool:
+        """保存 termios、切到非规范无回显模式。任何一步不成就返回 False 走老路。"""
+        try:
+            import fcntl
+            import termios
+
+            fd = sys.stdin.fileno()
+            saved = termios.tcgetattr(fd)
+            #  回显写回输入所在的终端（与内核回显同一去处）；
+            #  stdin 只读打开时退回 stdout，两者都写不了就不自管
+            if fcntl.fcntl(fd, fcntl.F_GETFL) & os.O_ACCMODE != os.O_RDONLY:
+                echo_fd = fd
+            elif sys.stdout.isatty():
+                echo_fd = sys.stdout.fileno()
+            else:
+                return False
+            raw = termios.tcgetattr(fd)
+            #  只动这两位：ISIG 留着（Ctrl-C/Ctrl-Z 照常发信号），iflag/oflag 不碰
+            #  （ICRNL 照旧把回车换成换行，输出的 \n 照旧补 \r）
+            raw[3] &= ~(termios.ICANON | termios.ECHO)
+            raw[6][termios.VMIN] = 1
+            raw[6][termios.VTIME] = 0
+            cc = saved[6]
+            editor = _LineEditor(cc[termios.VERASE], cc[termios.VKILL], cc[termios.VWERASE])
+            #  TCSANOW：TCSAFLUSH 会丢掉用户已敲的字，macOS pty 上还会挂死（见 terminal.py）
+            termios.tcsetattr(fd, termios.TCSANOW, raw)
+        except Exception:  # noqa: BLE001 - 切不了就老老实实用规范模式
+            return False
+        self._fd, self._echo_fd = fd, echo_fd
+        self._saved, self._raw, self._editor = saved, raw, editor
+        self._hook_sigcont()
+        return True
+
+    def _set_tty(self, attrs: list[Any] | None) -> None:
+        if attrs is None:
+            return
+        with contextlib.suppress(Exception):
+            import termios
+
+            termios.tcsetattr(self._fd, termios.TCSANOW, attrs)
+
+    def _hook_sigcont(self) -> None:
+        """Ctrl-Z 挂起时 shell 会把终端改回它自己的模式；fg 回来要重新切走，
+        否则内核回显与这里的回显叠成两份、超长行问题也回来了。
+        信号处理只能在主线程装，装不上就算了（下一次 pause/resume 也会纠正）。"""
+        import signal
+
+        if not hasattr(signal, "SIGCONT") or threading.current_thread() is not threading.main_thread():
+            return
+
+        def on_cont(signum: int, frame: Any) -> None:
+            #  主线程可能正持有锁（pause/resume 里被信号打断）：拿不到就跳过，不能死锁
+            if self._lock.acquire(blocking=False):
+                try:
+                    foreground = False
+                    with contextlib.suppress(OSError):
+                        foreground = os.tcgetpgrp(self._fd) == os.getpgrp()
+                    #  bg 继续运行时不碰终端：后台进程改 termios 会被 SIGTTOU 再次挂起
+                    if foreground and self._alive and not self._paused.is_set() and not self._stop.is_set():
+                        self._set_tty(self._raw)
+                finally:
+                    self._lock.release()
+            if callable(previous):
+                previous(signum, frame)
+
+        try:
+            previous = signal.signal(signal.SIGCONT, on_cont)
+        except (ValueError, OSError):
+            return
+        self._prev_sigcont = previous
+        self._sigcont_hooked = True
+
+    def _unhook_sigcont(self) -> None:
+        if not self._sigcont_hooked:
+            return
+        import signal
+
+        with contextlib.suppress(ValueError, OSError, TypeError):
+            previous = self._prev_sigcont
+            signal.signal(signal.SIGCONT, previous if previous is not None else signal.SIG_DFL)
+            self._sigcont_hooked = False
+
+    def _edit_loop(self) -> None:
+        import select
+
+        fd = self._fd
+        #  已成行、等粘贴合并窗口结束再交付的截止时刻
+        deadline: float | None = None
+        try:
+            while not self._stop.is_set():
+                if self._paused.is_set():
+                    deadline = None
+                    time.sleep(self._POLL)
+                    continue
+                timeout = self._POLL
+                if deadline is not None:
+                    timeout = max(0.0, min(timeout, deadline - time.monotonic()))
+                readable, _, _ = select.select([fd], [], [], timeout)
+                echo = ""
+                with self._lock:
+                    #  锁里再查一次：pause 已经把终端交给确认框，一个字节都不能读
+                    if self._stop.is_set() or self._paused.is_set():
+                        continue
+                    if readable:
+                        data = os.read(fd, 4096)
+                        if not data:
+                            return
+                        echo = self._editor.feed(data)  # type: ignore[union-attr]
+                        if self._editor.lines:  # type: ignore[union-attr]
+                            #  规范模式下粘贴 N 行是连着到达的：窗口内还有数据就接着并
+                            deadline = time.monotonic() + self._PASTE_WINDOW
+                    elif deadline is not None and time.monotonic() >= deadline:
+                        self._deliver_lines()
+                        deadline = None
+                if echo:
+                    #  回显在锁外写：终端被 ^S 停住时写会阻塞，不能连带卡住 pause
+                    self._echo(echo)
+        except Exception:  # noqa: BLE001 - 读不动就收工，绝不能拖垮主循环
+            pass
+        finally:
+            with self._lock:
+                self._alive = False
+                self._deliver_lines()
+                if not self._paused.is_set() and not self._stop.is_set():
+                    #  线程意外退出：立刻还原，别让用户在剩下的一轮里敲字没有回显。
+                    #  stop() 发起的收工不在这里还原——它要先趁非规范模式把
+                    #  残留按键读干净，切回规范模式后没按回车的字就读不到了
+                    self._set_tty(self._saved)
+
+    def _drain_into_editor(self) -> None:
+        import select
+
+        with contextlib.suppress(Exception):
+            while select.select([self._fd], [], [], 0)[0]:
+                data = os.read(self._fd, 4096)
+                if not data:
+                    break
+                self._editor.feed(data)  # type: ignore[union-attr]
+
+    def _echo(self, text: str) -> None:
+        data = text.encode("utf-8")
+        with contextlib.suppress(OSError):
+            while data:
+                data = data[os.write(self._echo_fd, data) :]
+
+    def _deliver_lines(self) -> None:
+        """自管模式下攒着的完整行作为一条插话交出去（与规范模式的整段合并同义）。"""
+        if self._editor is None or not self._editor.lines:
+            return
+        lines, self._editor.lines = self._editor.lines, []
+        self._deliver_text("\n".join(lines))
+
+    # ---------- 规范模式老路 ----------
 
     def _loop(self) -> None:
         import select
@@ -1211,8 +1574,10 @@ class SteerPoller:
         return data, False
 
     def _deliver(self, data: bytes) -> None:
+        self._deliver_text(data.decode("utf-8", errors="replace"))
+
+    def _deliver_text(self, text: str) -> None:
         """整段作为**一条**插话：保留内部换行（含空行），只去首尾空行。"""
-        text = data.decode("utf-8", errors="replace")
         lines = text.replace("\r\n", "\n").replace("\r", "\n").split("\n")
         while lines and not lines[0].strip():
             lines.pop(0)
@@ -1444,6 +1809,11 @@ class Tui:
 
         def _submit(event: Any) -> None:
             buffer = event.current_buffer
+            if _enter_is_pasted(event):
+                #  粘贴里的换行（bracketed paste 失效时以回车按键到达）：
+                #  插成换行，整段粘贴完才由最后那个回车提交
+                buffer.insert_text("\n")
+                return
             state = buffer.complete_state
             if state and state.current_completion:
                 #  菜单里有选中的候选：先把它落定成真实文本再提交。
@@ -2089,7 +2459,9 @@ class Tui:
                     Text(f"\n请求失败：{type(exc).__name__}: {exc}", style="status.error")
                 )
             finally:
-                self._poller.stop()
+                #  自管行编辑时还没按回车的半截插话（规范模式下它留在内核缓冲里，
+                #  下一轮 prompt 自己会读到，这里拿到的是空串）
+                partial = self._poller.stop()
                 self._poller = None
             #  still-running 状态行：inline 架构没有常驻状态栏，
             #  轮次结束打一行即走，与明文 REPL 同一份文案（cli.background_status）
@@ -2102,7 +2474,7 @@ class Tui:
             #  都转成下一轮输入行的预填——用户的话绝不凭空消失，也绝不自动提交
             leftover = agent.drain_steers()
             typed = self._drain_typeahead()
-            queued = "\n".join(part for part in [*leftover, typed] if part).strip()
+            queued = "\n".join(part for part in [*leftover, typed, partial] if part).strip()
             if queued:
                 self.console.print(
                     Text("  （已接住你刚才输入的内容，确认后回车发送）", style="text.secondary")
