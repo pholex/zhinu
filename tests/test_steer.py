@@ -252,5 +252,231 @@ class PollerTest(unittest.TestCase):
             self.assertFalse(tui.SteerPoller.supported())
 
 
+class LineEditorTest(unittest.TestCase):
+    """自管行编辑的纯逻辑部分（不需要终端）。"""
+
+    def test_utf8_split_across_reads_tab_and_wide_erase(self):
+        from xiaoyu.tui import _LineEditor
+
+        editor = _LineEditor()
+        data = "中\t".encode()
+        #  多字节字符被拆在两次 read 里：前半截不回显、不进文本
+        self.assertEqual(editor.feed(data[:1]), "")
+        self.assertEqual(editor.feed(data[1:]), "中 ")
+        #  先删 tab（回显时占一格），再删中文（两格）
+        self.assertEqual(editor.feed(b"\x7f\x7f"), "\b \b" + "\b\b  \b\b")
+        self.assertEqual(editor.pending_text(), "")
+
+    def test_combining_mark_erased_with_its_base(self):
+        from xiaoyu.tui import _LineEditor
+
+        editor = _LineEditor()
+        editor.feed("xé".encode())
+        self.assertEqual(editor.feed(b"\x7f"), "\b \b")
+        self.assertEqual(editor.pending_text(), "x")
+
+    def test_unfinished_escape_does_not_swallow_enter(self):
+        from xiaoyu.tui import _LineEditor
+
+        editor = _LineEditor()
+        editor.feed(b"a\x1b[1\nb\x1bOAc")
+        self.assertEqual(editor.lines, ["a"])
+        self.assertEqual(editor.pending_text(), "bc")
+
+    def test_disabled_cc_slot_is_not_a_key(self):
+        from xiaoyu.tui import _LineEditor
+
+        #  macOS 用 0xff、Linux 用 0 表示"该键被禁用"，不能把 ÿ / Ctrl-Space 当清行
+        editor = _LineEditor(kill=b"\xff", werase=b"\x00")
+        editor.feed("ÿ\x00".encode())
+        self.assertEqual(editor.pending_text(), "ÿ")
+
+
+@unittest.skipUnless(os.name == "posix", "自管行编辑仅 posix")
+class OwnLineEditingTest(unittest.TestCase):
+    """macOS/BSD 的自管行编辑（非规范模式）。测试里强制开启，Linux 上同样跑一遍。
+
+    全部在真实 pty 上测：termios 的切换与还原、内核是否还在替我们回显，
+    只有真终端设备说了算。
+    """
+
+    def setUp(self) -> None:
+        import pty
+        import select
+        import termios
+        import threading
+
+        from xiaoyu import tui
+
+        self.tui = tui
+        self.termios = termios
+        self.master, self.slave = pty.openpty()
+        self.saved = termios.tcgetattr(self.slave)
+        fake_stdin = os.fdopen(self.slave, "rb", buffering=0, closefd=False)
+        for patcher in (
+            mock.patch.object(tui.sys, "stdin", fake_stdin),
+            mock.patch.object(tui.SteerPoller, "wants_own_editing", staticmethod(lambda: True)),
+        ):
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        self.echo = bytearray()
+        done = threading.Event()
+
+        def pump() -> None:
+            #  回显必须有人读走：pty 输出缓冲写满后回显阻塞，读线程随之停摆
+            while not done.is_set():
+                try:
+                    if select.select([self.master], [], [], 0.05)[0]:
+                        self.echo += os.read(self.master, 65536)
+                except OSError:
+                    return
+
+        reader = threading.Thread(target=pump, daemon=True)
+        reader.start()
+        self.target = _FakeSteerTarget()
+        self.poller = tui.SteerPoller(self.target)  # type: ignore[arg-type]
+
+        def cleanup() -> None:
+            self.poller.stop()
+            done.set()
+            reader.join(timeout=2.0)
+            fake_stdin.close()
+            os.close(self.slave)
+            os.close(self.master)
+
+        self.addCleanup(cleanup)
+
+    #  ---------- 小工具 ----------
+
+    def type(self, data: bytes) -> None:
+        while data:
+            data = data[os.write(self.master, data) :]
+
+    @staticmethod
+    def wait_for(predicate, timeout: float = 5.0) -> bool:
+        #  正向等待：一满足就往下走，窗口给大是免费的
+        deadline = time.monotonic() + timeout
+        while not predicate() and time.monotonic() < deadline:
+            time.sleep(0.01)
+        return bool(predicate())
+
+    def restored(self) -> bool:
+        #  切回规范模式后 lflag 可能多出内核维护的 PENDIN 位（待重显输入），不是我们设的
+        pendin = getattr(self.termios, "PENDIN", 0)
+        now = self.termios.tcgetattr(self.slave)
+        expected = list(self.saved)
+        now[3] &= ~pendin
+        expected[3] &= ~pendin
+        return now == expected
+
+    def assert_raw(self) -> None:
+        lflag = self.termios.tcgetattr(self.slave)[3]
+        self.assertFalse(lflag & self.termios.ICANON)
+        self.assertFalse(lflag & self.termios.ECHO)
+        self.assertTrue(lflag & self.termios.ISIG, "Ctrl-C 必须照常发信号")
+
+    #  ---------- 用例 ----------
+
+    def test_long_single_line_arrives_whole(self):
+        """超过 MAX_CANON 的单行（macOS 1024、Linux 4096）整行送达：规范模式下
+        macOS 连回车一起丢，整行卡死在内核缓冲里。"""
+        line = "长" * 1000 + "x" * 2000  # 5000 字节
+        self.poller.start()
+        self.assert_raw()
+        self.type(line.encode() + b"\n")
+        self.assertTrue(self.wait_for(lambda: self.target.lines), "超长行没有送达")
+        self.assertEqual(self.target.lines, [line])
+        self.assertEqual(self.poller.stop(), "")
+        self.assertTrue(self.restored())
+
+    def test_erase_kill_word_and_escape_sequences(self):
+        self.poller.start()
+        for typed, expected in (
+            ("ab中\x7f\x7fc\n", "ac"),
+            ("foo bar\x17baz\n", "foo baz"),
+            ("丢掉\x15保留\n", "保留"),
+            ("上\x1b[A一\n", "上一"),
+        ):
+            count = len(self.target.lines)
+            self.type(typed.encode())
+            self.assertTrue(self.wait_for(lambda: len(self.target.lines) > count), typed)
+            self.assertEqual(self.target.lines[-1], expected)
+        #  中文退格擦两列、ASCII 擦一列
+        erased = "ab中\b\b  \b\b\b \bc".encode()
+        self.assertTrue(self.wait_for(lambda: erased in bytes(self.echo)), bytes(self.echo))
+        #  内核不再回显：否则"中"会出现两次（内核一份、我们一份）
+        self.assertEqual(bytes(self.echo).count("中".encode()), 1)
+
+    def test_pause_restores_tty_synchronously_and_nests(self):
+        self.poller.start()
+        self.poller.pause()
+        #  pause 返回时终端必须已经还原——确认框紧接着就要接管
+        self.assertTrue(self.restored())
+        self.poller.pause()  # 嵌套：确认框里再弹规则编辑
+        self.poller.resume()
+        self.assertTrue(self.restored(), "内层 resume 提前切回了非规范模式")
+        self.type(b"y\n")
+        deadline = time.monotonic() + 10 * self.tui.SteerPoller._POLL
+        while time.monotonic() < deadline:
+            self.assertEqual(self.target.lines, [], "pause 期间的输入被偷读了")
+            time.sleep(0.02)
+        self.poller.resume()
+        self.assert_raw()
+        #  确认框没取走的输入，恢复后照常成为插话，不丢
+        self.assertTrue(self.wait_for(lambda: self.target.lines))
+        self.assertEqual(self.target.lines, ["y"])
+
+    def test_stop_hands_back_partial_line_and_restores(self):
+        self.poller.start()
+        self.type("半截话".encode())
+        self.assertTrue(self.wait_for(lambda: "半截话".encode() in bytes(self.echo)))
+        #  紧接着再敲、立刻 stop：线程来不及读的字也要读干净交回
+        self.type("尾巴".encode())
+        self.assertEqual(self.poller.stop(), "半截话尾巴")
+        self.assertEqual(self.target.lines, [])
+        self.assertTrue(self.restored())
+
+    def test_reader_crash_restores_tty(self):
+        with mock.patch.object(self.tui._LineEditor, "feed", side_effect=RuntimeError("boom")):
+            self.poller.start()
+            self.assert_raw()
+            self.type(b"x")
+            self.assertTrue(self.wait_for(lambda: not self.poller._alive and self.restored()))
+        #  线程没了：resume 不能再把终端切回无回显模式，否则用户敲字彻底看不见
+        self.poller.pause()
+        self.poller.resume()
+        self.assertTrue(self.restored())
+
+    def test_sigcont_reenters_after_shell_reset(self):
+        import signal
+        import threading
+
+        if not hasattr(signal, "SIGCONT") or threading.current_thread() is not threading.main_thread():
+            self.skipTest("需要 SIGCONT 且在主线程")
+        before = signal.getsignal(signal.SIGCONT)
+        #  pty 从端不是本进程的控制终端，前台判定在测试里只能替身
+        with mock.patch.object(self.tui.os, "tcgetpgrp", lambda fd: os.getpgrp()):
+            self.poller.start()
+            #  模拟 Ctrl-Z 挂起期间 shell 把终端改回了它自己的模式，随后 fg
+            self.termios.tcsetattr(self.slave, self.termios.TCSANOW, self.saved)
+            os.kill(os.getpid(), signal.SIGCONT)
+            self.assertTrue(
+                self.wait_for(lambda: not self.termios.tcgetattr(self.slave)[3] & self.termios.ICANON)
+            )
+            self.poller.stop()
+        self.assertTrue(self.restored())
+        self.assertEqual(signal.getsignal(signal.SIGCONT), before)
+
+    def test_canonical_path_kept_where_not_wanted(self):
+        """不需要自管的平台保持内核行规程：终端模式一位不动。"""
+        with mock.patch.object(self.tui.SteerPoller, "wants_own_editing", staticmethod(lambda: False)):
+            self.poller.start()
+            self.assertTrue(self.restored())
+            self.type("改用 unittest\n".encode())
+            self.assertTrue(self.wait_for(lambda: self.target.lines))
+            self.assertEqual(self.target.lines, ["改用 unittest"])
+            self.assertEqual(self.poller.stop(), "")
+
+
 if __name__ == "__main__":
     unittest.main()
