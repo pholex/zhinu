@@ -192,6 +192,52 @@ class SessionFilePermissionTest(SessionDirTestCase):
         self.assertEqual(self.mode(log.path), 0o600)
 
 
+class DeferredSessionTest(SessionDirTestCase):
+    """defer=True：什么都没发生的会话不在盘上留任何东西。"""
+
+    def test_empty_session_leaves_nothing_on_disk(self):
+        log = SessionLog.create("m", "/ws/probe", session_id="sess-probe", defer=True)
+        self.assertFalse(log.materialized)
+        self.assertFalse(log.path.exists())
+        self.assertFalse(lock_path(log.path).exists())
+        log.close()
+        #  exit 事件也不落：整个会话目录都不该被建出来
+        self.assertFalse(sessions_dir().exists())
+        self.assertEqual(list_sessions(workspace="/ws/probe"), [])
+
+    def test_first_record_materializes_with_meta_first(self):
+        log = SessionLog.create("m", "/ws/probe", session_id="sess-real", defer=True)
+        self.addCleanup(log.release)
+        log.event("mode", value="plan")
+        self.assertTrue(log.materialized)
+        lines = self.read_lines(log)
+        self.assertEqual([line.get("event") for line in lines], ["meta", "mode"])
+        self.assertEqual(lines[0]["session_id"], "sess-real")
+        #  落盘即持锁：另一个写句柄抢不到
+        with self.assertRaises(SessionLockedError):
+            SessionLog(log.path)
+        log.append({"role": "user", "content": "问题"})
+        (info,) = list_sessions(workspace="/ws/probe")
+        self.assertEqual(info.preview, "问题")
+
+    def test_explicit_materialize_then_close_records_exit(self):
+        log = SessionLog.create("m", "/ws/probe", defer=True)
+        log.materialize()
+        self.assertTrue(log.path.exists())
+        log.close()
+        self.assertEqual([line.get("event") for line in self.read_lines(log)], ["meta", "exit"])
+
+    def test_released_pending_session_can_be_reacquired(self):
+        log = SessionLog.create("m", "/ws/probe", defer=True)
+        log.release()
+        log.append({"role": "user", "content": "丢弃"})  # 放锁后的写入一律丢弃
+        self.assertFalse(log.path.exists())
+        log.acquire()
+        log.append({"role": "user", "content": "留下"})
+        self.addCleanup(log.release)
+        self.assertEqual(self.read_lines(log)[-1]["content"], "留下")
+
+
 class UsageDigestTest(SessionDirTestCase):
     """`xiaoyu sessions digest` 的地基：跨会话聚合轮末 usage 快照。"""
 
