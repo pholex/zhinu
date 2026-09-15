@@ -684,6 +684,14 @@ class TestCompletionShape(unittest.TestCase):
         result = to_completion(SimpleNamespace(output_text="x", usage=None))
         self.assertIsNone(result.usage)
 
+    def test_incomplete_max_output_tokens_maps_to_length(self) -> None:
+        """非流式的 incomplete 截断同样翻成 finish_reason=length（摘要截断判定靠它）。"""
+        details = SimpleNamespace(reason="max_output_tokens")
+        cut = to_completion(SimpleNamespace(output_text="半截", usage=None, incomplete_details=details))
+        self.assertEqual(cut.choices[0].finish_reason, "length")
+        done = to_completion(SimpleNamespace(output_text="完整", usage=None, incomplete_details=None))
+        self.assertIsNone(done.choices[0].finish_reason)
+
 
 if __name__ == "__main__":  # pragma: no cover
     unittest.main()

@@ -100,6 +100,16 @@ def is_degenerate_summary(summary: str) -> bool:
     return len(summary.strip()) < MIN_SUMMARY_CHARS
 
 
+class TruncatedSummary(RuntimeError):
+    """摘要撞输出上限被截断（finish_reason=length）。
+
+    退化下限只拦得住过短的输出，几千字的半截摘要照样过得去——而交接说明是
+    增量维护的：半截落盘后下一轮被当"此前摘要"继续维护，缺掉的后几节
+    （未完成事项、当前状态、下一步）逐轮丢失且无从察觉。与退化同罪：换路由重试，
+    全链截断就放弃本次压缩、历史原样保留。
+    """
+
+
 #  分界标记消毒（插零宽空格打断，不删内容）：
 #  摘要正文若原样复读了 CONTEXT_PREFIX（复述上一份摘要的开头、引用指令），
 #  下次压缩 split_head 会把它认成真的分界标记、从假标记处切开历史。

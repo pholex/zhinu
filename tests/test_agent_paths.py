@@ -74,6 +74,13 @@ def text_response(content: str, prompt: int = 100, completion: int = 20):
     )
 
 
+def truncated_response(content: str):
+    """撞输出上限的非流式响应：正文照常返回，finish_reason=length。"""
+    response = text_response(content)
+    response.choices[0].finish_reason = "length"
+    return response
+
+
 class AgentTestCase(unittest.TestCase):
     def setUp(self) -> None:
         self.tmp = tempfile.TemporaryDirectory()
@@ -686,6 +693,35 @@ class TestSummaryFallback(AgentTestCase):
             agent.maybe_compact(force=True)
         self.assertEqual(agent.messages, before)
 
+    def test_truncated_summary_triggers_fallback(self) -> None:
+        """撞输出上限的半截摘要再长也不算成功：换下一条路由。
+
+        增量交接说明会被下一轮当"此前摘要"继续维护，半截落盘的丢失会逐轮累积。
+        """
+        half = GOOD_SUMMARY * 20
+        agent = self.build([truncated_response(half), text_response(GOOD_SUMMARY)])
+        buffer = io.StringIO()
+        with contextlib.redirect_stdout(buffer):
+            summary = agent._summarize("一段历史")
+        self.assertEqual(summary, GOOD_SUMMARY)
+        self.assertIn("截断", buffer.getvalue())
+
+    def test_all_truncated_keeps_history(self) -> None:
+        """全链截断：放弃本次压缩、历史原样保留（与摘要全挂同一出口）。"""
+        #  长度远超退化下限、又比被压原文短：不看 finish_reason 就会被当成功摘要落盘
+        half = GOOD_SUMMARY * 3
+        #  降级阶梯两次 ×（便宜腿 1 + 主模型重放腿 1 + 主模型转写腿 1）= 六次，全部截断
+        agent = self.build([truncated_response(half) for _ in range(6)])
+        for index in range(10):
+            agent.messages.append({"role": "user", "content": f"第 {index} 轮"})
+            agent.messages.append({"role": "assistant", "content": f"回答 {index}" + "阿" * 1500})
+        before = list(agent.messages)
+        with contextlib.redirect_stdout(io.StringIO()):
+            note = agent.maybe_compact(force=True)
+        self.assertEqual(agent.messages, before)
+        self.assertIn("压缩失败", note)
+        self.assertNotIn(half, str(agent.messages))
+
 
 # ---------- REPL 斜杠命令 ----------
 
@@ -1113,6 +1149,20 @@ class TestPrefixReplaySummary(AgentTestCase):
         self.assertEqual(summary, GOOD_SUMMARY)
         used = [call["model"] for call in self.client.completions.calls]
         self.assertEqual(used, ["cheap-model", "main-model", "main-model"])
+
+    def test_truncated_replay_falls_back_to_transcript_on_same_route(self) -> None:
+        """重放姿势被截断与退化同罪：掉回转写姿势再试本路由（转写输入更短）。"""
+        agent = self.build(
+            [
+                RuntimeError("502"),
+                truncated_response(GOOD_SUMMARY * 20),
+                text_response(GOOD_SUMMARY),
+            ]
+        )
+        with contextlib.redirect_stdout(io.StringIO()):
+            summary = agent._summarize("一段历史", list(self.PREFIX))
+        self.assertEqual(summary, GOOD_SUMMARY)
+        self.assertEqual(len(self.client.completions.calls[2]["messages"]), 1)
 
     def test_no_prefix_means_no_replay(self) -> None:
         """不带前缀（compact 降级阶梯等）时主模型腿也走转写姿势。"""

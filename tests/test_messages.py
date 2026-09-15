@@ -771,6 +771,14 @@ class TestCompletionShape(unittest.TestCase):
         self.assertIsNone(result.usage)
         self.assertEqual(result.choices[0].message.content, "")
 
+    def test_max_tokens_stop_maps_to_length(self) -> None:
+        """非流式也要透传截断：摘要调用靠 length 识别半截摘要，不让它落盘。"""
+        block = SimpleNamespace(type="text", text="半截")
+        cut = msgs.to_completion(SimpleNamespace(content=[block], usage=None, stop_reason="max_tokens"))
+        self.assertEqual(cut.choices[0].finish_reason, "length")
+        done = msgs.to_completion(SimpleNamespace(content=[block], usage=None, stop_reason="end_turn"))
+        self.assertIsNone(done.choices[0].finish_reason)
+
 
 if __name__ == "__main__":  # pragma: no cover
     unittest.main()

@@ -36,6 +36,7 @@ from .compaction import (
     PREFIX_SUMMARY_INSTRUCTION,
     SUMMARY_INSTRUCTION,
     Compactor,
+    TruncatedSummary,
     is_degenerate_summary,
     microcompact,
 )
@@ -2973,9 +2974,10 @@ class Agent:
                         response.usage.completion_tokens or 0,
                     )
                 content = response.choices[0].message.content or ""
-                if not is_degenerate_summary(content):
+                if not self._summary_truncated(response) and not is_degenerate_summary(content):
                     return content
-                #  重放姿势退化（比如模型执意调工具）：掉回转写姿势再试本路由
+                #  重放姿势退化（比如模型执意调工具）或被截断：掉回转写姿势再试本路由
+                #  ——转写输入更短，要交接的内容少了，输出也更可能落在上限之内
         prompt = f"{SUMMARY_INSTRUCTION}\n\n---\n\n{transcript}"
         response = route.client.chat.completions.create(
             model=route.model,
@@ -2988,7 +2990,20 @@ class Agent:
                 response.usage.prompt_tokens or 0,
                 response.usage.completion_tokens or 0,
             )
-        return response.choices[0].message.content or ""
+        content = response.choices[0].message.content or ""
+        if self._summary_truncated(response):
+            #  半截摘要再长也不能当成功（见 TruncatedSummary）：抛给 _summarize 换路由
+            raise TruncatedSummary(
+                f"{route.qualified} 的摘要撞输出上限被截断（已产出 {len(content)} 字符）"
+            )
+        return content
+
+    @staticmethod
+    def _summary_truncated(response: Any) -> bool:
+        """非流式响应是否撞了输出上限。三种协议都已归一成 finish_reason=length
+        （Messages 的 max_tokens、Responses 的 incomplete: max_output_tokens）。"""
+        choices = getattr(response, "choices", None) or []
+        return bool(choices) and getattr(choices[0], "finish_reason", None) == "length"
 
     def _summarize(self, transcript: str, prefix: list[dict[str, Any]] | None = None) -> str:
         """让模型把早期对话总结成交接说明。不带工具调用、不流式。
@@ -3002,6 +3017,12 @@ class Agent:
         for route in self.summary_models():
             try:
                 content = self._summary_call(route, transcript, prefix or [])
+            except TruncatedSummary as exc:
+                last_error = exc
+                self.sink.emit(
+                    Notice(f"  摘要模型 {route.qualified} 输出被截断（半截摘要不落盘），回退下一个")
+                )
+                continue
             except Exception as exc:  # noqa: BLE001 - 换下一个模型再试
                 last_error = exc
                 self.sink.emit(

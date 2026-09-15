@@ -555,14 +555,16 @@ def stream_chunks(events: Iterator[Any]) -> Iterator[Chunk]:
 def to_completion(response: Any) -> Completion:
     """非流式响应 → chat completions 形状（`_summarize` 走这条路）。
 
-    refusal 在这里表现为空正文——_summarize 现有的空摘要守卫会自动换下一个模型。"""
+    refusal 在这里表现为空正文——_summarize 现有的空摘要守卫会自动换下一个模型。
+    截断（stop_reason=max_tokens）与流式一路同样翻成 finish_reason=length。"""
     text = "".join(
         getattr(block, "text", "") or ""
         for block in (getattr(response, "content", None) or [])
         if getattr(block, "type", "") == "text"
     )
+    finish = "length" if getattr(response, "stop_reason", None) == "max_tokens" else None
     return Completion(
-        choices=[NonStreamChoice(Message(content=text))],
+        choices=[NonStreamChoice(Message(content=text), finish_reason=finish)],
         usage=_usage(getattr(response, "usage", None)),
     )
 
