@@ -89,8 +89,16 @@ from .config import Config, user_config_dir
 #  活着的 MCP 连接数（stdio 子进程 + HTTP 会话），/diagnostics 与 doctor 可见
 CONNECTIONS_LIVE = diagnostics.Gauge("mcp.connections.live")
 
-#  MCP 规范修订号。server 端一般都向后兼容旧修订，握手时对方回什么版本就用什么。
+#  MCP 规范修订号：initialize 时向 server 请求的版本。server 支持就原样回它，
+#  不支持就回一个自己支持的——最终以回包里的 protocolVersion 为准（协商结果）。
 PROTOCOL_VERSION = "2025-06-18"
+#  客户端接受的协商结果。规范：server 回的版本客户端不支持，就应当断开。
+#  入选标准是"小羽用到的那部分（initialize / tools/list / tools/call / 通知）
+#  在该修订下语义不变"：
+#  - 2024-11-05、2025-03-26：旧修订，数据层是 2025-06-18 的子集（stdio 老 server 大量停在这里）
+#  - 2025-11-25：新修订，对这几个方法只有增量字段，多出来的字段按未知忽略
+#  不在集合里的（含日后改掉握手形态的修订）一律明确报错，不带着猜测连下去。
+SUPPORTED_PROTOCOL_VERSIONS = ("2025-11-25", PROTOCOL_VERSION, "2025-03-26", "2024-11-05")
 
 #  initialize + tools/list 的超时：npx/uvx 首跑要现下包，给足余量。
 INIT_TIMEOUT = 30.0
@@ -556,8 +564,9 @@ class _HttpChannel:
     def __init__(self, spec: ServerSpec) -> None:
         self.spec = spec
         self.session_id = ""
-        #  握手后才带协议版本头（规范：initialize 那次还不知道协商结果）
-        self.negotiated = False
+        #  initialize 协商出的协议版本，空串 = 还没握手。握手后才带协议版本头
+        #  （规范：initialize 那次还不知道协商结果）。restart 换新通道即清零
+        self.protocol_version = ""
         self._stream: Any = None
         self._stream_thread: threading.Thread | None = None
         self._closed = False
@@ -572,8 +581,13 @@ class _HttpChannel:
         }
         if self.session_id:
             headers["Mcp-Session-Id"] = self.session_id
-        if self.negotiated:
-            headers["MCP-Protocol-Version"] = PROTOCOL_VERSION
+        if self.protocol_version:
+            #  发协商值而不是本端常量：server 回了 2025-03-26 还发 2025-06-18，
+            #  严格的 server 按规范对不支持的版本头回 400。
+            #  这个头是 2025-06-18 才引入的；协商到更早的修订照样发协商值——
+            #  老 server 不认识的头按规范忽略，多版本 server 没收到头时本来也按
+            #  2025-03-26 处理，发与不发语义一致，统一发省掉按版本分叉
+            headers["MCP-Protocol-Version"] = self.protocol_version
         #  自定义头最后合并：用户点名的优先（他可能就是要覆盖 UA/Accept）
         headers.update(self.spec.headers)
         return headers
@@ -834,6 +848,8 @@ class McpServer:
         self._breaker_until = 0.0
         #  server 声明的名字/版本（initialize 响应里的 serverInfo），/mcp 展示用
         self.server_info = ""
+        #  本代 initialize 协商出的协议版本（空串 = 未握手）；restart 清零重协商
+        self.protocol_version = ""
         #  最近一次 call_tool 的图片部件（见 call_tool）：调用方紧接着取走
         self.last_media: list[dict[str, Any]] = []
         #  惰性启动状态：schema 缓存命中的 server 直到第一次真实调用才 spawn
@@ -933,12 +949,22 @@ class McpServer:
         self.server_info = " ".join(
             str(part) for part in (info.get("name"), info.get("version")) if part
         )
+        version = result.get("protocolVersion")
+        if not isinstance(version, str) or not version:
+            #  漏回版本字段的 server 不在少数：按我方请求的版本算，不为此拒连
+            version = PROTOCOL_VERSION
+        if version not in SUPPORTED_PROTOCOL_VERSIONS:
+            raise McpError(
+                f"server 协商的协议版本 {version[:40]!r} 不受支持"
+                f"（支持：{', '.join(SUPPORTED_PROTOCOL_VERSIONS)}），按规范断开"
+            )
+        self.protocol_version = version
         if self._http is not None:
             #  协商完成的那一刻就要立旗：规范要求 initialize 响应**之后**的每一次
             #  请求都带 MCP-Protocol-Version，包括紧接着这条 initialized 通知。
             #  （立旗晚一行，通知就成了唯一漏带的那条——server 严格校验时只有
             #  这一条被拒，症状是"握手过了但 server 认为没握手"。）
-            self._http.negotiated = True
+            self._http.protocol_version = version
         self._notify("notifications/initialized")
         if self._http is not None:
             #  server→client 长流放在 initialized 之后开：server 有权在握手
@@ -1041,8 +1067,10 @@ class McpServer:
             #  熔断是"进程活着但请求连败"的防线，新一代从零开始
             self._failures = 0
             self._breaker_until = 0.0
+            #  协商结果属于上一代：新一代的 server 可能已经升/降级，必须重新协商
+            self.protocol_version = ""
             if self._http is not None:
-                #  HTTP 换一条全新通道：会话 id、关闭标志都属于上一代。沿用旧会话 id
+                #  HTTP 换一条全新通道：会话 id、协商版本、关闭标志都属于上一代。沿用旧会话 id
                 #  去 initialize，严格的 server 回 404（重连永远连不上）；沿用关闭
                 #  标志，新长流上的 list_changed 会被静默丢弃
                 self._http = _HttpChannel(self.spec)

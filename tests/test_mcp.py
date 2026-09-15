@@ -244,8 +244,9 @@ class _McpHttpHandler(BaseHTTPRequestHandler):
     #  非 initialize 请求的剧本：非空时每个带 id 的请求弹出一个动作决定怎么答——
     #  "404" 回收会话 / "401" / "500" / "hang" 挂起不答 / "drop" 不答直接断连接
     actions: list = []
-    #  initialize 的状态码（200 = 正常握手）
+    #  initialize 的状态码（200 = 正常握手）与回包里的协商版本
     init_status = 200
+    init_version = "2025-06-18"
     #  超大应答类动作的数据量（用例把客户端上限临时调小到它之下）
     big = 100 * 1024
 
@@ -341,7 +342,7 @@ class _McpHttpHandler(BaseHTTPRequestHandler):
             new_session = f"sess-http-{cls.issued}"
             cls.sessions.add(new_session)
             reply = {"jsonrpc": "2.0", "id": message["id"], "result": {
-                "protocolVersion": "2025-06-18",
+                "protocolVersion": cls.init_version,
                 "capabilities": {"tools": {}},
                 "serverInfo": {"name": "fake-http", "version": "1"},
             }}
@@ -419,6 +420,7 @@ class _HttpServerCase(unittest.TestCase):
         _McpHttpHandler.issued = 0
         _McpHttpHandler.actions = []
         _McpHttpHandler.init_status = 200
+        _McpHttpHandler.init_version = "2025-06-18"
         self.serve()
         self.url = f"http://127.0.0.1:{self.httpd.server_address[1]}/mcp"
         self.tmp = tempfile.TemporaryDirectory()
@@ -475,6 +477,32 @@ class HttpTransportTest(_HttpServerCase):
         #  协议版本头握手后才带（initialize 那次还没协商出结果）
         self.assertNotIn("mcp-protocol-version", _McpHttpHandler.record["headers"][0])
         self.assertTrue(all(h.get("mcp-protocol-version") for h in after_init))
+
+    def test_protocol_version_header_follows_negotiation(self):
+        """server 回了更早的修订：此后的版本头（含 initialized 通知）必须是协商值，
+        发本端常量会被严格的 server 按"不支持的版本"回 400。"""
+        _McpHttpHandler.init_version = "2025-03-26"
+        server = self.make_server()
+        server.bootstrap()
+        self.assertEqual(server.call_tool("echo", {"text": "旧"}), "远端回显：旧")
+        record = _McpHttpHandler.record
+        self.assertEqual(record["methods"][1], "notifications/initialized")
+        after_init = record["headers"][1:]
+        self.assertTrue(after_init)
+        self.assertEqual(
+            {h.get("mcp-protocol-version") for h in after_init}, {"2025-03-26"}
+        )
+        self.assertEqual(server.protocol_version, "2025-03-26")
+
+    def test_unsupported_negotiated_version_is_rejected(self):
+        _McpHttpHandler.init_version = "2099-01-01"
+        server = self.make_server()
+        with self.assertRaises(mcp.McpError) as caught:
+            server.bootstrap()
+        self.assertIn("2099-01-01", str(caught.exception))
+        self.assertIn("不受支持", str(caught.exception))
+        #  不带着猜测连下去：连 initialized 通知都不该发
+        self.assertEqual(_McpHttpHandler.record["methods"], ["initialize"])
 
     def test_custom_headers_are_sent(self):
         server = self.make_server(headers={"Authorization": "Bearer t0k"})
@@ -584,6 +612,8 @@ class HttpFailureTest(_HttpServerCase):
         inits = [h for m, h in zip(record["methods"], record["headers"]) if m == "initialize"]
         self.assertEqual(len(inits), 2)
         self.assertNotIn("mcp-session-id", inits[1])
+        #  协商值同样归零：重新握手那次不能带上一代的版本头
+        self.assertNotIn("mcp-protocol-version", inits[1])
 
     def test_connection_lost_then_server_back_reconnects(self):
         manager = self.make_manager()
