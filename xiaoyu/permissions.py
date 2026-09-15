@@ -100,6 +100,18 @@ def _wrapped_pattern_reason(spec: str, depth: int) -> str | None:
     - 剥出来的还是 wrapper（`nice sudo *`）→ 接着剥。
     """
     tokens = spec.split()
+    head = tokens[0].rsplit("/", 1)[-1] if tokens else ""
+    if _has_glob(head):
+        #  wrapper 名本身带通配（`*nice -n 5 *`、`n?ce …`、`[s]udo …`）：unwrap 认不出名字，
+        #  不拦就原样放行。逐个代入它能匹配上的 wrapper 名再判，任一代入被拒即拒
+        for name in sorted(command_check.WRAPPER_NAMES):
+            if fnmatch.fnmatch(name, head) and _wrapped_pattern_reason(
+                " ".join([name, *tokens[1:]]), depth + 1
+            ):
+                return (f"该模式的开头「{tokens[0]}」能匹配「{name}」，会借它放行里面的任意命令，"
+                        "等于永久绕过整套权限系统。请写到具体命令（如 allow bash(timeout 60 pytest*)），"
+                        "或在确认框答 a 做会话级放行。")
+        return None
     try:
         inners = command_check.unwrap_argv(tokens)
     except ValueError:
