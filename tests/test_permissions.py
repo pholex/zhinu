@@ -400,6 +400,15 @@ class BannedAllowTest(unittest.TestCase):
             "allow bash(nice -n 5 python *)",
             "allow bash(nice -n 5 sudo *)",
             "allow bash(su -c *)",
+            #  会把后续参数当命令/脚本跑的工具：随 wrapper 表自动进禁用名单
+            "allow bash(watch *)",
+            "allow bash(watch -n 5 *)",
+            "allow bash(script -c *)",
+            "allow bash(script -q /dev/null *)",
+            "allow bash(sg docker *)",
+            "allow bash(caffeinate -i *)",
+            "allow bash(arch -arm64 *)",
+            "allow bash(chrt -o *)",
         ):
             with self.assertRaises(ValueError, msg=line):
                 perms.add_persistent(parse_rule(line))

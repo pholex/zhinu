@@ -1,0 +1,29 @@
+{"cmd": "nsenter -N 3 rm -rf ~", "guard": "dangerous", "expect": "block", "note": "nsenter -N/--net-socket 带值（旧表误作 flag，值 3 被当命令）"}
+{"cmd": "nsenter --net-socket 3 rm -rf ~", "guard": "dangerous", "expect": "block", "note": "nsenter --net-socket 独立值"}
+{"cmd": "nsenter -W rm -rf ~", "guard": "dangerous", "expect": "block", "note": "nsenter -W 值可选（旧表误作必带值，rm 被吃成目录）"}
+{"cmd": "nsenter -t 1 -W /srv rm -rf ~", "guard": "dangerous", "expect": "block", "note": "nsenter -W 各版本语义不一：两种解释都扫"}
+{"cmd": "ltrace -w 3 rm -rf ~", "guard": "dangerous", "expect": "block", "note": "ltrace -w/--where 带值（旧表误作 flag）"}
+{"cmd": "ltrace -d 2 -n 4 rm -rf ~", "guard": "dangerous", "expect": "block", "note": "ltrace -d/--max-depth 带值"}
+{"cmd": "chrt -o rm -rf ~", "guard": "dangerous", "expect": "block", "note": "chrt 优先级只在纯数字时才吃（旧表固定吃一个位置参数）"}
+{"cmd": "chrt --batch rm -rf ~", "guard": "dangerous", "expect": "block", "note": "chrt 长选项策略、省略优先级"}
+{"cmd": "chrt -f 10 rm -rf ~", "guard": "dangerous", "expect": "block", "note": "chrt 带优先级"}
+{"cmd": "chrt -U 512 -X 1024 -o 0 rm -rf ~", "guard": "dangerous", "expect": "block", "note": "chrt -U/-X 带值"}
+{"cmd": "sudo FOO=1 rm -rf ~", "guard": "dangerous", "expect": "block", "note": "sudo 命令前的 VAR=value"}
+{"cmd": "sudo -h rm -rf ~", "guard": "dangerous", "expect": "block", "note": "sudo -h 既可能是 help 也可能吃主机名：两种解释都扫"}
+{"cmd": "sudo -a style rm -rf ~", "guard": "dangerous", "expect": "block", "note": "sudo -a/--auth-type 带值"}
+{"cmd": "doas -a style rm -rf ~", "guard": "dangerous", "expect": "block", "note": "doas -a 带值"}
+{"cmd": "run0 -i --via-shell -n rm -rf ~", "guard": "dangerous", "expect": "block", "note": "run0 flag 类选项"}
+{"cmd": "systemd-run -v -R --expand-environment=no rm -rf ~", "guard": "dangerous", "expect": "block", "note": "systemd-run -v/-R flag + --expand-environment 带值"}
+{"cmd": "systemd-run --root-directory /srv --json pretty rm -rf ~", "guard": "dangerous", "expect": "block", "note": "systemd-run --root-directory/--json 带值"}
+{"cmd": "unshare -mu --owner 0:0 rm -rf ~", "guard": "dangerous", "expect": "block", "note": "unshare 短选项聚合 + --owner 带值"}
+{"cmd": "setpriv --ptracer any rm -rf ~", "guard": "dangerous", "expect": "block", "note": "setpriv --ptracer 带值"}
+{"cmd": "flock --start 0 --length 1 /tmp/l rm -rf ~", "guard": "dangerous", "expect": "block", "note": "flock --start/--length 带值"}
+{"cmd": "strace -A -o log rm -rf ~", "guard": "dangerous", "expect": "block", "note": "strace -A 是 flag"}
+{"cmd": "unshare --owner rm printf -rf", "guard": "dangerous", "expect": "allow", "note": "--owner 的值 rm 不是命令"}
+{"cmd": "env --env0-from rm printf -rf", "guard": "dangerous", "expect": "allow", "note": "env --env0-from 的值 rm 不是命令"}
+{"cmd": "setpriv --ptracer rm printf -rf", "guard": "dangerous", "expect": "allow", "note": "setpriv --ptracer 的值 rm 不是命令"}
+{"cmd": "ltrace -w rm printf -rf", "guard": "dangerous", "expect": "allow", "note": "ltrace -w 的值 rm 不是命令"}
+{"cmd": "nsenter -N rm printf -rf", "guard": "dangerous", "expect": "allow", "note": "nsenter -N 的值 rm 不是命令"}
+{"cmd": "chrt -f 10 make", "guard": "dangerous", "expect": "allow", "note": "chrt 包无害命令"}
+{"cmd": "nsenter -N 3 sudo id", "guard": "privileged", "expect": "block", "note": "nsenter -N 带值包 sudo"}
+{"cmd": "chrt -o sudo id", "guard": "privileged", "expect": "block", "note": "chrt 省略优先级包 sudo"}
