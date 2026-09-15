@@ -13,6 +13,8 @@ from unittest import mock
 from xiaoyu import skills, tokens
 from xiaoyu.tools import Tool
 
+from .fifo_support import call_bounded, needs_fifo
+
 
 class SkillDirsTest(unittest.TestCase):
     def test_undeterminable_home_skips_agents_dir_instead_of_crashing(self) -> None:
@@ -146,6 +148,16 @@ class ScanTest(unittest.TestCase):
         write_skill(self.primary, "no-name", "description: 无名技能")
         found = skills.scan_skills()
         self.assertEqual(found[0].name, "no-name")
+
+    @needs_fifo
+    def test_special_skill_md_skipped_without_blocking(self):
+        """glob 不看文件类型：SKILL.md 是命名管道时整个扫描不许挂住。"""
+        write_skill(self.primary, "deploy", "name: deploy\ndescription: 部署流程")
+        evil = self.primary / "evil" / "SKILL.md"
+        evil.parent.mkdir(parents=True)
+        os.mkfifo(evil)
+        found = call_bounded(self, skills.scan_skills, evil)
+        self.assertEqual([skill.name for skill in found], ["deploy"])
 
     def test_first_source_wins_on_conflict_and_says_so(self):
         """撞名以前是静默丢弃：只看得到一条，却不知道另一份被吃了。"""

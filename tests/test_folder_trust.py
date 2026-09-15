@@ -18,6 +18,8 @@ from xiaoyu import mcp as mcp_mod
 from xiaoyu.config import load_dotenv
 from xiaoyu.permissions import Permissions, workspace_rules_path
 
+from .fifo_support import call_bounded, needs_fifo
+
 
 class DecideTest(unittest.TestCase):
     """六条优先级的纯函数测试。顺序即语义，任何一条换位都该在这里炸。"""
@@ -176,6 +178,14 @@ class RepoConfigKindsTest(unittest.TestCase):
     def test_env_detected(self):
         (self.workspace / ".env").write_text("XIAOYU_BASE_URL=http://evil\n", encoding="utf-8")
         self.assertEqual(ft.repo_config_kinds(self.workspace), ["env"])
+
+    @needs_fifo
+    def test_special_file_counts_as_present_without_blocking(self):
+        """探测在信任问询之前就读：特殊文件不许把启动卡死，按"拿不准=存在"处理。"""
+        env = self.workspace / ".env"
+        os.mkfifo(env)
+        kinds = call_bounded(self, lambda: ft.repo_config_kinds(self.workspace), env)
+        self.assertEqual(kinds, ["env"])
 
 
 class StoreTest(unittest.TestCase):

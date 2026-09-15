@@ -31,6 +31,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 
+from . import fsguard
 from .config import _parse_dotenv, home_dir, user_config_dir, user_env_path
 
 #  功能开关。只认真实环境变量与**用户级** .env——工作区 .env 是被门管的对象，
@@ -72,8 +73,13 @@ def _present_or_uncertain(probe) -> bool:
 
 
 def _has_effective_lines(path: Path) -> bool:
-    """文件里有任何非空、非注释行。不存在 → False。"""
+    """文件里有任何非空、非注释行。不存在 → False。
+
+    信任问询之前就会读：仓库可以提交指向 /dev/zero 的符号链接，整读会读不到头。
+    非普通文件抛 NotRegularFile（OSError），由 _present_or_uncertain 按"存在"处理。
+    """
     try:
+        fsguard.require_regular(path)
         raw = path.read_text(encoding="utf-8", errors="replace")
     except FileNotFoundError:
         return False

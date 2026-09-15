@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import contextlib
 import io
+import os
 import unittest
 from unittest import mock
 
@@ -962,6 +963,61 @@ class TestDedupedHistory(unittest.TestCase):
         for line in ("a", "a", "a", "b"):
             plain.append_string(line)
         self.assertEqual(list(DedupedHistory(history.filename).load_history_strings()), ["b", "a"])
+
+
+@unittest.skipUnless(HAS_TUI, "未安装 tui 可选依赖")
+@unittest.skipIf(os.name == "nt", "权限位只在 POSIX 上有语义")
+class TestInputHistoryPermissions(unittest.TestCase):
+    """输入历史里可能有用户贴过的密钥：文件仅本人可读写，新建目录 0700。"""
+
+    def setUp(self) -> None:
+        import tempfile
+        from pathlib import Path
+
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.root = Path(tmp.name)
+
+    def open_history(self, config_dir):
+        from unittest import mock
+
+        from xiaoyu import tui
+
+        shell = object.__new__(tui.Tui)  # 只测建会话这一步，不起整个 TUI
+        shell._session = None
+        with mock.patch.object(tui, "user_config_dir", return_value=config_dir), \
+                mock.patch.object(tui, "PromptSession") as session_cls, \
+                mock.patch.object(tui, "SlashCompleter"), \
+                mock.patch.object(tui.Tui, "_key_bindings"):
+            shell._input_session()
+        return session_cls.call_args.kwargs["history"].filename
+
+    @staticmethod
+    def mode(path) -> int:
+        import stat
+
+        return stat.S_IMODE(os.stat(path).st_mode)
+
+    def test_fresh_dirs_and_file_are_private(self) -> None:
+        config_dir = self.root / "home" / "xiaoyu"
+        filename = self.open_history(config_dir)
+        self.assertEqual(self.mode(filename), 0o600)
+        #  本次新建的每一层都是 0700
+        self.assertEqual(self.mode(config_dir), 0o700)
+        self.assertEqual(self.mode(config_dir.parent), 0o700)
+
+    def test_existing_loose_file_tightened_dir_left_alone(self) -> None:
+        config_dir = self.root / "xiaoyu"
+        config_dir.mkdir()
+        os.chmod(config_dir, 0o755)
+        history = config_dir / "input_history"
+        history.write_text("\n# 旧版按 umask 建的\n+ls\n", encoding="utf-8")
+        os.chmod(history, 0o644)
+        self.open_history(config_dir)
+        self.assertEqual(self.mode(history), 0o600)
+        #  已存在的目录可能是用户自己建的，不替人改权限；内容原样
+        self.assertEqual(self.mode(config_dir), 0o755)
+        self.assertIn("+ls", history.read_text(encoding="utf-8"))
 
 
 @unittest.skipUnless(HAS_TUI, "未安装 tui 可选依赖")

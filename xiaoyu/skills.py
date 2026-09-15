@@ -17,7 +17,7 @@ import sys
 from dataclasses import dataclass
 from pathlib import Path
 
-from . import plugins, tokens
+from . import fsguard, plugins, tokens
 from .config import home_dir, user_config_dir
 
 #  插件命名空间与技能名之间的分隔符（`<插件>:<技能>`，业界通行形态）
@@ -243,6 +243,8 @@ def scan_skills() -> list[Skill]:
             continue
         for skill_md in sorted(source.directory.glob("*/SKILL.md")):
             try:
+                #  glob 不看文件类型：仓库里 SKILL.md 可以是指向设备的链接
+                fsguard.require_regular(skill_md)
                 meta = parse_frontmatter(skill_md.read_text(encoding="utf-8", errors="replace"))
             except OSError:
                 continue
@@ -282,6 +284,7 @@ def scan_skills() -> list[Skill]:
 def load_skill_body(skill: Skill) -> str:
     """技能正文（去 frontmatter）。读失败返回错误文本交给模型。"""
     try:
+        fsguard.require_regular(skill.path)  # 扫描之后可能被换成特殊文件
         return strip_frontmatter(skill.path.read_text(encoding="utf-8", errors="replace"))
     except OSError as exc:
         return f"ERROR: 读取技能失败：{exc}"
