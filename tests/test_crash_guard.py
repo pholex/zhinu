@@ -82,6 +82,18 @@ class CrashGuardTest(unittest.TestCase):
         self.assertIn("err-49", text)
         self.assertNotIn("err-0\n", text)
 
+    @unittest.skipIf(sys.platform == "win32", "Windows 上 POSIX 权限位无语义")
+    def test_crash_log_is_owner_only(self) -> None:
+        import os
+
+        with mock.patch.object(sys, "excepthook", lambda *a: None):
+            crash_guard.install(self.log)
+            try:
+                raise ValueError("secret-ish")
+            except ValueError as exc:
+                sys.excepthook(type(exc), exc, exc.__traceback__)
+        self.assertEqual(os.stat(self.log).st_mode & 0o777, 0o600)
+
 
 if __name__ == "__main__":
     unittest.main()

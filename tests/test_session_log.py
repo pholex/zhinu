@@ -152,6 +152,46 @@ class SessionLogTest(SessionDirTestCase):
         self.assertEqual(lines[2]["event"], "clear")
 
 
+@unittest.skipIf(os.name == "nt", "Windows 上 POSIX 权限位无语义")
+class SessionFilePermissionTest(SessionDirTestCase):
+    """会话 JSONL 含工具输出、可能带密钥：文件 0600、自建目录 0700。"""
+
+    @staticmethod
+    def mode(path: Path) -> int:
+        return path.stat().st_mode & 0o777
+
+    def test_new_session_file_and_dirs_are_owner_only(self):
+        log = SessionLog.create("m", "/ws/perm")
+        self.addCleanup(log.release)
+        self.assertEqual(self.mode(log.path), 0o600)
+        self.assertEqual(self.mode(lock_path(log.path)), 0o600)
+        #  xiaoyu 自己建出来的每一层目录都是 0700
+        self.assertEqual(self.mode(log.path.parent), 0o700)
+        self.assertEqual(self.mode(sessions_dir()), 0o700)
+
+    def test_existing_wide_file_tightened_on_append(self):
+        directory = sessions_dir() / "-ws-old"
+        directory.mkdir(parents=True)
+        path = directory / "19990101-000000-1.jsonl"
+        path.write_text(json.dumps({"event": "meta", "workspace": "/ws/old"}) + "\n", encoding="utf-8")
+        os.chmod(path, 0o644)
+        log = SessionLog(path)
+        self.addCleanup(log.release)
+        log.append({"role": "user", "content": "hi"})
+        self.assertEqual(self.mode(path), 0o600)
+        self.assertEqual(self.read_lines(log)[-1]["content"], "hi")
+
+    def test_host_directory_permissions_untouched(self):
+        """宿主显式传的已存在目录不替它改权限，只管自己建的文件。"""
+        target = Path(self.tmp.name) / "host"
+        target.mkdir()
+        os.chmod(target, 0o755)
+        log = SessionLog.create("m", "/ws", directory=target)
+        self.addCleanup(log.release)
+        self.assertEqual(self.mode(target), 0o755)
+        self.assertEqual(self.mode(log.path), 0o600)
+
+
 class UsageDigestTest(SessionDirTestCase):
     """`xiaoyu sessions digest` 的地基：跨会话聚合轮末 usage 快照。"""
 
