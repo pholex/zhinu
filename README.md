@@ -78,7 +78,7 @@ xiaoyu mcp list                         # 写的就是 .mcp.json / mcp.json
 
 REPL 里：`/help` `/tools` `/skills` `/model` `/effort` `/mode` `/usage` `/context` `/compact` `/clear` `/exit` `/tasks` `/plan` `/perm` `/allow` `/deny` `/resume` `/rewind` `/mcp` `/quit`
 
-无人值守时没人按确认键：先用 `/allow` 配规则，或 `--mode auto`、`--yolo`。
+无人值守时没人按确认键：先用 `/allow` 配规则，或 `--mode auto`、`--yolo`。放进 CI 跑见 [docs/ci.md](docs/ci.md)（附 GitHub Actions 样本）。
 
 ## 模式：放手程度你定
 
