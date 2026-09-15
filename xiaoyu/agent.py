@@ -3353,6 +3353,7 @@ class Agent:
         self.sink.emit(RequestStarted(route.model))
         self._content_filtered = False
         self._length_truncated = False
+        self._stream_finished = False
         try:
             stream = route.client.chat.completions.create(**request)
             self._consume_stream(route, stream, content_parts, pending, reasoning)
@@ -3378,6 +3379,20 @@ class Agent:
             if content_parts:
                 self.sink.emit(TextEnd())
             self.sink.emit(RequestEnded())
+
+        if not self._stream_finished:
+            #  流结束了却没有任何收尾信号（finish_reason / usage 都没见到），而某个
+            #  工具调用的 arguments 不是合法 JSON：这是断流拦腰截断，不是模型写坏了。
+            #  执行只会白费一步，抛给 _stream_retrying 按瞬时错误退避重发。
+            #  纯文本断流、完整参数的调用不在此列（前者保持现状，后者照常执行）
+            for call in pending.values():
+                try:
+                    json.loads(call["function"]["arguments"] or "{}")
+                except json.JSONDecodeError:
+                    raise errors.StreamTruncated(
+                        f"{route.qualified} 的流在工具调用 {call['function']['name'] or '?'} "
+                        "的参数写到一半时结束，没有收尾信号"
+                    ) from None
 
         if self._content_filtered:
             if not content_parts and not pending:
@@ -3521,6 +3536,9 @@ class Agent:
                 self._interrupt_flag.clear()
                 raise Interrupted("宿主请求打断")
             if getattr(chunk, "usage", None):
+                #  收到 usage 即视为正常收尾：有些端点不发 finish_reason，只在
+                #  最后给一个纯 usage chunk（断流判定见 _stream_once）
+                self._stream_finished = True
                 prompt_tokens = chunk.usage.prompt_tokens or 0
                 self.usage.add(
                     route.qualified,
@@ -3556,6 +3574,8 @@ class Agent:
             #  收尾原因认两种：内容过滤决定这次"空补全"是拒答还是断流；length 说明
             #  输出撞了长度上限，最后一个工具调用多半被拦腰截断
             finish = getattr(chunk.choices[0], "finish_reason", None)
+            if finish:
+                self._stream_finished = True
             if finish == "content_filter":
                 self._content_filtered = True
             elif finish == "length":

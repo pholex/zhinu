@@ -338,7 +338,12 @@ class TestToolCallLoop(AgentTestCase):
         self.assertNotIn("没带回 thought_signature", buffer.getvalue())
 
     def test_malformed_arguments_are_reported_not_crashed(self) -> None:
-        first = [chunk(tool_calls=[call_fragment(0, "x", "read_file", "{不是合法 JSON")])]
+        #  带 usage 收尾：流正常结束、坏 JSON 是模型自己写的，走报错路径。
+        #  没有任何收尾信号的同形状是断流，会被原地重发（见 test_errors 的 StreamTruncationTest）
+        first = [
+            chunk(tool_calls=[call_fragment(0, "x", "read_file", "{不是合法 JSON")]),
+            usage_chunk(100, 10),
+        ]
         agent = self.build([first, [chunk(content="我重试")]])
         with contextlib.redirect_stdout(io.StringIO()):
             agent.send("试试")

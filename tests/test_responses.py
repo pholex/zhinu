@@ -277,6 +277,16 @@ class TestStreamTranslation(unittest.TestCase):
         _, _, usage = self.collect([text_delta("x"), completed(11, 22)])
         self.assertEqual((usage.prompt_tokens, usage.completion_tokens), (11, 22))
 
+    def test_completed_without_usage_still_signals_finish(self) -> None:
+        """不回 usage 的兼容端点：收尾事件补一个 stop，内核才不会把它当断流重发。"""
+        chunks = list(
+            responses.stream_chunks(iter([event("response.completed", response=SimpleNamespace(usage=None))]))
+        )
+        self.assertEqual([c.choices[0].finish_reason for c in chunks if c.choices], ["stop"])
+        #  有 usage 时形状不变：不多发 stop
+        with_usage = list(responses.stream_chunks(iter([completed(1, 2)])))
+        self.assertEqual([c for c in with_usage if c.choices], [])
+
     def test_usage_chunk_carries_no_choices(self) -> None:
         """收尾 usage chunk 的 choices 必须为空——内核靠它跳过，形状同 chat 流末尾。"""
         chunks = list(responses.stream_chunks(iter([completed(1, 2)])))

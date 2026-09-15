@@ -495,6 +495,10 @@ def stream_chunks(events: Iterator[Any]) -> Iterator[Chunk]:
             elif getattr(details, "reason", None) == "max_output_tokens":
                 #  截断同理：内核靠 length 丢弃残缺工具调用、提示用户，而不是当断流重发
                 yield Chunk(choices=[Choice(Delta(), finish_reason="length")])
+            elif getattr(event.response, "usage", None) is None:
+                #  收尾事件是内核认"流正常结束"的唯一信号，平时由 usage chunk 带过去；
+                #  个别兼容端点不回 usage，就补一个 stop，免得被当成断流重发
+                yield Chunk(choices=[Choice(Delta(), finish_reason="stop")])
             yield Chunk(usage=_usage(getattr(event.response, "usage", None)))
         elif kind in ("response.failed", "error"):
             #  真失败才抛。落到 errors.classify 多半是 fatal（没有 HTTP 状态码可判），

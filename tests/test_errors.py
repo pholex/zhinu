@@ -15,6 +15,7 @@ from xiaoyu.errors import (
     ALL_KINDS,
     RETRY_AFTER_CAP,
     ContentFiltered,
+    StreamTruncated,
     classify,
     retry_after_seconds,
 )
@@ -570,3 +571,84 @@ class ContentFilterTest(AgentTestCase):
             agent.send("hi")
         self.assertEqual(agent.last_assistant_text(), "前半段")
         self.assertIn("内容过滤截断", buffer.getvalue())
+
+
+def finish_chunk(reason: str = "tool_calls"):
+    delta = types.SimpleNamespace(content=None, tool_calls=None)
+    choice = types.SimpleNamespace(delta=delta, finish_reason=reason)
+    return types.SimpleNamespace(choices=[choice], usage=None)
+
+
+HALF_WRITE = '{"path": "a.py", "content": "de'
+
+
+class StreamTruncationTest(AgentTestCase):
+    """流在工具参数写到一半时结束、没有任何收尾信号：断流，原地重发而不是执行残缺调用。"""
+
+    def test_classified_transient(self):
+        verdict = classify(StreamTruncated("断了"))
+        self.assertEqual(verdict.kind, "transient")
+        self.assertTrue(verdict.retryable)
+
+    def test_half_arguments_without_finish_or_usage_are_retried(self):
+        agent = self.build([
+            [chunk(tool_calls=[call_fragment(0, "c1", "write_file", HALF_WRITE)])],
+            [
+                chunk(tool_calls=[call_fragment(0, "c2", "write_file", '{"path": "a.py", "content": "done"}')]),
+                usage_chunk(100, 10),
+            ],
+            [chunk(content="写好了"), usage_chunk(100, 5)],
+        ])
+        with mock.patch("xiaoyu.agent.time.sleep") as fake_sleep, contextlib.redirect_stdout(io.StringIO()):
+            agent.send("写个文件")
+        self.assertEqual(len(self.client.completions.calls), 3)
+        #  走的是可重试错误的退避路径
+        fake_sleep.assert_called_once()
+        self.assertEqual((self.root / "a.py").read_text(encoding="utf-8"), "done")
+        #  残缺调用没进历史，也没换来一条"参数不是合法 JSON"
+        ids = [c["id"] for m in agent.messages for c in m.get("tool_calls") or []]
+        self.assertEqual(ids, ["c2"])
+        self.assertFalse(any("不是合法 JSON" in str(m.get("content")) for m in agent.messages))
+
+    def test_half_arguments_with_usage_are_not_retried(self):
+        """收到过 usage 就是正常结束（有的端点不发 finish_reason）：坏 JSON 走原报错路径。"""
+        agent = self.build([
+            [chunk(tool_calls=[call_fragment(0, "c1", "write_file", HALF_WRITE)]), usage_chunk(100, 10)],
+            [chunk(content="我重试"), usage_chunk(100, 5)],
+        ])
+        with mock.patch("xiaoyu.agent.time.sleep") as fake_sleep, contextlib.redirect_stdout(io.StringIO()):
+            agent.send("写个文件")
+        self.assertEqual(len(self.client.completions.calls), 2)
+        fake_sleep.assert_not_called()
+        self.assertIn("不是合法 JSON", agent.messages[3]["content"])
+
+    def test_half_arguments_with_finish_reason_are_not_retried(self):
+        agent = self.build([
+            [chunk(tool_calls=[call_fragment(0, "c1", "write_file", HALF_WRITE)]), finish_chunk()],
+            [chunk(content="我重试")],
+        ])
+        with mock.patch("xiaoyu.agent.time.sleep") as fake_sleep, contextlib.redirect_stdout(io.StringIO()):
+            agent.send("写个文件")
+        self.assertEqual(len(self.client.completions.calls), 2)
+        fake_sleep.assert_not_called()
+        self.assertIn("不是合法 JSON", agent.messages[3]["content"])
+
+    def test_complete_arguments_without_finish_still_run(self):
+        """参数完整的调用哪怕没有收尾信号也照常执行（只拦残缺的）。"""
+        agent = self.build([
+            [chunk(tool_calls=[call_fragment(0, "c1", "read_file", '{"path": "calc.py"}')])],
+            [chunk(content="读完了")],
+        ])
+        with contextlib.redirect_stdout(io.StringIO()):
+            agent.send("读")
+        self.assertEqual(len(self.client.completions.calls), 2)
+        self.assertIn("def add", agent.trace[0]["output"])
+
+    def test_retries_exhausted_raise_stream_truncated(self):
+        agent = self.build([
+            [chunk(tool_calls=[call_fragment(0, f"c{n}", "write_file", HALF_WRITE)])] for n in range(3)
+        ])
+        with mock.patch("xiaoyu.agent.time.sleep"), contextlib.redirect_stdout(io.StringIO()):
+            with self.assertRaises(StreamTruncated):
+                agent.send("写个文件")
+        self.assertFalse((self.root / "a.py").exists())

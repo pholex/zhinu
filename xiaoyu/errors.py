@@ -23,6 +23,14 @@ class ContentFiltered(RuntimeError):
     """
 
 
+class StreamTruncated(RuntimeError):
+    """流在工具调用参数写到一半时结束，且没有任何收尾信号（finish_reason / usage）。
+
+    这是断流不是模型输出：执行残缺调用只会换来"参数不是合法 JSON"白费一步。
+    分类为 transient，复用可重试网络错误的预算与退避原地重发。
+    """
+
+
 @dataclass(frozen=True)
 class Verdict:
     kind: str  # 取值必须在 ALL_KINDS 里
@@ -135,6 +143,9 @@ def classify(exc: Exception) -> Verdict:
             "fatal", False, False,
             f"{exc}（重发或换模型多半同样被拦，请调整请求内容）",
         )
+    if isinstance(exc, StreamTruncated):
+        #  先于文本判定：断流描述里的措辞不该撞上任何 marker
+        return Verdict("transient", True, False, "流在工具参数写到一半时断开")
     text = str(exc).lower()
     status = _status_code(exc)
 
