@@ -445,7 +445,7 @@ _ACP_COMMANDS: tuple[AcpCommand, ...] = (
     AcpCommand("tools", "", _cmd_tools),
     AcpCommand("skills", "", _cmd_skills),
     AcpCommand("tasks", "", _cmd_tasks),
-    AcpCommand("mcp", "approve <server名>（可选）", _cmd_mcp),
+    AcpCommand("mcp", "diff|approve|reconnect <server名>（可选）", _cmd_mcp),
     AcpCommand("perm", "", _cmd_perm),
     AcpCommand("allow", "bash(git *) 或 write_file", lambda agent, args: _cmd_rule("allow", agent, args)),
     AcpCommand("deny", "bash(git *) 或 write_file", lambda agent, args: _cmd_rule("deny", agent, args)),

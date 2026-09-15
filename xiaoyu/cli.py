@@ -58,7 +58,7 @@ SLASH_COMMANDS: dict[str, str] = {
     "/keys": "按键与输入前缀速查",
     "/tools": "列出已注册的工具",
     "/tasks": "后台任务列表（run_in_background 的命令 / monitor）",
-    "/mcp": "MCP server 状态；/mcp diff [名] 看变更工具的差异；/mcp approve [名] 批准（无参 = 全部）",
+    "/mcp": "MCP server 状态；/mcp diff [名] 看变更工具的差异；/mcp approve [名] 批准（无参 = 全部）；/mcp reconnect [名] 修好后重读配置热恢复（无参 = 全部失败的）",
     "/skills": "列出可用技能；/skills reload 重扫磁盘并刷新索引",
     "/model": "查看或切换模型（/model 名字）",
     "/usage": "本次会话的 token 统计",
