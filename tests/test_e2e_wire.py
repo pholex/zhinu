@@ -7,9 +7,12 @@
 
 from __future__ import annotations
 
+import collections
+import contextlib
 import json
 import os
 import queue
+import signal
 import subprocess
 import sys
 import threading
@@ -20,6 +23,8 @@ from typing import Any
 from .test_e2e_scripted import E2ECase
 
 _READ_TIMEOUT = 60.0
+#  stderr 只留最后这么多行：够装下 faulthandler 的全线程栈
+_STDERR_KEEP = 400
 
 
 class WireProcess:
@@ -28,12 +33,54 @@ class WireProcess:
         self._lines: queue.Queue[str | None] = queue.Queue()
         self._reader = threading.Thread(target=self._pump, daemon=True)
         self._reader.start()
+        #  stderr 也得有人读：没人读的管道写满（Linux 64K）子进程就卡在 write
+        #  上退不出。只留尾部——它是子进程挂住时唯一的现场（见 wait）
+        self._stderr: collections.deque[str] = collections.deque(maxlen=_STDERR_KEEP)
+        self._stderr_reader: threading.Thread | None = None
+        if proc.stderr is not None:
+            self._stderr_reader = threading.Thread(target=self._pump_stderr, daemon=True)
+            self._stderr_reader.start()
 
     def _pump(self) -> None:
         assert self.proc.stdout is not None
         for line in self.proc.stdout:
             self._lines.put(line)
         self._lines.put(None)  # EOF 哨兵
+
+    def _pump_stderr(self) -> None:
+        assert self.proc.stderr is not None
+        for line in self.proc.stderr:
+            self._stderr.append(line)
+
+    def stderr_tail(self) -> str:
+        return "".join(self._stderr)
+
+    def wait(self, timeout: float) -> int:
+        """等子进程自己退出。超时 = 挂住：先取全部线程栈再收掉，栈与 stderr
+        尾部一起进失败消息，不再只剩一句 TimeoutExpired。
+
+        取栈靠子进程 CLI 入口（crash_guard）装的 faulthandler：SIGABRT 触发它
+        把所有线程的 Python 栈写到 stderr，由上面的线程收下。不往被测进程里
+        加任何测试专用钩子。Windows 没有这条路，只附 stderr。
+        """
+        try:
+            return self.proc.wait(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            pass
+        if os.name != "nt":
+            with contextlib.suppress(OSError):
+                self.proc.send_signal(signal.SIGABRT)
+        try:
+            self.proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            self.proc.kill()
+            self.proc.wait(timeout=5)
+        if self._stderr_reader is not None:
+            self._stderr_reader.join(timeout=5)
+        raise AssertionError(
+            f"子进程 {timeout:g}s 内没有退出（已 SIGABRT 取栈后收掉），stderr 尾部：\n"
+            + self.stderr_tail()
+        )
 
     def send(self, message: dict[str, Any]) -> None:
         assert self.proc.stdin is not None
@@ -67,6 +114,8 @@ class WireProcess:
             self.proc.kill()
             self.proc.wait(timeout=5)
         self._reader.join(timeout=5)
+        if self._stderr_reader is not None:
+            self._stderr_reader.join(timeout=5)
         for stream in (self.proc.stdout, self.proc.stderr):
             if stream is not None:
                 try:
