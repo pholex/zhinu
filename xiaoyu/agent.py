@@ -602,6 +602,17 @@ def collect_project_docs(
     return kept
 
 
+class _DeterministicEmpty(Exception):
+    """同一路由连续空补全、usage 明确报 0 个 completion token：换路由的信号。
+
+    只在 _stream_retrying 与 _stream_with_recovery 之间流转，不进 classify。
+    """
+
+    def __init__(self, message: dict[str, Any]) -> None:
+        super().__init__("连续空补全（completion_tokens=0）")
+        self.message = message
+
+
 class _RetryBudget:
     """一次请求内整条降级链共享的重试次数（每条路由的首次尝试不计）。"""
 
@@ -3074,6 +3085,10 @@ class Agent:
     #  不共享时 N 条路由 × 每条 3 次，一次持续故障放大成 3N 个请求、十几分钟退避；
     #  共享后最坏 N + 4 次，而每条路由仍至少被试一次
     _RECOVERY_BUDGET = 4
+    #  同一路由连续几次"空补全且 completion_tokens=0"就不再原地重发、直接换路由。
+    #  2 而不是 1：单次 0 token 可能正是网关缓存的回放（流式命中时 usage 被改写成 0），
+    #  第二次已带缓存绕过，仍是 0 才说明模型真的一个字不出
+    _DETERMINISTIC_EMPTY = 2
     #  粘性降级后回探首选模型的冷却（秒）：首次 10 分钟，探测失败翻倍，封顶 2 小时
     _PREFERRED_PROBE_DELAY = 600.0
     _PREFERRED_PROBE_MAX = 7200.0
@@ -3191,6 +3206,14 @@ class Agent:
                 self.switch_model(self.registry.sticky_name(route), sticky=True)
             try:
                 return self._stream_retrying(route, with_tools=with_tools, budget=budget)
+            except _DeterministicEmpty as exc:
+                #  确定性空补全：同一路由再发也是空，直接换下一条路由。已是最后一条
+                #  就把空消息交回去，由 send() 的空回复护栏（nudge → 显式告警）兜底，
+                #  与原地重试耗尽走同一个出口
+                if index == len(chain) - 1:
+                    return exc.message
+                last_error = exc
+                continue
             except Exception as exc:  # noqa: BLE001 - 分类器决定要不要换模型
                 verdict = classify(exc)
                 #  瞬时故障（限流/超时/5xx）值得换；上下文超限该压缩不该换。
@@ -3266,27 +3289,50 @@ class Agent:
         比 send() 层的 nudge 便宜（不污染历史、不多一轮可见交互）。不退避：
         这不是限流，立刻重发即可。重试耗尽仍返回空消息，send() 的空回复
         护栏（nudge → 显式告警）是最终兜底，两层不冲突。
+
+        空补全的重发带两条修正：
+        - 网关开着响应缓存时，重发附带"跳过缓存读取"（Registry.cache_bypass）——
+          否则拿回的只是被缓存住的同一个空结果；
+        - 连续 _DETERMINISTIC_EMPTY 次空补全且 usage 明确报 completion_tokens=0：
+          模型在这条路由上就是一个字不出，再发也一样，抛 _DeterministicEmpty
+          让外层直接换下一条路由（不耗重试预算）。没有 usage 判不出，维持原样重发。
+          拒答（content_filter）在 _stream_once 里就抛 ContentFiltered，到不了这里；
+          撞长度上限的空补全带截断标记、不算空——两者都不会被误判成确定性空补全。
         """
         delay = self._RECOVERY_DELAY
+        #  上一次是空补全 → 这次重发要绕开网关缓存；zero_streak 数连续的 0 token 空补全
+        after_empty = False
+        zero_streak = 0
         for attempt in range(1, self._RECOVERY_ATTEMPTS + 1):
             try:
-                message = self._stream_once(route, with_tools=with_tools)
-                if (
-                    not media.text_of(message.get("content")).strip()
-                    and not message.get("tool_calls")
-                    and attempt < self._RECOVERY_ATTEMPTS
-                    and (budget is None or budget.take())
-                ):
-                    self.sink.emit(
-                        Notice(
-                            f"[模型返回空补全（疑似流中断），已重发"
-                            f"（{attempt}/{self._RECOVERY_ATTEMPTS - 1}）]",
-                            "warn",
+                message = self._stream_once(route, with_tools=with_tools, bypass_cache=after_empty)
+                if not media.text_of(message.get("content")).strip() and not message.get("tool_calls"):
+                    zero_streak = zero_streak + 1 if self._completion_tokens == 0 else 0
+                    if zero_streak >= self._DETERMINISTIC_EMPTY:
+                        self.sink.emit(
+                            Notice(
+                                f"[{route.qualified} 连续 {zero_streak} 次返回空补全且未产出任何 token"
+                                "（completion_tokens=0），不再原样重发]",
+                                "warn",
+                            )
                         )
-                    )
-                    continue
+                        raise _DeterministicEmpty(message)
+                    if attempt < self._RECOVERY_ATTEMPTS and (budget is None or budget.take()):
+                        after_empty = True
+                        self.sink.emit(
+                            Notice(
+                                f"[模型返回空补全（疑似流中断），已重发"
+                                f"（{attempt}/{self._RECOVERY_ATTEMPTS - 1}）]",
+                                "warn",
+                            )
+                        )
+                        continue
                 return message
+            except _DeterministicEmpty:
+                raise
             except Exception as exc:  # noqa: BLE001 - 分类器决定去留
+                #  中间夹了一次报错就不算"连续"
+                zero_streak = 0
                 verdict = classify(exc)
                 if verdict.should_compact:
                     #  上下文超限：本地估算低估了才会走到这，立刻强制压缩
@@ -3331,10 +3377,13 @@ class Agent:
         new = route.model if same else route.qualified
         return f"[系统提示] 模型已切换：以上 assistant 回复由 {old} 生成，从这里起由 {new} 接续。"
 
-    def _stream_once(self, route: Route, with_tools: bool = True) -> dict[str, Any]:
+    def _stream_once(
+        self, route: Route, with_tools: bool = True, bypass_cache: bool = False
+    ) -> dict[str, Any]:
         """流式跑一次模型调用，边打印边攒出完整的 assistant message。
 
         with_tools=False 用于收尾总结这类"只许说话不许干活"的调用。
+        bypass_cache=True 只由空补全重发传入（见 _stream_retrying）。
         """
         #  发请求前惰性修复历史不变量：
         #  中断路径不需要记得做清理，任何来路的悬空/孤儿都在这里兜住。
@@ -3380,6 +3429,11 @@ class Agent:
             request[COMPACTION_KEY] = {
                 "trigger": int(self.config.compact_at * self.config.context_limit),
             }
+        if bypass_cache and (body := self.registry.cache_bypass(route)) is not None:
+            #  只在空补全重发时绕开网关响应缓存：首发照常可命中——正常回复被缓存
+            #  是省钱的，给每个请求都关掉读取等于白白放弃命中率、改变成本面。
+            #  走 extra_body 并进请求体：三条协议的 SDK 都认这个参数
+            request["extra_body"] = body
 
         content_parts: list[str] = []
         pending: dict[int, dict[str, Any]] = {}
@@ -3394,6 +3448,8 @@ class Agent:
         self._content_filtered = False
         self._length_truncated = False
         self._stream_finished = False
+        #  这次请求 usage 报的 completion_tokens；None = 没收到 usage（判不出）
+        self._completion_tokens: int | None = None
         try:
             stream = route.client.chat.completions.create(**request)
             self._consume_stream(route, stream, content_parts, pending, reasoning)
@@ -3580,6 +3636,7 @@ class Agent:
                 #  最后给一个纯 usage chunk（断流判定见 _stream_once）
                 self._stream_finished = True
                 prompt_tokens = chunk.usage.prompt_tokens or 0
+                self._completion_tokens = chunk.usage.completion_tokens
                 self.usage.add(
                     route.qualified,
                     prompt_tokens,
