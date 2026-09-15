@@ -12,6 +12,10 @@ runner，小羽读 issue、改代码、跑测试，按 JSON Schema 交回结论�
 mkdir -p .github/workflows
 cp examples/ci-github-actions/ai-fix.yml .github/workflows/
 #  再去仓库 Settings → Secrets 配 DEEPSEEK_API_KEY（换模型见 docs/configuration.md）
+gh label create ai-fix
+#  新仓库默认不许 Actions 开 PR，打开它（组织仓库可能要管理员在组织级放开）
+gh api -X PUT repos/<owner>/<repo>/actions/permissions/workflow \
+  -f default_workflow_permissions=read -F can_approve_pull_request_reviews=true
 ```
 
 三个值得照抄的结构（原因见 [docs/ci.md](../../docs/ci.md)）：
