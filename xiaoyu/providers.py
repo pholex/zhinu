@@ -827,8 +827,9 @@ def _gateway_cache_bypass(base_url: str) -> bool:
     空补全一旦被缓存，原样重发只会拿回同一个空结果、白耗重试预算。
     两类地址默认关：① 主机名与内置直连厂商相同——用户把网关位指向了官方
     端点，未知请求体字段可能 400；② 本机端点（vLLM / Ollama…）没有响应缓存
-    可绕。`XIAOYU_GATEWAY_CACHE_BYPASS=0/1` 显式指定时以它为准（网关不是
-    LiteLLM、又会拒绝未知字段时的逃生口）。
+    可绕。`XIAOYU_GATEWAY_CACHE_BYPASS=0/1` 显式指定时以它为准。
+    默认猜错（网关不是 LiteLLM、又拒收未知字段）不致命：重发被 400/422 拒后，
+    内核本会话对这家停带并不计次原样重发（见 Agent._stream_retrying）。
     """
     raw = os.environ.get("XIAOYU_GATEWAY_CACHE_BYPASS", "").strip().lower()
     if raw in ("0", "false", "no", "off"):

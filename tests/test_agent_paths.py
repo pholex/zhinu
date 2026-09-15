@@ -15,6 +15,9 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
+import httpx
+import openai
+
 from xiaoyu.agent import Agent
 from xiaoyu.cli import handle_slash
 from xiaoyu.config import Config
@@ -1065,6 +1068,32 @@ class EmptyCompletionRecoveryTest(AgentTestCase):
         self.assertNotIn("extra_body", first)
         self.assertEqual(second["extra_body"], {"cache": {"no-cache": True}})
         self.assertEqual(agent.last_assistant_text(), "重发拿到的")
+
+    def test_gateway_refusing_bypass_field_falls_back_without_it(self) -> None:
+        """网关位默认猜它认绕过字段；猜错（严格兼容端点 400）时本会话停带、不计次原样重发。"""
+        rejected = openai.BadRequestError(
+            "Unrecognized request argument supplied: cache",
+            response=httpx.Response(400, request=httpx.Request("POST", "https://gw.example/v1")),
+            body=None,
+        )
+        empty = [chunk(content=None)]
+        agent = self.build_on(
+            [empty, rejected, [chunk(content="不带字段重发成功")], empty, [chunk(content="第二轮")]],
+            response_cache=True,
+        )
+        buffer = io.StringIO()
+        with contextlib.redirect_stdout(buffer):
+            agent.send("hi")
+            self.assertEqual(agent.last_assistant_text(), "不带字段重发成功")
+            agent.send("再来")
+        calls = self.client.completions.calls
+        self.assertEqual(len(calls), 5)
+        self.assertEqual(calls[1]["extra_body"], {"cache": {"no-cache": True}})
+        self.assertNotIn("extra_body", calls[2])
+        #  同一会话后续的空补全重发也不再携带
+        self.assertNotIn("extra_body", calls[4])
+        self.assertIn("不接受跳过响应缓存", buffer.getvalue())
+        self.assertEqual(agent.last_assistant_text(), "第二轮")
 
     def test_direct_provider_retry_sends_no_cache_field(self) -> None:
         """没有响应缓存能力的端点（直连厂商）绝不发这个字段：未知请求体字段可能 400。"""
