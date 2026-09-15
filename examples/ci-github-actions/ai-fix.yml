@@ -61,7 +61,9 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           ISSUE_NUMBER: ${{ github.event.issue.number }}
         run: |
+          #  -A 会连带模型跑测试留下的产物（__pycache__、构建目录）——仓库需有对应的 .gitignore
           git add -A
+          git status --short
           if git diff --cached --quiet; then
             echo "::error::模型报告已修复，但工作区没有任何改动"
             exit 1

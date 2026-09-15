@@ -115,10 +115,18 @@ issue 正文、PR 描述、评论都是**外部用户写的**。把它们交给�
 
 ## 已知坑
 
+- **新仓库默认不允许 Actions 开 PR**：Settings → Actions → General → Workflow permissions
+  里的 "Allow GitHub Actions to create and approve pull requests" 出厂是关的，workflow 里
+  声明 `pull-requests: write` 也没用，开 PR 那一步会失败。打开它，或用命令：
+  `gh api -X PUT repos/<owner>/<repo>/actions/permissions/workflow -f default_workflow_permissions=read -F can_approve_pull_request_reviews=true`。
+  组织仓库可能被组织级设置锁住，要找组织管理员。
 - **用 `GITHUB_TOKEN` 开的 PR 不会触发其他 workflow**（GitHub 防递归的规定），PR 上的
   CI 不会自动跑。需要的话，发布那一步改用 GitHub App token 或细粒度 PAT。
 - **模型说修好了，工作区却没改动**——样本在开 PR 前用 `git diff --cached --quiet` 拦住，
   按失败处理。
+- **`git add -A` 会把模型跑测试留下的产物一起提交**——实测 Python 仓库的 PR 里混进了
+  `__pycache__/*.pyc`。仓库要有覆盖构建产物的 `.gitignore`；没有的话，发布那一步先
+  `git status --short` 看清楚再加，或只 `git add` 明确的路径。
 - **结果文件别写进工作区**，否则会被 `git add -A` 一起提交。样本写在 `$RUNNER_TEMP`。
 
 ## GitLab CI
