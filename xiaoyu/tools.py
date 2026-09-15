@@ -21,6 +21,7 @@ import locale
 import os
 import re
 import shutil
+import stat
 import unicodedata
 import subprocess
 import sys
@@ -295,6 +296,45 @@ def _edit_encodings() -> list[str]:
         if canonical not in names:
             names.append(canonical)
     return names
+
+
+#  read_file / str_replace 整读文件的大小上限。两者都是整份读进内存再解码、
+#  分段读（offset/limit）也不例外——几百 MB 的日志能把进程吃爆，内容也塞不进上下文。
+_READ_MAX_BYTES = 50 * 1024 * 1024
+
+_SPECIAL_FILE_KINDS = (
+    (stat.S_ISFIFO, "FIFO（命名管道）"),
+    (stat.S_ISCHR, "字符设备"),
+    (stat.S_ISBLK, "块设备"),
+    (stat.S_ISSOCK, "socket"),
+)
+
+
+def _unreadable_file_error(target: Path, shown: str, size_cap: bool = True) -> str | None:
+    """整读前的闸：非普通文件、或超过大小上限，返回拒绝说明；可读返回 None。
+
+    exists/is_dir 挡不住特殊文件：读 FIFO 会一直阻塞到有人写入（工具调用永久
+    挂死、连超时都没有），读 /dev/zero 这类设备读不到头。stat 跟随符号链接，
+    链接指向 FIFO 同样拦下。size_cap=False 只查类型（覆盖写不整读原文）。
+    """
+    try:
+        info = os.stat(target)
+    except OSError as exc:
+        return f"ERROR: 读取失败 {shown}: {exc}"
+    if not stat.S_ISREG(info.st_mode):
+        kind = next((name for test, name in _SPECIAL_FILE_KINDS if test(info.st_mode)), "非普通文件")
+        return (
+            f"ERROR: {shown} 是{kind}，不是普通文件，已拒绝读取——读它可能永久阻塞"
+            "等待数据，或读出没有尽头的内容。确需查看请用 bash 并加超时与字节上限"
+            f"（如 timeout 5 head -c 4096 {shown}）。"
+        )
+    if size_cap and info.st_size > _READ_MAX_BYTES:
+        return (
+            f"ERROR: {shown} 有 {info.st_size / 1048576:.1f} MiB，超过整读上限 "
+            f"{_READ_MAX_BYTES / 1048576:.0f} MiB，已拒绝读取。请先用 grep 定位关键内容，"
+            "再用 bash 的 head / tail / sed -n '起,止p' 取需要的片段。"
+        )
+    return None
 
 
 def _read_for_edit(target: Path) -> tuple[str, str, bytes]:
@@ -1573,6 +1613,8 @@ class Toolbox:
             return f"ERROR: 文件不存在：{path}"
         if target.is_dir():
             return f"ERROR: {path} 是目录，不是文件。用 list_files 看目录。"
+        if error := _unreadable_file_error(target, path):
+            return error
         try:
             text, encoding, _ = _read_for_edit(target)
         except _Undecodable:
@@ -1620,6 +1662,9 @@ class Toolbox:
             guard = self._guard_known(target, path)
             if guard:
                 return guard
+            #  快照要 read_bytes 原文、写入要 open 它：FIFO 两步都会阻塞死
+            if error := _unreadable_file_error(target, path, size_cap=False):
+                return error
         #  /rewind 快照：改前内容（新建文件记 None——回滚即删除）
         if existed:
             try:
@@ -1653,6 +1698,9 @@ class Toolbox:
         guard = self._guard_known(target, path)
         if guard:
             return guard
+        #  读过之后路径可能被换成了 FIFO/设备：闸门之后的整读同样要拦
+        if error := _unreadable_file_error(target, path):
+            return error
 
         try:
             text, encoding, raw = _read_for_edit(target)
