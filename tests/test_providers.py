@@ -9,6 +9,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
+import httpx
 import openai
 
 from xiaoyu import providers
@@ -726,6 +727,34 @@ class TestRouteAndClients(ProviderTestCase):
         """异常回溯会带出 repr，key 绝不能出现在里面。"""
         provider = Provider("x", "https://u", "super-secret", (), "x")
         self.assertNotIn("super-secret", repr(provider))
+
+
+class TestTimeouts(ProviderTestCase):
+    """建连超时必须和 request_timeout 分开：把单个秒数交给 SDK，httpx 会把
+    connect 也设成它——端点写错/网关挂了要干等十分钟才报错，用户只看到假死。"""
+
+    ENV = {"XIAOYU_API_KEY": "gw", "DEEPSEEK_API_KEY": "ds"}
+
+    def test_connect_is_short_while_read_stays_long(self) -> None:
+        timeout = providers.request_timeout(600.0)
+        self.assertEqual(timeout.connect, providers._CONNECT_TIMEOUT)
+        self.assertEqual(timeout.read, 600.0)
+        self.assertEqual(timeout.write, 600.0)
+
+    def test_short_request_timeout_is_not_lengthened(self) -> None:
+        """eval 横扫时会把 request_timeout 调小，建连不能反倒比它还长。"""
+        timeout = providers.request_timeout(3.0)
+        self.assertEqual(timeout.connect, 3.0)
+        self.assertEqual(timeout.read, 3.0)
+
+    def test_client_gets_the_split_timeout(self) -> None:
+        registry = providers.build(config())
+        with mock.patch("xiaoyu.providers.OpenAI") as fake:
+            fake.side_effect = lambda **kw: object()
+            registry.client("deepseek")
+        passed = fake.call_args.kwargs["timeout"]
+        self.assertIsInstance(passed, httpx.Timeout)
+        self.assertEqual(passed.connect, providers._CONNECT_TIMEOUT)
 
 
 if __name__ == "__main__":

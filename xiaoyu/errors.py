@@ -31,6 +31,17 @@ class StreamTruncated(RuntimeError):
     """
 
 
+class StreamFailed(RuntimeError):
+    """流已经开始、中途收到服务端的错误事件（HTTP 层是 200，没有状态码可判）。
+
+    上游原文照带，`classify` 先照常按文本判（额度耗尽、鉴权失败这类仍各归各位），
+    **只有全都没命中时才兜底成 transient 而不是 fatal**：流都跑起来了才炸，
+    绝大多数是容量/过载一类的瞬时故障（xAI 的 "at capacity"、Anthropic 的
+    overloaded_error 都走这条路）。判 fatal 会让一次抖动直接打死整轮——既不退避
+    也不换路由，而重试预算本来就是全链共享且有界的，兜底成 transient 代价可控。
+    """
+
+
 @dataclass(frozen=True)
 class Verdict:
     kind: str  # 取值必须在 ALL_KINDS 里
@@ -90,6 +101,32 @@ _QUOTA_MARKERS = (
 #  直接放弃这一路）
 _BILLING_MARKER = "billing"
 _THROTTLE_WORDS = ("rate limit", "rate_limit", "throttl", "too many requests")
+
+#  服务端瞬时故障的文案兜底。**为什么必须有**：流内错误事件（SSE `event: error`）
+#  在 HTTP 层是 200——openai SDK 抛的是没有状态码的裸 `APIError`，anthropic SDK 抛的
+#  是 status_code=200 的 APIStatusError，两者都躲开了"状态码 >= 500"那条判据。
+#  于是最常见的一类瞬时故障（Anthropic 的 overloaded_error、xAI 的容量错误）会被
+#  判成 fatal：不退避、不换路由，一次抖动打死整轮。按措辞兜住它们。
+#  只收**明确说了是服务端侧临时问题**的词，别泛化——太宽会把真正的请求错误也拖进重试。
+_TRANSIENT_MARKERS = (
+    "overloaded",
+    "service unavailable",
+    "service_unavailable",
+    "internal server error",
+    "internal_error",
+    "bad gateway",
+    "gateway timeout",
+    "upstream connect",
+    "provider returned error",
+    #  "临时没容量，等会儿再来"：xAI 容量错误、各家网关排队满的标准措辞
+    "at capacity",
+    "try again later",
+    "try again in",
+)
+
+#  gRPC 系（Gemini / Vertex）的限流码。Google 对"每分钟配额用尽"也报这个，
+#  按限流处理正合适——退避等一等就过去了，和 _QUOTA_MARKERS 那种充值才能解的不同
+_EXHAUSTED_MARKERS = ("resource exhausted", "resource_exhausted")
 
 #  结构化错误码（exc.code / body.error.code）的精确值与后缀：流式里冒出来的
 #  错误常常只有 body，str(exc) 里不一定带码
@@ -173,6 +210,7 @@ def classify(exc: Exception) -> Verdict:
         or "rate limit" in text
         or "throttl" in text  # AWS 系措辞：ThrottlingException / throttled
         or "429" in text
+        or any(marker in text for marker in _EXHAUSTED_MARKERS)
     ):
         return Verdict("rate_limit", True, False, "限流")
 
@@ -185,8 +223,14 @@ def classify(exc: Exception) -> Verdict:
         or (status is not None and status >= 500)
         #  anthropic 的连接/超时异常是 `raise ... from <httpx 异常>`，认底因即可
         or isinstance(exc.__cause__, httpx.HTTPError)
+        #  没有状态码可判的流内错误事件，只剩措辞可认（见 _TRANSIENT_MARKERS）
+        or any(marker in text for marker in _TRANSIENT_MARKERS)
     ):
         return Verdict("transient", True, False, f"网络/服务端瞬时错误（{type(exc).__name__}）")
+
+    if isinstance(exc, StreamFailed):
+        #  流跑起来了才炸、且措辞没落进上面任何一类：兜底成 transient（理由见类注释）
+        return Verdict("transient", True, False, f"流中途失败（{exc}）")
 
     return Verdict("fatal", False, False, f"{type(exc).__name__}: {exc}")
 
@@ -201,22 +245,29 @@ def retry_after_seconds(exc: Exception) -> float | None:
 
     服务端明确说了等多久，就该听它的而不是盲目指数退避——
     限流窗口没过去之前，早重试只是白挨一次 429。
+
+    `retry-after-ms` 优先于 `retry-after`：OpenAI 系两个头一起发，秒级那个是向下
+    取整的（"等 1.4 秒"会写成 `retry-after: 1`），照它重试仍在窗口内、白挨一次。
     """
     response = getattr(exc, "response", None)
     headers = getattr(response, "headers", None)
     if headers is None:
         return None
     try:
+        raw_ms = headers.get("retry-after-ms")
         raw = headers.get("retry-after")
     except Exception:  # noqa: BLE001 - headers 形状不对就当没有
         return None
-    if not raw:
-        return None
-    try:
-        seconds = float(raw)
-    except (TypeError, ValueError):
-        #  HTTP-date 形式的 Retry-After 极少见，不为它引入日期解析
-        return None
-    if seconds <= 0:
-        return None
-    return min(seconds, RETRY_AFTER_CAP)
+    #  除以 1000 而不是乘 0.001：后者 1400 会算出 1.4000000000000001
+    for value, divisor in ((raw_ms, 1000.0), (raw, 1.0)):
+        if not value:
+            continue
+        try:
+            seconds = float(value) / divisor
+        except (TypeError, ValueError):
+            #  HTTP-date 形式的 Retry-After 极少见，不为它引入日期解析；
+            #  解析不了就当这个头没有，接着看下一个候选
+            continue
+        if seconds > 0:
+            return min(seconds, RETRY_AFTER_CAP)
+    return None

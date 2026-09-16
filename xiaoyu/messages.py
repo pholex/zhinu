@@ -36,6 +36,9 @@ from __future__ import annotations
 import json
 from typing import Any, Iterator
 
+#  httpx 是 anthropic SDK 的硬传递依赖，顶层 import 安全（同 errors.py）
+import httpx
+
 from .errors import ContentFiltered
 from .responses import (
     OPERATOR_KEY,
@@ -586,7 +589,7 @@ def _usage(raw: Any) -> Usage | None:
 # ---------- client 工厂 ----------
 
 
-def client(base_url: str, api_key: str, timeout: float) -> Any:
+def client(base_url: str, api_key: str, timeout: float | httpx.Timeout) -> Any:
     """构造 anthropic SDK client。Transport 首次遇到 Messages 协议请求才调用
     （懒构造：不用 Claude 直连的进程不付 import 和连接池成本）。
 

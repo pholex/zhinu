@@ -35,6 +35,7 @@ from dataclasses import dataclass, field
 from typing import Any, Iterator
 
 from . import media
+from .errors import StreamFailed
 
 #  协议名。也是通用兜底 provider 的 XIAOYU_PROVIDER_<NAME>_PROTOCOL 取值
 CHAT = "chat"
@@ -503,10 +504,12 @@ def stream_chunks(events: Iterator[Any]) -> Iterator[Chunk]:
                 yield Chunk(choices=[Choice(Delta(), finish_reason="stop")])
             yield Chunk(usage=_usage(getattr(event.response, "usage", None)))
         elif kind in ("response.failed", "error"):
-            #  真失败才抛。落到 errors.classify 多半是 fatal（没有 HTTP 状态码可判），
-            #  于是不换模型、直接报到 REPL——会话保留，用户重发即可。把上游原文带上，
-            #  是因为这条路径上"到底哪儿炸了"只有这一句话可看
-            raise RuntimeError(f"Responses 流失败：{_failure(event)}")
+            #  真失败才抛。类型用 StreamFailed 而不是裸 RuntimeError：这条路径上没有
+            #  HTTP 状态码可判，裸异常会被 classify 兜底成 fatal——一次容量抖动就
+            #  不退避不换路由地打死整轮。StreamFailed 仍照常按文本判（额度/鉴权各归
+            #  各位），只是全没命中时兜底成 transient。上游原文照带：这条路径上
+            #  "到底哪儿炸了"只有这一句话可看
+            raise StreamFailed(f"Responses 流失败：{_failure(event)}")
 
 
 def _failure(event: Any) -> str:
