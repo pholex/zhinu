@@ -1547,6 +1547,9 @@ _MCP_ADD_FLAGS = {
     "--env": True,
     "-e": True,
     "--timeout": True,
+    "--url": True,
+    "--header": True,
+    "-H": True,
     "--force": False,
     "-f": False,
     "--help": False,
@@ -1583,6 +1586,7 @@ def split_mcp_command(argv: list[str]) -> tuple[list[str], list[str]]:
 MCP_USAGE = (
     "用法：\n"
     "  xiaoyu mcp add <名字> [选项] <命令> [参数…]   添加一个 stdio MCP server\n"
+    "  xiaoyu mcp add <名字> --url https://…         添加一个远端 MCP server\n"
     "  xiaoyu mcp list                              列出已声明的 server\n"
     "  xiaoyu mcp remove <名字> [--scope …]          删除一个声明\n"
     "例：xiaoyu mcp add chrome-devtools --scope user npx -y chrome-devtools-mcp@latest"
@@ -1753,10 +1757,14 @@ def mcp_add_command(argv: list[str]) -> int:
         return 1
 
     print(ui.success(f"已写入 {path}"))
-    print(f"  {ui.accent(args.name)}  {ui.secondary('·')}  {' '.join(command_argv)}")
-    #  Windows 上 npx 是 .cmd、pipx/uvx 常不在 PATH 里——现在提示比启动后翻日志便宜
-    if shutil.which(command) is None:
-        print(ui.warning(f"  提示：当前 PATH 里找不到 {command}，装好之前这个 server 起不来"))
+    summary = args.url if args.url else " ".join(command_argv)
+    print(f"  {ui.accent(args.name)}  {ui.secondary('·')}  {summary}")
+    #  Windows 上 npx 是 .cmd、pipx/uvx 常不在 PATH 里——现在提示比启动后翻日志便宜。
+    #  只对 stdio 有意义：远端 server 根本没有本地命令
+    if command_argv and shutil.which(command_argv[0]) is None:
+        print(
+            ui.warning(f"  提示：当前 PATH 里找不到 {command_argv[0]}，装好之前这个 server 起不来")
+        )
     print(ui.secondary("  下次启动小羽时后台连上；/mcp 看状态与日志路径。"))
     return 0
 
