@@ -36,6 +36,16 @@ class SplitCommandTest(unittest.TestCase):
     def test_no_command(self):
         self.assertEqual(cli.split_mcp_command(["a", "-f"]), (["a", "-f"], []))
 
+    def test_value_taking_flags_do_not_swallow_the_url(self):
+        """--url/-H 也吃值：漏登记的话 URL 会被当成启动命令切走。"""
+        head, rest = cli.split_mcp_command(
+            ["gw", "--url", "https://example.com/mcp", "-H", "Authorization: Bearer x"]
+        )
+        self.assertEqual(
+            head, ["gw", "--url", "https://example.com/mcp", "-H", "Authorization: Bearer x"]
+        )
+        self.assertEqual(rest, [])
+
     def test_unknown_flag_left_for_argparse(self):
         head, rest = cli.split_mcp_command(["a", "--typo", "npx"])
         self.assertEqual(head, ["a", "--typo"])
@@ -96,6 +106,37 @@ class McpCommandTest(unittest.TestCase):
         self.assertEqual(specs[0].args, ["pkg"])
         self.assertEqual(specs[0].env, {"TOKEN": "s3cret"})
         self.assertEqual(specs[0].timeout, 30.0)
+
+    def test_add_remote_server_with_url_and_headers(self):
+        """帮助里的空格写法要真能跑通，并且落盘成 http 形状。"""
+        code, text = self.run_cli(
+            "add",
+            "gw",
+            "--scope",
+            "user",
+            "--url",
+            "https://mcp.example.com/mcp",
+            "-H",
+            "Authorization: Bearer ${env:TOKEN}",
+        )
+        self.assertEqual(code, 0, text)
+        self.assertEqual(
+            self.user_file()["mcpServers"]["gw"],
+            {
+                "type": "http",
+                "url": "https://mcp.example.com/mcp",
+                "headers": {"Authorization": "Bearer ${env:TOKEN}"},
+            },
+        )
+        #  远端 server 没有本地命令：摘要行打地址，别打空串
+        self.assertIn("https://mcp.example.com/mcp", text)
+
+    def test_add_remote_server_equals_form(self):
+        self.assertEqual(self.run_cli("add", "gw", "--url=https://example.com/mcp")[0], 0)
+        self.assertEqual(
+            self.project_file()["mcpServers"]["gw"],
+            {"type": "http", "url": "https://example.com/mcp"},
+        )
 
     def test_add_merges_and_preserves_other_keys(self):
         (self.workspace / ".mcp.json").write_text(
