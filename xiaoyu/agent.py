@@ -66,6 +66,7 @@ from .render import PlainSink
 from .messages import (
     COMPACTION_KEY,
     TASK_BUDGET_KEY,
+    invalidate_bound_thinking,
     supports_server_compaction,
     supports_task_budget,
 )
@@ -1839,9 +1840,18 @@ class Agent:
         return sorted(new_names - old_names), sorted(old_names - new_names)
 
     def _history_rewritten(self) -> None:
-        """messages 被非追加式改写后的统一收尾：token 锚点作废 + 版本号 +1。"""
+        """messages 被非追加式改写后的统一收尾：token 锚点作废 + 版本号 +1
+        + 作废绑定会话前缀的 thinking 块。
+
+        第三条是给 Claude 的 preserved thinking 校验用的：thinking block 的 signature
+        绑着「产出它时的那段会话前缀」（system + tools + 它之前的每一条消息），前缀变了
+        再回传就是 400。这里正是全部「前缀变了」的收口——十个调用点（system 重渲染、
+        压缩、microcompact、工具图老化、孤儿修补、rewind、翻篇、装载历史…）一个不落，
+        所以作废动作挂在这里而不是逐点补。细节见 messages.invalidate_bound_thinking。
+        """
         self._anchor = None
         self.history_version += 1
+        invalidate_bound_thinking(self.messages)
 
     def reset(self) -> None:
         """清空对话，保留 system prompt。
