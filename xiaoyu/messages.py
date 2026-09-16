@@ -19,6 +19,11 @@ thinking block 必须**原样字节回放**（服务端校验 signature），且
 同一型号；display 默认 omitted 时 thinking 文本为空但 signature 仍在，照样要
 攒块回放，不能按"有无文本"过滤。
 
+signature 绑的不止型号，还有**产出它时的那段会话前缀**（顶层 system、tools 清单、
+它之前的每一条消息）——官方把两者合称 preserved thinking。小羽每次请求都可能改前缀
+（压缩、system 重渲染、孤儿修补…），所以历史一被非追加式改写就得把这些块丢掉，
+见 `invalidate_bound_thinking`（挂在 `agent._history_rewritten` 上）。
+
 **缓存断点**：在这一层自动注入两个 `cache_control`（上限 4）——system 块一个
 （tools 在 system 之前渲染，一个断点盖住两者），最终消息的最后一个 block 一个
 （多轮增量缓存）。低于模型最小可缓存前缀（512~4096 token 按模型）时断点静默
@@ -184,6 +189,54 @@ def _to_blocks(content: Any) -> list[dict[str, Any]]:
         elif text := str(part.get("text") or ""):
             blocks.append({"type": "text", "text": text})
     return blocks
+
+
+#  绑定会话前缀的块类型。**为什么要单独认它们**：Claude 的 thinking block
+#  signature 除了绑型号，还绑「产出它时的那段会话前缀」——顶层 system、tools 清单、
+#  以及它之前的每一条消息。回传时服务端重新校验这段前缀没变过，变了就 400
+#  （官方把它和型号绑定合称 preserved thinking，报错文案里的字段名是
+#  prefix_mismatch_behavior）。强制范围：2026-08-31 之后新建的账号（Claude API /
+#  Bedrock / Vertex / Foundry 都算），官方明说后续模型会对所有账号强制。
+#
+#  小羽每次请求都可能改前缀：system 重渲染、压缩、microcompact、工具图老化、
+#  孤儿修补、rewind——所以历史一被非追加式改写，这些块就必须作废（见
+#  `invalidate_bound_thinking`）。compaction 块不在此列：服务端压缩不算「编辑」
+#  （校验比的是我们发出去的会话，不是服务端改过的那份），且压缩之后被校验的前缀
+#  正是从 compaction 块起算——丢了它反而让服务端压缩失效。
+_PREFIX_BOUND_BLOCKS = ("thinking", "redacted_thinking")
+
+
+def invalidate_bound_thinking(messages: list[dict[str, Any]]) -> int:
+    """历史被非追加式改写之后，丢掉所有绑定会话前缀的 thinking 块。返回丢了几块。
+
+    这是客户端版的 `prefix_mismatch_behavior: "drop_block"`：服务端的做法是丢掉第一个
+    对不上的块**及其之后的每一个**，我们无从知道哪一个是第一个（前缀是我们自己改的），
+    就全丢。代价是模型少一段推理连续性——和服务端丢的结果一样，但不需要 beta header、
+    不挑平台（Bedrock/Vertex 按型号陆续开、Foundry 根本没有那套控制项）。
+
+    只动 Anthropic 的块：Responses 那边的 `reasoning` item 是加密的会话状态，不走
+    这套前缀校验，跟着一起丢是白丢。就地改 `_reasoning["items"]`（空了就把整个键摘掉）
+    ——那份数据的唯一用途就是回放，作废之后留着只会让会话日志变大。
+
+    **宁可多丢不可少丢**：个别改写其实不动前缀（rewind 只截尾巴，留下来那些块的
+    前缀原封不动），这里照样一并丢。多丢的代价是模型少一段推理连续性，少丢的代价
+    是硬 400——收口简单比省那一点连续性重要。
+    """
+    dropped = 0
+    for message in messages:
+        reasoning = message.get(REASONING_KEY)
+        if not isinstance(reasoning, dict):
+            continue
+        items = reasoning.get("items") or []
+        kept = [item for item in items if item.get("type") not in _PREFIX_BOUND_BLOCKS]
+        if len(kept) == len(items):
+            continue
+        dropped += len(items) - len(kept)
+        if kept:
+            reasoning["items"] = kept
+        else:
+            message.pop(REASONING_KEY, None)
+    return dropped
 
 
 def _assistant_blocks(

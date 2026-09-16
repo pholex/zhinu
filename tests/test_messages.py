@@ -780,5 +780,92 @@ class TestCompletionShape(unittest.TestCase):
         self.assertIsNone(done.choices[0].finish_reason)
 
 
+
+class TestPrefixBoundThinkingInvalidation(unittest.TestCase):
+    """preserved thinking：thinking block 的 signature 还绑着「产出它时的那段会话前缀」
+    （system + tools + 它之前的每一条消息）。小羽每次请求都可能改前缀——压缩、
+    microcompact、system 重渲染、孤儿修补、rewind——改完还把老块塞回去就是硬 400。
+
+    做法是客户端版的 drop_block：历史一被非追加式改写就全丢，不挑平台、不要 beta 头。
+    """
+
+    def compacted(self) -> dict[str, Any]:
+        return {"type": "compaction", "content": "摘要正文"}
+
+    def test_thinking_and_redacted_are_dropped(self) -> None:
+        message = {
+            "role": "assistant",
+            "content": "算好了",
+            REASONING_KEY: {
+                "model": "claude-opus-5",
+                "provider": "anthropic",
+                "items": [dict(THINKING_ITEM), {"type": "redacted_thinking", "data": "ENC"}],
+            },
+        }
+        self.assertEqual(msgs.invalidate_bound_thinking([message]), 2)
+        #  一块不剩时整个私有键摘掉，别在历史和会话日志里留个空壳
+        self.assertNotIn(REASONING_KEY, message)
+
+    def test_compaction_blocks_survive(self) -> None:
+        """服务端压缩不算「编辑」，且压缩之后被校验的前缀正是从 compaction 块起算
+        ——丢了它反而让服务端压缩失效。"""
+        message = {
+            "role": "assistant",
+            "content": "",
+            REASONING_KEY: {
+                "model": "claude-opus-5",
+                "provider": "anthropic",
+                "items": [self.compacted(), dict(THINKING_ITEM)],
+            },
+        }
+        self.assertEqual(msgs.invalidate_bound_thinking([message]), 1)
+        self.assertEqual(message[REASONING_KEY]["items"], [self.compacted()])
+
+    def test_responses_reasoning_items_are_left_alone(self) -> None:
+        """Responses 那边的加密 reasoning 不走这套前缀校验，跟着一起丢是白丢。"""
+        items = [{"type": "reasoning", "encrypted_content": "ENC"}]
+        message = {
+            "role": "assistant",
+            "content": "好",
+            REASONING_KEY: {"model": "gpt-5.6-sol", "provider": "openai", "items": items},
+        }
+        self.assertEqual(msgs.invalidate_bound_thinking([message]), 0)
+        self.assertEqual(message[REASONING_KEY]["items"], items)
+
+    def test_no_reasoning_is_a_noop(self) -> None:
+        messages = [
+            {"role": "system", "content": "你是小羽"},
+            {"role": "user", "content": "hi"},
+            {"role": "assistant", "content": "在"},
+        ]
+        before = [dict(m) for m in messages]
+        self.assertEqual(msgs.invalidate_bound_thinking(messages), 0)
+        self.assertEqual(messages, before)
+
+    def test_invalidated_history_no_longer_replays_thinking(self) -> None:
+        """端到端：作废之后再出网，请求体里不该再有 thinking 块。"""
+        message = {
+            "role": "assistant",
+            "content": "算好了",
+            REASONING_KEY: {
+                "model": "claude-opus-5",
+                "provider": "anthropic",
+                "items": [dict(THINKING_ITEM)],
+            },
+        }
+        history = [message, {"role": "user", "content": "继续"}]
+        request = msgs.to_request(
+            "claude-opus-5", history, None, False, {}, provider="anthropic"
+        )
+        self.assertEqual(request["messages"][0]["content"][0]["type"], "thinking")
+        msgs.invalidate_bound_thinking(history)
+        request = msgs.to_request(
+            "claude-opus-5", history, None, False, {}, provider="anthropic"
+        )
+        self.assertEqual(
+            request["messages"][0]["content"], [{"type": "text", "text": "算好了"}]
+        )
+
+
 if __name__ == "__main__":  # pragma: no cover
     unittest.main()

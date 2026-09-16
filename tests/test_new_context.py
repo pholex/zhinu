@@ -12,6 +12,7 @@ import unittest
 
 from xiaoyu import tokens
 from xiaoyu.agent import PLAN_MODE_TOOLS, Agent
+from xiaoyu.responses import REASONING_KEY
 from xiaoyu.tools import Toolbox
 
 from tests.test_agent_paths import AgentTestCase, Registry, call_fragment, chunk, usage_chunk
@@ -176,3 +177,71 @@ class HistoryVersionTest(AgentTestCase):
         agent.messages.append({"role": "tool", "tool_call_id": "orphan", "content": "孤儿"})
         agent._repair_history()  # noqa: SLF001
         self.assertEqual(agent.history_version, 1)
+
+
+class BoundThinkingInvalidationTest(AgentTestCase):
+    """preserved thinking：thinking block 绑着产出它时的会话前缀，前缀变了再回传是硬 400。
+
+    `_history_rewritten` 是全部「前缀变了」的收口——这里钉住它真的会作废，
+    以及**每一个**调用点都经过它（新增改写路径时这条断言会先红）。
+    """
+
+    THINKING = {"type": "thinking", "thinking": "先想想", "signature": "SIG"}
+
+    def with_thinking(self, agent: Agent) -> dict:
+        message = {
+            "role": "assistant",
+            "content": "想好了",
+            REASONING_KEY: {
+                "model": "claude-opus-5",
+                "provider": "anthropic",
+                "items": [dict(self.THINKING)],
+            },
+        }
+        agent.messages.append(message)
+        return message
+
+    def test_rewrite_invalidates_thinking(self) -> None:
+        agent = self.build([])
+        message = self.with_thinking(agent)
+        agent._history_rewritten()  # noqa: SLF001
+        self.assertNotIn(REASONING_KEY, message)
+
+    def test_plain_append_keeps_thinking(self) -> None:
+        """只追加不改写：前缀没动，块仍然有效，不许白丢推理连续性。"""
+        agent = self.build([])
+        message = self.with_thinking(agent)
+        agent.messages.append({"role": "user", "content": "接着说"})
+        self.assertIn(REASONING_KEY, message)
+
+    def test_every_rewrite_path_goes_through_the_choke_point(self) -> None:
+        """改写路径绕开 `_history_rewritten` 就等于埋一个只在生产才炸的 400。"""
+        agent = self.build([])
+        message = self.with_thinking(agent)
+        agent.messages.append({"role": "tool", "tool_call_id": "orphan", "content": "孤儿"})
+        agent._repair_history()  # noqa: SLF001
+        self.assertNotIn(REASONING_KEY, message, "孤儿修补改了历史，thinking 必须作废")
+
+        message = self.with_thinking(agent)
+        agent._new_context_notes = "笔记"  # noqa: SLF001
+        agent._start_new_context_window()  # noqa: SLF001
+        self.assertNotIn(message, agent.messages, "翻篇之后那条消息本身就不在了")
+
+        agent.restore([
+            {"role": "user", "content": "x"},
+            {
+                "role": "assistant",
+                "content": "y",
+                REASONING_KEY: {
+                    "model": "claude-opus-5",
+                    "provider": "anthropic",
+                    "items": [dict(self.THINKING)],
+                },
+            },
+        ])
+        restored = [m for m in agent.messages if m.get("role") == "assistant"]
+        self.assertTrue(restored)
+        self.assertNotIn(
+            REASONING_KEY, restored[-1],
+            "装入的历史配的是上一进程的 system prompt，前缀必然对不上",
+        )
