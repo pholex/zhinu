@@ -15,6 +15,7 @@ from xiaoyu.errors import (
     ALL_KINDS,
     RETRY_AFTER_CAP,
     ContentFiltered,
+    StreamFailed,
     StreamTruncated,
     classify,
     retry_after_seconds,
@@ -230,6 +231,26 @@ class RetryAfterTest(unittest.TestCase):
     def test_capped(self):
         #  服务端偶尔给几小时后的值，交互场景等不了
         self.assertEqual(retry_after_seconds(rate_limit_error("7200")), RETRY_AFTER_CAP)
+
+    def test_millisecond_header_wins(self):
+        """OpenAI 系两个头一起发，秒级那个向下取整——照它重试仍在窗口内。"""
+        exc = _DuckStatusError("err", 429, {"retry-after": "1", "retry-after-ms": "1400"})
+        self.assertEqual(retry_after_seconds(exc), 1.4)
+
+    def test_millisecond_header_alone(self):
+        self.assertEqual(
+            retry_after_seconds(_DuckStatusError("err", 429, {"retry-after-ms": "2500"})), 2.5
+        )
+
+    def test_falls_back_to_seconds_when_ms_unusable(self):
+        #  毫秒头是垃圾/非正数时不该连秒级那个一起丢掉
+        for ms in ("", "abc", "0"):
+            exc = _DuckStatusError("err", 429, {"retry-after": "7", "retry-after-ms": ms})
+            self.assertEqual(retry_after_seconds(exc), 7.0, ms)
+
+    def test_millisecond_header_capped(self):
+        exc = _DuckStatusError("err", 429, {"retry-after-ms": "7200000"})
+        self.assertEqual(retry_after_seconds(exc), RETRY_AFTER_CAP)
 
 
 class AllKindsTest(unittest.TestCase):
@@ -652,3 +673,71 @@ class StreamTruncationTest(AgentTestCase):
             with self.assertRaises(StreamTruncated):
                 agent.send("写个文件")
         self.assertFalse((self.root / "a.py").exists())
+
+
+class StreamFailedTest(unittest.TestCase):
+    """流跑起来了才收到服务端错误事件：HTTP 层是 200，没有状态码可判。
+
+    判 fatal 会让一次容量抖动不退避不换路由地打死整轮——这类错误绝大多数是瞬时的。
+    """
+
+    def test_unrecognised_message_falls_back_to_transient(self):
+        verdict = classify(StreamFailed("Responses 流失败：upstream said no"))
+        self.assertEqual(verdict.kind, "transient")
+        self.assertTrue(verdict.retryable)
+        self.assertFalse(verdict.should_compact)
+
+    def test_known_categories_still_win_over_the_fallback(self):
+        """兜底只在没别的判据时生效：额度耗尽仍是 quota，重试无用。"""
+        verdict = classify(StreamFailed("insufficient_quota: 余额不足"))
+        self.assertEqual(verdict.kind, "quota")
+        self.assertFalse(verdict.retryable)
+
+    def test_overflow_in_stream_still_compacts(self):
+        verdict = classify(StreamFailed("prompt is too long"))
+        self.assertEqual(verdict.kind, "context_overflow")
+        self.assertTrue(verdict.should_compact)
+
+
+class TransientMarkerTest(unittest.TestCase):
+    """流内错误事件在两个 SDK 里都躲开了「状态码 >= 500」那条判据：
+
+    openai 抛没有状态码的裸 APIError，anthropic 抛 status_code=200 的 APIStatusError。
+    最常见的一类瞬时故障（overloaded / 容量不足）只剩措辞可认。
+    """
+
+    def test_bare_api_error_without_status(self):
+        exc = openai.APIError(
+            "Overloaded", request=httpx.Request("POST", "http://unused"), body=None
+        )
+        self.assertIsNone(getattr(exc, "status_code", None))
+        self.assertEqual(classify(exc).kind, "transient")
+
+    def test_two_hundred_status_error_from_stream(self):
+        #  anthropic 的流内 error 事件带的是那条 200 响应
+        exc = _DuckStatusError(
+            '{"type":"error","error":{"type":"overloaded_error","message":"Overloaded"}}', 200
+        )
+        self.assertEqual(classify(exc).kind, "transient")
+
+    def test_capacity_wordings(self):
+        for text in (
+            "xai: the model is currently at capacity, please try again later",
+            "upstream connect error or disconnect/reset before headers",
+            "provider returned error",
+            "503 service unavailable",
+        ):
+            self.assertEqual(classify(RuntimeError(text)).kind, "transient", text)
+
+    def test_grpc_resource_exhausted_is_rate_limit(self):
+        #  Google 对「每分钟配额用尽」也报这个：退避等一等就过去，不是充值才能解的 quota
+        verdict = classify(RuntimeError("429 RESOURCE_EXHAUSTED: quota exceeded for model"))
+        self.assertEqual(verdict.kind, "rate_limit")
+        self.assertTrue(verdict.retryable)
+
+    def test_markers_do_not_swallow_real_request_errors(self):
+        for text in (
+            "invalid_request_error: messages.3: unexpected role",
+            "model not found",
+        ):
+            self.assertEqual(classify(RuntimeError(text)).kind, "fatal", text)
