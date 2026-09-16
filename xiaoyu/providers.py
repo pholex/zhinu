@@ -24,6 +24,7 @@ from dataclasses import dataclass, field
 from typing import Any
 from urllib.parse import urlsplit
 
+import httpx
 from openai import OpenAI
 
 from . import netproxy
@@ -72,6 +73,18 @@ DISCOVER_SENTINEL = "auto"
 #  独立于 request_timeout 的短超时：这是启动路径上的元数据探测，端点没起来就该
 #  很快失败（loopback 连不上是即时的），绝不能把启动卡在生成级的长超时上。
 _DISCOVER_TIMEOUT = 5.0
+
+#  建连超时（秒）。**为什么要和 request_timeout 分开**：把 600.0 这样一个标量交给
+#  SDK，httpx 会把 connect/read/write/pool 全设成它——端点写错、网关挂了、DNS 不通
+#  这类"连都连不上"的故障要干等 10 分钟才报错，用户只看到假死。建连是秒级的事，
+#  跨境链路留足余量也就十几秒；read 仍用 request_timeout（httpx 的 read 超时是**逐次
+#  读**计的，对流式请求天然等价于"两个 chunk 之间最多等多久"，生成慢不会误伤）。
+_CONNECT_TIMEOUT = 15.0
+
+
+def request_timeout(seconds: float) -> httpx.Timeout:
+    """把配置里的单个超时秒数摊成 httpx 的四段超时（建连短、读写长）。"""
+    return httpx.Timeout(seconds, connect=min(_CONNECT_TIMEOUT, seconds))
 
 
 def _discover_models(base_url: str, api_key: str, label: str) -> tuple[str, ...]:
@@ -369,7 +382,8 @@ class Registry:
         if not providers:
             raise MissingConfig(NO_PROVIDER_HINT)
         self.providers = providers
-        self._timeout = timeout
+        #  配置给的是一个秒数，出网用的是摊开的四段超时（建连短、读写长）
+        self._timeout = request_timeout(timeout)
         #  预置 client（测试注入假 client 用）；其余按需惰性构造并缓存。
         #  惰性构造上锁：qixiang 的工作线程可能同时首访同一家 provider，
         #  竞态下 ScriptedClient（e2e 进程内单例队列）会被建出两份，
@@ -551,7 +565,7 @@ class Registry:
         factory = None
         if provider.anthropic_models:
 
-            def factory(p: Provider = provider, t: float = self._timeout) -> Any:
+            def factory(p: Provider = provider, t: httpx.Timeout = self._timeout) -> Any:
                 from . import messages
 
                 return messages.client(p.base_url, p.api_key, t)
