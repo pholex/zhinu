@@ -11,6 +11,7 @@ from types import SimpleNamespace
 from typing import Any
 
 from xiaoyu import responses
+from xiaoyu.errors import StreamFailed, classify
 from xiaoyu.responses import (
     REASONING_KEY,
     Transport,
@@ -308,16 +309,22 @@ class TestStreamTranslation(unittest.TestCase):
         self.assertEqual((text, pending), ("答案", {}))
 
     def test_failed_and_error_events_raise(self) -> None:
-        """上游失败必须抛出去，交给 agent 那层的分类，不能静默收流。"""
-        with self.assertRaises(RuntimeError) as failed:
+        """上游失败必须抛出去，交给 agent 那层的分类，不能静默收流。
+
+        类型必须是 StreamFailed 而不是裸 RuntimeError：这条路径上没有 HTTP 状态码，
+        裸异常会被 classify 兜底成 fatal——一次容量抖动就不退避不换路由地打死整轮。
+        """
+        with self.assertRaises(StreamFailed) as failed:
             list(responses.stream_chunks(iter([
                 event("response.failed",
                       response=SimpleNamespace(error=SimpleNamespace(message="内部错误"))),
             ])))
         self.assertIn("内部错误", str(failed.exception))
-        with self.assertRaises(RuntimeError) as errored:
+        self.assertEqual(classify(failed.exception).kind, "transient")
+        with self.assertRaises(StreamFailed) as errored:
             list(responses.stream_chunks(iter([event("error", message="连接断了")])))
         self.assertIn("连接断了", str(errored.exception))
+        self.assertTrue(classify(errored.exception).retryable)
 
     def test_incomplete_keeps_partial_text_instead_of_raising(self) -> None:
         """截断/内容过滤不抛：chat 侧 finish_reason=length 也是照常返回半截正文。"""
