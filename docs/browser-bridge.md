@@ -57,7 +57,9 @@ xiaoyu serve                                       浏览器扩展
   `browser_navigate` / `browser_open` 要等页面 load，扩展侧的等待上限就有 20s
 - `content` 是给模型看的文本；`image` 可选，仅 `browser_screenshot` 用
 
-## 工具清单（v1，名字与 schema 由服务端定义）
+## 工具清单（名字与 schema 由服务端定义）
+
+v1：
 
 | 工具 | 参数 | 返回 | 审批 |
 |---|---|---|---|
@@ -69,16 +71,36 @@ xiaoyu serve                                       浏览器扩展
 | `browser_type` | `ref`、`text`（必填），`submit`=false，`tab_id` | 同上 | **是** |
 | `browser_screenshot` | `tab_id` | `image` + 一行说明 | 否 |
 
+v2（追加在 v1 之后，顺序即注册顺序；旧扩展不声明就不注册，新扩展连旧 serve 则落进 `ignored`）：
+
+| 工具 | 参数 | 返回 | 审批 |
+|---|---|---|---|
+| `browser_scroll` | `direction`=`up`\|`down`\|`top`\|`bottom`，`amount`=1（屏），`ref`，`tab_id` | 滚动位置、是否到顶 / 到底、滚的是哪个容器 | 否 |
+| `browser_hover` | `ref`（必填），`tab_id` | 悬停了谁 | 否 |
+| `browser_key` | `key`（必填，如 `Enter` / `Escape` / `Control+a`），`ref`，`tab_id` | 页面是否接管、标题 / URL 是否变化 | **是** |
+| `browser_find` | `query`（必填），`tab_id` | 命中的元素，每个带 ref | 否 |
+| `browser_back` | `direction`=`back`\|`forward`，`tab_id` | 加载完成后的标题与 URL | **是** |
+| `browser_close` | `tab_id`（**必填**） | 关了哪个 | **是** |
+| `browser_wait` | `text`，`gone`=false，`seconds`=5（≤30），`tab_id` | 等到了 / 超时（超时 `ok:false`） | 否 |
+
+- `browser_scroll`：文档本身不能滚时，扩展应挑可见面积最大的可滚容器（SPA 常见）；`ref` + `direction` =
+  滚该元素所在的容器，只给 `ref` = 滚到视口中间
+- `browser_close` 不吃「缺省 = 当前标签页」：不可撤销的动作要点名
+- `browser_wait` 的上限 30s 是为了留在服务端 `timeout`（默认 60）之内
+- **iframe 的 ref 带框架前缀**：`[f37.e4]` = frameId 37 里的 e4。前缀由扩展加、由扩展解，服务端与模型都只
+  原样传递；`read_page` / `find` 的输出里子框架内容列在 `[iframe f37 · <url>]` 小节下
 - `tab_id` 缺省 = 扩展侧栏当前所在的标签页（扩展决定，不由模型猜）
 - `browser_read_page`：`text` 模式返回标题、URL、正文（`main/article` 优先，超长截断并注明）；
   `interactive` 模式在正文之外列出可交互元素，每个带 **ref**：`[e12] button "提交"`、
   `[e13] input[type=email] placeholder="邮箱"`。ref 由扩展在页面里编号并记住（同一 tab 内
   导航前稳定），`click` / `type` 只认 ref，不认选择器——选择器让模型猜，猜错就点错地方
-- 只读三件（tabs / read_page / screenshot）默认免审批；四件写类默认 `requires_approval`，
+- 只读 / 不改变页面状态的（tabs / read_page / screenshot / scroll / hover / find / wait）默认免审批；
+  七件写类（open / navigate / click / type / key / back / close）默认 `requires_approval`，
   走既有 `/permissions` 回路。用户想免确认，`--mode auto` 配 `/allow browser_click` 之类规则
 - 扩展对 `chrome://` / 扩展页 / 无权限站点一律回 `ok:false`，说明原因；不要静默做半截
 - 站点权限要提前拿：`permissions.request` 需要用户手势，agent 调用时没有手势可用。
-  扩展应在用户打开「浏览器桥」开关那一下把 `<all_urls>`（或用户选的站点）申请下来
+  扩展要么在用户打开「浏览器桥」开关那一下把 `<all_urls>` 申请下来，要么让用户逐个站点点授权
+  （xiaoyu-chrome 0.2 起默认后者）；没授权的站点上工具回 `ok:false` 并说明"请用户点授权"，模型据此转告用户
 
 ## 服务端行为
 
