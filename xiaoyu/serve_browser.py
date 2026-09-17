@@ -43,7 +43,12 @@ _REF = {
 #  顺序 = 注册顺序 = 请求里的工具顺序，会话内稳定，不要重排。
 BROWSER_TOOLS: dict[str, dict[str, Any]] = {
     "browser_tabs": {
-        "description": "列出浏览器里打开的标签页：每行 tab_id · 标题 · URL，当前标签页标 *。",
+        "description": (
+            "列出浏览器里打开的标签页：每行 tab_id · 标题 · URL，当前标签页标 *。"
+            "browser_* 这组工具操作的是用户正在用的那个浏览器（带登录态，范围由用户在扩展里圈定）；"
+            "涉及用户的网页时优先用它们，不要改用别的浏览器自动化工具（CDP / devtools MCP 之类看到的是另一个视角，"
+            "也不受用户圈定的范围约束）。"
+        ),
         "parameters": {"type": "object", "properties": {}, "required": []},
         "requires_approval": False,
     },
