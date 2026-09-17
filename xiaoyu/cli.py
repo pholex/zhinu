@@ -220,15 +220,22 @@ def add_system_prompt_flags(parser: argparse.ArgumentParser) -> None:
 
 
 def _read_prompt_file(flag: str, spec: str) -> str:
+    """读提示词文件：块级 HTML 注释不发给模型（约定见 promptfile.py）。
+
+    没闭合的注释、没填完的 `{{…}}` 占位符只在 stderr 提醒，不改内容也不拦启动。
+    """
+    from . import promptfile
+
     path = Path(spec).expanduser()
     try:
-        #  utf-8-sig：Windows 记事本存的文件带 BOM，留着会成为 prompt 的第一个字符
-        text = path.read_text(encoding="utf-8-sig")
+        loaded = promptfile.load(path)
     except (OSError, UnicodeDecodeError) as exc:
         raise ValueError(f"{flag} 读不了 {path}：{exc}") from exc
-    if not text.strip():
-        raise ValueError(f"{flag} 指向的文件是空的：{path}")
-    return text.strip()
+    if not loaded.text:
+        raise ValueError(f"{flag} 指向的文件是空的（或只有注释）：{path}")
+    for note in loaded.warnings(flag):
+        print(ui.warning(note), file=sys.stderr)
+    return loaded.text
 
 
 def resolve_system_prompt_flags(args: argparse.Namespace) -> None:

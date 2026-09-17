@@ -135,6 +135,30 @@ class SystemPromptFileFlagsTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "是空的"):
             self.resolve("--system-prompt-file", str(path))
 
+    def test_block_comments_not_sent_and_template_leftovers_warned(self) -> None:
+        path = self.root / "persona.md"
+        path.write_text(
+            "<!-- 给维护者：把 NAME 换掉 -->\n\n你是 {{NAME}}\n<!-- 忘了收尾\n", encoding="utf-8"
+        )
+        with contextlib.redirect_stderr(io.StringIO()) as err:
+            args = self.resolve("--system-prompt-file", str(path))
+        self.assertEqual(args.system_prompt, "你是 {{NAME}}\n<!-- 忘了收尾")
+        self.assertIn("第 4 行的 <!-- 没有闭合", err.getvalue())
+        self.assertIn("1 处 {{…}}", err.getvalue())
+
+    def test_clean_file_warns_nothing(self) -> None:
+        path = self.root / "persona.md"
+        path.write_text("<!-- 说明 -->\n你是炉匠", encoding="utf-8")
+        with contextlib.redirect_stderr(io.StringIO()) as err:
+            self.resolve("--system-prompt-file", str(path))
+        self.assertEqual(err.getvalue(), "")
+
+    def test_comment_only_file_is_empty(self) -> None:
+        path = self.root / "persona.md"
+        path.write_text("<!-- 只有说明 -->\n", encoding="utf-8")
+        with self.assertRaisesRegex(ValueError, "只有注释"):
+            self.resolve("--system-prompt-file", str(path))
+
     def test_main_reports_bad_file_and_exits_2(self) -> None:
         with contextlib.redirect_stderr(io.StringIO()) as err:
             code = main(["--system-prompt-file", str(self.root / "nope.txt"), "任务"])
