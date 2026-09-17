@@ -424,6 +424,19 @@ class SessionLog:
         """记一条非消息事件（meta / compact / clear …）。"""
         self._write({"ts": self._now(), "event": kind, **fields})
 
+    def preamble(self, kind: str, **fields: Any) -> None:
+        """记一条会话前言事件：与 meta 同性质的"这场会话的设定"，不算发生过什么。
+
+        延迟落盘还没落时只攒着、不触发落盘（否则带自定义 system prompt 的
+        ACP 探测会话又会在盘上留空壳）；已落盘就照常写。
+        """
+        record = {"ts": self._now(), "event": kind, **fields}
+        with self._mutex:
+            if self._pending is not None and not (self._broken or self._released):
+                self._pending.append(record)
+                return
+            self._write_locked(record)
+
     def close(self, reason: str = "normal") -> None:
         """写退出事件（幂等：信号处理器和 atexit 可能先后都到，只记第一个）。
 
@@ -980,6 +993,34 @@ class LoadedMessages(list):
     def __init__(self, messages: Any = (), corrupt_lines: Any = ()) -> None:
         super().__init__(messages)
         self.corrupt_lines: list[int] = list(corrupt_lines)
+
+
+SYSTEM_PROMPT_EVENT = "system_prompt"
+
+
+def load_system_prompt(path: Path) -> str | None:
+    """读回会话记录的自定义 system prompt（最后一条 system_prompt 事件的 text）。
+
+    续会话用：自定义 system prompt 来自启动旗标，续的时候没再给旗标就该沿用
+    原来那份，而不是悄悄变回内置身份。存的是**全文**而不是路径——文件可能
+    已经挪走或改过，会话要能自包含地接回去。没记过、读不了都回 None。
+    """
+    found: str | None = None
+    try:
+        with path.open(encoding="utf-8", errors="replace") as handle:
+            for raw in handle:
+                if SYSTEM_PROMPT_EVENT not in raw:
+                    continue
+                try:
+                    record = json.loads(raw)
+                except json.JSONDecodeError:
+                    continue
+                if isinstance(record, dict) and record.get("event") == SYSTEM_PROMPT_EVENT:
+                    text = record.get("text")
+                    found = text if isinstance(text, str) and text.strip() else None
+    except OSError:
+        return None
+    return found
 
 
 def load_messages(path: Path) -> LoadedMessages:

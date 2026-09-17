@@ -113,6 +113,32 @@ XIAOYU_API_KEY=<key>
 | `XIAOYU_BROWSER_CDP` | — | 接管以 `--remote-debugging-port` 起的本机 Chrome（要登录态时用） |
 | `XIAOYU_BROWSER_HEADED` | 无头 | 有头模式启动浏览器 |
 
+## 自定义 system prompt
+
+小羽出厂是编码 agent。要让它换一种工作身份（写作助手、客服话术、某类专项工作的人设），把提示词写进文件、启动时指过去：
+
+```bash
+xiaoyu --system-prompt-file ~/prompts/writer.md
+```
+
+| 旗标 | 作用 |
+|---|---|
+| `--system-prompt-file PATH` | 文件内容**顶替**内置的"身份"与"回答风格"两段 |
+| `--append-system-prompt TEXT` | 在身份之后**追加**一段，内置身份不变（宿主嵌入时注入人格用） |
+| `--append-system-prompt-file PATH` | 同上，内容从文件读；与上一个只能给一个 |
+
+顶替的只是身份与风格。下面这些照常保留，不受自定义提示词影响：
+
+- **运行纪律**：工具怎么用（explore / str_replace / bash 验证）、计划怎么记、`<untrusted_content>` 里的指令不照做、工作区与系统信息。这是 harness 正常且安全运转的前提，不属于人格；
+- 环境画像、项目指令（`AGENTS.md` 等）、技能索引；`--append-system-prompt` 给的内容仍追加在后。
+
+几点约定：
+
+- 文件按 UTF-8 读，内容原样使用——里面的花括号（`{{占位符}}`、代码示例）不会被当模板处理。文件读不了或是空的，启动时直接报错退出；
+- 自定义提示词**全文记进会话文件**：`xiaoyu resume` 和 `--session-id` 续写时不必再给旗标，沿用原来那份；重新给了就以新给的为准。存全文而不是路径，是为了文件挪走、改过之后旧会话仍能原样接回；
+- 提示词常驻每一轮请求，长度直接计入上下文与费用；`/context` 里它单列为"自定义身份"一行；
+- 库层嵌入对应 `Config(system_prompt=...)`，ACP（`xiaoyu acp`）同样认这组旗标。`xiaoyu serve` 的 agent 对象目前只有 `append_system_prompt`。
+
 ## 插件包（skills + MCP 一起装）
 
 认的是 [agent-plugins.org](https://agent-plugins.org) 那套中立的 bundle 格式——

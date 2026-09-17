@@ -673,6 +673,104 @@ class TestAppendSystemPrompt(AgentTestCase):
         self.assertLess(len(agent.messages[0]["content"]), 20_000)
 
 
+# ---------- 自定义 system prompt（--system-prompt-file） ----------
+
+
+class TestCustomSystemPrompt(AgentTestCase):
+    def test_default_prompt_is_the_three_parts_joined(self) -> None:
+        """拆分不改默认输出：三段相连就是原来那一整份。"""
+        from xiaoyu.agent import (
+            SYSTEM_HARNESS_RULES,
+            SYSTEM_IDENTITY,
+            SYSTEM_PROMPT,
+            SYSTEM_STYLE,
+        )
+
+        self.assertEqual(
+            SYSTEM_PROMPT, f"{SYSTEM_IDENTITY}\n\n{SYSTEM_HARNESS_RULES}\n\n{SYSTEM_STYLE}"
+        )
+        labels = [label for label, _ in self.build([])._system_segments()]
+        self.assertEqual(labels[0], "核心身份")
+        self.assertNotIn("自定义身份", labels)
+
+    def test_replaces_identity_and_style_but_keeps_harness_rules(self) -> None:
+        self.config.system_prompt = "你是炉匠 Cinder，专写短篇小说。"
+        content = self.build([]).messages[0]["content"]
+        self.assertTrue(content.startswith("你是炉匠 Cinder"))
+        self.assertNotIn("你是小羽", content)
+        self.assertNotIn("一律用中文", content)
+        #  运行纪律不随身份让位：工具用法、注入防线、环境约束都还在
+        self.assertIn("str_replace", content)
+        self.assertIn("<untrusted_content>", content)
+        self.assertIn(f"工作区根目录：{self.root}", content)
+
+    def test_braces_in_custom_text_are_literal(self) -> None:
+        """用户文本不过 format：模板占位符与代码花括号原样保留，不炸。"""
+        self.config.system_prompt = "Name: {{NAME}}\nint main() { return 0; } {workspace}"
+        content = self.build([]).messages[0]["content"]
+        self.assertIn("Name: {{NAME}}", content)
+        self.assertIn("int main() { return 0; } {workspace}", content)
+
+    def test_append_and_project_docs_still_follow(self) -> None:
+        (self.root / "AGENTS.md").write_text("跑测试用 make check", encoding="utf-8")
+        self.config.system_prompt = "你是炉匠"
+        self.config.append_system_prompt = "署名用 [C]"
+        content = self.build([]).messages[0]["content"]
+        self.assertLess(content.index("你是炉匠"), content.index("str_replace"))
+        self.assertLess(content.index("str_replace"), content.index("署名用 [C]"))
+        self.assertLess(content.index("署名用 [C]"), content.index("make check"))
+
+    def test_segments_sum_to_prompt_length(self) -> None:
+        self.config.system_prompt = "你是炉匠"
+        agent = self.build([])
+        total = sum(len(text) for _, text in agent._system_segments())
+        self.assertEqual(total, len(agent.messages[0]["content"]))
+
+    def test_blank_custom_prompt_falls_back_to_builtin(self) -> None:
+        self.config.system_prompt = "  \n"
+        self.assertIn("你是小羽", self.build([]).messages[0]["content"])
+
+    def test_survives_reset(self) -> None:
+        self.config.system_prompt = "你是炉匠"
+        agent = self.build([])
+        agent.reset()
+        self.assertTrue(agent.messages[0]["content"].startswith("你是炉匠"))
+
+    def test_recorded_in_session_log_once(self) -> None:
+        from xiaoyu.session_log import SessionLog, load_system_prompt
+
+        self.config.system_prompt = "你是炉匠"
+        path = self.root / "session.jsonl"
+        log = SessionLog(path)
+        self.addCleanup(log.release)
+        self.build([], session_log=log)
+        self.assertEqual(load_system_prompt(path), "你是炉匠")
+        #  同一个文件再起一个 agent（--session-id 续写）：不重复记
+        self.build([], session_log=log)
+        self.assertEqual(path.read_text(encoding="utf-8").count('"system_prompt"'), 1)
+
+    def test_builtin_prompt_not_recorded(self) -> None:
+        from xiaoyu.session_log import SessionLog, load_system_prompt
+
+        path = self.root / "session.jsonl"
+        log = SessionLog(path)
+        self.addCleanup(log.release)
+        self.build([], session_log=log)
+        self.assertIsNone(load_system_prompt(path))
+
+    def test_deferred_log_stays_off_disk(self) -> None:
+        """前言事件不算"发生过什么"：延迟落盘的会话不因它落盘。"""
+        from xiaoyu.session_log import SessionLog, load_system_prompt
+
+        self.config.system_prompt = "你是炉匠"
+        log = SessionLog.create("m", str(self.root), directory=self.root / "s", defer=True)
+        self.addCleanup(log.release)
+        self.build([], session_log=log)
+        self.assertFalse(log.path.exists())
+        log.append({"role": "user", "content": "hi"})
+        self.assertEqual(load_system_prompt(log.path), "你是炉匠")
+
+
 # ---------- 摘要回退链 ----------
 
 #  过退化门（MIN_SUMMARY_CHARS）的合格摘要桩：真实摘要都远超这个长度

@@ -216,10 +216,14 @@ class Interrupted(Exception):
     """
 
 
-SYSTEM_PROMPT = """你是小羽（Xiaoyu），一个在终端里干活的编码 agent。
-名字取自董永传说中七仙女天羽——织女织布，你织代码。
+#  内置 system prompt 分三段。默认三段原样相连（SYSTEM_PROMPT，与拆分前逐字一致）；
+#  用户给了自定义 system prompt（Config.system_prompt / --system-prompt-file）时，
+#  身份与风格两段让位给用户那份，**运行纪律始终保留**——工具怎么用、计划怎么记、
+#  <untrusted_content> 不照做，是 harness 能正常且安全运转的前提，不是人格的一部分。
+SYSTEM_IDENTITY = """你是小羽（Xiaoyu），一个在终端里干活的编码 agent。
+名字取自董永传说中七仙女天羽——织女织布，你织代码。"""
 
-工作方式：
+SYSTEM_HARNESS_RULES = """工作方式：
 - **跨文件探查一律先用 explore**。凡是"这个符号定义在哪""谁调用了它""这条链路怎么走"
   "这个功能涉及哪些文件"这类需要翻 2 个以上文件才能回答的问题，交给 explore
   （便宜模型的只读子 agent），它会返回带 路径:行号 的结论。
@@ -252,11 +256,20 @@ SYSTEM_PROMPT = """你是小羽（Xiaoyu），一个在终端里干活的编码 
 环境约束：
 - {shell_note}
 - 工作区根目录：{workspace}
-- 系统：{system}
+- 系统：{system}"""
 
-回答风格：一律用中文，包括中间的过程说明和思考，不要中英混杂。结论先行，简洁。
+SYSTEM_STYLE = """回答风格：一律用中文，包括中间的过程说明和思考，不要中英混杂。结论先行，简洁。
 不要复述你做过的每一步，只讲结果和需要用户知道的事。
 不确定的地方直说，不要编造文件内容或命令输出。"""
+
+SYSTEM_PROMPT = f"{SYSTEM_IDENTITY}\n\n{SYSTEM_HARNESS_RULES}\n\n{SYSTEM_STYLE}"
+
+#  自定义 system prompt 之后、运行纪律之前的过渡句：告诉模型两段并行生效，
+#  别把后面的工具纪律当成与自定义身份冲突的"另一个人设"
+CUSTOM_PROMPT_HARNESS_LEAD = (
+    "以下是运行环境的工具使用纪律，与上面的身份和风格设定并行生效；"
+    "表达风格以上面的设定为准，工具怎么用以下面为准。"
+)
 
 #  空回复自救指令：deepseek 等模型偶发返回完全空的补全，静默收尾等于用户面前
 #  一片空白（真实会话里模型改完 8 处代码后空回复结束，用户等了 27 分钟才追问）
@@ -928,6 +941,7 @@ class Agent:
         #  gate_skip 事件按轮去重：门控一轮内会被评估多次（每个收尾步都问一遍）
         self._crystallize_skip_logged = False
         self.messages: list[dict[str, Any]] = [{"role": "system", "content": self._system_prompt()}]
+        self._log_custom_system_prompt()
         #  token 记账锚点（服务端 usage 是权威值，本地只估算它之后新增的
         #  部分，误差不随会话累积）：(权威 prompt_tokens, 当时的消息条数)。
         #  Mantle 系模型不回 usage 时锚点保持 None，退化为纯本地估算。
@@ -1290,6 +1304,17 @@ class Agent:
     #  （见 skills.index_block），所以这个比例只影响描述的详略、不影响技能可见性。
     _SKILL_BUDGET_RATIO = 0.02
 
+    def _log_custom_system_prompt(self) -> None:
+        """自定义 system prompt 全文记进会话前言，续会话时据此沿用（见
+        session_log.load_system_prompt）。内置身份不记——那是默认值。"""
+        custom = (self.config.system_prompt or "").strip()
+        if custom and self.session_log is not None:
+            from .session_log import SYSTEM_PROMPT_EVENT, load_system_prompt
+
+            #  续写同名会话（--session-id）每次启动都经这里：文件里已是这份就不重复记
+            if load_system_prompt(self.session_log.path) != custom:
+                self.session_log.preamble(SYSTEM_PROMPT_EVENT, text=custom)
+
     def _system_prompt(self) -> str:
         """组装 system prompt。
 
@@ -1310,16 +1335,26 @@ class Agent:
         from .tools import _platform_shell_note
 
         segments: list[tuple[str, str]] = []
-        segments.append(
-            (
-                "核心身份",
-                SYSTEM_PROMPT.format(
-                    shell_note=_platform_shell_note(),
-                    workspace=self.config.workspace,
-                    system=f"{platform.system()} {platform.release()} ({platform.machine()})",
-                ),
+        environment = {
+            "shell_note": _platform_shell_note(),
+            "workspace": self.config.workspace,
+            "system": f"{platform.system()} {platform.release()} ({platform.machine()})",
+        }
+        custom = (self.config.system_prompt or "").strip()
+        if custom:
+            #  自定义 system prompt：顶替内置的身份与风格两段，运行纪律照留。
+            #  用户文本**不过 format**——里面的花括号（模板占位符、代码示例）
+            #  是正文，不是我们的占位符。
+            segments.append(("自定义身份", custom))
+            segments.append(
+                (
+                    "运行纪律",
+                    f"\n\n{CUSTOM_PROMPT_HARNESS_LEAD}\n\n"
+                    + SYSTEM_HARNESS_RULES.format(**environment),
+                )
             )
-        )
+        else:
+            segments.append(("核心身份", SYSTEM_PROMPT.format(**environment)))
         #  宿主注入的身份/人格（--append-system-prompt）：紧跟核心身份之后，
         #  早于环境探测/项目指令——人格是"我是谁"，后面两段是"我在什么环境里"。
         if self.config.append_system_prompt:

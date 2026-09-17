@@ -29,6 +29,7 @@ from .session_log import (
     install_exit_logging,
     list_sessions,
     load_messages,
+    load_system_prompt,
     open_named,
     turn_starts,
     usage_digest,
@@ -127,11 +128,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="给会话起个固定名字：同名会话已存在就接着聊，不存在就新建"
         "（脚本/CI 里反复调同一个会话用；交互着聊用 xiaoyu resume 更顺手）",
     )
-    parser.add_argument(
-        "--append-system-prompt",
-        dest="append_system_prompt",
-        help="追加到内置 system prompt 末尾，用于宿主进程嵌入 xiaoyu 时注入身份/人格",
-    )
+    add_system_prompt_flags(parser)
     parser.add_argument(
         "--effort",
         choices=list(EFFORT_LEVELS),
@@ -198,6 +195,59 @@ def build_parser() -> argparse.ArgumentParser:
     )
     add_output_format(parser)
     return parser
+
+
+def add_system_prompt_flags(parser: argparse.ArgumentParser) -> None:
+    """system prompt 的三个旗标，主命令与 resume 共用。"""
+    parser.add_argument(
+        "--system-prompt-file",
+        dest="system_prompt_file",
+        metavar="PATH",
+        help="用文件内容作为自定义 system prompt：顶替内置的身份与回答风格，"
+        "工具使用纪律、环境信息、项目指令与技能索引照常保留；续会话时不必重复给",
+    )
+    parser.add_argument(
+        "--append-system-prompt",
+        dest="append_system_prompt",
+        help="追加到内置 system prompt 末尾，用于宿主进程嵌入 xiaoyu 时注入身份/人格",
+    )
+    parser.add_argument(
+        "--append-system-prompt-file",
+        dest="append_system_prompt_file",
+        metavar="PATH",
+        help="同 --append-system-prompt，内容从文件读（两者只能给一个）",
+    )
+
+
+def _read_prompt_file(flag: str, spec: str) -> str:
+    path = Path(spec).expanduser()
+    try:
+        #  utf-8-sig：Windows 记事本存的文件带 BOM，留着会成为 prompt 的第一个字符
+        text = path.read_text(encoding="utf-8-sig")
+    except (OSError, UnicodeDecodeError) as exc:
+        raise ValueError(f"{flag} 读不了 {path}：{exc}") from exc
+    if not text.strip():
+        raise ValueError(f"{flag} 指向的文件是空的：{path}")
+    return text.strip()
+
+
+def resolve_system_prompt_flags(args: argparse.Namespace) -> None:
+    """把两个 -file 旗标读成文本，落到 args.system_prompt / args.append_system_prompt。
+
+    读不了、文件为空、--append-system-prompt 两种写法同时给，都抛 ValueError
+    （消息面向用户）——启动期就报，别等装配完 agent 才发现提示词没生效。
+    """
+    args.system_prompt = (
+        _read_prompt_file("--system-prompt-file", args.system_prompt_file)
+        if args.system_prompt_file
+        else None
+    )
+    if args.append_system_prompt_file:
+        if args.append_system_prompt:
+            raise ValueError("--append-system-prompt 与 --append-system-prompt-file 只能给一个")
+        args.append_system_prompt = _read_prompt_file(
+            "--append-system-prompt-file", args.append_system_prompt_file
+        )
 
 
 def add_prompt_flag(parser: argparse.ArgumentParser) -> None:
@@ -838,9 +888,15 @@ def resume_command(argv: list[str]) -> int:
     )
     parser.add_argument("--yolo", action="store_true", help="不再逐个确认写文件和执行命令")
     parser.add_argument("--no-tui", dest="no_tui", action="store_true", help="用明文 REPL")
+    add_system_prompt_flags(parser)
     add_prompt_flag(parser)
     add_output_format(parser)
     args = parser.parse_args(argv)
+    try:
+        resolve_system_prompt_flags(args)
+    except ValueError as exc:
+        print(ui.error(str(exc)), file=sys.stderr)
+        return 2
     #  folder trust 门（与 main 同一道，先于 load_dotenv；resume 的工作区就是 cwd）
     trust = resolve_folder_trust(
         Path.cwd(),
@@ -951,6 +1007,10 @@ def resume_command(argv: list[str]) -> int:
             workspace=resume_workspace,
             auto_approve=args.yolo or None,
             mode=args.mode,
+            #  没重新给旗标就沿用原会话那份自定义 system prompt：续的是同一场
+            #  对话，身份不该悄悄变回内置的
+            system_prompt=args.system_prompt or load_system_prompt(chosen.path),
+            append_system_prompt=args.append_system_prompt,
             workspace_trusted=trust.trusted,
         )
         permissions = Permissions.load(config.workspace, include_workspace=trust.trusted)
@@ -2388,7 +2448,11 @@ def open_session(config: Config, session_id: str | None) -> tuple[SessionLog, li
     if not session_id:
         return SessionLog.create(config.model, str(config.workspace)), []
     name = check_session_id(session_id)
-    return open_named(name, config.model, str(config.workspace))
+    log, restored = open_named(name, config.model, str(config.workspace))
+    if config.system_prompt is None:
+        #  续写同名会话而没再给 --system-prompt-file：沿用会话里记的那份
+        config.system_prompt = load_system_prompt(log.path)
+    return log, restored
 
 
 def warn_if_home_workspace(workspace: Path) -> None:
@@ -2483,6 +2547,11 @@ def main(argv: list[str] | None = None) -> int:
     if argv and argv[0] == "uninstall":
         return uninstall_command(argv[1:])
     args = build_parser().parse_args(argv)
+    try:
+        resolve_system_prompt_flags(args)
+    except ValueError as exc:
+        print(ui.error(str(exc)), file=sys.stderr)
+        return 2
     #  folder trust 门必须先于 load_dotenv（工作区 .env 是被门管的对象）。
     #  交互判定：stdin 与 stderr 都是 tty 才算——wire/管道/重定向都
     #  走 headless 分支（不问，直接不信任 + 告警）。
@@ -2562,6 +2631,7 @@ def main(argv: list[str] | None = None) -> int:
             mode=args.mode,
             sandbox=args.sandbox,
             sandbox_network=args.sandbox_network,
+            system_prompt=args.system_prompt,
             append_system_prompt=args.append_system_prompt,
             effort=args.effort,
             budget_tokens=args.budget_tokens,
@@ -2665,6 +2735,7 @@ def wire_main(args: argparse.Namespace, workspace_trusted: bool = True) -> int:
             mode=args.mode,
             sandbox=args.sandbox,
             sandbox_network=args.sandbox_network,
+            system_prompt=args.system_prompt,
             append_system_prompt=args.append_system_prompt,
             effort=args.effort,
             budget_tokens=args.budget_tokens,
@@ -2714,6 +2785,7 @@ def acp_main(args: argparse.Namespace) -> int:
         build_agent_factory(
             model=args.model,
             base_url=args.base_url,
+            system_prompt=args.system_prompt,
             append_system_prompt=args.append_system_prompt,
             effort=args.effort,
             budget_tokens=args.budget_tokens,
