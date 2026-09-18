@@ -313,5 +313,49 @@ class SessionLockCliTest(E2ECase):
         self.assertIn("会话 nightly 正被", stderr)
 
 
+
+class CustomSystemPromptTest(E2ECase):
+    """--system-prompt-file：真实子进程里发给模型的 system prompt 确实换了，
+    且 resume 不带旗标时沿用原会话那份（全文记在会话文件里）。"""
+
+    def _captured_system(self, directory: Path) -> str:
+        return json.loads((directory / "request-1.json").read_text(encoding="utf-8"))["system"]
+
+    def test_custom_prompt_sent_and_carried_over_by_resume(self):
+        persona = Path(self.tmp) / "persona.txt"
+        persona.write_text("你是炉匠 {{NAME}}，专写短篇小说。\n", encoding="utf-8")
+        first = Path(self.tmp) / "capture-1"
+        _, _, code, stderr = self.run_cli(
+            "text: 好\n",
+            extra_args=["--system-prompt-file", str(persona)],
+            extra_env={"XIAOYU_SCRIPTED_CAPTURE": str(first)},
+        )
+        self.assertEqual(code, 0, stderr)
+        system = self._captured_system(first)
+        self.assertTrue(system.startswith("你是炉匠 {{NAME}}"), system[:80])
+        self.assertNotIn("你是小羽", system)
+        self.assertIn("<untrusted_content>", system)
+
+        #  提示词文件删掉再 resume：沿用的是会话里记的全文，不回头读文件
+        persona.unlink()
+        second = Path(self.tmp) / "capture-2"
+        env = self.scripted_env("text: 接着写\n")
+        env["XIAOYU_SCRIPTED_CAPTURE"] = str(second)
+        proc = subprocess.run(
+            [sys.executable, "-m", "xiaoyu", "resume", "--last", "继续",
+             "--output-format", "stream-json"],
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=_TIMEOUT,
+            env=env,
+            cwd=self.workspace,
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertTrue(self._captured_system(second).startswith("你是炉匠 {{NAME}}"))
+
+
 if __name__ == "__main__":
     unittest.main()

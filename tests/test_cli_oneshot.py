@@ -23,10 +23,12 @@ from xiaoyu.cli import (
     build_parser,
     collect_image_parts,
     compose_prompt,
+    main,
     make_headless_deny,
     oneshot_frontend,
     open_session,
     prompt_words,
+    resolve_system_prompt_flags,
     run_once,
     split_resume_positionals,
 )
@@ -86,6 +88,82 @@ class AppendSystemPromptFlagTest(unittest.TestCase):
     def test_default_is_none(self) -> None:
         args = build_parser().parse_args(["任务"])
         self.assertIsNone(args.append_system_prompt)
+
+
+class SystemPromptFileFlagsTest(unittest.TestCase):
+    """--system-prompt-file / --append-system-prompt-file：从文件读提示词。"""
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+
+    def resolve(self, *argv: str):
+        args = build_parser().parse_args([*argv, "任务"])
+        resolve_system_prompt_flags(args)
+        return args
+
+    def test_defaults(self) -> None:
+        args = self.resolve()
+        self.assertIsNone(args.system_prompt)
+        self.assertIsNone(args.append_system_prompt)
+
+    def test_system_prompt_file_read_and_stripped(self) -> None:
+        path = self.root / "persona.txt"
+        path.write_bytes("\ufeff你是炉匠 {{NAME}}\n\n".encode("utf-8"))
+        self.assertEqual(self.resolve("--system-prompt-file", str(path)).system_prompt, "你是炉匠 {{NAME}}")
+
+    def test_append_file(self) -> None:
+        path = self.root / "extra.txt"
+        path.write_text("署名用 [C]", encoding="utf-8")
+        args = self.resolve("--append-system-prompt-file", str(path))
+        self.assertEqual(args.append_system_prompt, "署名用 [C]")
+
+    def test_append_text_and_file_conflict(self) -> None:
+        path = self.root / "extra.txt"
+        path.write_text("x", encoding="utf-8")
+        with self.assertRaisesRegex(ValueError, "只能给一个"):
+            self.resolve("--append-system-prompt", "y", "--append-system-prompt-file", str(path))
+
+    def test_missing_file(self) -> None:
+        with self.assertRaisesRegex(ValueError, "--system-prompt-file 读不了"):
+            self.resolve("--system-prompt-file", str(self.root / "nope.txt"))
+
+    def test_empty_file(self) -> None:
+        path = self.root / "empty.txt"
+        path.write_text("  \n", encoding="utf-8")
+        with self.assertRaisesRegex(ValueError, "是空的"):
+            self.resolve("--system-prompt-file", str(path))
+
+    def test_block_comments_not_sent_and_template_leftovers_warned(self) -> None:
+        path = self.root / "persona.md"
+        path.write_text(
+            "<!-- 给维护者：把 NAME 换掉 -->\n\n你是 {{NAME}}\n<!-- 忘了收尾\n", encoding="utf-8"
+        )
+        with contextlib.redirect_stderr(io.StringIO()) as err:
+            args = self.resolve("--system-prompt-file", str(path))
+        self.assertEqual(args.system_prompt, "你是 {{NAME}}\n<!-- 忘了收尾")
+        self.assertIn("第 4 行的 <!-- 没有闭合", err.getvalue())
+        self.assertIn("1 处 {{…}}", err.getvalue())
+
+    def test_clean_file_warns_nothing(self) -> None:
+        path = self.root / "persona.md"
+        path.write_text("<!-- 说明 -->\n你是炉匠", encoding="utf-8")
+        with contextlib.redirect_stderr(io.StringIO()) as err:
+            self.resolve("--system-prompt-file", str(path))
+        self.assertEqual(err.getvalue(), "")
+
+    def test_comment_only_file_is_empty(self) -> None:
+        path = self.root / "persona.md"
+        path.write_text("<!-- 只有说明 -->\n", encoding="utf-8")
+        with self.assertRaisesRegex(ValueError, "只有注释"):
+            self.resolve("--system-prompt-file", str(path))
+
+    def test_main_reports_bad_file_and_exits_2(self) -> None:
+        with contextlib.redirect_stderr(io.StringIO()) as err:
+            code = main(["--system-prompt-file", str(self.root / "nope.txt"), "任务"])
+        self.assertEqual(code, 2)
+        self.assertIn("读不了", err.getvalue())
 
 
 class SplitResumePositionalsTest(unittest.TestCase):
@@ -236,7 +314,7 @@ class SessionIdFlagTest(unittest.TestCase):
         )
         patcher.start()
         self.addCleanup(patcher.stop)
-        self.config = SimpleNamespace(model="m", workspace=Path("/ws"))
+        self.config = SimpleNamespace(model="m", workspace=Path("/ws"), system_prompt=None)
 
     def test_parser_accepts_short_and_long_flag(self) -> None:
         for argv in (["-s", "nightly"], ["--session-id", "nightly"]):
@@ -259,6 +337,21 @@ class SessionIdFlagTest(unittest.TestCase):
         second, restored = open_session(self.config, "nightly")
         self.assertEqual(second.path, first.path)
         self.assertEqual([m["content"] for m in restored], ["第一步"])
+
+    def test_named_session_carries_custom_system_prompt(self) -> None:
+        """续写同名会话没再给 --system-prompt-file：沿用会话里记的那份；
+        重新给了就以新给的为准。"""
+        first, _ = open_session(self.config, "writer")
+        first.preamble("system_prompt", text="你是炉匠")
+        first.append({"role": "user", "content": "第一步"})
+        first.close()
+        second, _ = open_session(self.config, "writer")
+        self.assertEqual(self.config.system_prompt, "你是炉匠")
+        second.close()
+        self.config.system_prompt = "你是新人设"
+        third, _ = open_session(self.config, "writer")
+        self.addCleanup(third.close)
+        self.assertEqual(self.config.system_prompt, "你是新人设")
 
     def test_bad_name_raises_for_caller_to_report(self) -> None:
         with self.assertRaises(ValueError):

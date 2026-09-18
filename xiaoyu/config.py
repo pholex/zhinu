@@ -314,6 +314,11 @@ class Config:
     #  供宿主进程把 xiaoyu 当执行引擎嵌入时注入身份/人格，
     #  不是项目指令——项目级规范走 AGENTS.md 那条路。
     append_system_prompt: str | None = None
+    #  完整的自定义 system prompt（--system-prompt-file）；None = 用内置的。
+    #  顶替的是内置的"身份 + 回答风格"两段，运行纪律（工具用法、计划、
+    #  <untrusted_content> 不照做、环境约束）与后面的环境画像/项目指令/技能索引
+    #  照常保留。与 append_system_prompt 可同时用：那份仍追加在其后。
+    system_prompt: str | None = None
     #  推理深度（effort）。空 = 不传，上游按自家默认。取值见 EFFORT_LEVELS；
     #  三条协议各自翻译（chat: reasoning_effort / Responses: reasoning.effort /
     #  Anthropic: output_config.effort），不认的上游会 400——宁可报错也不静默丢。
