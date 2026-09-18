@@ -910,6 +910,34 @@ class TestSlashCommands(AgentTestCase):
         self.assertIn("已切换到 grok-4.6（直连 xai）", out)
         self.assertEqual(agent.config.model, "grok-4.6")
 
+    def test_model_switch_on_gateway_prechecks_remote_listing(self) -> None:
+        """通配 provider 什么名字都接：切换后现场探清单，不在里面就告警但仍切换。"""
+
+        class ListingClient(FakeClient):
+            def with_options(self, **kwargs):
+                return self
+
+            @property
+            def models(self):
+                page = [types.SimpleNamespace(id=name) for name in ("grok-4.6", "deepseek-flash")]
+                return types.SimpleNamespace(list=lambda: page)
+
+        agent = self.build([])
+        client = ListingClient([])
+        agent.registry = Registry([Provider("gw", "", "", (), "网关")], clients={"gw": client})
+        _, out = self.run_slash(agent, "/model grok")
+        self.assertIn("已切换到 grok（网关）", out)
+        self.assertIn("网关清单里没有 grok", out)
+        self.assertEqual(agent.config.model, "grok", "只告警不拦：网关清单未必全")
+        _, out = self.run_slash(agent, "/model grok-4.6")
+        self.assertIn("已切换到 grok-4.6（网关）", out)
+        self.assertNotIn("清单里没有", out)
+        #  清单探不到：说明无法预检，仍切换
+        agent.registry = Registry([Provider("gw", "", "", (), "网关")], clients={"gw": FakeClient([])})
+        _, out = self.run_slash(agent, "/model whatever")
+        self.assertIn("清单获取失败", out)
+        self.assertEqual(agent.config.model, "whatever")
+
     def test_context_reports_budget_and_calibration(self) -> None:
         agent = self.build([])
         _, out = self.run_slash(agent, "/context")

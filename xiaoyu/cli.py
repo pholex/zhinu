@@ -3264,6 +3264,23 @@ def handle_slash(agent: Agent, line: str, select: Any = None) -> bool:
                 owner = agent.registry.get(route.provider)
                 where = owner.display if owner else route.provider
                 print(ui.secondary(f"已切换到 {rest[0]}（{where}）"))
+                if owner is not None and owner.wildcard:
+                    #  通配 provider（网关）什么名字都接，本地解析答不了"存不存在"；
+                    #  现场探一次它的清单，不在里面就提前说——否则要到第一次请求
+                    #  才收到一句干巴巴的 400。只告警不拦：网关清单未必全，用户点名
+                    #  要试的模型不该被本地拦死
+                    for label, models, note in agent.registry.remote_models():
+                        if label != owner.display:
+                            continue
+                        if models is None:
+                            print(ui.warning(f"{label}清单获取失败，无法预检模型名：{note}"))
+                        elif rest[0] not in models:
+                            print(
+                                ui.warning(
+                                    f"{label}清单里没有 {rest[0]}，请求很可能失败"
+                                    f"（清单共 {len(models)} 个，/model 不带参数可查看）"
+                                )
+                            )
                 #  切模型顺手探一次它的 Models API 能力：自校正上下文上限、报能力/漂移
                 for note in agent.refresh_capabilities():
                     print(ui.secondary(note))
