@@ -454,9 +454,15 @@ def execute_delegation(
     on_agent: Callable[[Any], None] | None = None,
     require_isolation: bool = False,
     model_override: str | None = None,
+    effort_override: str | None = None,
     parent_history: Callable[[], list[dict[str, Any]]] | None = None,
 ) -> DelegationResult:
     """跑一次委托的执行核心（单发 subagent 工具与 qixiang 批量共用）。
+
+    model_override / effort_override 是调用方按本次任务给的模型与推理深度
+    （七襄给整批、斗巧给每席）：优先级 调用参数 > spec 声明 > 主会话。
+    model 在 resume 时钉住存档里的那个（上下文是按它长的），effort 不影响
+    上下文形状，resume 时照常可改。
 
     parent_history 是父会话历史的取值回调（spec.inherit = "distilled" 时才
     调用，取到的副本经 distill_history 精简后作为子 agent 的起始历史）；
@@ -498,6 +504,17 @@ def execute_delegation(
                 "放宽档位或不传这个参数。"
             )
         )
+    #  effort 与 spec 解析同一张表：不认的值在任何副作用（建 worktree）之前挡下
+    effort_param = _clean_param(effort_override)
+    if effort_param is not None:
+        effort_param = effort_param.lower()
+        if effort_param not in EFFORT_LEVELS:
+            return DelegationResult(
+                error=(
+                    f"ERROR: effort 只认 {' / '.join(EFFORT_LEVELS)}，"
+                    f"不认识 {effort_override!r}。"
+                )
+            )
 
     #  -- resume：全链路 fail-closed，任何一步不对就报错，绝不退化成全新子 agent --
     record: SubagentRun | None = None
@@ -603,8 +620,8 @@ def execute_delegation(
         explore_model=config.explore_model,
         vision_fallback_model=config.vision_fallback_model,
         workspace=workdir,
-        #  spec 声明 > 主会话；只读探索类子 agent 适合 low，总控类给 high
-        effort=spec.effort or config.effort,
+        #  调用参数 > spec 声明 > 主会话；只读探索类子 agent 适合 low，总控类给 high
+        effort=effort_param or spec.effort or config.effort,
         turn_extension=config.turn_extension,
         max_iterations=spec.max_iterations,
         max_tool_output=config.max_tool_output,

@@ -39,9 +39,10 @@ from .agents import (
     _clean_param,
     execute_delegation,
 )
-from .config import Config
+from .config import EFFORT_LEVELS, Config
 from .events import Notice, UISink
 from .fanout import Attempt, run_attempts
+from .providers import UnknownModel
 from .tools import Tool
 
 #  一批最多多少项（新建 + resume 合计）。单机直连场景 64 已远超实际并发
@@ -131,6 +132,8 @@ def make_qixiang_tool(
         resume: Any = None,
         capability_mode: str | None = None,
         isolation: str | None = None,
+        model: str | None = None,
+        effort: str | None = None,
     ) -> str:
         #  ---------- 校验（全部在任何子 agent 启动之前：半途报错=白烧钱） ----------
         spec_name = _clean_param(spec)
@@ -198,6 +201,22 @@ def make_qixiang_tool(
         else:
             iso_value = "none" if target.readonly else "worktree"
 
+        #  模型与推理深度：整批统一（批量迁移用便宜模型、只读调研给 low）。
+        #  模型名先过 registry：没人认领的名字在开工前挡下，不让 N 项一起 400
+        model_name = _clean_param(model)
+        if model_name is not None:
+            try:
+                registry.resolve(model_name)
+            except UnknownModel:
+                return f"ERROR: 模型 {model_name!r} 没有任何 provider 认领——先配好再扇出。"
+        effort_level = _clean_param(effort)
+        if effort_level is not None:
+            effort_level = effort_level.lower()
+            if effort_level not in EFFORT_LEVELS:
+                return (
+                    f"ERROR: effort 只认 {' / '.join(EFFORT_LEVELS)}，不认识 {effort!r}。"
+                )
+
         #  ---------- 组装任务列表：resume 在前（续跑的活最急），编号连续 ----------
         states: list[_ItemState] = []
         for rid, prompt in resume_map.items():
@@ -237,6 +256,10 @@ def make_qixiang_tool(
                     on_agent=register,
                     #  批量并行写不许退回主工作区（worktree 建不出来=该项不执行）
                     require_isolation=iso_value == "worktree",
+                    #  resume 项的模型钉在存档上（execute_delegation 内部），
+                    #  这里传了也只对新开项生效
+                    model_override=model_name,
+                    effort_override=effort_level,
                 )
 
             return primary
@@ -253,6 +276,7 @@ def make_qixiang_tool(
                 resume_from=run_id,
                 child_sink=_NullSink(),
                 on_agent=register,
+                effort_override=effort_level,
             )
 
         attempts = [
@@ -339,8 +363,10 @@ def make_qixiang_tool(
             blocks.append("\n".join(lines))
 
         header = (
-            f"[七襄 report] spec={spec_name} · "
-            f"完成 {counts['completed']} / 失败 {counts['failed']} / "
+            f"[七襄 report] spec={spec_name}"
+            + (f" · model={model_name}" if model_name else "")
+            + (f" · effort={effort_level}" if effort_level else "")
+            + f" · 完成 {counts['completed']} / 失败 {counts['failed']} / "
             f"中止 {counts['aborted']} / 未执行 {counts['error']}"
             f"（共 {len(states)} 项，并发 {concurrency}）"
         )
@@ -417,6 +443,18 @@ def make_qixiang_tool(
                         "独立 worktree（防并行写冲突）；确认各项写的文件互不相交"
                         "且要直接落主工作区时才传 none"
                     ),
+                },
+                "model": {
+                    "type": "string",
+                    "description": (
+                        "本批全部委托用的模型（缺省随 spec 声明/主会话）。"
+                        "批量迁移、批量调研这类活给便宜模型；resume 项钉住上次的模型"
+                    ),
+                },
+                "effort": {
+                    "type": "string",
+                    "enum": list(EFFORT_LEVELS),
+                    "description": "本批全部委托的推理深度（缺省随 spec 声明/主会话）；只读调研给 low",
                 },
             },
             "required": ["spec"],

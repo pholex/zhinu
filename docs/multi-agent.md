@@ -88,6 +88,10 @@ qixiang(
   已完成的存档还在，`resume` 参数批量续跑：
   `qixiang(spec="tester", resume={"ab12cd34": "接着修剩下的用例"})`。
 - **质量闸**：子 agent 结论短于 200 字符会被自动追问一轮，逼出完整交接。
+- **模型与深度**：`model` / `effort` 给本批全部委托单独指定（缺省随 spec
+  声明/主会话）——批量迁移、批量调研这类活用便宜模型、只读的给 `low`，
+  主会话留着强模型做统筹。模型名开工前过 provider 校验，不认的名字整批
+  不起；resume 项钉住上次的模型（上下文是按它长的），effort 照常可改。
 - 任务之间有依赖或要共享中间结果时**不要用七襄**——改为顺序委托或上宸枢。
 
 ## 斗巧：竞争织造模式（Contest-Weave Mode）
@@ -128,6 +132,8 @@ douqiao(
 2. **chenshu_spawn** 逐个起成员：worker 绑 mission（build 自动创建
    `feat/<slug>` 分支 + 独立 worktree），reviewer 绑评审目标。把依赖已
    解锁的 mission 一口气发满（上限 `XIAOYU_CHENSHU_MAX_WORKERS`，默认 4）。
+   `model` / `effort` 可给成员单独定模型与推理深度：总枢用强模型规划，
+   build worker 用便宜模型，survey / reviewer 给 `low`；缺省随主会话。
 3. **chenshu_wait** 阻塞等成员事件（成员发给总枢的来信、完成/失败，按发生顺序，最长 600s）——不轮询。
 4. 评审过闸后 **chenshu_merge** 收回主干。
 5. 全部合并后 **chenshu_teardown** 收枢（干净 worktree 删除，审计轨迹
@@ -145,9 +151,13 @@ douqiao(
   日志——拒绝是一个带理由的决策。
 - **审计**：所有协作产物（消息/发现/评审/mission 状态/活动日志）是
   `.xiaoyu/chenshu/` 下的明文 markdown + JSON，永久保留、随时可查。
+- **存档**：成员收工时整份 transcript 落盘到 `.xiaoyu/chenshu/archives/`，
+  `chenshu_spawn` 同名 `resume=true` 就在它的上下文上续跑（追加评审轮、
+  接着修遗留），模型钉住存档那一个，要换模型请换名新开。
 
 重启后重新 `chenshu_init` 会**收养**既有工作区：mission、worktree、审计
-轨迹全保留，上个会话的成员退役，重新 spawn 即可接着干。
+轨迹、存档全保留，上个会话的成员退役；有存档的成员 `resume=true` 接着
+原上下文续跑，中途断掉没走到收工的直接重新 spawn。
 
 已知边界（诚实记录）：worker 的 bash 不做命令级审查（macOS 有 Seatbelt
 沙箱兜写越界，其它平台靠 briefing 纪律）；reviewer/survey 的只读性是
