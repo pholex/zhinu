@@ -252,6 +252,29 @@ class TrustContentTest(AgentTestCase):
         self.assertTrue(box.get("mcp__web__fetch").untrusted)
 
 
+class ModeNoticeUnderYoloTest(AgentTestCase):
+    """--yolo 下 auto 档的开场说明不打（"bash 仍逐条确认"与全放行矛盾）；plan 档照说。"""
+
+    def _notice(self, mode: str) -> str:
+        from xiaoyu.cli import print_mode_notice
+
+        self.config.mode = mode
+        agent = self.build([])
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            print_mode_notice(agent)
+        return out.getvalue()
+
+    def test_auto_under_yolo_is_silent(self) -> None:
+        self.assertEqual(self._notice("auto"), "")
+
+    def test_plan_under_yolo_still_speaks(self) -> None:
+        self.assertIn("plan", self._notice("plan"))
+
+    def test_auto_without_yolo_speaks(self) -> None:
+        self.config.auto_approve = False
+        self.assertIn("auto", self._notice("auto"))
+
+
 class SessionTraceTest(AgentTestCase):
     """放开护栏的会话在前言里留痕；默认配置一字不记。"""
 

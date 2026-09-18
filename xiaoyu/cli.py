@@ -3046,6 +3046,10 @@ def print_mode_notice(agent: Agent) -> None:
     """
     if agent.mode == modes.DEFAULT:
         return
+    #  --yolo 下 auto 档那句"bash 仍逐条确认"不成立（全放行盖过了 auto 的放行矩阵），
+    #  不打；plan 档仍要说——只读承诺不受 --yolo 影响
+    if agent.config.auto_approve and agent.mode == modes.AUTO:
+        return
     ready = agent.sandbox_ready()
     text = modes.describe(agent.mode, sandbox_ready=ready)
     style = ui.secondary if agent.mode == modes.AUTO and ready else ui.warning

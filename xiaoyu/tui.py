@@ -2057,7 +2057,11 @@ class Tui:
             self.console.print(
                 Text("--yolo 已开启：写文件和执行命令都不会再问你", style="status.error")
             )
-        if agent.mode != modes.DEFAULT:
+        #  --yolo 下 auto 档那句"bash 仍逐条确认"不成立（全放行盖过了 auto 的放行矩阵），
+        #  不打；plan 档仍要说——只读承诺不受 --yolo 影响
+        if agent.mode != modes.DEFAULT and not (
+            agent.config.auto_approve and agent.mode == modes.AUTO
+        ):
             #  --mode auto 起手：提示符上的标记不解释"这一档会不会问你"，开场说一次
             self.console.print(
                 Text(
