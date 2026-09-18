@@ -896,6 +896,20 @@ class TestSlashCommands(AgentTestCase):
         self.run_slash(agent, "/model 另一个模型")
         self.assertEqual(agent.config.model, "另一个模型")
 
+    def test_model_switch_rejects_unknown_and_shows_route(self) -> None:
+        """/model 先解析再切：没人接的名字报错、原模型不动；接住的打出走哪家。"""
+        agent = self.build([])
+        agent.registry = Registry(
+            [Provider("xai", "", "", ("grok-4.6",), "直连 xai")],
+            clients={"xai": self.client},
+        )
+        _, out = self.run_slash(agent, "/model grok")
+        self.assertIn("没有 provider 提供模型 grok", out)
+        self.assertEqual(agent.config.model, "main-model", "解析失败不该切换")
+        _, out = self.run_slash(agent, "/model grok-4.6")
+        self.assertIn("已切换到 grok-4.6（直连 xai）", out)
+        self.assertEqual(agent.config.model, "grok-4.6")
+
     def test_context_reports_budget_and_calibration(self) -> None:
         agent = self.build([])
         _, out = self.run_slash(agent, "/context")

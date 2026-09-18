@@ -3252,11 +3252,21 @@ def handle_slash(agent: Agent, line: str, select: Any = None) -> bool:
                 print(f"  {skill.name}  {ui.secondary(skill.description or str(skill.path))}{origin}")
     elif command == "/model":
         if rest:
-            agent.switch_model(rest[0])
-            print(ui.secondary(f"已切换到 {rest[0]}"))
-            #  切模型顺手探一次它的 Models API 能力：自校正上下文上限、报能力/漂移
-            for note in agent.refresh_capabilities():
-                print(ui.secondary(note))
+            #  先解析再切：名字没人接就报错、原模型不动。否则"已切换到 grok"打了
+            #  一句假成功，错误要到下一次请求才冒出来。解析成功时把路由一并打出来
+            #  ——直连是靠环境变量静默启用的，不说用户不知道请求走哪家、钱花在谁那
+            try:
+                route = agent.registry.resolve(rest[0])
+            except providers.UnknownModel as exc:
+                print(ui.error(str(exc)))
+            else:
+                agent.switch_model(rest[0])
+                owner = agent.registry.get(route.provider)
+                where = owner.display if owner else route.provider
+                print(ui.secondary(f"已切换到 {rest[0]}（{where}）"))
+                #  切模型顺手探一次它的 Models API 能力：自校正上下文上限、报能力/漂移
+                for note in agent.refresh_capabilities():
+                    print(ui.secondary(note))
         else:
             print(ui.secondary(f"当前模型 {agent.config.model}"))
             for note in agent.refresh_capabilities():
