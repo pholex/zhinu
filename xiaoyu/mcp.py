@@ -200,6 +200,11 @@ class ServerSpec:
     #  基线的意义正是让上游悄悄改描述这件事被看见；--yolo 也刻意不覆盖它（执行审批
     #  与供应链是两条轴）。全局版是环境变量 XIAOYU_MCP_TRUST_CHANGES=1（同样默认关）。
     trust_tool_changes: bool = False
+    #  结果当可信内容回灌：不套 <untrusted_content> 标记。给"来源就是自己人"的
+    #  内部 server 用（内网 runbook / 工单系统——用户就是想让模型照它说的做）。
+    #  与 trustToolChanges 是两条轴：那个信的是工具声明的变更，这个信的是工具
+    #  返回的内容。网页与联网搜索没有对应开关：它们的来源不是用户能背书的。
+    trust_content: bool = False
 
     @property
     def is_http(self) -> bool:
@@ -476,6 +481,7 @@ def parse_server_mapping(
                     timeout=float(timeout),
                     disabled=bool(raw.get("disabled", False)),
                     trust_tool_changes=bool(raw.get("trustToolChanges", False)),
+                    trust_content=bool(raw.get("trustContent", False)),
                 )
             )
             continue
@@ -491,6 +497,7 @@ def parse_server_mapping(
                     str(name) for name in raw.get("inheritEnv") or [] if str(name).strip()
                 ],
                 trust_tool_changes=bool(raw.get("trustToolChanges", False)),
+                trust_content=bool(raw.get("trustContent", False)),
             )
         )
     return specs, problems
@@ -1595,6 +1602,8 @@ class RemoteTool:
     #  server 侧原始工具名与声明指纹：代际 swap 靠它们判断原位替换还是保留
     raw_name: str = ""
     fingerprint: str = ""
+    #  来源 server 声明了 trustContent：结果不套不可信标记（见 ServerSpec.trust_content）
+    trust_content: bool = False
 
 
 def _make_remote_tool(
@@ -1654,6 +1663,7 @@ def _make_remote_tool(
         server=server.spec.name,
         raw_name=tool_name,
         fingerprint=mcp_guard.tool_fingerprint(declared),
+        trust_content=server.spec.trust_content,
     )
 
 
@@ -1671,8 +1681,13 @@ class McpManager:
         self,
         specs: list[ServerSpec],
         spec_loader: Callable[[], list[ServerSpec]] | None = None,
+        *,
+        trust_tool_changes: bool = False,
     ) -> None:
         self._specs = specs
+        #  全局"变更工具不隔离"（Config.mcp_trust_changes：--unguarded 预设的落点）。
+        #  与环境变量 XIAOYU_MCP_TRUST_CHANGES 同义，二者任一即开
+        self._trust_tool_changes = trust_tool_changes
         #  重读配置的函数（/mcp reconnect 用）：必须是启动时同一条加载路径
         #  （folder trust 门 + 加载期准入 + ${env:VAR} 展开），由 launch 接线。
         #  None = 清单是宿主直接给的，热恢复沿用现有声明
@@ -1808,7 +1823,7 @@ class McpManager:
             "trustToolChanges"
             if server.spec.trust_tool_changes
             else "XIAOYU_MCP_TRUST_CHANGES"
-            if _opted_in("XIAOYU_MCP_TRUST_CHANGES")
+            if self._trust_tool_changes or _opted_in("XIAOYU_MCP_TRUST_CHANGES")
             else ""
         )
         if quarantined and trusted_by:
@@ -2629,7 +2644,12 @@ def launch(config: Config, extra_specs: list[ServerSpec] | None = None) -> McpMa
     specs = discover()
     if not specs:
         return None
-    manager = McpManager(specs, spec_loader=discover)
+    manager = McpManager(
+        specs,
+        spec_loader=discover,
+        #  getattr 兜底同上：旧版 Config 对象没有这个字段
+        trust_tool_changes=bool(getattr(config, "mcp_trust_changes", False)),
+    )
     manager.start()
     _managers[config.workspace] = manager
     _ensure_atexit()

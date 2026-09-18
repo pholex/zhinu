@@ -29,6 +29,8 @@ DEFAULT_MODEL = "deepseek-flash"
 
 # 摘要/检索这类有界的辅助任务用更便宜的模型：不需要工具调用，失败可回退主模型。
 DEFAULT_SUMMARY_MODEL = "deepseek-flash"
+#  "放松防线"类环境开关认的真值（未设置 = 关）
+_ON_VALUES = ("1", "true", "yes", "on")
 
 #  已知模型的上下文输入窗口（token），按模型名前缀匹配。**这是零往返的快路径
 #  兜底**——权威值是 Models API 的 `max_input_tokens`（`/model` 探测时抓取并
@@ -369,6 +371,19 @@ class Config:
     #  可执行配置（.mcp.json / .xiaoyu/permissions.txt）不生效。门是 CLI 启动期
     #  的关卡，这里只是判决的载体；库层嵌入默认 True（宿主要门自己过 evaluate）。
     workspace_trusted: bool = True
+    #  ---- 可单独关闭的护栏层（表在 guardrails.py，预设 --unguarded 一次放开）----
+    #  bash 硬红线（rm -rf / 、mkfs、dd of=/dev/…）：默认任何模式都拦，包括 --yolo。
+    #  关掉是给镜像烧录、磁盘格式化这类内部运维任务用的。来源 XIAOYU_HARDLINE=0。
+    hardline: bool = True
+    #  --yolo 之上再放开两处 bypass-immune 的必问（退出 plan、沙箱升权）。单独开
+    #  没有意义：不带 --yolo 时它们本来就走常规确认。来源 --unattended / XIAOYU_UNATTENDED=1。
+    unattended: bool = False
+    #  MCP 工具描述/schema 变更不隔离、自动接受并刷新基线（全局版，逐 server 版是声明里
+    #  的 trustToolChanges）。来源 XIAOYU_MCP_TRUST_CHANGES=1；mcp.py 自己也读同一个
+    #  变量，这里只是让预设有个不碰 os.environ 的落点。
+    mcp_trust_changes: bool = False
+    #  无护栏预设是否打开（横幅与会话前言据此提示；各层的实际开关在上面各字段）
+    unguarded: bool = False
 
     @property
     def context_limit(self) -> int:
@@ -483,6 +498,13 @@ class Config:
             cfg.sandbox = flag.strip().lower() not in ("0", "false", "no", "off")
         if (flag := os.environ.get("XIAOYU_SANDBOX_NETWORK")) is not None:
             cfg.sandbox_network = flag.strip().lower() not in ("0", "false", "no", "off")
+        if (flag := os.environ.get("XIAOYU_HARDLINE")) is not None:
+            cfg.hardline = flag.strip().lower() not in ("0", "false", "no", "off")
+        #  "放松防线"类开关：未设置 = 关，必须显式打开
+        cfg.unattended = os.environ.get("XIAOYU_UNATTENDED", "").strip().lower() in _ON_VALUES
+        cfg.mcp_trust_changes = (
+            os.environ.get("XIAOYU_MCP_TRUST_CHANGES", "").strip().lower() in _ON_VALUES
+        )
         for key, value in overrides.items():
             if value is not None:
                 setattr(cfg, key, value)

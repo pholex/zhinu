@@ -1063,6 +1063,16 @@ class Toolbox:
         tool_input.pop(PURPOSE_PARAM, None)
         return remote.handler(**tool_input)
 
+    def mcp_content_trusted(self, tool_name: str) -> bool:
+        """use_tool 触达的 MCP 工具，其 server 是否声明了 trustContent（结果不套
+        不可信标记）。默认 False：查不到就按外部来源处理。"""
+        if self._mcp is None:
+            return False
+        return any(
+            item.name == tool_name and getattr(item, "trust_content", False)
+            for item in self._mcp.ready_tools()
+        )
+
     def _announce_mcp(self) -> None:
         """检索模式的上线公告：server 就绪/工具集变化时经通知轨道告诉模型。
 
@@ -1122,7 +1132,8 @@ class Toolbox:
                     requires_approval=True,
                     #  server 进程退出后工具自动从 schemas 消失、拒绝执行
                     check_fn=remote.check_fn,
-                    untrusted=True,
+                    #  声明里 trustContent: true 的 server，结果不套不可信标记
+                    untrusted=not getattr(remote, "trust_content", False),
                 )
             )
 
@@ -2058,7 +2069,7 @@ class Toolbox:
         escalation: str | None = None,
     ) -> str:
         """后台进程的统一入口：进程策略在这里拼好，生命周期交给 TaskManager。"""
-        if reason := hardline_violation(command):
+        if self.config.hardline and (reason := hardline_violation(command)):
             return (
                 f"ERROR: 命令被硬性拦截（{reason}）。"
                 "这类不可撤销的破坏性操作在任何模式下都不执行，包括 --yolo。"
@@ -2151,7 +2162,9 @@ class Toolbox:
                 timeout=float(timeout) if timeout else None,
                 escalation=escalation,
             )
-        if reason := hardline_violation(command):
+        #  硬红线查表（Config.hardline）：XIAOYU_HARDLINE=0 / --unguarded 关掉它——
+        #  内部运维（镜像烧录、格式化）在隔离环境里确有 dd of=/dev/… 的真实需求
+        if self.config.hardline and (reason := hardline_violation(command)):
             return (
                 f"ERROR: 命令被硬性拦截（{reason}）。"
                 "这类不可撤销的破坏性操作在任何模式下都不执行，包括 --yolo。"

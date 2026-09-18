@@ -8,7 +8,7 @@
 
 - `/allow` / `/deny` 配权限规则：命中 allow 免确认，命中 deny 强制拦截。
 - **`deny` 与危险命令硬拦截（`rm -rf /`、fork bomb 一类）是 bypass-immune 的**：`--yolo` 也拦得住。审批是"用户想不想"，这一层是"绝不"。
-- `exit_plan_mode` 的审批同样 bypass-immune：`--yolo` 也要问。否则模型能自行退出 plan 档，"批准后才执行"就是空话。
+- `exit_plan_mode` 的审批同样 bypass-immune：`--yolo` 也要问。否则模型能自行退出 plan 档，"批准后才执行"就是空话。无人值守里确实没人按键时用 `--unattended` 显式放开（见文末[放开护栏](#放开护栏unattended--xiaoyu_hardline0--trustcontent--unguarded)）。
 
 ## 模式与沙箱
 
@@ -30,7 +30,9 @@ auto 档**放行的依据是沙箱，不是信任**。所以沙箱不可用时�
 - bash 照常跑在内核级沙箱里（`--yolo` 只关审批，不关沙箱）；
 - `deny` 规则一条都不放行；
 - `rm -rf /`、fork bomb 一类不可逆命令任何模式下都不执行；
-- `exit_plan_mode` 仍要你批准，跨会话消息默认不收。
+- `exit_plan_mode` 与沙箱升权仍要你批准，跨会话消息默认不收。
+
+这四条里有三条是可以再放开的（硬红线、两处必问、沙箱），怎么放见下文[放开护栏](#放开护栏unattended--xiaoyu_hardline0--trustcontent--unguarded)。
 
 两点差别值得知道：**`--yolo` 不像 auto 那样把"沙箱可用"当放行前提**——在没有沙箱的平台上（Windows、没装 bubblewrap、`--no-sandbox`），它是真的全放行，bash 能写你有权限的任何地方；另外它刻意不在 Shift-Tab 循环里，得显式敲命令行参数进去。
 
@@ -102,3 +104,38 @@ xiaoyu --no-network          # 或 XIAOYU_SANDBOX_NETWORK=0，断掉沙箱内的
   结果同样处理。这是降低提示注入成功率的一层，**不是隔离**——真正的边界仍是确认与沙箱。
 
 浏览器工具的每个动作都过人工确认——它能以你的身份点任何按钮，**审批就是它的沙箱**。
+
+## 放开护栏：`--unattended` / `XIAOYU_HARDLINE=0` / `trustContent` / `--unguarded`
+
+上面的护栏几乎不约束你，约束的是模型的动作与外部内容——内置提示里没有任何"拒绝某类请求"的内容策略。但内部场景（一次性容器、一任务一 VM 的无人值守活）里，"用户在安全沙箱里跑、后端模型自带内容约束"这个前提成立时，端侧护栏只剩摩擦：镜像烧录被硬红线拦、无人值守卡在必问点、每个 MCP 发版都得重批。小羽把这几层做成可以关的，**而且是分开关**：
+
+| 层 | 单独关掉 | 适用场景 |
+|---|---|---|
+| bash 硬红线（`rm -rf /`、`mkfs`、`dd of=/dev/…`） | `XIAOYU_HARDLINE=0`（默认开，与 `XIAOYU_SANDBOX` 同形态） | 隔离环境里做镜像烧录、格式化 |
+| `--yolo` 下仍必问的两项（`exit_plan_mode`、沙箱升权） | `--unattended`（或 `XIAOYU_UNATTENDED=1`） | 无人值守：没人按键，卡住等于任务死掉 |
+| 某个 MCP server 的结果不套 `<untrusted_content>` | 该 server 声明里 `"trustContent": true` | 内网 runbook / 工单系统——你就是想让模型照它说的做 |
+| 逐条审批 / 沙箱 / 工作区信任门 / MCP 变更隔离 | `--yolo` / `--no-sandbox` / `--trust` / `XIAOYU_MCP_TRUST_CHANGES=1` | 原有开关，不变 |
+
+`trustContent` 只给 MCP：网页与联网搜索的来源不是你能背书的，没有对应开关。`--unattended` 单独开没有意义——不带 `--yolo` 时那两项本来就走常规确认。
+
+### `--unguarded`：无护栏预设
+
+一次放开上表全部层（等价 `--yolo --no-sandbox --unattended XIAOYU_HARDLINE=0 XIAOYU_MCP_TRUST_CHANGES=1`，并跳过工作区信任门——本次放行，不记入信任表）。名字刻意叫"无护栏"而不是 advance / pro：读启动命令的人一眼要看出它做了什么。
+
+它**只在环境变量 `XIAOYU_UNGUARDED=1` 存在时生效**，否则报错退出、不静默降级。这个变量应由容器 / VM 的编排脚本注入，只认真实环境变量、不读任何 `.env`：工作区 `.env` 能被仓库带进来，用户级 `.env` 会被"上次设过"遗忘——两种都不是"这次运行确实在沙箱里"的证据。"安全沙箱"是你和环境之间的契约，不是口头承诺。
+
+```bash
+# 容器 / VM 的编排脚本里
+export XIAOYU_UNGUARDED=1
+xiaoyu --unguarded -p "把镜像写进 /dev/vdb 并验证"
+```
+
+开场横幅会喊一行"关了哪些、仍生效哪些"，会话日志前言里记一条 `guardrails` 事件（关了哪些层、是否跳过信任门），事后审计能分辨"这一跑是无护栏的"。
+
+预设下**仍然生效**、也不该有开关的：
+
+- `deny` 权限规则——那是你自己写的明确意志，想放行就删规则；
+- `<untrusted_content>` 来源标注——它是标注不是限制，模型照样看到全文；想让某个 server 的结果当指令用，逐 server 加 `trustContent`；
+- 终端控制字符剥离、特殊文件闸、宿主侧 git 加固、出网口私有键净化——关掉换不来任何能力，只会让自己更脆。
+
+后端模型的安全约束管的是内容，小羽护栏管的是宿主完整性。模型看不见你的机器，不可能替你挡 `dd of=/dev/sda`——所以这不是把安全"转嫁"给模型，而是用"运行在隔离环境里"这个环境假设替代了端侧护栏。假设不成立时，什么都接不住。

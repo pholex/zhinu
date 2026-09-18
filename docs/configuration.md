@@ -95,6 +95,9 @@ XIAOYU_API_KEY=<key>
 | `XIAOYU_MCP_TRUST_CHANGES` | **默认关**，`1` = 开：所有 MCP server 的工具描述/schema 变更自动接受、不再隔离等 `/mcp approve`（逐 server 版是声明里的 `trustToolChanges`；见[安全](security.md)） |
 | `XIAOYU_MCP_TOOL_SEARCH` | MCP 工具检索模式（默认开：工具不进 schema，`search_tool` 检索 + `use_tool` 调用；`0` = 回到全量注册） |
 | `XIAOYU_FOLDER_TRUST` | 工作区信任门（默认开，见[安全](security.md)；只认真实环境变量与用户级 `.env`） |
+| `XIAOYU_HARDLINE` | bash 硬红线（`rm -rf /`、`mkfs`、`dd of=/dev/…`，默认开、任何模式都拦）；`0` = 关，给隔离环境里的镜像烧录 / 格式化用（见[安全](security.md)） |
+| `XIAOYU_UNATTENDED` | **默认关**，`1` = 开：`--yolo` 下仍必问的两项（`exit_plan_mode`、沙箱升权）也不再问；等价命令行 `--unattended` |
+| `XIAOYU_UNGUARDED` | `--unguarded` 无护栏预设的**环境同意**：只认真实环境变量、不读 `.env`，由容器 / VM 编排脚本注入；没有它 `--unguarded` 报错退出（见[安全](security.md)） |
 | `XIAOYU_ENABLE_HOOKS` | 用户级 `hooks.toml` 生命周期钩子 |
 | `XIAOYU_ENABLE_AGENTS` | 声明式 subagent（`agents/*.toml`）与七襄并行织造模式（见[多 agent 协同](multi-agent.md)） |
 | `XIAOYU_ENABLE_CHENSHU` | 宸枢统筹织造模式（见[多 agent 协同](multi-agent.md)） |
@@ -198,6 +201,11 @@ server 的工具描述 / schema 一变（多半是 `npx xxx@latest` 拉到了新
 在该 server 的声明里加 `"trustToolChanges": true`（或全局 `XIAOYU_MCP_TRUST_CHANGES=1`），
 变更自动接受并刷新基线（stderr 记一行）；更稳的做法仍是钉死版本号，让基线只在你主动
 升级时才需要重批。
+
+server 的**结果**默认包进 `<untrusted_content>` 回灌（里面的指令只当数据）。来源就是自己人的
+内部 server（内网 runbook、工单系统——你就是想让模型照它说的做）在声明里加
+`"trustContent": true`，该 server 的结果按可信内容回灌。与 `trustToolChanges` 是两条轴：那个信
+的是工具声明的变更，这个信的是工具返回的内容。
 
 > `xiaoyu plugin` 装的是**内容包**（技能文本 + MCP 声明）。它和 `XIAOYU_ENABLE_PLUGINS`
 > 管的**插件工具**（entry point 组 `xiaoyu.tools`，第三方 Python 包往进程里注册函数）
