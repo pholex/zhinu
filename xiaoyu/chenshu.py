@@ -30,7 +30,12 @@ merge 闸收回主干。与七襄（qixiang，一次性批量扇出）的分工�
   其它平台靠 briefing 纪律）；reviewer / survey 的只读性是工具集级的
   （没有写工具），reviewer 的 bash 同样只有纪律约束。
 - 429/限流治理、跨进程恢复线程（重启后 worker 线程不复活，重入 init 会
-  "收养"：mission/worktree/审计全保留，花名册退役重 spawn）。
+  "收养"：mission/worktree/审计/存档全保留，花名册退役后同名 spawn
+  resume=true 接着存档续跑——存档在成员收工时落盘，中途断掉的成员没有）。
+
+成员的模型与推理深度可逐个指定（spawn 的 model / effort）：总枢用强模型
+规划，build worker 用便宜模型，survey / reviewer 给 low。resume 钉住存档
+的模型（上下文是按它长的），effort 可改。
 """
 
 from __future__ import annotations
@@ -49,8 +54,9 @@ from pathlib import Path
 from typing import Any, Callable
 
 from . import ui, worktree
-from .config import Config
+from .config import EFFORT_LEVELS, Config
 from .events import Notice, UISink
+from .providers import UnknownModel
 from .tools import Tool, Toolbox
 
 CHENSHU = "chenshu"
@@ -172,6 +178,10 @@ class Member:
     status: str = "running"  # running | done | failed | retired
     #  完成后的交接摘要（总枢在 wait/status 里看）
     handoff: str = ""
+    #  实际生效的模型（不指定就记下 spawn 时的主模型）：resume 钉住它，
+    #  上下文是按它长的；effort 空 = 随主会话，不影响上下文形状不钉
+    model: str = ""
+    effort: str = ""
 
 
 class ChenshuError(RuntimeError):
@@ -181,10 +191,11 @@ class ChenshuError(RuntimeError):
 class ChenshuRuntime:
     """宸枢的进程内运行时 + 磁盘协议 store。
 
-    磁盘上只有两类东西：state.json（机器真相：missions/花名册/base 分支）
-    与 comms 产物（inbox/findings/reviews markdown、activity.log、
-    MISSIONS.md 人类视图）。线程、活 agent、事件队列是进程内的，
-    重启不复活——init 的"收养"路径负责把花名册对齐现实。
+    磁盘上只有三类东西：state.json（机器真相：missions/花名册/base 分支）、
+    comms 产物（inbox/findings/reviews markdown、activity.log、
+    MISSIONS.md 人类视图）与 archives/（成员收工时的 transcript，resume
+    的种子）。线程、活 agent、事件队列是进程内的，重启不复活——init 的
+    "收养"路径负责把花名册对齐现实，存档让退役成员能在原上下文上续跑。
     """
 
     def __init__(
@@ -211,8 +222,6 @@ class ChenshuRuntime:
         self.events: queue.Queue[str] = queue.Queue()
         self._threads: dict[str, threading.Thread] = {}
         self._agents: dict[str, Any] = {}
-        #  worker 完成后的 transcript 存档（resume 重唤醒用；纯内存）
-        self._archives: dict[str, list[dict[str, Any]]] = {}
         self._seq = 0
 
     # ---------- 磁盘 ----------
@@ -253,6 +262,40 @@ class ChenshuRuntime:
             with contextlib.suppress(TypeError):
                 self.members.append(Member(**raw))
         return True
+
+    #  成员 transcript 存档：收工时整份落盘，resume 跨进程可用（重启收养后
+    #  照样续跑）。落盘失败只记日志不拖垮收工——存档是便利不是正确性前提
+    def _archive_path(self, name: str) -> Path:
+        return self.root / "archives" / f"{name}.json"
+
+    def _save_archive(self, name: str, messages: list[dict[str, Any]]) -> None:
+        path = self._archive_path(name)
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = path.with_name(path.name + ".tmp")
+            tmp.write_text(
+                json.dumps(messages, ensure_ascii=False, default=str), encoding="utf-8"
+            )
+            tmp.replace(path)
+        except (OSError, TypeError, ValueError) as exc:
+            self.log(name, "archive.failed", error=ui.preview(str(exc), 80))
+
+    def _load_archive(self, name: str) -> list[dict[str, Any]] | None:
+        path = self._archive_path(name)
+        if not path.is_file():
+            return None
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return None
+        #  至少 system + 一条对话才算有上下文可续；坏档当没有
+        if (
+            not isinstance(data, list)
+            or len(data) < 2
+            or not all(isinstance(item, dict) for item in data)
+        ):
+            return None
+        return data
 
     def log(self, actor: str, action: str, **kv: Any) -> None:
         parts = [_now_iso(), actor, action]
@@ -346,9 +389,14 @@ class ChenshuRuntime:
             "mission 状态归协议管，不要用 update_plan 记它。",
         ]
         if retired:
+            resumable = [name for name in retired if self._archive_path(name).is_file()]
             lines.append(
                 f"上个会话的成员已退役：{', '.join(retired)}——mission 与 worktree "
-                "还在，用 chenshu_spawn 重新指派。"
+                "还在，用 chenshu_spawn 重新指派"
+                + (
+                    f"；有存档的（{', '.join(resumable)}）可带 resume=true 接着上次的上下文续跑。"
+                    if resumable else "。"
+                )
             )
         if self.missions:
             lines.append(f"已有 {len(self.missions)} 个 mission（chenshu_status 查看）。")
@@ -734,6 +782,8 @@ class ChenshuRuntime:
         review_target: str = "",
         instructions: str = "",
         resume: bool = False,
+        model: str = "",
+        effort: str = "",
     ) -> str:
         self._require_active()
         if not _NAME_RE.match(name or ""):
@@ -744,6 +794,22 @@ class ChenshuRuntime:
             raise ChenshuError(f"ERROR: {name!r} 是保留名（总枢/广播地址），换一个。")
         if kind not in ("worker", "reviewer"):
             raise ChenshuError("ERROR: kind 只能是 worker 或 reviewer。")
+        #  模型/深度在任何副作用（登记、建 worktree）之前校验：没人认领的模型
+        #  名会让成员首轮就 400，白占一个席位
+        model_name = (model or "").strip()
+        if model_name:
+            try:
+                self.registry.resolve(model_name)
+            except UnknownModel:
+                raise ChenshuError(
+                    f"ERROR: 模型 {model_name!r} 没有任何 provider 认领——先配好再 spawn。"
+                ) from None
+        effort_level = (effort or "").strip().lower()
+        if effort_level and effort_level not in EFFORT_LEVELS:
+            raise ChenshuError(
+                f"ERROR: effort 只认 {' / '.join(EFFORT_LEVELS)}，不认识 {effort!r}。"
+            )
+        seed: list[dict[str, Any]] | None = None
         with self.lock:
             existing = self.member(name)
             thread = self._threads.get(name)
@@ -756,11 +822,21 @@ class ChenshuRuntime:
                     f"ERROR: {name} 已在花名册（状态 {existing.status}）。要在它的"
                     "上下文上继续，传 resume=true；要新人换个名字。"
                 )
-            if resume and (existing is None or name not in self._archives):
-                raise ChenshuError(
-                    f"ERROR: {name} 没有可恢复的存档（重启后线程与存档不跨进程，"
-                    "直接不带 resume 重新 spawn 即可，mission 与 worktree 都还在）。"
-                )
+            if resume:
+                seed = self._load_archive(name) if existing is not None else None
+                if seed is None:
+                    raise ChenshuError(
+                        f"ERROR: {name} 没有可恢复的存档（成员收工时才落盘，中途断掉的"
+                        "没有）——不带 resume 重新 spawn 即可，mission 与 worktree 都还在。"
+                    )
+                #  存档的上下文是按上次的模型长的：resume 钉住它，换模型请换名新开
+                if model_name and existing.model and model_name != existing.model:
+                    raise ChenshuError(
+                        f"ERROR: {name} 的存档是在 {existing.model} 上长的，resume 不换"
+                        "模型——要换模型请换个名字新开。"
+                    )
+                model_name = model_name or existing.model
+                effort_level = effort_level or existing.effort
             if self._live_count() >= max(1, self.config.chenshu_max_workers):
                 raise ChenshuError(
                     f"ERROR: 在跑成员已达上限 {self.config.chenshu_max_workers}"
@@ -809,28 +885,38 @@ class ChenshuRuntime:
             if existing is None:
                 self.members.append(
                     Member(name=name, kind=kind, mission_id=mission.id if mission else "",
-                           review_target=review_target, status="running")
+                           review_target=review_target, status="running",
+                           model=model_name or self.config.model, effort=effort_level)
                 )
             else:
                 existing.status = "running"
                 existing.handoff = ""
+                existing.model = model_name or self.config.model
+                existing.effort = effort_level
             self._save()
             self.log(CHENSHU, "spawn", name=name, kind=kind,
-                     target=mission.id if mission else review_target, resume=resume)
+                     target=mission.id if mission else review_target, resume=resume,
+                     model=model_name or "-", effort=effort_level or "-")
 
         briefing = self._briefing(name, kind, mission, review_target, instructions)
-        seed = self._archives.get(name) if resume else None
         thread = threading.Thread(
             target=self._run_member,
-            args=(name, kind, workdir, mission, briefing, seed),
+            args=(name, kind, workdir, mission, briefing, seed, model_name, effort_level),
             name=f"chenshu-{name}",
             daemon=True,
         )
         self._threads[name] = thread
         thread.start()
         target_label = mission.id if mission else review_target
+        tuning = ", ".join(
+            part for part in (
+                f"model={model_name}" if model_name else "",
+                f"effort={effort_level}" if effort_level else "",
+            ) if part
+        )
         return (
             f"{name}（{kind} → {target_label}）已开工"
+            + (f"［{tuning}］" if tuning else "")
             + (f"，worktree：{workdir}" if mission and mission.kind == "build" else "")
             + "。继续指派其它可开工的 mission，全部发完再 chenshu_wait 等事件；"
             "不要空转轮询 status。"
@@ -893,6 +979,8 @@ class ChenshuRuntime:
         mission: Mission | None,
         briefing: str,
         seed: list[dict[str, Any]] | None,
+        model: str = "",
+        effort: str = "",
     ) -> None:
         from .agent import Agent
 
@@ -906,11 +994,13 @@ class ChenshuRuntime:
             )
             sub_config = Config(
                 base_url=self.config.base_url,
-                model=self.config.model,
+                #  成员专属 > 主会话（与声明式 subagent 的优先级同一套）
+                model=model or self.config.model,
                 summary_model=self.config.summary_model,
                 explore_model=self.config.explore_model,
                 vision_fallback_model=self.config.vision_fallback_model,
                 workspace=workdir,
+                effort=effort or self.config.effort,
                 max_iterations=_WORKER_ITERATIONS,
                 max_tool_output=self.config.max_tool_output,
                 context_limit_override=self.config.context_limit_override,
@@ -965,8 +1055,9 @@ class ChenshuRuntime:
             handoff = ""
             if agent is not None:
                 handoff = agent.last_assistant_text()
+                #  先落存档再翻花名册状态：总枢收到"完成"事件那一刻 resume 就已可用
+                self._save_archive(name, [dict(m) for m in agent.messages])
                 with self.lock:
-                    self._archives[name] = [dict(m) for m in agent.messages]
                     self._agents.pop(name, None)
             with self.lock:
                 member = self.member(name)
@@ -1082,7 +1173,10 @@ class ChenshuRuntime:
             for member in self.members:
                 live = "在跑" if (t := self._threads.get(member.name)) is not None and t.is_alive() else member.status
                 target = member.mission_id or member.review_target
-                lines.append(f"  {member.name} [{member.kind}→{target}] {live}")
+                lines.append(
+                    f"  {member.name} [{member.kind}→{target}] {live}"
+                    + (f" · {member.model}" if member.model and member.model != self.config.model else "")
+                )
                 if member.handoff and member.status in ("done", "failed"):
                     lines.append(f"    交接：{ui.preview(member.handoff, 120)}")
             if not self.members:
@@ -1320,7 +1414,9 @@ def make_chenshu_tools(runtime: ChenshuRuntime) -> list[Tool]:
         _tool(
             "chenshu_spawn",
             "起一个成员：worker 带 mission_id（build 自动建分支 worktree），"
-            "reviewer 带 review_target。resume=true 在同名成员的上下文上续跑。"
+            "reviewer 带 review_target。resume=true 在同名成员的存档上下文上续跑"
+            "（重启收养后也行）。model / effort 给成员单独定模型与推理深度："
+            "build 用便宜模型、survey/reviewer 给 low，缺省随主会话。"
             "把所有依赖已解锁的 mission 背靠背发满，再 chenshu_wait。",
             {"type": "object", "properties": {
                 "name": {"type": "string"},
@@ -1328,11 +1424,15 @@ def make_chenshu_tools(runtime: ChenshuRuntime) -> list[Tool]:
                 "mission_id": {"type": "string"},
                 "review_target": {"type": "string"},
                 "instructions": {"type": "string", "description": "追加给成员的具体指示"},
-                "resume": {"type": "boolean"}},
+                "resume": {"type": "boolean"},
+                "model": {"type": "string", "description": "成员用的模型（缺省随主会话；resume 钉住存档的模型）"},
+                "effort": {"type": "string", "enum": list(EFFORT_LEVELS),
+                           "description": "成员的推理深度（缺省随主会话）"}},
              "required": ["name", "kind"]},
             _wrap(lambda name, kind, mission_id="", review_target="", instructions="",
-                  resume=False: runtime.spawn(name, kind, mission_id, review_target,
-                                              instructions, bool(resume))),
+                  resume=False, model="", effort="": runtime.spawn(
+                      name, kind, mission_id, review_target, instructions, bool(resume),
+                      str(model or ""), str(effort or ""))),
             check_fn=active,
         ),
         _tool(

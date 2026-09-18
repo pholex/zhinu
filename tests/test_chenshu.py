@@ -17,6 +17,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
+from xiaoyu import chenshu as chenshu_mod
 from xiaoyu import worktree as worktree_mod
 from xiaoyu.agent import Usage
 from xiaoyu.chenshu import (
@@ -26,7 +27,7 @@ from xiaoyu.chenshu import (
     scope_match,
     scopes_conflict,
 )
-from xiaoyu.providers import Registry
+from xiaoyu.providers import Registry, UnknownModel
 from xiaoyu.render import PlainSink
 from xiaoyu.sandbox import _worktree_git_paths
 
@@ -555,3 +556,107 @@ class WorkerEndToEndTest(ChenshuCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+@unittest.skipUnless(HAS_GIT, "机器上没有 git")
+class MemberTuningAndArchiveTest(ChenshuCase):
+    """成员 model / effort 逐个指定 + 存档落盘跨进程 resume。"""
+
+    def make_runtime(self, script: list | None = None) -> ChenshuRuntime:
+        runtime = super().make_runtime(script)
+        self.sub_client = runtime.registry._clients["gateway"]
+        return runtime
+
+    def wait_done(self, runtime, name, timeout: float = 30.0):
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            thread = runtime._threads.get(name)
+            if thread is not None and not thread.is_alive():
+                return
+            time.sleep(0.05)
+        self.fail(f"{name} 没有在 {timeout}s 内收工")
+
+    def test_model_effort_validated_before_any_side_effect(self):
+        self.init_repo()
+        runtime = self.make_runtime([])
+        runtime.init()
+        runtime.plan([{"title": "a", "scope": ["src/"]}])
+        with self.assertRaises(chenshu_mod.ChenshuError) as ctx:
+            runtime.spawn("w1", "worker", mission_id="M1", effort="ultra")
+        self.assertIn("ultra", str(ctx.exception))
+        with mock.patch.object(
+            runtime.registry, "resolve", side_effect=UnknownModel("没人认领")
+        ), self.assertRaises(chenshu_mod.ChenshuError) as ctx:
+            runtime.spawn("w1", "worker", mission_id="M1", model="ghost")
+        self.assertIn("ghost", str(ctx.exception))
+        #  两次都没登记、没建 worktree、没认领 mission
+        self.assertIsNone(runtime.member("w1"))
+        self.assertEqual(runtime.mission("M1").owner, "")
+        self.assertEqual(runtime.mission("M1").worktree, "")
+
+    def test_model_effort_reach_member_and_state(self):
+        self.init_repo()
+        runtime = self.make_runtime([text_turn(LONG)])
+        runtime.init()
+        runtime.plan([{"title": "a", "scope": ["src/"]}])
+        with contextlib.redirect_stdout(io.StringIO()):
+            out = runtime.spawn("w1", "worker", mission_id="M1", model="cheap-x", effort="Low")
+        self.assertIn("model=cheap-x", out)
+        self.assertIn("effort=low", out)
+        self.wait_done(runtime, "w1")
+        call = self.sub_client.completions.calls[0]
+        self.assertEqual(call["model"], "cheap-x")
+        self.assertEqual(call.get("reasoning_effort"), "low")
+        member = runtime.member("w1")
+        self.assertEqual((member.model, member.effort), ("cheap-x", "low"))
+        state = json.loads((self.root / ".xiaoyu" / "chenshu" / "state.json").read_text("utf-8"))
+        self.assertEqual(state["members"][0]["model"], "cheap-x")
+        self.assertIn("cheap-x", runtime.status())
+
+    def test_archive_survives_restart_and_pins_model(self):
+        self.init_repo()
+        first = self.make_runtime([text_turn("第一轮交接。" + LONG)])
+        first.init()
+        first.plan([{"title": "a", "scope": ["src/"]}])
+        with contextlib.redirect_stdout(io.StringIO()):
+            first.spawn("w1", "worker", mission_id="M1", model="model-one")
+        self.wait_done(first, "w1")
+        archive = self.root / ".xiaoyu" / "chenshu" / "archives" / "w1.json"
+        self.assertTrue(archive.is_file())
+
+        #  模拟重启：全新 runtime 收养同一目录
+        second = self.make_runtime([text_turn("第二轮交接。" + LONG)])
+        with contextlib.redirect_stdout(io.StringIO()):
+            second.init()
+            with self.assertRaises(chenshu_mod.ChenshuError):
+                second.spawn("w1", "worker", mission_id="M1", resume=True, model="model-two")
+            with self.assertRaises(chenshu_mod.ChenshuError):
+                second.spawn("nobody", "worker", mission_id="M1", resume=True)
+            out = second.spawn("w1", "worker", mission_id="M1", resume=True)
+        self.assertIn("model=model-one", out, "resume 不传 model 时钉住存档的模型")
+        self.wait_done(second, "w1")
+        call = self.sub_client.completions.calls[0]
+        self.assertEqual(call["model"], "model-one")
+        self.assertTrue(
+            any("第一轮交接" in str(m.get("content")) for m in call["messages"]),
+            "第二轮请求应带着第一轮的上下文",
+        )
+        data = json.loads(archive.read_text("utf-8"))
+        self.assertTrue(any("第二轮交接" in str(m.get("content")) for m in data))
+
+    def test_retired_member_with_archive_is_announced_on_adopt(self):
+        self.init_repo()
+        first = self.make_runtime([text_turn(LONG)])
+        first.init()
+        first.plan([{"title": "a", "scope": ["src/"]}])
+        with contextlib.redirect_stdout(io.StringIO()):
+            first.spawn("w1", "worker", mission_id="M1")
+        self.wait_done(first, "w1")
+        #  伪造"上个会话中途断掉"：花名册还挂着 running
+        with first.lock:
+            first.member("w1").status = "running"
+            first._save()
+        second = self.make_runtime([])
+        out = second.init()
+        self.assertIn("已退役：w1", out)
+        self.assertIn("resume=true", out)

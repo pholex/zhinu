@@ -20,7 +20,7 @@ from unittest import mock
 from xiaoyu import qixiang as qixiang_mod
 from xiaoyu.agent import Usage
 from xiaoyu.agents import AgentSpec, RunStore
-from xiaoyu.providers import Registry
+from xiaoyu.providers import Registry, UnknownModel
 from xiaoyu.qixiang import _ItemState, _status_of, make_qixiang_tool
 from xiaoyu.render import PlainSink
 
@@ -298,3 +298,59 @@ class StatusClassifyTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ModelEffortTest(QixiangTestCase):
+    """整批统一的 model / effort：开工前校验、逐项生效、报告头可见。"""
+
+    def test_unknown_model_rejected_upfront(self):
+        tool = self.make_tool([READER], [])
+        with mock.patch.object(Registry, "resolve", side_effect=UnknownModel("没人认领")):
+            result = self.call(
+                tool, spec="reader", prompt_template="{{item}}", items=["a", "b"],
+                model="ghost-1",
+            )
+        self.assertTrue(result.startswith("ERROR"), result)
+        self.assertIn("ghost-1", result)
+        self.assertEqual(self.sub_client.completions.calls, [], "校验失败不该起任何子 agent")
+
+    def test_bad_effort_rejected_upfront(self):
+        tool = self.make_tool([READER], [])
+        result = self.call(
+            tool, spec="reader", prompt_template="{{item}}", items=["a", "b"],
+            effort="ultra",
+        )
+        self.assertTrue(result.startswith("ERROR"), result)
+        self.assertIn("ultra", result)
+        self.assertEqual(self.sub_client.completions.calls, [])
+
+    def test_model_and_effort_apply_to_every_item(self):
+        tool = self.make_tool([READER], [text_turn(LONG), text_turn(LONG)])
+        result = self.call(
+            tool, spec="reader", prompt_template="{{item}}", items=["a", "b"],
+            model="cheap-x", effort="LOW",
+        )
+        self.assertIn("model=cheap-x", result)
+        self.assertIn("effort=low", result)
+        self.assertEqual({run.model for run in self.runs.values()}, {"cheap-x"})
+        calls = self.sub_client.completions.calls
+        self.assertEqual(len(calls), 2)
+        self.assertEqual({call["model"] for call in calls}, {"cheap-x"})
+        self.assertEqual({call.get("reasoning_effort") for call in calls}, {"low"})
+
+    def test_resume_item_keeps_archived_model(self):
+        """resume 项的模型钉在存档上：整批传了别的 model 也只对新开项生效。"""
+        tool = self.make_tool([READER], [text_turn(LONG), text_turn(LONG)])
+        self.config.qixiang_concurrency = 1
+        first = self.call(
+            tool, spec="reader", prompt_template="{{item}}", items=["a", "b"],
+            model="model-one",
+        )
+        rid = re.search(r"resume_from: (\w+)", first).group(1)
+        tool = self.make_tool([READER], [text_turn(LONG), text_turn(LONG)], runs=self.runs)
+        self.call(
+            tool, spec="reader", prompt_template="{{item}}", items=["c"],
+            resume={rid: "接着"}, model="model-two",
+        )
+        used = [call["model"] for call in self.sub_client.completions.calls]
+        self.assertEqual(sorted(used), ["model-one", "model-two"])
