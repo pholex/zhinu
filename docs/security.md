@@ -111,7 +111,7 @@ xiaoyu --no-network          # 或 XIAOYU_SANDBOX_NETWORK=0，断掉沙箱内的
 
 | 层 | 单独关掉 | 适用场景 |
 |---|---|---|
-| bash 硬红线（`rm -rf /`、`mkfs`、`dd of=/dev/…`） | `XIAOYU_HARDLINE=0` | 隔离环境里做镜像烧录、格式化 |
+| bash 硬红线（`rm -rf /`、`mkfs`、`dd of=/dev/…`） | `XIAOYU_HARDLINE=0`（默认开，与 `XIAOYU_SANDBOX` 同形态） | 隔离环境里做镜像烧录、格式化 |
 | `--yolo` 下仍必问的两项（`exit_plan_mode`、沙箱升权） | `--unattended`（或 `XIAOYU_UNATTENDED=1`） | 无人值守：没人按键，卡住等于任务死掉 |
 | 某个 MCP server 的结果不套 `<untrusted_content>` | 该 server 声明里 `"trustContent": true` | 内网 runbook / 工单系统——你就是想让模型照它说的做 |
 | 逐条审批 / 沙箱 / 工作区信任门 / MCP 变更隔离 | `--yolo` / `--no-sandbox` / `--trust` / `XIAOYU_MCP_TRUST_CHANGES=1` | 原有开关，不变 |
