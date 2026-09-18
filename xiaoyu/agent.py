@@ -1384,7 +1384,9 @@ class Agent:
             segments.append(
                 (
                     "扩展指南",
-                    "\n\n要为小羽本身新增能力（技能 SKILL.md、工具插件、MCP server、hooks）时，"
+                    #  不点名"小羽"：--system-prompt-file 顶替身份后，这里若仍叫内置名，
+                    #  拒绝人设的模型会顺着它自称小羽（实测）
+                    "\n\n要为本 agent 新增能力（技能 SKILL.md、工具插件、MCP server、hooks）时，"
                     f"先完整阅读随包分发的扩展指南再动手：{extending_doc}",
                 )
             )
