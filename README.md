@@ -91,6 +91,7 @@ REPL 里：`/help` `/tools` `/skills` `/model` `/effort` `/mode` `/usage` `/cont
 | **确认** | 写文件、执行命令逐条确认 |
 | **plan** | 只读规划态：交计划后要你批准才执行 |
 | **`--yolo`** | 全放行，一路跑到底 |
+| **`--unguarded`** | 无护栏预设：硬红线、必问点、沙箱、信任门一并放开，只在编排环境注入 `XIAOYU_UNGUARDED=1` 时生效（见 [docs/security.md](docs/security.md)） |
 
 auto 档**放行的依据是沙箱，不是信任**——沙箱不可用时自动降级成只有改文件免确认。
 

@@ -2049,7 +2049,11 @@ class Tui:
         self.agent = agent
         self.sink.bash_timeout = agent.config.bash_timeout
         self.sink.request_timeout = int(agent.config.request_timeout)
-        if agent.config.auto_approve:
+        if agent.config.unguarded:
+            from . import guardrails
+
+            self.console.print(Text(guardrails.notice(agent.config), style="status.error"))
+        elif agent.config.auto_approve:
             self.console.print(
                 Text("--yolo 已开启：写文件和执行命令都不会再问你", style="status.error")
             )

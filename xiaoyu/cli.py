@@ -163,6 +163,7 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="关掉 macOS 沙箱（默认开启：bash 命令只能写工作区/临时目录/构建缓存）",
     )
+    add_guardrail_flags(parser)
     parser.add_argument(
         "--no-network",
         dest="sandbox_network",
@@ -255,6 +256,49 @@ def resolve_system_prompt_flags(args: argparse.Namespace) -> None:
         args.append_system_prompt = _read_prompt_file(
             "--append-system-prompt-file", args.append_system_prompt_file
         )
+
+
+def add_guardrail_flags(parser: argparse.ArgumentParser) -> None:
+    """护栏开关：主命令与 resume 共用（表在 guardrails.py）。
+
+    --unattended 单独放开 --yolo 下仍必问的两项；--unguarded 是预设：一次放开表里
+    全部层，且只在 XIAOYU_UNGUARDED=1 时生效（见 resolve_guardrail_flags）。
+    """
+    from . import guardrails
+
+    parser.add_argument(
+        "--unattended",
+        action="store_true",
+        default=None,
+        help="--yolo 之上再放开退出 plan 与沙箱升权这两处必问（无人值守里没人按键）",
+    )
+    parser.add_argument(
+        guardrails.FLAG,
+        dest="unguarded",
+        action="store_true",
+        help=f"无护栏预设：放开端侧全部可关护栏（等价 --yolo --no-sandbox --unattended "
+        f"XIAOYU_HARDLINE=0 XIAOYU_MCP_TRUST_CHANGES=1 并跳过工作区信任门）。"
+        f"只在环境变量 {guardrails.CONSENT_ENV}=1 时生效——由沙箱编排脚本注入，不读 .env",
+    )
+
+
+def resolve_guardrail_flags(args: argparse.Namespace) -> None:
+    """把 --unguarded 落到 args 上（各 Config.from_env 站点照旧从 args 取值）。
+
+    没有环境同意就抛 ValueError（消息面向用户）：给了旗标又不生效的静默失败
+    是最坏的形态——用户以为在无护栏跑，其实每条命令还在等确认。
+    """
+    from . import guardrails
+
+    #  resume 解析器没有 --no-sandbox / 主解析器有：两边都给字段一个落点
+    for name in ("hardline", "mcp_trust_changes", "sandbox"):
+        if not hasattr(args, name):
+            setattr(args, name, None)
+    if not getattr(args, "unguarded", False):
+        return
+    if not guardrails.consented():
+        raise ValueError(guardrails.missing_consent())
+    guardrails.apply_args(args)
 
 
 def add_prompt_flag(parser: argparse.ArgumentParser) -> None:
@@ -895,12 +939,14 @@ def resume_command(argv: list[str]) -> int:
     )
     parser.add_argument("--yolo", action="store_true", help="不再逐个确认写文件和执行命令")
     parser.add_argument("--no-tui", dest="no_tui", action="store_true", help="用明文 REPL")
+    add_guardrail_flags(parser)
     add_system_prompt_flags(parser)
     add_prompt_flag(parser)
     add_output_format(parser)
     args = parser.parse_args(argv)
     try:
         resolve_system_prompt_flags(args)
+        resolve_guardrail_flags(args)
     except ValueError as exc:
         print(ui.error(str(exc)), file=sys.stderr)
         return 2
@@ -909,6 +955,7 @@ def resume_command(argv: list[str]) -> int:
         Path.cwd(),
         grant=getattr(args, "trust", False),
         interactive=sys.stdin.isatty() and sys.stderr.isatty(),
+        unguarded=args.unguarded,
     )
     load_dotenv(untrusted_dir=None if trust.trusted else Path.cwd())
 
@@ -1008,12 +1055,18 @@ def resume_command(argv: list[str]) -> int:
             resume_workspace,
             grant=False,
             interactive=sys.stdin.isatty() and sys.stderr.isatty(),
+            unguarded=args.unguarded,
         )
     try:
         config = Config.from_env(
             workspace=resume_workspace,
             auto_approve=args.yolo or None,
             mode=args.mode,
+            sandbox=args.sandbox,
+            hardline=args.hardline,
+            unattended=args.unattended,
+            mcp_trust_changes=args.mcp_trust_changes,
+            unguarded=args.unguarded or None,
             #  没重新给旗标就沿用原会话那份自定义 system prompt：续的是同一场
             #  对话，身份不该悄悄变回内置的
             system_prompt=args.system_prompt or load_system_prompt(chosen.path),
@@ -2483,15 +2536,19 @@ def warn_if_home_workspace(workspace: Path) -> None:
 
 
 def resolve_folder_trust(
-    workspace: Path, *, grant: bool, interactive: bool
+    workspace: Path, *, grant: bool, interactive: bool, unguarded: bool = False
 ) -> "folder_trust.TrustDecision":
     """启动期的 folder trust 门（见 folder_trust.py 模块 docstring）。
 
     必须在 load_dotenv 之前调用：工作区 .env 是被门管的对象，先读了再问
     等于门形同虚设。--trust 先记后判：记完 evaluate 自然走"信任表命中"。
+    --unguarded 预设直接放行本次、**不记入信任表**：预设是这一跑的环境契约，
+    不该变成下次普通启动时的持久信任。
     """
     from . import folder_trust
 
+    if unguarded:
+        return folder_trust.TrustDecision("trusted", folder_trust.workspace_key(workspace), ())
     if grant:
         key = folder_trust.workspace_key(workspace)
         if folder_trust.record_decision(key, True) is None:
@@ -2556,6 +2613,7 @@ def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     try:
         resolve_system_prompt_flags(args)
+        resolve_guardrail_flags(args)
     except ValueError as exc:
         print(ui.error(str(exc)), file=sys.stderr)
         return 2
@@ -2570,6 +2628,7 @@ def main(argv: list[str] | None = None) -> int:
         gate_workspace,
         grant=args.trust,
         interactive=not (args.wire or args.acp) and sys.stdin.isatty() and sys.stderr.isatty(),
+        unguarded=args.unguarded,
     )
     env_files = load_dotenv(
         Path(args.env_file).expanduser() if args.env_file else None,
@@ -2638,6 +2697,10 @@ def main(argv: list[str] | None = None) -> int:
             mode=args.mode,
             sandbox=args.sandbox,
             sandbox_network=args.sandbox_network,
+            hardline=args.hardline,
+            unattended=args.unattended,
+            mcp_trust_changes=args.mcp_trust_changes,
+            unguarded=args.unguarded or None,
             system_prompt=args.system_prompt,
             append_system_prompt=args.append_system_prompt,
             effort=args.effort,
@@ -2672,6 +2735,11 @@ def main(argv: list[str] | None = None) -> int:
         print(ui.error(str(exc)), file=sys.stderr)
         return 2
     install_exit_logging(agent.session_log)
+    if config.unguarded and prompt:
+        #  一次性模式不进 repl/TUI，开场警告走 stderr（stdout 是这条命令的产物）
+        from . import guardrails
+
+        print(ui.error(guardrails.notice(config)), file=sys.stderr)
     #  copy=False：续写的就是历史所在那个文件，再抄一遍等于每次调用翻倍
     agent.restore(restored, copy=False)
     resumed = f"已接上会话 {args.session_id}（{len(restored)} 条消息）" if restored else ""
@@ -2742,6 +2810,10 @@ def wire_main(args: argparse.Namespace, workspace_trusted: bool = True) -> int:
             mode=args.mode,
             sandbox=args.sandbox,
             sandbox_network=args.sandbox_network,
+            hardline=args.hardline,
+            unattended=args.unattended,
+            mcp_trust_changes=args.mcp_trust_changes,
+            unguarded=args.unguarded or None,
             system_prompt=args.system_prompt,
             append_system_prompt=args.append_system_prompt,
             effort=args.effort,
@@ -2800,6 +2872,10 @@ def acp_main(args: argparse.Namespace) -> int:
             mode=args.mode,
             sandbox=args.sandbox,
             sandbox_network=args.sandbox_network,
+            hardline=args.hardline,
+            unattended=args.unattended,
+            mcp_trust_changes=args.mcp_trust_changes,
+            unguarded=args.unguarded or None,
         )
     ).serve()
 
@@ -2985,7 +3061,11 @@ def background_status(agent: Agent) -> str:
 def repl(agent: Agent) -> int:
     config = agent.config
     #  模型/工作区/help 提示都在启动横幅里了，这里只留必须扎眼的警告
-    if config.auto_approve:
+    if config.unguarded:
+        from . import guardrails
+
+        print(ui.error(guardrails.notice(config)))
+    elif config.auto_approve:
         print(ui.error("--yolo 已开启：写文件和执行命令都不会再问你"))
     print_mode_notice(agent)
 

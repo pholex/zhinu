@@ -942,6 +942,7 @@ class Agent:
         self._crystallize_skip_logged = False
         self.messages: list[dict[str, Any]] = [{"role": "system", "content": self._system_prompt()}]
         self._log_custom_system_prompt()
+        self._log_guardrails()
         #  token 记账锚点（服务端 usage 是权威值，本地只估算它之后新增的
         #  部分，误差不随会话累积）：(权威 prompt_tokens, 当时的消息条数)。
         #  Mantle 系模型不回 usage 时锚点保持 None，退化为纯本地估算。
@@ -1314,6 +1315,17 @@ class Agent:
             #  续写同名会话（--session-id）每次启动都经这里：文件里已是这份就不重复记
             if load_system_prompt(self.session_log.path) != custom:
                 self.session_log.preamble(SYSTEM_PROMPT_EVENT, text=custom)
+
+    def _log_guardrails(self) -> None:
+        """放开了护栏的会话在前言里留痕：事后审计能分辨"这一跑是无护栏的"。
+        只记新加的开关与预设（--yolo 本来就在启动行上，且横幅每次都喊）。"""
+        config = self.config
+        if self.session_log is None:
+            return
+        if config.unguarded or not config.hardline or config.unattended:
+            from . import guardrails
+
+            self.session_log.preamble(guardrails.EVENT, **guardrails.snapshot(config))
 
     def _system_prompt(self) -> str:
         """组装 system prompt。
@@ -4039,8 +4051,11 @@ class Agent:
         #  沙箱升权同理（升权只认一次性的人工批准）：allow 规则说的是
         #  "这个形状的命令在沙箱里安全"，不等于"可以不套沙箱跑"；--yolo 下
         #  自动放行升权等于模型能无声解除自己的沙箱。
-        must_confirm = name == "exit_plan_mode" or (
-            name == "bash" and bool(str(args.get("sandbox_permissions", "") or "").strip())
+        #  --unattended（或 --unguarded 预设）把这两处必问也放开：无人值守里没人
+        #  按键，卡在这里等于任务死掉。查 Config 字段而不是 args：表在 guardrails.py。
+        must_confirm = not self.config.unattended and (
+            name == "exit_plan_mode"
+            or (name == "bash" and bool(str(args.get("sandbox_permissions", "") or "").strip()))
         )
         #  auto 档：沙箱兜得住的那部分免确认（工作区内改文件、沙箱内跑命令）。
         #  写成 `not must_confirm and …` 而不是指望 exit_plan_mode 恰好不在
@@ -4199,7 +4214,9 @@ class Agent:
     def _untrusted_source(self, name: str, args: dict[str, Any]) -> str | None:
         """外部来源工具的来源标签；内置工具返回 None。use_tool 永远是 MCP。"""
         if name == "use_tool":
-            return str(args.get("tool_name") or "mcp")
+            tool_name = str(args.get("tool_name") or "mcp")
+            #  声明了 trustContent 的 server：结果按可信内容回灌
+            return None if self.toolbox.mcp_content_trusted(tool_name) else tool_name
         tool = self.toolbox.get(name)
         return name if tool is not None and tool.untrusted else None
 

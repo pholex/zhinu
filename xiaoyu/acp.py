@@ -1012,6 +1012,10 @@ def build_agent_factory(
     mode: str | None = None,
     sandbox: bool | None = None,
     sandbox_network: bool | None = None,
+    hardline: bool | None = None,
+    unattended: bool | None = None,
+    mcp_trust_changes: bool | None = None,
+    unguarded: bool | None = None,
     mcp_view: "mcp.McpView | None" = None,
 ) -> AgentFactory:
     """造一个 AcpServer 要的 agent 工厂：每 session 现配 Config/Permissions/SessionLog。
@@ -1047,7 +1051,10 @@ def build_agent_factory(
         create: bool,
         mcp_servers: "list[mcp.ServerSpec] | None" = None,
     ) -> tuple[Agent, list[dict[str, Any]]]:
-        trusted = folder_trust.evaluate(workspace, interactive=False).verdict == "trusted"
+        #  --unguarded 预设跳过信任门（CLI 已校验过环境同意；库面宿主传 True 即自负）
+        trusted = bool(unguarded) or (
+            folder_trust.evaluate(workspace, interactive=False).verdict == "trusted"
+        )
         config = Config.from_env(
             workspace=workspace,
             model=model or None,
@@ -1056,6 +1063,10 @@ def build_agent_factory(
             mode=mode or None,
             sandbox=sandbox,
             sandbox_network=sandbox_network,
+            hardline=hardline,
+            unattended=unattended,
+            mcp_trust_changes=mcp_trust_changes,
+            unguarded=unguarded or None,
             system_prompt=system_prompt or None,
             append_system_prompt=append_system_prompt or None,
             effort=effort or None,
