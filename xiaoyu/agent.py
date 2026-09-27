@@ -4062,6 +4062,9 @@ class Agent:
             None if plan_file_access or self.config.unattended
             else self.toolbox.guarded_config(name, args)
         )
+        #  过审时路径的落点：下面所有判定（越界、可执行配置、deny）都是对着它做的，
+        #  执行前要再核一次它没被换走（见 Toolbox.target_moved）
+        reviewed_target = self.toolbox.resolved_target(args)
         must_confirm = not self.config.unattended and (
             name == "exit_plan_mode"
             or (name == "bash" and bool(str(args.get("sandbox_permissions", "") or "").strip()))
@@ -4110,6 +4113,8 @@ class Agent:
                 #  批准并改写：后续执行、trace、tool.running 事件全部用改写后的参数
                 args = dict(updated)
                 args.pop(PURPOSE_PARAM, None)
+                #  改写后的参数才是被批准的那一份
+                reviewed_target = self.toolbox.resolved_target(args)
                 #  改写后的参数重新过 deny 规则——"deny 是 bypass-immune"的承诺
                 #  对宿主改写同样成立（宿主可信，但结构性兜底不靠约定：改写逻辑
                 #  的 bug 不该有能力绕过用户明令禁止的操作）
@@ -4141,6 +4146,11 @@ class Agent:
                     f"ERROR: 这次调用被用户配置的 PreToolUse hook 拦截：{decision.reason}。"
                     "请按此反馈调整做法。",
                 )
+
+        if moved := self.toolbox.target_moved(args, reviewed_target):
+            self.trace.append({"tool": name, "args": args, "ok": False, "output": "TARGET_MOVED"})
+            self.sink.emit(ToolDenied(name, by="rule"))
+            return self._tool_message(call, moved)
 
         #  过了全部关卡才算 running（状态机：pending → running →
         #  completed|denied，每个 pending 恰好一个终态——将来活区 spinner 靠它不悬空）

@@ -301,6 +301,54 @@ class GuardedConfigWriteTest(AgentTestCase):
         self.assertTrue((self.root / ".mcp.json").is_file())
 
 
+class TargetMovedTest(AgentTestCase):
+    """过审之后、执行之前，路径被换成指向别处的符号链接：这次调用不执行。"""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.outside = Path(self.tmp.name).resolve().parent / f"outside-{os.getpid()}"
+        self.outside.mkdir()
+        self.addCleanup(lambda: __import__("shutil").rmtree(self.outside, ignore_errors=True))
+        (self.root / "out").mkdir()
+
+    def swap_directory_for_symlink(self) -> None:
+        (self.root / "out").rmdir()
+        try:
+            (self.root / "out").symlink_to(self.outside, target_is_directory=True)
+        except (OSError, NotImplementedError):
+            self.skipTest("这台机器建不了符号链接")
+
+    def _write(self, approver):
+        args = json.dumps({"path": "out/result.txt", "content": "data\n"})
+        script = [
+            [chunk(tool_calls=[call_fragment(0, "w1", "write_file", args)])],
+            [chunk(content="好")],
+        ]
+        agent = self.build(script, approver=approver)
+        with contextlib.redirect_stdout(io.StringIO()):
+            agent.send("写")
+        return agent
+
+    def test_swap_during_confirmation_is_refused(self) -> None:
+        self.config.mode = "default"
+        self.config.auto_approve = False
+
+        def approve_while_the_path_moves(name, args):
+            self.swap_directory_for_symlink()
+            return True
+
+        agent = self._write(approve_while_the_path_moves)
+        self.assertFalse((self.outside / "result.txt").exists(), "写到了工作区之外")
+        self.assertIn("指向了别处", agent.messages[-2]["content"])
+        self.assertEqual(agent.trace[-1]["output"], "TARGET_MOVED")
+
+    def test_unmoved_path_writes_normally(self) -> None:
+        self.config.mode = "default"
+        self.config.auto_approve = False
+        self._write(lambda name, args: True)
+        self.assertEqual((self.root / "out" / "result.txt").read_text(encoding="utf-8"), "data\n")
+
+
 class TrustContentTest(AgentTestCase):
     """.mcp.json 的 trustContent：该 server 的结果不套 <untrusted_content>。"""
 

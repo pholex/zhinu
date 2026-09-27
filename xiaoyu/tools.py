@@ -1214,6 +1214,37 @@ class Toolbox:
             return False
         return outside
 
+    def resolved_target(self, args: dict[str, Any]) -> Path | None:
+        """这次调用的路径参数此刻落在哪（resolve 过）。没有路径参数、解析不了返回 None。"""
+        path = args.get("path")
+        if not isinstance(path, str) or not path:
+            return None
+        try:
+            return self._resolve(path)[0]
+        except OSError:
+            return None
+
+    def target_moved(self, args: dict[str, Any], reviewed: Path | None) -> str | None:
+        """过审时路径落在 reviewed，现在要执行了——还落在同一处吗？不是就返回拒因。
+
+        "在不在工作区内""是不是可执行配置""命不命中 deny 规则"都是对着过审那一刻
+        的落点判的；从那时到真正执行之间隔着确认框（人要读、要想）和 hook。这段
+        时间里路径上的某一级被换成指向别处的符号链接——后台任务、别的进程都
+        做得到——放行的就不再是实际写下去的那个文件。这里把窗口从"人按键的
+        几秒到几分钟"收到"两次系统调用之间"；彻底关上要靠按 fd 钉住每一级目录，
+        那是另一件事。
+        """
+        if reviewed is None:
+            return None
+        now = self.resolved_target(args)
+        if now == reviewed:
+            return None
+        return (
+            f"ERROR: {args.get('path')} 在确认之后指向了别处"
+            f"（过审时是 {reviewed}，现在是 {now or '无法解析'}）——路径上有符号链接被改动。"
+            "这次调用没有执行；确认路径无误后重新发起。"
+        )
+
     def guarded_config(self, name: str, args: dict[str, Any]) -> str | None:
         """这次调用是不是在写可执行配置（.mcp.json / .env / .xiaoyu/ / .git/）。
 
