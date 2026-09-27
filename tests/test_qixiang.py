@@ -127,11 +127,32 @@ class FanOutTest(QixiangTestCase):
         result = self.call(
             tool, spec="reader", prompt_template="查 {{item}}", items=["甲", "乙"]
         )
-        self.assertIn("完成 2 / 失败 0", result)
+        self.assertIn("完成 2 / 未做完 0 / 失败 0", result)
         #  输入顺序聚合
         self.assertLess(result.index("甲的结论"), result.index("乙的结论"))
         self.assertEqual(len(re.findall(r"resume_from: [0-9a-f]{8}", result)), 2)
         self.assertEqual(len(self.runs), 2)
+
+    def test_capped_item_is_counted_as_unfinished_and_offered_for_resume(self):
+        capped = AgentSpec(
+            name="reader", description="d", system_prompt="工作区 {workspace}",
+            tools=("read_file", "grep", "list_files"), max_iterations=1,
+        )
+        self.config.turn_extension = 0
+        script = [
+            tool_turn("r1", "read_file", {"path": "calc.py"}),
+            text_turn("甲只查到一半 " + LONG),
+            text_turn("乙的结论 " + LONG),
+        ]
+        tool = self.make_tool([capped], script)
+        result = self.call(
+            tool, spec="reader", prompt_template="查 {{item}}", items=["甲", "乙"]
+        )
+        self.assertIn("完成 1 / 未做完 1 / 失败 0", result)
+        self.assertIn("1/2 未做完", result)
+        self.assertIn("撞了轮数上限", result)
+        self.assertIn("甲只查到一半", result)
+        self.assertIn("批量续跑", result)
 
     def test_failure_isolated_with_retry_hint(self):
         script = [RuntimeError("模型炸了"), text_turn("乙的结论 " + LONG)]
@@ -140,7 +161,7 @@ class FanOutTest(QixiangTestCase):
             result = self.call(
                 tool, spec="reader", prompt_template="查 {{item}}", items=["甲", "乙"]
             )
-        self.assertIn("完成 1 / 失败 1", result)
+        self.assertIn("完成 1 / 未做完 0 / 失败 1", result)
         self.assertIn("子 agent 失败", result)
         self.assertIn("批量续跑", result)
         #  失败的也有 resume 句柄（从 failed 恢复继续修是正当用法）
@@ -222,7 +243,7 @@ class ConcurrentTest(QixiangTestCase):
             tool, spec="reader", prompt_template="查 {{item}}",
             items=[f"i{n}" for n in range(6)],
         )
-        self.assertIn("完成 6 / 失败 0", result)
+        self.assertIn("完成 6 / 未做完 0 / 失败 0", result)
         #  块按输入顺序（与完成先后无关）
         positions = [result.index(f"· i{n}") for n in range(6)]
         self.assertEqual(positions, sorted(positions))

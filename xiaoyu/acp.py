@@ -156,7 +156,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Iterator, TextIO
 
-from . import __version__, folder_trust, fsguard, mcp, mcp_guard, media, modes, ui
+from . import __version__, errors, folder_trust, fsguard, mcp, mcp_guard, media, modes, ui
 from .config import Config, MissingConfig, load_dotenv, user_env_path
 from .permissions import Permissions, suggest_allow_rule
 from .session_log import (
@@ -235,6 +235,10 @@ _PREVIEW_MAX_BYTES = 1024 * 1024
 
 def _text_content(text: str) -> dict[str, Any]:
     return {"type": "content", "content": {"type": "text", "text": text}}
+
+
+#  Agent.last_stop → 规范里的 stopReason（没列的都是 end_turn）
+_STOP_REASONS = {"turn_cap": "max_turn_requests", "budget": "max_tokens"}
 
 
 def _tool_title(name: str, args: dict[str, Any]) -> str:
@@ -1198,8 +1202,13 @@ class AcpServer:
     def _respond(self, req_id: Any, result: dict[str, Any]) -> None:
         self._send({"jsonrpc": "2.0", "id": req_id, "result": result})
 
-    def _fail(self, req_id: Any, code: int, message: str) -> None:
-        self._send({"jsonrpc": "2.0", "id": req_id, "error": {"code": code, "message": message}})
+    def _fail(
+        self, req_id: Any, code: int, message: str, data: dict[str, Any] | None = None
+    ) -> None:
+        error: dict[str, Any] = {"code": code, "message": message}
+        if data:
+            error["data"] = data
+        self._send({"jsonrpc": "2.0", "id": req_id, "error": error})
 
     # ---------- 主循环 ----------
 
@@ -1637,6 +1646,7 @@ class AcpServer:
         agent = session.agent
         stop_reason = "end_turn"
         error = ""
+        error_data: dict[str, Any] | None = None
         try:
             if isinstance(content, str) and (matched := match_command(content)) is not None:
                 #  命中命令：不进模型、不入历史，输出走 agent_message_chunk。
@@ -1646,6 +1656,8 @@ class AcpServer:
                 session.sink.emit(TextDelta(output if output.strip() else "（无输出）"))
             else:
                 agent.send(_degrade_images(session, content))
+                #  怎么停的如实报：撞轮数上限、预算用尽都不是"模型说完了"
+                stop_reason = _STOP_REASONS.get(str(getattr(agent, "last_stop", "")), "end_turn")
         except (Interrupted, KeyboardInterrupt):
             agent.close_open_tool_calls("本轮被 ACP client 取消。")
             stop_reason = "cancelled"
@@ -1654,8 +1666,18 @@ class AcpServer:
                 #  规范：取消后必须回 cancelled，不能回 error——打断打在异常路径上
                 #  （网络层把中断包装成了别的异常）也算取消
                 stop_reason = "cancelled"
+            elif isinstance(exc, errors.ContentFiltered):
+                #  服务端拒答不是故障：规范有专门的停因，宿主据此决定怎么呈现
+                agent.close_open_tool_calls("本轮被服务端拒答。")
+                session.sink.emit(TextDelta(f"\n[{exc}]"))
+                stop_reason = "refusal"
+                if agent.session_log:
+                    agent.session_log.event("error", error=f"ContentFiltered: {exc}")
             else:
                 error = f"{type(exc).__name__}: {exc}"
+                #  宿主要决定重不重试、怎么提示：给分好的类，别让它按文案猜
+                verdict = errors.classify(exc)
+                error_data = {"kind": verdict.kind, "retryable": verdict.retryable}
                 if agent.session_log:
                     agent.session_log.event("error", error=error)
         finally:
@@ -1678,7 +1700,7 @@ class AcpServer:
                 },
             )
         if error:
-            self._fail(req_id, INTERNAL_ERROR, error)
+            self._fail(req_id, INTERNAL_ERROR, error, error_data)
         else:
             self._respond(req_id, {"stopReason": stop_reason})
 

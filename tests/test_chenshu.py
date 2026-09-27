@@ -481,6 +481,44 @@ class WorkerEndToEndTest(ChenshuCase):
         #  完成通知走了通知轨道
         self.assertTrue(any("bee" in text for text, _ in self.notices))
 
+    def test_completion_event_reports_what_was_actually_delivered(self):
+        """"完成"是成员自己说的：事件里附上量出来的实况，别等到 merge 闸才发现是空的。"""
+        self.init_repo()
+        script = [
+            tool_turn("w1", "write_file", {"path": "src/feature.py", "content": "f = 1\n"}),
+            text_turn("都做完了。" + LONG),
+        ]
+        runtime = self.make_runtime(script)
+        with contextlib.redirect_stdout(io.StringIO()):
+            runtime.init()
+            runtime.plan([{"title": "加功能", "scope": ["src/"]}])
+            runtime.spawn("bee", "worker", mission_id="M1")
+            self.wait_done(runtime, "bee")
+            events = runtime.wait(timeout=5)
+        self.assertIn("bee 完成", events)
+        self.assertIn("没有提交", events)
+        self.assertIn("改动没提交", events)
+        self.assertIn("状态 active", events)
+
+    def test_member_stopped_by_turn_cap_is_not_announced_as_done(self):
+        self.init_repo()
+        script = [
+            tool_turn("w1", "read_file", {"path": "src/a.py"}),
+            text_turn("只看了一个文件，还没动手。" + LONG),
+        ]
+        runtime = self.make_runtime(script)
+        self.config.turn_extension = 0
+        with mock.patch.object(chenshu_mod, "_WORKER_ITERATIONS", 1):
+            with contextlib.redirect_stdout(io.StringIO()):
+                runtime.init()
+                runtime.plan([{"title": "加功能", "scope": ["src/"]}])
+                runtime.spawn("bee", "worker", mission_id="M1")
+                self.wait_done(runtime, "bee")
+                events = runtime.wait(timeout=5)
+        self.assertIn("bee 停下", events)
+        self.assertIn("撞了轮数上限", events)
+        self.assertNotIn("bee 完成", events)
+
     def test_spawn_cap_and_teardown_guard(self):
         self.init_repo()
         runtime = self.make_runtime([])

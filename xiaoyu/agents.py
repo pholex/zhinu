@@ -233,6 +233,21 @@ class DelegationResult:
     worktree: Path | None = None
     notes: list[str] = field(default_factory=list)
     resumed: bool = False
+    #  这一轮是怎么停下来的（Agent.last_stop）：done = 模型自己收尾；turn_cap /
+    #  budget = 撞了轮数上限 / token 预算，被要求就地交代——那份交代不等于做完
+    stopped: str = "done"
+
+    @property
+    def cut_short(self) -> str:
+        """没做完就被叫停时的一句话原因；正常收尾返回空串。"""
+        return STOP_REASONS.get(self.stopped, "")
+
+
+#  非正常收尾的说法（单发结论、七襄 report、斗巧席位共用）
+STOP_REASONS = {
+    "turn_cap": "撞了轮数上限",
+    "budget": "token 预算用尽",
+}
 
 
 def spec_dirs(workspace: Path) -> list[tuple[Path, str]]:
@@ -824,6 +839,7 @@ def execute_delegation(
         worktree=kept,
         notes=notes,
         resumed=record is not None,
+        stopped=str(getattr(sub_agent, "last_stop", "done") or "done"),
     )
 
 
@@ -886,7 +902,17 @@ def make_subagent_tool(
             partial = f"[失败前的部分结论，未必完整]\n{answer}\n" if answer else ""
             return f"ERROR: 子 agent {spec.name} 失败（{result.failure}）。\n{partial}{footer}"
         if not answer:
-            return f"子 agent {spec.name} 没有给出结论（可能是轮次用尽）。\n{footer}"
+            why = result.cut_short or "可能是轮次用尽"
+            return f"子 agent {spec.name} 没有给出结论（{why}）。\n{footer}"
+        if result.cut_short:
+            #  被叫停时写的交代与做完后写的结论长得一样：不点明的话，父级会把
+            #  "做到一半"当成"做完了"往下走
+            return (
+                f"[{spec.name} 子 agent **没有做完**——{result.cut_short}，下面是它被叫停时"
+                f"交代的进度（{result.model}，{result.tool_calls} 次工具调用）。"
+                "要接着做就带 resume_from 续跑，别把这份进度当成最终结论]\n"
+                f"{answer}\n\n{footer}"
+            )
         return (
             f"[{spec.name} 子 agent 的结论（{result.model}，{result.tool_calls} 次工具调用）]\n"
             f"{answer}\n\n{footer}"

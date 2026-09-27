@@ -1546,6 +1546,92 @@ class AgentAccessTest(unittest.TestCase):
         self.assertIsNone(seen["unknown"])
 
 
+class StopReasonTest(unittest.TestCase):
+    """prompt 一轮是怎么停的如实报给宿主：撞上限、预算用尽、拒答各有各的停因。"""
+
+    def run_turn(self, behave) -> dict[str, Any]:
+        import io
+
+        from xiaoyu.acp import AcpServer
+        from xiaoyu.render import PlainSink
+
+        class StubAgent:
+            mode = "default"
+            session_log = None
+            last_stop = "done"
+            config = type("C", (), {"model": "stub-model"})()
+
+            def switchable_models(self) -> list[str]:
+                return ["stub-model"]
+
+            def sandbox_ready(self) -> bool:
+                return False
+
+            def close_open_tool_calls(self, note: str) -> None:
+                pass
+
+            def interrupt(self) -> None:
+                pass
+
+            def send(self, content) -> None:
+                behave(self)
+
+        out = io.StringIO()
+
+        def lines():
+            yield json.dumps({"jsonrpc": "2.0", "id": "init", "method": "initialize",
+                              "params": {"protocolVersion": 1}})
+            yield json.dumps({"jsonrpc": "2.0", "id": "new", "method": "session/new",
+                              "params": {"cwd": str(Path.cwd())}})
+            session_id = next(
+                record["result"]["sessionId"]
+                for line in out.getvalue().splitlines()
+                if (record := json.loads(line)).get("id") == "new"
+            )
+            yield json.dumps({"jsonrpc": "2.0", "id": "p1", "method": "session/prompt",
+                              "params": {"sessionId": session_id,
+                                         "prompt": [{"type": "text", "text": "干活"}]}})
+
+        server = AcpServer(
+            agent_factory=lambda *args: (StubAgent(), []), stdin=lines(), stdout=out
+        )
+        server.serve()
+        return next(
+            record for line in out.getvalue().splitlines()
+            if (record := json.loads(line)).get("id") == "p1"
+        )
+
+    def test_turn_cap_and_budget_are_not_end_turn(self) -> None:
+        for last_stop, expected in (
+            ("done", "end_turn"),
+            ("turn_cap", "max_turn_requests"),
+            ("budget", "max_tokens"),
+        ):
+            with self.subTest(last_stop=last_stop):
+                response = self.run_turn(lambda agent: setattr(agent, "last_stop", last_stop))
+                self.assertEqual(response["result"]["stopReason"], expected)
+
+    def test_server_side_refusal_is_a_stop_reason_not_an_error(self) -> None:
+        from xiaoyu.errors import ContentFiltered
+
+        def refuse(agent) -> None:
+            raise ContentFiltered("内容被服务端安全策略拦截")
+
+        response = self.run_turn(refuse)
+        self.assertNotIn("error", response)
+        self.assertEqual(response["result"]["stopReason"], "refusal")
+
+    def test_errors_carry_a_classification_the_host_can_act_on(self) -> None:
+        def explode(agent) -> None:
+            raise RuntimeError("上游 503 service unavailable")
+
+        response = self.run_turn(explode)
+        self.assertIn("RuntimeError", response["error"]["message"])
+        data = response["error"]["data"]
+        self.assertIn(data["kind"], ("transient", "fatal", "rate_limit"))
+        self.assertIsInstance(data["retryable"], bool)
+
+
 class ClientMcpServersTest(unittest.TestCase):
     """client 随 session/new 下发的 mcpServers（ACP session-setup 的标准面）。"""
 

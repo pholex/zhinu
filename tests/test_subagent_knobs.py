@@ -219,6 +219,38 @@ class FailureReportTest(KnobTestCase):
         self.assertNotIn("部分结论", result)
 
 
+class CutShortTest(KnobTestCase):
+    """撞轮数上限被叫停的子 agent 交的是进度，不能长得和"做完了"一样。"""
+
+    SPEC = AgentSpec(
+        name="digger", description="d", system_prompt="工作区 {workspace}",
+        tools=("read_file",), max_iterations=2,
+    )
+
+    def test_capped_run_is_reported_as_unfinished(self):
+        self.config.turn_extension = 0
+        script = [
+            tool_turn("r1", "read_file", {"path": "calc.py"}),
+            tool_turn("r2", "read_file", {"path": "calc.py"}),
+            text_turn("查到一半：A 已确认，B 还没看"),
+        ]
+        runs: dict = {}
+        tool = self.make_tool(self.SPEC, script, runs=runs)
+        with contextlib.redirect_stdout(io.StringIO()):
+            result = tool.handler(task="查清楚")
+        self.assertIn("没有做完", result)
+        self.assertIn("撞了轮数上限", result)
+        self.assertIn("查到一半", result)
+        self.assertRegex(result, r"resume_from: [0-9a-f]{8}")
+
+    def test_normal_finish_is_reported_as_a_conclusion(self):
+        tool = self.make_tool(self.SPEC, [text_turn("查完了")])
+        with contextlib.redirect_stdout(io.StringIO()):
+            result = tool.handler(task="查清楚")
+        self.assertIn("子 agent 的结论", result)
+        self.assertNotIn("没有做完", result)
+
+
 class CapabilityRuntimeTest(KnobTestCase):
     SPEC = AgentSpec(
         name="coder", description="d", system_prompt="工作区 {workspace}",

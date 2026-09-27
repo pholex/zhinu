@@ -379,6 +379,8 @@ def make_douqiao_tool(
                 lines.append(result.error)
             elif result is not None and result.failure:
                 lines.append(f"ERROR: 织手失败（{result.failure}）")
+            elif result is not None and result.cut_short:
+                lines.append(f"（{result.cut_short}，被叫停时交代的进度，方案未必完整）")
             if result is not None and result.answer and seat.finished:
                 answer = result.answer
                 if len(answer) > _PER_SEAT_CAP:
