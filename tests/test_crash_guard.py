@@ -2,8 +2,12 @@
 
 from __future__ import annotations
 
+import os
+import signal
+import subprocess
 import sys
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -19,13 +23,81 @@ class CrashGuardTest(unittest.TestCase):
         crash_guard._installed = False
         crash_guard._log_path = None
         self._orig_hook = sys.excepthook
+        self._orig_thread_hook = threading.excepthook
         self.addCleanup(self._restore)
         self.addCleanup(self._tmp.cleanup)
 
     def _restore(self) -> None:
         sys.excepthook = self._orig_hook
+        threading.excepthook = self._orig_thread_hook
         crash_guard._installed = False
         crash_guard._log_path = None
+
+    def test_exception_in_a_worker_thread_is_recorded_and_chained(self) -> None:
+        """小羽是线程架构：后台线程里没接住的异常不经 sys.excepthook。"""
+        chained = []
+        with mock.patch.object(threading, "excepthook", lambda args: chained.append(args)):
+            crash_guard.install(self.log)
+
+            def explode() -> None:
+                raise RuntimeError("worker-boom-xyz")
+
+            worker = threading.Thread(target=explode, name="fanout-7")
+            worker.start()
+            worker.join(5)
+        text = self.log.read_text(encoding="utf-8")
+        self.assertIn("worker-boom-xyz", text)
+        self.assertIn("fanout-7", text)
+        self.assertEqual(len(chained), 1, "原来的线程 hook 也得照常收到")
+
+    def test_thread_exiting_via_system_exit_is_not_a_crash(self) -> None:
+        with mock.patch.object(threading, "excepthook", lambda args: None):
+            crash_guard.install(self.log)
+
+            def leave() -> None:
+                raise SystemExit(0)
+
+            worker = threading.Thread(target=leave)
+            worker.start()
+            worker.join(5)
+        self.assertFalse(self.log.exists())
+
+    def test_text_with_lone_surrogates_is_still_recorded(self) -> None:
+        with mock.patch.object(sys, "excepthook", lambda *a: None):
+            crash_guard.install(self.log)
+            exc = ValueError("bad-\udcff-bytes")
+            sys.excepthook(ValueError, exc, None)
+        self.assertIn("bad-", self.log.read_text(encoding="utf-8"))
+
+    @unittest.skipUnless(hasattr(signal, "SIGUSR1"), "这个平台没有 SIGUSR1")
+    def test_sigusr1_dumps_stacks_and_the_process_carries_on(self) -> None:
+        """卡住不动的进程没有异常可记：发个信号让它把各线程的栈打出来。"""
+        script = (
+            "import sys, time, threading\n"
+            "from xiaoyu import crash_guard\n"
+            f"crash_guard.install(__import__('pathlib').Path({str(self.log)!r}))\n"
+            "def stuck_worker():\n"
+            "    time.sleep(30)\n"
+            "threading.Thread(target=stuck_worker, daemon=True).start()\n"
+            "print('ready', flush=True)\n"
+            "sys.stdin.readline()\n"
+            "print('still-alive', flush=True)\n"
+        )
+        proc = subprocess.Popen(
+            [sys.executable, "-c", script], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE, text=True,
+            cwd=str(Path(__file__).resolve().parent.parent),
+        )
+        try:
+            self.assertEqual(proc.stdout.readline().strip(), "ready")
+            os.kill(proc.pid, signal.SIGUSR1)
+            out, err = proc.communicate("\n", timeout=20)
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+        self.assertIn("still-alive", out)
+        self.assertIn("stuck_worker", err)
+        self.assertEqual(proc.returncode, 0)
 
     def test_install_is_idempotent(self) -> None:
         crash_guard.install(self.log)
