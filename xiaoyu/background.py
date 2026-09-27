@@ -125,6 +125,37 @@ class BackgroundTask:
         return time.monotonic() - self.started
 
 
+class _RepeatFilter:
+    """把与上一行一模一样的行折掉；换了内容（或收尾）时补一句重复了几次。
+
+    只折**连续**的重复：A B A 三行各是各的事件。计数不丢——模型知道那一行
+    后来又出现过多少次，只是不为每一次单独醒来。
+    """
+
+    def __init__(self) -> None:
+        self.last: str | None = None
+        self.count = 0
+
+    def filter(self, lines: list[str], flush: bool = False) -> list[str]:
+        fresh: list[str] = []
+        for line in lines:
+            if line == self.last:
+                self.count += 1
+                continue
+            if self.count:
+                fresh.append(self._note())
+            fresh.append(line)
+            self.last = line
+        if flush and self.count:
+            fresh.append(self._note())
+        return fresh
+
+    def _note(self) -> str:
+        note = f"（上一行又原样出现了 {self.count} 次）"
+        self.count = 0
+        return note
+
+
 class _RateLimiter:
     """monitor 事件的令牌桶。allow() 返回 (放行?, 恢复时要补的说明)。"""
 
@@ -308,11 +339,15 @@ class TaskManager:
         offset = 0
         pending = ""
         limiter = _RateLimiter()
+        repeats = _RepeatFilter()
         while True:
             finished = task.done.is_set()
             chunk, offset = self._read_new(task.log_path, offset, flush=finished)
             pending += chunk
             lines, pending = self._split_lines(pending, flush=finished)
+            #  原样重复的行不是新事件：每 30 秒打一行"还在跑"的轮询脚本永远碰不到
+            #  限流，却每一行都要唤醒模型一次
+            lines = repeats.filter(lines, flush=finished)
             if lines and self.notify is not None:
                 allowed, note = limiter.allow()
                 if allowed:
