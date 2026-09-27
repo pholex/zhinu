@@ -291,16 +291,29 @@ def _safe_env(
 #  server 报错文本里的凭据脱敏：server 把请求
 #  原样回显进错误信息是常见毛病，别让 token 经 tool result 进对话历史。
 #  只作用于错误路径——正常输出里的 key=value 可能是用户要的真实数据。
+#  键名：单独成词，或挂在别的词后面（access_token / client_secret / x-api-key）
+_CREDENTIAL_KEY = (
+    r"(?:[A-Za-z0-9]+[_-])*"
+    r"(?:token|api[_-]?key|apikey|password|passwd|secret|authorization|credential)"
+)
 _CREDENTIAL_PATTERN = re.compile(
-    r"ghp_[A-Za-z0-9]{20,}"
-    r"|sk-[A-Za-z0-9_-]{16,}"
+    #  已知前缀的令牌。sk- 要求左边不是单词字符或路径分隔：`task-…`、`disk-…`、
+    #  `/risk-assessment-…` 这类普通文本不该被吃掉
+    r"(?<![A-Za-z0-9])(?:ghp|gho|ghu|ghs|ghr)_[A-Za-z0-9]{20,}"
+    r"|(?<![A-Za-z0-9])github_pat_[A-Za-z0-9_]{20,}"
+    r"|(?<![A-Za-z0-9_/.-])sk-[A-Za-z0-9_-]{16,}"
     r"|Bearer\s+\S+"
-    r"|\b(?:token|api_key|apikey|password|secret)=\S+",
+    #  键=值 / 键: 值 / "键": "值"（JSON）。值到空白、引号、逗号、& 为止；值前面
+    #  带认证方案名（Authorization: Bearer xxx）时连方案后面的令牌一起盖掉
+    rf"|(?<![A-Za-z0-9])[\"']?{_CREDENTIAL_KEY}[\"']?\s*[=:]\s*[\"']?"
+    r"(?:(?:Bearer|Basic|Token)\s+)?[^\s\"',&}]+",
     re.IGNORECASE,
 )
 
 
 def _redact(text: str) -> str:
+    """报错文本里的凭据换成 [REDACTED]。必须在截断**之前**做：截断落在令牌
+    中间的话，剩下的半截对不上任何模式，原样漏出去。"""
     return _CREDENTIAL_PATTERN.sub("[REDACTED]", text)
 
 
@@ -662,7 +675,7 @@ class _HttpChannel:
             #  只读开头：错误体同样来自不可信的远端，展示也只用得上前 200 字
             with contextlib.suppress(Exception):
                 head = exc.read(_HTTP_ERROR_BODY_CAP)
-                detail = _redact(head.decode("utf-8", "replace")[:200]).strip()
+                detail = _redact(head.decode("utf-8", "replace"))[:200].strip()
         with contextlib.suppress(Exception):
             exc.close()
         suffix = f"：{detail}" if detail else ""
@@ -671,9 +684,20 @@ class _HttpChannel:
                 "远端会话已失效（HTTP 404），需要重新握手", kind="session_expired", status=code
             )
         if code in (401, 403):
+            challenge = ""
+            with contextlib.suppress(Exception):
+                challenge = str(exc.headers.get("WWW-Authenticate") or "")
+            if "resource_metadata" in challenge.lower():
+                #  RFC 9728 的受保护资源元数据：server 要的是 OAuth 登录，不是一个
+                #  写死的头。让人去查 headers 是指错了路
+                hint = (
+                    "这个 server 要求 OAuth 登录，小羽目前只支持在 headers 里写静态凭据"
+                    "——改用它提供的长期令牌，或经本地的 OAuth 桥接程序（stdio）接入"
+                )
+            else:
+                hint = "检查 mcp.json 里这个 server 的 headers 凭据"
             return McpError(
-                f"认证失败（HTTP {code} {exc.reason}）{suffix}——"
-                "检查 mcp.json 里这个 server 的 headers 凭据",
+                f"认证失败（HTTP {code} {exc.reason}）{suffix}——{hint}",
                 kind="auth",
                 status=code,
             )

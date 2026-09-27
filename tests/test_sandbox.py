@@ -173,6 +173,33 @@ class HostProgramLookupTest(unittest.TestCase):
         self.assertFalse(self.marker.exists(), "工作区里的假 git 被宿主执行了")
 
 
+class SecretPathsTest(unittest.TestCase):
+    def test_lists_user_env_and_user_mcp_config(self):
+        from xiaoyu import config as config_mod
+
+        paths = sandbox.secret_paths()
+        self.assertIn(str(config_mod.user_env_path()), paths)
+        self.assertIn(str(config_mod.user_config_dir() / "mcp.json"), paths)
+
+    def test_explicit_env_file_is_included(self):
+        with mock.patch.dict(os.environ, {"XIAOYU_ENV_FILE": "/opt/keys/xiaoyu.env"}):
+            self.assertIn("/opt/keys/xiaoyu.env", sandbox.secret_paths())
+
+    def test_deny_covers_reads_and_comes_last(self):
+        text = sandbox.policy_text(1, True, secret_files=1)
+        rule = '(deny file-read* file-write* (literal (param "SECRET_FILE_0")))'
+        self.assertGreater(text.index(rule), text.rindex("(allow "))
+
+    def test_bwrap_masks_existing_secret_with_empty_device(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            secret = Path(tmp) / ".env"
+            secret.write_text("K=1", encoding="utf-8")
+            args = sandbox.bwrap_args([], True, [], [str(secret), str(Path(tmp) / "missing")])
+        index = args.index(str(secret))
+        self.assertEqual(args[index - 2 : index], ["--ro-bind", "/dev/null"])
+        self.assertNotIn(str(Path(tmp) / "missing"), args)
+
+
 class ProtectedPathsTest(unittest.TestCase):
     def test_deny_rules_come_after_every_allow(self):
         text = sandbox.policy_text(2, allow_network=True, protected_files=1, protected_dirs=1)
@@ -394,6 +421,22 @@ class RealSandboxTest(unittest.TestCase):
             (self.ws / ".xiaoyu" / "permissions.txt").read_text(encoding="utf-8"), "# 空\n"
         )
         self.assertFalse((self.ws / ".xiaoyu" / "agents").exists())
+
+    def test_own_secret_files_are_unreadable(self):
+        """子进程环境里剥掉的密钥，不能让一条 cat 从配置文件里读回来。"""
+        secret = self.ws.parent / "userconf" / ".env"
+        secret.parent.mkdir()
+        secret.write_text("DEEPSEEK_API_KEY=sk-very-secret\n", encoding="utf-8")
+        neighbour = secret.parent / "notes.txt"
+        neighbour.write_text("plain\n", encoding="utf-8")
+        with mock.patch.object(sandbox, "secret_paths", return_value=[str(secret)]):
+            result = self.run_in_sandbox(f"cat '{secret}'")
+            self.assertNotIn("sk-very-secret", result.stdout + result.stderr)
+            copied = self.run_in_sandbox(f"cp '{secret}' stolen.txt; cat stolen.txt")
+            self.assertNotIn("sk-very-secret", copied.stdout)
+            #  同目录里别的文件照常可读
+            other = self.run_in_sandbox(f"cat '{neighbour}'")
+            self.assertEqual(other.stdout.strip(), "plain")
 
     def test_ordinary_dotfiles_stay_writable(self):
         (self.ws / ".git").mkdir()

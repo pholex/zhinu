@@ -1156,6 +1156,77 @@ class RedactTest(unittest.TestCase):
     def test_normal_text_untouched(self):
         self.assertEqual(mcp._redact("一切正常，共 3 条结果"), "一切正常，共 3 条结果")
 
+    def test_compound_keys_headers_and_json_are_covered(self):
+        leaked = "S3CR3T-value-0123"
+        shapes = [
+            f"access_token={leaked}",
+            f"client_secret={leaked}",
+            f"refresh_token: {leaked}",
+            f"X-Api-Key: {leaked}",
+            f"Authorization: Bearer {leaked}",
+            f"Authorization: Basic {leaked}",
+            f'{{"api_key": "{leaked}", "user": "bob"}}',
+            f"https://host/path?token={leaked}&page=2",
+            "github_pat_" + "A1b2" * 8,
+            "gho_" + "a" * 30,
+        ]
+        for text in shapes:
+            with self.subTest(text=text[:30]):
+                out = mcp._redact(text)
+                self.assertIn("[REDACTED]", out)
+                self.assertNotIn(leaked, out)
+                self.assertNotIn("A1b2A1b2", out)
+        #  不是凭据的那一半留着
+        self.assertIn('"user": "bob"', mcp._redact(shapes[6]))
+        self.assertIn("page=2", mcp._redact(shapes[7]))
+
+    def test_ordinary_words_are_not_eaten(self):
+        for text in (
+            "path /tmp/task-abcd_efgh_ijkl_mnop/file",
+            "the disk-usage-report-2026-09-27 is ready",
+            "see https://x/risk-assessment-abcdefghijklmnop",
+            "tokens used: 1523",
+            "invalid token",
+            "no password provided",
+            "secretary of state",
+        ):
+            with self.subTest(text=text):
+                self.assertEqual(mcp._redact(text), text)
+
+    def test_http_error_body_is_redacted_before_it_is_cut(self):
+        """截断落在令牌中间：先截后脱敏的话，剩下的半截对不上模式就漏了。"""
+        import io
+        import urllib.error
+
+        body = ("x" * 180 + " token=" + "Z" * 60).encode()
+        error = urllib.error.HTTPError("https://h/mcp", 500, "boom", {}, io.BytesIO(body))
+        channel = mcp._HttpChannel.__new__(mcp._HttpChannel)
+        channel.session_id = None
+        self.assertNotIn("ZZZZ", str(channel._http_error(error)))
+
+    def test_oauth_challenge_gets_its_own_hint(self):
+        """server 要的是 OAuth 登录时，让人去查 headers 是指错了路。"""
+        import io
+        import urllib.error
+        from email.message import Message
+
+        channel = mcp._HttpChannel.__new__(mcp._HttpChannel)
+        channel.session_id = None
+        headers = Message()
+        headers["WWW-Authenticate"] = (
+            'Bearer resource_metadata="https://h/.well-known/oauth-protected-resource"'
+        )
+        oauth = channel._http_error(
+            urllib.error.HTTPError("https://h/mcp", 401, "Unauthorized", headers, io.BytesIO(b""))
+        )
+        self.assertEqual(oauth.kind, "auth")
+        self.assertIn("OAuth", str(oauth))
+        self.assertNotIn("检查 mcp.json", str(oauth))
+        plain = channel._http_error(
+            urllib.error.HTTPError("https://h/mcp", 401, "Unauthorized", Message(), io.BytesIO(b""))
+        )
+        self.assertIn("检查 mcp.json", str(plain))
+
 
 class NormalizeSchemaTest(unittest.TestCase):
     def test_nullable_type_list_folded(self):
