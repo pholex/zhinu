@@ -8,6 +8,7 @@
 
 - `/allow` / `/deny` 配权限规则：命中 allow 免确认，命中 deny 强制拦截。
 - **`deny` 与危险命令硬拦截（`rm -rf /`、fork bomb 一类）是 bypass-immune 的**：`--yolo` 也拦得住。审批是"用户想不想"，这一层是"绝不"。
+  `deny bash(curl *)` 按命令本身认，不按写法认：`/usr/bin/curl`、`env curl`、`"curl"`、`FOO=1 curl`、`bash -c 'curl …'`、`$(curl …)` 都拦。它仍是按字面匹配的规则而不是沙箱——脚本文件里写的、解释器里拼出来的命令它看不见，要挡住出网得靠沙箱的网络策略。
 - `exit_plan_mode` 的审批同样 bypass-immune：`--yolo` 也要问。否则模型能自行退出 plan 档，"批准后才执行"就是空话。无人值守里确实没人按键时用 `--unattended` 显式放开（见文末[放开护栏](#放开护栏unattended--xiaoyu_hardline0--trustcontent--unguarded)）。
 
 ## 模式与沙箱

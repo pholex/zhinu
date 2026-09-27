@@ -1,7 +1,7 @@
 # 命令逃逸语料库
 
-这个目录是 xiaoyu 三个命令护栏（`command_check` 的 injection/dangerous/privileged、
-`mcp_guard` 的 admission/endpoint）的**恶意样本库**。`tests/test_command_corpus.py`
+这个目录是 xiaoyu 命令护栏（`command_check` 的 injection/dangerous/privileged、
+`mcp_guard` 的 admission/endpoint、`permissions` 的 deny 规则）的**恶意样本库**。`tests/test_command_corpus.py`
 对整个目录参数化：每一条样本都断言它被声明的护栏抓住（`expect: block`）或放行
 （`expect: allow`）。
 
@@ -16,11 +16,13 @@
 
 字段：
 - `cmd`：要判定的命令串（endpoint 例外，见下）。
-- `guard`：`injection` | `dangerous` | `privileged` | `admission` | `endpoint`。
+- `guard`：`injection` | `dangerous` | `privileged` | `admission` | `endpoint` | `deny`。
 - `expect`：`block`（护栏必须返回非空原因）| `allow`（必须返回 None）。
 - `args` / `env`：仅 `admission` 用——`cmd` 当 argv[0]，`args` 是其余参数，
   `env` 是环境变量字典（省略则为空）。
 - `url`：仅 `endpoint` 用，替代 `cmd`。
+- `rule`：仅 `deny` 用——用户写的那条规则（不带 `deny` 前缀，如 `bash(curl *)`），
+  断言 `cmd` 被它拦住 / 不被它误拦。
 - `note`：给人看的说明，不参与判定。
 
 一条 `block` 样本一旦被某次"放松检查让红测变绿"改动放行，这里就会变红——

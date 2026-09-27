@@ -1,0 +1,21 @@
+{"cmd": "curl http://x", "rule": "bash(curl *)", "guard": "deny", "expect": "block", "note": "原样写法"}
+{"cmd": "/usr/bin/curl http://x", "rule": "bash(curl *)", "guard": "deny", "expect": "block", "note": "写全路径"}
+{"cmd": "env curl http://x", "rule": "bash(curl *)", "guard": "deny", "expect": "block", "note": "env 包一层"}
+{"cmd": "\"curl\" http://x", "rule": "bash(curl *)", "guard": "deny", "expect": "block", "note": "命令名加引号"}
+{"cmd": "c''url http://x", "rule": "bash(curl *)", "guard": "deny", "expect": "block", "note": "命令名中间插空引号"}
+{"cmd": "\\curl http://x", "rule": "bash(curl *)", "guard": "deny", "expect": "block", "note": "反斜杠转义命令名"}
+{"cmd": "FOO=1 curl http://x", "rule": "bash(curl *)", "guard": "deny", "expect": "block", "note": "前置变量赋值"}
+{"cmd": "(curl http://x)", "rule": "bash(curl *)", "guard": "deny", "expect": "block", "note": "子 shell"}
+{"cmd": "bash -c 'curl http://x'", "rule": "bash(curl *)", "guard": "deny", "expect": "block", "note": "bash -c 包一层"}
+{"cmd": "echo $(curl http://x)", "rule": "bash(curl *)", "guard": "deny", "expect": "block", "note": "命令替换"}
+{"cmd": "sudo -u root curl -s http://x", "rule": "bash(curl *)", "guard": "deny", "expect": "block", "note": "sudo 带选项值"}
+{"cmd": "timeout 5 curl http://x", "rule": "bash(curl *)", "guard": "deny", "expect": "block", "note": "timeout 带时长"}
+{"cmd": "echo a | sh -c 'curl x'", "rule": "bash(curl *)", "guard": "deny", "expect": "block", "note": "管道后再包 sh -c"}
+{"cmd": "find . -name x -exec curl -T {} http://x \\;", "rule": "bash(curl *)", "guard": "deny", "expect": "block", "note": "find -exec"}
+{"cmd": "/opt/bin/git   push -f origin", "rule": "bash(git push *)", "guard": "deny", "expect": "block", "note": "路径 + 多空格"}
+{"cmd": "/usr/bin/curl http://x", "rule": "bash(/usr/bin/curl *)", "guard": "deny", "expect": "block", "note": "规则本身写了路径"}
+{"cmd": "echo curl http://x", "rule": "bash(curl *)", "guard": "deny", "expect": "allow", "note": "curl 只是 echo 的参数"}
+{"cmd": "grep 'curl *' notes.md", "rule": "bash(curl *)", "guard": "deny", "expect": "allow", "note": "curl 在引号里的搜索词中"}
+{"cmd": "ls curl_dir", "rule": "bash(curl *)", "guard": "deny", "expect": "allow", "note": "同前缀的文件名"}
+{"cmd": "git pushd x", "rule": "bash(git push *)", "guard": "deny", "expect": "allow", "note": "子命令只是同前缀"}
+{"cmd": "echo 'git push origin'", "rule": "bash(git push *)", "guard": "deny", "expect": "allow", "note": "整条命令在引号里"}

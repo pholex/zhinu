@@ -3,6 +3,8 @@
 三条要点：
 1. **deny 规则是 bypass-immune**：用户显式配置的 deny 连 --yolo 都不放行——
    与 tools.py 的硬拦截（hardline）同级，是"绝不"而不是"想不想"。
+   bash 的 deny 既配原文段、也配剥开之后的每一层（command_check.any_layer）：
+   换路径、加引号、套 env / bash -c 跑的还是同一条命令。
 2. **allow 规则免确认**：bash 前缀（如 ``bash(git *)``）、文件路径 glob
    （如 ``write_file(src/*)``）、或整个工具（如 ``read_file``）。
 3. **fail-closed**：规则解析不了就当不存在；复合命令（含 ; && || 等）和含
@@ -450,10 +452,21 @@ class Permissions:
         if name == "bash":
             #  deny：任一段命中即拦
             command = str(args.get("command", ""))
-            return any(
-                fnmatch.fnmatch(part.strip(), rule.spec)
+            spec = rule.spec
+            if any(
+                fnmatch.fnmatch(part.strip(), spec)
                 for part in _SEGMENT_SPLIT.split(command)
                 if part.strip()
+            ):
+                return True
+            #  原文对不上再看剥开之后的每一层：`/usr/bin/curl …`、`env curl …`、
+            #  `"curl" …`、`FOO=1 curl …`、`bash -c 'curl …'` 跑的都是同一个 curl。
+            #  两种写法都配——归一过命令名的，和保留原样 argv[0] 的（规则本身
+            #  可能就写了路径）
+            return command_check.any_layer(
+                command,
+                lambda base, argv: fnmatch.fnmatch(" ".join([base, *argv[1:]]), spec)
+                or fnmatch.fnmatch(" ".join(argv), spec),
             )
         return self._match_path(rule.spec, args.get("path"))
 
