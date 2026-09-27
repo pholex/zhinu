@@ -2958,6 +2958,9 @@ def run_once(
         payload["output"] = agent.structured_output
     if agent.session_log:
         payload["session_log"] = str(agent.session_log.path)
+        if not getattr(agent.session_log, "complete", True):
+            #  路径还在、内容却不全：CI 拿这个路径去 resume 会少掉后半段
+            payload["session_log_complete"] = False
     if error:
         payload["error"] = error
     if output_format == "stream-json":

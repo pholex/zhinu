@@ -268,6 +268,8 @@ class SessionLog:
     def __init__(self, path: Path, *, defer: bool = False) -> None:
         self.path = path
         self._broken = False
+        #  停写的原因（给人看的一句话）；没停写时为空
+        self.broken_reason = ""
         self._closed = False
         #  写入与放锁互斥：serve 关会话（事件循环线程）可能与工作线程的收尾写入并发
         self._mutex = threading.Lock()
@@ -498,6 +500,7 @@ class SessionLog:
             #  名字带新造的 uuid / 时间戳 + pid，理论上撞不上；真撞上了宁可停写，
             #  也不和另一个写者交错写坏同一个文件
             self._broken = True
+            self.broken_reason = "会话文件被另一个进程占着"
             return
         self._append_locked(records)
 
@@ -522,11 +525,18 @@ class SessionLog:
                     view = view[os.write(fd, view):]
             finally:
                 os.close(fd)
-        except OSError:
+        except OSError as exc:
             #  磁盘满/权限问题不能影响会话，停写即可；写不进去的句柄也没理由占着锁
             self._broken = True
+            self.broken_reason = exc.strerror or type(exc).__name__
             if self._lock_finalizer is not None:
                 self._lock_finalizer()
+
+    @property
+    def complete(self) -> bool:
+        """盘上这份日志是不是完整的。写失败之后就停写了：此后的消息不在文件里，
+        resume 回来的会话会少掉后半段——这件事得有人说出来。"""
+        return not self._broken
 
 
 # ---------- 退出事件：进程级钩子 ----------

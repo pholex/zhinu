@@ -888,6 +888,8 @@ class Agent:
         self.session_log = session_log
         #  上一次快照进日志的用量（轮末对比，变了才写；见 _log_usage）
         self._usage_logged: dict[str, Any] | None = None
+        #  会话日志停写的提示只发一次
+        self._log_loss_warned = False
         #  plan mode 的计划文件：有会话文件就放它旁边
         #  （<会话名>.plan.md，不进仓库）；没有（eval/嵌入）退到工作区 .xiaoyu/。
         log_path = getattr(session_log, "path", None) if session_log is not None else None
@@ -2195,6 +2197,17 @@ class Agent:
         self.messages.append(message)
         if self.session_log:
             self.session_log.append(message)
+            if not self._log_loss_warned and not getattr(self.session_log, "complete", True):
+                #  只说一次：会话照常进行，但用户得知道之后的内容 resume 不回来
+                self._log_loss_warned = True
+                why = getattr(self.session_log, "broken_reason", "") or "写入失败"
+                self.sink.emit(
+                    Notice(
+                        f"[会话日志已停写（{why}）：从这里往后的对话不会落盘，"
+                        "resume 只能恢复到此前的内容]",
+                        "warn",
+                    )
+                )
 
     def _record_operator(self, text: str) -> None:
         """以 operator 身份入历史：harness/宿主说的话，不是用户原话。

@@ -247,6 +247,48 @@ class SessionLogTest(SessionDirTestCase):
         self.assertEqual(lines[2]["event"], "clear")
 
 
+class WriteLossIsAnnouncedTest(SessionDirTestCase):
+    """日志停写之后的内容 resume 不回来：这件事得说出来，而且只说一次。"""
+
+    def test_log_reports_why_it_stopped(self):
+        target = Path(self.tmp.name) / "a-directory"
+        target.mkdir()
+        log = SessionLog(target)
+        self.assertTrue(log.complete)
+        log.append({"role": "user", "content": "x"})
+        self.assertFalse(log.complete)
+        self.assertTrue(log.broken_reason)
+
+    def test_agent_warns_once_and_keeps_working(self):
+        from xiaoyu.agent import Agent
+        from xiaoyu.config import Config
+        from xiaoyu.events import Notice
+        from xiaoyu.providers import Registry
+
+        seen: list[str] = []
+
+        class Sink:
+            def emit(self, event) -> None:
+                if isinstance(event, Notice):
+                    seen.append(event.text)
+
+        config = Config(base_url="http://unused", model="m", workspace=Path.cwd())
+        config.enable_explore = False
+        config.enable_skills = False
+        target = Path(self.tmp.name) / "a-directory"
+        target.mkdir()
+        agent = Agent(
+            config, registry=Registry.for_client(object()),
+            session_log=SessionLog(target), sink=Sink(),
+        )
+        for text in ("一", "二", "三"):
+            agent._record({"role": "user", "content": text})
+        warnings = [text for text in seen if "会话日志已停写" in text]
+        self.assertEqual(len(warnings), 1)
+        self.assertIn("resume", warnings[0])
+        self.assertEqual([m["content"] for m in agent.messages[1:]], ["一", "二", "三"])
+
+
 @unittest.skipIf(os.name == "nt", "Windows 上 POSIX 权限位无语义")
 class SessionFilePermissionTest(SessionDirTestCase):
     """会话 JSONL 含工具输出、可能带密钥：文件 0600、自建目录 0700。"""
