@@ -794,7 +794,7 @@ class TestBashAndSafety(ToolboxTestCase):
         self._without_sandbox()
         grandchild: list[int] = []
 
-        def raise_system_exit(proc, pipes, deadline):  # noqa: ANN001
+        def raise_system_exit(proc, pipes, deadline, stop_requested=None):  # noqa: ANN001
             grandchild.append(self._grandchild_pid())
             raise SystemExit(143)
 

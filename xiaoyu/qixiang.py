@@ -29,7 +29,7 @@ from __future__ import annotations
 
 import threading
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Callable
 
 from . import ui
 from .agents import (
@@ -87,8 +87,8 @@ class _ItemState:
 
 
 def _status_of(state: _ItemState, cancelled: bool) -> str:
-    """收束分类（三态 + error）：
-    error = 参数校验失败没执行；aborted = 超时/用户中止；failed = 执行异常。"""
+    """收束分类：error = 参数校验失败没执行；aborted = 超时/用户中止；
+    failed = 执行异常；partial = 撞轮数上限 / 预算被叫停，交了进度但没做完。"""
     if state.crash:
         return "failed"
     if state.result is not None and state.result.error:
@@ -101,6 +101,8 @@ def _status_of(state: _ItemState, cancelled: bool) -> str:
         return "aborted" if cancelled else "failed"
     if state.result is None:
         return "aborted"
+    if state.result.cut_short:
+        return "partial"
     return "completed"
 
 
@@ -114,6 +116,7 @@ def make_qixiang_tool(
     permissions: Any,
     runs: dict[str, SubagentRun],
     mcp_manager: Any = None,
+    stop_requested: Callable[[], bool] | None = None,
 ) -> Tool:
     """七襄工具：与 make_subagent_tool 同一套依赖（同一本账、同一存档）。"""
     spec_map = {spec.name: spec for spec in specs}
@@ -295,7 +298,7 @@ def make_qixiang_tool(
             state = states[attempt.index]
             copy_back(state, attempt)
             status = _status_of(state, cancelled=False)
-            mark = {"completed": "✓", "failed": "✗"}.get(status, "⊘")
+            mark = {"completed": "✓", "failed": "✗", "partial": "◐"}.get(status, "⊘")
             sink.emit(
                 Notice(
                     f"  🕸 七襄 {settled}/{total_n} {mark} "
@@ -316,12 +319,13 @@ def make_qixiang_tool(
             timeout_s=timeout_s,
             min_answer_chars=MIN_ANSWER_CHARS,
             on_settled=on_settled,
+            stop_requested=stop_requested,
         )
         for state, attempt in zip(states, attempts):
             copy_back(state, attempt)
 
         #  ---------- 聚合 report：输入顺序，与完成先后无关 ----------
-        counts = {"completed": 0, "failed": 0, "aborted": 0, "error": 0}
+        counts = {"completed": 0, "partial": 0, "failed": 0, "aborted": 0, "error": 0}
         blocks: list[str] = []
         retry_ids: list[str] = []
         for state in states:
@@ -329,6 +333,7 @@ def make_qixiang_tool(
             counts[status] += 1
             zh = {
                 "completed": "完成",
+                "partial": "未做完",
                 "failed": "失败",
                 "aborted": "中止",
                 "error": "未执行",
@@ -354,7 +359,9 @@ def make_qixiang_tool(
                 lines.append(f"ERROR: 子 agent 失败（{result.failure}）")
             elif result is None:
                 lines.append("未开始即被中止。")
-            if result is not None and result.answer and status in ("completed", "failed"):
+            elif status == "partial":
+                lines.append(f"{result.cut_short}，被叫停时交代的进度如下（不是最终结论，可续跑）：")
+            if result is not None and result.answer and status in ("completed", "partial", "failed"):
                 answer = result.answer
                 if len(answer) > per_item_cap:
                     answer = answer[:per_item_cap] + "\n…（结论过长已截断；完整上下文在存档里，可 resume 追问）"
@@ -367,8 +374,8 @@ def make_qixiang_tool(
             f"[七襄 report] spec={spec_name}"
             + (f" · model={model_name}" if model_name else "")
             + (f" · effort={effort_level}" if effort_level else "")
-            + f" · 完成 {counts['completed']} / 失败 {counts['failed']} / "
-            f"中止 {counts['aborted']} / 未执行 {counts['error']}"
+            + f" · 完成 {counts['completed']} / 未做完 {counts['partial']} / "
+            f"失败 {counts['failed']} / 中止 {counts['aborted']} / 未执行 {counts['error']}"
             f"（共 {len(states)} 项，并发 {concurrency}）"
         )
         hints: list[str] = []

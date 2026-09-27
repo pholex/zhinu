@@ -233,6 +233,39 @@ class DelegationResult:
     worktree: Path | None = None
     notes: list[str] = field(default_factory=list)
     resumed: bool = False
+    #  这一轮是怎么停下来的（Agent.last_stop）：done = 模型自己收尾；turn_cap /
+    #  budget = 撞了轮数上限 / token 预算，被要求就地交代——那份交代不等于做完
+    stopped: str = "done"
+
+    @property
+    def cut_short(self) -> str:
+        """没做完就被叫停时的一句话原因；正常收尾返回空串。"""
+        return STOP_REASONS.get(self.stopped, "")
+
+
+#  非正常收尾的说法（单发结论、七襄 report、斗巧席位共用）
+STOP_REASONS = {
+    "turn_cap": "撞了轮数上限",
+    "budget": "token 预算用尽",
+}
+
+
+def reap_background(agent: Any) -> int:
+    """收掉一个收工的 agent 留下的后台任务，返回终止了几个。
+
+    子 agent 有 bash 就能起后台任务，却没有 task_output / kill_task——它自己
+    收不了场。每个 Toolbox 自带任务表，整体回收只挂在进程退出上：常驻进程
+    （serve、嵌入宿主）里这些进程会一直攒着。
+    """
+    tasks = getattr(getattr(agent, "toolbox", None), "tasks", None)
+    if tasks is None:
+        return 0
+    try:
+        running = len(tasks.running())
+        tasks.shutdown()
+    except Exception:  # noqa: BLE001 - 收场失败不该盖掉委托本身的结果
+        return 0
+    return running
 
 
 def spec_dirs(workspace: Path) -> list[tuple[Path, str]]:
@@ -415,7 +448,7 @@ def distill_history(
             #  压缩后首条 user = 原始任务 + 摘要：摘要是父 agent 的转述，不带
             text, _ = compaction.split_head(text)
             text = text.strip()
-            if media.is_injected_user_text(text, synthetic_texts):
+            if media.is_injected_message({**message, "content": text}, synthetic_texts):
                 continue
             kept.append({"role": "user", "content": text})
         elif role == "assistant" and not message.get("tool_calls"):
@@ -464,6 +497,7 @@ def execute_delegation(
     model_override: str | None = None,
     effort_override: str | None = None,
     parent_history: Callable[[], list[dict[str, Any]]] | None = None,
+    stop_requested: Callable[[], bool] | None = None,
 ) -> DelegationResult:
     """跑一次委托的执行核心（单发 subagent 工具与 qixiang 批量共用）。
 
@@ -640,6 +674,16 @@ def execute_delegation(
         if mcp_manager is not None and spec.mcp_mode != "none"
         else None
     )
+    #  声明了却用不上的 MCP server：点名告诉父级与子 agent（只给名字）
+    mcp_absent: list[str] = []
+    if mcp_view is not None:
+        mcp_absent = mcp_view.unavailable()
+    elif spec.mcp_mode != "none":
+        mcp_absent = (
+            sorted(spec.mcp_servers) if spec.mcp_mode == "named" else ["（本会话没有可用的 MCP）"]
+        )
+    if mcp_absent:
+        notes.append(f"声明的 MCP server 这次用不了：{'、'.join(mcp_absent)}")
 
     #  resume 钉死上次的模型（spec/主模型中途换了也不动摇——上下文是按它长的）；
     #  新开时 model_override（斗巧的异构竞争席位）> spec 声明 > 主模型
@@ -705,6 +749,8 @@ def execute_delegation(
         permissions=permissions,
         sink=child_sink,
         allow_nesting=nest,
+        #  父级被打断时跟着停（单发委托跑在父级线程里，父级自己没机会去叫停它）
+        upstream_stop=stop_requested,
     )
     if on_agent is not None:
         on_agent(sub_agent)
@@ -745,6 +791,11 @@ def execute_delegation(
             "分支流程、代码风格、命名约定等）时，不要拿你的默认当项目约定——"
             "先读工作区里的约定文件，读不到就在交接里点明这是未确认的假设。"
         )
+    if mcp_absent:
+        system_text += (
+            f"\n\n[MCP] 这些 MCP server 这次用不了：{'、'.join(mcp_absent)}。它们的工具不在"
+            "你的工具表里——别去搜、别假装调用；非它们不可的那部分任务在交接里点明做不了。"
+        )
     if seed:
         if spec.inherit == "fork":
             system_text += (
@@ -777,6 +828,9 @@ def execute_delegation(
         failure = f"{type(exc).__name__}: {exc}"
         if len(failure) > MAX_FAILURE_CHARS:
             failure = failure[:MAX_FAILURE_CHARS] + "…（已截断）"
+    finally:
+        if reaped := reap_background(sub_agent):
+            notes.append(f"子 agent 留下的 {reaped} 个后台任务已终止")
     answer = sub_agent.last_assistant_text()
     if answer == inherited_answer:
         answer = ""
@@ -824,6 +878,7 @@ def execute_delegation(
         worktree=kept,
         notes=notes,
         resumed=record is not None,
+        stopped=str(getattr(sub_agent, "last_stop", "done") or "done"),
     )
 
 
@@ -838,6 +893,7 @@ def make_subagent_tool(
     runs: dict[str, SubagentRun] | None = None,
     mcp_manager: Any = None,
     parent_history: Callable[[], list[dict[str, Any]]] | None = None,
+    stop_requested: Callable[[], bool] | None = None,
 ) -> Tool:
     """spec → 可挂载的工具。结构与 explore.make_explore_tool 同构：
     usage/registry 传父级的（同一本账、client 复用），sink 走 quiet_child 派生。
@@ -861,6 +917,7 @@ def make_subagent_tool(
             task=task, capability_mode=capability_mode,
             isolation=isolation, resume_from=resume_from,
             parent_history=parent_history,
+            stop_requested=stop_requested,
         )
         if result.error:
             return result.error
@@ -886,7 +943,17 @@ def make_subagent_tool(
             partial = f"[失败前的部分结论，未必完整]\n{answer}\n" if answer else ""
             return f"ERROR: 子 agent {spec.name} 失败（{result.failure}）。\n{partial}{footer}"
         if not answer:
-            return f"子 agent {spec.name} 没有给出结论（可能是轮次用尽）。\n{footer}"
+            why = result.cut_short or "可能是轮次用尽"
+            return f"子 agent {spec.name} 没有给出结论（{why}）。\n{footer}"
+        if result.cut_short:
+            #  被叫停时写的交代与做完后写的结论长得一样：不点明的话，父级会把
+            #  "做到一半"当成"做完了"往下走
+            return (
+                f"[{spec.name} 子 agent **没有做完**——{result.cut_short}，下面是它被叫停时"
+                f"交代的进度（{result.model}，{result.tool_calls} 次工具调用）。"
+                "要接着做就带 resume_from 续跑，别把这份进度当成最终结论]\n"
+                f"{answer}\n\n{footer}"
+            )
         return (
             f"[{spec.name} 子 agent 的结论（{result.model}，{result.tool_calls} 次工具调用）]\n"
             f"{answer}\n\n{footer}"

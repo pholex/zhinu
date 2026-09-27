@@ -150,6 +150,79 @@ def preview(value: object, limit: int = 100) -> str:
     return text[: max(limit - 1, 0)] + "…"
 
 
+#  键名像凭据的参数：值永远不进标题（标题会上屏、进宿主的 UI、进截图）
+_CREDENTIAL_KEY = re.compile(
+    r"(?i)(?:token|secret|passw(?:or)?d|passphrase|api[_-]?key|apikey|authorization"
+    r"|^auth$|cookie|credential|private[_-]?key|session[_-]?id|bearer|signature)"
+)
+#  通用摘要里每个值的字符上限
+_SUMMARY_VALUE_CAP = 60
+#  已知工具：按顺序取这些参数里有值的拼起来。第一项是"这次调用在干什么"，
+#  其余是限定（在哪搜、搜哪类文件）
+_SUMMARY_FIELDS: dict[str, tuple[tuple[str, str], ...]] = {
+    "bash": (("command", ""),),
+    "monitor": (("command", ""),),
+    "read_file": (("path", ""),),
+    "write_file": (("path", ""),),
+    "str_replace": (("path", ""),),
+    "grep": (("pattern", ""), ("path", "in "), ("glob", "")),
+    "list_files": (("pattern", ""), ("path", "in ")),
+    "recall": (("id", "#"), ("pattern", "")),
+    "explore": (("task", ""), ("query", ""), ("pattern", "")),
+    "web_search": (("query", ""),),
+    "search_tool": (("query", ""),),
+    "browser": (("action", ""), ("url", ""), ("selector", ""), ("key", "")),
+    "kill_task": (("task_id", ""),),
+}
+
+
+def _summary_value(value: object) -> str:
+    if isinstance(value, dict):
+        return "{…}" if value else "{}"
+    if isinstance(value, (list, tuple)):
+        return f"[{len(value)} 项]" if value else "[]"
+    text = " ".join(str(value).split())
+    return text if len(text) <= _SUMMARY_VALUE_CAP else text[: _SUMMARY_VALUE_CAP - 1] + "…"
+
+
+def tool_summary(name: str, args: object) -> str:
+    """一次工具调用"在干什么"的一行摘要（不含工具名、不截到终端宽度）。
+
+    终端的工具行、ACP 的 tool_call 标题、确认框都从这里取：各写一份的时候，
+    终端对 grep 只显示路径（搜什么看不见），MCP 工具把整个参数字典连同
+    token 一起打上屏。规则：
+    - 已知工具取最能说明意图的参数（见 _SUMMARY_FIELDS）；
+    - use_tool 取被调工具的名字，再按同样规则摘它的入参；
+    - 其余（MCP、插件）逐个 `键=值`：键名像凭据的整个跳过，值各自封顶，
+      嵌套结构只报形状。
+    """
+    if not isinstance(args, dict):
+        return _summary_value(args)
+    if name == "use_tool":
+        inner = str(args.get("tool_name") or "").strip()
+        rest = tool_summary(inner, args.get("tool_input") or {}) if inner else ""
+        return " ".join(part for part in (inner, rest) if part)
+    fields = _SUMMARY_FIELDS.get(name)
+    if fields is not None:
+        #  值原样给（多行命令的换行由调用方决定怎么画：终端画成 ⏎，ACP 压成空格）
+        parts = [
+            f"{prefix}{args[key]}"
+            for key, prefix in fields
+            if args.get(key) not in (None, "", [], {})
+        ]
+        if parts:
+            return " ".join(parts)
+    elif "path" in args and isinstance(args["path"], str) and args["path"]:
+        #  不认识的工具带着 path：多半是文件类，路径就是意图
+        return args["path"]
+    pairs = [
+        f"{key}={_summary_value(value)}"
+        for key, value in args.items()
+        if not _CREDENTIAL_KEY.search(str(key)) and value not in (None, "", [], {})
+    ]
+    return " ".join(pairs)
+
+
 def fit(value: object, reserve: int = 0, width: int | None = None) -> str:
     """按终端实际宽度压成一行（`preview` 的自适应版）。"""
     return preview(value, budget(reserve, width))

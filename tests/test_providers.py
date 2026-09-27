@@ -572,7 +572,7 @@ class TestCrossProviderFallback(ProviderTestCase):
         return Agent(cfg, registry=registry, usage=Usage()), gateway
 
     def _run(self, agent: Agent) -> None:
-        with mock.patch("xiaoyu.agent.time.sleep"), contextlib.redirect_stdout(io.StringIO()):
+        with mock.patch("xiaoyu.agent.Agent._sleep"), contextlib.redirect_stdout(io.StringIO()):
             agent.send("hi")
 
     def test_rate_limited_direct_falls_to_gateway(self) -> None:
@@ -611,7 +611,7 @@ class TestCrossProviderFallback(ProviderTestCase):
         以前落进 fatal，降级链直接不放行、整轮报错。"""
         broke = openai.APIStatusError("Insufficient Balance", response=_response(402), body=None)
         agent, gateway = self.build([broke], [[chunk(content="网关顶上")]])
-        with mock.patch("xiaoyu.agent.time.sleep") as fake_sleep, contextlib.redirect_stdout(io.StringIO()):
+        with mock.patch("xiaoyu.agent.Agent._sleep") as fake_sleep, contextlib.redirect_stdout(io.StringIO()):
             agent.send("hi")
         self.assertEqual(agent.last_assistant_text(), "网关顶上")
         self.assertEqual(len(gateway.completions.calls), 1)

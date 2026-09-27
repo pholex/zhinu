@@ -79,6 +79,17 @@ class BwrapArgsTest(unittest.TestCase):
         self.assertEqual(args[index + 1], "ALL")
 
 
+def home_probe(stem: str) -> Path:
+    """家目录里的探针路径（沙箱挡的就是往这里写，探针只能放这）。
+
+    名字带进程号与随机串：固定名字的话两份测试并行跑会互相踩，上一次跑到一半
+    被杀留下的残骸也会让这一次的断言看到假象。
+    """
+    import uuid
+
+    return Path.home() / f".{stem}-{os.getpid()}-{uuid.uuid4().hex[:8]}.txt"
+
+
 class LinuxWrapTest(unittest.TestCase):
     def test_wrap_builds_bwrap_call(self):
         with (
@@ -171,6 +182,33 @@ class HostProgramLookupTest(unittest.TestCase):
             argv, env = gitsafe.prepare(["--version"], self.ws)
             subprocess.run(argv, env=env, capture_output=True, timeout=30, cwd=str(self.ws))
         self.assertFalse(self.marker.exists(), "工作区里的假 git 被宿主执行了")
+
+
+class SecretPathsTest(unittest.TestCase):
+    def test_lists_user_env_and_user_mcp_config(self):
+        from xiaoyu import config as config_mod
+
+        paths = sandbox.secret_paths()
+        self.assertIn(str(config_mod.user_env_path()), paths)
+        self.assertIn(str(config_mod.user_config_dir() / "mcp.json"), paths)
+
+    def test_explicit_env_file_is_included(self):
+        with mock.patch.dict(os.environ, {"XIAOYU_ENV_FILE": "/opt/keys/xiaoyu.env"}):
+            self.assertIn("/opt/keys/xiaoyu.env", sandbox.secret_paths())
+
+    def test_deny_covers_reads_and_comes_last(self):
+        text = sandbox.policy_text(1, True, secret_files=1)
+        rule = '(deny file-read* file-write* (literal (param "SECRET_FILE_0")))'
+        self.assertGreater(text.index(rule), text.rindex("(allow "))
+
+    def test_bwrap_masks_existing_secret_with_empty_device(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            secret = Path(tmp) / ".env"
+            secret.write_text("K=1", encoding="utf-8")
+            args = sandbox.bwrap_args([], True, [], [str(secret), str(Path(tmp) / "missing")])
+        index = args.index(str(secret))
+        self.assertEqual(args[index - 2 : index], ["--ro-bind", "/dev/null"])
+        self.assertNotIn(str(Path(tmp) / "missing"), args)
 
 
 class ProtectedPathsTest(unittest.TestCase):
@@ -350,7 +388,7 @@ class RealSandboxTest(unittest.TestCase):
         ⚠️ 探针必须落在真正不可写的地方：临时目录的父目录就是 $TMPDIR，
         本身在可写根里——拿它当"外面"会测出假通过。用家目录。
         """
-        victim = Path.home() / "xiaoyu_sandbox_should_not_exist.txt"
+        victim = home_probe("xiaoyu_sandbox_should_not_exist")
         self.addCleanup(lambda: victim.exists() and victim.unlink())
         result = self.run_in_sandbox(f"echo pwned > {victim}")
         self.assertNotEqual(result.returncode, 0)
@@ -359,7 +397,7 @@ class RealSandboxTest(unittest.TestCase):
 
     def test_existing_file_outside_cannot_be_deleted(self):
         """真实存在的文件删不掉——不存在的路径 rm -f 会假成功，测不出保护。"""
-        home_victim = Path.home() / "xiaoyu_sandbox_test_victim.txt"
+        home_victim = home_probe("xiaoyu_sandbox_test_victim")
         home_victim.write_text("precious", encoding="utf-8")
         self.addCleanup(lambda: home_victim.exists() and home_victim.unlink())
         result = self.run_in_sandbox(f"rm -f {home_victim}")
@@ -394,6 +432,23 @@ class RealSandboxTest(unittest.TestCase):
             (self.ws / ".xiaoyu" / "permissions.txt").read_text(encoding="utf-8"), "# 空\n"
         )
         self.assertFalse((self.ws / ".xiaoyu" / "agents").exists())
+
+    def test_own_secret_files_are_unreadable(self):
+        """子进程环境里剥掉的密钥，不能让一条 cat 从配置文件里读回来。"""
+        conf = tempfile.TemporaryDirectory()
+        self.addCleanup(conf.cleanup)
+        secret = Path(conf.name).resolve() / ".env"
+        secret.write_text("DEEPSEEK_API_KEY=sk-very-secret\n", encoding="utf-8")
+        neighbour = secret.parent / "notes.txt"
+        neighbour.write_text("plain\n", encoding="utf-8")
+        with mock.patch.object(sandbox, "secret_paths", return_value=[str(secret)]):
+            result = self.run_in_sandbox(f"cat '{secret}'")
+            self.assertNotIn("sk-very-secret", result.stdout + result.stderr)
+            copied = self.run_in_sandbox(f"cp '{secret}' stolen.txt; cat stolen.txt")
+            self.assertNotIn("sk-very-secret", copied.stdout)
+            #  同目录里别的文件照常可读
+            other = self.run_in_sandbox(f"cat '{neighbour}'")
+            self.assertEqual(other.stdout.strip(), "plain")
 
     def test_ordinary_dotfiles_stay_writable(self):
         (self.ws / ".git").mkdir()
@@ -456,7 +511,7 @@ class BashToolIntegrationTest(unittest.TestCase):
         self.assertTrue(self.config.sandbox)
         box = Toolbox(self.config)
         #  家目录才是真正的"工作区之外"（$TMPDIR 在可写根里）
-        victim = Path.home() / "xiaoyu_tool_probe.txt"
+        victim = home_probe("xiaoyu_tool_probe")
         self.addCleanup(lambda: victim.exists() and victim.unlink())
         output = box.run("bash", {"command": f"echo pwned > {victim}"})
         self.assertFalse(victim.exists())
@@ -466,7 +521,7 @@ class BashToolIntegrationTest(unittest.TestCase):
     def test_sandbox_can_be_disabled(self):
         self.config.sandbox = False
         box = Toolbox(self.config)
-        victim = Path.home() / "xiaoyu_tool_probe_off.txt"
+        victim = home_probe("xiaoyu_tool_probe_off")
         self.addCleanup(lambda: victim.exists() and victim.unlink())
         box.run("bash", {"command": f"echo ok > {victim}"})
         self.assertTrue(victim.exists())

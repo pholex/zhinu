@@ -44,11 +44,8 @@ def args_preview(
     （缩进 + 符号 + 工具名）。写死上限的话，窄终端上"一行预览"会折成两行，
     折叠摘要的意义就没了。
     """
-    if name == "bash":
-        return ui.fit(args.get("command", ""), reserve, width)
-    if "path" in args:
-        return ui.fit(args["path"], reserve, width)
-    return ui.fit(args, reserve, width)
+    #  摘什么由 ui.tool_summary 定（与 ACP 的标题同一份规则），这里只管压到一行
+    return ui.fit(ui.tool_summary(name, args), reserve, width)
 
 
 #  计划状态的显示符号（校验用的合法状态集在 agent 侧，这里只管画）
@@ -100,7 +97,7 @@ def replay_transcript(
         role = record.get("role")
         if role == "user":
             text = media.text_of(record.get("content"))
-            if media.is_injected_user_text(text, skip_user_texts):
+            if media.is_injected_message(record, skip_user_texts):
                 continue
             if emitted:
                 notice("")  # 轮与轮之间空一行

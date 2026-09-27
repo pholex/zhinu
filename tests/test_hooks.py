@@ -203,6 +203,42 @@ class AgentIntegrationTest(AgentTestCase):
         self.assertTrue(any("hook 反馈" in text for text in user_texts))
         self.assertEqual(agent.last_assistant_text(), "补充完毕")
 
+    def test_stop_feedback_is_neither_a_user_turn_nor_an_operator_message(self):
+        """hook 打印的东西可能来自仓库文件：不当用户原话，也不进权威通道。"""
+        from xiaoyu import media
+        from xiaoyu.responses import OPERATOR_KEY
+        from xiaoyu.session_log import turn_starts
+
+        engine = self._engine([Hook("Stop", self._cmd("b.py", BLOCK_BODY))])
+        agent = self.build(
+            [text_turn("我做完了"), text_turn("补充完毕")], hook_engine=engine
+        )
+        agent.send("干活")
+        feedback = next(m for m in agent.messages if "hook 反馈" in str(m.get("content")))
+        self.assertTrue(feedback.get(media.INJECTED_KEY))
+        self.assertFalse(feedback.get(OPERATOR_KEY))
+        self.assertTrue(media.is_injected_message(feedback))
+        starts = turn_starts(agent.messages)
+        self.assertEqual([agent.messages[i]["content"] for i in starts], ["干活"])
+        #  私有标记止于内核边界（出网口统一摘下划线键）
+        from xiaoyu.responses import strip_private
+
+        self.assertNotIn(media.INJECTED_KEY, strip_private([feedback])[0])
+
+    def test_long_hook_output_is_clipped_with_both_ends_kept(self):
+        body = (
+            "import sys\n"
+            "sys.stderr.write('FIRST-ERROR\\n' + 'x' * 300000 + '\\nSUMMARY: 3 failed')\n"
+            "sys.exit(2)\n"
+        )
+        engine = self._engine([Hook("Stop", self._cmd("long.py", body))])
+        decision = engine.fire("Stop", {"last_text": "done"})
+        self.assertTrue(decision.blocked)
+        self.assertLess(len(decision.reason), 4_200)
+        self.assertIn("FIRST-ERROR", decision.reason)
+        self.assertIn("SUMMARY: 3 failed", decision.reason)
+        self.assertIn("省略", decision.reason)
+
 
 if __name__ == "__main__":
     unittest.main()

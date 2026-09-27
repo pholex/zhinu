@@ -159,6 +159,8 @@ def measured_send(
         agent.send(user_input)
     except Interrupted:
         interrupted = True
+        #  打断可能落在一批工具调用中间：悬空的调用补上原因，下一轮才发得出去
+        agent.close_open_tool_calls("本轮被宿主打断。")
     finally:
         output = agent.structured_output if output_schema is not None else None
         if output_schema is not None:

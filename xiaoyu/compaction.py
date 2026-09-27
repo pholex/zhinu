@@ -13,6 +13,7 @@
 from __future__ import annotations
 
 import re
+import time
 from dataclasses import dataclass
 from typing import Any, Callable
 
@@ -124,7 +125,9 @@ def sanitize_summary(summary: str) -> str:
 
 #  可清理的工具：结果是"可重新获取的原始数据"，清了随时能再拿。
 #  explore 的结论、skill 的说明是蒸馏产物 / 行为指令，清了拿不回来，不碰。
-CLEARABLE_TOOLS = frozenset({"read_file", "grep", "list_files", "bash"})
+#  browser 的页面快照同理，而且过期得最快：页面一跳转旧快照就作废了，单次
+#  又能有几万字符——不清的话要一直留到全量压缩
+CLEARABLE_TOOLS = frozenset({"read_file", "grep", "list_files", "bash", "browser"})
 
 #  小于这个字符数的结果不值得清（换出来的 token 抵不过 stub 占位）
 CLEAR_MIN_CHARS = 500
@@ -383,6 +386,21 @@ def collect_user_voice(
     )
 
 
+#  瞬时故障后的冷却（秒）：首次这么久，之后逐次翻倍到上限
+_TRANSIENT_COOLDOWN = 60.0
+_TRANSIENT_COOLDOWN_MAX = 600.0
+
+
+def _is_transient(exc: Exception) -> bool:
+    """这次摘要失败是不是"过一会儿就好"的那种。分类表只有一份（errors.classify）。"""
+    from . import errors
+
+    try:
+        return errors.classify(exc).kind in ("rate_limit", "transient")
+    except Exception:  # noqa: BLE001 - 分类器出岔子不能让压缩的失败出口再抛
+        return False
+
+
 @dataclass
 class CompactionState:
     count: int = 0
@@ -394,6 +412,39 @@ class CompactionState:
     #  这种情况说明剩下的都是压不动的内容（近期消息 + 已有摘要），
     #  再压只是白烧摘要调用还磨损细节。手动 /compact 不受限。
     ineffective: int = 0
+    #  瞬时故障（限流、网络抖动）后的冷却：到这个时刻之前不自动重试。
+    #  瞬时故障不进 failures——两次 429 不该让自动压缩停到会话结束
+    retry_at: float = 0.0
+    transient_failures: int = 0
+    #  最近一次失败的原因（/context 显示用）
+    last_failure: str = ""
+
+    def paused_reason(self, now: float | None = None) -> str:
+        """自动压缩此刻为什么不会触发；正常时返回空串。"""
+        if self.failures >= 2:
+            return f"连续失败 {self.failures} 次已暂停" + (
+                f"（{self.last_failure}）" if self.last_failure else ""
+            )
+        if self.ineffective >= 2:
+            return "连续两次收效甚微已暂停（剩下的内容压不动）"
+        remaining = self.retry_at - (time.monotonic() if now is None else now)
+        if remaining > 0:
+            return f"上次遇到瞬时故障，约 {int(remaining) + 1}s 后重试" + (
+                f"（{self.last_failure}）" if self.last_failure else ""
+            )
+        return ""
+
+    def recover(self) -> None:
+        """换了模型 / 清空了对话：之前判"别再试了"的依据不成立了，重新给机会。
+
+        失败多半与当时的摘要模型、当时的窗口有关；收效甚微说的是当时那份历史。
+        压缩次数与上次省下的量是账，不动。
+        """
+        self.failures = 0
+        self.ineffective = 0
+        self.retry_at = 0.0
+        self.transient_failures = 0
+        self.last_failure = ""
 
 
 class Compactor:
@@ -427,9 +478,7 @@ class Compactor:
         return int(self.context_limit * self.compact_at)
 
     def should_compact(self, estimated: int) -> bool:
-        if self.state.failures >= 2:
-            return False
-        if self.state.ineffective >= 2:
+        if self.state.paused_reason():
             return False
         return estimated >= self.budget()
 
@@ -460,13 +509,29 @@ class Compactor:
     # ---------- 执行 ----------
 
     def _fail(
-        self, messages: list[dict[str, Any]], reason: str
+        self, messages: list[dict[str, Any]], reason: str, transient: bool = False
     ) -> tuple[list[dict[str, Any]], str]:
         """压缩失败的统一出口：历史原样保留，失败计数 +1。
 
         撞到断路器阈值时给出自救命令清单（/compact /usage /clear
         三条指令）：自动路径断了，用户得知道手动出口在哪。
+
+        transient（限流、网络抖动、上游 5xx）不进断路器：那不是"这份历史压不了"，
+        过一会儿多半就好。改成冷却后重试，冷却逐次翻倍——不然上游持续限流时
+        每一步都要白发一次摘要请求。
         """
+        self.state.last_failure = reason
+        if transient:
+            self.state.transient_failures += 1
+            wait = min(
+                _TRANSIENT_COOLDOWN * 2 ** (self.state.transient_failures - 1),
+                _TRANSIENT_COOLDOWN_MAX,
+            )
+            self.state.retry_at = time.monotonic() + wait
+            return messages, (
+                f"压缩失败（历史已保留）：{reason}。这是瞬时故障，约 {int(wait)}s 后"
+                "自动重试；等不及可 /compact 手动重试"
+            )
         self.state.failures += 1
         note = f"压缩失败（历史已保留）：{reason}"
         if self.state.failures >= 2:
@@ -527,7 +592,9 @@ class Compactor:
             try:
                 summary = self.summarizer(clamp(transcript, self.transcript_cap // 2), prefix)
             except Exception as exc:  # noqa: BLE001
-                return self._fail(messages, f"{type(exc).__name__}: {exc}")
+                return self._fail(
+                    messages, f"{type(exc).__name__}: {exc}", transient=_is_transient(exc)
+                )
 
         if not summary.strip():
             return self._fail(messages, "摘要为空")
@@ -574,6 +641,9 @@ class Compactor:
         self.state.count += 1
         self.state.saved_tokens = before - after
         self.state.failures = 0
+        self.state.retry_at = 0.0
+        self.state.transient_failures = 0
+        self.state.last_failure = ""
 
         note = (
             f"已压缩 {len(older)} 条历史消息，估算 {before} → {after} tok"

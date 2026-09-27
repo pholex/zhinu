@@ -951,6 +951,19 @@ class LaunchSpecsTest(unittest.TestCase):
             name=name, command=sys.executable, args=[str(self.script)], timeout=15.0
         )
 
+    def test_trust_setting_reaches_sessions_with_extra_specs(self):
+        """带 extra_specs 走的是另一条路：信任开关不能在这条路上丢。"""
+        config = Config(
+            base_url="http://unused", model="m", workspace=self.workspace,
+            enable_plugins=False,
+        )
+        config.mcp_trust_changes = True
+        manager = mcp.launch(config, extra_specs=[self.fake_spec("extra")])
+        self.assertTrue(manager._trust_tool_changes)  # noqa: SLF001
+        config.mcp_trust_changes = False
+        manager = mcp.launch(config, extra_specs=[self.fake_spec("extra")])
+        self.assertFalse(manager._trust_tool_changes)  # noqa: SLF001
+
     def test_empty_specs_still_yield_a_real_manager(self):
         """空清单必须给出真 manager：返回 None 的话，嵌入方顺手往下传给
         Toolbox(mcp_view=None) 就等于"回到配置发现"——操作者自己 mcp.json 里的
@@ -1155,6 +1168,77 @@ class RedactTest(unittest.TestCase):
 
     def test_normal_text_untouched(self):
         self.assertEqual(mcp._redact("一切正常，共 3 条结果"), "一切正常，共 3 条结果")
+
+    def test_compound_keys_headers_and_json_are_covered(self):
+        leaked = "S3CR3T-value-0123"
+        shapes = [
+            f"access_token={leaked}",
+            f"client_secret={leaked}",
+            f"refresh_token: {leaked}",
+            f"X-Api-Key: {leaked}",
+            f"Authorization: Bearer {leaked}",
+            f"Authorization: Basic {leaked}",
+            f'{{"api_key": "{leaked}", "user": "bob"}}',
+            f"https://host/path?token={leaked}&page=2",
+            "github_pat_" + "A1b2" * 8,
+            "gho_" + "a" * 30,
+        ]
+        for text in shapes:
+            with self.subTest(text=text[:30]):
+                out = mcp._redact(text)
+                self.assertIn("[REDACTED]", out)
+                self.assertNotIn(leaked, out)
+                self.assertNotIn("A1b2A1b2", out)
+        #  不是凭据的那一半留着
+        self.assertIn('"user": "bob"', mcp._redact(shapes[6]))
+        self.assertIn("page=2", mcp._redact(shapes[7]))
+
+    def test_ordinary_words_are_not_eaten(self):
+        for text in (
+            "path /tmp/task-abcd_efgh_ijkl_mnop/file",
+            "the disk-usage-report-2026-09-27 is ready",
+            "see https://x/risk-assessment-abcdefghijklmnop",
+            "tokens used: 1523",
+            "invalid token",
+            "no password provided",
+            "secretary of state",
+        ):
+            with self.subTest(text=text):
+                self.assertEqual(mcp._redact(text), text)
+
+    def test_http_error_body_is_redacted_before_it_is_cut(self):
+        """截断落在令牌中间：先截后脱敏的话，剩下的半截对不上模式就漏了。"""
+        import io
+        import urllib.error
+
+        body = ("x" * 180 + " token=" + "Z" * 60).encode()
+        error = urllib.error.HTTPError("https://h/mcp", 500, "boom", {}, io.BytesIO(body))
+        channel = mcp._HttpChannel.__new__(mcp._HttpChannel)
+        channel.session_id = None
+        self.assertNotIn("ZZZZ", str(channel._http_error(error)))
+
+    def test_oauth_challenge_gets_its_own_hint(self):
+        """server 要的是 OAuth 登录时，让人去查 headers 是指错了路。"""
+        import io
+        import urllib.error
+        from email.message import Message
+
+        channel = mcp._HttpChannel.__new__(mcp._HttpChannel)
+        channel.session_id = None
+        headers = Message()
+        headers["WWW-Authenticate"] = (
+            'Bearer resource_metadata="https://h/.well-known/oauth-protected-resource"'
+        )
+        oauth = channel._http_error(
+            urllib.error.HTTPError("https://h/mcp", 401, "Unauthorized", headers, io.BytesIO(b""))
+        )
+        self.assertEqual(oauth.kind, "auth")
+        self.assertIn("OAuth", str(oauth))
+        self.assertNotIn("检查 mcp.json", str(oauth))
+        plain = channel._http_error(
+            urllib.error.HTTPError("https://h/mcp", 401, "Unauthorized", Message(), io.BytesIO(b""))
+        )
+        self.assertIn("检查 mcp.json", str(plain))
 
 
 class NormalizeSchemaTest(unittest.TestCase):
@@ -1397,6 +1481,143 @@ class EndToEndTest(unittest.TestCase):
         manager = self.make_manager()
         log = mcp.McpManager._log_path("fake")
         self.assertTrue(log.is_file())
+
+
+class RobustnessTest(unittest.TestCase):
+    """畸形帧、版本协商、找不到命令、坏配置：各自只该坏掉自己那一小块。"""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name).resolve()
+        patcher = mock.patch.object(mcp, "user_config_dir", lambda: self.root / "userconf")
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def server(self, body: str) -> mcp.McpManager:
+        script = self.root / "server.py"
+        script.write_text(textwrap.dedent(body), encoding="utf-8")
+        spec = mcp.ServerSpec(
+            name="fake", command=sys.executable, args=[str(script)], timeout=10.0
+        )
+        manager = mcp.McpManager([spec])
+        manager.start()
+        self.addCleanup(manager.close)
+        manager.wait_ready(20.0)
+        return manager
+
+    def test_frame_with_unhashable_id_costs_one_frame_not_the_connection(self):
+        manager = self.server(
+            """
+            import json, sys
+            def send(obj):
+                sys.stdout.write(json.dumps(obj) + "\\n"); sys.stdout.flush()
+            for line in sys.stdin:
+                msg = json.loads(line)
+                if "id" not in msg:
+                    continue
+                #  每个响应之前先塞一帧 id 是列表的垃圾
+                send({"jsonrpc": "2.0", "id": [1, 2], "result": {}})
+                send({"jsonrpc": "2.0", "id": {"a": 1}, "result": {}})
+                if msg["method"] == "initialize":
+                    send({"jsonrpc": "2.0", "id": msg["id"], "result": {
+                        "protocolVersion": "2025-06-18", "capabilities": {"tools": {}},
+                        "serverInfo": {"name": "fake", "version": "1"}}})
+                elif msg["method"] == "tools/list":
+                    send({"jsonrpc": "2.0", "id": msg["id"], "result": {"tools": [
+                        {"name": "echo", "description": "d",
+                         "inputSchema": {"type": "object", "properties": {}}}]}})
+                else:
+                    send({"jsonrpc": "2.0", "id": msg["id"], "result": {
+                        "content": [{"type": "text", "text": "ok"}]}})
+            """
+        )
+        names = [remote.name for remote in manager.ready_tools()]
+        self.assertEqual(names, ["mcp__fake__echo"])
+        text = manager.ready_tools()[0].handler()
+        self.assertEqual(text, "ok")
+
+    def test_version_rejected_with_supported_list_is_retried_once(self):
+        manager = self.server(
+            """
+            import json, sys
+            def send(obj):
+                sys.stdout.write(json.dumps(obj) + "\\n"); sys.stdout.flush()
+            for line in sys.stdin:
+                msg = json.loads(line)
+                if "id" not in msg:
+                    continue
+                if msg["method"] == "initialize":
+                    wanted = msg["params"]["protocolVersion"]
+                    if wanted != "2024-11-05":
+                        send({"jsonrpc": "2.0", "id": msg["id"], "error": {
+                            "code": -32602, "message": "Unsupported protocol version",
+                            "data": {"supported": ["2024-11-05"], "requested": wanted}}})
+                        continue
+                    send({"jsonrpc": "2.0", "id": msg["id"], "result": {
+                        "protocolVersion": "2024-11-05", "capabilities": {"tools": {}},
+                        "serverInfo": {"name": "old", "version": "0"}}})
+                elif msg["method"] == "tools/list":
+                    send({"jsonrpc": "2.0", "id": msg["id"], "result": {"tools": [
+                        {"name": "echo", "description": "d",
+                         "inputSchema": {"type": "object", "properties": {}}}]}})
+            """
+        )
+        self.assertEqual([r.name for r in manager.ready_tools()], ["mcp__fake__echo"])
+
+    def test_missing_command_is_named_in_the_error(self):
+        spec = mcp.ServerSpec(name="ghost", command="xiaoyu-no-such-mcp-binary", timeout=5.0)
+        manager = mcp.McpManager([spec])
+        manager.start()
+        self.addCleanup(manager.close)
+        manager.wait_ready(20.0)
+        text = manager.describe()
+        self.assertIn("找不到启动命令", text)
+        self.assertIn("xiaoyu-no-such-mcp-binary", text)
+        self.assertNotIn("exit None", text)
+
+    def test_unreadable_configs_are_skipped_not_fatal(self):
+        path = self.root / ".mcp.json"
+        for raw in (b"[1, 2, 3]", b'"just a string"', b"\xff\xfe broken bytes", b"{not json"):
+            with self.subTest(raw=raw[:12]):
+                path.write_bytes(raw)
+                with contextlib.redirect_stderr(io.StringIO()) as shown:
+                    self.assertEqual(mcp._parse_config_file(path), [])
+                self.assertIn(str(path), shown.getvalue())
+                #  写入路径相反：读不出来必须抛，不能当成空配置覆盖回去
+                with self.assertRaises(mcp.McpError):
+                    mcp.read_config_file(path)
+
+    def test_remote_servers_with_different_urls_have_different_fingerprints(self):
+        one = mcp.ServerSpec(name="a", command="", url="https://one.example/mcp")
+        two = mcp.ServerSpec(name="a", command="", url="https://two.example/mcp")
+        rotated = mcp.ServerSpec(
+            name="a", command="", url="https://one.example/mcp",
+            headers={"Authorization": "Bearer new"},
+        )
+        prints = {mcp.spec_fingerprint(spec) for spec in (one, two, rotated)}
+        self.assertEqual(len(prints), 3)
+
+    def test_undefined_variables_are_reported(self):
+        with mock.patch.dict(os.environ, {"DEFINED_ONE": "v"}):
+            os.environ.pop("XIAOYU_TEST_UNDEFINED", None)
+            specs, problems = mcp.parse_server_mapping({
+                "gw": {"url": "https://h.example/mcp",
+                       "headers": {"Authorization": "Bearer ${XIAOYU_TEST_UNDEFINED}"}},
+                "ok": {"command": "npx", "env": {"K": "${env:DEFINED_ONE}"}},
+            })
+        self.assertEqual(len(specs), 2)
+        self.assertEqual(len(problems), 1)
+        self.assertIn("XIAOYU_TEST_UNDEFINED", problems[0])
+        self.assertIn("'gw'", problems[0])
+
+    def test_closed_manager_leaves_the_at_exit_list(self):
+        self.addCleanup(mcp.shutdown_all)
+        manager = mcp.launch_specs([])
+        self.assertIn(manager, mcp._extra_managers)
+        manager.close()
+        self.assertNotIn(manager, mcp._extra_managers)
+        manager.close()  # 幂等
 
 
 class ToolboxIntegrationTest(unittest.TestCase):

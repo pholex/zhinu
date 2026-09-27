@@ -44,7 +44,7 @@ from .compaction import (
     microcompact,
 )
 from .config import Config
-from .errors import classify
+from .errors import Interrupted, classify
 from .providers import Registry, Route, UnknownModel
 from .permissions import Permissions
 from .events import (
@@ -198,22 +198,6 @@ def normalize_questions(questions: Any) -> list[dict[str, Any]] | str:
             }
         )
     return normalized
-
-
-class Interrupted(Exception):
-    """`Agent.interrupt()` 触发的打断——不是 OS 信号，是宿主线程/协程主动请求的。
-
-    刻意**不**继承 `KeyboardInterrupt`（最初这么写过，被 async 场景的测试炸出来
-    才改掉）：`asyncio.Task` 对 `(KeyboardInterrupt, SystemExit)` 有特殊处理——
-    不会把它们收进 Task 的结果里正常传播，而是直接原样捅穿事件循环，效果等同于
-    "整个进程被 Ctrl-C 了"。库层嵌入场景下 `interrupt()` 跑在 `asyncio.to_thread`
-    包着的工作线程里，这个特殊处理会导致 `await async_agent.send(...)` 直接把
-    宿主的整个事件循环带崩，而不是像一次普通异常那样被 `try/except` 接住。
-
-    `_stream_once` 的收尾分支同时捕获 `(KeyboardInterrupt, Interrupted)`——两条
-    触发路径共用同一段"半截话入历史、残缺 tool_calls 丢弃"的逻辑，但只有真的
-    OS 信号才会被顶层特殊对待。
-    """
 
 
 #  内置 system prompt 分三段。默认三段原样相连（SYSTEM_PROMPT，与拆分前逐字一致）；
@@ -820,6 +804,7 @@ class Agent:
         hook_engine: Any | None = None,
         asker: Asker | None = None,
         peer: "PeerLink | None" = None,
+        upstream_stop: Callable[[], bool] | None = None,
     ) -> None:
         self.config = config
         self.toolbox = toolbox or Toolbox(config)
@@ -864,6 +849,10 @@ class Agent:
         #  库层嵌入用：宿主可从任意线程/协程调用 interrupt()，线程安全，
         #  不依赖 OS 信号。_consume_stream 在下一个 chunk 边界自己发现并收尾。
         self._interrupt_flag = threading.Event()
+        #  子 agent 用：问父级"你被打断了吗"。父级被打断时，在飞的子 agent 在自己的
+        #  下一个检查点跟着停——不然父级要等它自己跑完才停得下来。
+        #  只问不清：那是父级的标志，由父级在自己的轮次开头清
+        self._upstream_stop = upstream_stop
         #  steer：运行中追加的用户输入，任意线程可入队，
         #  agent 在 step 边界消费。queue.Queue 自带锁，与 interrupt 同一纪律。
         self._steer_queue: queue.Queue[str] = queue.Queue()
@@ -883,6 +872,8 @@ class Agent:
         #  hasattr 兜底：嵌入宿主可能注入自定义 Toolbox 形态。
         if hasattr(self.toolbox, "tasks"):
             self.toolbox.tasks.notify = self.notify
+        #  前台命令的等待循环靠它发现打断（见 Toolbox.stop_requested）
+        self.toolbox.stop_requested = self.interrupt_requested
         #  MCP 检索模式的 server 上线公告走同一条轨道（tools._announce_mcp），
         #  但**不唤醒**：模型已经在给收尾正文时，为一条"某某 server 上线了"
         #  强制再跑一步，模型会把同一个问题再答一遍（client 端拼成一条，
@@ -897,6 +888,8 @@ class Agent:
         self.session_log = session_log
         #  上一次快照进日志的用量（轮末对比，变了才写；见 _log_usage）
         self._usage_logged: dict[str, Any] | None = None
+        #  会话日志停写的提示只发一次
+        self._log_loss_warned = False
         #  plan mode 的计划文件：有会话文件就放它旁边
         #  （<会话名>.plan.md，不进仓库）；没有（eval/嵌入）退到工作区 .xiaoyu/。
         log_path = getattr(session_log, "path", None) if session_log is not None else None
@@ -1226,6 +1219,7 @@ class Agent:
                         runs=subagent_runs,
                         mcp_manager=getattr(self.toolbox, "mcp_manager", None),
                         parent_history=lambda: self.messages,
+                        stop_requested=self.interrupt_requested,
                     )
                 )
                 mounted_specs.append(spec)
@@ -1240,6 +1234,7 @@ class Agent:
                         self.sink, self.approver, self.permissions,
                         subagent_runs,
                         mcp_manager=getattr(self.toolbox, "mcp_manager", None),
+                        stop_requested=self.interrupt_requested,
                     )
                 )
             #  斗巧（竞争织造）：与七襄同闸——有可扇出的 spec 才有参赛者
@@ -1252,6 +1247,7 @@ class Agent:
                         self.sink, self.approver, self.permissions,
                         subagent_runs,
                         mcp_manager=getattr(self.toolbox, "mcp_manager", None),
+                        stop_requested=self.interrupt_requested,
                     )
                 )
         #  宸枢（编排总控模式）：init 常驻 schema，其余工具在 active 后经
@@ -1766,7 +1762,9 @@ class Agent:
                 "以下是完整内容（供上下文被压缩后重取）。\n\n"
             ) + header
         self._loaded_skills.add(name)
-        return header + body
+        #  留出头部与续读提示的余量：合起来不许再被工具输出的通用截断挖掉中段
+        budget = max(2_000, self.config.max_tool_output - len(header) - 600)
+        return header + skills.clip_body(found, body, budget)
 
     #  收尾轻推的迭代阈值：同一文件被整写 ≥3 次（首写 + 至少两轮返工才算真迭代，
     #  "建文件 + 改一处"够不着）且本轮 bash ≥3 次（写了要跑过才叫验证过的解法）。
@@ -1917,6 +1915,8 @@ class Agent:
         """
         self.messages = [{"role": "system", "content": self._system_prompt()}]
         self._history_rewritten()
+        #  压缩断路器说的是"那份历史压不动 / 那时的摘要调用不通"，历史没了就不作数
+        self.compactor.state.recover()
         self.plan = []
         #  plan 档必须跟着清：它的规则是以 user 消息注入历史的，历史一空模型就
         #  不知道自己在规划态了，留着就是"关卡还在拦、模型却不明白为什么"。
@@ -2049,6 +2049,38 @@ class Agent:
         """
         self._interrupt_flag.set()
 
+    def interrupt_requested(self) -> bool:
+        """此刻有没有待处理的打断（自己的，或父级的）。只看不清。"""
+        if self._interrupt_flag.is_set():
+            return True
+        upstream = self._upstream_stop
+        return upstream is not None and bool(upstream())
+
+    def _checkpoint(self) -> None:
+        """打断检查点：有待处理的打断就清掉自己的标志并抛 Interrupted。
+
+        检查点不止流的 chunk 边界一处：退避等待、一批工具调用的每一个之间、
+        前台命令的等待循环都要看——否则打断要等到模型下一次开口才生效，
+        而那可能隔着一分多钟的退避或一条几十分钟的命令。
+        """
+        if self.interrupt_requested():
+            self._interrupt_flag.clear()
+            raise Interrupted("宿主请求打断")
+
+    def _sleep(self, seconds: float) -> None:
+        """可被打断的等待（退避用）：打断到达时立刻醒来并抛 Interrupted。"""
+        if self._upstream_stop is None:
+            self._interrupt_flag.wait(seconds)
+        else:
+            #  两个标志没法同时等：切成小片轮流看
+            deadline = time.monotonic() + seconds
+            while not self.interrupt_requested():
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                self._interrupt_flag.wait(min(0.2, remaining))
+        self._checkpoint()
+
     def steer(self, text: str) -> None:
         """运行中追加一条用户输入（线程安全）。
 
@@ -2153,7 +2185,8 @@ class Agent:
         #  wake_only 跟着 consumed 走：插话/信箱已经让这一步非跑不可时，
         #  捎带把不唤醒的通知也送了；否则只有 wake 项才值得多跑一步。
         for note in self._drain_notifications(wake_only=not consumed):
-            self._record_operator(f"<system-reminder>\n{note}\n</system-reminder>")
+            #  通知里有后台任务的命令行、monitor 转来的输出行：不可信，不走 operator
+            self._record_injected(f"<system-reminder>\n{note}\n</system-reminder>")
             if self.session_log:
                 self.session_log.event("notify")
             consumed = True
@@ -2164,6 +2197,17 @@ class Agent:
         self.messages.append(message)
         if self.session_log:
             self.session_log.append(message)
+            if not self._log_loss_warned and not getattr(self.session_log, "complete", True):
+                #  只说一次：会话照常进行，但用户得知道之后的内容 resume 不回来
+                self._log_loss_warned = True
+                why = getattr(self.session_log, "broken_reason", "") or "写入失败"
+                self.sink.emit(
+                    Notice(
+                        f"[会话日志已停写（{why}）：从这里往后的对话不会落盘，"
+                        "resume 只能恢复到此前的内容]",
+                        "warn",
+                    )
+                )
 
     def _record_operator(self, text: str) -> None:
         """以 operator 身份入历史：harness/宿主说的话，不是用户原话。
@@ -2171,9 +2215,19 @@ class Agent:
         内核形态仍是 role=user（压缩的 synthetic 判据、fork、回放全部不变），
         只多一个私有标记；出网时认会话中 system 的型号翻成 `role: system`
         （见 messages._place_operators），其余协议与从前一个字节不差。
-        **不可放不可信内容**（同伴来信、工具输出、插话都不走这里）。
+        **不可放不可信内容**（同伴来信、工具输出、插话都不走这里；hook 的输出、
+        后台任务通知走 _record_injected）。
         """
         self._record({"role": "user", "content": text, OPERATOR_KEY: True})
+
+    def _record_injected(self, text: str) -> None:
+        """harness 放进历史、但内容不可信的消息：出网永远是 role=user。
+
+        hook 打印的理由、monitor 转来的输出行都可能来自仓库里的文件（测试输出、
+        日志）——走 operator 通道的话，认会话中 system 的型号会把它们当成
+        权威指令。章照盖：回放、数轮次、蒸馏都不把它当用户原话。
+        """
+        self._record({"role": "user", "content": text, media.INJECTED_KEY: True})
 
     # ---------- rewind（/rewind：回滚到某轮开始前） ----------
 
@@ -2229,6 +2283,25 @@ class Agent:
             if self.session_log:
                 self.session_log.event("rewind_files", target=index, ok=ok)
         return "；".join(notes) if notes else "什么也没做。"
+
+    def drop_from(self, start: int, reason: str) -> int:
+        """把历史从下标 start 起整段拿掉（不含 system），返回拿掉了几条。
+
+        给"这一轮不该留在历史里"的场合用：服务端拒答的那一轮留着的话，之后
+        每一次请求都带着它，多半接着被拒。落盘走 rewind 同款的 replacement，
+        resume 重放时整体替换，不需要理解这里发生了什么。
+        """
+        start = max(1, start)
+        dropped = len(self.messages) - start
+        if dropped <= 0:
+            return 0
+        self.messages = self.messages[:start]
+        self._history_rewritten()
+        if self.session_log:
+            self.session_log.event(
+                "rewind", target=-1, reason=reason, replacement=self.messages[1:]
+            )
+        return dropped
 
     # ---------- 主循环 ----------
 
@@ -2417,7 +2490,7 @@ class Agent:
                             self.sink.emit(
                                 Notice(f"[Stop hook 要求继续：{decision.reason}]", "warn")
                             )
-                            self._record_operator(f"[hook 反馈] {decision.reason}")
+                            self._record_injected(f"[hook 反馈] {decision.reason}")
                             continue
                     #  收尾轻推排在 Stop hook 之后：hook 顶回去续跑的轮次还没
                     #  真正收尾，等它真结束时这里自然会再走到
@@ -2443,6 +2516,8 @@ class Agent:
                 continue
 
             for call in calls:
+                #  同一批里后面的调用不该在打断之后照跑
+                self._checkpoint()
                 self._record(self._execute(call))
             #  structured_output 已落：这就是收尾，不再让模型多说一轮
             if self.output_schema is not None and self.structured_output is not None:
@@ -2553,6 +2628,7 @@ class Agent:
         for call in calls:
             function = call.get("function") or {}
             if function.get("name") != EXTEND_TURNS_TOOL:
+                self._checkpoint()
                 self._record(self._execute(call))
                 continue
             try:
@@ -2714,9 +2790,8 @@ class Agent:
         for message in reversed(self.messages):
             if message.get("role") != "user":
                 continue
-            text = media.text_of(message.get("content"))
-            if not media.is_injected_user_text(text, SYNTHETIC_USER_TEXTS):
-                return text
+            if not media.is_injected_message(message, SYNTHETIC_USER_TEXTS):
+                return media.text_of(message.get("content"))
         return ""
 
     def _attach_media(self) -> None:
@@ -3179,6 +3254,9 @@ class Agent:
         else:
             #  用户/客户端显式换模型（或回探成功切回）：以这次选择为准，不再回探
             self._preferred_model = None
+        if name != self.config.model:
+            #  窗口与摘要链都可能跟着变：之前停掉的自动压缩重新给机会
+            self.compactor.state.recover()
         self.config.model = name
         if self.session_log:
             self.session_log.event("model", model=name)
@@ -3445,7 +3523,8 @@ class Agent:
                         "warn",
                     )
                 )
-                time.sleep(wait)
+                #  等的是别人，不是在干活：打断要能立刻生效
+                self._sleep(wait)
                 delay *= 2
         raise RuntimeError("unreachable")  # for 循环里必然 return 或 raise
 
@@ -3722,9 +3801,7 @@ class Agent:
             #  库层嵌入：宿主的 interrupt() 在这个边界被发现。抛
             #  Interrupted（KeyboardInterrupt 子类）复用 _stream_once 里
             #  现成的收尾分支——半截话入历史、残缺 tool_calls 丢弃。
-            if self._interrupt_flag.is_set():
-                self._interrupt_flag.clear()
-                raise Interrupted("宿主请求打断")
+            self._checkpoint()
             if getattr(chunk, "usage", None):
                 #  收到 usage 即视为正常收尾：有些端点不发 finish_reason，只在
                 #  最后给一个纯 usage chunk（断流判定见 _stream_once）

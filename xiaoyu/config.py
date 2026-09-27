@@ -147,6 +147,58 @@ def save_user_env(values: dict[str, str]) -> Path:
     return path
 
 
+#  数值型环境变量 → (类型, 下限, 上限, 超出范围时的说明)。只收"超出范围就该
+#  忽略"的那几个；其余数值项在 from_env 里自己钳到合法区间，不算写错
+_NUMERIC_ENV: dict[str, tuple[type, float | None, float | None, str]] = {
+    "XIAOYU_CONTEXT_LIMIT": (int, 1_000, None, "单位是 token，至少 1000"),
+    "XIAOYU_KEEP_RECENT": (int, 1, None, "至少保留 1 条"),
+    "XIAOYU_COMPACT_AT": (float, 0.05, 1.0, "是占窗口的比例，取 0.05~1（0.7 即 70%）"),
+    "XIAOYU_BUDGET_TOKENS": (int, 0, None, "不能为负"),
+    "XIAOYU_TURN_EXTENSION": (float, 0, None, "不能为负"),
+    "XIAOYU_EXPLORE_ITERATIONS": (int, None, None, ""),
+    "XIAOYU_SUBAGENT_MAX_DEPTH": (int, None, None, ""),
+    "XIAOYU_QIXIANG_CONCURRENCY": (int, None, None, ""),
+    "XIAOYU_QIXIANG_TIMEOUT": (int, None, None, ""),
+    "XIAOYU_CHENSHU_MAX_WORKERS": (int, None, None, ""),
+}
+
+
+def _check_number(name: str) -> tuple[float | None, str]:
+    """(合法的取值, 问题说明)。没设置 = (None, "")；写错了 = (None, 说明)。"""
+    raw = os.environ.get(name)
+    if raw is None or not raw.strip():
+        return None, ""
+    cast, low, high, hint = _NUMERIC_ENV[name]
+    try:
+        value = cast(raw.strip())
+    except ValueError:
+        return None, f"{name}={raw.strip()!r} 不是{'整数' if cast is int else '数字'}，已忽略"
+    if (low is not None and value < low) or (high is not None and value > high):
+        return None, f"{name}={raw.strip()} 超出范围（{hint}），已忽略"
+    return value, ""
+
+
+def env_number(name: str) -> float | None:
+    """数值型环境变量的合法取值；没设置或写错了都返回 None（沿用默认值）。"""
+    return _check_number(name)[0]
+
+
+def env_problems() -> list[str]:
+    """环境变量里写错了、因而被忽略的配置，一条一句。
+
+    写错的值一直是静默忽略——`XIAOYU_COMPACT_AT=70`（本意 70%）等于永不压缩，
+    用户要到上下文撑爆才发现。忽略的做法不变（配置写错不该炸主循环），
+    只是启动时说一声。
+    """
+    problems = [note for name in _NUMERIC_ENV if (note := _check_number(name)[1])]
+    effort = os.environ.get("XIAOYU_EFFORT", "").strip().lower()
+    if effort and effort not in EFFORT_LEVELS:
+        problems.append(
+            f"XIAOYU_EFFORT={effort!r} 不认识（可选：{' / '.join(EFFORT_LEVELS)}），已忽略"
+        )
+    return problems
+
+
 def load_dotenv(
     explicit: Path | None = None, untrusted_dir: Path | None = None
 ) -> list[Path]:
@@ -420,6 +472,8 @@ class Config:
 
     @classmethod
     def from_env(cls, workspace: Path | None = None, **overrides) -> "Config":
+        #  数值项的解析与取值范围在 _NUMERIC_ENV / env_number 里：写错的值在这里
+        #  只是被忽略（不炸主循环），说出来是 env_problems 的事
         cfg = cls(
             base_url=os.environ.get("XIAOYU_BASE_URL", ""),
             model=os.environ.get("XIAOYU_MODEL", DEFAULT_MODEL),
@@ -430,16 +484,14 @@ class Config:
         )
         if raw := os.environ.get("XIAOYU_FALLBACK_MODELS"):
             cfg.fallback_models = [name.strip() for name in raw.split(",") if name.strip()]
-        if limit := os.environ.get("XIAOYU_CONTEXT_LIMIT"):
-            with contextlib.suppress(ValueError):
-                cfg.context_limit = int(limit)
+        if (limit := env_number("XIAOYU_CONTEXT_LIMIT")) is not None:
+            cfg.context_limit = int(limit)
         if rounds := os.environ.get("XIAOYU_EXPLORE_ITERATIONS"):
             with contextlib.suppress(ValueError):
                 cfg.explore_iterations = max(1, min(int(rounds), 100))
-        if keep := os.environ.get("XIAOYU_KEEP_RECENT"):
-            with contextlib.suppress(ValueError):
-                cfg.keep_recent = int(keep)
-        if level := os.environ.get("XIAOYU_EFFORT", "").strip().lower():
+        if (keep := env_number("XIAOYU_KEEP_RECENT")) is not None:
+            cfg.keep_recent = int(keep)
+        if (level := os.environ.get("XIAOYU_EFFORT", "").strip().lower()) in EFFORT_LEVELS:
             cfg.effort = level
         if raw := os.environ.get("XIAOYU_BUDGET_TOKENS"):
             with contextlib.suppress(ValueError):
@@ -449,9 +501,8 @@ class Config:
                 cfg.turn_extension = max(0.0, float(raw))
         if (flag := os.environ.get("XIAOYU_SERVER_COMPACTION")) is not None:
             cfg.server_compaction = flag.strip().lower() not in ("0", "false", "no", "off")
-        if ratio := os.environ.get("XIAOYU_COMPACT_AT"):
-            with contextlib.suppress(ValueError):
-                cfg.compact_at = float(ratio)
+        if (ratio := env_number("XIAOYU_COMPACT_AT")) is not None:
+            cfg.compact_at = float(ratio)
         if (flag := os.environ.get("XIAOYU_ENABLE_EXPLORE")) is not None:
             cfg.enable_explore = flag.strip().lower() not in ("0", "false", "no", "off")
         if (flag := os.environ.get("XIAOYU_ENABLE_SKILLS")) is not None:

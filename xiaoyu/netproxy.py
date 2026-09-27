@@ -41,7 +41,11 @@ _SOCKS5_SCHEMES = ("socks5", "socks5h")
 #  只关心这几种：别的 *_PROXY（ftp_proxy、TRAVIS_APT_PROXY…）与小羽的出网无关
 _KINDS = ("http", "https", "all", "no")
 _SYSTEM_LABEL = "系统代理设置"
-SOCKS_REMEDY = 'pip install "httpx[socks]"'
+def socks_remedy() -> str:
+    """装 SOCKS 依赖的命令（按小羽所在的环境给，见 envprobe.install_hint）。"""
+    from .envprobe import install_hint
+
+    return install_hint("httpx[socks]")
 
 
 @dataclass(frozen=True)
@@ -182,7 +186,7 @@ def _check(kind: str, var: str, raw: str, socks_ok: bool) -> Entry | Rejected:
         return Rejected(var, shown, "地址解析不出主机名", f"检查 {var} 的写法，形如 http://127.0.0.1:7890")
     scheme = parts.scheme.lower()
     if scheme in _SOCKS5_SCHEMES and not socks_ok:
-        return Rejected(var, shown, "SOCKS5 代理需要 socksio 依赖，当前环境没装", SOCKS_REMEDY)
+        return Rejected(var, shown, "SOCKS5 代理需要 socksio 依赖，当前环境没装", socks_remedy())
     if scheme in ("socks4", "socks4a"):
         return Rejected(
             var, shown, "小羽的 HTTP 客户端（httpx）不支持 SOCKS4",

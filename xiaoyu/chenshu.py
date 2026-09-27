@@ -295,7 +295,7 @@ class ChenshuRuntime:
             return None
         try:
             data = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
+        except (OSError, ValueError):
             return None
         #  至少 system + 一条对话才算有上下文可续；坏档当没有
         if (
@@ -1070,8 +1070,17 @@ class ChenshuRuntime:
             failure = f"{type(exc).__name__}: {exc}"
         finally:
             handoff = ""
+            cut_short = ""
             if agent is not None:
+                from .agents import reap_background
+
+                if reaped := reap_background(agent):
+                    self.log(name, "member.reaped", detail=f"{reaped} 个后台任务")
                 handoff = agent.last_assistant_text()
+                if not failure:
+                    from .agents import STOP_REASONS
+
+                    cut_short = STOP_REASONS.get(str(getattr(agent, "last_stop", "")), "")
                 #  先落存档再翻花名册状态：总枢收到"完成"事件那一刻 resume 就已可用
                 self._save_archive(name, [dict(m) for m in agent.messages])
                 with self.lock:
@@ -1082,18 +1091,43 @@ class ChenshuRuntime:
                     member.status = "failed" if failure else "done"
                     member.handoff = ui.preview(handoff or failure, 500)
                 self._save()
-            self.log(name, "member.failed" if failure else "member.done",
-                     detail=ui.preview(failure or handoff, 80))
-            verb = "失败" if failure else "完成"
+            outcome = "member.failed" if failure else "member.cut_short" if cut_short else "member.done"
+            self.log(name, outcome, detail=ui.preview(failure or cut_short or handoff, 80))
+            #  "完成"只留给模型自己收尾的情形：被轮数上限 / 预算叫停的成员交的是进度
+            verb = "失败" if failure else "停下" if cut_short else "完成"
+            facts = "" if failure else self._delivery_facts(mission, workdir)
             event = (
                 f"{name} {verb}"
                 + (f"：{failure}" if failure else "")
+                + (f"（{cut_short}，没做完——可 resume=true 续跑）" if cut_short else "")
+                + (f"\n实况：{facts}" if facts else "")
                 + (f"\n交接：{ui.preview(handoff, 400)}" if handoff else "")
             )
             self.events.put(event)
             self.notify(f"宸枢：{name} {verb}。chenshu_wait / chenshu_status 查看。",
                         f"chenshu-{name}-{verb}")
             self.sink.emit(Notice(f"  🛰 宸枢：{name} {verb}"))
+
+    def _delivery_facts(self, mission: Mission | None, workdir: Path) -> str:
+        """成员收工那一刻量出来的事实：mission 标没标完成、分支上有几个提交、
+        工作区还有没有没提交的改动。
+
+        "完成"是成员自己说的；评审、合并都要花真金白银，等到 merge 闸才发现
+        分支上一个提交都没有就晚了。量不出来的那一项不报。
+        """
+        if mission is None or mission.kind != "build":
+            return ""
+        parts = [f"mission {mission.id} 状态 {mission.status}"]
+        if mission.branch and self.base_branch:
+            count = _git_out(
+                ["rev-list", "--count", f"{self.base_branch}..{mission.branch}"], workdir
+            )
+            if count is not None and count.isdigit():
+                parts.append(f"分支上 {count} 个提交" if int(count) else "分支上**没有提交**")
+        dirty = _git_out(["status", "--porcelain"], workdir)
+        if dirty:
+            parts.append(f"工作区还有 {len(dirty.splitlines())} 处改动没提交")
+        return "；".join(parts)
 
     def wait(self, timeout: int) -> str:
         self._require_active()

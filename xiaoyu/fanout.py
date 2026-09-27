@@ -18,6 +18,7 @@ from dataclasses import dataclass
 from typing import Any, Callable
 
 from .agents import DelegationResult
+from .errors import Interrupted
 
 #  错峰间隔：首批并发槽位依次延后起步，避免同一瞬间打满 provider
 STAGGER_SECONDS = 0.3
@@ -50,6 +51,7 @@ def run_attempts(
     timeout_s: int = 0,
     min_answer_chars: int = MIN_ANSWER_CHARS,
     on_settled: Callable[[Attempt, int, int], None] | None = None,
+    stop_requested: Callable[[], bool] | None = None,
 ) -> None:
     """并发跑完全部尝试；结果写回各 Attempt。
 
@@ -60,6 +62,8 @@ def run_attempts(
       deadline 边上完赛的尝试会被巡检误标超时、好答案被藏。
     - 用户中止（BaseException）：叫停所有在飞 agent、等一小段让存档
       落地（resume 句柄仍有效）后原样上抛。
+    - stop_requested（父级的"我被打断了吗"）每个 tick 问一次：宿主经
+      interrupt() 叫停父级时没有异常会落到这个线程上，得自己去看。
     """
     cancel_event = threading.Event()
     live: dict[int, Any] = {}
@@ -115,6 +119,9 @@ def run_attempts(
         pending = set(futures)
         settled = 0
         while pending:
+            if stop_requested is not None and stop_requested():
+                #  走下面的中止分支：叫停在飞的、保住存档、原样上抛
+                raise Interrupted("宿主请求打断")
             finished, pending = wait(pending, timeout=1.0, return_when=FIRST_COMPLETED)
             for future in finished:
                 settled += 1

@@ -237,7 +237,7 @@ def load_baseline(path: Path) -> dict[str, dict[str, str]]:
     """{server: {tool: 指纹}}。坏文件当空基线（等价于全部重新 TOFU）。"""
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
+    except (OSError, ValueError):
         return {}
     return data if isinstance(data, dict) else {}
 
@@ -248,7 +248,7 @@ def load_declarations(path: Path) -> dict[str, dict[str, dict[str, Any]]]:
     声明另存一份旁路文件；坏了/没有只影响 diff 的可读性，不影响裁决。"""
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
+    except (OSError, ValueError):
         return {}
     if not isinstance(data, dict):
         return {}

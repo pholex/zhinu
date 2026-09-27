@@ -42,10 +42,106 @@ _MAX_SCAN_NODES = 512
 _TOO_COMPLEX = "命令嵌套过深或写法分叉过多，无法完整分析（按有风险处理）"
 
 
+_ANSI_C_ESCAPES = {
+    "a": "\a", "b": "\b", "e": "\x1b", "E": "\x1b", "f": "\f", "n": "\n",
+    "r": "\r", "t": "\t", "v": "\v", "\\": "\\", "'": "'", '"': '"', "?": "?",
+}
+_HEX = "0123456789abcdefABCDEF"
+
+
+def _decode_ansi_c(body: str) -> str:
+    """`$'…'` 引号体里的转义 → 字面字符（bash 手册 ANSI-C Quoting 一节的那张表）。"""
+    out: list[str] = []
+    i, n = 0, len(body)
+    while i < n:
+        ch = body[i]
+        if ch != "\\" or i + 1 >= n:
+            out.append(ch)
+            i += 1
+            continue
+        nxt = body[i + 1]
+        if nxt in _ANSI_C_ESCAPES:
+            out.append(_ANSI_C_ESCAPES[nxt])
+            i += 2
+        elif nxt in "xuU":
+            width = {"x": 2, "u": 4, "U": 8}[nxt]
+            j = i + 2
+            while j < n and j - (i + 2) < width and body[j] in _HEX:
+                j += 1
+            digits = body[i + 2 : j]
+            try:
+                out.append(chr(int(digits, 16)) if digits else "\\" + nxt)
+            except (ValueError, OverflowError):
+                out.append("?")
+            i = j
+        elif nxt in "01234567":
+            j = i + 1
+            while j < n and j - (i + 1) < 3 and body[j] in "01234567":
+                j += 1
+            out.append(chr(int(body[i + 1 : j], 8) & 0xFF))
+            i = j
+        elif nxt == "c" and i + 2 < n:
+            out.append(chr(ord(body[i + 2]) & 0x1F))
+            i += 3
+        else:
+            out.append("\\" + nxt)
+            i += 2
+    return "".join(out)
+
+
+def _plain_quoting(segment: str) -> str:
+    """把 shlex 不认的两种 shell 写法改写成它认的等价形式。
+
+    - `$'-rf'`（ANSI-C 引号）→ 普通单引号串。不改的话 shlex 把它读成 `$-rf`，
+      `rm $'-rf' x` 里的 force 就看不见了；
+    - 反斜杠 + 换行（续行）→ 删掉。shell 在分词之前就把它拿走，`r` + 续行 + `m` 是 rm。
+    认引号状态：单引号里这两样都是字面量，双引号里 `$'` 是字面量。
+    """
+    if "$'" not in segment and "\\\n" not in segment:
+        return segment
+    out: list[str] = []
+    quote = ""
+    i, n = 0, len(segment)
+    while i < n:
+        ch = segment[i]
+        if quote == "'":
+            out.append(ch)
+            if ch == "'":
+                quote = ""
+            i += 1
+            continue
+        if ch == "\\" and i + 1 < n:
+            if segment[i + 1] == "\n":
+                i += 2
+                continue
+            out.append(segment[i : i + 2])
+            i += 2
+            continue
+        if quote == '"':
+            out.append(ch)
+            if ch == '"':
+                quote = ""
+            i += 1
+            continue
+        if ch == "$" and segment.startswith("$'", i):
+            j = i + 2
+            while j < n and segment[j] != "'":
+                j += 2 if segment[j] == "\\" and j + 1 < n else 1
+            if j < n:
+                out.append(shlex.quote(_decode_ansi_c(segment[i + 2 : j])))
+                i = j + 1
+                continue
+        if ch in "'\"":
+            quote = ch
+        out.append(ch)
+        i += 1
+    return "".join(out)
+
+
 def _split(segment: str) -> list[str]:
     """shlex 分词；解析不了（引号不闭合等）返回空列表，由调用方决定方向。"""
     try:
-        return shlex.split(segment, posix=True)
+        return shlex.split(_plain_quoting(segment), posix=True)
     except ValueError:
         return []
 
@@ -74,8 +170,16 @@ _GIT_UNSAFE_GLOBAL_PREFIX = ("--config-env=", "--exec-path=", "--git-dir=",
                              "--namespace=", "--super-prefix=", "--work-tree=")
 _GIT_UNSAFE_GLOBAL_INLINE = ("-c", "-C")  # -cfoo.bar=x / -C/path 粘连形态
 #  子命令级：能写任意文件或执行外部程序的选项
-_GIT_UNSAFE_SUB_EXACT = {"--output", "--ext-diff", "--textconv", "--exec", "--upload-pack"}
-_GIT_UNSAFE_SUB_PREFIX = ("--output=", "--exec=", "--upload-pack=")
+_GIT_UNSAFE_SUB_EXACT = {"--output", "--ext-diff", "--textconv", "--exec", "--upload-pack",
+                         "--open-files-in-pager", "-O"}
+#  -O<pager> 是 git grep 的粘连写法（别的子命令的 -O<orderfile> 多问一次无妨）
+_GIT_UNSAFE_SUB_PREFIX = ("--output=", "--exec=", "--upload-pack=",
+                          "--open-files-in-pager=", "-O")
+
+_SORT_NAMES = {"sort", "gsort"}
+_PAGER_NAMES = {"man", "less", "more", "most"}
+#  go 的"拿这个程序来跑 / 来编译"类选项（test/run 的 -exec，build 家族的 -toolexec，vet 的 -vettool）
+_GO_EXEC_OPTIONS = {"exec", "toolexec", "vettool"}
 
 #  find：执行/删除/写文件类动作
 _FIND_UNSAFE = {"-exec", "-execdir", "-ok", "-okdir", "-delete",
@@ -208,6 +312,31 @@ def _injection_risk_argv(argv: list[str], depth: int) -> str | None:
         for arg in argv[1:]:
             if arg in _VIM_EXEC_EXACT or arg.startswith(_VIM_EXEC_PREFIX):
                 return f"{name} {arg.split('=')[0]} 可执行 ex 命令（:!shell 逃逸）"
+        return None
+    if name in _SORT_NAMES:
+        for arg in argv[1:]:
+            if arg.startswith("--compress-program"):
+                return "sort --compress-program 可执行外部程序"
+            if arg == "--output" or arg.startswith("--output=") or (
+                arg.startswith("-") and not arg.startswith("--") and "o" in arg[1:]
+            ):
+                return "sort -o 可写任意文件"
+        return None
+    if name in _PAGER_NAMES:
+        #  翻页器是交互程序：`!cmd` 随时能起 shell，`+` 开头的参数是启动即执行的命令
+        for arg in argv[1:]:
+            if arg.startswith("+") or arg in ("-P", "--pager", "-H") or arg.startswith(
+                ("-P", "--pager=", "--html=", "-H")
+            ):
+                return f"{name} {arg[:12]} 可执行外部程序"
+        if name != "man":
+            return f"{name} 是交互式翻页器，里面能起 shell"
+        return None
+    if name == "go":
+        for arg in argv[1:]:
+            option = arg.lstrip("-").split("=", 1)[0]
+            if arg.startswith("-") and option in _GO_EXEC_OPTIONS:
+                return f"go -{option} 可执行外部程序"
         return None
     if name == "xargs":
         return "xargs 会执行任意后续命令"
@@ -353,6 +482,8 @@ _WRAPPERS: dict[str, tuple[_WrapperSpec, ...]] = {
                       positionals=1),),
     "stdbuf": (_spec(value="e i o error input output", flag="help version"),),
     "command": (_spec(flag="p v V"),),
+    #  `builtin eval '…'` / `builtin command …`：只是点名走内建版本，后面照常执行
+    "builtin": (_spec(),),
     "exec": (_spec(value="a", flag="c l"),),
     #  GNU time 与 BSD time 取并集（bash 关键字 time 只认 -p）
     "time": (_spec(value="f o format output",
@@ -1125,10 +1256,43 @@ def _scan_script(script: str, depth: int, hit, budget: _Budget) -> str | None:
     for body in _substitutions(script):
         if reason := _scan_script(body, budget.descend(depth), hit, budget):
             return reason
+    previous: list[str] = []
     for segment in _split_script(script):
-        if reason := _scan_segment(_split(segment), depth, hit, budget):
+        argv = _split(segment)
+        if reason := _scan_segment(argv, depth, hit, budget):
             return reason
+        for fed in _stdin_scripts(argv, previous):
+            if reason := _scan_script(fed, budget.descend(depth), hit, budget):
+                return reason
+        previous = argv
     return None
+
+
+_ECHO_NAMES = {"echo", "printf"}
+
+
+def _stdin_scripts(argv: list[str], previous: list[str]) -> list[str]:
+    """从 stdin 喂给 shell 的源码里，写在同一条命令里看得见的那部分。
+
+    - here-string：`bash <<< 'rm -rf x'`；
+    - 前一段是 echo / printf：`echo 'rm -rf x' | sh`。
+    `cat x.sh | sh`、`curl … | sh` 这种内容不在命令里的不归这里（那和 `sh x.sh`
+    一样看不见，靠确认与沙箱）。连接符是不是管道不细究：多扫一段只会多问一次。
+    """
+    argv = _strip_shell_prefix(list(argv))
+    if not argv or _base_name(argv[0]) not in _SHELLS:
+        return []
+    found: list[str] = []
+    for index, token in enumerate(argv):
+        if token == "<<<" and index + 1 < len(argv):
+            found.append(argv[index + 1])
+        elif token.startswith("<<<") and len(token) > 3:
+            found.append(token[3:])
+    previous = _strip_shell_prefix(list(previous))
+    if previous and _base_name(previous[0]) in _ECHO_NAMES and len(previous) > 1:
+        #  printf 的 \n 是换行：每行各是一条命令
+        found.append(" ".join(previous[1:]).replace("\\n", "\n"))
+    return found
 
 
 def _scan_segment(argv: list[str], depth: int, hit, budget: _Budget) -> str | None:

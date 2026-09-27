@@ -303,23 +303,18 @@ def check_proxy() -> Check:
 def check_sandbox() -> Check:
     from . import sandbox
 
-    if sys.platform == "darwin":
-        ok = sandbox.available()
-        return Check(
-            "sandbox", "ok" if ok else "warn",
-            "沙箱可用（Seatbelt）" if ok else "sandbox-exec 不存在，bash 不受沙箱约束",
-        )
-    if sys.platform == "linux":
-        if sandbox.available():
-            return Check("sandbox", "ok", "沙箱可用（bubblewrap）")
-        return Check(
-            "sandbox", "warn", "沙箱不可用，bash 命令可写任意路径",
-            remedy="安装 bubblewrap，并确认内核允许 unprivileged user namespace",
-        )
-    return Check("sandbox", "warn", "本平台无沙箱（建议在 WSL 里用）")
+    if sandbox.available():
+        backend = "Seatbelt" if sys.platform == "darwin" else "bubblewrap"
+        return Check("sandbox", "ok", f"沙箱可用（{backend}）")
+    why, remedy = sandbox.unavailable_reason()
+    return Check(
+        "sandbox", "warn", f"沙箱不可用（{why}），bash 命令可写任意路径", remedy=remedy
+    )
 
 
 def check_bash_parser() -> Check:
+    from . import envprobe
+
     try:
         from . import bash_ast  # noqa: F401
 
@@ -327,7 +322,9 @@ def check_bash_parser() -> Check:
     except ImportError as exc:
         return Check(
             "bash_parser", "warn", "命令解析器缺失，allow 规则退化为逐条确认", [str(exc)],
-            remedy="pip install tree-sitter tree-sitter-bash",
+            remedy=" && ".join(
+                envprobe.install_hint(name) for name in ("tree-sitter", "tree-sitter-bash")
+            ),
         )
     return Check("bash_parser", "ok", "命令解析器就绪（tree-sitter-bash）")
 
@@ -336,6 +333,7 @@ def check_mcp_config(workspace: Path) -> Check:
     from . import mcp
 
     details: list[str] = []
+    missing: list[str] = []
     status = "ok"
     total = 0
     for path in mcp.config_paths(workspace):
@@ -351,11 +349,67 @@ def check_mcp_config(workspace: Path) -> Check:
         count = len(servers) if isinstance(servers, dict) else 0
         total += count
         details.append(f"{path}：{count} 个 server")
+        for name, entry in (servers if isinstance(servers, dict) else {}).items():
+            command = entry.get("command") if isinstance(entry, dict) else None
+            if not isinstance(command, str) or not command.strip() or entry.get("disabled"):
+                continue
+            #  只查"起不起得来"的第一步：命令在不在。不启动任何东西
+            if shutil.which(os.path.expanduser(command)) is None:
+                missing.append(f"{name} 的启动命令 {command!r} 找不到")
     if status == "fail":
         return Check("mcp_config", "fail", "MCP 配置文件损坏", details, remedy="修正 JSON 后重试")
     if not details:
         return Check("mcp_config", "ok", "未配置 MCP server")
+    if missing:
+        return Check(
+            "mcp_config", "warn", f"{len(missing)} 个 MCP server 的启动命令找不到",
+            details + missing,
+            remedy="装上对应的程序，或在配置里把 command 写成绝对路径",
+        )
     return Check("mcp_config", "ok", f"MCP 配置可解析（{total} 个 server）", details)
+
+
+#  名字由别处拼出来的环境变量（按前缀放行）
+_DYNAMIC_ENV_PREFIXES = ("XIAOYU_PROVIDER_",)
+
+
+def known_env_names() -> set[str]:
+    """小羽认的全部 XIAOYU_* 环境变量名：从包的源码里现扫。
+
+    不维护清单：清单迟早跟不上代码。源码里出现过的名字就是认的。
+    """
+    import re
+
+    names: set[str] = set()
+    pattern = re.compile(r"XIAOYU_[A-Z0-9_]+")
+    for path in Path(__file__).resolve().parent.glob("*.py"):
+        with contextlib.suppress(OSError):
+            names.update(pattern.findall(path.read_text(encoding="utf-8", errors="replace")))
+    return names
+
+
+def check_env() -> Check:
+    """写错了被忽略的配置，和拼错了名字、压根没人读的 XIAOYU_* 变量。"""
+    import difflib
+
+    from . import config
+
+    details = list(config.env_problems())
+    known = known_env_names()
+    for name in sorted(os.environ):
+        if not name.startswith("XIAOYU_") or name in known:
+            continue
+        if name.startswith(_DYNAMIC_ENV_PREFIXES):
+            continue
+        close = difflib.get_close_matches(name, sorted(known), n=1, cutoff=0.8)
+        hint = f"——是不是想写 {close[0]}？" if close else ""
+        details.append(f"{name} 不是小羽认的变量，设了也不起作用{hint}")
+    if details:
+        return Check(
+            "env", "warn", f"{len(details)} 处配置没有生效", details,
+            remedy="对照 docs/configuration.md 改正，或删掉",
+        )
+    return Check("env", "ok", "环境变量里的配置都认得、都合法")
 
 
 def check_sessions(sessions: Path) -> Check:
@@ -375,7 +429,11 @@ def check_sessions(sessions: Path) -> Check:
     if size > 2 * GIB:
         return Check(
             "sessions", "warn", "会话目录偏大", details,
-            remedy="`xiaoyu sessions` 清理旧会话",
+            #  小羽没有清理旧会话的命令：别指一条不存在的路
+            remedy=(
+                "旧会话的 .jsonl 可以直接删（连同同名的 .lock / .plan.md）；"
+                "先用 `xiaoyu sessions` 看哪些还在跑，在跑的别动"
+            ),
         )
     return Check("sessions", "ok", "会话目录正常", details)
 
@@ -405,6 +463,7 @@ def run_doctor(workspace: Path | None = None) -> list[Check]:
         check_config_dir(config_dir),
         check_disk({"配置目录": config_dir, "工作区": workspace}),
         check_providers(),
+        check_env(),
         check_proxy(),
         check_sandbox(),
         check_bash_parser(),

@@ -129,6 +129,20 @@ class TaskManagerTest(unittest.TestCase):
             wait_until(lambda: any("已结束" in t for t in self.notify.texts()))
         )
 
+    def test_polling_script_wakes_the_model_once_per_change(self):
+        task = self.start(
+            "for i in 1 2 3 4 5; do echo waiting; sleep 0.3; done; echo DONE",
+            kind="monitor", description="轮询",
+        )
+        self.assertTrue(wait_until(task.done.is_set, timeout=15))
+        self.assertTrue(
+            wait_until(lambda: any("DONE" in t for t in self.notify.texts()))
+        )
+        events = [t for t in self.notify.texts() if "monitor-event" in t]
+        waiting = sum(text.count("\nwaiting") for text in events)
+        self.assertEqual(waiting, 1, events)
+        self.assertTrue(any("又原样出现了 4 次" in text for text in events), events)
+
     def test_still_running_line(self):
         self.assertEqual(self.manager.still_running_line(), "")
         task = self.start("sleep 30")
@@ -138,6 +152,31 @@ class TaskManagerTest(unittest.TestCase):
         self.assertIn("1 个 monitor", line)
         self.manager.kill(task.task_id)
         self.manager.kill(monitor.task_id)
+
+
+class RepeatFilterTest(unittest.TestCase):
+    """原样重复的行不是新事件：不为它单独唤醒模型，但出现过几次要交代。"""
+
+    def test_consecutive_repeats_are_folded_and_counted(self):
+        repeats = bg._RepeatFilter()
+        self.assertEqual(repeats.filter(["still running"]), ["still running"])
+        #  之后的轮询一直是同一行：什么都不发
+        self.assertEqual(repeats.filter(["still running"]), [])
+        self.assertEqual(repeats.filter(["still running", "still running"]), [])
+        #  换了内容：先交代上一行又出现了几次
+        self.assertEqual(
+            repeats.filter(["DONE"]), ["（上一行又原样出现了 3 次）", "DONE"]
+        )
+
+    def test_only_consecutive_repeats_count(self):
+        repeats = bg._RepeatFilter()
+        self.assertEqual(repeats.filter(["A", "B", "A"]), ["A", "B", "A"])
+
+    def test_pending_count_is_flushed_when_the_monitor_ends(self):
+        repeats = bg._RepeatFilter()
+        repeats.filter(["waiting", "waiting"])
+        self.assertEqual(repeats.filter([], flush=True), ["（上一行又原样出现了 1 次）"])
+        self.assertEqual(repeats.filter([], flush=True), [])
 
 
 class RateLimiterTest(unittest.TestCase):

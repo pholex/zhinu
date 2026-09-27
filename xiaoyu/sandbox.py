@@ -20,6 +20,8 @@
 - **读**：全盘放行。收紧读会踩不完的坑（动态链接、locale、各语言 runtime 的
   配置发现），而读本身不造成不可逆损失。⚠️ 代价是模型仍读得到 `~/.ssh`、
   `~/.aws` 这类凭据——这一层不解决凭据泄露，那靠的是 bash 默认逐次确认。
+  唯一的例外是小羽自己存密钥的那几个文件（见 `secret_paths`）：子进程环境里
+  已经把这些密钥剥掉了，沙箱里一条 `cat` 又读回来的话，剥离就是摆设。
 - **网络**：默认放行。断网会静默打断 `pip install` / `npm install` / `git push`
   这些编码工作的日常动作，是"让人恨上这个功能"的最快方式。要断网设
   `XIAOYU_SANDBOX_NETWORK=0`——那才是完整的防外传姿势。
@@ -113,12 +115,13 @@ def policy_text(
     allow_network: bool,
     protected_files: int = 0,
     protected_dirs: int = 0,
+    secret_files: int = 0,
 ) -> str:
     """按可写根目录的数量生成策略文本。根目录本身由 -D WRITABLE_n 传值。
 
     受保护路径（PROTECTED_FILE_n / PROTECTED_DIR_n）的 deny 必须排在全部 allow
     之后：Seatbelt 后写的规则胜出。deny file-write* 同时管住改写、删除、改名
-    顶替与建硬链接。
+    顶替与建硬链接。密钥文件（SECRET_FILE_n）连读一起拒。
     """
     parts = [_POLICY_HEADER, _NETWORK_ALLOW if allow_network else _NETWORK_DENY]
     for index in range(writable_count):
@@ -132,6 +135,12 @@ def policy_text(
         parts.append(f'(deny file-write* (literal (param "PROTECTED_FILE_{index}")))\n')
     for index in range(protected_dirs):
         parts.append(f'(deny file-write* (subpath (param "PROTECTED_DIR_{index}")))\n')
+    if secret_files:
+        parts.append("\n; 小羽自己的密钥文件：沙箱内不可读写\n")
+    for index in range(secret_files):
+        parts.append(
+            f'(deny file-read* file-write* (literal (param "SECRET_FILE_{index}")))\n'
+        )
     return "".join(parts)
 
 
@@ -139,7 +148,10 @@ def policy_text(
 
 
 def bwrap_args(
-    writable_roots: list[str], allow_network: bool, protected: list[str] | None = None
+    writable_roots: list[str],
+    allow_network: bool,
+    protected: list[str] | None = None,
+    secrets: list[str] | None = None,
 ) -> list[str]:
     """bwrap 参数（不含二进制路径和目标命令）。纯函数，全平台可测。
 
@@ -184,6 +196,10 @@ def bwrap_args(
     for path in protected or []:
         if Path(path).exists():
             args += ["--ro-bind", path, path]
+    #  密钥文件：拿空设备盖住，读到的是空（只对已存在的普通文件做）
+    for path in secrets or []:
+        if Path(path).is_file():
+            args += ["--ro-bind", "/dev/null", path]
     return args
 
 
@@ -192,6 +208,32 @@ def _bwrap_path() -> str | None:
         if Path(candidate).is_file():
             return candidate
     return None
+
+
+def unavailable_reason() -> tuple[str, str]:
+    """沙箱用不了时：(为什么, 怎么办)。可用时返回两个空串。
+
+    Linux 上"用不了"有两种，办法完全不同：没装，装上即可；装了但跑不起来，
+    再装一遍也没用——是内核或 AppArmor 不让非特权进程建 user namespace。
+    混成一句"安装 bubblewrap 并确认内核允许…"，两种人都得猜自己是哪一种。
+    """
+    if available():
+        return "", ""
+    if sys.platform == "darwin":
+        return f"{SANDBOX_EXEC} 不存在", "这台 macOS 缺了系统自带的 sandbox-exec，沙箱无从启用"
+    if not sys.platform.startswith("linux"):
+        return "本平台没有可用的沙箱", "Windows 上建议在 WSL 里用"
+    if _bwrap_path() is None:
+        return (
+            "没有安装 bubblewrap",
+            "装上即可：apt install bubblewrap / dnf install bubblewrap / pacman -S bubblewrap",
+        )
+    return (
+        "bubblewrap 装了但跑不起来：系统不让非特权进程建 user namespace",
+        "Ubuntu 24.04 起要给 bwrap 配一份 AppArmor profile 放行 userns"
+        "（或 sysctl kernel.apparmor_restrict_unprivileged_userns=0）；"
+        "别的发行版查 kernel.unprivileged_userns_clone 是否为 1。重装 bubblewrap 没有用",
+    )
 
 
 #  探针结果缓存（进程级）。None = 还没探过。
@@ -314,6 +356,28 @@ def protected_paths(workspace: Path) -> tuple[list[str], list[str]]:
         return list(found)
 
     return both(root / ".mcp.json"), both(root / ".xiaoyu")
+
+
+def secret_paths() -> list[str]:
+    """小羽自己存密钥的文件：用户级 .env、用户级 mcp.json（env / headers 里的令牌）、
+    `XIAOYU_ENV_FILE` 指的那份。沙箱内连读都拒。
+
+    只收这几样，不收 `~/.ssh` / `~/.aws`：那些是别的工具的凭据，沙箱里的 git、
+    aws 命令正当地要读。小羽的密钥是"小羽调模型用的"，模型跑的命令没有理由
+    需要——要看配置走 read_file（工作区之外，会问）。
+    """
+    candidates = [config.user_env_path(), config.user_config_dir() / "mcp.json"]
+    if override := os.environ.get("XIAOYU_ENV_FILE"):
+        candidates.append(Path(override).expanduser())
+    found: dict[str, None] = {}
+    for path in candidates:
+        try:
+            absolute = path if path.is_absolute() else Path.cwd() / path
+            found.setdefault(str(absolute), None)
+            found.setdefault(str(absolute.resolve()), None)
+        except OSError:
+            continue
+    return list(found)
 
 
 # ---------- 宿主侧自己要跑的程序去哪找 ----------
@@ -453,8 +517,9 @@ def wrap(argv: list[str], workspace: Path, allow_network: bool = True) -> list[s
         return argv
     roots = _normalize(default_writable_roots(workspace) + extra_writable_roots())
     files, dirs = protected_paths(workspace)
+    secrets = secret_paths()
     if sys.platform == "darwin":
-        policy = policy_text(len(roots), allow_network, len(files), len(dirs))
+        policy = policy_text(len(roots), allow_network, len(files), len(dirs), len(secrets))
         command = [SANDBOX_EXEC, "-p", policy]
         for index, root in enumerate(roots):
             command += ["-D", f"WRITABLE_{index}={root}"]
@@ -462,8 +527,12 @@ def wrap(argv: list[str], workspace: Path, allow_network: bool = True) -> list[s
             command += ["-D", f"PROTECTED_FILE_{index}={path}"]
         for index, path in enumerate(dirs):
             command += ["-D", f"PROTECTED_DIR_{index}={path}"]
+        for index, path in enumerate(secrets):
+            command += ["-D", f"SECRET_FILE_{index}={path}"]
         return command + ["--", *argv]
-    return [_bwrap_path(), *bwrap_args(roots, allow_network, files + dirs), "--", *argv]
+    return [
+        _bwrap_path(), *bwrap_args(roots, allow_network, files + dirs, secrets), "--", *argv
+    ]
 
 
 def enabled(config_flag: bool) -> bool:

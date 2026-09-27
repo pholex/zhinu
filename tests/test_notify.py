@@ -62,6 +62,13 @@ class NotifyTest(AgentTestCase):
         contents = [(m.get("role"), m.get("content")) for m in agent.messages]
         self.assertIn(("user", "<system-reminder>\n部署已完成\n</system-reminder>"), contents)
         self.assertEqual(contents[-1], ("assistant", "收到"))
+        #  通知里可能带着后台任务的输出行：不走 operator（权威）通道
+        from xiaoyu import media
+        from xiaoyu.responses import OPERATOR_KEY
+
+        note = next(m for m in agent.messages if "部署已完成" in str(m.get("content")))
+        self.assertTrue(note.get(media.INJECTED_KEY))
+        self.assertFalse(note.get(OPERATOR_KEY))
 
     def test_non_waking_notification_does_not_force_another_step(self):
         """wake=False：收尾正文期间到达也不多跑一步——多跑一步的代价是模型

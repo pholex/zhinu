@@ -38,6 +38,7 @@ from .background import (
     mark_group_leader as _mark_group_leader,
 )
 from .config import Config
+from .errors import Interrupted
 from .rewind import RewindStore
 
 
@@ -260,20 +261,56 @@ def _trim_partial_utf8(data: bytes) -> bytes:
     return data
 
 
-def _wait_bounded(proc: subprocess.Popen, pipes: list[_BoundedPipe], deadline: float) -> bool:
+#  等前台命令时多久看一次"有没有人叫停"
+_STOP_POLL_SECONDS = 0.2
+
+
+def _wait_bounded(
+    proc: subprocess.Popen,
+    pipes: list[_BoundedPipe],
+    deadline: float,
+    stop_requested: Callable[[], bool] | None = None,
+) -> bool:
     """等进程退出、两路管道读完，不超过 deadline；超时返回 False。
 
     先等进程再等管道：进程退出了而孙进程还握着管道（`sleep 30 &`）时，管道的
     EOF 迟迟不来——这同样算超时，交给调用方整树杀掉，与 communicate(timeout)
     的语义一致。
+
+    给了 stop_requested 就切成小片等，每片问一次；有人叫停就抛 Interrupted
+    （调用方的收尾分支负责整树杀）。宿主的 interrupt() 不是信号，不会自己
+    打断一个阻塞着的 wait——不问的话，一条跑半小时的命令要跑完才停得下来。
     """
-    try:
-        proc.wait(timeout=max(0.0, deadline - time.monotonic()))
-    except subprocess.TimeoutExpired:
+
+    def step(wait_once: Callable[[float], bool]) -> bool:
+        """反复等到成功或超时。wait_once(秒) 返回"等到了吗"。"""
+        while True:
+            remaining = deadline - time.monotonic()
+            if stop_requested is None:
+                return wait_once(max(0.0, remaining))
+            if wait_once(max(0.0, min(_STOP_POLL_SECONDS, remaining))):
+                return True
+            if stop_requested():
+                raise Interrupted("宿主请求打断")
+            if remaining <= 0:
+                return False
+
+    def process_exited(seconds: float) -> bool:
+        try:
+            proc.wait(timeout=seconds)
+        except subprocess.TimeoutExpired:
+            return False
+        return True
+
+    if not step(process_exited):
         return False
     for pipe in pipes:
-        pipe.thread.join(max(0.0, deadline - time.monotonic()))
-        if pipe.thread.is_alive():
+
+        def pipe_drained(seconds: float, pipe: _BoundedPipe = pipe) -> bool:
+            pipe.thread.join(seconds)
+            return not pipe.thread.is_alive()
+
+        if not step(pipe_drained):
             return False
     return True
 
@@ -883,6 +920,9 @@ class Toolbox:
         self.config = config
         #  宿主侧找 rg / git 时，这个工作区下面的 PATH 目录不算数（见 sandbox.host_which）
         sandbox.note_workspace(config.workspace)
+        #  "有没有人叫停"：Agent 接线时注入（interrupt_requested）。没有 Agent 的
+        #  用法（测试、直接拿 Toolbox 跑工具）保持 None，等待照旧一口气等到底
+        self.stop_requested: Callable[[], bool] | None = None
         self._tools: dict[str, Tool] = {}
         #  后台任务表（bash run_in_background / monitor）。通知回调由 Agent
         #  注入（agent.__init__ 里 tasks.notify = self.notify）；受限子集
@@ -1299,6 +1339,9 @@ class Toolbox:
 
         try:
             output = self._bound_output(name, tool.handler(**args))
+        except Interrupted:
+            #  打断不是工具的错误：不能折成 ERROR 文本回给模型然后接着跑
+            raise
         except TypeError as exc:
             return f"ERROR: 调用 {name} 的参数不对：{exc}"
         except Exception as exc:  # noqa: BLE001 - 工具错误要回给模型自愈
@@ -2299,7 +2342,7 @@ class Toolbox:
         pipes = [_BoundedPipe(proc.stdout), _BoundedPipe(proc.stderr)]
         _register_foreground(proc)
         try:
-            if not _wait_bounded(proc, pipes, started + limit):
+            if not _wait_bounded(proc, pipes, started + limit, self.stop_requested):
                 raise subprocess.TimeoutExpired(argv, limit)
             stdout_raw, stderr_raw = pipes[0].value(), pipes[1].value()
         except KeyboardInterrupt:

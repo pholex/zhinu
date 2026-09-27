@@ -293,7 +293,7 @@ class RecoveryLoopTest(AgentTestCase):
             [chunk(content="恢复了"), usage_chunk(100, 10)],
         ]
         agent = self.build(script)
-        with mock.patch("xiaoyu.agent.time.sleep") as fake_sleep:
+        with mock.patch("xiaoyu.agent.Agent._sleep") as fake_sleep:
             agent.send("hi")
         self.assertEqual(agent.last_assistant_text(), "恢复了")
         fake_sleep.assert_called_once()
@@ -309,7 +309,7 @@ class RecoveryLoopTest(AgentTestCase):
     def test_gives_up_after_max_attempts(self):
         script = [rate_limit_error(), rate_limit_error(), rate_limit_error()]
         agent = self.build(script)
-        with mock.patch("xiaoyu.agent.time.sleep"), self.assertRaises(openai.RateLimitError):
+        with mock.patch("xiaoyu.agent.Agent._sleep"), self.assertRaises(openai.RateLimitError):
             agent.send("hi")
         self.assertEqual(len(self.client.completions.script), 0, "应该重试满 3 次")
 
@@ -319,7 +319,7 @@ class RecoveryLoopTest(AgentTestCase):
             [chunk(content="恢复了"), usage_chunk(100, 10)],
         ]
         agent = self.build(script)
-        with mock.patch("xiaoyu.agent.time.sleep") as fake_sleep, mock.patch(
+        with mock.patch("xiaoyu.agent.Agent._sleep") as fake_sleep, mock.patch(
             "xiaoyu.agent.random.uniform", return_value=1.0
         ):
             agent.send("hi")
@@ -333,7 +333,7 @@ class RecoveryLoopTest(AgentTestCase):
             [chunk(content="恢复了"), usage_chunk(100, 10)],
         ]
         agent = self.build(script)
-        with mock.patch("xiaoyu.agent.time.sleep") as fake_sleep:
+        with mock.patch("xiaoyu.agent.Agent._sleep") as fake_sleep:
             agent.send("hi")
         waits = [call.args[0] for call in fake_sleep.call_args_list]
         #  基准 2s、4s，jitter ±25%
@@ -362,7 +362,7 @@ class RecoveryLoopTest(AgentTestCase):
         )
         script = [overflow, [chunk(content="ok"), usage_chunk(100, 5)]]
         agent = self.build(script)
-        with mock.patch("xiaoyu.agent.time.sleep"), mock.patch.object(
+        with mock.patch("xiaoyu.agent.Agent._sleep"), mock.patch.object(
             agent, "maybe_compact"
         ) as fake_compact:
             agent.send("hi")
@@ -427,7 +427,7 @@ class ModelSwitchNoticeTest(AgentTestCase):
             rate_limit_error(),
             [chunk(content="备用模型顶上"), usage_chunk(10, 1)],
         ])
-        with mock.patch("xiaoyu.agent.time.sleep"), contextlib.redirect_stdout(io.StringIO()):
+        with mock.patch("xiaoyu.agent.Agent._sleep"), contextlib.redirect_stdout(io.StringIO()):
             agent.send("一")
             agent.send("二")
         notices = switch_notices(agent)
@@ -453,7 +453,7 @@ class FallbackChainTest(AgentTestCase):
             [chunk(content="备用模型顶上"), usage_chunk(100, 10)],
         ]
         agent = self.build(script)
-        with mock.patch("xiaoyu.agent.time.sleep"):
+        with mock.patch("xiaoyu.agent.Agent._sleep"):
             agent.send("hi")
         self.assertEqual(agent.last_assistant_text(), "备用模型顶上")
         models = [call["model"] for call in self.client.completions.calls]
@@ -476,7 +476,7 @@ class FallbackChainTest(AgentTestCase):
         self.config.fallback_models = ["backup-model"]
         script = [rate_limit_error() for _ in range(6)]
         agent = self.build(script)
-        with mock.patch("xiaoyu.agent.time.sleep"), self.assertRaises(openai.RateLimitError):
+        with mock.patch("xiaoyu.agent.Agent._sleep"), self.assertRaises(openai.RateLimitError):
             agent.send("hi")
         #  主 3 次 + 备用 3 次，全部试完
         self.assertEqual(len(self.client.completions.script), 0)
@@ -484,7 +484,7 @@ class FallbackChainTest(AgentTestCase):
     def test_no_fallback_configured_keeps_old_behavior(self):
         script = [rate_limit_error(), rate_limit_error(), rate_limit_error()]
         agent = self.build(script)
-        with mock.patch("xiaoyu.agent.time.sleep"), self.assertRaises(openai.RateLimitError):
+        with mock.patch("xiaoyu.agent.Agent._sleep"), self.assertRaises(openai.RateLimitError):
             agent.send("hi")
         self.assertEqual(agent.config.model, "main-model")
 
@@ -579,7 +579,7 @@ class ContentFilterTest(AgentTestCase):
     def test_empty_filtered_completion_raises_without_retry(self):
         self.config.fallback_models = ["backup-model"]
         agent = self.build([[filtered_chunk(), usage_chunk(100, 0)]])
-        with mock.patch("xiaoyu.agent.time.sleep"), contextlib.redirect_stdout(io.StringIO()):
+        with mock.patch("xiaoyu.agent.Agent._sleep"), contextlib.redirect_stdout(io.StringIO()):
             with self.assertRaises(ContentFiltered):
                 agent.send("hi")
         #  只打了一次：没有空补全重发，也没有落到备用模型
@@ -620,7 +620,7 @@ class StreamTruncationTest(AgentTestCase):
             ],
             [chunk(content="写好了"), usage_chunk(100, 5)],
         ])
-        with mock.patch("xiaoyu.agent.time.sleep") as fake_sleep, contextlib.redirect_stdout(io.StringIO()):
+        with mock.patch("xiaoyu.agent.Agent._sleep") as fake_sleep, contextlib.redirect_stdout(io.StringIO()):
             agent.send("写个文件")
         self.assertEqual(len(self.client.completions.calls), 3)
         #  走的是可重试错误的退避路径
@@ -637,7 +637,7 @@ class StreamTruncationTest(AgentTestCase):
             [chunk(tool_calls=[call_fragment(0, "c1", "write_file", HALF_WRITE)]), usage_chunk(100, 10)],
             [chunk(content="我重试"), usage_chunk(100, 5)],
         ])
-        with mock.patch("xiaoyu.agent.time.sleep") as fake_sleep, contextlib.redirect_stdout(io.StringIO()):
+        with mock.patch("xiaoyu.agent.Agent._sleep") as fake_sleep, contextlib.redirect_stdout(io.StringIO()):
             agent.send("写个文件")
         self.assertEqual(len(self.client.completions.calls), 2)
         fake_sleep.assert_not_called()
@@ -648,7 +648,7 @@ class StreamTruncationTest(AgentTestCase):
             [chunk(tool_calls=[call_fragment(0, "c1", "write_file", HALF_WRITE)]), finish_chunk()],
             [chunk(content="我重试")],
         ])
-        with mock.patch("xiaoyu.agent.time.sleep") as fake_sleep, contextlib.redirect_stdout(io.StringIO()):
+        with mock.patch("xiaoyu.agent.Agent._sleep") as fake_sleep, contextlib.redirect_stdout(io.StringIO()):
             agent.send("写个文件")
         self.assertEqual(len(self.client.completions.calls), 2)
         fake_sleep.assert_not_called()
@@ -669,7 +669,7 @@ class StreamTruncationTest(AgentTestCase):
         agent = self.build([
             [chunk(tool_calls=[call_fragment(0, f"c{n}", "write_file", HALF_WRITE)])] for n in range(3)
         ])
-        with mock.patch("xiaoyu.agent.time.sleep"), contextlib.redirect_stdout(io.StringIO()):
+        with mock.patch("xiaoyu.agent.Agent._sleep"), contextlib.redirect_stdout(io.StringIO()):
             with self.assertRaises(StreamTruncated):
                 agent.send("写个文件")
         self.assertFalse((self.root / "a.py").exists())

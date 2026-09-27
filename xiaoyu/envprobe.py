@@ -18,6 +18,29 @@ import shutil
 import time
 
 #  只探测"缺了会改变技术选型"的工具；探测用 which（毫秒级），不查版本。
+def install_hint(requirement: str) -> str:
+    """"把这个依赖装进小羽所在的环境"的命令，按小羽自己是怎么装的来给。
+
+    裸写 `pip install …` 在 pipx / uv tool 装的环境里会装到别处去（PATH 上的
+    pip 属于另一个解释器），用户照做了、问题还在。小羽本体的可选依赖
+    （`xiaoyu-agent[tui]`）在这两种环境下要整包重装才带得上。
+    """
+    import sys
+
+    prefix = sys.prefix.replace("\\", "/").lower()
+    extra_of_self = requirement.startswith("xiaoyu-agent[")
+    if "/pipx/" in prefix:
+        if extra_of_self:
+            return f'pipx install --force "{requirement}"'
+        return f'pipx inject xiaoyu-agent "{requirement}"'
+    if "/uv/tools/" in prefix:
+        if extra_of_self:
+            return f'uv tool install --force "{requirement}"'
+        return f'uv tool install --force xiaoyu-agent --with "{requirement}"'
+    #  点名解释器：PATH 上的 pip 不一定是这个环境的
+    return f'"{sys.executable}" -m pip install "{requirement}"'
+
+
 _COMMON_TOOLS = ("git", "node", "npm", "curl", "rg")
 _POSIX_TOOLS = ("python3", "pip3")
 _WINDOWS_TOOLS = ("python", "pip", "pwsh")
