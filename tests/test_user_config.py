@@ -443,3 +443,70 @@ class ModeEnvTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class EnvProblemsTest(unittest.TestCase):
+    """写错的配置照旧被忽略（不炸主循环），但要说得出来。"""
+
+    def problems(self, **env: str) -> list[str]:
+        from xiaoyu import config as config_mod
+
+        with mock.patch.dict(os.environ, env, clear=True):
+            return config_mod.env_problems()
+
+    def config(self, **env: str):
+        from xiaoyu.config import Config
+
+        with mock.patch.dict(os.environ, env, clear=True):
+            return Config.from_env(workspace=Path.cwd())
+
+    def test_percentage_written_as_a_whole_number_is_rejected(self):
+        """XIAOYU_COMPACT_AT=70（本意 70%）原先被照单收下，等于永不压缩。"""
+        self.assertEqual(self.config(XIAOYU_COMPACT_AT="70").compact_at, self.config().compact_at)
+        (problem,) = self.problems(XIAOYU_COMPACT_AT="70")
+        self.assertIn("XIAOYU_COMPACT_AT", problem)
+        self.assertIn("0.7", problem)
+
+    def test_valid_values_are_applied_and_silent(self):
+        cfg = self.config(XIAOYU_COMPACT_AT="0.5", XIAOYU_KEEP_RECENT="12",
+                          XIAOYU_CONTEXT_LIMIT="70000", XIAOYU_EFFORT="high")
+        self.assertEqual((cfg.compact_at, cfg.keep_recent, cfg.context_limit, cfg.effort),
+                         (0.5, 12, 70000, "high"))
+        self.assertEqual(
+            self.problems(XIAOYU_COMPACT_AT="0.5", XIAOYU_KEEP_RECENT="12",
+                          XIAOYU_CONTEXT_LIMIT="70000", XIAOYU_EFFORT="high"),
+            [],
+        )
+
+    def test_non_numbers_and_out_of_range_values_are_named(self):
+        problems = self.problems(
+            XIAOYU_KEEP_RECENT="0", XIAOYU_CONTEXT_LIMIT="lots",
+            XIAOYU_QIXIANG_CONCURRENCY="four", XIAOYU_EFFORT="ludicrous",
+        )
+        text = "\n".join(problems)
+        for name in ("XIAOYU_KEEP_RECENT", "XIAOYU_CONTEXT_LIMIT",
+                     "XIAOYU_QIXIANG_CONCURRENCY", "XIAOYU_EFFORT"):
+            self.assertIn(name, text)
+        self.assertEqual(len(problems), 4)
+
+    def test_unknown_effort_is_not_passed_upstream(self):
+        self.assertEqual(self.config(XIAOYU_EFFORT="ludicrous").effort, self.config().effort)
+
+    def test_doctor_flags_misspelled_variable_names(self):
+        from xiaoyu import diagnostics
+
+        with mock.patch.dict(
+            os.environ, {"XIAOYU_COMPACT_ATT": "0.5", "XIAOYU_PROVIDER_ACME_PROTOCOL": "responses",
+                         "XIAOYU_MODEL": "m"}, clear=True,
+        ):
+            check = diagnostics.check_env()
+        self.assertEqual(check.status, "warn")
+        (detail,) = check.details
+        self.assertIn("XIAOYU_COMPACT_ATT", detail)
+        self.assertIn("XIAOYU_COMPACT_AT", detail)
+
+    def test_doctor_is_quiet_when_everything_is_known(self):
+        from xiaoyu import diagnostics
+
+        with mock.patch.dict(os.environ, {"XIAOYU_MODEL": "m", "XIAOYU_SANDBOX": "1"}, clear=True):
+            self.assertEqual(diagnostics.check_env().status, "ok")

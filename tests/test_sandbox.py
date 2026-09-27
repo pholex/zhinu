@@ -79,6 +79,17 @@ class BwrapArgsTest(unittest.TestCase):
         self.assertEqual(args[index + 1], "ALL")
 
 
+def home_probe(stem: str) -> Path:
+    """家目录里的探针路径（沙箱挡的就是往这里写，探针只能放这）。
+
+    名字带进程号与随机串：固定名字的话两份测试并行跑会互相踩，上一次跑到一半
+    被杀留下的残骸也会让这一次的断言看到假象。
+    """
+    import uuid
+
+    return Path.home() / f".{stem}-{os.getpid()}-{uuid.uuid4().hex[:8]}.txt"
+
+
 class LinuxWrapTest(unittest.TestCase):
     def test_wrap_builds_bwrap_call(self):
         with (
@@ -377,7 +388,7 @@ class RealSandboxTest(unittest.TestCase):
         ⚠️ 探针必须落在真正不可写的地方：临时目录的父目录就是 $TMPDIR，
         本身在可写根里——拿它当"外面"会测出假通过。用家目录。
         """
-        victim = Path.home() / "xiaoyu_sandbox_should_not_exist.txt"
+        victim = home_probe("xiaoyu_sandbox_should_not_exist")
         self.addCleanup(lambda: victim.exists() and victim.unlink())
         result = self.run_in_sandbox(f"echo pwned > {victim}")
         self.assertNotEqual(result.returncode, 0)
@@ -386,7 +397,7 @@ class RealSandboxTest(unittest.TestCase):
 
     def test_existing_file_outside_cannot_be_deleted(self):
         """真实存在的文件删不掉——不存在的路径 rm -f 会假成功，测不出保护。"""
-        home_victim = Path.home() / "xiaoyu_sandbox_test_victim.txt"
+        home_victim = home_probe("xiaoyu_sandbox_test_victim")
         home_victim.write_text("precious", encoding="utf-8")
         self.addCleanup(lambda: home_victim.exists() and home_victim.unlink())
         result = self.run_in_sandbox(f"rm -f {home_victim}")
@@ -500,7 +511,7 @@ class BashToolIntegrationTest(unittest.TestCase):
         self.assertTrue(self.config.sandbox)
         box = Toolbox(self.config)
         #  家目录才是真正的"工作区之外"（$TMPDIR 在可写根里）
-        victim = Path.home() / "xiaoyu_tool_probe.txt"
+        victim = home_probe("xiaoyu_tool_probe")
         self.addCleanup(lambda: victim.exists() and victim.unlink())
         output = box.run("bash", {"command": f"echo pwned > {victim}"})
         self.assertFalse(victim.exists())
@@ -510,7 +521,7 @@ class BashToolIntegrationTest(unittest.TestCase):
     def test_sandbox_can_be_disabled(self):
         self.config.sandbox = False
         box = Toolbox(self.config)
-        victim = Path.home() / "xiaoyu_tool_probe_off.txt"
+        victim = home_probe("xiaoyu_tool_probe_off")
         self.addCleanup(lambda: victim.exists() and victim.unlink())
         box.run("bash", {"command": f"echo ok > {victim}"})
         self.assertTrue(victim.exists())

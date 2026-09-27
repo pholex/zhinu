@@ -358,6 +358,49 @@ def check_mcp_config(workspace: Path) -> Check:
     return Check("mcp_config", "ok", f"MCP 配置可解析（{total} 个 server）", details)
 
 
+#  名字由别处拼出来的环境变量（按前缀放行）
+_DYNAMIC_ENV_PREFIXES = ("XIAOYU_PROVIDER_",)
+
+
+def known_env_names() -> set[str]:
+    """小羽认的全部 XIAOYU_* 环境变量名：从包的源码里现扫。
+
+    不维护清单：清单迟早跟不上代码。源码里出现过的名字就是认的。
+    """
+    import re
+
+    names: set[str] = set()
+    pattern = re.compile(r"XIAOYU_[A-Z0-9_]+")
+    for path in Path(__file__).resolve().parent.glob("*.py"):
+        with contextlib.suppress(OSError):
+            names.update(pattern.findall(path.read_text(encoding="utf-8", errors="replace")))
+    return names
+
+
+def check_env() -> Check:
+    """写错了被忽略的配置，和拼错了名字、压根没人读的 XIAOYU_* 变量。"""
+    import difflib
+
+    from . import config
+
+    details = list(config.env_problems())
+    known = known_env_names()
+    for name in sorted(os.environ):
+        if not name.startswith("XIAOYU_") or name in known:
+            continue
+        if name.startswith(_DYNAMIC_ENV_PREFIXES):
+            continue
+        close = difflib.get_close_matches(name, sorted(known), n=1, cutoff=0.8)
+        hint = f"——是不是想写 {close[0]}？" if close else ""
+        details.append(f"{name} 不是小羽认的变量，设了也不起作用{hint}")
+    if details:
+        return Check(
+            "env", "warn", f"{len(details)} 处配置没有生效", details,
+            remedy="对照 docs/configuration.md 改正，或删掉",
+        )
+    return Check("env", "ok", "环境变量里的配置都认得、都合法")
+
+
 def check_sessions(sessions: Path) -> Check:
     if not sessions.is_dir():
         return Check("sessions", "ok", "还没有会话记录", [str(sessions)])
@@ -405,6 +448,7 @@ def run_doctor(workspace: Path | None = None) -> list[Check]:
         check_config_dir(config_dir),
         check_disk({"配置目录": config_dir, "工作区": workspace}),
         check_providers(),
+        check_env(),
         check_proxy(),
         check_sandbox(),
         check_bash_parser(),

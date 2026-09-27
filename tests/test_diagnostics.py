@@ -145,15 +145,21 @@ class DoctorCommandTest(unittest.TestCase):
                 "HOME": tmp, "USERPROFILE": tmp,
                 "XDG_CONFIG_HOME": str(Path(tmp) / "config"), "APPDATA": str(Path(tmp) / "config"),
             }
-            with mock.patch.dict(os.environ, env, clear=False):
+            #  Keychain 不归 HOME 管：不挡住的话这条用例会去读开发机的真钥匙串，
+            #  结果随机器而变
+            with mock.patch.dict(os.environ, env, clear=False), mock.patch(
+                "xiaoyu.config._read_from_keychain", return_value=None
+            ) as keychain:
                 out = io.StringIO()
                 with redirect_stdout(out):
                     code = doctor_command(["--json", "--workspace", tmp])
+            self.assertTrue(keychain.called, "前提：doctor 确实会去查钥匙串")
         payload = json.loads(out.getvalue())
         ids = [check["id"] for check in payload["checks"]]
         self.assertEqual(
             ids,
-            ["python", "config_dir", "disk", "providers", "proxy", "sandbox", "bash_parser", "tools", "mcp_config", "sessions"],
+            ["python", "config_dir", "disk", "providers", "env", "proxy", "sandbox",
+             "bash_parser", "tools", "mcp_config", "sessions"],
         )
         self.assertEqual(code, 1 if payload["status"] == "fail" else 0)
         self.assertIn("gauges", payload["diagnostics"])

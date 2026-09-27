@@ -1057,6 +1057,7 @@ def resume_command(argv: list[str]) -> int:
             interactive=sys.stdin.isatty() and sys.stderr.isatty(),
             unguarded=args.unguarded,
         )
+    _warn_env_problems()
     try:
         config = Config.from_env(
             workspace=resume_workspace,
@@ -2539,6 +2540,21 @@ def warn_if_home_workspace(workspace: Path) -> None:
     )
 
 
+_env_problems_shown = False
+
+
+def _warn_env_problems() -> None:
+    """写错了被忽略的配置，启动时说一声（一个进程只说一次）。"""
+    global _env_problems_shown
+    if _env_problems_shown:
+        return
+    _env_problems_shown = True
+    from .config import env_problems
+
+    for problem in env_problems():
+        print(ui.warning(f"配置：{problem}"), file=sys.stderr)
+
+
 def _trust_fingerprints(scope: str, workspace: Path) -> "dict[str, str] | None":
     """改工作区级 MCP 配置之前的指纹；用户级配置不归信任门管，返回 None。"""
     if scope != "project":
@@ -2717,6 +2733,7 @@ def main(argv: list[str] | None = None) -> int:
         return 2
     warn_if_home_workspace(workspace)
 
+    _warn_env_problems()
     try:
         config = Config.from_env(
             workspace=workspace,
@@ -2830,6 +2847,7 @@ def wire_main(args: argparse.Namespace, workspace_trusted: bool = True) -> int:
     if not workspace.is_dir():
         print(ui.error(f"工作区不存在：{workspace}"), file=sys.stderr)
         return 2
+    _warn_env_problems()
     try:
         config = Config.from_env(
             workspace=workspace,
