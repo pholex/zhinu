@@ -668,7 +668,11 @@ class TestBashAndSafety(ToolboxTestCase):
         与上一条的区别在于 shell 不留下来等——它一退就被 wait() 收割，
         之后再按它的 pid 查进程组是查不到的，整组信号根本发不出去，
         而结果文案照样写着"已终止整个进程树"。
+
+        关沙箱跑：Linux 沙箱里 shell 一退 PID 命名空间就整体收场，孙进程被内核
+        带走、命令正常返回，走不到超时这条路；`$!` 也是命名空间内的编号。
         """
+        self._without_sandbox()
         result = self.box.run("bash", {"command": "sleep 60 & echo pid=$!", "timeout": 1})
         match = re.search(r"pid=(\d+)", result)
         self.assertIsNotNone(match, result)
