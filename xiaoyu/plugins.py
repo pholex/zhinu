@@ -179,6 +179,51 @@ def _staged_matches(source: Path, staged: Path, candidates: tuple[str, ...]) -> 
     return None
 
 
+def _declared_skill_paths(root: Path) -> list[str]:
+    """manifest 里 `skills` 字段点名的目录（相对包根的写法，原样返回）。"""
+    hit = _first_existing(root, MANIFEST_FILES)
+    if hit is None:
+        return []
+    try:
+        declared = _read_json(hit[1]).get("skills")
+    except PluginError:
+        return []
+    if isinstance(declared, str):
+        declared = [declared]
+    if not isinstance(declared, list):
+        return []
+    return [item for item in declared if isinstance(item, str) and item.strip()]
+
+
+def bundle_skill_dirs(root: Path) -> list[Path]:
+    """一个包里放技能的目录：约定的 `skills/`，加上 manifest 点名的那些。
+
+    manifest 点名的路径必须落在包内：绝对路径、`..` 跳出去的、经符号链接指到
+    包外的一律不认——包是从网上拉来的，不能让一行 manifest 把包外的目录变成
+    技能来源。只有约定目录的包不读 manifest（这条路每次构造 Agent 都走）。
+    """
+    found: dict[Path, None] = {}
+    default = root / SKILLS_DIRNAME
+    if default.is_dir():
+        found[default] = None
+    else:
+        try:
+            base = root.resolve()
+        except OSError:
+            return list(found)
+        for raw in _declared_skill_paths(root):
+            candidate = root / raw
+            try:
+                resolved = candidate.resolve()
+            except OSError:
+                continue
+            if resolved != base and base not in resolved.parents:
+                continue
+            if candidate.is_dir():
+                found[candidate] = None
+    return list(found)
+
+
 def scan_bundle_skills(root: Path) -> tuple[str, ...]:
     """包里的技能名。读不了目录按"没有技能"处理，不抛。
 
@@ -188,19 +233,52 @@ def scan_bundle_skills(root: Path) -> tuple[str, ...]:
     """
     from . import skills as skills_module
 
-    skills_dir = root / SKILLS_DIRNAME
-    if not skills_dir.is_dir():
-        return ()
     names = []
-    for md in skills_dir.glob("*/SKILL.md"):
-        try:
-            meta = skills_module.parse_frontmatter(md.read_text(encoding="utf-8", errors="replace"))
-        except OSError:
-            continue
-        name = (meta.get("name") or md.parent.name).strip()
-        if name:
-            names.append(name)
-    return tuple(sorted(names))
+    for skills_dir in bundle_skill_dirs(root):
+        for md in skills_dir.glob("*/SKILL.md"):
+            try:
+                meta = skills_module.parse_frontmatter(
+                    md.read_text(encoding="utf-8", errors="replace")
+                )
+            except OSError:
+                continue
+            name = (meta.get("name") or md.parent.name).strip()
+            if name:
+                names.append(name)
+    return tuple(sorted(set(names)))
+
+
+#  声明里指代"这个包装在哪"的占位符（各家插件生态的写法）
+_ROOT_PLACEHOLDER = re.compile(r"\$\{(?:CLAUDE_|CODEX_|CURSOR_|XIAOYU_)?PLUGIN_ROOT\}")
+
+
+def _localize(plugin: str, server: str, entry: dict[str, Any]) -> tuple[dict[str, Any], str]:
+    """把声明里指向包内的路径落到实处，返回 (改写后的条目, 要告诉用户的话)。
+
+    `${CLAUDE_PLUGIN_ROOT}` 这类占位符换成安装目录（小羽装包时留着整个目录）。
+    不换的话装得上、起不来，而且零提示。相对路径的启动命令（`./bin/server`）
+    换不了——启动时的工作目录不是包目录——只能如实报出来。
+    """
+    home = str(plugins_root() / plugin)
+
+    def swap(value: Any) -> Any:
+        return _ROOT_PLACEHOLDER.sub(lambda _: home, value) if isinstance(value, str) else value
+
+    changed = dict(entry)
+    changed["command"] = swap(entry.get("command"))
+    if isinstance(entry.get("args"), list):
+        changed["args"] = [swap(item) for item in entry["args"]]
+    if isinstance(entry.get("env"), dict):
+        changed["env"] = {key: swap(value) for key, value in entry["env"].items()}
+    if changed != entry:
+        return changed, f"{server} 会运行包内的程序（路径已指向安装目录 {home}）"
+    command = str(entry.get("command") or "")
+    if command.startswith(("./", "../", ".\\", "..\\")):
+        return entry, (
+            f"{server} 的启动命令是相对路径（{command}），启动时的工作目录不是包目录，"
+            "多半起不来"
+        )
+    return entry, ""
 
 
 def _scan_hooks(root: Path, manifest: dict[str, Any]) -> list[str]:
@@ -260,6 +338,10 @@ def inspect_bundle(root: Path, fallback_name: str | None = None) -> Bundle:
                 if not remote and not isinstance(entry.get("command"), str):
                     notes.append(f"{mcp_file} 里的 {server} 既没有 command 也没有 url，跳过")
                     continue
+                if not remote:
+                    entry, note = _localize(name, str(server), entry)
+                    if note:
+                        notes.append(note)
                 mcp_servers[str(server)] = entry
 
     for hook in _scan_hooks(root, manifest):
@@ -267,7 +349,8 @@ def inspect_bundle(root: Path, fallback_name: str | None = None) -> Bundle:
 
     if not skills and not mcp_servers:
         raise PluginError(
-            f"{root} 里既没有 {SKILLS_DIRNAME}/ 也没有可用的 MCP 声明，不像一个插件包"
+            f"{root} 里既没有技能（{SKILLS_DIRNAME}/ 或 manifest 点名的目录）"
+            "也没有可用的 MCP 声明，不像一个插件包"
         )
 
     return Bundle(
@@ -503,8 +586,7 @@ def installed_skill_dirs() -> list[tuple[str, Path]]:
     """
     found = []
     for name, path in installed_dirs():
-        skills_dir = path / SKILLS_DIRNAME
-        if skills_dir.is_dir():
+        for skills_dir in bundle_skill_dirs(path):
             found.append((name, skills_dir))
     return found
 
@@ -679,13 +761,22 @@ def guard_servers(plugin: str, servers: dict[str, dict[str, Any]]) -> None:
     """写盘前过一遍 MCP 准入规则（和 `xiaoyu mcp add` 同一个保存点）。
 
     插件包是从网上拉来的、里面就带着可执行声明——这道门比手敲一条声明时更该有。
+    本地 server 判"这条命令像不像攻击"，远端 server 判"这个地址会不会让凭据
+    裸奔"（与 mcp.py 启动前那道同一对）。
     """
     from . import mcp_guard
 
     for server, entry in servers.items():
-        args = [str(item) for item in entry.get("args") or []]
-        env = {str(k): str(v) for k, v in (entry.get("env") or {}).items()}
-        if reason := mcp_guard.admission_violation(str(entry["command"]), args, env):
+        url = entry.get("url")
+        if isinstance(url, str) and url.strip():
+            reason = mcp_guard.endpoint_violation(url.strip())
+        elif isinstance(entry.get("command"), str):
+            args = [str(item) for item in entry.get("args") or []]
+            env = {str(k): str(v) for k, v in (entry.get("env") or {}).items()}
+            reason = mcp_guard.admission_violation(entry["command"], args, env)
+        else:
+            reason = "既没有 command 也没有 url"
+        if reason:
             raise PluginError(f"插件 {plugin} 的 MCP server {server!r} 被安全规则拦下：{reason}")
 
 

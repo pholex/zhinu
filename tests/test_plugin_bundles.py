@@ -304,6 +304,86 @@ class ResolveSourceTest(IsolatedConfigTest):
             plugins.resolve_source("这是什么")
 
 
+class RealWorldShapesTest(IsolatedConfigTest):
+    """真实插件包里常见、而最初没接住的三种形状。"""
+
+    def bundle(self, servers: dict | None = None, manifest: dict | None = None) -> Path:
+        src = self.root / "src"
+        write_json(src / "plugin.json", {"name": "demo", "version": "1.0.0", **(manifest or {})})
+        if servers is not None:
+            write_json(src / "mcp.json", {"mcpServers": servers})
+        return src
+
+    def test_remote_server_installs_instead_of_crashing(self):
+        src = self.bundle({"gw": {"type": "http", "url": "https://mcp.example.com/mcp",
+                                  "headers": {"Authorization": "Bearer ${env:GW_TOKEN}"}}})
+        write_skill(src, "hello")
+        code, out, err = self.run_cli(["add", str(src), "--accept-mcp"])
+        self.assertEqual(code, 0, err)
+        self.assertEqual(self.user_mcp()["demo__gw"]["url"], "https://mcp.example.com/mcp")
+
+    def test_remote_server_with_plaintext_endpoint_is_refused(self):
+        src = self.bundle({"gw": {"url": "http://mcp.example.com/mcp"}})
+        write_skill(src, "hello")
+        code, _, err = self.run_cli(["add", str(src), "--accept-mcp"])
+        self.assertEqual(code, 2)
+        self.assertIn("被安全规则拦下", err)
+        self.assertFalse((plugins.plugins_root() / "demo").exists(), "被拦下就该整包不装")
+
+    def test_plugin_root_placeholder_points_at_the_installed_copy(self):
+        src = self.bundle({"bot": {
+            "command": "bun",
+            "args": ["run", "--cwd", "${CLAUDE_PLUGIN_ROOT}", "start"],
+            "env": {"DATA": "${CLAUDE_PLUGIN_ROOT}/data"},
+        }})
+        write_skill(src, "hello")
+        code, out, err = self.run_cli(["add", str(src), "--accept-mcp"])
+        self.assertEqual(code, 0, err)
+        home = str(plugins.plugins_root() / "demo")
+        entry = self.user_mcp()["demo__bot"]
+        self.assertEqual(entry["args"], ["run", "--cwd", home, "start"])
+        self.assertEqual(entry["env"]["DATA"], f"{home}/data")
+        self.assertIn("包内的程序", out + err)
+        #  同一份包再装一次：声明没变，不该被当成"有变化"
+        bundle = plugins.inspect_bundle(src)
+        self.assertTrue(
+            plugins.same_servers(plugins.installed_mcp("demo"), plugins.declared_mcp(bundle))
+        )
+
+    def test_relative_command_is_reported_not_silently_installed(self):
+        src = self.bundle({"bot": {"command": "./bin/server"}})
+        write_skill(src, "hello")
+        bundle = plugins.inspect_bundle(src)
+        self.assertTrue(any("相对路径" in note for note in bundle.notes))
+
+    def test_skills_declared_by_the_manifest_are_found_and_loadable(self):
+        from xiaoyu import skills
+
+        src = self.bundle(manifest={"skills": "./.claude/skills/"})
+        skill = src / ".claude" / "skills" / "design"
+        skill.mkdir(parents=True)
+        (skill / "SKILL.md").write_text(
+            "---\nname: design\ndescription: 出设计\n---\n\n正文\n", encoding="utf-8"
+        )
+        self.assertEqual(plugins.inspect_bundle(src).skills, ("design",))
+        code, _, err = self.run_cli(["add", str(src)])
+        self.assertEqual(code, 0, err)
+        with mock.patch.object(skills, "skill_dirs", return_value=[]):
+            found = skills.scan_skills()
+        self.assertIn(f"demo{skills.NAMESPACE_SEP}design", [item.name for item in found])
+
+    def test_manifest_cannot_point_skills_outside_the_bundle(self):
+        outside = self.root / "outside" / "skills" / "leak"
+        outside.mkdir(parents=True)
+        (outside / "SKILL.md").write_text(
+            "---\nname: leak\ndescription: x\n---\n\n正文\n", encoding="utf-8"
+        )
+        for declared in ("../outside/skills", str(self.root / "outside" / "skills")):
+            with self.subTest(declared=declared):
+                src = self.bundle(manifest={"skills": declared})
+                self.assertEqual(plugins.bundle_skill_dirs(src), [])
+
+
 class InstallTest(IsolatedConfigTest):
     def test_add_installs_skills_but_not_mcp_without_consent(self):
         """非交互场景不替用户点头：技能照装，MCP 声明留着等确认。"""
