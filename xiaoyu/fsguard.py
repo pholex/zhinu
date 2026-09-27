@@ -21,6 +21,7 @@ import contextlib
 import errno
 import os
 import stat
+import time
 import uuid
 from pathlib import Path
 
@@ -65,7 +66,8 @@ def write_atomic(
     """把 data 原子地写到 path：同目录临时文件写完再改名，读者看不到半个文件。
 
     - 临时名唯一（pid + 随机串）：并发的写者——两个会话、同进程的两个线程——
-      各写各的临时文件，后改名的胜出，谁也读不到对方的半截；
+      各写各的临时文件，后改名的胜出，谁也读不到对方的半截（Windows 上改名
+      撞见目标被占用会稍等重试，见 _replace）；
     - private=True 时临时文件**创建时**就是 0600：里面有密钥的文件不该有任何
       一刻按 umask 可读（写完再 chmod 留着这个窗口）。Windows 上 mode 基本
       无语义，照常写；
@@ -94,8 +96,26 @@ def write_atomic(
         if not private:
             with contextlib.suppress(OSError):
                 os.chmod(tmp, stat.S_IMODE(os.stat(path).st_mode))
-        os.replace(tmp, path)
+        _replace(tmp, path)
     except BaseException:
         with contextlib.suppress(OSError):
             os.unlink(tmp)
         raise
+
+
+#  Windows 上目标正被另一个写者改名、或被读者短暂打开着的那一瞬，改名会报
+#  "拒绝访问"——是瞬时的，稍等再来就过。POSIX 上改名不受已打开句柄影响，一次定论
+_REPLACE_ATTEMPTS = 20 if os.name == "nt" else 1
+_REPLACE_PAUSE = 0.01
+
+
+def _replace(tmp: Path, path: Path) -> None:
+    """改名到位；被占用（PermissionError）时退避重试，次数用尽原样抛出。"""
+    for attempt in range(1, _REPLACE_ATTEMPTS + 1):
+        try:
+            os.replace(tmp, path)
+            return
+        except PermissionError:
+            if attempt >= _REPLACE_ATTEMPTS:
+                raise
+            time.sleep(_REPLACE_PAUSE * attempt)

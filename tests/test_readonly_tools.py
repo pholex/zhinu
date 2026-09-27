@@ -192,8 +192,9 @@ class TestLocateGrep(unittest.TestCase):
         return mock.patch.dict(os.environ, env)
 
     def test_path_grep_wins(self) -> None:
+        #  返回的是绝对路径：Windows 上没带盘符的路径会被补上当前盘
         with self._which(grep="/usr/bin/grep"):
-            self.assertEqual(_locate_grep(), "/usr/bin/grep")
+            self.assertEqual(_locate_grep(), os.path.abspath("/usr/bin/grep"))
 
     def test_posix_does_not_probe(self) -> None:
         """非 Windows 上 PATH 没有就是没有，不去乱猜路径。"""
