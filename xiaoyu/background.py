@@ -47,11 +47,37 @@ _AUTO_KILL_SECONDS = 30.0
 MONITOR_DEFAULT_TIMEOUT = 36_000
 
 
+#  记在 Popen 对象上的进程组 id（见 mark_group_leader）
+_GROUP_ATTR = "_xiaoyu_pgid"
+
+
+def mark_group_leader(proc: subprocess.Popen) -> None:
+    """登记"这个子进程是自己那个进程组的组长"（用 start_new_session 拉起的）。
+
+    进程组 id 必须在 spawn 当场记下：组长一旦被 wait() 收割，getpgid(pid) 就
+    查不到了，而组里的孙进程（`sleep 30 &`）还活着、还握着管道。kill_tree 靠
+    这份登记在组长已退之后照样整组杀。Windows 没有进程组语义，不登记。
+    """
+    if os.name != "nt":
+        setattr(proc, _GROUP_ATTR, proc.pid)
+
+
+def _group_of(proc: subprocess.Popen) -> int | None:
+    """kill_tree 该对哪个进程组发信号；拿不准就返回 None（退化为只杀直接子进程）。"""
+    if proc.returncode is None:
+        with contextlib.suppress(OSError):
+            return os.getpgid(proc.pid)
+    #  组长已被收割：pid 不再属于它，拿这个 pid 现查只会查不到、或查到别人。
+    #  只认 spawn 时的登记——组里还有成员时组 id 不会被系统复用
+    return getattr(proc, _GROUP_ATTR, None)
+
+
 def kill_tree(proc: subprocess.Popen) -> None:
     """整树终止（从 tools.py 移入，那边 import 这里的）。
 
     只杀 shell 会留下孙进程握着管道不放；Windows 用 taskkill /T 按树杀，
-    POSIX 靠 start_new_session 建立的进程组整组杀。
+    POSIX 靠 start_new_session 建立的进程组整组杀。组长先退、孙进程还在的
+    形态靠 mark_group_leader 的登记覆盖。
     """
     if os.name == "nt":
         with contextlib.suppress(Exception):
@@ -64,10 +90,10 @@ def kill_tree(proc: subprocess.Popen) -> None:
         import signal
 
         with contextlib.suppress(ProcessLookupError, PermissionError, OSError):
-            pgid = os.getpgid(proc.pid)
+            pgid = _group_of(proc)
             #  子进程与我们同组（调用方没开 start_new_session）时绝不能 killpg——
             #  那会把自己整组带走。这种情况下退化为只杀直接子进程。
-            if pgid != os.getpgid(0):
+            if pgid is not None and pgid != os.getpgid(0):
                 os.killpg(pgid, signal.SIGKILL)
     with contextlib.suppress(Exception):
         proc.kill()
@@ -216,6 +242,8 @@ class TaskManager:
             #  子进程已继承文件描述符，父进程这份立即关掉（Windows 上不关会锁文件）
             with contextlib.suppress(OSError):
                 log_handle.close()
+        if (popen_extra or {}).get("start_new_session"):
+            mark_group_leader(proc)
         task = BackgroundTask(
             task_id=task_id,
             kind=kind,

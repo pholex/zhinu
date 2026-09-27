@@ -32,7 +32,12 @@ from pathlib import Path
 from typing import Any, Callable
 
 from . import browser, fsguard, mcp, sandbox, tempdirs
-from .background import MONITOR_DEFAULT_TIMEOUT, TaskManager, kill_tree as _kill_tree
+from .background import (
+    MONITOR_DEFAULT_TIMEOUT,
+    TaskManager,
+    kill_tree as _kill_tree,
+    mark_group_leader as _mark_group_leader,
+)
 from .config import Config
 from .rewind import RewindStore
 
@@ -40,30 +45,51 @@ from .rewind import RewindStore
 #  硬性拦截：不可撤销的系统级破坏，
 #  连 --yolo / auto_approve 都不放行——审批是"用户想不想"，这里是"绝不"。
 #  只收录误伤概率极低的模式；宁可漏（还有人工审批兜底），不可错杀日常命令。
-_HARDLINE_RULES: tuple[tuple[re.Pattern[str], str], ...] = tuple(
+#
+#  两种规则，都保证对命令长度线性：
+#  - 整条命令上的单个正则（_HARDLINE_WHOLE）：模式里没有跨词的通配，随便扫。
+#  - 段内链（_HARDLINE_CHAINS）："先有 rm、后面有 -r、段尾是根目录"这类带
+#    "中间随便隔什么"的规则。写成一个正则就得用两三个 [^;|&]* 通配，每个起点
+#    都扫到段尾，几 KB 的重复词就能跑上秒级（持 GIL、Ctrl-C 打不断，serve 下
+#    拖住所有会话）。这里拆成逐步向后找：每一步取第一处命中、下一步从它后面
+#    接着找——"存在一组先后出现的位置"与"每步取最早的那个"等价，每步只扫一遍。
+_HARDLINE_WHOLE: tuple[tuple[re.Pattern[str], str], ...] = tuple(
     (re.compile(pattern), reason)
     for pattern, reason in [
-        #  rm 递归删根/家目录（目标必须是裸 / ~ $HOME /*，/tmp/foo 这类不命中）
-        (
-            r"\brm\s+(?=(?:[^;|&]*\s)?-\w*r)[^;|&]*\s(?:/|/\*|~|~/|\$HOME/?|\"\$HOME\"/?)\s*(?:$|[;|&])",
-            "rm 递归删除根目录或家目录",
-        ),
         (r":\(\)\s*\{\s*:\s*\|\s*:\s*&\s*\}\s*;\s*:", "fork bomb"),
         (r"\bmkfs(\.\w+)?\b", "格式化文件系统（mkfs）"),
-        (r"\bdd\b[^;|&]*\bof=/dev/", "dd 直写块设备"),
         (r">\s*/dev/(sd[a-z]|disk\d|nvme\d)", "重定向覆写块设备"),
         (r"\bdiskutil\s+(erase|zero)", "diskutil 抹盘"),
         (r"(?i)\bformat\s+[a-z]:", "Windows format 格式化分区"),
+    ]
+)
+
+_HARDLINE_CHAINS: tuple[tuple[tuple[re.Pattern[str], ...], str], ...] = tuple(
+    (tuple(re.compile(step) for step in steps), reason)
+    for steps, reason in [
+        #  rm 递归删根/家目录（目标必须是裸 / ~ $HOME /*，/tmp/foo 这类不命中）
         (
-            r"(?i)\b(rd|rmdir)\s+/s\b[^;|&]*\s[a-z]:\\?\s*(?:$|[;|&])",
+            (
+                r"\brm(?=\s)",
+                r"\s-\w*r",
+                r"\s(?:/|/\*|~|~/|\$HOME/?|\"\$HOME\"/?)\s*\Z",
+            ),
+            "rm 递归删除根目录或家目录",
+        ),
+        ((r"\bdd\b", r"\bof=/dev/"), "dd 直写块设备"),
+        (
+            (r"(?i)\b(?:rd|rmdir)\s+/s\b", r"(?i)\s[a-z]:\\?\s*\Z"),
             "Windows 递归删除盘根",
         ),
         (
-            r"(?i)Remove-Item\b[^;|&]*-Recurse[^;|&]*\s[a-z]:\\\s*(?:$|[;|&])",
+            (r"(?i)Remove-Item\b", r"(?i)-Recurse", r"(?i)\s[a-z]:\\\s*\Z"),
             "PowerShell 递归删除盘根",
         ),
     ]
 )
+
+#  段的边界：命令分隔符与换行（多行脚本的每一行各是一条命令）
+_HARDLINE_SEGMENT_SPLIT = re.compile(r"[;|&\n]")
 
 
 UNTRUSTED_TAG = "untrusted_content"
@@ -117,9 +143,25 @@ def wrap_untrusted(source: str, text: str) -> str:
 
 def hardline_violation(command: str) -> str | None:
     """命中硬性拦截规则时返回原因，否则 None。"""
-    for pattern, reason in _HARDLINE_RULES:
+    for pattern, reason in _HARDLINE_WHOLE:
         if pattern.search(command):
             return reason
+    #  两种读法都查：原样按行切；续行（反斜杠 + 换行）接回一行再切。只查后一种
+    #  会把 PowerShell 里行尾的 `C:\` 当成续行吃掉——那里反斜杠不是续行符
+    views = [command]
+    if "\\\n" in command:
+        views.append(command.replace("\\\n", " "))
+    for view in views:
+        for segment in _HARDLINE_SEGMENT_SPLIT.split(view):
+            for steps, reason in _HARDLINE_CHAINS:
+                position = 0
+                for step in steps:
+                    match = step.search(segment, position)
+                    if match is None:
+                        break
+                    position = match.end()
+                else:
+                    return reason
     return None
 
 
@@ -2180,6 +2222,7 @@ class Toolbox:
         #  等管道关闭——孙进程握着管道时"超时"根本不生效。这里超时整树杀。
         #  字节模式读管道，解码带 GBK 兜底（见 _decode_output）。
         started = time.monotonic()
+        hardening = _subprocess_hardening()
         try:
             proc = subprocess.Popen(
                 argv,
@@ -2191,10 +2234,13 @@ class Toolbox:
                 stderr=subprocess.PIPE,
                 cwd=str(self.config.workspace),
                 env=_hardened_env(self.config.extra_env),
-                **_subprocess_hardening(),
+                **hardening,
             )
         except OSError as exc:
             return f"ERROR: 无法执行命令：{exc}"
+        #  趁组长还活着登记进程组：shell 先退、孙进程握着管道时超时才杀得到
+        if hardening.get("start_new_session"):
+            _mark_group_leader(proc)
         #  不用 communicate：它把整份输出读进内存，几 GB 的输出能把进程吃爆
         pipes = [_BoundedPipe(proc.stdout), _BoundedPipe(proc.stderr)]
         _register_foreground(proc)
