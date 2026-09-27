@@ -249,13 +249,14 @@ def make_qixiang_tool(
                     permissions, runs, mcp_manager,
                     task=state.task,
                     capability_mode=capability_mode,
-                    #  resume 项沿用上次的 worktree，isolation 本就被忽略
+                    #  resume 项沿用上次的隔离，isolation 本就被忽略
                     isolation=None if state.resume_from else iso_value,
                     resume_from=state.resume_from,
                     child_sink=_NullSink(),
                     on_agent=register,
-                    #  批量并行写不许退回主工作区（worktree 建不出来=该项不执行）
-                    require_isolation=iso_value == "worktree",
+                    #  批量并行写不许退回主工作区（worktree 建不出来=该项不执行）。
+                    #  resume 项看的是存档里"上次是否隔离"，与本批的 isolation 无关
+                    require_isolation=iso_value == "worktree" or bool(state.resume_from),
                     #  resume 项的模型钉在存档上（execute_delegation 内部），
                     #  这里传了也只对新开项生效
                     model_override=model_name,
@@ -266,8 +267,8 @@ def make_qixiang_tool(
 
         def follow_up(run_id: str, register: Any) -> DelegationResult:
             #  追问轮一律收紧到 read-only：它只要一份更完整的交接，不需要写；
-            #  且首轮的干净 worktree 已被回收，resume 会落回主工作区——
-            #  带着写工具续跑等于绕过「绝不退回主工作区并行写」的硬保证
+            #  首轮的干净 worktree 已被回收，只读续跑直接在主工作区看即可，
+            #  不必为一轮追问重建目录
             return execute_delegation(
                 target, config, registry, usage, sink, locked_approver,
                 permissions, runs, mcp_manager,

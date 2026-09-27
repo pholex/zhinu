@@ -397,6 +397,101 @@ class WorktreeIsolationTest(KnobTestCase):
         new_id = re.search(r"resume_from: ([0-9a-f]{8})", result).group(1)
         self.assertEqual(runs[new_id].worktree, kept)
 
+    def _clean_first_run(self, runs) -> str:
+        """隔离里跑一轮、没留改动：worktree 收尾即删，存档里只剩"它本该隔离"。"""
+        tool = self.make_tool(self.SPEC_ISOLATED, [text_turn("只看不改")], runs=runs)
+        with contextlib.redirect_stdout(io.StringIO()):
+            result = tool.handler(task="看看")
+        rid = re.search(r"resume_from: ([0-9a-f]{8})", result).group(1)
+        self.assertIsNone(runs[rid].worktree)
+        self.assertTrue(runs[rid].isolated)
+        return rid
+
+    def test_resume_after_clean_run_writes_into_fresh_worktree(self):
+        """上次的 worktree 已回收：续跑要写，就得重建隔离，不能写进主工作区。"""
+        runs: dict = {}
+        rid = self._clean_first_run(runs)
+        script = [
+            tool_turn("w1", "write_file", {"path": "late.txt", "content": "hi"}),
+            text_turn("补写好了"),
+        ]
+        tool = self.make_tool(self.SPEC_ISOLATED, script, runs=runs)
+        with contextlib.redirect_stdout(io.StringIO()):
+            result = tool.handler(task="把文件补上", resume_from=rid)
+        self.assertFalse((self.root / "late.txt").exists(), "续跑写进了主工作区")
+        new_id = re.search(r"resume_from: ([0-9a-f]{8})", result).group(1)
+        kept = runs[new_id].worktree
+        self.assertIsNotNone(kept)
+        self.assertTrue((kept / "late.txt").is_file())
+        self.assertIn("新建了一个", result)
+        #  子 agent 得知道目录换了：它历史里的旧路径已经作废
+        sent = next(
+            message["content"]
+            for message in self.sub_client.completions.calls[0]["messages"]
+            if message["role"] == "user" and "把文件补上" in str(message["content"])
+        )
+        self.assertIn("工作目录已变更", sent)
+        self.assertIn(str(kept), sent)
+
+    def test_resume_after_lost_worktree_recreates_and_says_changes_are_gone(self):
+        script = [
+            tool_turn("w1", "write_file", {"path": "new.txt", "content": "hi"}),
+            text_turn("写好了"),
+        ]
+        runs: dict = {}
+        tool = self.make_tool(self.SPEC_ISOLATED, script, runs=runs)
+        with contextlib.redirect_stdout(io.StringIO()):
+            result = tool.handler(task="写个文件")
+        rid = re.search(r"resume_from: ([0-9a-f]{8})", result).group(1)
+        shutil.rmtree(runs[rid].worktree)
+        tool = self.make_tool(self.SPEC_ISOLATED, [text_turn("换了新目录")], runs=runs)
+        with contextlib.redirect_stdout(io.StringIO()):
+            result = tool.handler(task="继续", resume_from=rid)
+        self.assertIn("未提交的改动没有保留", result)
+        new_id = re.search(r"resume_from: ([0-9a-f]{8})", result).group(1)
+        self.assertTrue(runs[new_id].isolated)
+        self.assertNotEqual(runs[new_id].workdir, self.root)
+
+    def test_readonly_resume_of_isolated_run_needs_no_worktree(self):
+        """只读续跑（七襄的追问轮）：主工作区看一眼即可，但隔离意图要传下去。"""
+        runs: dict = {}
+        rid = self._clean_first_run(runs)
+        tool = self.make_tool(self.SPEC_ISOLATED, [text_turn("交接补全")], runs=runs)
+        with mock.patch.object(worktree_mod, "create") as create, contextlib.redirect_stdout(
+            io.StringIO()
+        ):
+            result = tool.handler(task="补交接", resume_from=rid, capability_mode="read-only")
+        create.assert_not_called()
+        new_id = re.search(r"resume_from: ([0-9a-f]{8})", result).group(1)
+        self.assertTrue(runs[new_id].isolated)
+
+    def test_batch_resume_refuses_when_worktree_cannot_be_rebuilt(self):
+        """批量续跑建不出隔离：该项不执行，绝不退回主工作区并行写。"""
+        runs: dict = {}
+        rid = self._clean_first_run(runs)
+        client = FakeClient([text_turn("不该跑到这里")])
+        with mock.patch.object(
+            worktree_mod, "create", side_effect=worktree_mod.WorktreeError("磁盘满了")
+        ), contextlib.redirect_stdout(io.StringIO()):
+            outcome = agents_mod.execute_delegation(
+                self.SPEC_ISOLATED, self.config, Registry.for_client(client), Usage(),
+                PlainSink(indent="", verbose=False), lambda name, args: True, None, runs,
+                task="继续写", resume_from=rid, require_isolation=True,
+            )
+        self.assertIn("不允许退回主工作区", outcome.error)
+        self.assertEqual(client.completions.calls, [])
+
+    def test_single_resume_falls_back_with_warning_when_rebuild_fails(self):
+        runs: dict = {}
+        rid = self._clean_first_run(runs)
+        tool = self.make_tool(self.SPEC_ISOLATED, [text_turn("照常干完")], runs=runs)
+        with mock.patch.object(
+            worktree_mod, "create", side_effect=worktree_mod.WorktreeError("磁盘满了")
+        ), contextlib.redirect_stdout(io.StringIO()):
+            result = tool.handler(task="继续", resume_from=rid)
+        self.assertIn("照常干完", result)
+        self.assertIn("实际在主工作区跑", result)
+
     def test_non_git_workspace_fails_open(self):
         """不在 git 仓里：告警、退回主工作区，委托照常完成。"""
         import tempfile
