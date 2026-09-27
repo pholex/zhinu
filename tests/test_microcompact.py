@@ -59,6 +59,18 @@ class MicrocompactTest(unittest.TestCase):
             [m.get("role") for m in result], [m.get("role") for m in messages]
         )
 
+    def test_stale_browser_snapshots_are_cleared_too(self):
+        """页面一跳转旧快照就作废了，单次又能有几万字符。"""
+        messages = [
+            {"role": "system", "content": "s"},
+            {"role": "user", "content": "任务"},
+            *tool_exchange("c1", "browser", self.big),
+            *tool_exchange("c2", "browser", self.big),
+            {"role": "assistant", "content": "结论"},
+        ]
+        result, cleared, _ = microcompact(messages, keep_recent=1)
+        self.assertEqual(cleared, 2)
+
     def test_recent_messages_protected(self):
         messages = [
             {"role": "system", "content": "s"},

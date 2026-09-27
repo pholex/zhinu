@@ -85,7 +85,7 @@ class CrashGuardTest(unittest.TestCase):
         )
         proc = subprocess.Popen(
             [sys.executable, "-c", script], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE, text=True,
+            stderr=subprocess.PIPE, text=True, encoding="utf-8", errors="replace",
             cwd=str(Path(__file__).resolve().parent.parent),
         )
         try:

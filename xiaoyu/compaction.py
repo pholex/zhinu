@@ -125,7 +125,9 @@ def sanitize_summary(summary: str) -> str:
 
 #  可清理的工具：结果是"可重新获取的原始数据"，清了随时能再拿。
 #  explore 的结论、skill 的说明是蒸馏产物 / 行为指令，清了拿不回来，不碰。
-CLEARABLE_TOOLS = frozenset({"read_file", "grep", "list_files", "bash"})
+#  browser 的页面快照同理，而且过期得最快：页面一跳转旧快照就作废了，单次
+#  又能有几万字符——不清的话要一直留到全量压缩
+CLEARABLE_TOOLS = frozenset({"read_file", "grep", "list_files", "bash", "browser"})
 
 #  小于这个字符数的结果不值得清（换出来的 token 抵不过 stub 占位）
 CLEAR_MIN_CHARS = 500
