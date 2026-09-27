@@ -124,6 +124,41 @@ class WriteAtomicTest(unittest.TestCase):
         self.assertEqual(target.read_text(encoding="utf-8"), "原样")
         self.assertEqual(self.leftovers(), [])
 
+    def test_replace_retries_while_target_is_busy(self) -> None:
+        """目标被占用是瞬时的（Windows 上并发改名会撞见）：等一下再来，别把错抛给调用方。"""
+        target = self.root / "state.json"
+        target.write_text("原样", encoding="utf-8")
+        real_replace = os.replace
+        calls: list[int] = []
+
+        def busy_twice(src, dst):  # noqa: ANN001, ANN202
+            calls.append(1)
+            if len(calls) <= 2:
+                raise PermissionError(13, "Access is denied")
+            return real_replace(src, dst)
+
+        with mock.patch.object(fsguard, "_REPLACE_ATTEMPTS", 5), mock.patch.object(
+            fsguard.time, "sleep"
+        ), mock.patch.object(fsguard.os, "replace", side_effect=busy_twice):
+            fsguard.write_atomic(target, "新内容")
+        self.assertEqual(len(calls), 3)
+        self.assertEqual(target.read_text(encoding="utf-8"), "新内容")
+        self.assertEqual(self.leftovers(), [])
+
+    def test_replace_gives_up_after_the_last_attempt(self) -> None:
+        target = self.root / "state.json"
+        target.write_text("原样", encoding="utf-8")
+        with mock.patch.object(fsguard, "_REPLACE_ATTEMPTS", 3), mock.patch.object(
+            fsguard.time, "sleep"
+        ), mock.patch.object(
+            fsguard.os, "replace", side_effect=PermissionError(13, "Access is denied")
+        ) as replace:
+            with self.assertRaises(PermissionError):
+                fsguard.write_atomic(target, "新内容")
+        self.assertEqual(replace.call_count, 3)
+        self.assertEqual(target.read_text(encoding="utf-8"), "原样")
+        self.assertEqual(self.leftovers(), [])
+
     def test_concurrent_writers_never_produce_a_torn_file(self) -> None:
         target = self.root / "shared.json"
         bodies = [str(index) * 20000 for index in range(8)]
