@@ -2527,6 +2527,20 @@ class McpManager:
         for thread in service:
             thread.join(timeout=15.0)
 
+    def server_states(self) -> dict[str, str]:
+        """声明过的每个 server 此刻的状态字（ready / cached / loading / failed / …）。
+
+        只给状态的第一个词：冒号后面的细节是 server 自己报的错误文本，不该被
+        带进别处的提示里。
+        """
+        with self._lock:
+            states = dict(self._states)
+        return {
+            spec.name: states.get(spec.name, "loading").split(":", 1)[0].strip()
+            for spec in self._specs
+            if not spec.disabled
+        }
+
     def describe(self) -> str:
         """/mcp 的状态输出。"""
         if not self._specs:
@@ -2612,6 +2626,24 @@ class McpView:
 
     def ready_tools(self) -> list[RemoteTool]:
         return [remote for remote in self._manager.ready_tools() if self._allows(remote.server)]
+
+    def unavailable(self) -> list[str]:
+        """这个视图本该看得到、此刻却用不了的 server 名字（只给名字）。
+
+        点了名却没配置的、配置了但起不来的都算；还在启动的不算（工具就绪后
+        会自动挂上）。引用不存在的名字在筛选时不报错是对的——但得有人告诉
+        子 agent 它少了什么，不然它只会对着工具表反复搜到轮数用尽。
+        """
+        states_of = getattr(self._manager, "server_states", None)
+        states = states_of() if callable(states_of) else {}
+        down = [
+            name
+            for name, state in states.items()
+            if self._allows(name) and state in ("failed", "closed")
+        ]
+        if self._mode == "named":
+            down += [name for name in sorted(self._names) if name not in states]
+        return down
 
     def loading(self) -> bool:
         return self._manager.loading()

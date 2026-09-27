@@ -1072,6 +1072,10 @@ class ChenshuRuntime:
             handoff = ""
             cut_short = ""
             if agent is not None:
+                from .agents import reap_background
+
+                if reaped := reap_background(agent):
+                    self.log(name, "member.reaped", detail=f"{reaped} 个后台任务")
                 handoff = agent.last_assistant_text()
                 if not failure:
                     from .agents import STOP_REASONS

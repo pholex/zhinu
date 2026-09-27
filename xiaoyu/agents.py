@@ -250,6 +250,24 @@ STOP_REASONS = {
 }
 
 
+def reap_background(agent: Any) -> int:
+    """收掉一个收工的 agent 留下的后台任务，返回终止了几个。
+
+    子 agent 有 bash 就能起后台任务，却没有 task_output / kill_task——它自己
+    收不了场。每个 Toolbox 自带任务表，整体回收只挂在进程退出上：常驻进程
+    （serve、嵌入宿主）里这些进程会一直攒着。
+    """
+    tasks = getattr(getattr(agent, "toolbox", None), "tasks", None)
+    if tasks is None:
+        return 0
+    try:
+        running = len(tasks.running())
+        tasks.shutdown()
+    except Exception:  # noqa: BLE001 - 收场失败不该盖掉委托本身的结果
+        return 0
+    return running
+
+
 def spec_dirs(workspace: Path) -> list[tuple[Path, str]]:
     return [
         (user_config_dir() / "agents", "user"),
@@ -656,6 +674,16 @@ def execute_delegation(
         if mcp_manager is not None and spec.mcp_mode != "none"
         else None
     )
+    #  声明了却用不上的 MCP server：点名告诉父级与子 agent（只给名字）
+    mcp_absent: list[str] = []
+    if mcp_view is not None:
+        mcp_absent = mcp_view.unavailable()
+    elif spec.mcp_mode != "none":
+        mcp_absent = (
+            sorted(spec.mcp_servers) if spec.mcp_mode == "named" else ["（本会话没有可用的 MCP）"]
+        )
+    if mcp_absent:
+        notes.append(f"声明的 MCP server 这次用不了：{'、'.join(mcp_absent)}")
 
     #  resume 钉死上次的模型（spec/主模型中途换了也不动摇——上下文是按它长的）；
     #  新开时 model_override（斗巧的异构竞争席位）> spec 声明 > 主模型
@@ -763,6 +791,11 @@ def execute_delegation(
             "分支流程、代码风格、命名约定等）时，不要拿你的默认当项目约定——"
             "先读工作区里的约定文件，读不到就在交接里点明这是未确认的假设。"
         )
+    if mcp_absent:
+        system_text += (
+            f"\n\n[MCP] 这些 MCP server 这次用不了：{'、'.join(mcp_absent)}。它们的工具不在"
+            "你的工具表里——别去搜、别假装调用；非它们不可的那部分任务在交接里点明做不了。"
+        )
     if seed:
         if spec.inherit == "fork":
             system_text += (
@@ -795,6 +828,9 @@ def execute_delegation(
         failure = f"{type(exc).__name__}: {exc}"
         if len(failure) > MAX_FAILURE_CHARS:
             failure = failure[:MAX_FAILURE_CHARS] + "…（已截断）"
+    finally:
+        if reaped := reap_background(sub_agent):
+            notes.append(f"子 agent 留下的 {reaped} 个后台任务已终止")
     answer = sub_agent.last_assistant_text()
     if answer == inherited_answer:
         answer = ""
