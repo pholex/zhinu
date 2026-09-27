@@ -19,3 +19,17 @@
 {"cmd": "rm /tmp/x", "guard": "dangerous", "expect": "allow", "note": "普通删单文件"}
 {"cmd": "echo 'rm -rf /tmp/x'", "guard": "dangerous", "expect": "allow", "note": "字面量不是执行"}
 {"cmd": "trap 'echo done' EXIT", "guard": "dangerous", "expect": "allow", "note": "trap 里是无害命令"}
+{"cmd": "rm $'-rf' build", "guard": "dangerous", "expect": "block", "note": "ANSI-C 引号藏 flag"}
+{"cmd": "rm $'\\x2drf' build", "guard": "dangerous", "expect": "block", "note": "ANSI-C 十六进制转义拼出 -"}
+{"cmd": "rm $'\\055rf' build", "guard": "dangerous", "expect": "block", "note": "ANSI-C 八进制转义拼出 -"}
+{"cmd": "r\\\nm -rf build", "guard": "dangerous", "expect": "block", "note": "命令名中间续行"}
+{"cmd": "echo 'rm -rf build' | sh", "guard": "dangerous", "expect": "block", "note": "echo 喂给 sh"}
+{"cmd": "echo 'rm -rf build' | bash -s", "guard": "dangerous", "expect": "block", "note": "bash -s 从 stdin 读"}
+{"cmd": "printf 'ls\\nrm -rf x\\n' | zsh", "guard": "dangerous", "expect": "block", "note": "printf 多行喂给 zsh"}
+{"cmd": "bash <<< 'rm -rf build'", "guard": "dangerous", "expect": "block", "note": "here-string"}
+{"cmd": "bash <<<'rm -rf build'", "guard": "dangerous", "expect": "block", "note": "here-string 粘连写法"}
+{"cmd": "builtin eval 'rm -rf build'", "guard": "dangerous", "expect": "block", "note": "builtin 点名内建 eval"}
+{"cmd": "echo 'rm -rf x'", "guard": "dangerous", "expect": "allow", "note": "只是打印，没喂给 shell"}
+{"cmd": "echo hi | sh", "guard": "dangerous", "expect": "allow", "note": "喂给 shell 的内容无害"}
+{"cmd": "echo rm -rf x | cat", "guard": "dangerous", "expect": "allow", "note": "下游不是 shell"}
+{"cmd": "echo \"$'-rf'\"", "guard": "dangerous", "expect": "allow", "note": "双引号里的 $' 是字面量"}

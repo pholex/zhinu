@@ -34,3 +34,21 @@
 {"cmd": "rg -n pattern src", "guard": "injection", "expect": "allow", "note": "普通搜索"}
 {"cmd": "tar -tzf a.tar", "guard": "injection", "expect": "allow", "note": "只列内容"}
 {"cmd": "ssh host uptime", "guard": "injection", "expect": "allow", "note": "远程跑一条命令无注入口"}
+{"cmd": "sort --compress-program=sh big.txt", "guard": "injection", "expect": "block", "note": "sort 指定外部压缩程序"}
+{"cmd": "sort --compress-program sh big.txt", "guard": "injection", "expect": "block", "note": "同上，值分开写"}
+{"cmd": "sort -o /etc/hosts a", "guard": "injection", "expect": "block", "note": "sort -o 写任意文件"}
+{"cmd": "sort -uo out a", "guard": "injection", "expect": "block", "note": "-o 藏在聚合短选项里"}
+{"cmd": "man -P sh ls", "guard": "injection", "expect": "block", "note": "man 指定翻页器"}
+{"cmd": "man --pager=sh ls", "guard": "injection", "expect": "block", "note": "长选项写法"}
+{"cmd": "less +!id file", "guard": "injection", "expect": "block", "note": "less 启动即执行命令"}
+{"cmd": "git grep --open-files-in-pager=sh x", "guard": "injection", "expect": "block", "note": "git grep 借翻页器执行"}
+{"cmd": "git grep -Osh x", "guard": "injection", "expect": "block", "note": "-O 粘连写法"}
+{"cmd": "go test -exec sh ./...", "guard": "injection", "expect": "block", "note": "go test -exec"}
+{"cmd": "go build -toolexec=wrap ./...", "guard": "injection", "expect": "block", "note": "go build -toolexec"}
+{"cmd": "go vet -vettool=x ./...", "guard": "injection", "expect": "block", "note": "go vet -vettool"}
+{"cmd": "sort -u -k2 a.txt", "guard": "injection", "expect": "allow", "note": "普通排序"}
+{"cmd": "sort -rn -t, a.csv", "guard": "injection", "expect": "allow", "note": "自定分隔符"}
+{"cmd": "man ls", "guard": "injection", "expect": "allow", "note": "普通查手册"}
+{"cmd": "git grep -n -i foo", "guard": "injection", "expect": "allow", "note": "普通 git grep"}
+{"cmd": "go test -run TestX -v ./...", "guard": "injection", "expect": "allow", "note": "普通 go test"}
+{"cmd": "go build -o bin/x ./cmd", "guard": "injection", "expect": "allow", "note": "go build 的 -o 是产物路径"}
