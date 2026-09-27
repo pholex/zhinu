@@ -1213,6 +1213,27 @@ class Toolbox:
             return False
         return outside
 
+    def guarded_config(self, name: str, args: dict[str, Any]) -> str | None:
+        """这次调用是不是在写可执行配置（.mcp.json / .env / .xiaoyu/ / .git/）。
+
+        是就返回说明。只看会写文件的工具；判定用 resolve 过的路径，与
+        outside_workspace 同一个解析口。解析不了的路径不在这里拦——它会按
+        越界走确认。
+        """
+        tool = self.get(name)
+        if tool is None or not tool.requires_approval or name == "bash":
+            return None
+        path = args.get("path")
+        if not isinstance(path, str) or not path:
+            return None
+        try:
+            resolved, _ = self._resolve(path)
+        except OSError:
+            return None
+        from . import folder_trust
+
+        return folder_trust.guarded_write_reason(resolved)
+
     def _is_spill_path(self, resolved: Path) -> bool:
         """resolve 过的路径是否落在 spill 目录下（自家落盘的工具输出）。"""
         return self._spill_dir is not None and resolved.is_relative_to(self._spill_dir)

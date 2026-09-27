@@ -58,7 +58,7 @@ LAYERS: tuple[Layer, ...] = (
     Layer("hardline", "hardline", False, "bash 硬红线", "XIAOYU_HARDLINE=0"),
     Layer(
         "unattended", "unattended", True,
-        "--yolo 下仍必问的两项（退出 plan、沙箱升权）", "--unattended",
+        "--yolo 下仍必问的三项（退出 plan、沙箱升权、写可执行配置）", "--unattended",
     ),
     Layer(
         "mcp_trust_changes", "mcp_trust_changes", True,

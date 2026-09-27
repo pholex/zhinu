@@ -261,7 +261,7 @@ def resolve_system_prompt_flags(args: argparse.Namespace) -> None:
 def add_guardrail_flags(parser: argparse.ArgumentParser) -> None:
     """护栏开关：主命令与 resume 共用（表在 guardrails.py）。
 
-    --unattended 单独放开 --yolo 下仍必问的两项；--unguarded 是预设：一次放开表里
+    --unattended 单独放开 --yolo 下仍必问的三项；--unguarded 是预设：一次放开表里
     全部层，且只在 XIAOYU_UNGUARDED=1 时生效（见 resolve_guardrail_flags）。
     """
     from . import guardrails
@@ -270,7 +270,7 @@ def add_guardrail_flags(parser: argparse.ArgumentParser) -> None:
         "--unattended",
         action="store_true",
         default=None,
-        help="--yolo 之上再放开退出 plan 与沙箱升权这两处必问（无人值守里没人按键）",
+        help="--yolo 之上再放开退出 plan、沙箱升权、写可执行配置这三处必问（无人值守里没人按键）",
     )
     parser.add_argument(
         guardrails.FLAG,

@@ -64,6 +64,38 @@ KIND_LABELS = {
 }
 
 
+#  写入目标按路径分量认的"可执行配置"：文件名命中，或落在这些目录之下。
+#  比 repo_config_kinds 宽——那边只管工作区根上小羽自己启动时会读的三样，
+#  这里管的是"模型这一笔写下去，之后会有东西被执行"：子目录里的 .mcp.json
+#  （换个目录启动就生效）、.git 里的 hooks 与 config（不进 git diff，事后看不见）
+_GUARDED_FILES = {
+    ".mcp.json": "MCP server 声明（启动时拉起进程）",
+    ".env": "环境配置（可改写端点与开关）",
+}
+_GUARDED_DIRS = {
+    ".xiaoyu": "小羽的工作区配置（权限规则、子 agent 声明）",
+    ".git": "git 内部文件（hooks 与 config 会在跑 git 时被执行）",
+}
+
+
+def guarded_write_reason(target: Path) -> str | None:
+    """这个写入目标是不是可执行配置；是就返回给用户看的说明。
+
+    target 应当是 resolve 过的路径——符号链接指过去的、`sub/../.mcp.json` 这种
+    绕路写法都该落在真实目标上判。按分量比、不分大小写（macOS / Windows 的
+    文件系统默认不分，`.MCP.JSON` 写的是同一个文件）。
+    """
+    parts = [part.casefold() for part in target.parts]
+    if not parts:
+        return None
+    for name, label in _GUARDED_DIRS.items():
+        if name in parts:
+            return f"{name}/：{label}"
+    if label := _GUARDED_FILES.get(parts[-1]):
+        return f"{target.name}：{label}"
+    return None
+
+
 def _present_or_uncertain(probe) -> bool:
     """探测出错按"存在"处理（fail-secure：拿不准就当有，宁多问不漏问）。"""
     try:

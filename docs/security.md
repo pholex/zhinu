@@ -9,6 +9,7 @@
 - `/allow` / `/deny` 配权限规则：命中 allow 免确认，命中 deny 强制拦截。
 - **`deny` 与危险命令硬拦截（`rm -rf /`、fork bomb 一类）是 bypass-immune 的**：`--yolo` 也拦得住。审批是"用户想不想"，这一层是"绝不"。
   `deny bash(curl *)` 按命令本身认，不按写法认：`/usr/bin/curl`、`env curl`、`"curl"`、`FOO=1 curl`、`bash -c 'curl …'`、`$(curl …)` 都拦。它仍是按字面匹配的规则而不是沙箱——脚本文件里写的、解释器里拼出来的命令它看不见，要挡住出网得靠沙箱的网络策略。
+- **写可执行配置必问**：`.mcp.json`、`.env`、`.xiaoyu/`、`.git/` 之下的文件由 `write_file` / `str_replace` 改动时，auto 档、`--yolo`、allow 规则都免不掉这一问（任意子目录里的同名文件、指过去的符号链接一样算）。这一笔写下去，下次启动拉起什么进程、哪些命令免确认就由模型说了算，等于模型给自己的下一次运行放权。
 - `exit_plan_mode` 的审批同样 bypass-immune：`--yolo` 也要问。否则模型能自行退出 plan 档，"批准后才执行"就是空话。无人值守里确实没人按键时用 `--unattended` 显式放开（见文末[放开护栏](#放开护栏unattended--xiaoyu_hardline0--trustcontent--unguarded)）。
 
 ## 模式与沙箱
@@ -33,7 +34,7 @@ auto 档**放行的依据是沙箱，不是信任**。所以沙箱不可用时�
 - `rm -rf /`、fork bomb 一类不可逆命令任何模式下都不执行；
 - `exit_plan_mode` 与沙箱升权仍要你批准，跨会话消息默认不收。
 
-这四条里有三条是可以再放开的（硬红线、两处必问、沙箱），怎么放见下文[放开护栏](#放开护栏unattended--xiaoyu_hardline0--trustcontent--unguarded)。
+这四条里有三条是可以再放开的（硬红线、三处必问、沙箱），怎么放见下文[放开护栏](#放开护栏unattended--xiaoyu_hardline0--trustcontent--unguarded)。
 
 两点差别值得知道：**`--yolo` 不像 auto 那样把"沙箱可用"当放行前提**——在没有沙箱的平台上（Windows、没装 bubblewrap、`--no-sandbox`），它是真的全放行，bash 能写你有权限的任何地方；另外它刻意不在 Shift-Tab 循环里，得显式敲命令行参数进去。
 
@@ -113,11 +114,11 @@ xiaoyu --no-network          # 或 XIAOYU_SANDBOX_NETWORK=0，断掉沙箱内的
 | 层 | 单独关掉 | 适用场景 |
 |---|---|---|
 | bash 硬红线（`rm -rf /`、`mkfs`、`dd of=/dev/…`） | `XIAOYU_HARDLINE=0`（默认开，与 `XIAOYU_SANDBOX` 同形态） | 隔离环境里做镜像烧录、格式化 |
-| `--yolo` 下仍必问的两项（`exit_plan_mode`、沙箱升权） | `--unattended`（或 `XIAOYU_UNATTENDED=1`） | 无人值守：没人按键，卡住等于任务死掉 |
+| `--yolo` 下仍必问的三项（`exit_plan_mode`、沙箱升权、写可执行配置） | `--unattended`（或 `XIAOYU_UNATTENDED=1`） | 无人值守：没人按键，卡住等于任务死掉 |
 | 某个 MCP server 的结果不套 `<untrusted_content>` | 该 server 声明里 `"trustContent": true` | 内网 runbook / 工单系统——你就是想让模型照它说的做 |
 | 逐条审批 / 沙箱 / 工作区信任门 / MCP 变更隔离 | `--yolo` / `--no-sandbox` / `--trust` / `XIAOYU_MCP_TRUST_CHANGES=1` | 原有开关，不变 |
 
-`trustContent` 只给 MCP：网页与联网搜索的来源不是你能背书的，没有对应开关。`--unattended` 单独开没有意义——不带 `--yolo` 时那两项本来就走常规确认。
+`trustContent` 只给 MCP：网页与联网搜索的来源不是你能背书的，没有对应开关。`--unattended` 在确认档单独开没有意义——那几项本来就走常规确认；出厂的 auto 档下它会让写可执行配置不再问。
 
 ### `--unguarded`：无护栏预设
 
