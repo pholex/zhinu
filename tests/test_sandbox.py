@@ -193,8 +193,10 @@ class SecretPathsTest(unittest.TestCase):
         self.assertIn(str(config_mod.user_config_dir() / "mcp.json"), paths)
 
     def test_explicit_env_file_is_included(self):
-        with mock.patch.dict(os.environ, {"XIAOYU_ENV_FILE": "/opt/keys/xiaoyu.env"}):
-            self.assertIn("/opt/keys/xiaoyu.env", sandbox.secret_paths())
+        #  Windows 上没带盘符的路径不算绝对路径，先补成当前盘下的
+        explicit = os.path.abspath("/opt/keys/xiaoyu.env")
+        with mock.patch.dict(os.environ, {"XIAOYU_ENV_FILE": explicit}):
+            self.assertIn(explicit, sandbox.secret_paths())
 
     def test_deny_covers_reads_and_comes_last(self):
         text = sandbox.policy_text(1, True, secret_files=1)
