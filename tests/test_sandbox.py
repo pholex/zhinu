@@ -96,6 +96,47 @@ class LinuxWrapTest(unittest.TestCase):
             self.assertTrue(candidate.startswith("/"), candidate)
 
 
+class ProtectedPathsTest(unittest.TestCase):
+    def test_deny_rules_come_after_every_allow(self):
+        text = sandbox.policy_text(2, allow_network=True, protected_files=1, protected_dirs=1)
+        last_allow = text.rindex("(allow ")
+        self.assertGreater(text.index('(deny file-write* (literal (param "PROTECTED_FILE_0")))'), last_allow)
+        self.assertGreater(text.index('(deny file-write* (subpath (param "PROTECTED_DIR_0")))'), last_allow)
+
+    def test_paths_travel_as_parameters_not_policy_text(self):
+        """路径里的引号、括号破坏不了策略语法：只经 -D 传值。"""
+        with (
+            mock.patch.object(sandbox.sys, "platform", "darwin"),
+            mock.patch.object(sandbox, "available", return_value=True),
+        ):
+            argv = sandbox.wrap(["/bin/true"], Path('/tmp/w") (allow default) ("'))
+        policy = argv[2]
+        self.assertNotIn("allow default", policy)
+        self.assertTrue(any(a.startswith("PROTECTED_FILE_0=") and a.endswith(".mcp.json") for a in argv))
+        self.assertTrue(any(a.startswith("PROTECTED_DIR_0=") and a.endswith(".xiaoyu") for a in argv))
+
+    def test_bwrap_remounts_existing_config_read_only_after_binds(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config = Path(tmp) / ".mcp.json"
+            config.write_text("{}", encoding="utf-8")
+            missing = str(Path(tmp) / ".xiaoyu")
+            args = sandbox.bwrap_args([tmp], True, [str(config), missing])
+        self.assertGreater(args.index("--ro-bind", 3), args.index("--bind"))
+        self.assertIn(str(config), args)
+        self.assertNotIn(missing, args, "不存在的路径挂不了，挂了会在磁盘上留下空目录")
+
+    def test_symlinked_config_protects_both_ends(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            (root / "real.json").write_text("{}", encoding="utf-8")
+            try:
+                (root / ".mcp.json").symlink_to(root / "real.json")
+            except (OSError, NotImplementedError):
+                self.skipTest("这台机器建不了符号链接")
+            files, _ = sandbox.protected_paths(root)
+        self.assertEqual(files, [str(root / ".mcp.json"), str(root / "real.json")])
+
+
 class WrapTest(unittest.TestCase):
     def test_wrap_builds_sandbox_exec_call(self):
         with (
@@ -253,6 +294,47 @@ class RealSandboxTest(unittest.TestCase):
         result = self.run_in_sandbox("cat /etc/hosts > /dev/null && echo read-ok")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("read-ok", result.stdout)
+
+    def test_executable_config_is_read_only_inside_workspace(self):
+        """小羽自己启动时会读的配置，沙箱内的命令改不了、删不掉、也顶替不了。"""
+        (self.ws / ".mcp.json").write_text("{}", encoding="utf-8")
+        (self.ws / ".xiaoyu").mkdir()
+        (self.ws / ".xiaoyu" / "permissions.txt").write_text("# 空\n", encoding="utf-8")
+        attempts = [
+            "echo '{\"mcpServers\": {}}' > .mcp.json",
+            "rm .mcp.json",
+            "echo x > swap.json && mv swap.json .mcp.json",
+            "echo 'allow bash' >> .xiaoyu/permissions.txt",
+            "mkdir .xiaoyu/agents",
+            "mv .xiaoyu moved",
+        ]
+        for command in attempts:
+            with self.subTest(command=command):
+                result = self.run_in_sandbox(command)
+                self.assertNotEqual(result.returncode, 0, command)
+        self.assertEqual((self.ws / ".mcp.json").read_text(encoding="utf-8"), "{}")
+        self.assertEqual(
+            (self.ws / ".xiaoyu" / "permissions.txt").read_text(encoding="utf-8"), "# 空\n"
+        )
+        self.assertFalse((self.ws / ".xiaoyu" / "agents").exists())
+
+    def test_ordinary_dotfiles_stay_writable(self):
+        (self.ws / ".git").mkdir()
+        result = self.run_in_sandbox(
+            "cp /etc/hosts .env && echo x > .git/config && echo y > .gitignore && "
+            "mkdir sub && echo z > sub/notes.json && echo ok"
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("ok", result.stdout)
+
+    @unittest.skipUnless(sys.platform == "darwin", "bwrap 挡不住尚不存在的路径")
+    def test_executable_config_cannot_be_created_either(self):
+        result = self.run_in_sandbox("echo '{}' > .mcp.json")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertFalse((self.ws / ".mcp.json").exists())
+        result = self.run_in_sandbox("mkdir -p .xiaoyu && echo 'allow bash' > .xiaoyu/permissions.txt")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertFalse((self.ws / ".xiaoyu").exists())
 
     def test_temp_dirs_writable(self):
         result = self.run_in_sandbox("echo x > /tmp/xiaoyu_probe && rm /tmp/xiaoyu_probe")

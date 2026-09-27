@@ -13,7 +13,10 @@
 误删家目录、覆写 `~/.zshrc`、把包装进系统 Python。所以：
 
 - **写**：默认只允许工作区 + 临时目录 + 若干缓存目录（见 `default_writable_roots`），
-  其余一律拒绝。这是这层沙箱的全部价值所在。
+  其余一律拒绝。这是这层沙箱的全部价值所在。工作区里有一处例外：小羽自己
+  启动时会读的可执行配置（`.mcp.json`、`.xiaoyu/`）在沙箱内只读（见
+  `protected_paths`）——auto 档下沙箱内的命令免确认，不能让它顺手改掉下次
+  启动拉起什么进程。
 - **读**：全盘放行。收紧读会踩不完的坑（动态链接、locale、各语言 runtime 的
   配置发现），而读本身不造成不可逆损失。⚠️ 代价是模型仍读得到 `~/.ssh`、
   `~/.aws` 这类凭据——这一层不解决凭据泄露，那靠的是 bash 默认逐次确认。
@@ -102,22 +105,44 @@ _NETWORK_DENY = """
 """
 
 
-def policy_text(writable_count: int, allow_network: bool) -> str:
-    """按可写根目录的数量生成策略文本。根目录本身由 -D WRITABLE_n 传值。"""
+def policy_text(
+    writable_count: int,
+    allow_network: bool,
+    protected_files: int = 0,
+    protected_dirs: int = 0,
+) -> str:
+    """按可写根目录的数量生成策略文本。根目录本身由 -D WRITABLE_n 传值。
+
+    受保护路径（PROTECTED_FILE_n / PROTECTED_DIR_n）的 deny 必须排在全部 allow
+    之后：Seatbelt 后写的规则胜出。deny file-write* 同时管住改写、删除、改名
+    顶替与建硬链接。
+    """
     parts = [_POLICY_HEADER, _NETWORK_ALLOW if allow_network else _NETWORK_DENY]
     for index in range(writable_count):
         parts.append(
             f'\n(allow file-write* (subpath (param "WRITABLE_{index}")))'
             f'\n(allow file-read* (subpath (param "WRITABLE_{index}")))\n'
         )
+    if protected_files or protected_dirs:
+        parts.append("\n; 工作区里的可执行配置：沙箱内只读\n")
+    for index in range(protected_files):
+        parts.append(f'(deny file-write* (literal (param "PROTECTED_FILE_{index}")))\n')
+    for index in range(protected_dirs):
+        parts.append(f'(deny file-write* (subpath (param "PROTECTED_DIR_{index}")))\n')
     return "".join(parts)
 
 
 # ---------- Linux bubblewrap ----------
 
 
-def bwrap_args(writable_roots: list[str], allow_network: bool) -> list[str]:
+def bwrap_args(
+    writable_roots: list[str], allow_network: bool, protected: list[str] | None = None
+) -> list[str]:
     """bwrap 参数（不含二进制路径和目标命令）。纯函数，全平台可测。
+
+    protected 是可写根里要重新压回只读的路径，排在全部 `--bind` 之后（后挂的
+    盖住先挂的）。⚠️ 只压得住**已存在**的路径：bwrap 给不存在的目标建挂载点
+    会在真实磁盘上留下空文件/空目录。不存在的靠工作区信任门的内容指纹兜底。
 
     - `--ro-bind / /`：整棵文件系统只读挂进来，之后逐条开洞——对应 seatbelt
       的 `(deny default)` + `(allow file-read*)`
@@ -153,6 +178,9 @@ def bwrap_args(writable_roots: list[str], allow_network: bool) -> list[str]:
     for root in writable_roots:
         if Path(root).exists():
             args += ["--bind", root, root]
+    for path in protected or []:
+        if Path(path).exists():
+            args += ["--ro-bind", path, path]
     return args
 
 
@@ -256,6 +284,35 @@ def default_writable_roots(workspace: Path) -> list[Path]:
     return roots
 
 
+def protected_paths(workspace: Path) -> tuple[list[str], list[str]]:
+    """工作区里沙箱内也不许写的路径：(文件, 目录)。
+
+    只收小羽自己启动时会读、读了就会执行或放权的那几样：`.mcp.json`（拉起
+    MCP server 进程）、`.xiaoyu/`（权限规则、子 agent 声明）。刻意不收：
+    - `.env`：`cp .env.example .env` 是项目初始化的日常动作；它的改动靠工作区
+      信任门的内容指纹在下次启动时问；
+    - `.git/` 里的 hooks 与 config：`git checkout -b`、`push -u`、`remote add`
+      都要写 config，拦了 git 的日常操作就坏了。
+    要改受保护的文件，走 write_file / str_replace（会请用户确认）。
+
+    符号链接两头都保护：链接本身（防被删掉换成普通文件）与它指向的真实文件。
+    """
+    try:
+        root = workspace.expanduser().resolve()
+    except OSError:
+        return [], []
+
+    def both(path: Path) -> list[str]:
+        found = {str(path): None}
+        try:
+            found.setdefault(str(path.resolve()), None)
+        except OSError:
+            pass
+        return list(found)
+
+    return both(root / ".mcp.json"), both(root / ".xiaoyu")
+
+
 def extra_writable_roots() -> list[Path]:
     """`XIAOYU_SANDBOX_WRITABLE`（冒号分隔）追加的可写根目录。"""
     raw = os.environ.get("XIAOYU_SANDBOX_WRITABLE", "").strip()
@@ -281,12 +338,18 @@ def wrap(argv: list[str], workspace: Path, allow_network: bool = True) -> list[s
     if not available():
         return argv
     roots = _normalize(default_writable_roots(workspace) + extra_writable_roots())
+    files, dirs = protected_paths(workspace)
     if sys.platform == "darwin":
-        command = [SANDBOX_EXEC, "-p", policy_text(len(roots), allow_network)]
+        policy = policy_text(len(roots), allow_network, len(files), len(dirs))
+        command = [SANDBOX_EXEC, "-p", policy]
         for index, root in enumerate(roots):
             command += ["-D", f"WRITABLE_{index}={root}"]
+        for index, path in enumerate(files):
+            command += ["-D", f"PROTECTED_FILE_{index}={path}"]
+        for index, path in enumerate(dirs):
+            command += ["-D", f"PROTECTED_DIR_{index}={path}"]
         return command + ["--", *argv]
-    return [_bwrap_path(), *bwrap_args(roots, allow_network), "--", *argv]
+    return [_bwrap_path(), *bwrap_args(roots, allow_network, files + dirs), "--", *argv]
 
 
 def enabled(config_flag: bool) -> bool:
@@ -364,6 +427,8 @@ def denial_hint(workspace: Path, allow_network: bool, escalation: bool = False) 
         "",
         "[沙箱提示] 这次失败疑似是被沙箱拦截的，不一定是命令本身有问题。",
         f"当前策略：只有工作区（{workspace}）、临时目录和构建缓存可写；其余路径只读。",
+        "工作区里的 .mcp.json 与 .xiaoyu/ 是可执行配置，沙箱内同样只读——"
+        "要改它们用 write_file / str_replace（会请用户确认），不要升权重试。",
     ]
     if not allow_network:
         lines.append("网络当前是**禁用**的，联网命令（pip/npm/curl/git push）都会失败。")
