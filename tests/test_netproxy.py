@@ -155,7 +155,8 @@ class UnsupportedSchemeTest(unittest.TestCase):
             messages.client("https://api.example.invalid/v1", "k", 5.0)
         text = err.getvalue()
         self.assertEqual(text.count("ALL_PROXY"), 1, text)
-        self.assertIn('pip install "httpx[socks]"', text)
+        self.assertIn('pip install "httpx[socks]"', text)  # 普通环境：点名解释器的 pip
+        self.assertIn(sys.executable, text)
 
     def test_socks4_is_rejected_without_value_error(self) -> None:
         err = io.StringIO()

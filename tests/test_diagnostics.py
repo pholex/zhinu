@@ -5,6 +5,7 @@ from __future__ import annotations
 import io
 import json
 import os
+import sys
 import tempfile
 import unittest
 from contextlib import redirect_stdout
@@ -134,6 +135,62 @@ class DoctorChecksTest(unittest.TestCase):
         payload = json.loads(diagnostics.to_json(checks))
         self.assertEqual(payload["status"], "warn")
         self.assertEqual(len(payload["checks"]), 2)
+
+
+class RemediesPointSomewhereRealTest(unittest.TestCase):
+    """doctor 给的出路得真的走得通。"""
+
+    def test_linux_sandbox_tells_missing_from_blocked(self) -> None:
+        from xiaoyu import sandbox
+
+        with mock.patch.object(sandbox, "available", return_value=False), mock.patch.object(
+            sandbox.sys, "platform", "linux"
+        ):
+            with mock.patch.object(sandbox, "_bwrap_path", return_value=None):
+                why, remedy = sandbox.unavailable_reason()
+                self.assertIn("没有安装", why)
+                self.assertIn("install bubblewrap", remedy)
+            with mock.patch.object(sandbox, "_bwrap_path", return_value="/usr/bin/bwrap"):
+                why, remedy = sandbox.unavailable_reason()
+                self.assertIn("跑不起来", why)
+                self.assertIn("AppArmor", remedy)
+                self.assertIn("重装 bubblewrap 没有用", remedy)
+
+    def test_available_sandbox_has_no_reason(self) -> None:
+        from xiaoyu import sandbox
+
+        with mock.patch.object(sandbox, "available", return_value=True):
+            self.assertEqual(sandbox.unavailable_reason(), ("", ""))
+
+    def test_mcp_server_whose_command_is_missing_is_flagged(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = Path(tmp)
+            (workspace / ".mcp.json").write_text(
+                json.dumps({"mcpServers": {
+                    "ghost": {"command": "xiaoyu-no-such-mcp-binary"},
+                    "here": {"command": sys.executable},
+                    "remote": {"url": "https://mcp.example.com/mcp"},
+                    "off": {"command": "also-missing-but-disabled", "disabled": True},
+                }}),
+                encoding="utf-8",
+            )
+            with mock.patch("xiaoyu.mcp.user_config_dir", lambda: workspace / "userconf"):
+                check = diagnostics.check_mcp_config(workspace)
+        self.assertEqual(check.status, "warn")
+        flagged = [line for line in check.details if "找不到" in line]
+        self.assertEqual(len(flagged), 1)
+        self.assertIn("ghost", flagged[0])
+
+    def test_oversized_sessions_remedy_names_no_missing_command(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            sessions = Path(tmp)
+            (sessions / "a.jsonl").write_text("x", encoding="utf-8")
+            #  把"偏大"的门槛压到 1 字节以下：不必真造 2GB 的文件
+            with mock.patch.object(diagnostics, "GIB", 0.25):
+                check = diagnostics.check_sessions(sessions)
+        self.assertEqual(check.status, "warn")
+        self.assertNotIn("清理旧会话", check.remedy)
+        self.assertIn("直接删", check.remedy)
 
 
 class DoctorCommandTest(unittest.TestCase):

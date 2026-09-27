@@ -303,23 +303,18 @@ def check_proxy() -> Check:
 def check_sandbox() -> Check:
     from . import sandbox
 
-    if sys.platform == "darwin":
-        ok = sandbox.available()
-        return Check(
-            "sandbox", "ok" if ok else "warn",
-            "沙箱可用（Seatbelt）" if ok else "sandbox-exec 不存在，bash 不受沙箱约束",
-        )
-    if sys.platform == "linux":
-        if sandbox.available():
-            return Check("sandbox", "ok", "沙箱可用（bubblewrap）")
-        return Check(
-            "sandbox", "warn", "沙箱不可用，bash 命令可写任意路径",
-            remedy="安装 bubblewrap，并确认内核允许 unprivileged user namespace",
-        )
-    return Check("sandbox", "warn", "本平台无沙箱（建议在 WSL 里用）")
+    if sandbox.available():
+        backend = "Seatbelt" if sys.platform == "darwin" else "bubblewrap"
+        return Check("sandbox", "ok", f"沙箱可用（{backend}）")
+    why, remedy = sandbox.unavailable_reason()
+    return Check(
+        "sandbox", "warn", f"沙箱不可用（{why}），bash 命令可写任意路径", remedy=remedy
+    )
 
 
 def check_bash_parser() -> Check:
+    from . import envprobe
+
     try:
         from . import bash_ast  # noqa: F401
 
@@ -327,7 +322,9 @@ def check_bash_parser() -> Check:
     except ImportError as exc:
         return Check(
             "bash_parser", "warn", "命令解析器缺失，allow 规则退化为逐条确认", [str(exc)],
-            remedy="pip install tree-sitter tree-sitter-bash",
+            remedy=" && ".join(
+                envprobe.install_hint(name) for name in ("tree-sitter", "tree-sitter-bash")
+            ),
         )
     return Check("bash_parser", "ok", "命令解析器就绪（tree-sitter-bash）")
 
@@ -336,6 +333,7 @@ def check_mcp_config(workspace: Path) -> Check:
     from . import mcp
 
     details: list[str] = []
+    missing: list[str] = []
     status = "ok"
     total = 0
     for path in mcp.config_paths(workspace):
@@ -351,10 +349,23 @@ def check_mcp_config(workspace: Path) -> Check:
         count = len(servers) if isinstance(servers, dict) else 0
         total += count
         details.append(f"{path}：{count} 个 server")
+        for name, entry in (servers if isinstance(servers, dict) else {}).items():
+            command = entry.get("command") if isinstance(entry, dict) else None
+            if not isinstance(command, str) or not command.strip() or entry.get("disabled"):
+                continue
+            #  只查"起不起得来"的第一步：命令在不在。不启动任何东西
+            if shutil.which(os.path.expanduser(command)) is None:
+                missing.append(f"{name} 的启动命令 {command!r} 找不到")
     if status == "fail":
         return Check("mcp_config", "fail", "MCP 配置文件损坏", details, remedy="修正 JSON 后重试")
     if not details:
         return Check("mcp_config", "ok", "未配置 MCP server")
+    if missing:
+        return Check(
+            "mcp_config", "warn", f"{len(missing)} 个 MCP server 的启动命令找不到",
+            details + missing,
+            remedy="装上对应的程序，或在配置里把 command 写成绝对路径",
+        )
     return Check("mcp_config", "ok", f"MCP 配置可解析（{total} 个 server）", details)
 
 
@@ -418,7 +429,11 @@ def check_sessions(sessions: Path) -> Check:
     if size > 2 * GIB:
         return Check(
             "sessions", "warn", "会话目录偏大", details,
-            remedy="`xiaoyu sessions` 清理旧会话",
+            #  小羽没有清理旧会话的命令：别指一条不存在的路
+            remedy=(
+                "旧会话的 .jsonl 可以直接删（连同同名的 .lock / .plan.md）；"
+                "先用 `xiaoyu sessions` 看哪些还在跑，在跑的别动"
+            ),
         )
     return Check("sessions", "ok", "会话目录正常", details)
 

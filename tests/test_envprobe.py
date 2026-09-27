@@ -71,3 +71,35 @@ class BlockTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class InstallHintTest(unittest.TestCase):
+    """"装进小羽所在的环境"的命令得按安装通道给：裸 pip 在 pipx / uv 环境里装到别处。"""
+
+    def hint(self, prefix: str, requirement: str) -> str:
+        import sys
+
+        with mock.patch.object(sys, "prefix", prefix):
+            return envprobe.install_hint(requirement)
+
+    def test_plain_environment_names_its_own_interpreter(self):
+        import sys
+
+        hint = self.hint("/opt/venvs/work", "httpx[socks]")
+        self.assertIn(sys.executable, hint)
+        self.assertIn('-m pip install "httpx[socks]"', hint)
+
+    def test_pipx_and_uv_environments_get_their_own_commands(self):
+        pipx = "/Users/x/.local/pipx/venvs/xiaoyu-agent"
+        uv = "/Users/x/.local/share/uv/tools/xiaoyu-agent"
+        self.assertEqual(self.hint(pipx, "httpx[socks]"), 'pipx inject xiaoyu-agent "httpx[socks]"')
+        self.assertEqual(
+            self.hint(pipx, "xiaoyu-agent[tui]"), 'pipx install --force "xiaoyu-agent[tui]"'
+        )
+        self.assertIn("uv tool install", self.hint(uv, "httpx[socks]"))
+        self.assertIn('--with "httpx[socks]"', self.hint(uv, "httpx[socks]"))
+        self.assertEqual(
+            self.hint(uv, "xiaoyu-agent[tui]"), 'uv tool install --force "xiaoyu-agent[tui]"'
+        )
+        for prefix in (pipx, uv):
+            self.assertNotIn("pip install", self.hint(prefix, "tree-sitter"))

@@ -210,6 +210,32 @@ def _bwrap_path() -> str | None:
     return None
 
 
+def unavailable_reason() -> tuple[str, str]:
+    """沙箱用不了时：(为什么, 怎么办)。可用时返回两个空串。
+
+    Linux 上"用不了"有两种，办法完全不同：没装，装上即可；装了但跑不起来，
+    再装一遍也没用——是内核或 AppArmor 不让非特权进程建 user namespace。
+    混成一句"安装 bubblewrap 并确认内核允许…"，两种人都得猜自己是哪一种。
+    """
+    if available():
+        return "", ""
+    if sys.platform == "darwin":
+        return f"{SANDBOX_EXEC} 不存在", "这台 macOS 缺了系统自带的 sandbox-exec，沙箱无从启用"
+    if not sys.platform.startswith("linux"):
+        return "本平台没有可用的沙箱", "Windows 上建议在 WSL 里用"
+    if _bwrap_path() is None:
+        return (
+            "没有安装 bubblewrap",
+            "装上即可：apt install bubblewrap / dnf install bubblewrap / pacman -S bubblewrap",
+        )
+    return (
+        "bubblewrap 装了但跑不起来：系统不让非特权进程建 user namespace",
+        "Ubuntu 24.04 起要给 bwrap 配一份 AppArmor profile 放行 userns"
+        "（或 sysctl kernel.apparmor_restrict_unprivileged_userns=0）；"
+        "别的发行版查 kernel.unprivileged_userns_clone 是否为 1。重装 bubblewrap 没有用",
+    )
+
+
 #  探针结果缓存（进程级）。None = 还没探过。
 _bwrap_verdict: bool | None = None
 

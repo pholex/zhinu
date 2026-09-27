@@ -17,7 +17,10 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
-from . import __version__, command_check, keys, media, modes, peers, providers, skills, terminal, ui
+from . import (
+    __version__, command_check, envprobe, keys, media, modes, peers, providers, skills,
+    terminal, ui,
+)
 from .agent import Agent
 from .banner import build_banner
 from .session_log import (
@@ -83,24 +86,47 @@ SLASH_HELP = "可用命令：\n" + "\n".join(
 ) + "\n"
 
 
+#  子命令表：分发（main）与 --help 的清单共用这一张。各写各的时候 serve 能分发、
+#  帮助里却没有这一项。每行：(名字与别名, 处理函数名, 帮助里的写法, 一句话说明)。
+#  处理函数按名字在分发时再取——它们大多定义在这张表后面
+SUBCOMMANDS: tuple[tuple[tuple[str, ...], str, str, str], ...] = (
+    (("config",), "config_command", "config", "初始化/查看配置"),
+    (("resume",), "resume_command", "resume", "恢复历史会话"),
+    (("sessions",), "sessions_command", "sessions",
+     "列出本机在跑的会话（sessions digest 汇总 token 用量）"),
+    (("send",), "send_command", "send <会话> <消息>", "给另一个会话发一条消息"),
+    (("mcp",), "mcp_command", "mcp add|list|remove", "管理 MCP server 声明"),
+    (("plugin", "plugins"), "plugin_command", "plugin add|list|update|remove",
+     "装卸插件包（skills + MCP）"),
+    (("serve",), "serve_command", "serve", "以 HTTP API 服务启动（需 [serve] 可选依赖）"),
+    (("acp",), "_acp_command", "acp", "以 ACP 协议 server 启动，供编辑器客户端驱动（等价 --acp）"),
+    (("doctor",), "doctor_command", "doctor",
+     "体检环境（凭据有无 / 配置 / 代理 / 沙箱 / 磁盘 / MCP 配置）"),
+    (("terminal-setup",), "terminal_setup_command", "terminal-setup",
+     "给 VS Code 系编辑器配 Shift+Enter 换行"),
+    (("update",), "update_command", "update",
+     "升级到最新版（未装 TUI 时自动补上；已装 serve 时一并升级）"),
+    (("uninstall",), "uninstall_command", "uninstall", "卸载（--purge 连配置目录一起删）"),
+)
+
+
+def subcommand_help() -> str:
+    """--help 末尾的子命令清单（从 SUBCOMMANDS 渲染，对齐按可见宽度算）。"""
+    width = max(ui.display_width(usage) for _, _, usage, _ in SUBCOMMANDS)
+    lines = ["子命令（各自带 --help）："]
+    lines += [
+        f"  xiaoyu {ui.pad(usage, width)}  {summary}" for _, _, usage, summary in SUBCOMMANDS
+    ]
+    return "\n".join(lines)
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="xiaoyu",
         description="小羽 — 一个 harness coding agent",
-        epilog=(
-            "子命令：xiaoyu config  初始化/查看配置（详见 xiaoyu config --help）；"
-            "xiaoyu resume  恢复历史会话（详见 xiaoyu resume --help）；"
-            "xiaoyu sessions  列出本机在跑的会话（sessions digest 汇总 token 用量）；"
-            "xiaoyu send <会话> <消息>  给另一个会话发一条消息；"
-            "xiaoyu mcp add|list|remove  管理 MCP server 声明（详见 xiaoyu mcp --help）；"
-            "xiaoyu plugin add|list|update|remove  装卸插件包（skills + MCP，"
-            "详见 xiaoyu plugin --help）；"
-            "xiaoyu acp  以 ACP 协议 server 启动，供编辑器客户端驱动（等价 --acp）；"
-            "xiaoyu doctor  体检环境（凭据有无 / 代理 / 沙箱 / 磁盘 / MCP 配置）；"
-            "xiaoyu terminal-setup  给 VS Code 系编辑器配 Shift+Enter 换行；"
-            "xiaoyu update  升级到最新版（未装 TUI 时自动补上；已装 serve 时一并升级）；"
-            "xiaoyu uninstall  卸载（--purge 连配置目录一起删）"
-        ),
+        epilog=subcommand_help(),
+        #  清单是排好版的：默认的格式化会把它重新折成一段
+        formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument("prompt", nargs="*", help="直接执行一条指令后退出（不进交互模式）")
     add_prompt_flag(parser)
@@ -1538,7 +1564,7 @@ def serve_command(argv: list[str]) -> int:
             ui.error("serve 需要 fastapi 和 uvicorn，当前环境没装。"),
             file=sys.stderr,
         )
-        print('  pip install "xiaoyu-agent[serve]"', file=sys.stderr)
+        print(f"  {envprobe.install_hint('xiaoyu-agent[serve]')}", file=sys.stderr)
         return 2
     except KeyboardInterrupt:
         return 130
@@ -2382,7 +2408,7 @@ def make_frontend(permissions: Permissions, no_tui: bool = False):
             make_confirm(permissions),
             None,
             repl,
-            '提示：pip install "xiaoyu-agent[tui]" 可获得补全/历史/粘贴折叠',
+            f"提示：{envprobe.install_hint('xiaoyu-agent[tui]')} 可获得补全/历史/粘贴折叠",
             text_ask_questions,
         )
     front = tui.Tui(permissions)
@@ -2612,6 +2638,14 @@ def resolve_folder_trust(
     return decision
 
 
+def _acp_command(argv: list[str]) -> int:
+    """子命令形态与 `--acp` 旗标完全等价：转写成旗标再走主解析器，两条路
+    共用同一套参数、folder trust 门与 wire/acp 互斥检查，永不漂移。
+    两种写法都留：编辑器/registry 的配置模板惯用子命令，`--acp` 是
+    既有集成（含 ACP registry 提交物）的入口，属永久别名不做废弃。"""
+    return main(["--acp", *argv])
+
+
 def main(argv: list[str] | None = None) -> int:
     if argv is None:
         argv = sys.argv[1:]
@@ -2626,35 +2660,12 @@ def main(argv: list[str] | None = None) -> int:
     from . import tempdirs
 
     tempdirs.sweep_in_background()
-    #  子命令拦截：nargs="*" 的 prompt 位置参数和 subparsers 不兼容，手动分流
-    if argv and argv[0] == "config":
-        return config_command(argv[1:])
-    if argv and argv[0] == "resume":
-        return resume_command(argv[1:])
-    if argv and argv[0] == "sessions":
-        return sessions_command(argv[1:])
-    if argv and argv[0] == "send":
-        return send_command(argv[1:])
-    if argv and argv[0] == "mcp":
-        return mcp_command(argv[1:])
-    if argv and argv[0] == "serve":
-        return serve_command(argv[1:])
-    if argv and argv[0] == "acp":
-        #  子命令形态与 `--acp` 旗标完全等价：转写成旗标再走主解析器，两条路
-        #  共用同一套参数、folder trust 门与 wire/acp 互斥检查，永不漂移。
-        #  两种写法都留：编辑器/registry 的配置模板惯用子命令，`--acp` 是
-        #  既有集成（含 ACP registry 提交物）的入口，属永久别名不做废弃。
-        return main(["--acp", *argv[1:]])
-    if argv and argv[0] in ("plugin", "plugins"):
-        return plugin_command(argv[1:])
-    if argv and argv[0] == "terminal-setup":
-        return terminal_setup_command(argv[1:])
-    if argv and argv[0] == "doctor":
-        return doctor_command(argv[1:])
-    if argv and argv[0] == "update":
-        return update_command(argv[1:])
-    if argv and argv[0] == "uninstall":
-        return uninstall_command(argv[1:])
+    #  子命令拦截：nargs="*" 的 prompt 位置参数和 subparsers 不兼容，手动分流。
+    #  清单与 --help 共用 SUBCOMMANDS 一张表
+    if argv:
+        for names, handler, _, _ in SUBCOMMANDS:
+            if argv[0] in names:
+                return globals()[handler](argv[1:])
     args = build_parser().parse_args(argv)
     try:
         resolve_system_prompt_flags(args)
@@ -3242,7 +3253,8 @@ def handle_slash(agent: Agent, line: str, select: Any = None) -> bool:
         print(keys.help_text())
         if not _tui_available():
             print(ui.secondary("  当前是明文 REPL，上表只在 TUI 前端生效"))
-            print(ui.secondary('  装上可选依赖即可：pip install "xiaoyu-agent[tui]"'))
+            hint = envprobe.install_hint("xiaoyu-agent[tui]")
+            print(ui.secondary(f"  装上可选依赖即可：{hint}"))
     elif command == "/tools":
         for name in agent.toolbox.names():
             tool = agent.toolbox.get(name)
@@ -3454,16 +3466,9 @@ def sandbox_status(config: Config) -> str:
     if not config.sandbox:
         return "沙箱：已关闭（--no-sandbox）——bash 命令可写任意路径"
     if not sandbox.available():
-        import sys
-
-        if sys.platform == "linux":
-            #  Linux 上"不可用"分两种：没装 bwrap，或装了但内核/AppArmor
-            #  禁了 unprivileged user namespace——都指向同一条出路
-            return (
-                "沙箱：未生效（需安装 bubblewrap 且内核允许 unprivileged user namespace），"
-                "bash 命令可写任意路径"
-            )
-        return "沙箱：本平台不支持（macOS/Linux 可用；Windows 建议在 WSL 里用），bash 命令可写任意路径"
+        #  为什么用不了、怎么办由 sandbox 给（Linux 上没装与装了跑不起来是两回事）
+        why, remedy = sandbox.unavailable_reason()
+        return f"沙箱：未生效（{why}），bash 命令可写任意路径。{remedy}"
     network = "允许联网" if config.sandbox_network else "禁止联网"
     return f"沙箱：已启用 · 只可写工作区/临时目录/构建缓存 · 全盘可读 · {network}"
 
