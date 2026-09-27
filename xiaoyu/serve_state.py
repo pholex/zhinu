@@ -24,13 +24,13 @@
 from __future__ import annotations
 
 import json
-import os
 import time
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from . import fsguard
 from .config import EFFORT_LEVELS
 
 #  Agent 对象可携带的配置键。只收这一撮：它们都是 serve 启动参数里"会话可覆盖"
@@ -197,16 +197,10 @@ def budget_breach(budget: Budget | None, spend: Spend) -> str:
 
 def _write_json(path: Path, payload: dict[str, Any]) -> None:
     """原子写：先写临时文件再 rename，进程中途死掉不会留下半个 JSON。"""
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(path.suffix + f".{os.getpid()}.tmp")
-    tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-    #  agent 配置里的 MCP server 可能带 env/headers 令牌：POSIX 上仅本人可读，
-    #  rename 前收紧，落位的那一刻就是 0600（Windows 无此语义，忽略失败）
-    try:
-        os.chmod(tmp, 0o600)
-    except OSError:
-        pass
-    os.replace(tmp, path)
+    #  agent 配置里的 MCP server 可能带 env/headers 令牌：仅本人可读
+    fsguard.write_atomic(
+        path, json.dumps(payload, ensure_ascii=False, indent=2), private=True
+    )
 
 
 def _read_json(path: Path) -> dict[str, Any] | None:

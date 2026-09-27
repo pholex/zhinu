@@ -29,6 +29,8 @@ from datetime import datetime
 from pathlib import Path
 from types import TracebackType
 
+from . import fsguard
+
 #  单文件上限：超了截断保留尾部（最近的崩溃最相关）。崩溃日志无界增长没意义。
 _MAX_BYTES = 256 * 1024
 
@@ -61,10 +63,11 @@ def _write(header: str, exc: BaseException | None) -> None:
         merged = old + body
         if len(merged) > _MAX_BYTES:
             merged = "[……早期崩溃记录已截断……]\n" + merged[-_MAX_BYTES:]
-        _log_path.write_text(merged, encoding="utf-8")
-        #  异常消息里可能带着请求参数、密钥片段：POSIX 上收紧到仅本人可读
-        #  （外层 suppress 兜住 Windows 等 chmod 语义不同的失败）
-        os.chmod(_log_path, 0o600)
+        #  异常消息里可能带着请求参数、密钥片段：仅本人可读。errors 放宽：
+        #  异常文本里的孤立代理字符不该让整条记录写不进去
+        fsguard.write_atomic(
+            _log_path, merged.encode("utf-8", errors="backslashreplace"), private=True
+        )
 
 
 def _pid() -> int:

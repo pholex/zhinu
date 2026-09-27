@@ -284,11 +284,8 @@ def store(data: bytes, mime: str) -> str:
     if path.exists():
         return SCHEME + ref
     try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        #  同 sha256 的并发写：先写临时文件再原子改名，读者永远看不到半张图
-        tmp = path.with_name(f".{ref}.{os.getpid()}")
-        tmp.write_bytes(data)
-        os.replace(tmp, path)
+        #  同 sha256 的并发写：原子改名，读者永远看不到半张图
+        fsguard.write_atomic(path, data)
     except OSError:
         return ""
     return SCHEME + ref

@@ -140,10 +140,10 @@ def save_user_env(values: dict[str, str]) -> Path:
     merged = _parse_dotenv(path) if path.is_file() else {}
     merged.update(values)
     body = "\n".join(f"{key}={value}" for key, value in merged.items())
-    path.write_text(body + "\n", encoding="utf-8")
-    #  里面可能有 key，POSIX 上收紧到仅本人可读（Windows 无此语义，忽略失败）。
-    with contextlib.suppress(OSError):
-        os.chmod(path, 0o600)
+    #  里面可能有 key：创建时就是仅本人可读，而不是写完再收紧
+    from . import fsguard
+
+    fsguard.write_atomic(path, body + "\n", private=True)
     return path
 
 

@@ -163,6 +163,43 @@ class LifecycleTest(ChenshuCase):
         self.assertEqual(second.member("w1").status, "retired")
         self.assertEqual(len(second.missions), 1)
 
+    def test_unreadable_state_is_kept_as_evidence_not_silently_reset(self):
+        """半个 state.json：不能当成全新启动悄悄覆盖，上次的 mission 没接上得说出来。"""
+        self.init_repo()
+        first = self.make_runtime()
+        first.init()
+        first.plan([{"title": "改 API", "scope": ["src/"]}])
+        state = self.root / ".xiaoyu" / "chenshu" / "state.json"
+        whole = state.read_text(encoding="utf-8")
+        state.write_text(whole[: len(whole) // 2], encoding="utf-8")
+
+        second = self.make_runtime()
+        out = second.init()
+        self.assertIn("读不出来", out)
+        self.assertEqual(second.missions, [])
+        kept = [p for p in state.parent.iterdir() if p.name.startswith("state.json.unreadable-")]
+        self.assertEqual(len(kept), 1)
+        self.assertEqual(kept[0].read_text(encoding="utf-8"), whole[: len(whole) // 2])
+        #  新写下的 state.json 是完整的；提示只报一次
+        json.loads(state.read_text(encoding="utf-8"))
+        self.assertNotIn("读不出来", self.make_runtime().init())
+
+    def test_state_is_written_atomically(self):
+        """写到一半失败：磁盘上留着的还是上一份完整状态。"""
+        from xiaoyu import fsguard
+
+        self.init_repo()
+        runtime = self.make_runtime()
+        runtime.init()
+        runtime.plan([{"title": "改 API", "scope": ["src/"]}])
+        state = self.root / ".xiaoyu" / "chenshu" / "state.json"
+        before = state.read_text(encoding="utf-8")
+        with mock.patch.object(fsguard.os, "replace", side_effect=OSError("磁盘满了")):
+            with self.assertRaises(OSError):
+                runtime._save()
+        self.assertEqual(state.read_text(encoding="utf-8"), before)
+        self.assertEqual([p.name for p in state.parent.iterdir() if p.name.endswith(".tmp")], [])
+
     def test_plan_validations(self):
         self.init_repo()
         runtime = self.make_runtime()

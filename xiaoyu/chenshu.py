@@ -53,7 +53,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
 
-from . import ui, worktree
+from . import fsguard, ui, worktree
 from .config import EFFORT_LEVELS, Config
 from .events import Notice, UISink
 from .providers import UnknownModel
@@ -223,6 +223,8 @@ class ChenshuRuntime:
         self._threads: dict[str, threading.Thread] = {}
         self._agents: dict[str, Any] = {}
         self._seq = 0
+        #  上次的 state.json 读不出来时：(留证的路径, 原因)，init 报给总枢后清掉
+        self._unreadable_state: tuple[Path, str] | None = None
 
     # ---------- 磁盘 ----------
 
@@ -235,9 +237,10 @@ class ChenshuRuntime:
             "missions": [asdict(m) for m in self.missions],
             "members": [asdict(m) for m in self.members],
         }
-        self.root.mkdir(parents=True, exist_ok=True)
-        self._state_path().write_text(
-            json.dumps(payload, ensure_ascii=False, indent=1), encoding="utf-8"
+        #  原子写：写到一半进程死了，留下的半个 state.json 下次读不出来，
+        #  整份 mission 花名册就没了
+        fsguard.write_atomic(
+            self._state_path(), json.dumps(payload, ensure_ascii=False, indent=1)
         )
         self._render_missions_md()
 
@@ -247,7 +250,15 @@ class ChenshuRuntime:
             return False
         try:
             payload = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
+            if not isinstance(payload, dict):
+                raise ValueError("顶层不是对象")
+        except (OSError, ValueError) as exc:
+            #  读不出来不能当成"全新启动"悄悄覆盖：改名留证，并让总枢知道
+            #  上次的 mission 没接上（UnicodeDecodeError 也是 ValueError）
+            kept = path.with_name(f"{path.name}.unreadable-{int(time.time())}")
+            with contextlib.suppress(OSError):
+                path.replace(kept)
+            self._unreadable_state = (kept, ui.preview(str(exc), 80))
             return False
         self.base_branch = str(payload.get("base_branch", ""))
         self.missions = []
@@ -271,12 +282,10 @@ class ChenshuRuntime:
     def _save_archive(self, name: str, messages: list[dict[str, Any]]) -> None:
         path = self._archive_path(name)
         try:
-            path.parent.mkdir(parents=True, exist_ok=True)
-            tmp = path.with_name(path.name + ".tmp")
-            tmp.write_text(
-                json.dumps(messages, ensure_ascii=False, default=str), encoding="utf-8"
+            #  transcript 里有工具输出，可能带着密钥：仅本人可读
+            fsguard.write_atomic(
+                path, json.dumps(messages, ensure_ascii=False, default=str), private=True
             )
-            tmp.replace(path)
         except (OSError, TypeError, ValueError) as exc:
             self.log(name, "archive.failed", error=ui.preview(str(exc), 80))
 
@@ -400,6 +409,14 @@ class ChenshuRuntime:
             )
         if self.missions:
             lines.append(f"已有 {len(self.missions)} 个 mission（chenshu_status 查看）。")
+        if self._unreadable_state is not None:
+            kept, why = self._unreadable_state
+            self._unreadable_state = None
+            lines.append(
+                f"⚠ 上次的状态文件读不出来（{why}），已原样保留为 {kept}，本次从空状态"
+                "启动——上个会话的 mission 没有接上，需要的话对照 MISSIONS.md 与"
+                "各 mission 分支重新 chenshu_plan。"
+            )
         return "\n".join(lines)
 
     def _exclude_from_git(self, root: Path) -> None:

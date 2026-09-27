@@ -83,7 +83,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Iterator
 
-from . import diagnostics, mcp_guard, media, netproxy
+from . import diagnostics, fsguard, mcp_guard, media, netproxy
 from .config import Config, user_config_dir
 
 #  活着的 MCP 连接数（stdio 子进程 + HTTP 会话），/diagnostics 与 doctor 可见
@@ -338,11 +338,15 @@ def read_config_file(path: Path) -> dict[str, Any]:
 
 
 def write_config_file(path: Path, data: dict[str, Any]) -> None:
-    """写回配置文件。同目录临时文件 + os.replace：写到一半崩了也不留半个配置。"""
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_name(path.name + ".tmp")
-    tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-    os.replace(tmp, path)
+    """写回配置文件（原子写：写到一半崩了也不留半个配置）。
+
+    用户级配置仅本人可读：env / headers 里常写着令牌。工作区级的是仓库文件，
+    权限沿用原样。
+    """
+    private = path.parent == user_config_dir()
+    fsguard.write_atomic(
+        path, json.dumps(data, ensure_ascii=False, indent=2) + "\n", private=private
+    )
 
 
 def load_server_specs(

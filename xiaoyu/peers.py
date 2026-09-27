@@ -44,6 +44,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from . import fsguard
 from .config import user_config_dir
 
 #  心跳间隔 / 判死阈值。mtime 比 os.kill(pid, 0) 跨平台，也不会被 pid 复用骗到；
@@ -283,10 +284,8 @@ def deliver(target: str, text: str, sender: str = "") -> Peer:
             ensure_ascii=False,
         )
         name = f"{_delivery_stamp():020d}-{uuid.uuid4().hex[:8]}.json"
-        #  先写点号临时文件再 rename：收件方绝不会读到半条消息
-        tmp = inbox / f".{name}.tmp"
-        tmp.write_text(payload, encoding="utf-8")
-        os.replace(tmp, inbox / name)
+        #  原子写：收件方绝不会读到半条消息（临时文件以点号开头，不会被当成来信）
+        fsguard.write_atomic(inbox / name, payload, private=True)
     except OSError as exc:
         raise PeerError(f"投递失败：{exc}") from exc
     return peer

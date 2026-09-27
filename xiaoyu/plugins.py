@@ -39,6 +39,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from . import fsguard
 from .config import user_config_dir
 
 
@@ -468,13 +469,9 @@ def load_registry() -> dict[str, Any]:
 
 
 def save_registry(plugins: dict[str, Any]) -> None:
-    path = registry_path()
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_name(path.name + ".tmp")
-    tmp.write_text(
-        json.dumps({"plugins": plugins}, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
+    fsguard.write_atomic(
+        registry_path(), json.dumps({"plugins": plugins}, ensure_ascii=False, indent=2) + "\n"
     )
-    os.replace(tmp, path)
 
 
 def installed_dirs() -> list[tuple[str, Path]]:

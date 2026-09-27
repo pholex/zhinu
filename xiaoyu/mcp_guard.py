@@ -34,7 +34,7 @@ import urllib.request
 from pathlib import Path
 from typing import Any
 
-from . import netproxy
+from . import fsguard, netproxy
 
 # ---------- 配置准入 ----------
 
@@ -363,15 +363,8 @@ def describe_change(old: dict[str, Any] | None, new: dict[str, Any], *, cap: int
 
 
 def save_json_atomic(path: Path, data: dict) -> None:
-    """临时文件 + rename 原子写，0600（基线被部分写坏 = 全部工具重新 TOFU）。"""
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    tmp.write_text(json.dumps(data, ensure_ascii=False, indent=1), encoding="utf-8")
-    try:
-        os.chmod(tmp, 0o600)
-    except OSError:
-        pass
-    os.replace(tmp, path)
+    """原子写，0600（基线被部分写坏 = 全部工具重新 TOFU）。"""
+    fsguard.write_atomic(path, json.dumps(data, ensure_ascii=False, indent=1), private=True)
 
 
 def admit_tools(
