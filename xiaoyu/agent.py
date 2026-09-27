@@ -2269,6 +2269,25 @@ class Agent:
                 self.session_log.event("rewind_files", target=index, ok=ok)
         return "；".join(notes) if notes else "什么也没做。"
 
+    def drop_from(self, start: int, reason: str) -> int:
+        """把历史从下标 start 起整段拿掉（不含 system），返回拿掉了几条。
+
+        给"这一轮不该留在历史里"的场合用：服务端拒答的那一轮留着的话，之后
+        每一次请求都带着它，多半接着被拒。落盘走 rewind 同款的 replacement，
+        resume 重放时整体替换，不需要理解这里发生了什么。
+        """
+        start = max(1, start)
+        dropped = len(self.messages) - start
+        if dropped <= 0:
+            return 0
+        self.messages = self.messages[:start]
+        self._history_rewritten()
+        if self.session_log:
+            self.session_log.event(
+                "rewind", target=-1, reason=reason, replacement=self.messages[1:]
+            )
+        return dropped
+
     # ---------- 主循环 ----------
 
     def send(self, user_input: str | list[dict[str, Any]]) -> None:

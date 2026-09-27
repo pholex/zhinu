@@ -157,7 +157,7 @@ from pathlib import Path
 from typing import Any, Callable, Iterator, TextIO
 
 from . import __version__, errors, folder_trust, fsguard, mcp, mcp_guard, media, modes, ui
-from .config import Config, MissingConfig, load_dotenv, user_env_path
+from .config import EFFORT_LEVELS, Config, MissingConfig, load_dotenv, user_env_path
 from .permissions import Permissions, suggest_allow_rule
 from .session_log import (
     SessionLockedError,
@@ -237,6 +237,9 @@ def _text_content(text: str) -> dict[str, Any]:
     return {"type": "content", "content": {"type": "text", "text": text}}
 
 
+#  推理深度下拉框里"不指定"那一项的取值（Config.effort 为空串）
+EFFORT_DEFAULT = "default"
+
 #  Agent.last_stop → 规范里的 stopReason（没列的都是 end_turn）
 _STOP_REASONS = {"turn_cap": "max_turn_requests", "budget": "max_tokens"}
 
@@ -295,6 +298,19 @@ def config_options(agent: Agent) -> list[dict[str, Any]]:
             "options": [
                 {"value": name, "name": label, "description": desc}
                 for name, label, desc in _mode_entries(agent)
+            ],
+        },
+        #  推理深度：规范保留的第三个语义标签（thought_level）。与 TUI /effort
+        #  同一张表；"上游默认"是不传这个参数，不是某一档
+        {
+            "id": "effort",
+            "name": "推理深度",
+            "category": "thought_level",
+            "type": "select",
+            "currentValue": str(getattr(agent.config, "effort", "") or "") or EFFORT_DEFAULT,
+            "options": [
+                {"value": EFFORT_DEFAULT, "name": "上游默认"},
+                *({"value": level, "name": level} for level in EFFORT_LEVELS),
             ],
         },
     ]
@@ -1295,12 +1311,24 @@ class AcpServer:
                 if not isinstance(message, dict):
                     self._fail(None, INVALID_REQUEST, "必须是 JSON 对象")
                     continue
-                if "method" in message:
-                    self._handle_request(message)
-                elif "id" in message:
-                    self._resolve_pending(message)
-                else:
-                    self._fail(None, INVALID_REQUEST, "既不是请求也不是响应")
+                try:
+                    if "method" in message:
+                        self._handle_request(message)
+                    elif "id" in message:
+                        self._resolve_pending(message)
+                    else:
+                        self._fail(None, INVALID_REQUEST, "既不是请求也不是响应")
+                except Exception as exc:  # noqa: BLE001 - 一帧畸形降级的是这一帧
+                    #  处理某一帧时的异常冒出主循环，整个进程连同所有会话一起没了。
+                    #  带 id 的请求回一个错误；通知与响应没有可回的对象，只记下来
+                    print(
+                        f"[ACP] 处理消息时出错（已跳过这一帧）：{type(exc).__name__}: {exc}",
+                        file=sys.stderr,
+                    )
+                    if "method" in message and message.get("id") is not None:
+                        self._fail(
+                            message["id"], INTERNAL_ERROR, f"{type(exc).__name__}: {exc}"
+                        )
         except KeyboardInterrupt:
             pass
         finally:
@@ -1368,6 +1396,10 @@ class AcpServer:
         elif method == "session/cancel":
             #  notification：无论成败都不回包
             self._handle_cancel(params)
+        elif req_id is None:
+            #  不认识的**通知**：JSON-RPC 规定通知不得应答（连错误也不回）。
+            #  宿主发来的扩展通知多半如此，回一个 id 为 null 的错误反而是违规
+            return
         else:
             self._fail(req_id, METHOD_NOT_FOUND, f"未知方法 {method!r}")
 
@@ -1545,8 +1577,8 @@ class AcpServer:
             self._fail(req_id, INVALID_PARAMS, "未知 sessionId（先 session/new）")
             return
         config_id = str(params.get("configId", ""))
-        if config_id not in ("model", "mode"):
-            self._fail(req_id, INVALID_PARAMS, "未知 configId（可用：model、mode）")
+        if config_id not in ("model", "mode", "effort"):
+            self._fail(req_id, INVALID_PARAMS, "未知 configId（可用：model、mode、effort）")
             return
         value = params.get("value")
         if not isinstance(value, str) or not value.strip():
@@ -1555,13 +1587,33 @@ class AcpServer:
         if config_id == "mode":
             self._set_mode_via(req_id, session, value.strip(), config_face=True)
             return
+        if config_id == "effort":
+            level = value.strip().lower()
+            if level != EFFORT_DEFAULT and level not in EFFORT_LEVELS:
+                self._fail(
+                    req_id, INVALID_PARAMS,
+                    f"effort 只认 {' / '.join((EFFORT_DEFAULT, *EFFORT_LEVELS))}",
+                )
+                return
+            #  与 TUI /effort 同一动作：不影响上下文形状，跑轮期间改也无妨，下一次请求生效
+            session.agent.config.effort = "" if level == EFFORT_DEFAULT else level
+            self._respond(req_id, {"configOptions": config_options(session.agent)})
+            return
         if session.turn_active():
             #  跑轮期间 config.model 归降级链（粘性写在工作线程），主线程不抢
             self._fail(req_id, BUSY, "本轮进行中不能切模型（等本轮结束或 session/cancel）")
             return
         #  与 TUI /model 同一动作：切换粘性生效于下一次请求，并在日志留痕
         #  （session/load 跟随旧模型靠它）。候选之外的名字也收（TUI 同款
-        #  自由度）：显式寻址/新模型不该被下拉框挡住
+        #  自由度）：显式寻址/新模型不该被下拉框挡住——但得有 provider 认领，
+        #  没人接的名字回"成功"的话，错误要到下一轮请求才冒出来
+        registry = getattr(session.agent, "registry", None)
+        if registry is not None:
+            try:
+                registry.resolve(value.strip())
+            except UnknownModel as exc:
+                self._fail(req_id, INVALID_PARAMS, str(exc))
+                return
         session.agent.switch_model(value.strip())
         session.advertised_model = session.agent.config.model
         self._respond(req_id, {"configOptions": config_options(session.agent)})
@@ -1652,6 +1704,7 @@ class AcpServer:
         stop_reason = "end_turn"
         error = ""
         error_data: dict[str, Any] | None = None
+        history_mark = len(getattr(agent, "messages", ()))
         try:
             if isinstance(content, str) and (matched := match_command(content)) is not None:
                 #  命中命令：不进模型、不入历史，输出走 agent_message_chunk。
@@ -1672,9 +1725,13 @@ class AcpServer:
                 #  （网络层把中断包装成了别的异常）也算取消
                 stop_reason = "cancelled"
             elif isinstance(exc, errors.ContentFiltered):
-                #  服务端拒答不是故障：规范有专门的停因，宿主据此决定怎么呈现
-                agent.close_open_tool_calls("本轮被服务端拒答。")
+                #  服务端拒答不是故障：规范有专门的停因，宿主据此决定怎么呈现。
+                #  规范同时约定被拒的提问及其后的内容不进下一次请求——历史里
+                #  照着拿掉，不然之后每一轮都带着它、接着被拒
                 session.sink.emit(TextDelta(f"\n[{exc}]"))
+                drop = getattr(agent, "drop_from", None)
+                if callable(drop):
+                    drop(history_mark, "refusal")
                 stop_reason = "refusal"
                 if agent.session_log:
                     agent.session_log.event("error", error=f"ContentFiltered: {exc}")

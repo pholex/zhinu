@@ -9,6 +9,7 @@ stopReason=cancelled 收尾。传输驱动复用 wire e2e 的 WireProcess（都�
 from __future__ import annotations
 
 import contextlib
+import io
 import json
 import os
 import signal
@@ -18,6 +19,7 @@ import unittest
 from pathlib import Path
 from typing import Any
 
+from .test_agent_paths import AgentTestCase, chunk
 from .test_e2e_scripted import E2ECase
 from .test_e2e_wire import WireProcess
 
@@ -514,6 +516,38 @@ class MalformedTest(AcpCase):
         response, _ = acp.read_until(self.is_response("1"))
         self.assertEqual(response["error"]["code"], -32601)
 
+    def test_malformed_request_costs_one_frame_not_the_process(self):
+        """处理某一帧时的异常不能冒出主循环：那会带走所有会话。"""
+        acp = self.start_acp("text: ok\n")
+        acp.send(
+            {"jsonrpc": "2.0", "id": "init", "method": "initialize",
+             "params": {"protocolVersion": 1}}
+        )
+        acp.read_until(self.is_response("init"))
+        for index, servers in enumerate(
+            ([{"args": 5}], [{"name": "x", "command": "y", "args": 5}], [5], "nope")
+        ):
+            acp.send(
+                {"jsonrpc": "2.0", "id": f"bad{index}", "method": "session/new",
+                 "params": {"cwd": str(self.workspace), "mcpServers": servers}}
+            )
+            response, _ = acp.read_until(self.is_response(f"bad{index}"))
+            self.assertIn("error" if "error" in response else "result", response)
+        #  进程还活着，正常请求照常应答
+        session_id = self.new_session(acp)
+        self.prompt(acp, session_id, "还在吗")
+        response, _ = acp.read_until(self.is_response("p1"))
+        self.assertEqual(response["result"]["stopReason"], "end_turn")
+
+    def test_unknown_notification_is_not_answered(self):
+        """JSON-RPC：通知不得应答，连错误也不回。"""
+        acp = self.start_acp("text: ok\n")
+        acp.send({"jsonrpc": "2.0", "method": "_host/heartbeat", "params": {"n": 1}})
+        acp.send({"jsonrpc": "2.0", "id": "after", "method": "session/teleport"})
+        response, skipped = acp.read_until(self.is_response("after"))
+        self.assertEqual(response["error"]["code"], -32601)
+        self.assertEqual(skipped, [], "对通知回了包")
+
     def test_malformed_permission_outcome_fails_closed(self):
         acp = self.start_acp(_TOOL_SCRIPT)
         session_id = self.new_session(acp)
@@ -754,6 +788,78 @@ class ModelConfigTest(AcpCase):
         self.prompt(acp, session_id, "还好吗")
         response, _ = acp.read_until(self.is_response("p1"))
         self.assertEqual(response["result"]["stopReason"], "end_turn")
+
+    def test_unclaimed_model_name_is_rejected_up_front(self):
+        """没人认领的名字回"成功"的话，错误要到下一轮请求才冒出来。"""
+        import io
+
+        from xiaoyu.acp import AcpServer
+        from xiaoyu.providers import UnknownModel
+
+        class Registry:
+            def resolve(self, name: str):
+                if name == "ghost-model":
+                    raise UnknownModel("没有任何 provider 认领 ghost-model")
+                return object()
+
+        class StubAgent:
+            mode = "default"
+            session_log = None
+            registry = Registry()
+            config = type("C", (), {"model": "stub-model", "effort": ""})()
+
+            def switchable_models(self) -> list[str]:
+                return ["stub-model"]
+
+            def sandbox_ready(self) -> bool:
+                return False
+
+            def switch_model(self, name: str) -> None:
+                self.config.model = name
+
+        out = io.StringIO()
+
+        def lines():
+            yield json.dumps({"jsonrpc": "2.0", "id": "init", "method": "initialize",
+                              "params": {"protocolVersion": 1}})
+            yield json.dumps({"jsonrpc": "2.0", "id": "new", "method": "session/new",
+                              "params": {"cwd": str(Path.cwd())}})
+            session_id = next(
+                record["result"]["sessionId"]
+                for line in out.getvalue().splitlines()
+                if (record := json.loads(line)).get("id") == "new"
+            )
+            for req_id, config_id, value in (
+                ("bad", "model", "ghost-model"),
+                ("good", "model", "other-model"),
+                ("deep", "effort", "high"),
+                ("odd", "effort", "ludicrous"),
+                ("back", "effort", "default"),
+            ):
+                yield json.dumps({
+                    "jsonrpc": "2.0", "id": req_id, "method": "session/set_config_option",
+                    "params": {"sessionId": session_id, "configId": config_id, "value": value},
+                })
+
+        agent = StubAgent()
+        AcpServer(agent_factory=lambda *args: (agent, []), stdin=lines(), stdout=out).serve()
+        replies = {
+            record["id"]: record
+            for line in out.getvalue().splitlines()
+            if "id" in (record := json.loads(line)) and "method" not in record
+        }
+        self.assertEqual(replies["bad"]["error"]["code"], -32602)
+        self.assertIn("ghost-model", replies["bad"]["error"]["message"])
+        self.assertEqual(self.model_option(replies["good"]["result"])["currentValue"], "other-model")
+        effort = self.option_by_id(replies["deep"]["result"], "effort")
+        self.assertEqual(effort["category"], "thought_level")
+        self.assertEqual(effort["currentValue"], "high")
+        self.assertIn(effort["currentValue"], [o["value"] for o in effort["options"]])
+        self.assertEqual(replies["odd"]["error"]["code"], -32602)
+        self.assertEqual(
+            self.option_by_id(replies["back"]["result"], "effort")["currentValue"], "default"
+        )
+        self.assertEqual(agent.config.effort, "")
 
     def test_new_session_advertises_mode_selector(self):
         """模式也走 configOptions（category="mode"，v1 stable 保留的语义标签）：
@@ -1630,6 +1736,24 @@ class StopReasonTest(unittest.TestCase):
         data = response["error"]["data"]
         self.assertIn(data["kind"], ("transient", "fatal", "rate_limit"))
         self.assertIsInstance(data["retryable"], bool)
+
+
+class RefusalHistoryTest(AgentTestCase):
+    def test_refused_turn_is_dropped_so_the_next_one_is_not_refused_too(self) -> None:
+        """规范约定被拒的提问及其后的内容不进下一次请求。"""
+        agent = self.build([[chunk(content="第一轮的回答")]])
+        with contextlib.redirect_stdout(io.StringIO()):
+            agent.send("第一轮")
+        mark = len(agent.messages)
+        agent.messages.append({"role": "user", "content": "会被拒的提问"})
+        agent.messages.append({"role": "assistant", "content": "半截"})
+        self.assertEqual(agent.drop_from(mark, "refusal"), 2)
+        self.assertEqual(len(agent.messages), mark)
+        self.assertEqual(agent.messages[-1]["content"], "第一轮的回答")
+        #  幂等、且永远不动 system
+        self.assertEqual(agent.drop_from(mark, "refusal"), 0)
+        self.assertEqual(agent.drop_from(0, "refusal"), mark - 1)
+        self.assertEqual(agent.messages[0]["role"], "system")
 
 
 class ClientMcpServersTest(unittest.TestCase):
