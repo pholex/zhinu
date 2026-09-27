@@ -795,7 +795,7 @@ class AcpSink:
             role = record.get("role")
             if role == "user":
                 text = media.text_of(record.get("content"))
-                if media.is_injected_user_text(text, SYNTHETIC_USER_TEXTS):
+                if media.is_injected_message(record, SYNTHETIC_USER_TEXTS):
                     continue
                 self._update(
                     {

@@ -864,9 +864,8 @@ def turn_starts(
     for index, message in enumerate(messages):
         if message.get("role") != "user":
             continue
-        text = media.text_of(message.get("content"))
         #  harness 注入的说明（plan mode 进出、环境差分等）不算一轮，判据全仓一份
-        if media.is_injected_user_text(text, exclude_texts):
+        if media.is_injected_message(message, exclude_texts):
             continue
         starts.append(index)
     return starts

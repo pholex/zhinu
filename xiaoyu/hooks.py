@@ -176,13 +176,31 @@ class HookEngine:
                 continue
             if proc.returncode == 2:
                 reason = proc.stderr.strip() or proc.stdout.strip() or "（hook 未给出理由）"
-                reasons.append(reason)
+                reasons.append(clip_reason(reason))
             elif proc.returncode != 0:
                 self._notify(
                     f"[hook 退出码 {proc.returncode}（既非 0 放行也非 2 拦截），"
                     f"按放行处理：{hook.command}]"
                 )
         return Decision(blocked=bool(reasons), reason="；".join(reasons))
+
+
+#  一条 hook 理由进上下文的字符上限。理由是给模型的反馈，不是日志：测试闸把
+#  整份失败输出打到 stderr 是常事，几十万字符原样进历史，之后每一轮都要为它付费
+_REASON_CAP = 4_000
+#  开头留这么多（第一条报错通常在最前），其余额度给结尾（汇总通常在最后）
+_REASON_HEAD = 1_200
+
+
+def clip_reason(text: str) -> str:
+    """hook 理由超限时留头留尾，中间明说省了多少。"""
+    if len(text) <= _REASON_CAP:
+        return text
+    tail = _REASON_CAP - _REASON_HEAD
+    dropped = len(text) - _REASON_CAP
+    return (
+        f"{text[:_REASON_HEAD]}\n…（hook 输出过长，中间省略 {dropped} 字符）…\n{text[-tail:]}"
+    )
 
 
 def clip(text: str) -> str:

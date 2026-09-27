@@ -415,7 +415,7 @@ def distill_history(
             #  压缩后首条 user = 原始任务 + 摘要：摘要是父 agent 的转述，不带
             text, _ = compaction.split_head(text)
             text = text.strip()
-            if media.is_injected_user_text(text, synthetic_texts):
+            if media.is_injected_message({**message, "content": text}, synthetic_texts):
                 continue
             kept.append({"role": "user", "content": text})
         elif role == "assistant" and not message.get("tool_calls"):

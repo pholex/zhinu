@@ -234,10 +234,33 @@ INJECTED_USER_PREFIXES = ("[系统提示]", "<system-reminder>", "<world_state>"
 def is_injected_user_text(text: str, exclude: frozenset[str] | set[str] = frozenset()) -> bool:
     """user 角色的这条是不是 harness 注入（或空白）——回放 / 数轮次 / 蒸馏时跳过。
 
-    日志读回来的内容前面可能带空白，前缀按 lstrip 后比。
+    日志读回来的内容前面可能带空白，前缀按 lstrip 后比。手里有整条消息时用
+    is_injected_message：落笔时盖的章比事后认文案可靠。
     """
     stripped = text.strip()
     return not stripped or text in exclude or stripped.startswith(INJECTED_USER_PREFIXES)
+
+
+#  user 消息上的私有键：这条是 harness 放进历史的，但**内容不可信**——hook 的
+#  输出、后台任务与 monitor 的通知。与 operator 标记（responses.OPERATOR_KEY）的
+#  区别只在出网：operator 会被翻成会话中的 system（权威通道），这一类永远是
+#  user。两者在回放 / 数轮次 / 蒸馏时一视同仁：都不是用户说的话
+INJECTED_KEY = "_injected"
+#  落笔时盖的章（字面量而不是 import：media 在 responses 的下层）
+_HARNESS_MARKS = ("_operator", INJECTED_KEY)
+
+
+def is_injected_message(
+    message: dict[str, Any], exclude: frozenset[str] | set[str] = frozenset()
+) -> bool:
+    """is_injected_user_text 的整条消息版：先认落笔时盖的章，再退到认文案。
+
+    只认文案的话，每多一种注入就得记得往前缀表 / 文案集合里补一笔，漏了的那种
+    会被当成用户原话——回放成用户输入、算成一轮、带进子 agent 的精简历史。
+    """
+    if any(message.get(mark) for mark in _HARNESS_MARKS):
+        return True
+    return is_injected_user_text(text_of(message.get("content")), exclude)
 
 
 def as_parts(content: Any) -> list[dict[str, Any]]:

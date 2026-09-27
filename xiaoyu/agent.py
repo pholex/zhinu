@@ -2153,7 +2153,8 @@ class Agent:
         #  wake_only 跟着 consumed 走：插话/信箱已经让这一步非跑不可时，
         #  捎带把不唤醒的通知也送了；否则只有 wake 项才值得多跑一步。
         for note in self._drain_notifications(wake_only=not consumed):
-            self._record_operator(f"<system-reminder>\n{note}\n</system-reminder>")
+            #  通知里有后台任务的命令行、monitor 转来的输出行：不可信，不走 operator
+            self._record_injected(f"<system-reminder>\n{note}\n</system-reminder>")
             if self.session_log:
                 self.session_log.event("notify")
             consumed = True
@@ -2171,9 +2172,19 @@ class Agent:
         内核形态仍是 role=user（压缩的 synthetic 判据、fork、回放全部不变），
         只多一个私有标记；出网时认会话中 system 的型号翻成 `role: system`
         （见 messages._place_operators），其余协议与从前一个字节不差。
-        **不可放不可信内容**（同伴来信、工具输出、插话都不走这里）。
+        **不可放不可信内容**（同伴来信、工具输出、插话都不走这里；hook 的输出、
+        后台任务通知走 _record_injected）。
         """
         self._record({"role": "user", "content": text, OPERATOR_KEY: True})
+
+    def _record_injected(self, text: str) -> None:
+        """harness 放进历史、但内容不可信的消息：出网永远是 role=user。
+
+        hook 打印的理由、monitor 转来的输出行都可能来自仓库里的文件（测试输出、
+        日志）——走 operator 通道的话，认会话中 system 的型号会把它们当成
+        权威指令。章照盖：回放、数轮次、蒸馏都不把它当用户原话。
+        """
+        self._record({"role": "user", "content": text, media.INJECTED_KEY: True})
 
     # ---------- rewind（/rewind：回滚到某轮开始前） ----------
 
@@ -2417,7 +2428,7 @@ class Agent:
                             self.sink.emit(
                                 Notice(f"[Stop hook 要求继续：{decision.reason}]", "warn")
                             )
-                            self._record_operator(f"[hook 反馈] {decision.reason}")
+                            self._record_injected(f"[hook 反馈] {decision.reason}")
                             continue
                     #  收尾轻推排在 Stop hook 之后：hook 顶回去续跑的轮次还没
                     #  真正收尾，等它真结束时这里自然会再走到
@@ -2714,9 +2725,8 @@ class Agent:
         for message in reversed(self.messages):
             if message.get("role") != "user":
                 continue
-            text = media.text_of(message.get("content"))
-            if not media.is_injected_user_text(text, SYNTHETIC_USER_TEXTS):
-                return text
+            if not media.is_injected_message(message, SYNTHETIC_USER_TEXTS):
+                return media.text_of(message.get("content"))
         return ""
 
     def _attach_media(self) -> None:
