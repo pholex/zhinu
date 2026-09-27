@@ -277,17 +277,18 @@ class HardenArgvTest(unittest.TestCase):
     def test_diff_family_gets_no_driver_flags(self):
         from xiaoyu import gitsafe
 
+        git = gitsafe._git_program()
         for sub in ("diff", "show", "log"):
             argv, _ = gitsafe.prepare([sub, "HEAD"], None)
-            self.assertEqual(argv[:4], ["git", sub, "--no-ext-diff", "--no-textconv"])
+            self.assertEqual(argv[:4], [git, sub, "--no-ext-diff", "--no-textconv"])
         argv, _ = gitsafe.prepare(["status", "--porcelain"], None)
-        self.assertEqual(argv, ["git", "status", "--porcelain"])
+        self.assertEqual(argv, [git, "status", "--porcelain"])
 
     def test_dash_c_moves_into_env_before_pins(self):
         from xiaoyu import gitsafe
 
         argv, env = gitsafe.prepare(["-c", "user.name=x", "diff"], None, env={})
-        self.assertEqual(argv[:2], ["git", "diff"])
+        self.assertEqual(argv[:2], [gitsafe._git_program(), "diff"])
         self.assertEqual(env["GIT_CONFIG_KEY_0"], "user.name")
         self.assertEqual(env["GIT_CONFIG_VALUE_0"], "x")
         keys = [env[f"GIT_CONFIG_KEY_{i}"] for i in range(int(env["GIT_CONFIG_COUNT"]))]

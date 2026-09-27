@@ -796,6 +796,24 @@ def privileged_command(command: str) -> str | None:
     return _scan_command(command, _privileged_hit)
 
 
+def any_layer(command: str, predicate) -> bool:
+    """命令的任意一层是否满足 `predicate(name, argv)`。
+
+    "层"与危险命令扫描是同一套：剥掉语法外壳（`(…)`、`FOO=1 …`）、wrapper
+    （`env …`、`sudo -u x …`）、shell 源码（`bash -c '…'`、`$(…)`）之后露出来的
+    每一条命令都问一次；name 是归一过的命令名（`/usr/bin/curl` → `curl`）。
+    给 deny 规则用：规则写的是 `curl *`，换个写法包一层不该就躲过去。
+    扫不完（嵌套过深）返回 False——这类命令本来就进不了任何免确认通道。
+    """
+    def hit(name: str, argv: list[str]) -> str | None:
+        return "hit" if predicate(name, argv) else None
+
+    try:
+        return _scan_script(command, 0, hit, _Budget()) is not None
+    except _TooComplex:
+        return False
+
+
 def _privileged_hit(name: str, argv: list[str]) -> str | None:
     if name in _PRIVILEGE_ESCALATORS:
         return f"提权命令（{name}）"

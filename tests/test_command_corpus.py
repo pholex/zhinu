@@ -19,13 +19,23 @@ import json
 import unittest
 from pathlib import Path
 
-from xiaoyu import command_check, mcp_guard
+from xiaoyu import command_check, mcp_guard, permissions
 
 _CORPUS_DIR = Path(__file__).resolve().parent / "fixtures" / "command_corpus"
 
+def _deny_verdict(case: dict) -> str | None:
+    """用户写的 deny 规则（case["rule"]）拦不拦得住这条命令。"""
+    rule = permissions.parse_rule(f"deny {case['rule']}")
+    assert rule is not None, f"规则写错了：{case['rule']!r}"
+    perms = permissions.Permissions(Path("/nonexistent-workspace"), [rule])
+    decision = perms.decide("bash", {"command": case["cmd"]})
+    return "deny" if decision == "deny" else None
+
+
 #  guard 名 → 判定函数（命中返回非空原因，放行返回 None）。
-#  admission / endpoint 的调用签名不同，各自适配。
+#  admission / endpoint / deny 的调用签名不同，各自适配。
 _GUARDS = {
+    "deny": _deny_verdict,
     "injection": lambda case: command_check.injection_risk(case["cmd"]),
     "dangerous": lambda case: command_check.dangerous_command(case["cmd"]),
     "privileged": lambda case: command_check.privileged_command(case["cmd"]),

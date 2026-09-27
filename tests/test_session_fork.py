@@ -67,6 +67,9 @@ class ForkE2ETest(E2ECase):
     def _run_resume(self, script: str, argv: list[str]) -> subprocess.CompletedProcess:
         return subprocess.run(
             [sys.executable, "-m", "xiaoyu", "resume", *argv],
+            #  不继承跑测试那一方的 stdin：resume 在 stdin 不是终端时会把它整个
+            #  读完当作追加输入，继承到一个永不关闭的管道就一直等到超时
+            stdin=subprocess.DEVNULL,
             capture_output=True,
             text=True,
             encoding="utf-8",

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import os
 import tempfile
 import unittest
@@ -83,7 +84,7 @@ class TestGrepWithoutRipgrep(ReadonlyToolsTestCase):
         #  是不够的——真在 Windows 上跑时 _locate_grep 会探到 runner/开发机预装的
         #  Git 自带 grep，这组用例就悄悄测了另一条分支（CI 上真这么翻过车）。
         for target, value in (
-            ("xiaoyu.tools.shutil.which", None),
+            ("xiaoyu.sandbox.shutil.which", None),
             ("xiaoyu.tools._locate_grep", None),
         ):
             patcher = mock.patch(target, return_value=value)
@@ -165,9 +166,14 @@ class TestLocateGrep(unittest.TestCase):
         return grep
 
     def _which(self, **answers: str):
-        return mock.patch(
-            "xiaoyu.tools.shutil.which", side_effect=lambda name: answers.get(name)
+        """钉住 which 的回答。这组用例验的是探测顺序，不是"哪些目录可信"——
+        假的 Git 安装落在临时目录里，得先让临时目录算可信（可信判定另测）。"""
+        stack = contextlib.ExitStack()
+        stack.enter_context(
+            mock.patch("xiaoyu.sandbox.shutil.which", side_effect=lambda name: answers.get(name))
         )
+        stack.enter_context(mock.patch("xiaoyu.sandbox._untrusted_roots", return_value=()))
+        return stack
 
     def _env(self, **overrides: str):
         """把所有会被探测的 Windows 目录变量指到一个空目录，只留本用例要验的那个。

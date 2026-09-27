@@ -269,6 +269,148 @@ class EvaluateTest(unittest.TestCase):
         self.assertEqual(decision.verdict, "trusted")
 
 
+class ContentBindingTest(unittest.TestCase):
+    """信任的是内容不是路径：配置变了，旧的信任记录不再算数。"""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        base = Path(self.tmp.name).resolve()
+        self.repo = base / "repo"
+        (self.repo / ".git").mkdir(parents=True)
+        self.mcp = self.repo / ".mcp.json"
+        self.mcp.write_text('{"mcpServers": {}}', encoding="utf-8")
+        self.store = base / "trusted_folders.json"
+        patcher = mock.patch.object(ft, "trust_store_path", lambda: self.store)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def _trust(self, workspace: Path | None = None) -> None:
+        workspace = workspace or self.repo
+        decision = ft.evaluate(workspace, interactive=True)
+        self.assertEqual(decision.verdict, "prompt")
+        with contextlib.redirect_stderr(io.StringIO()):
+            with mock.patch("builtins.input", return_value="y"):
+                self.assertTrue(ft.ask_user(decision))
+
+    def test_unchanged_config_stays_trusted(self):
+        self._trust()
+        for interactive in (True, False):
+            decision = ft.evaluate(self.repo, interactive=interactive)
+            self.assertEqual(decision.verdict, "trusted")
+            self.assertEqual(decision.changed, ())
+
+    def test_changed_config_is_asked_again(self):
+        self._trust()
+        self.mcp.write_text('{"mcpServers": {"x": {"command": "sh"}}}', encoding="utf-8")
+        decision = ft.evaluate(self.repo, interactive=True)
+        self.assertEqual(decision.verdict, "prompt")
+        self.assertEqual(decision.changed, ("mcp",))
+        #  没人可问时按不信任处理，说明里点出是哪份变了、怎么重新认
+        headless = ft.evaluate(self.repo, interactive=False)
+        self.assertEqual(headless.verdict, "untrusted")
+        note = ft.untrusted_note(headless)
+        self.assertIn(".mcp.json", note)
+        self.assertIn("不一样了", note)
+        self.assertIn("--trust", note)
+
+    def test_newly_appeared_config_counts_as_changed(self):
+        self._trust()
+        (self.repo / ".env").write_text("XIAOYU_SANDBOX=0\n", encoding="utf-8")
+        decision = ft.evaluate(self.repo, interactive=False)
+        self.assertEqual(decision.verdict, "untrusted")
+        self.assertEqual(decision.changed, ("env",))
+
+    def test_removed_config_is_not_a_change(self):
+        (self.repo / ".env").write_text("A=1\n", encoding="utf-8")
+        self._trust()
+        (self.repo / ".env").unlink()
+        self.assertEqual(ft.evaluate(self.repo, interactive=False).verdict, "trusted")
+        #  记录收窄到现状：同样的内容再冒出来，也得重新问
+        (self.repo / ".env").write_text("A=1\n", encoding="utf-8")
+        self.assertEqual(ft.evaluate(self.repo, interactive=False).changed, ("env",))
+
+    def test_answering_yes_again_binds_the_new_content(self):
+        self._trust()
+        self.mcp.write_text('{"mcpServers": {"x": {"command": "sh"}}}', encoding="utf-8")
+        decision = ft.evaluate(self.repo, interactive=True)
+        with contextlib.redirect_stderr(io.StringIO()) as shown:
+            with mock.patch("builtins.input", return_value="y"):
+                ft.ask_user(decision)
+        self.assertIn("不一样了", shown.getvalue())
+        self.assertEqual(ft.evaluate(self.repo, interactive=False).verdict, "trusted")
+
+    def test_record_without_fingerprints_adopts_current_content_once(self):
+        """旧版本写下的记录：第一次过门按当前内容补记，不追问；之后照常比对。"""
+        ft.record_decision(ft.workspace_key(self.repo), True)
+        self.assertEqual(ft.evaluate(self.repo, interactive=False).verdict, "trusted")
+        self.mcp.write_text('{"mcpServers": {"x": {"command": "sh"}}}', encoding="utf-8")
+        self.assertEqual(ft.evaluate(self.repo, interactive=False).verdict, "untrusted")
+
+    def test_other_workspace_under_trusted_root_is_asked(self):
+        """信任键是 git 根，配置却按工作区读：子目录里没见过的配置得问。"""
+        self._trust()
+        sub = self.repo / "pkg"
+        sub.mkdir()
+        (sub / ".mcp.json").write_text('{"mcpServers": {"y": {"command": "sh"}}}', encoding="utf-8")
+        decision = ft.evaluate(sub, interactive=True)
+        self.assertEqual(decision.verdict, "prompt")
+        with contextlib.redirect_stderr(io.StringIO()):
+            with mock.patch("builtins.input", return_value="y"):
+                ft.ask_user(decision)
+        #  两个工作区各记各的，互不覆盖
+        self.assertEqual(ft.evaluate(sub, interactive=False).verdict, "trusted")
+        self.assertEqual(ft.evaluate(self.repo, interactive=False).verdict, "trusted")
+
+    def test_trust_flag_rebinds(self):
+        from xiaoyu import cli
+
+        self._trust()
+        self.mcp.write_text('{"mcpServers": {"x": {"command": "sh"}}}', encoding="utf-8")
+        with contextlib.redirect_stderr(io.StringIO()):
+            decision = cli.resolve_folder_trust(self.repo, grant=True, interactive=False)
+        self.assertEqual(decision.verdict, "trusted")
+        self.assertEqual(ft.evaluate(self.repo, interactive=False).verdict, "trusted")
+
+    def test_own_write_resyncs_only_when_previously_in_sync(self):
+        self._trust()
+        before = ft.config_fingerprints(self.repo)
+        self.mcp.write_text('{"mcpServers": {"mine": {"command": "npx"}}}', encoding="utf-8")
+        ft.resync_after_own_write(self.repo, before)
+        self.assertEqual(ft.evaluate(self.repo, interactive=False).verdict, "trusted")
+        #  动手之前内容就已经对不上：不能借这次同步把别人的改动一起认下来
+        self.mcp.write_text('{"mcpServers": {"foreign": {"command": "sh"}}}', encoding="utf-8")
+        drifted = ft.config_fingerprints(self.repo)
+        self.mcp.write_text('{"mcpServers": {"foreign": {}, "mine2": {}}}', encoding="utf-8")
+        ft.resync_after_own_write(self.repo, drifted)
+        self.assertEqual(ft.evaluate(self.repo, interactive=False).verdict, "untrusted")
+
+    @needs_fifo
+    def test_special_file_is_fingerprinted_without_reading(self):
+        """仓库可以提交一个 FIFO 当配置：算指纹不能因此挂住。"""
+        env = self.repo / ".env"
+        os.mkfifo(env)
+        prints = call_bounded(self, lambda: ft.config_fingerprints(self.repo), env)
+        self.assertEqual(prints["env"], "unreadable")
+
+    def test_prompt_shows_which_secrets_the_config_reads(self):
+        self.mcp.write_text(
+            '{"mcpServers": {"x": {"command": "npx", "env": {"K": "${env:DEEPSEEK_API_KEY}",'
+            ' "T": "${GITHUB_TOKEN}"}, "inheritEnv": ["AWS_PROFILE"]}}}',
+            encoding="utf-8",
+        )
+        decision = ft.evaluate(self.repo, interactive=True)
+        with contextlib.redirect_stderr(io.StringIO()) as shown:
+            with mock.patch("builtins.input", return_value="n"):
+                ft.ask_user(decision)
+        text = shown.getvalue()
+        for name in ("DEEPSEEK_API_KEY", "GITHUB_TOKEN", "AWS_PROFILE"):
+            self.assertIn(name, text)
+        warning = next(line for line in text.splitlines() if "密钥" in line)
+        self.assertIn("DEEPSEEK_API_KEY", warning)
+        self.assertNotIn("GITHUB_TOKEN", warning)
+
+
 class AskUserTest(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()

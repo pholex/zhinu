@@ -32,6 +32,7 @@ import time
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from . import fsguard
 from .config import user_config_dir
 
 if TYPE_CHECKING:
@@ -83,11 +84,8 @@ def _flush_locked() -> None:
         _counts.update(counts)
     path = _path()
     try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        #  同目录唯一临时名（带 pid）+ 原子改名：并发写（子 agent/七襄）不撞
-        tmp = path.with_name(f".{_USAGE_FILE}.{os.getpid()}")
-        tmp.write_text(json.dumps(counts, ensure_ascii=False), encoding="utf-8")
-        os.replace(tmp, path)
+        #  并发写（子 agent/七襄）各用各的临时文件，不撞
+        fsguard.write_atomic(path, json.dumps(counts, ensure_ascii=False))
         _dirty = False
         _last_flush = time.monotonic()
     except OSError:

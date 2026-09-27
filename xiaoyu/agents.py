@@ -32,6 +32,9 @@
   上次的）。全链路 fail-closed：找不到 / spec 不符 / 上下文超窗口 80% 都
   直接报错，绝不悄悄退化成全新子 agent（与 worktree 的 fail-open 相反，
   这个不对称是刻意设计）。记录纯内存、上限 16 条滚动淘汰。
+  上次在隔离里跑的，resume 沿用隔离：worktree 还在就复用，不在了就重建并
+  告诉子 agent 旧路径作废；重建失败与新开同口径（单发退回主工作区并告警，
+  批量该项不执行）。
 - **mcp / mcp_except**（仅 spec 字段，作者可控、模型不可控）：
   `"none"`（默认）/ `"all"` /
   `["名单"]`（named）/ `mcp_except = ["排除"]`（except）。server 级粒度，
@@ -177,6 +180,11 @@ class SubagentRun:
     messages: list[dict[str, Any]] = field(default_factory=list)
     #  跑完保留下来的 worktree（没隔离/已删则 None），resume 时原地复用
     worktree: Path | None = None
+    #  这次委托是不是在隔离里跑的。与 worktree 字段分开记：干净的 worktree 收尾
+    #  即删（worktree=None），但"它本该隔离"这件事 resume 时还得认
+    isolated: bool = False
+    #  上次实际的工作目录（resume 换了目录时要告诉子 agent 旧路径作废）
+    workdir: Path | None = None
 
 
 class RunStore(dict):
@@ -547,20 +555,52 @@ def execute_delegation(
                 )
             )
 
-    #  -- workspace 与 worktree：resume 复用上次的（没了就退回主工作区，
-    #     isolation 参数此时忽略）；新开则按 参数 > spec 默认 决定是否隔离，
-    #     创建失败 fail-open --
+    #  -- workspace 与 worktree：resume 沿用上次的隔离（isolation 参数此时忽略）
+    #     ——目录还在就原地复用，不在了（干净收尾已回收 / 被外力删掉）就重建；
+    #     新开则按 参数 > spec 默认 决定是否隔离。创建失败单发 fail-open、
+    #     批量 fail-closed，resume 与新开同一口径 --
     workdir = config.workspace
     created: Path | None = None
     inherited_wt: Path | None = None
+    relocation = ""
     notes: list[str] = []
     if record is not None:
-        if record.worktree is not None:
-            if record.worktree.is_dir():
-                workdir = record.worktree
-                inherited_wt = record.worktree
+        was_isolated = record.isolated or record.worktree is not None
+        if record.worktree is not None and record.worktree.is_dir():
+            workdir = record.worktree
+            inherited_wt = record.worktree
+        elif was_isolated and set(tools_list) <= set(Toolbox.READONLY):
+            #  这次只读：在主工作区看一眼无妨，不值得为它建目录
+            notes.append("上次的 worktree 已不存在，这次在主工作区只读跑")
+        elif was_isolated:
+            lost = record.worktree is not None
+            try:
+                with _WORKTREE_CREATE_LOCK:
+                    created = worktree.create(config.workspace, spec.name)
+                workdir = created
+            except worktree.WorktreeError as exc:
+                #  上次在隔离里写、这次悄悄改到主工作区写——批量续跑时就是
+                #  N 个写者并行写主工作区，与新开项同样不允许
+                if require_isolation:
+                    return DelegationResult(
+                        error=(
+                            f"ERROR: {rid} 上次的 worktree 已不存在，重建失败（{exc}），"
+                            "该项未执行——批量并行写不允许退回主工作区。"
+                        )
+                    )
+                sink.emit(
+                    Notice(f"  ⚠ {spec.name} worktree 重建失败，退回主工作区：{exc}", "warn")
+                )
+                notes.append(f"上次的 worktree 已不存在，重建失败（{exc}），实际在主工作区跑")
             else:
-                notes.append("上次的 worktree 已不存在，这次在主工作区跑")
+                fate = "其中未提交的改动没有保留" if lost else "上次收尾时没有留下改动"
+                notes.append(f"上次的 worktree 已不存在（{fate}），这次新建了一个")
+                old = f" {record.workdir}" if record.workdir is not None else ""
+                relocation = (
+                    f"[工作目录已变更] 你上次的工作目录{old} 已不存在（{fate}）。"
+                    f"现在的工作目录是 {created}，是主仓 HEAD 的干净 checkout；"
+                    "历史里出现的旧路径不要再用。\n\n"
+                )
     else:
         iso_param = _clean_param(isolation)
         #  与 spec 解析同一套 alias 容错：大小写 / 下划线都认
@@ -732,7 +772,7 @@ def execute_delegation(
     inherited_answer = sub_agent.last_assistant_text()
     failure = ""
     try:
-        sub_agent.send(task)
+        sub_agent.send(relocation + task)
     except Exception as exc:  # noqa: BLE001 - 委托失败不该打断主流程
         failure = f"{type(exc).__name__}: {exc}"
         if len(failure) > MAX_FAILURE_CHARS:
@@ -760,6 +800,14 @@ def execute_delegation(
             model=model,
             messages=copy.deepcopy(sub_agent.messages),
             worktree=kept,
+            #  隔离意图随存档传下去：只读追问轮、fail-open 退回主工作区的那次
+            #  都不改变"这条线本该隔离"
+            isolated=(
+                created is not None
+                or inherited_wt is not None
+                or bool(record is not None and record.isolated)
+            ),
+            workdir=workdir,
         )
         limit = max(MAX_RUNS, int(getattr(store, "capacity", MAX_RUNS)))
         while len(store) > limit:

@@ -20,7 +20,6 @@ import json
 import locale
 import os
 import re
-import shutil
 import signal
 import unicodedata
 import subprocess
@@ -32,7 +31,12 @@ from pathlib import Path
 from typing import Any, Callable
 
 from . import browser, fsguard, mcp, sandbox, tempdirs
-from .background import MONITOR_DEFAULT_TIMEOUT, TaskManager, kill_tree as _kill_tree
+from .background import (
+    MONITOR_DEFAULT_TIMEOUT,
+    TaskManager,
+    kill_tree as _kill_tree,
+    mark_group_leader as _mark_group_leader,
+)
 from .config import Config
 from .rewind import RewindStore
 
@@ -40,30 +44,51 @@ from .rewind import RewindStore
 #  硬性拦截：不可撤销的系统级破坏，
 #  连 --yolo / auto_approve 都不放行——审批是"用户想不想"，这里是"绝不"。
 #  只收录误伤概率极低的模式；宁可漏（还有人工审批兜底），不可错杀日常命令。
-_HARDLINE_RULES: tuple[tuple[re.Pattern[str], str], ...] = tuple(
+#
+#  两种规则，都保证对命令长度线性：
+#  - 整条命令上的单个正则（_HARDLINE_WHOLE）：模式里没有跨词的通配，随便扫。
+#  - 段内链（_HARDLINE_CHAINS）："先有 rm、后面有 -r、段尾是根目录"这类带
+#    "中间随便隔什么"的规则。写成一个正则就得用两三个 [^;|&]* 通配，每个起点
+#    都扫到段尾，几 KB 的重复词就能跑上秒级（持 GIL、Ctrl-C 打不断，serve 下
+#    拖住所有会话）。这里拆成逐步向后找：每一步取第一处命中、下一步从它后面
+#    接着找——"存在一组先后出现的位置"与"每步取最早的那个"等价，每步只扫一遍。
+_HARDLINE_WHOLE: tuple[tuple[re.Pattern[str], str], ...] = tuple(
     (re.compile(pattern), reason)
     for pattern, reason in [
-        #  rm 递归删根/家目录（目标必须是裸 / ~ $HOME /*，/tmp/foo 这类不命中）
-        (
-            r"\brm\s+(?=(?:[^;|&]*\s)?-\w*r)[^;|&]*\s(?:/|/\*|~|~/|\$HOME/?|\"\$HOME\"/?)\s*(?:$|[;|&])",
-            "rm 递归删除根目录或家目录",
-        ),
         (r":\(\)\s*\{\s*:\s*\|\s*:\s*&\s*\}\s*;\s*:", "fork bomb"),
         (r"\bmkfs(\.\w+)?\b", "格式化文件系统（mkfs）"),
-        (r"\bdd\b[^;|&]*\bof=/dev/", "dd 直写块设备"),
         (r">\s*/dev/(sd[a-z]|disk\d|nvme\d)", "重定向覆写块设备"),
         (r"\bdiskutil\s+(erase|zero)", "diskutil 抹盘"),
         (r"(?i)\bformat\s+[a-z]:", "Windows format 格式化分区"),
+    ]
+)
+
+_HARDLINE_CHAINS: tuple[tuple[tuple[re.Pattern[str], ...], str], ...] = tuple(
+    (tuple(re.compile(step) for step in steps), reason)
+    for steps, reason in [
+        #  rm 递归删根/家目录（目标必须是裸 / ~ $HOME /*，/tmp/foo 这类不命中）
         (
-            r"(?i)\b(rd|rmdir)\s+/s\b[^;|&]*\s[a-z]:\\?\s*(?:$|[;|&])",
+            (
+                r"\brm(?=\s)",
+                r"\s-\w*r",
+                r"\s(?:/|/\*|~|~/|\$HOME/?|\"\$HOME\"/?)\s*\Z",
+            ),
+            "rm 递归删除根目录或家目录",
+        ),
+        ((r"\bdd\b", r"\bof=/dev/"), "dd 直写块设备"),
+        (
+            (r"(?i)\b(?:rd|rmdir)\s+/s\b", r"(?i)\s[a-z]:\\?\s*\Z"),
             "Windows 递归删除盘根",
         ),
         (
-            r"(?i)Remove-Item\b[^;|&]*-Recurse[^;|&]*\s[a-z]:\\\s*(?:$|[;|&])",
+            (r"(?i)Remove-Item\b", r"(?i)-Recurse", r"(?i)\s[a-z]:\\\s*\Z"),
             "PowerShell 递归删除盘根",
         ),
     ]
 )
+
+#  段的边界：命令分隔符与换行（多行脚本的每一行各是一条命令）
+_HARDLINE_SEGMENT_SPLIT = re.compile(r"[;|&\n]")
 
 
 UNTRUSTED_TAG = "untrusted_content"
@@ -117,9 +142,25 @@ def wrap_untrusted(source: str, text: str) -> str:
 
 def hardline_violation(command: str) -> str | None:
     """命中硬性拦截规则时返回原因，否则 None。"""
-    for pattern, reason in _HARDLINE_RULES:
+    for pattern, reason in _HARDLINE_WHOLE:
         if pattern.search(command):
             return reason
+    #  两种读法都查：原样按行切；续行（反斜杠 + 换行）接回一行再切。只查后一种
+    #  会把 PowerShell 里行尾的 `C:\` 当成续行吃掉——那里反斜杠不是续行符
+    views = [command]
+    if "\\\n" in command:
+        views.append(command.replace("\\\n", " "))
+    for view in views:
+        for segment in _HARDLINE_SEGMENT_SPLIT.split(view):
+            for steps, reason in _HARDLINE_CHAINS:
+                position = 0
+                for step in steps:
+                    match = step.search(segment, position)
+                    if match is None:
+                        break
+                    position = match.end()
+                else:
+                    return reason
     return None
 
 
@@ -379,7 +420,7 @@ def _pwsh_path() -> str | None:
     原样透传而不是包装成红色 ErrorRecord（5.1 的包装会把 CLI 输出的 JSON 拆碎）。
     有则优先。
     """
-    return shutil.which("pwsh")
+    return sandbox.host_which("pwsh")
 
 
 #  PS 5.1 对重定向的管道按系统 OEM 代码页（中文机是 GBK）编码输出，
@@ -782,13 +823,13 @@ def _locate_grep() -> str | None:
     Windows 只能 patch os.name，那会连带把 Path 变成 WindowsPath（在 POSIX 上
     一构造就抛 UnsupportedOperation）。同 cli.py 的 _running_launcher。
     """
-    if found := shutil.which("grep"):
+    if found := sandbox.host_which("grep"):
         return found
     if os.name != "nt":
         return None
 
     candidates: list[str] = []
-    if git := shutil.which("git"):
+    if git := sandbox.host_which("git"):
         #  ...\Git\cmd\git.exe 或 ...\Git\bin\git.exe → ...\Git\usr\bin\grep.exe
         git_root = os.path.dirname(os.path.dirname(git))
         candidates.append(os.path.join(git_root, "usr", "bin", "grep.exe"))
@@ -840,6 +881,8 @@ class Toolbox:
         mcp_view: "mcp.McpView | None" = None,
     ) -> None:
         self.config = config
+        #  宿主侧找 rg / git 时，这个工作区下面的 PATH 目录不算数（见 sandbox.host_which）
+        sandbox.note_workspace(config.workspace)
         self._tools: dict[str, Tool] = {}
         #  后台任务表（bash run_in_background / monitor）。通知回调由 Agent
         #  注入（agent.__init__ 里 tasks.notify = self.notify）；受限子集
@@ -1170,6 +1213,58 @@ class Toolbox:
         if outside and self._is_spill_path(resolved):
             return False
         return outside
+
+    def resolved_target(self, args: dict[str, Any]) -> Path | None:
+        """这次调用的路径参数此刻落在哪（resolve 过）。没有路径参数、解析不了返回 None。"""
+        path = args.get("path")
+        if not isinstance(path, str) or not path:
+            return None
+        try:
+            return self._resolve(path)[0]
+        except OSError:
+            return None
+
+    def target_moved(self, args: dict[str, Any], reviewed: Path | None) -> str | None:
+        """过审时路径落在 reviewed，现在要执行了——还落在同一处吗？不是就返回拒因。
+
+        "在不在工作区内""是不是可执行配置""命不命中 deny 规则"都是对着过审那一刻
+        的落点判的；从那时到真正执行之间隔着确认框（人要读、要想）和 hook。这段
+        时间里路径上的某一级被换成指向别处的符号链接——后台任务、别的进程都
+        做得到——放行的就不再是实际写下去的那个文件。这里把窗口从"人按键的
+        几秒到几分钟"收到"两次系统调用之间"；彻底关上要靠按 fd 钉住每一级目录，
+        那是另一件事。
+        """
+        if reviewed is None:
+            return None
+        now = self.resolved_target(args)
+        if now == reviewed:
+            return None
+        return (
+            f"ERROR: {args.get('path')} 在确认之后指向了别处"
+            f"（过审时是 {reviewed}，现在是 {now or '无法解析'}）——路径上有符号链接被改动。"
+            "这次调用没有执行；确认路径无误后重新发起。"
+        )
+
+    def guarded_config(self, name: str, args: dict[str, Any]) -> str | None:
+        """这次调用是不是在写可执行配置（.mcp.json / .env / .xiaoyu/ / .git/）。
+
+        是就返回说明。只看会写文件的工具；判定用 resolve 过的路径，与
+        outside_workspace 同一个解析口。解析不了的路径不在这里拦——它会按
+        越界走确认。
+        """
+        tool = self.get(name)
+        if tool is None or not tool.requires_approval or name == "bash":
+            return None
+        path = args.get("path")
+        if not isinstance(path, str) or not path:
+            return None
+        try:
+            resolved, _ = self._resolve(path)
+        except OSError:
+            return None
+        from . import folder_trust
+
+        return folder_trust.guarded_write_reason(resolved)
 
     def _is_spill_path(self, resolved: Path) -> bool:
         """resolve 过的路径是否落在 spill 目录下（自家落盘的工具输出）。"""
@@ -1904,8 +1999,9 @@ class Toolbox:
         if not target.exists():
             return f"ERROR: 路径不存在：{path}"
 
-        if shutil.which("rg"):
-            command = ["rg", "--line-number", "--no-heading", "--color", "never", "-e", pattern]
+        #  绝对路径起：rg 不经沙箱、不经确认，不能让 PATH 上工作区里的同名程序顶替
+        if rg := sandbox.host_which("rg"):
+            command = [rg, "--line-number", "--no-heading", "--color", "never", "-e", pattern]
             for skip in sorted(_SKIP_DIRS):
                 command += ["--glob", f"!{skip}/**"]
             if glob:
@@ -2180,6 +2276,7 @@ class Toolbox:
         #  等管道关闭——孙进程握着管道时"超时"根本不生效。这里超时整树杀。
         #  字节模式读管道，解码带 GBK 兜底（见 _decode_output）。
         started = time.monotonic()
+        hardening = _subprocess_hardening()
         try:
             proc = subprocess.Popen(
                 argv,
@@ -2191,10 +2288,13 @@ class Toolbox:
                 stderr=subprocess.PIPE,
                 cwd=str(self.config.workspace),
                 env=_hardened_env(self.config.extra_env),
-                **_subprocess_hardening(),
+                **hardening,
             )
         except OSError as exc:
             return f"ERROR: 无法执行命令：{exc}"
+        #  趁组长还活着登记进程组：shell 先退、孙进程握着管道时超时才杀得到
+        if hardening.get("start_new_session"):
+            _mark_group_leader(proc)
         #  不用 communicate：它把整份输出读进内存，几 GB 的输出能把进程吃爆
         pipes = [_BoundedPipe(proc.stdout), _BoundedPipe(proc.stderr)]
         _register_foreground(proc)

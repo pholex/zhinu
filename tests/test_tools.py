@@ -484,6 +484,49 @@ class TestBashAndSafety(ToolboxTestCase):
         for command in allowed:
             self.assertIsNone(hardline_violation(command), msg=command)
 
+    def test_hardline_sees_every_line_of_a_script(self) -> None:
+        """多行命令的每一行各是一条命令：红线不能只看最后一行。"""
+        from xiaoyu.tools import hardline_violation
+
+        blocked = [
+            "rm -rf /\necho done",
+            "echo a\nrm -rf ~\necho b",
+            "set -e\ndd if=/dev/zero \\\n  of=/dev/sda",
+            "rm -rf \\\n /",
+            "Remove-Item -Recurse -Force C:\\\nWrite-Host ok",
+        ]
+        for command in blocked:
+            self.assertIsNotNone(hardline_violation(command), msg=repr(command))
+
+        allowed = [
+            "rm -rf\n/usr/bin/true",
+            "rm -rf ./build\nls /",
+            "dd if=a of=./img\necho of=/dev/null",
+        ]
+        for command in allowed:
+            self.assertIsNone(hardline_violation(command), msg=repr(command))
+
+    def test_hardline_is_linear_on_long_commands(self) -> None:
+        """几 KB 的重复词不许把红线检查拖到秒级（持 GIL，会拖住所有会话）。"""
+        import time as time_module
+
+        from xiaoyu.tools import hardline_violation
+
+        probes = [
+            "Remove-Item -Recurse " * 6000,
+            "rm -r a " * 16000,
+            "dd if=a " * 16000,
+            "rd /s x " * 16000,
+            "rm -r" + " " * 200_000 + "x",
+        ]
+        for command in probes:
+            started = time_module.perf_counter()
+            self.assertIsNone(hardline_violation(command))
+            elapsed = time_module.perf_counter() - started
+            self.assertLess(elapsed, 1.0, f"{command[:24]!r}… 用了 {elapsed:.2f}s")
+        #  拉长不等于躲过：重复词的末尾接上真目标照样命中
+        self.assertIsNotNone(hardline_violation("rm -r a " * 16000 + "/"))
+
     def test_hardline_blocks_even_with_auto_approve(self) -> None:
         self.config.auto_approve = True
         result = self.box.run("bash", {"command": "rm -rf /"})
@@ -617,6 +660,41 @@ class TestBashAndSafety(ToolboxTestCase):
         self.assertIn("超时", result)
         self.assertIn("进程树", result)
         self.assertIn("spawned", result)
+
+    @unittest.skipIf(os.name == "nt", "POSIX 专属：进程组语义")
+    def test_bash_timeout_kills_orphans_after_shell_exited(self) -> None:
+        """shell 自己先退、只剩后台孙进程握着管道：超时必须真的杀到孙进程。
+
+        与上一条的区别在于 shell 不留下来等——它一退就被 wait() 收割，
+        之后再按它的 pid 查进程组是查不到的，整组信号根本发不出去，
+        而结果文案照样写着"已终止整个进程树"。
+        """
+        result = self.box.run("bash", {"command": "sleep 60 & echo pid=$!", "timeout": 1})
+        match = re.search(r"pid=(\d+)", result)
+        self.assertIsNotNone(match, result)
+        pid = int(match.group(1))
+        self.addCleanup(_force_kill, pid)
+        self.assertIn("进程树", result)
+        self.assertTrue(_wait_dead(pid), f"孙进程 {pid} 在超时终止后仍然活着")
+
+    @unittest.skipIf(os.name == "nt", "POSIX 专属：进程组语义")
+    def test_kill_tree_ignores_stale_pid_without_group_record(self) -> None:
+        """没登记过进程组的已收割进程：不许拿它的旧 pid 去现查进程组。
+
+        pid 被收割后可能已经属于别人，按它查到的组不是我们的组。
+        """
+        import subprocess
+
+        from xiaoyu import background
+
+        proc = subprocess.Popen(["true"], start_new_session=True)
+        proc.wait(timeout=5)
+        with mock.patch.object(background.os, "getpgid") as getpgid, mock.patch.object(
+            background.os, "killpg"
+        ) as killpg:
+            background.kill_tree(proc)
+        getpgid.assert_not_called()
+        killpg.assert_not_called()
 
     def test_bash_stdin_is_devnull(self) -> None:
         """子进程不许继承 tty stdin。

@@ -15,12 +15,11 @@ fail-open 纪律：隔离失败不该挡住委托本身——调用方捕获 Wor
 from __future__ import annotations
 
 import hashlib
-import shutil
 import subprocess
 import uuid
 from pathlib import Path
 
-from . import gitsafe
+from . import gitsafe, sandbox
 from .config import user_config_dir
 
 _GIT_TIMEOUT = 60.0
@@ -65,7 +64,7 @@ def create(workspace: Path, prefix: str) -> Path:
     root = git_root(workspace)
     if root is None:
         raise WorktreeError(f"{workspace} 不在 git 仓库里")
-    if shutil.which("git") is None:
+    if sandbox.host_which("git") is None:
         raise WorktreeError("找不到 git 命令")
     #  仓名 + 路径哈希：同名不同处的仓不互相踩
     slug = f"{root.name}-{hashlib.sha256(str(root).encode('utf-8')).hexdigest()[:8]}"
@@ -91,7 +90,7 @@ def create_branch(workspace: Path, branch: str, prefix: str, base: str) -> Path:
     root = git_root(workspace)
     if root is None:
         raise WorktreeError(f"{workspace} 不在 git 仓库里")
-    if shutil.which("git") is None:
+    if sandbox.host_which("git") is None:
         raise WorktreeError("找不到 git 命令")
     slug = f"{root.name}-{hashlib.sha256(str(root).encode('utf-8')).hexdigest()[:8]}"
     path = user_config_dir() / "worktrees" / slug / f"{prefix}-{uuid.uuid4().hex[:6]}"

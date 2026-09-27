@@ -208,6 +208,147 @@ class UnattendedTest(AgentTestCase):
         self.assertEqual(asked, ["bash"])
 
 
+class GuardedConfigWriteTest(AgentTestCase):
+    """写可执行配置：auto 档、--yolo、allow 规则都免不掉这一问。"""
+
+    GUARDED = (
+        ".mcp.json",
+        ".env",
+        ".xiaoyu/permissions.txt",
+        ".xiaoyu/agents/helper.toml",
+        ".git/hooks/pre-commit",
+        ".git/config",
+        "sub/.mcp.json",
+        ".MCP.JSON",
+        "sub/../.env",
+    )
+    PLAIN = ("notes.md", ".env.example", "src/.envrc", ".github/workflows/ci.yml", "mcp.json")
+
+    def _write(self, path: str, approver, **config):
+        for key, value in config.items():
+            setattr(self.config, key, value)
+        args = json.dumps({"path": path, "content": "x = 1\n"})
+        script = [
+            [chunk(tool_calls=[call_fragment(0, "w1", "write_file", args)])],
+            [chunk(content="好")],
+        ]
+        with mock.patch("xiaoyu.tools.sandbox.available", return_value=True):
+            agent = self.build(script, approver=approver)
+            with contextlib.redirect_stdout(io.StringIO()):
+                agent.send("写")
+        return agent
+
+    def test_auto_mode_asks_before_writing_executable_config(self) -> None:
+        for path in self.GUARDED:
+            with self.subTest(path=path):
+                asked: list[str] = []
+                self._write(path, lambda name, a: asked.append(name) or False, mode="auto")
+                self.assertEqual(asked, ["write_file"])
+                self.assertFalse((self.root / path).exists(), "被拒绝的写入不该落盘")
+
+    def test_auto_mode_still_skips_the_prompt_for_ordinary_files(self) -> None:
+        for path in self.PLAIN:
+            with self.subTest(path=path):
+                asked: list[str] = []
+                self._write(path, lambda name, a: asked.append(name) or False, mode="auto")
+                self.assertEqual(asked, [])
+                self.assertTrue((self.root / path).is_file())
+
+    def test_yolo_and_allow_rules_do_not_waive_it(self) -> None:
+        from xiaoyu.permissions import Permissions, parse_rule
+
+        asked: list[str] = []
+        self._write(".mcp.json", lambda name, a: asked.append(name) or False, auto_approve=True)
+        self.assertEqual(asked, ["write_file"])
+
+        asked.clear()
+        self.config.auto_approve = False
+        args = json.dumps({"path": ".xiaoyu/permissions.txt", "content": "allow bash\n"})
+        script = [
+            [chunk(tool_calls=[call_fragment(0, "w1", "write_file", args)])],
+            [chunk(content="好")],
+        ]
+        agent = self.build(
+            script,
+            approver=lambda name, a: asked.append(name) or False,
+            permissions=Permissions(self.root, [parse_rule("allow write_file")]),
+        )
+        with contextlib.redirect_stdout(io.StringIO()):
+            agent.send("写")
+        self.assertEqual(asked, ["write_file"])
+
+    def test_symlink_into_guarded_target_is_seen_through(self) -> None:
+        (self.root / ".mcp.json").write_text("{}", encoding="utf-8")
+        try:
+            (self.root / "innocent.json").symlink_to(self.root / ".mcp.json")
+        except (OSError, NotImplementedError):
+            self.skipTest("这台机器建不了符号链接")
+        asked: list[str] = []
+        self._write("innocent.json", lambda name, a: asked.append(name) or False, mode="auto")
+        self.assertEqual(asked, ["write_file"])
+
+    def test_approved_write_goes_through(self) -> None:
+        self._write(".env", lambda name, a: True, mode="auto")
+        self.assertTrue((self.root / ".env").is_file())
+
+    def test_unattended_waives_it(self) -> None:
+        asked: list[str] = []
+        self._write(
+            ".mcp.json", lambda name, a: asked.append(name) or False,
+            auto_approve=True, unattended=True,
+        )
+        self.assertEqual(asked, [])
+        self.assertTrue((self.root / ".mcp.json").is_file())
+
+
+class TargetMovedTest(AgentTestCase):
+    """过审之后、执行之前，路径被换成指向别处的符号链接：这次调用不执行。"""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.outside = Path(self.tmp.name).resolve().parent / f"outside-{os.getpid()}"
+        self.outside.mkdir()
+        self.addCleanup(lambda: __import__("shutil").rmtree(self.outside, ignore_errors=True))
+        (self.root / "out").mkdir()
+
+    def swap_directory_for_symlink(self) -> None:
+        (self.root / "out").rmdir()
+        try:
+            (self.root / "out").symlink_to(self.outside, target_is_directory=True)
+        except (OSError, NotImplementedError):
+            self.skipTest("这台机器建不了符号链接")
+
+    def _write(self, approver):
+        args = json.dumps({"path": "out/result.txt", "content": "data\n"})
+        script = [
+            [chunk(tool_calls=[call_fragment(0, "w1", "write_file", args)])],
+            [chunk(content="好")],
+        ]
+        agent = self.build(script, approver=approver)
+        with contextlib.redirect_stdout(io.StringIO()):
+            agent.send("写")
+        return agent
+
+    def test_swap_during_confirmation_is_refused(self) -> None:
+        self.config.mode = "default"
+        self.config.auto_approve = False
+
+        def approve_while_the_path_moves(name, args):
+            self.swap_directory_for_symlink()
+            return True
+
+        agent = self._write(approve_while_the_path_moves)
+        self.assertFalse((self.outside / "result.txt").exists(), "写到了工作区之外")
+        self.assertIn("指向了别处", agent.messages[-2]["content"])
+        self.assertEqual(agent.trace[-1]["output"], "TARGET_MOVED")
+
+    def test_unmoved_path_writes_normally(self) -> None:
+        self.config.mode = "default"
+        self.config.auto_approve = False
+        self._write(lambda name, args: True)
+        self.assertEqual((self.root / "out" / "result.txt").read_text(encoding="utf-8"), "data\n")
+
+
 class TrustContentTest(AgentTestCase):
     """.mcp.json 的 trustContent：该 server 的结果不套 <untrusted_content>。"""
 

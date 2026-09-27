@@ -261,7 +261,7 @@ def resolve_system_prompt_flags(args: argparse.Namespace) -> None:
 def add_guardrail_flags(parser: argparse.ArgumentParser) -> None:
     """护栏开关：主命令与 resume 共用（表在 guardrails.py）。
 
-    --unattended 单独放开 --yolo 下仍必问的两项；--unguarded 是预设：一次放开表里
+    --unattended 单独放开 --yolo 下仍必问的三项；--unguarded 是预设：一次放开表里
     全部层，且只在 XIAOYU_UNGUARDED=1 时生效（见 resolve_guardrail_flags）。
     """
     from . import guardrails
@@ -270,7 +270,7 @@ def add_guardrail_flags(parser: argparse.ArgumentParser) -> None:
         "--unattended",
         action="store_true",
         default=None,
-        help="--yolo 之上再放开退出 plan 与沙箱升权这两处必问（无人值守里没人按键）",
+        help="--yolo 之上再放开退出 plan、沙箱升权、写可执行配置这三处必问（无人值守里没人按键）",
     )
     parser.add_argument(
         guardrails.FLAG,
@@ -1870,11 +1870,13 @@ def mcp_add_command(argv: list[str]) -> int:
         return 2
     servers[args.name] = entry
     data["mcpServers"] = servers
+    trust_before = _trust_fingerprints(scope, Path.cwd())
     try:
         mcp.write_config_file(path, data)
     except OSError as exc:
         print(ui.error(f"写不进 {path}：{exc}"), file=sys.stderr)
         return 1
+    _trust_resync(scope, Path.cwd(), trust_before)
 
     print(ui.success(f"已写入 {path}"))
     summary = args.url if args.url else " ".join(command_argv)
@@ -1979,11 +1981,13 @@ def mcp_remove_command(argv: list[str]) -> int:
         return 2
     scope, path, data = found[0]
     del data["mcpServers"][args.name]
+    trust_before = _trust_fingerprints(scope, workspace)
     try:
         mcp.write_config_file(path, data)
     except OSError as exc:
         print(ui.error(f"写不进 {path}：{exc}"), file=sys.stderr)
         return 1
+    _trust_resync(scope, workspace, trust_before)
     print(ui.success(f"已从 {path} 删除 {args.name}"))
     return 0
 
@@ -2535,6 +2539,27 @@ def warn_if_home_workspace(workspace: Path) -> None:
     )
 
 
+def _trust_fingerprints(scope: str, workspace: Path) -> "dict[str, str] | None":
+    """改工作区级 MCP 配置之前的指纹；用户级配置不归信任门管，返回 None。"""
+    if scope != "project":
+        return None
+    from . import folder_trust
+
+    return folder_trust.config_fingerprints(workspace)
+
+
+def _trust_resync(scope: str, workspace: Path, before: "dict[str, str] | None") -> None:
+    """用户亲手改完工作区级配置后同步信任指纹——自己加的 server 不该下次被追问。"""
+    if scope != "project" or before is None:
+        return
+    from . import folder_trust
+
+    try:
+        folder_trust.resync_after_own_write(workspace, before)
+    except OSError:
+        pass
+
+
 def resolve_folder_trust(
     workspace: Path, *, grant: bool, interactive: bool, unguarded: bool = False
 ) -> "folder_trust.TrustDecision":
@@ -2551,7 +2576,11 @@ def resolve_folder_trust(
         return folder_trust.TrustDecision("trusted", folder_trust.workspace_key(workspace), ())
     if grant:
         key = folder_trust.workspace_key(workspace)
-        if folder_trust.record_decision(key, True) is None:
+        #  信任绑在此刻的配置内容上：--trust 也是"重新看过、重新认"的入口
+        bound = folder_trust.record_decision(
+            key, True, workspace, folder_trust.config_fingerprints(workspace)
+        )
+        if bound is None:
             print(
                 ui.warning(f"--trust：{key} 过宽（家目录/文件系统根），不记录信任"),
                 file=sys.stderr,

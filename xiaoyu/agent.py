@@ -4053,11 +4053,22 @@ class Agent:
         #  沙箱升权同理（升权只认一次性的人工批准）：allow 规则说的是
         #  "这个形状的命令在沙箱里安全"，不等于"可以不套沙箱跑"；--yolo 下
         #  自动放行升权等于模型能无声解除自己的沙箱。
-        #  --unattended（或 --unguarded 预设）把这两处必问也放开：无人值守里没人
+        #  写可执行配置（.mcp.json / .env / .xiaoyu/ / .git/）同属这一类：这一笔
+        #  写下去，下次启动拉起什么进程、哪些命令免确认就由模型说了算——等于
+        #  模型给自己的下一次运行放权。plan 文件走自己的专线，不算。
+        #  --unattended（或 --unguarded 预设）把这几处必问也放开：无人值守里没人
         #  按键，卡在这里等于任务死掉。查 Config 字段而不是 args：表在 guardrails.py。
+        guarded = (
+            None if plan_file_access or self.config.unattended
+            else self.toolbox.guarded_config(name, args)
+        )
+        #  过审时路径的落点：下面所有判定（越界、可执行配置、deny）都是对着它做的，
+        #  执行前要再核一次它没被换走（见 Toolbox.target_moved）
+        reviewed_target = self.toolbox.resolved_target(args)
         must_confirm = not self.config.unattended and (
             name == "exit_plan_mode"
             or (name == "bash" and bool(str(args.get("sandbox_permissions", "") or "").strip()))
+            or guarded is not None
         )
         #  auto 档：沙箱兜得住的那部分免确认（工作区内改文件、沙箱内跑命令）。
         #  写成 `not must_confirm and …` 而不是指望 exit_plan_mode 恰好不在
@@ -4084,6 +4095,9 @@ class Agent:
             #  模型自述的调用目的：确认框上方展示，"这条命令要干嘛"不用人肉猜
             if purpose:
                 self.sink.emit(ToolPurpose(name, purpose))
+            if guarded is not None:
+                #  为什么这一笔在 auto / --yolo 下也要问，得让人看得见
+                self.sink.emit(Notice(f"  ⚠ 要写的是可执行配置——{guarded}", "warn"))
             approved, note, reason, updated = normalize_verdict(self.approver(name, args))
             if not approved:
                 self.trace.append({"tool": name, "args": args, "ok": False, "output": "DENIED"})
@@ -4099,6 +4113,8 @@ class Agent:
                 #  批准并改写：后续执行、trace、tool.running 事件全部用改写后的参数
                 args = dict(updated)
                 args.pop(PURPOSE_PARAM, None)
+                #  改写后的参数才是被批准的那一份
+                reviewed_target = self.toolbox.resolved_target(args)
                 #  改写后的参数重新过 deny 规则——"deny 是 bypass-immune"的承诺
                 #  对宿主改写同样成立（宿主可信，但结构性兜底不靠约定：改写逻辑
                 #  的 bug 不该有能力绕过用户明令禁止的操作）
@@ -4130,6 +4146,11 @@ class Agent:
                     f"ERROR: 这次调用被用户配置的 PreToolUse hook 拦截：{decision.reason}。"
                     "请按此反馈调整做法。",
                 )
+
+        if moved := self.toolbox.target_moved(args, reviewed_target):
+            self.trace.append({"tool": name, "args": args, "ok": False, "output": "TARGET_MOVED"})
+            self.sink.emit(ToolDenied(name, by="rule"))
+            return self._tool_message(call, moved)
 
         #  过了全部关卡才算 running（状态机：pending → running →
         #  completed|denied，每个 pending 恰好一个终态——将来活区 spinner 靠它不悬空）
