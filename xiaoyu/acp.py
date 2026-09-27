@@ -359,6 +359,11 @@ def _cmd_context(agent: Agent, args: str) -> str:
     return (
         f"{used} / {limit} tok（{used / limit:.0%}）\n"
         f"压缩阈值 {budget} tok · 已压缩 {state.count} 次（上次省 {state.saved_tokens} tok）\n"
+        + (
+            f"自动压缩：{paused}（/compact 可手动重试）\n"
+            if (paused := state.paused_reason()) else ""
+        )
+        +
         f"消息 {len(agent.messages)} 条 · 估算依据：{agent.context_source()}\n"
         f"摘要模型链：{' → '.join(r.qualified for r in agent.summary_models())}"
     )

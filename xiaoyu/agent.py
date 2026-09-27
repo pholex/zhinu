@@ -1917,6 +1917,8 @@ class Agent:
         """
         self.messages = [{"role": "system", "content": self._system_prompt()}]
         self._history_rewritten()
+        #  压缩断路器说的是"那份历史压不动 / 那时的摘要调用不通"，历史没了就不作数
+        self.compactor.state.recover()
         self.plan = []
         #  plan 档必须跟着清：它的规则是以 user 消息注入历史的，历史一空模型就
         #  不知道自己在规划态了，留着就是"关卡还在拦、模型却不明白为什么"。
@@ -3189,6 +3191,9 @@ class Agent:
         else:
             #  用户/客户端显式换模型（或回探成功切回）：以这次选择为准，不再回探
             self._preferred_model = None
+        if name != self.config.model:
+            #  窗口与摘要链都可能跟着变：之前停掉的自动压缩重新给机会
+            self.compactor.state.recover()
         self.config.model = name
         if self.session_log:
             self.session_log.event("model", model=name)

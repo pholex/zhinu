@@ -517,6 +517,109 @@ class TestCompact(unittest.TestCase):
         self.assertEqual(effective.state.ineffective, 0, "有效压缩应重置断路器计数")
 
 
+class TestBreakerRecovers(unittest.TestCase):
+    """断路器停的是"这份历史压不动"，不是"上游刚才限流了"。"""
+
+    def build(self, summarizer) -> Compactor:
+        return Compactor(context_limit=1000, compact_at=0.7, keep_recent=5, summarizer=summarizer)
+
+    def big(self) -> list[dict]:
+        messages = conversation()
+        messages[3]["content"] = "def add(a, b): ...\n" * 40
+        return messages
+
+    def test_transient_failures_never_trip_the_breaker(self) -> None:
+        import openai
+
+        def throttled(_t, _p):
+            raise openai.APIConnectionError(request=None)  # type: ignore[arg-type]
+
+        compactor = self.build(throttled)
+        for _ in range(3):
+            compactor.state.retry_at = 0.0  # 假装冷却已过
+            _, note = compactor.compact(self.big())
+            self.assertIn("瞬时故障", note)
+        self.assertEqual(compactor.state.failures, 0)
+        self.assertEqual(compactor.state.transient_failures, 3)
+
+    def test_transient_failure_cools_down_then_retries(self) -> None:
+        import openai
+
+        def throttled(_t, _p):
+            raise openai.APIConnectionError(request=None)  # type: ignore[arg-type]
+
+        compactor = self.build(throttled)
+        compactor.compact(self.big())
+        #  冷却期内不自动重试（不然上游持续限流时每一步都白发一次摘要请求）
+        self.assertFalse(compactor.should_compact(10_000))
+        self.assertIn("后重试", compactor.state.paused_reason())
+        compactor.state.retry_at = 0.0
+        self.assertTrue(compactor.should_compact(10_000))
+
+    def test_cooldown_grows_with_repeated_transient_failures(self) -> None:
+        import time
+
+        import openai
+
+        def throttled(_t, _p):
+            raise openai.APIConnectionError(request=None)  # type: ignore[arg-type]
+
+        compactor = self.build(throttled)
+        waits = []
+        for _ in range(3):
+            compactor.compact(self.big())
+            waits.append(compactor.state.retry_at - time.monotonic())
+        self.assertLess(waits[0], waits[1])
+        self.assertLess(waits[1], waits[2])
+
+    def test_permanent_failures_still_trip_it_and_say_why(self) -> None:
+        def broken(_t, _p):
+            raise ValueError("摘要模型不存在")
+
+        compactor = self.build(broken)
+        compactor.compact(self.big())
+        _, note = compactor.compact(self.big())
+        self.assertIn("自动压缩已暂停", note)
+        self.assertFalse(compactor.should_compact(10_000))
+        self.assertIn("摘要模型不存在", compactor.state.paused_reason())
+
+    def test_recover_reopens_the_breaker_but_keeps_the_ledger(self) -> None:
+        compactor = self.build(lambda _t, _p: "读过 calc.py")
+        compactor.compact(self.big())
+        self.assertEqual(compactor.state.count, 1)
+        compactor.state.failures = 2
+        compactor.state.ineffective = 2
+        self.assertFalse(compactor.should_compact(10_000))
+        compactor.state.recover()
+        self.assertTrue(compactor.should_compact(10_000))
+        self.assertEqual(compactor.state.count, 1)
+
+    def test_success_clears_transient_state(self) -> None:
+        compactor = self.build(lambda _t, _p: "读过 calc.py")
+        compactor.state.transient_failures = 2
+        compactor.state.last_failure = "上次限流"
+        compactor.compact(self.big())
+        self.assertEqual(compactor.state.transient_failures, 0)
+        self.assertEqual(compactor.state.paused_reason(), "")
+
+
+class TestAgentReopensBreaker(AgentTestCase):
+    def test_reset_and_model_switch_reopen_it(self) -> None:
+        agent = self.build([])
+        agent.compactor.state.failures = 2
+        agent.reset()
+        self.assertEqual(agent.compactor.state.failures, 0)
+        agent.compactor.state.ineffective = 2
+        agent.switch_model("another-model")
+        self.assertEqual(agent.compactor.state.ineffective, 0)
+
+    def test_switching_to_the_same_model_changes_nothing(self) -> None:
+        agent = self.build([])
+        agent.compactor.state.failures = 2
+        agent.switch_model(agent.config.model)
+        self.assertEqual(agent.compactor.state.failures, 2)
+
+
 class TestUsageAccounting(unittest.TestCase):
     def test_tracks_per_model(self) -> None:
         from xiaoyu.agent import Usage
