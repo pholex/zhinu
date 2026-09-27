@@ -29,7 +29,7 @@ from __future__ import annotations
 
 import threading
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Callable
 
 from . import ui
 from .agents import (
@@ -116,6 +116,7 @@ def make_qixiang_tool(
     permissions: Any,
     runs: dict[str, SubagentRun],
     mcp_manager: Any = None,
+    stop_requested: Callable[[], bool] | None = None,
 ) -> Tool:
     """七襄工具：与 make_subagent_tool 同一套依赖（同一本账、同一存档）。"""
     spec_map = {spec.name: spec for spec in specs}
@@ -318,6 +319,7 @@ def make_qixiang_tool(
             timeout_s=timeout_s,
             min_answer_chars=MIN_ANSWER_CHARS,
             on_settled=on_settled,
+            stop_requested=stop_requested,
         )
         for state, attempt in zip(states, attempts):
             copy_back(state, attempt)

@@ -424,8 +424,9 @@ class RealSandboxTest(unittest.TestCase):
 
     def test_own_secret_files_are_unreadable(self):
         """子进程环境里剥掉的密钥，不能让一条 cat 从配置文件里读回来。"""
-        secret = self.ws.parent / "userconf" / ".env"
-        secret.parent.mkdir()
+        conf = tempfile.TemporaryDirectory()
+        self.addCleanup(conf.cleanup)
+        secret = Path(conf.name).resolve() / ".env"
         secret.write_text("DEEPSEEK_API_KEY=sk-very-secret\n", encoding="utf-8")
         neighbour = secret.parent / "notes.txt"
         neighbour.write_text("plain\n", encoding="utf-8")

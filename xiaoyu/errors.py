@@ -13,6 +13,25 @@ import httpx
 import openai
 
 
+class Interrupted(Exception):
+    """`Agent.interrupt()` 触发的打断——不是 OS 信号，是宿主线程/协程主动请求的。
+
+    刻意**不**继承 `KeyboardInterrupt`（最初这么写过，被 async 场景的测试炸出来
+    才改掉）：`asyncio.Task` 对 `(KeyboardInterrupt, SystemExit)` 有特殊处理——
+    不会把它们收进 Task 的结果里正常传播，而是直接原样捅穿事件循环，效果等同于
+    "整个进程被 Ctrl-C 了"。库层嵌入场景下 `interrupt()` 跑在 `asyncio.to_thread`
+    包着的工作线程里，这个特殊处理会导致 `await async_agent.send(...)` 直接把
+    宿主的整个事件循环带崩，而不是像一次普通异常那样被 `try/except` 接住。
+
+    `_stream_once` 的收尾分支同时捕获 `(KeyboardInterrupt, Interrupted)`——两条
+    触发路径共用同一段"半截话入历史、残缺 tool_calls 丢弃"的逻辑，但只有真的
+    OS 信号才会被顶层特殊对待。
+
+    定义在 errors 而不是 agent：工具层（前台命令的等待循环）也要抛它，
+    不能反过来依赖 agent。`xiaoyu.agent.Interrupted` 仍是同一个类。
+    """
+
+
 class ContentFiltered(RuntimeError):
     """服务端内容过滤/安全分类器拒答（HTTP 200、没有可用内容）。
 

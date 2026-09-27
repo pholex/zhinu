@@ -31,7 +31,7 @@ import re
 import threading
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from . import worktree
 from .agents import (
@@ -122,6 +122,7 @@ def make_douqiao_tool(
     permissions: Any,
     runs: dict[str, SubagentRun],
     mcp_manager: Any = None,
+    stop_requested: Callable[[], bool] | None = None,
 ) -> Tool:
     """斗巧工具：与七襄同一套依赖（同一本账、同一存档）。"""
     spec_map = {spec.name: spec for spec in specs}
@@ -276,6 +277,7 @@ def make_douqiao_tool(
             timeout_s=timeout_s,
             min_answer_chars=MIN_ANSWER_CHARS,
             on_settled=on_settled,
+            stop_requested=stop_requested,
         )
         for seat, attempt in zip(seats, attempts):
             copy_back(seat, attempt)

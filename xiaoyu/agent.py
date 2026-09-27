@@ -44,7 +44,7 @@ from .compaction import (
     microcompact,
 )
 from .config import Config
-from .errors import classify
+from .errors import Interrupted, classify
 from .providers import Registry, Route, UnknownModel
 from .permissions import Permissions
 from .events import (
@@ -198,22 +198,6 @@ def normalize_questions(questions: Any) -> list[dict[str, Any]] | str:
             }
         )
     return normalized
-
-
-class Interrupted(Exception):
-    """`Agent.interrupt()` 触发的打断——不是 OS 信号，是宿主线程/协程主动请求的。
-
-    刻意**不**继承 `KeyboardInterrupt`（最初这么写过，被 async 场景的测试炸出来
-    才改掉）：`asyncio.Task` 对 `(KeyboardInterrupt, SystemExit)` 有特殊处理——
-    不会把它们收进 Task 的结果里正常传播，而是直接原样捅穿事件循环，效果等同于
-    "整个进程被 Ctrl-C 了"。库层嵌入场景下 `interrupt()` 跑在 `asyncio.to_thread`
-    包着的工作线程里，这个特殊处理会导致 `await async_agent.send(...)` 直接把
-    宿主的整个事件循环带崩，而不是像一次普通异常那样被 `try/except` 接住。
-
-    `_stream_once` 的收尾分支同时捕获 `(KeyboardInterrupt, Interrupted)`——两条
-    触发路径共用同一段"半截话入历史、残缺 tool_calls 丢弃"的逻辑，但只有真的
-    OS 信号才会被顶层特殊对待。
-    """
 
 
 #  内置 system prompt 分三段。默认三段原样相连（SYSTEM_PROMPT，与拆分前逐字一致）；
@@ -820,6 +804,7 @@ class Agent:
         hook_engine: Any | None = None,
         asker: Asker | None = None,
         peer: "PeerLink | None" = None,
+        upstream_stop: Callable[[], bool] | None = None,
     ) -> None:
         self.config = config
         self.toolbox = toolbox or Toolbox(config)
@@ -864,6 +849,10 @@ class Agent:
         #  库层嵌入用：宿主可从任意线程/协程调用 interrupt()，线程安全，
         #  不依赖 OS 信号。_consume_stream 在下一个 chunk 边界自己发现并收尾。
         self._interrupt_flag = threading.Event()
+        #  子 agent 用：问父级"你被打断了吗"。父级被打断时，在飞的子 agent 在自己的
+        #  下一个检查点跟着停——不然父级要等它自己跑完才停得下来。
+        #  只问不清：那是父级的标志，由父级在自己的轮次开头清
+        self._upstream_stop = upstream_stop
         #  steer：运行中追加的用户输入，任意线程可入队，
         #  agent 在 step 边界消费。queue.Queue 自带锁，与 interrupt 同一纪律。
         self._steer_queue: queue.Queue[str] = queue.Queue()
@@ -883,6 +872,8 @@ class Agent:
         #  hasattr 兜底：嵌入宿主可能注入自定义 Toolbox 形态。
         if hasattr(self.toolbox, "tasks"):
             self.toolbox.tasks.notify = self.notify
+        #  前台命令的等待循环靠它发现打断（见 Toolbox.stop_requested）
+        self.toolbox.stop_requested = self.interrupt_requested
         #  MCP 检索模式的 server 上线公告走同一条轨道（tools._announce_mcp），
         #  但**不唤醒**：模型已经在给收尾正文时，为一条"某某 server 上线了"
         #  强制再跑一步，模型会把同一个问题再答一遍（client 端拼成一条，
@@ -1226,6 +1217,7 @@ class Agent:
                         runs=subagent_runs,
                         mcp_manager=getattr(self.toolbox, "mcp_manager", None),
                         parent_history=lambda: self.messages,
+                        stop_requested=self.interrupt_requested,
                     )
                 )
                 mounted_specs.append(spec)
@@ -1240,6 +1232,7 @@ class Agent:
                         self.sink, self.approver, self.permissions,
                         subagent_runs,
                         mcp_manager=getattr(self.toolbox, "mcp_manager", None),
+                        stop_requested=self.interrupt_requested,
                     )
                 )
             #  斗巧（竞争织造）：与七襄同闸——有可扇出的 spec 才有参赛者
@@ -1252,6 +1245,7 @@ class Agent:
                         self.sink, self.approver, self.permissions,
                         subagent_runs,
                         mcp_manager=getattr(self.toolbox, "mcp_manager", None),
+                        stop_requested=self.interrupt_requested,
                     )
                 )
         #  宸枢（编排总控模式）：init 常驻 schema，其余工具在 active 后经
@@ -2051,6 +2045,38 @@ class Agent:
         """
         self._interrupt_flag.set()
 
+    def interrupt_requested(self) -> bool:
+        """此刻有没有待处理的打断（自己的，或父级的）。只看不清。"""
+        if self._interrupt_flag.is_set():
+            return True
+        upstream = self._upstream_stop
+        return upstream is not None and bool(upstream())
+
+    def _checkpoint(self) -> None:
+        """打断检查点：有待处理的打断就清掉自己的标志并抛 Interrupted。
+
+        检查点不止流的 chunk 边界一处：退避等待、一批工具调用的每一个之间、
+        前台命令的等待循环都要看——否则打断要等到模型下一次开口才生效，
+        而那可能隔着一分多钟的退避或一条几十分钟的命令。
+        """
+        if self.interrupt_requested():
+            self._interrupt_flag.clear()
+            raise Interrupted("宿主请求打断")
+
+    def _sleep(self, seconds: float) -> None:
+        """可被打断的等待（退避用）：打断到达时立刻醒来并抛 Interrupted。"""
+        if self._upstream_stop is None:
+            self._interrupt_flag.wait(seconds)
+        else:
+            #  两个标志没法同时等：切成小片轮流看
+            deadline = time.monotonic() + seconds
+            while not self.interrupt_requested():
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                self._interrupt_flag.wait(min(0.2, remaining))
+        self._checkpoint()
+
     def steer(self, text: str) -> None:
         """运行中追加一条用户输入（线程安全）。
 
@@ -2456,6 +2482,8 @@ class Agent:
                 continue
 
             for call in calls:
+                #  同一批里后面的调用不该在打断之后照跑
+                self._checkpoint()
                 self._record(self._execute(call))
             #  structured_output 已落：这就是收尾，不再让模型多说一轮
             if self.output_schema is not None and self.structured_output is not None:
@@ -2566,6 +2594,7 @@ class Agent:
         for call in calls:
             function = call.get("function") or {}
             if function.get("name") != EXTEND_TURNS_TOOL:
+                self._checkpoint()
                 self._record(self._execute(call))
                 continue
             try:
@@ -3460,7 +3489,8 @@ class Agent:
                         "warn",
                     )
                 )
-                time.sleep(wait)
+                #  等的是别人，不是在干活：打断要能立刻生效
+                self._sleep(wait)
                 delay *= 2
         raise RuntimeError("unreachable")  # for 循环里必然 return 或 raise
 
@@ -3737,9 +3767,7 @@ class Agent:
             #  库层嵌入：宿主的 interrupt() 在这个边界被发现。抛
             #  Interrupted（KeyboardInterrupt 子类）复用 _stream_once 里
             #  现成的收尾分支——半截话入历史、残缺 tool_calls 丢弃。
-            if self._interrupt_flag.is_set():
-                self._interrupt_flag.clear()
-                raise Interrupted("宿主请求打断")
+            self._checkpoint()
             if getattr(chunk, "usage", None):
                 #  收到 usage 即视为正常收尾：有些端点不发 finish_reason，只在
                 #  最后给一个纯 usage chunk（断流判定见 _stream_once）

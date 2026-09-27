@@ -479,6 +479,7 @@ def execute_delegation(
     model_override: str | None = None,
     effort_override: str | None = None,
     parent_history: Callable[[], list[dict[str, Any]]] | None = None,
+    stop_requested: Callable[[], bool] | None = None,
 ) -> DelegationResult:
     """跑一次委托的执行核心（单发 subagent 工具与 qixiang 批量共用）。
 
@@ -720,6 +721,8 @@ def execute_delegation(
         permissions=permissions,
         sink=child_sink,
         allow_nesting=nest,
+        #  父级被打断时跟着停（单发委托跑在父级线程里，父级自己没机会去叫停它）
+        upstream_stop=stop_requested,
     )
     if on_agent is not None:
         on_agent(sub_agent)
@@ -854,6 +857,7 @@ def make_subagent_tool(
     runs: dict[str, SubagentRun] | None = None,
     mcp_manager: Any = None,
     parent_history: Callable[[], list[dict[str, Any]]] | None = None,
+    stop_requested: Callable[[], bool] | None = None,
 ) -> Tool:
     """spec → 可挂载的工具。结构与 explore.make_explore_tool 同构：
     usage/registry 传父级的（同一本账、client 复用），sink 走 quiet_child 派生。
@@ -877,6 +881,7 @@ def make_subagent_tool(
             task=task, capability_mode=capability_mode,
             isolation=isolation, resume_from=resume_from,
             parent_history=parent_history,
+            stop_requested=stop_requested,
         )
         if result.error:
             return result.error
