@@ -156,7 +156,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Iterator, TextIO
 
-from . import __version__, folder_trust, fsguard, mcp, mcp_guard, media, modes
+from . import __version__, folder_trust, fsguard, mcp, mcp_guard, media, modes, ui
 from .config import Config, MissingConfig, load_dotenv, user_env_path
 from .permissions import Permissions, suggest_allow_rule
 from .session_log import (
@@ -238,15 +238,11 @@ def _text_content(text: str) -> dict[str, Any]:
 
 
 def _tool_title(name: str, args: dict[str, Any]) -> str:
-    """人读的一行标题：bash 给命令、文件类给路径、检索给 pattern。"""
-    value = ""
-    if name == "bash":
-        value = str(args.get("command", "") or "")
-    elif name in ("read_file", "write_file", "str_replace", "list_files"):
-        value = str(args.get("path", "") or "")
-    elif name in ("grep", "explore", "web_search"):
-        value = str(args.get("pattern") or args.get("query") or "")
-    value = " ".join(value.split())
+    """人读的一行标题。摘什么由 ui.tool_summary 定（与终端的工具行同一份规则）。"""
+    value = " ".join(ui.strip_controls(ui.tool_summary(name, args)).split())
+    if name == "use_tool" and value:
+        #  宿主按标题认工具：经元工具转发的调用，标题报真正被调的那个
+        name, _, value = value.partition(" ")
     if not value:
         return name
     if len(value) > _TITLE_LIMIT:
