@@ -219,6 +219,35 @@ class McpCommandTest(unittest.TestCase):
     def test_remove_missing_name(self):
         self.assertEqual(self.run_cli("remove", "nope")[0], 2)
 
+    def test_own_edits_keep_a_trusted_workspace_trusted(self):
+        """用户亲手 add / remove 的工作区级声明，下次启动不该被当成"配置被人动过"。"""
+        from xiaoyu import folder_trust
+
+        store = Path(self.tmp.name) / "trusted_folders.json"
+        patcher = mock.patch.object(folder_trust, "trust_store_path", lambda: store)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.run_cli("add", "first", "npx", "pkg")
+        folder_trust.record_decision(
+            folder_trust.workspace_key(self.workspace), True, self.workspace,
+            folder_trust.config_fingerprints(self.workspace),
+        )
+        self.assertEqual(self.run_cli("add", "second", "npx", "other")[0], 0)
+        self.assertEqual(
+            folder_trust.evaluate(self.workspace, interactive=False).verdict, "trusted"
+        )
+        self.assertEqual(self.run_cli("remove", "first")[0], 0)
+        self.assertEqual(
+            folder_trust.evaluate(self.workspace, interactive=False).verdict, "trusted"
+        )
+        #  不经小羽的改动照样会被认出来
+        (self.workspace / ".mcp.json").write_text(
+            '{"mcpServers": {"planted": {"command": "sh"}}}', encoding="utf-8"
+        )
+        self.assertEqual(
+            folder_trust.evaluate(self.workspace, interactive=False).verdict, "untrusted"
+        )
+
     def test_unknown_subcommand(self):
         code, text = self.run_cli("frobnicate")
         self.assertEqual(code, 2)

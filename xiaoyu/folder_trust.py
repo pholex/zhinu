@@ -19,13 +19,22 @@
 规则 3、4 的放行是临时判定、不落盘：git pull 之后冒出来的 .mcp.json
 下次启动照样会被检查，不靠一条陈旧的放行记录长期蒙混。
 
+**信任的是内容，不是路径。** 信任表里随记录存着当时那几份配置的指纹
+（按工作区分别记）；规则 2 命中之后还要比一次指纹，对不上——git pull 带来
+的改动、模型上一轮悄悄写进去的一行、换了个子目录启动——就当没有记录，
+落到规则 5/6 重新问。配置被删掉不算变化（少了可执行的东西，不用问）。
+没带指纹的旧记录（以及 record_decision 只记了信任没给指纹的）在第一次
+过门时按当前内容补记，不追问——那份信任本来就是对着当时的内容给的。
+
 嵌入宿主（库层调用方）不经这道门：门是 CLI 启动期的关卡，库层 Config 默认
 workspace_trusted=True，宿主要门自己调 evaluate() 再传进来。
 """
 
 from __future__ import annotations
 
+import hashlib
 import os
+import re
 import sys
 from dataclasses import dataclass
 from datetime import datetime
@@ -137,6 +146,90 @@ def repo_config_kinds(workspace: Path) -> list[str]:
     return kinds
 
 
+#  kind → 工作区内的相对路径（探测、指纹、告警三处共用）
+_KIND_FILES = {
+    "mcp": (".mcp.json",),
+    "permission": (".xiaoyu", "permissions.txt"),
+    "env": (".env",),
+}
+#  指纹只读这么多字节；再大的"配置文件"按尺寸记，不整读
+_FINGERPRINT_MAX_BYTES = 4 * 1024 * 1024
+
+
+def config_fingerprints(
+    workspace: Path, kinds: tuple[str, ...] | list[str] | None = None
+) -> dict[str, str]:
+    """当前工作区里每份可执行配置的内容指纹（kind → 摘要）。
+
+    读不了的（特殊文件、权限不够）记成固定的 "unreadable"：它反正不会被消费
+    （消费点同样要求普通文件），不必每次启动都为它重问一遍。
+    """
+    if kinds is None:
+        kinds = repo_config_kinds(workspace)
+    result: dict[str, str] = {}
+    for kind in kinds:
+        parts = _KIND_FILES.get(kind)
+        if parts is None:
+            continue
+        path = workspace.joinpath(*parts)
+        try:
+            fsguard.require_regular(path)
+            size = path.stat().st_size
+            if size > _FINGERPRINT_MAX_BYTES:
+                result[kind] = f"oversize:{size}"
+                continue
+            result[kind] = hashlib.sha256(path.read_bytes()).hexdigest()[:32]
+        except OSError:
+            result[kind] = "unreadable"
+    return result
+
+
+_ENV_REFERENCE = re.compile(r"\$\{(?:env:)?([A-Za-z_][A-Za-z0-9_]*)\}")
+
+
+def mcp_env_references(workspace: Path) -> tuple[list[str], list[str]]:
+    """工作区 .mcp.json 会读哪些环境变量：(全部, 其中属于小羽自己密钥的)。
+
+    `${VAR}` 展开与 inheritEnv 点名都算。给问询用：一份会把你的模型密钥递给
+    它自己那个 server 的配置，该让人在答 y 之前看见。读不了就返回空。
+    """
+    path = workspace / ".mcp.json"
+    try:
+        fsguard.require_regular(path)
+        if path.stat().st_size > _FINGERPRINT_MAX_BYTES:
+            return [], []
+        raw = path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return [], []
+    names = dict.fromkeys(_ENV_REFERENCE.findall(raw))
+    try:
+        import json
+
+        servers = json.loads(raw).get("mcpServers")
+    except (ValueError, AttributeError):
+        servers = None
+    if isinstance(servers, dict):
+        for entry in servers.values():
+            inherit = entry.get("inheritEnv") if isinstance(entry, dict) else None
+            for name in inherit if isinstance(inherit, list) else []:
+                if isinstance(name, str) and name.strip():
+                    names.setdefault(name.strip())
+    if not names:
+        return [], []
+    from .tools import non_inheritable_env_names
+
+    secrets = non_inheritable_env_names()
+
+    def is_secret(name: str) -> bool:
+        upper = name.upper()
+        if upper.endswith("*"):
+            prefix = upper[:-1]
+            return not prefix or any(item.startswith(prefix) for item in secrets)
+        return upper in secrets
+
+    return list(names), [name for name in names if is_secret(name)]
+
+
 # ---------- 信任键 ----------
 
 
@@ -193,19 +286,13 @@ def _load_store() -> dict:
     return data if isinstance(data, dict) else {}
 
 
-def stored_verdict(key: Path, store: dict | None = None) -> bool | None:
-    """查信任表：最长前缀匹配（最具体的记录获胜），没有记录返回 None。
-
-    同深度的并列记录（手改文件造出的别名）须全部 trusted 才算 trusted
-    （fail-closed）；过宽根的记录读时跳过——手改文件也造不出全局放行。
-    """
-    if store is None:
-        store = _load_store()
+def _matching_records(key: Path, store: dict) -> list[tuple[str, dict]]:
+    """信任表里管着 key 的记录：最长前缀那一层的全部条目（通常就一条）。"""
     folders = store.get("folders")
     if not isinstance(folders, dict):
-        return None
+        return []
     best_depth = -1
-    verdict: bool | None = None
+    best: list[tuple[str, dict]] = []
     for raw, record in folders.items():
         if not isinstance(record, dict):
             continue
@@ -215,16 +302,85 @@ def stored_verdict(key: Path, store: dict | None = None) -> bool | None:
         if entry != key and entry not in key.parents:
             continue
         depth = len(entry.parts)
-        trusted = bool(record.get("trusted"))
         if depth > best_depth:
-            best_depth, verdict = depth, trusted
-        elif depth == best_depth and verdict is not None:
-            verdict = verdict and trusted
-    return verdict
+            best_depth, best = depth, [(raw, record)]
+        elif depth == best_depth:
+            best.append((raw, record))
+    return best
 
 
-def record_decision(key: Path, trusted: bool) -> Path | None:
-    """把决定写进信任表（原子写、0600）。过宽的根拒写，返回 None。"""
+def stored_verdict(key: Path, store: dict | None = None) -> bool | None:
+    """查信任表：最长前缀匹配（最具体的记录获胜），没有记录返回 None。
+
+    同深度的并列记录（手改文件造出的别名）须全部 trusted 才算 trusted
+    （fail-closed）；过宽根的记录读时跳过——手改文件也造不出全局放行。
+    """
+    if store is None:
+        store = _load_store()
+    records = _matching_records(key, store)
+    if not records:
+        return None
+    return all(bool(record.get("trusted")) for _, record in records)
+
+
+def _workspace_id(workspace: Path) -> str:
+    try:
+        return str(workspace.resolve())
+    except OSError:
+        return str(workspace)
+
+
+def _known_fingerprints(
+    key: Path, workspace: Path, store: dict
+) -> tuple[bool, dict[str, str] | None]:
+    """(记录是否还没绑过内容, 记录里这个工作区的指纹)。
+
+    没绑过内容 = 管着 key 的记录全都没有 configs 字段（旧版本写的，或只记了
+    信任没给指纹）。绑过但没有这个工作区 = 这里的配置从没被看过，得问。
+    """
+    records = _matching_records(key, store)
+    unbound = True
+    for _, record in records:
+        configs = record.get("configs")
+        if not isinstance(configs, dict):
+            continue
+        unbound = False
+        known = configs.get(_workspace_id(workspace))
+        if isinstance(known, dict):
+            return False, {str(k): str(v) for k, v in known.items()}
+    return unbound, None
+
+
+def _remember_fingerprints(key: Path, workspace: Path, fingerprints: dict[str, str]) -> None:
+    """把指纹记到管着 key 的那条（那几条）信任记录上。落盘失败不拦启动。"""
+    from .mcp_guard import save_json_atomic
+
+    store = _load_store()
+    records = _matching_records(key, store)
+    if not records:
+        return
+    for _, record in records:
+        configs = record.get("configs")
+        if not isinstance(configs, dict):
+            configs = record["configs"] = {}
+        configs[_workspace_id(workspace)] = dict(fingerprints)
+    try:
+        save_json_atomic(trust_store_path(), store)
+    except OSError:
+        pass
+
+
+def record_decision(
+    key: Path,
+    trusted: bool,
+    workspace: Path | None = None,
+    fingerprints: dict[str, str] | None = None,
+) -> Path | None:
+    """把决定写进信任表（原子写、0600）。过宽的根拒写，返回 None。
+
+    workspace + fingerprints 一起给时，信任绑到这份内容上；同一条记录下别的
+    工作区已经记过的指纹原样保留。不给则只记信任，指纹留到下次过门时补。
+    """
     if unsafe_trust_root(key):
         return None
     from .mcp_guard import save_json_atomic
@@ -233,13 +389,38 @@ def record_decision(key: Path, trusted: bool) -> Path | None:
     folders = store.setdefault("folders", {})
     if not isinstance(folders, dict):
         folders = store["folders"] = {}
-    folders[str(key)] = {
+    previous = folders.get(str(key))
+    record: dict = {
         "trusted": trusted,
         "decided_at": datetime.now().isoformat(timespec="seconds"),
     }
+    if trusted and workspace is not None and fingerprints is not None:
+        kept = previous.get("configs") if isinstance(previous, dict) else None
+        configs = dict(kept) if isinstance(kept, dict) else {}
+        configs[_workspace_id(workspace)] = dict(fingerprints)
+        record["configs"] = configs
+    folders[str(key)] = record
     path = trust_store_path()
     save_json_atomic(path, store)
     return path
+
+
+def resync_after_own_write(workspace: Path, before: dict[str, str]) -> None:
+    """用户自己敲命令（`xiaoyu mcp add` 之类）改了工作区配置之后，同步指纹。
+
+    不同步的话，用户刚亲手加的 server 下次启动就被当成"配置被人动过"问一遍。
+    before 是动手之前的指纹：只有那时的内容本来就对得上记录（或记录还没绑过
+    内容、或那时根本没有配置）才同步——否则会顺手把别人的改动一起认下来。
+    """
+    if not enabled():
+        return
+    key = workspace_key(workspace)
+    store = _load_store()
+    if stored_verdict(key, store) is not True:
+        return
+    unbound, known = _known_fingerprints(key, workspace, store)
+    if unbound or known == before or (known is None and not before):
+        _remember_fingerprints(key, workspace, config_fingerprints(workspace))
 
 
 # ---------- 判定 ----------
@@ -250,6 +431,10 @@ class TrustDecision:
     verdict: str  # "trusted" | "prompt" | "untrusted"
     key: Path
     kinds: tuple[str, ...]
+    #  曾经信任过、但这几样的内容与当时对不上了（空 = 头一回见，或没变）
+    changed: tuple[str, ...] = ()
+    #  过门的工作区（信任键是 git 根，配置却是按工作区读的）
+    workspace: Path | None = None
 
     @property
     def trusted(self) -> bool:
@@ -289,14 +474,34 @@ def evaluate(workspace: Path, interactive: bool) -> TrustDecision:
     """CLI 启动期的入口：算出 verdict（"prompt" 留给调用方去问）。"""
     key = workspace_key(workspace)
     kinds = tuple(repo_config_kinds(workspace))
+    feature_enabled = enabled()
+    recordable = not unsafe_trust_root(key)
+    store = _load_store()
+    store_trusted = stored_verdict(key, store)
+    changed: tuple[str, ...] = ()
+    if feature_enabled and recordable and store_trusted is True and kinds:
+        current = config_fingerprints(workspace, kinds)
+        unbound, known = _known_fingerprints(key, workspace, store)
+        if unbound:
+            _remember_fingerprints(key, workspace, current)
+        else:
+            changed = tuple(
+                kind for kind in kinds if (known or {}).get(kind) != current.get(kind)
+            )
+            if changed:
+                #  内容对不上：这条记录信的不是眼前这份配置
+                store_trusted = None
+            elif known != current:
+                #  只是少了几样（配置被删）：不用问，把记录收窄到现状
+                _remember_fingerprints(key, workspace, current)
     verdict = decide(
-        feature_enabled=enabled(),
-        store_trusted=stored_verdict(key),
-        key_recordable=not unsafe_trust_root(key),
+        feature_enabled=feature_enabled,
+        store_trusted=store_trusted,
+        key_recordable=recordable,
         configs_present=bool(kinds),
         interactive=interactive,
     )
-    return TrustDecision(verdict, key, kinds)
+    return TrustDecision(verdict, key, kinds, changed, workspace)
 
 
 def ask_user(decision: TrustDecision) -> bool:
@@ -307,22 +512,46 @@ def ask_user(decision: TrustDecision) -> bool:
     反悔用 `xiaoyu --trust`）。
     """
     found = "、".join(KIND_LABELS.get(kind, kind) for kind in decision.kinds)
-    print(
-        f"\n该目录带有仓库级可执行配置，启动即生效：\n"
-        f"  目录：{decision.key}\n"
-        f"  发现:{found}\n"
-        f"信任这个目录的作者并启用这些配置吗？[y/N] ",
-        end="",
-        file=sys.stderr,
-        flush=True,
-    )
+    if decision.changed:
+        changed = "、".join(KIND_LABELS.get(kind, kind) for kind in decision.changed)
+        headline = (
+            f"\n该目录的可执行配置与你上次信任时不一样了：\n"
+            f"  目录：{decision.key}\n"
+            f"  有变化：{changed}\n"
+        )
+        question = "看过改动、确认仍然信任并启用这些配置吗？[y/N] "
+    else:
+        headline = (
+            f"\n该目录带有仓库级可执行配置，启动即生效：\n"
+            f"  目录：{decision.key}\n"
+            f"  发现:{found}\n"
+        )
+        question = "信任这个目录的作者并启用这些配置吗？[y/N] "
+    reads = ""
+    if decision.workspace is not None and "mcp" in decision.kinds:
+        names, secrets = mcp_env_references(decision.workspace)
+        if names:
+            shown = "、".join(names[:12]) + ("…" if len(names) > 12 else "")
+            reads = f"  .mcp.json 会读取环境变量：{shown}\n"
+            if secrets:
+                reads += (
+                    f"  ⚠ 其中 {'、'.join(secrets)} 是小羽调模型用的密钥，"
+                    "会被递给它声明的 server\n"
+                )
+    print(headline + reads + question, end="", file=sys.stderr, flush=True)
     try:
         answer = input().strip().lower()
     except (EOFError, KeyboardInterrupt):
         print(file=sys.stderr)
         answer = ""
     trusted = answer in ("y", "yes")
-    record_decision(decision.key, trusted)
+    if trusted and decision.workspace is not None:
+        record_decision(
+            decision.key, True, decision.workspace,
+            config_fingerprints(decision.workspace, decision.kinds),
+        )
+    else:
+        record_decision(decision.key, trusted)
     return trusted
 
 
@@ -330,6 +559,12 @@ def untrusted_note(decision: TrustDecision) -> str:
     """不信任时给用户的一行说明（CLI 打到 stderr / banner 下方）。"""
     names = {"mcp": ".mcp.json", "permission": ".xiaoyu/permissions.txt", "env": ".env"}
     found = " / ".join(names.get(kind, kind) for kind in decision.kinds)
+    if decision.changed:
+        changed = " / ".join(names.get(kind, kind) for kind in decision.changed)
+        return (
+            f"工作区的可执行配置与上次信任时不一样了（{changed} 有变化）："
+            f"仓库级 {found} 本次不生效（看过改动、确认无误后运行 xiaoyu --trust 重新信任）"
+        )
     return (
         f"工作区未受信任：仓库级 {found} 本次不生效"
         "（信任请运行 xiaoyu --trust，或删除信任表里的记录后重答）"
