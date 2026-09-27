@@ -2478,7 +2478,7 @@ def load_output_schema(spec: str | None) -> dict[str, Any] | None:
     try:
         text = path.read_text(encoding="utf-8") if path.is_file() else spec
         schema = json.loads(text)
-    except (OSError, json.JSONDecodeError) as exc:
+    except (OSError, ValueError) as exc:
         raise ValueError(f"--output-schema 不是合法的 JSON Schema 文件或内联 JSON：{exc}") from exc
     if not isinstance(schema, dict):
         raise ValueError("--output-schema 顶层必须是 JSON 对象")

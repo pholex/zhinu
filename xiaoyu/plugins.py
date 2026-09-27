@@ -120,7 +120,7 @@ class Bundle:
 def _read_json(path: Path) -> dict[str, Any]:
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
+    except (OSError, ValueError) as exc:
         raise PluginError(f"{path} 读不出来：{exc}") from exc
     if not isinstance(data, dict):
         raise PluginError(f"{path} 的顶层不是 JSON 对象")
@@ -463,7 +463,7 @@ def load_registry() -> dict[str, Any]:
         return {}
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
+    except (OSError, ValueError):
         #  账本坏了只是丢来源信息（update 会提示重装），不该让已装的包全体消失
         return {}
     plugins = data.get("plugins")

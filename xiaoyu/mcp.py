@@ -148,10 +148,19 @@ class McpError(RuntimeError):
     未分类的错误走旧语义。
     """
 
-    def __init__(self, message: str = "", *, kind: str = "", status: int | None = None) -> None:
+    def __init__(
+        self,
+        message: str = "",
+        *,
+        kind: str = "",
+        status: int | None = None,
+        data: Any = None,
+    ) -> None:
         super().__init__(message)
         self.kind = kind
         self.status = status
+        #  JSON-RPC error 响应里的 data（版本协商失败时 server 在这里列它支持的版本）
+        self.data = data
 
     @property
     def outcome_unknown(self) -> bool:
@@ -343,7 +352,7 @@ def read_config_file(path: Path) -> dict[str, Any]:
         return {}
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
+    except (OSError, ValueError) as exc:  # 坏 JSON、非 UTF-8 字节都是 ValueError
         raise McpError(f"{path} 读不出来：{exc}") from exc
     if not isinstance(data, dict):
         raise McpError(f"{path} 的顶层不是 JSON 对象")
@@ -415,9 +424,14 @@ def _present(path: Path) -> bool:
 
 
 def spec_fingerprint(spec: ServerSpec) -> str:
-    """schema 缓存的配置指纹：command/args/env 任何变化都让缓存失效。
-    env 的值也参与（sha256 单向，不泄漏）：换了 token 就该重新连一次拿新 schema。"""
-    material = json.dumps([spec.command, spec.args, spec.env], ensure_ascii=False, sort_keys=True)
+    """schema 缓存的配置指纹：command/args/env/url/headers 任何变化都让缓存失效。
+    env 与 headers 的值也参与（sha256 单向，不泄漏）：换了 token、换了地址就该
+    重新连一次拿新 schema。远端 server 的 command 恒为空——不把 url 算进来的话，
+    所有远端 server 的指纹都一样。"""
+    material = json.dumps(
+        [spec.command, spec.args, spec.env, spec.url, spec.headers],
+        ensure_ascii=False, sort_keys=True,
+    )
     return hashlib.sha256(material.encode("utf-8")).hexdigest()[:16]
 
 
@@ -428,8 +442,11 @@ def _parse_config_file(
         return []
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
+    except (OSError, ValueError) as exc:  # 坏 JSON、非 UTF-8 字节都是 ValueError
         print(f"[MCP 配置 {path} 解析失败：{exc}]", file=sys.stderr)
+        return []
+    if not isinstance(data, dict):
+        print(f"[MCP 配置 {path} 的顶层不是 JSON 对象，已忽略]", file=sys.stderr)
         return []
     servers = data.get("mcpServers")
     if not isinstance(servers, dict):
@@ -457,10 +474,20 @@ def parse_server_mapping(
     specs: list[ServerSpec] = []
     problems: list[str] = []
 
+    unresolved: dict[str, None] = {}
+
     def ex(value: Any) -> str:
-        return _expand(str(value), extra_env) if expand else str(value)
+        if not expand:
+            return str(value)
+        text = _expand(str(value), extra_env)
+        #  展开之后还在的占位就是没定义的变量：字面量会原样递给 server——写在
+        #  headers 里就是把 "${TOKEN}" 这几个字符当令牌发给远端
+        for variable in _ENV_PATTERN.findall(text):
+            unresolved.setdefault(variable)
+        return text
 
     for name, raw in servers.items():
+        unresolved.clear()
         if not isinstance(raw, dict):
             problems.append(f"{name!r} 不是对象，已忽略")
             continue
@@ -501,6 +528,11 @@ def parse_server_mapping(
                     trust_content=bool(raw.get("trustContent", False)),
                 )
             )
+            if unresolved:
+                problems.append(
+                    f"server {name!r}：环境变量 {'、'.join(unresolved)} 没有定义，"
+                    "占位符会原样发给远端"
+                )
             continue
         specs.append(
             ServerSpec(
@@ -517,6 +549,11 @@ def parse_server_mapping(
                 trust_content=bool(raw.get("trustContent", False)),
             )
         )
+        if unresolved:
+            problems.append(
+                f"server {name!r}：环境变量 {'、'.join(unresolved)} 没有定义，"
+                "占位符会原样递给 server"
+            )
     return specs, problems
 
 
@@ -971,15 +1008,7 @@ class McpServer:
                 if reason := mcp_guard.osv_malware_check(spec.command, spec.args):
                     raise McpError(f"启动被拦截：{reason}")
         self._spawn()
-        result = self._request(
-            "initialize",
-            {
-                "protocolVersion": PROTOCOL_VERSION,
-                "capabilities": {},
-                "clientInfo": {"name": "xiaoyu", "version": _version()},
-            },
-            timeout=INIT_TIMEOUT,
-        )
+        result = self._initialize(PROTOCOL_VERSION)
         info = result.get("serverInfo") or {}
         self.server_info = " ".join(
             str(part) for part in (info.get("name"), info.get("version")) if part
@@ -1022,7 +1051,16 @@ class McpServer:
         #  ~ 展开 + which：Windows 上 npx/uvx 这类 .cmd 入口不经 shell 找不到，
         #  which 一次全平台通吃。
         expanded = os.path.expanduser(self.spec.command)
-        command = shutil.which(expanded) or expanded
+        command = shutil.which(expanded)
+        if command is None:
+            #  不拦的话经看门狗包一层照样起得来，然后立刻退出——报出来的是
+            #  "server 进程已退出"，真因（命令不存在）只在日志文件里
+            where = (
+                "文件不存在或不可执行"
+                if os.sep in expanded or (os.altsep and os.altsep in expanded)
+                else f"PATH 的 {len(os.environ.get('PATH', '').split(os.pathsep))} 个目录里都没有"
+            )
+            raise McpError(f"找不到启动命令 {self.spec.command!r}（{where}）")
         #  环境走 _safe_env 白名单（见模块 docstring）；配置里声明的 env 覆盖
         #  继承值——这个覆盖方向不能反，反了配置值会被父环境静默盖掉。
         #  加固参数里的 start_new_session 同时解决另一件事：REPL 里 Ctrl-C 打断
@@ -1271,6 +1309,41 @@ class McpServer:
         text, self.last_media = _render_result(result)
         return text
 
+    def _initialize(self, version: str) -> dict[str, Any]:
+        """发 initialize；server 以"版本不支持"拒绝并列出它支持的版本时，挑一个
+        双方都认的重试一次。
+
+        规范的正路是 server 在响应里回一个它支持的版本（调用方据此协商），但
+        有的实现直接回错误、把支持的版本放在 error.data.supported 里。只重试
+        一次：第二次还不行就是真不兼容。
+        """
+
+        def call(protocol: str) -> dict[str, Any]:
+            return self._request(
+                "initialize",
+                {
+                    "protocolVersion": protocol,
+                    "capabilities": {},
+                    "clientInfo": {"name": "xiaoyu", "version": _version()},
+                },
+                timeout=INIT_TIMEOUT,
+            )
+
+        try:
+            return call(version)
+        except McpError as exc:
+            offered = exc.data.get("supported") if isinstance(exc.data, dict) else None
+            if not isinstance(offered, list):
+                raise
+            #  SUPPORTED_PROTOCOL_VERSIONS 按我方偏好排序：取第一个对方也认的
+            common = [
+                item for item in SUPPORTED_PROTOCOL_VERSIONS
+                if item != version and item in offered
+            ]
+            if not common:
+                raise
+            return call(common[0])
+
     def _request(self, method: str, params: dict[str, Any], timeout: float) -> dict[str, Any]:
         with self._cond:
             if self._dead:
@@ -1290,8 +1363,11 @@ class McpServer:
                 self._cond.wait(remaining)
             reply = self._responses.pop(request_id)
         if "error" in reply:
-            error = reply["error"] or {}
-            raise McpError(f"{error.get('message', '未知错误')}（code {error.get('code')}）")
+            error = reply["error"] if isinstance(reply["error"], dict) else {}
+            raise McpError(
+                f"{error.get('message', '未知错误')}（code {error.get('code')}）",
+                data=error.get("data"),
+            )
         result = reply.get("result")
         return result if isinstance(result, dict) else {}
 
@@ -1333,7 +1409,11 @@ class McpServer:
                 continue
             if not isinstance(message, dict):
                 continue
-            self._dispatch(message, generation=proc)
+            try:
+                self._dispatch(message, generation=proc)
+            except Exception:  # noqa: BLE001 - 一帧畸形降级的是这一帧，不是整条连接
+                #  读线程死了的话 server 不会被标死，在等的请求只能干等到超时
+                continue
         with self._cond:
             if self._proc is not proc:
                 return
@@ -1365,8 +1445,13 @@ class McpServer:
             #  其余通知（progress、logging…）一律忽略
             return
         if "id" in message:
+            response_id = message["id"]
+            #  我方发出去的 id 都是整数：列表、对象这类回来的 id 对不上任何请求，
+            #  还不能当字典键（直接抛 TypeError）。布尔是 int 的子类，一并挡掉
+            if not isinstance(response_id, (int, str)) or isinstance(response_id, bool):
+                return
             with self._cond:
-                self._responses[message["id"]] = message
+                self._responses[response_id] = message
                 self._cond.notify_all()
 
     def _post(self, payload: dict[str, Any]) -> None:
@@ -1760,7 +1845,7 @@ class McpManager:
     def _load_cache(self) -> dict[str, Any]:
         try:
             data = json.loads(self._cache_path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
+        except (OSError, ValueError):
             return {}
         if not isinstance(data, dict) or data.get("version") != 1:
             return {}
@@ -2505,6 +2590,10 @@ class McpManager:
     def close(self) -> None:
         with self._lock:
             self._closed = True
+        #  at-exit 兜底名单里除名：常驻进程里每个会话一份 manager，关了还留着
+        #  引用的话名单只增不减
+        with contextlib.suppress(ValueError):
+            _extra_managers.remove(self)
         #  重连线程的退避等待立即醒来，看到 _closed 退场
         self._close_event.set()
         #  join 而不是限时等状态：启动中的 server 由 _bootstrap_one 发现 _closed
@@ -2697,7 +2786,12 @@ def launch(config: Config, extra_specs: list[ServerSpec] | None = None) -> McpMa
             specs.update(extras)
             return list(specs.values())
 
-        return launch_specs(merged(), spec_loader=merged)
+        #  信任开关照传：带 extra_specs 走的是不缓存的路径，漏传的话
+        #  Config.mcp_trust_changes（--unguarded 的落点）在这类会话里不生效
+        return launch_specs(
+            merged(), spec_loader=merged,
+            trust_tool_changes=bool(getattr(config, "mcp_trust_changes", False)),
+        )
     manager = _managers.get(config.workspace)
     if manager is not None:
         return manager
@@ -2717,7 +2811,9 @@ def launch(config: Config, extra_specs: list[ServerSpec] | None = None) -> McpMa
 
 
 def launch_specs(
-    specs: list[ServerSpec], spec_loader: Callable[[], list[ServerSpec]] | None = None
+    specs: list[ServerSpec],
+    spec_loader: Callable[[], list[ServerSpec]] | None = None,
+    trust_tool_changes: bool = False,
 ) -> McpManager:
     """按给定 specs 现起一个 manager 并登记到 at-exit 清扫。
 
@@ -2735,7 +2831,9 @@ def launch_specs(
     spec_loader：/mcp reconnect 重读声明用的函数（见 McpManager）；不给则热恢复
     沿用这份清单里的声明。
     """
-    manager = McpManager(specs, spec_loader=spec_loader)
+    manager = McpManager(
+        specs, spec_loader=spec_loader, trust_tool_changes=trust_tool_changes
+    )
     manager.start()
     _extra_managers.append(manager)
     _ensure_atexit()

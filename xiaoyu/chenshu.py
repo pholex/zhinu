@@ -295,7 +295,7 @@ class ChenshuRuntime:
             return None
         try:
             data = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
+        except (OSError, ValueError):
             return None
         #  至少 system + 一条对话才算有上下文可续；坏档当没有
         if (

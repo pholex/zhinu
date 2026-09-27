@@ -323,7 +323,9 @@ def _parse_rules_file(path: Path) -> tuple[list[Rule], list[RuleTest]]:
     try:
         #  工作区规则文件来自仓库：指向设备的链接整读读不到头，按读不了处理
         fsguard.require_regular(path)
-        raw = path.read_text(encoding="utf-8")
+        #  坏字节不该让整份规则作废：里面的 deny 是用户明令禁止的事，
+        #  能认出来的行照常生效
+        raw = path.read_text(encoding="utf-8", errors="replace")
     except OSError:
         return [], []
     rules: list[Rule] = []
