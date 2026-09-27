@@ -2237,8 +2237,11 @@ class GenerationTest(unittest.TestCase):
         before = sorted(self.names(manager))
         self.die_file.write_text("x", encoding="utf-8")
         self.crash(manager)
+        #  状态先写成失败、重连占位随后才放开：两样都等到，否则紧跟着的手动重连
+        #  会撞进这道缝里，拿到的是"正在重连中"
         self.wait_until(
-            lambda: manager._states["gen"].startswith("failed:"),
+            lambda: manager._states["gen"].startswith("failed:")
+            and "gen" not in manager._reconnecting,
             message=f"未按预期放弃：{manager._states['gen']}",
         )
         status = manager.describe()
