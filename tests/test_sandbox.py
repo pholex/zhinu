@@ -9,6 +9,7 @@
 from __future__ import annotations
 
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -94,6 +95,82 @@ class LinuxWrapTest(unittest.TestCase):
         """不能走 PATH：PATH 上放个假 bwrap 就等于沙箱可以自己关掉自己。"""
         for candidate in sandbox.BWRAP_CANDIDATES:
             self.assertTrue(candidate.startswith("/"), candidate)
+
+
+@unittest.skipIf(os.name == "nt", "用可执行位伪造程序，POSIX 才有")
+class HostProgramLookupTest(unittest.TestCase):
+    """宿主侧自己要跑的程序只在模型写不进去的 PATH 目录里找。"""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.ws = Path(self.tmp.name).resolve() / "ws"
+        self.planted = self.ws / ".venv" / "bin"
+        self.planted.mkdir(parents=True)
+        self.marker = self.ws / "executed.txt"
+        #  登记表与缓存是进程级的：用例之间互不串味
+        for name, value in (("_workspaces", {}), ("_untrusted_cache", None)):
+            patcher = mock.patch.object(sandbox, name, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def plant(self, name: str) -> Path:
+        program = self.planted / name
+        program.write_text(f"#!/bin/sh\necho ran > '{self.marker}'\nexit 1\n", encoding="utf-8")
+        program.chmod(0o755)
+        return program
+
+    def path_with_planted_first(self) -> dict:
+        return {"PATH": f"{self.planted}{os.pathsep}{os.environ.get('PATH', '')}"}
+
+    def test_program_planted_in_workspace_is_skipped(self):
+        self.plant("git")
+        real = sandbox.host_which("git")
+        with mock.patch.dict(os.environ, self.path_with_planted_first()):
+            self.assertEqual(shutil.which("git"), str(self.planted / "git"), "前提：PATH 确实被顶了")
+            sandbox.note_workspace(self.ws)
+            self.assertEqual(sandbox.host_which("git"), real)
+            self.assertNotEqual(sandbox.host_command("git"), "git")
+
+    def test_program_only_in_workspace_counts_as_missing(self):
+        self.plant("xiaoyu-only-here")
+        with mock.patch.dict(os.environ, self.path_with_planted_first()):
+            sandbox.note_workspace(self.ws)
+            self.assertIsNone(sandbox.host_which("xiaoyu-only-here"))
+            command = sandbox.host_command("xiaoyu-only-here")
+        #  不退回裸名字（那会再被 PATH 顶替），而是一个必然不存在的绝对路径
+        self.assertTrue(os.path.isabs(command))
+        self.assertFalse(os.path.exists(command))
+
+    def test_relative_and_temp_entries_are_untrusted(self):
+        sandbox.note_workspace(self.ws)
+        self.assertFalse(sandbox.trusted_program_dir(""))
+        self.assertFalse(sandbox.trusted_program_dir("."))
+        self.assertFalse(sandbox.trusted_program_dir("node_modules/.bin"))
+        self.assertFalse(sandbox.trusted_program_dir(tempfile.gettempdir()))
+        self.assertFalse(sandbox.trusted_program_dir(str(self.ws)))
+        self.assertTrue(sandbox.trusted_program_dir("/usr/bin"))
+
+    def test_grep_tool_does_not_execute_planted_ripgrep(self):
+        self.plant("rg")
+        (self.ws / "a.txt").write_text("hello\n", encoding="utf-8")
+        with mock.patch.dict(os.environ, self.path_with_planted_first()):
+            box = Toolbox(
+                Config(base_url="http://unused", model="m", workspace=self.ws, enable_plugins=False)
+            )
+            result = box.run("grep", {"pattern": "hello", "path": "a.txt"})
+        self.assertFalse(self.marker.exists(), "工作区里的假 rg 被宿主执行了")
+        self.assertIn("hello", result)
+
+    def test_host_git_does_not_execute_planted_git(self):
+        from xiaoyu import gitsafe
+
+        self.plant("git")
+        with mock.patch.dict(os.environ, self.path_with_planted_first()):
+            sandbox.note_workspace(self.ws)
+            argv, env = gitsafe.prepare(["--version"], self.ws)
+            subprocess.run(argv, env=env, capture_output=True, timeout=30, cwd=str(self.ws))
+        self.assertFalse(self.marker.exists(), "工作区里的假 git 被宿主执行了")
 
 
 class ProtectedPathsTest(unittest.TestCase):

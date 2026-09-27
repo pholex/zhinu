@@ -364,7 +364,9 @@ def resolve_source(source: str) -> tuple[str, str]:
 
 
 def _git(args: list[str], cwd: Path | None = None) -> str:
-    if shutil.which("git") is None:
+    from . import sandbox
+
+    if sandbox.host_which("git") is None:
         raise PluginError("PATH 里找不到 git，装不了远端插件包（本地目录仍然可以装）")
     from . import gitsafe
 

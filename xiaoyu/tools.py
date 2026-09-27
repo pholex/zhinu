@@ -20,7 +20,6 @@ import json
 import locale
 import os
 import re
-import shutil
 import signal
 import unicodedata
 import subprocess
@@ -421,7 +420,7 @@ def _pwsh_path() -> str | None:
     原样透传而不是包装成红色 ErrorRecord（5.1 的包装会把 CLI 输出的 JSON 拆碎）。
     有则优先。
     """
-    return shutil.which("pwsh")
+    return sandbox.host_which("pwsh")
 
 
 #  PS 5.1 对重定向的管道按系统 OEM 代码页（中文机是 GBK）编码输出，
@@ -824,13 +823,13 @@ def _locate_grep() -> str | None:
     Windows 只能 patch os.name，那会连带把 Path 变成 WindowsPath（在 POSIX 上
     一构造就抛 UnsupportedOperation）。同 cli.py 的 _running_launcher。
     """
-    if found := shutil.which("grep"):
+    if found := sandbox.host_which("grep"):
         return found
     if os.name != "nt":
         return None
 
     candidates: list[str] = []
-    if git := shutil.which("git"):
+    if git := sandbox.host_which("git"):
         #  ...\Git\cmd\git.exe 或 ...\Git\bin\git.exe → ...\Git\usr\bin\grep.exe
         git_root = os.path.dirname(os.path.dirname(git))
         candidates.append(os.path.join(git_root, "usr", "bin", "grep.exe"))
@@ -882,6 +881,8 @@ class Toolbox:
         mcp_view: "mcp.McpView | None" = None,
     ) -> None:
         self.config = config
+        #  宿主侧找 rg / git 时，这个工作区下面的 PATH 目录不算数（见 sandbox.host_which）
+        sandbox.note_workspace(config.workspace)
         self._tools: dict[str, Tool] = {}
         #  后台任务表（bash run_in_background / monitor）。通知回调由 Agent
         #  注入（agent.__init__ 里 tasks.notify = self.notify）；受限子集
@@ -1967,8 +1968,9 @@ class Toolbox:
         if not target.exists():
             return f"ERROR: 路径不存在：{path}"
 
-        if shutil.which("rg"):
-            command = ["rg", "--line-number", "--no-heading", "--color", "never", "-e", pattern]
+        #  绝对路径起：rg 不经沙箱、不经确认，不能让 PATH 上工作区里的同名程序顶替
+        if rg := sandbox.host_which("rg"):
+            command = [rg, "--line-number", "--no-heading", "--color", "never", "-e", pattern]
             for skip in sorted(_SKIP_DIRS):
                 command += ["--glob", f"!{skip}/**"]
             if glob:

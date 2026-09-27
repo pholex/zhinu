@@ -36,8 +36,11 @@ unprivileged user namespace 的发行版）时 `available()` 返回 False，调�
 from __future__ import annotations
 
 import os
+import shutil
 import subprocess
 import sys
+import tempfile
+import threading
 from pathlib import Path
 
 from . import config
@@ -311,6 +314,117 @@ def protected_paths(workspace: Path) -> tuple[list[str], list[str]]:
         return list(found)
 
     return both(root / ".mcp.json"), both(root / ".xiaoyu")
+
+
+# ---------- 宿主侧自己要跑的程序去哪找 ----------
+
+#  本进程用过的工作区（Toolbox 构造时登记；子 agent 的 worktree 也会进来）
+_workspaces: dict[str, None] = {}
+_workspaces_lock = threading.Lock()
+
+
+def note_workspace(workspace: Path) -> None:
+    """登记一个工作区：它下面的目录从此不算"可信的 PATH 目录"。"""
+    try:
+        resolved = str(workspace.expanduser().resolve())
+    except OSError:
+        return
+    with _workspaces_lock:
+        _workspaces.setdefault(resolved, None)
+    #  趁现在算一遍可写根（缓存）：之后找程序时不必再碰 Path
+    _untrusted_roots()
+
+
+#  可写根的字符串形态缓存：(登记过的工作区, 相关环境变量) → 根目录列表
+_untrusted_cache: tuple[tuple, tuple[str, ...]] | None = None
+
+
+def _untrusted_roots() -> tuple[str, ...]:
+    """模型跑的命令写得进去的地方：工作区、临时目录、构建缓存、追加的可写根。
+
+    返回 realpath 过的字符串。这条路上不构造 Path：找程序的代码要在"把 os.name
+    伪装成另一个平台"的测试里照常工作，而 Path() 按 os.name 分派、一构造就抛
+    （同 tools._locate_grep 的纪律）。算不出来时沿用上一次的结果。
+    """
+    global _untrusted_cache
+    with _workspaces_lock:
+        workspaces = tuple(_workspaces)
+    key = (
+        workspaces,
+        os.environ.get("TMPDIR"),
+        os.environ.get("XDG_RUNTIME_DIR"),
+        os.environ.get("XIAOYU_SANDBOX_WRITABLE"),
+    )
+    cached = _untrusted_cache
+    if cached is not None and cached[0] == key:
+        return cached[1]
+    try:
+        roots: list[Path] = []
+        for workspace in workspaces or (os.getcwd(),):
+            roots += default_writable_roots(Path(workspace))
+        roots += extra_writable_roots()
+        roots.append(Path(tempfile.gettempdir()))
+        resolved = tuple(_normalize(roots))
+    except (OSError, NotImplementedError):
+        return cached[1] if cached is not None else ()
+    _untrusted_cache = (key, resolved)
+    return resolved
+
+
+def trusted_program_dir(directory: str) -> bool:
+    """PATH 里的这个目录能不能信：相对路径、落在可写根之内的都不能。"""
+    if not directory or not os.path.isabs(directory):
+        return False
+    try:
+        resolved = os.path.realpath(directory)
+    except OSError:
+        return False
+    for root in _untrusted_roots():
+        try:
+            if os.path.commonpath([resolved, root]) == root:
+                return False
+        except ValueError:
+            #  不同盘符之类：谈不上谁在谁里面
+            continue
+    return True
+
+
+def host_which(name: str) -> str | None:
+    """宿主侧**自己**要跑的程序（rg / grep / git / pwsh）的绝对路径；找不到返回 None。
+
+    这些程序不经沙箱、不经确认就执行，所以只在"模型跑的命令写不进去"的 PATH
+    目录里找。在项目里激活了 venv 再启动是很平常的事——PATH 打头就是
+    `<工作区>/.venv/bin`，而那是沙箱内可写的：放一个同名的 rg 进去，下一次
+    搜索就替它在沙箱外执行了。只在不可信目录里才有的程序按"没装"处理。
+
+    用户自己配置的命令（MCP server、hooks）不走这里：那些就该按用户的 PATH
+    解析，venv 里的 python 盖过系统的正是用户要的。
+    """
+    found = shutil.which(name)
+    if found is None:
+        return None
+    if trusted_program_dir(os.path.dirname(os.path.abspath(found))):
+        return os.path.abspath(found)
+    trusted = [
+        entry
+        for entry in os.environ.get("PATH", "").split(os.pathsep)
+        if trusted_program_dir(entry)
+    ]
+    if not trusted:
+        return None
+    found = shutil.which(name, path=os.pathsep.join(trusted))
+    return os.path.abspath(found) if found else None
+
+
+#  只在不可信目录里才有的程序：给一个必然不存在的绝对路径，让调用方按"没装"
+#  失败（FileNotFoundError），而不是退回裸名字再被 PATH 顶替
+def host_command(name: str) -> str:
+    """同 host_which，但总返回一个可放进 argv[0] 的字符串。"""
+    if found := host_which(name):
+        return found
+    if shutil.which(name) is None:
+        return name
+    return os.path.join(os.path.abspath(os.sep), "nonexistent", "xiaoyu-untrusted-path", name)
 
 
 def extra_writable_roots() -> list[Path]:

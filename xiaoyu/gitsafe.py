@@ -125,7 +125,14 @@ def prepare(
     #  联网模式不隔离用户配置，git 自己就读得到身份
     if not network and cwd is not None and subcommand in _COMMITTING:
         _fill_identity(hardened, base, cwd, dash_c)
-    return ["git", *rest], hardened
+    return [_git_program(), *rest], hardened
+
+
+def _git_program() -> str:
+    """宿主侧 git 的绝对路径：不让 PATH 上工作区里的同名程序顶替（见 sandbox.host_which）。"""
+    from . import sandbox
+
+    return sandbox.host_command("git")
 
 
 def _compose(base: Mapping[str, str], *, isolate: bool, pins: Sequence[tuple[str, str]]) -> dict[str, str]:
@@ -196,7 +203,7 @@ def _subcommand_index(args: Sequence[str]) -> int | None:
 def _lookup(args: list[str], cwd: os.PathLike[str] | str, env: Mapping[str, str]) -> str | None:
     try:
         result = subprocess.run(
-            ["git", *args],
+            [_git_program(), *args],
             cwd=cwd,
             env=dict(env),
             stdin=subprocess.DEVNULL,
