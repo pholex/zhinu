@@ -390,6 +390,27 @@ class AgentSkillIntegrationTest(unittest.TestCase):
         self.assertIn("技能目录", result)
         self.assertTrue(result.endswith("说你好"))
 
+    def test_oversized_skill_keeps_its_steps_in_order(self):
+        """超长技能给连续的开头 + 续读指路，不掐掉中间：步骤三之后不能直接是步骤九。"""
+        import re
+
+        steps = [f"步骤 {n}：" + "细节" * 40 for n in range(1, 801)]
+        root = Path(self.tmp.name) / "skills"
+        write_skill(root, "long", "name: long\ndescription: 很长", body="\n".join(steps))
+        agent = self.build_agent()
+        result = agent.toolbox.run("skill", {"name": "long"})
+        self.assertLessEqual(len(result), agent.config.max_tool_output)
+        self.assertNotIn("中间省略", result)
+        shown = [int(n) for n in re.findall(r"^步骤 (\d+)：", result, flags=re.M)]
+        self.assertEqual(shown, list(range(1, len(shown) + 1)), "给出去的步骤必须连续")
+        self.assertLess(len(shown), 800)
+        self.assertIn("后面还有内容没给出", result)
+        #  指的那一行正是下一步：照着读就能无缝接上
+        match = re.search(r'read_file\(path="([^"]+)", offset=(\d+)\)', result)
+        self.assertIsNotNone(match, result[-400:])
+        lines = Path(match.group(1)).read_text(encoding="utf-8").splitlines()
+        self.assertTrue(lines[int(match.group(2)) - 1].startswith(f"步骤 {len(shown) + 1}："))
+
     def test_unknown_skill_lists_available(self):
         agent = self.build_agent()
         result = agent.toolbox.run("skill", {"name": "nope"})

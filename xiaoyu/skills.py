@@ -290,6 +290,39 @@ def load_skill_body(skill: Skill) -> str:
         return f"ERROR: 读取技能失败：{exc}"
 
 
+def clip_body(skill: Skill, body: str, budget: int) -> str:
+    """正文超过 budget 时只给开头连续的一段，并指明从文件第几行接着读。
+
+    工具输出的通用超长处理是"留头留尾、中段落盘"——对日志合适，对技能不合适：
+    技能正文是按顺序读的指令，掐掉中间等于步骤三直接跳到步骤九，而模型手里
+    那份看起来还挺完整。这里改成给连续的开头，其余让模型用 read_file 分段读。
+    切点落在行边界上。
+    """
+    if len(body) <= budget:
+        return body
+    cut = body.rfind("\n", 0, max(1, budget))
+    if cut < budget // 2:
+        cut = budget  # 一行就超长（压成一行的正文）：只能硬切
+    shown = body[:cut]
+    #  正文在文件里从第几行开始（frontmatter 占掉了前面若干行）
+    first_line = 1
+    try:
+        raw = skill.path.read_text(encoding="utf-8", errors="replace")
+        start = raw.find(body[:200]) if body else -1
+        if start > 0:
+            first_line = raw.count("\n", 0, start) + 1
+    except OSError:
+        pass
+    next_line = first_line + shown.count("\n") + 1
+    total = len(body)
+    return (
+        f"{shown}\n\n"
+        f"[技能正文共 {total} 字符，以上是开头连续的 {len(shown)} 字符，**后面还有内容没给出**。"
+        f"接着读：read_file(path=\"{skill.path}\", offset={next_line})，按需分段读完"
+        "再照着做——不要凭已读的这部分推测后面的步骤。]"
+    )
+
+
 #  索引里单条描述的字符上限。这是"挡失控极端值"的兜底，不是控总量的手段——
 #  控总量归 index_block 的预算（它会按需逐字符压回去，且压得公平）。
 #  两道一起收紧等于双重设限：预算宽裕时也照砍，砍掉的还偏偏是描述末尾的

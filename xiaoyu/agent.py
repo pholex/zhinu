@@ -1760,7 +1760,9 @@ class Agent:
                 "以下是完整内容（供上下文被压缩后重取）。\n\n"
             ) + header
         self._loaded_skills.add(name)
-        return header + body
+        #  留出头部与续读提示的余量：合起来不许再被工具输出的通用截断挖掉中段
+        budget = max(2_000, self.config.max_tool_output - len(header) - 600)
+        return header + skills.clip_body(found, body, budget)
 
     #  收尾轻推的迭代阈值：同一文件被整写 ≥3 次（首写 + 至少两轮返工才算真迭代，
     #  "建文件 + 改一处"够不着）且本轮 bash ≥3 次（写了要跑过才叫验证过的解法）。
