@@ -151,6 +151,29 @@ async with contextlib.aclosing(async_agent.stream("任务")) as events:
 不变量：每个 `tool.pending` 最终恰好收到一个终态（`completed` 或 `denied`）；
 每个 `request.started` 恰好对应一个 `request.ended`。
 
+## 后台事件：会话空闲时也要知道
+
+模型把长命令放到后台跑之后照常收尾，任务完成时会话多半已经空闲。完成通知
+（`Agent.notify` 投递的那些）是给模型看的，要等下一轮才送得到。宿主想知道
+"有事件在等"，注册一个回调：
+
+```python
+def on_notification(item):          # {"key": ..., "text": ..., "wake": bool}
+    if item["wake"]:
+        loop.create_task(host.send("后台任务有结果了，接着做"))
+
+host.watch_notifications(on_notification)   # 在事件循环里调用；传 None 取消
+```
+
+- 回调在**注册时所在的事件循环**里执行，可以直接动宿主自己的状态。直接用同步
+  `Agent` 的宿主设 `agent.on_notification`，回调在**投递通知的那个线程**里执行
+  （多半是后台任务的监视线程），要自己保证线程安全。
+- `wake=True` 是值得为它开一轮的事件（后台任务完成、monitor 有新输出）；
+  `wake=False` 是捎带的公告，不值得专门叫醒模型。
+- **只告知，不会自己开一轮**：要不要 `send()` 由宿主定。
+- `pending_notifications()` 随时给出还没送达模型的通知；下一轮开跑、送达之后为空。
+- 同一个 `key` 整个会话只告知一次、只送达一次，宿主重复投递幂等事件不会刷屏。
+
 ## 单轮结算 `RunResult`
 
 `measured_send()` / `AsyncAgent.send()` 返回；`stream()` 在 `RunCompleted.result` 里给：
@@ -255,8 +278,11 @@ EOF / 连接关闭：挂起审批全部拒绝、打断当前轮、等工作线�
 - **版本**：`__version__`
 
 `Agent` 上属于契约的方法与属性：`send` / `interrupt` / `steer` / `drain_steers` /
-`notify` / `reset` / `restore` / `set_output_schema` / `set_mode` / `switch_model` /
-`set_budget_tokens` / `context_tokens` / `last_assistant_text`，以及
-`messages` / `usage` / `trace` / `sink` / `approver` / `structured_output`。
-`AsyncAgent` 上：`send` / `stream` / `interrupt` / `steer` / `notify` / `recycle`
-（`reset` 同义）/ `restore` / `agent`。
+`notify` / `pending_notifications` / `reset` / `restore` / `set_output_schema` /
+`set_mode` / `switch_model` / `set_budget_tokens` / `context_tokens` /
+`last_assistant_text`，以及
+`messages` / `usage` / `trace` / `sink` / `approver` / `structured_output` /
+`on_notification`。
+`AsyncAgent` 上：`send` / `stream` / `interrupt` / `steer` / `notify` /
+`pending_notifications` / `watch_notifications` / `recycle`（`reset` 同义）/
+`restore` / `agent`。

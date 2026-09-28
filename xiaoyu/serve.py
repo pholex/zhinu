@@ -443,6 +443,21 @@ class _Session:
     def publish(self, kind: str, **fields: Any) -> None:
         self._append({"kind": kind, **fields})
 
+    def note_notification(self, item: dict[str, Any]) -> None:
+        """有一条给模型的通知入队了（后台任务完成、monitor 有输出……）。
+
+        `idle` 是要点：会话在跑的时候，通知搭下一条工具结果就送到了，编排方
+        不必做什么；会话空闲时没有下一步，它会一直等到有人再提交一轮。
+        """
+        self.publish("notification.pending", idle=not self.busy, **item)
+
+    def pending_notifications(self) -> list[dict[str, Any]]:
+        limit = self.cfg.max_field
+        return [
+            {**item, "text": _clip(item["text"], limit)[0]}
+            for item in self.agent.pending_notifications()
+        ]
+
     def publish_event(self, event: UIEvent) -> None:
         self._append(event.to_dict())
 
@@ -498,6 +513,7 @@ class _Session:
             "budget": self.budget.to_dict() if self.budget else None,
             "budget_reason": self.budget_reason,
             "pending_approvals": [item.to_dict() for item in self.snapshot_pending()],
+            "pending_notifications": self.pending_notifications(),
             "browser": self.bridge.info() if self.bridge is not None else None,
             "next_seq": self.next_seq,
             "first_seq": self.first_seq,
@@ -1012,7 +1028,12 @@ def create_app(cfg: ServeConfig):  # noqa: C901 - 路由表天然长，拆开反
         #  绑定后 approver / sink 才真正生效。绑定前不可能有一轮在跑（会话还没
         #  返回给调用方），所以这个窗口安全——但 approver 仍 fail closed 兜底
         session.mcp_manager = manager
-        ref.bind(session, asyncio.get_running_loop())
+        loop = asyncio.get_running_loop()
+        ref.bind(session, loop)
+        #  通知是从工作线程、后台任务的 watcher 线程里投递的：转交给事件循环再动缓冲区
+        agent.on_notification = lambda item: loop.call_soon_threadsafe(
+            session.note_notification, item
+        )
         sessions[session_id] = session
         SESSIONS_LIVE.set(len(sessions))
         return session
