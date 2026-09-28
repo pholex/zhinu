@@ -130,6 +130,38 @@ curl -X POST $BASE/session/$SID/permissions -H "$AUTH" -H 'content-type: applica
 
 ---
 
+## 后台任务跑完了，会话却是空闲的
+
+模型可以把长命令放到后台跑（`bash` 的 `run_in_background`、`monitor`），然后照常
+收尾这一轮。任务跑完时会话多半已经空闲：完成通知是给模型看的，要等**下一轮**才
+送得到。不告诉编排方的话，它只能干等，或者定时发一轮去问——每问一次都是一次
+模型调用。
+
+所以通知入队的那一刻，事件流里会有一条 `notification.pending`：
+
+```json
+{ "kind": "notification.pending", "idle": true, "wake": true,
+  "key": "task-done-bg-1", "text": "后台任务 \"bg-1\" 已完成（exit 0）。…" }
+```
+
+`GET /session/{id}/status` 的 `pending_notifications` 列着当前还没送达模型的全部通知
+（轮询型的编排器看这个就够了，不必接事件流）。
+
+| 字段 | 含义 |
+|---|---|
+| `idle` | 入队时会话是不是空闲。`false` = 有一轮在跑，通知搭下一条工具结果就送到了，**不必做什么**；`true` = 没有下一步，得有人再提交一轮它才送得到 |
+| `wake` | `true` = 值得为它开一轮（后台任务完成、monitor 有新输出、宸枢成员收工）；`false` = 捎带的公告（如 MCP server 上线），不值得专门叫醒模型 |
+| `key` | 同一个 key 整个会话只告知一次、只送达一次 |
+| `text` | 模型将会看到的那段话 |
+
+**服务端只告知，不会自己开一轮。** 要不要为它叫醒模型由编排方定——通常是看到
+`idle=true` 且 `wake=true` 就 `POST /session/{id}/prompt_async` 一句"后台任务有结果了，
+接着做"。下一轮开跑、通知送达之后，`pending_notifications` 就空了。
+
+后台任务随 serve 进程一起结束，重启之后不会接着跑，也就没有通知可等。
+
+---
+
 ## ⚠️ 先解决网络：编排器多半在容器里
 
 **这是接入时最常翻车的一步。** Dify 和 n8n 通常跑在 Docker 里，容器里的
@@ -397,7 +429,7 @@ Windows 为 `%APPDATA%\xiaoyu\serve\<root slug>\`；启动后 `GET /health` 的 
 | GET · DELETE | `/session/{id}` | 详情 · 关闭 |
 | POST | `/session/{id}/prompt` | 跑一轮，等结果 |
 | POST | `/session/{id}/prompt_async` | 跑一轮，立刻返回 |
-| GET | `/session/{id}/status` | 状态机 |
+| GET | `/session/{id}/status` | 状态机（含 `pending_approvals`、`pending_notifications`） |
 | GET | `/session/{id}/events` | 拉事件（游标 + long-poll） |
 | GET | `/session/{id}/events/stream` | 同一份事件流的 SSE |
 | GET · POST | `/session/{id}/permissions` | 挂起的审批 · 回决定 |

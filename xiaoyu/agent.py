@@ -867,6 +867,9 @@ class Agent:
         self._notify_queue: list[tuple[str, str, bool]] = []
         self._notify_lock = threading.Lock()
         self._notified_keys: set[str] = set()
+        #  通知入队时的旁路回调（宿主注册，见 notify）：会话空闲时模型不在跑，
+        #  通知只能停在队列里等下一轮——宿主得有办法知道"有事件在等"
+        self.on_notification: Callable[[dict[str, Any]], None] | None = None
         #  后台任务（bash run_in_background / monitor）的完成与事件通知直接挂
         #  通知轨道——notify 线程安全（队列），watcher 线程可直接调。
         #  hasattr 兜底：嵌入宿主可能注入自定义 Toolbox 形态。
@@ -2146,10 +2149,47 @@ class Agent:
         不必打断"的公告——典型是 MCP server 上线。为什么要这档：模型给完收尾
         正文后被强制再跑一步，它会把同一个问题再答一遍，client 端把两段拼成
         一条，用户看到的就是答案重复。信息不丢（留在队列里），丢的只是那一步。
+
+        入队之后调一次 `on_notification`（宿主注册的回调，在**调用 notify 的那个
+        线程**里执行）：通知是给模型看的，要等下一步才送得到；会话空闲时没有
+        下一步，宿主不知道就只能干等或者定时来问。回调只是告知，**不开新的一轮**
+        ——要不要为它叫醒模型由宿主定。同一 key 重复投递不重复告知。
         """
-        if text.strip():
-            with self._notify_lock:
-                self._notify_queue.append((key.strip(), text.strip(), wake))
+        key, text = key.strip(), text.strip()
+        if not text:
+            return
+        with self._notify_lock:
+            repeated = bool(key) and (
+                key in self._notified_keys
+                or any(queued == key for queued, _, _ in self._notify_queue)
+            )
+            self._notify_queue.append((key, text, wake))
+        callback = self.on_notification
+        if callback is None or repeated:
+            return
+        try:
+            callback({"key": key, "text": text, "wake": wake})
+        except Exception:  # noqa: BLE001 - 宿主的回调坏了不该连累投递通知的那个线程
+            pass
+
+    def pending_notifications(self) -> list[dict[str, Any]]:
+        """还没送达模型的通知（快照，不取走；任意线程可调）。
+
+        每项 `{"key", "text", "wake"}`。`wake` 为真的是"值得为它开一轮"的事件
+        （后台任务完成、monitor 有新输出），为假的是捎带的公告。下一轮开跑、
+        通知送达之后这里就空了。
+        """
+        with self._notify_lock:
+            queued = list(self._notify_queue)
+        seen: set[str] = set()
+        items: list[dict[str, Any]] = []
+        for key, text, wake in queued:
+            if key:
+                if key in self._notified_keys or key in seen:
+                    continue
+                seen.add(key)
+            items.append({"key": key, "text": text, "wake": wake})
+        return items
 
     def _drain_notifications(self, wake_only: bool = False) -> list[str]:
         """取走待送达的通知并登记已报 key（只在会话自己的执行线程里调用）。

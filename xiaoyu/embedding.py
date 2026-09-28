@@ -421,6 +421,26 @@ class AsyncAgent:
         """
         self.agent.notify(text, key=key)
 
+    def pending_notifications(self) -> list[dict[str, Any]]:
+        """还没送达模型的通知（快照）。见 `Agent.pending_notifications`。"""
+        return self.agent.pending_notifications()
+
+    def watch_notifications(self, callback: Callable[[dict[str, Any]], Any] | None) -> None:
+        """注册"有通知入队"的回调；传 None 取消。必须在事件循环里调用。
+
+        后台任务是在别的线程里完成的，会话这时多半已经空闲：通知要等下一轮才
+        送得到模型，宿主不知道就只能干等。回调拿到 `{"key", "text", "wake"}`，
+        在**注册时所在的事件循环**里执行（内部经 `call_soon_threadsafe` 转交），
+        所以里面可以直接动宿主自己的状态。
+
+        回调只是告知，不会自己开一轮——要不要 `send()` 由宿主定。
+        """
+        if callback is None:
+            self.agent.on_notification = None
+            return
+        loop = asyncio.get_running_loop()
+        self.agent.on_notification = lambda item: loop.call_soon_threadsafe(callback, item)
+
     def recycle(self) -> None:
         """清空对话重开（对象/registry/config 都不重建）——"关会话重开"语义。
         名字取自常驻宿主侧的惯用词：会话回收复用，不是把对象重建一遍。"""
