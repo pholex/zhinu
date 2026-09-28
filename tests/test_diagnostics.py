@@ -181,6 +181,58 @@ class RemediesPointSomewhereRealTest(unittest.TestCase):
         self.assertEqual(len(flagged), 1)
         self.assertIn("ghost", flagged[0])
 
+    def _fake_dist(self, version: str, files: dict[str, str]) -> mock.Mock:
+        dist = mock.Mock()
+        dist.version = version
+        dist.read_text.side_effect = files.get
+        dist._path = "/site-packages/xiaoyu_agent.dist-info"
+        return dist
+
+    def test_install_reports_version_and_form(self) -> None:
+        import xiaoyu
+
+        dist = self._fake_dist(xiaoyu.__version__, {"INSTALLER": "pip\n"})
+        with mock.patch("importlib.metadata.distribution", return_value=dist), \
+                mock.patch.object(sys, "prefix", "/opt/venv"):
+            check = diagnostics.check_install()
+        self.assertEqual(check.status, "ok")
+        self.assertIn(xiaoyu.__version__, check.summary)
+        self.assertIn("pip", check.summary)
+        self.assertTrue(any("代码位置" in line for line in check.details))
+
+    def test_install_flags_record_that_lags_behind_the_code(self) -> None:
+        import xiaoyu
+
+        editable = json.dumps({"url": "file:///src", "dir_info": {"editable": True}})
+        dist = self._fake_dist("0.0.1", {"direct_url.json": editable})
+        with mock.patch("importlib.metadata.distribution", return_value=dist):
+            check = diagnostics.check_install()
+        self.assertEqual(check.status, "warn")
+        self.assertIn("0.0.1", check.summary)
+        self.assertIn(xiaoyu.__version__, check.summary)
+        self.assertIn("pip install -e", check.remedy)
+
+    def test_install_without_record_is_not_a_problem(self) -> None:
+        from importlib import metadata
+
+        with mock.patch(
+            "importlib.metadata.distribution", side_effect=metadata.PackageNotFoundError("x")
+        ):
+            check = diagnostics.check_install()
+        self.assertEqual(check.status, "ok")
+        self.assertIn("源码目录", check.summary)
+
+    def test_install_form_recognises_tool_managers(self) -> None:
+        dist = self._fake_dist("1.0", {"INSTALLER": "uv"})
+        for prefix, expected in (
+            ("/home/u/.local/share/pipx/venvs/xiaoyu-agent", "pipx"),
+            ("/home/u/.local/share/uv/tools/xiaoyu-agent", "uv tool"),
+            ("C:\\Users\\u\\pipx\\venvs\\xiaoyu-agent", "pipx"),
+            ("/opt/venv", "uv"),
+        ):
+            with self.subTest(prefix=prefix), mock.patch.object(sys, "prefix", prefix):
+                self.assertEqual(diagnostics._install_form(dist), expected)
+
     def test_mcp_command_is_found_through_declared_path(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             workspace = Path(tmp)
@@ -263,7 +315,7 @@ class DoctorCommandTest(unittest.TestCase):
         ids = [check["id"] for check in payload["checks"]]
         self.assertEqual(
             ids,
-            ["python", "config_dir", "disk", "providers", "env", "proxy", "sandbox",
+            ["install", "python", "config_dir", "disk", "providers", "env", "proxy", "sandbox",
              "bash_parser", "tools", "mcp_config", "sessions"],
         )
         self.assertEqual(code, 1 if payload["status"] == "fail" else 0)

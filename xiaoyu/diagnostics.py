@@ -198,6 +198,68 @@ def check_python() -> Check:
     return Check("python", "ok", f"Python {version}", [sys.executable])
 
 
+#  PyPI 上的发行名（`xiaoyu` 这个名字是别人的包）
+_DISTRIBUTION = "xiaoyu-agent"
+
+
+def _install_form(dist: Any) -> str:
+    """这份安装是怎么来的：可编辑安装 / pipx / uv tool / pip。认不出就只报安装器名。"""
+    try:
+        direct = json.loads(dist.read_text("direct_url.json") or "{}")
+    except (OSError, ValueError):
+        direct = {}
+    if isinstance(direct, dict) and (direct.get("dir_info") or {}).get("editable"):
+        return "可编辑安装（指向源码目录）"
+    prefix = sys.prefix.replace("\\", "/").lower()
+    if "/pipx/" in prefix:
+        return "pipx"
+    if "/uv/tools/" in prefix:
+        return "uv tool"
+    try:
+        installer = (dist.read_text("INSTALLER") or "").strip()
+    except OSError:
+        installer = ""
+    return installer or "未知安装器"
+
+
+def check_install() -> Check:
+    """小羽自身：跑的是哪个版本、代码在哪、怎么装的。
+
+    报 bug 时最先要对的就是这三样。顺带抓一种安静的错位：安装记录的版本和
+    实际加载的代码不是同一版（可编辑安装之后只 git pull 没重装、或 sys.path
+    上有另一份源码盖住了装好的那份）——`xiaoyu update` 读的是安装记录，
+    错位时它报的"已是最新版本"说的不是正在跑的这份代码。
+    """
+    from importlib import metadata
+
+    from . import __version__
+
+    code = Path(__file__).resolve().parent
+    details = [f"代码位置：{code}"]
+    try:
+        dist = metadata.distribution(_DISTRIBUTION)
+    except metadata.PackageNotFoundError:
+        return Check(
+            "install", "ok", f"xiaoyu {__version__}（未安装，直接从源码目录运行）", details
+        )
+    form = _install_form(dist)
+    details.append(f"安装方式：{form}")
+    recorded = dist.version
+    if recorded != __version__:
+        details.append(f"安装记录：{recorded}（{getattr(dist, '_path', '位置未知')}）")
+        return Check(
+            "install", "warn",
+            f"xiaoyu {__version__}，但安装记录是 {recorded}",
+            details,
+            remedy=(
+                "在源码目录重跑 pip install -e . 刷新安装记录"
+                if form.startswith("可编辑")
+                else f"重装一次：pip install --force-reinstall {_DISTRIBUTION}=={__version__}"
+            ),
+        )
+    return Check("install", "ok", f"xiaoyu {__version__}（{form}）", details)
+
+
 def check_config_dir(config_dir: Path) -> Check:
     details = [str(config_dir)]
     if not config_dir.exists():
@@ -504,6 +566,7 @@ def run_doctor(workspace: Path | None = None) -> list[Check]:
     workspace = (workspace or Path.cwd()).resolve()
     config_dir = user_config_dir()
     checks = [
+        check_install(),
         check_python(),
         check_config_dir(config_dir),
         check_disk({"配置目录": config_dir, "工作区": workspace}),
