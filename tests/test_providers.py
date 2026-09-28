@@ -826,6 +826,21 @@ class TestAutoDiscovery(ProviderTestCase):
         with mock.patch.object(providers, "OpenAI", return_value=fake):
             got = providers._discover_models(self.LOCAL, "local", "XIAOYU_PROVIDER_LOCAL")
         self.assertEqual(got, ("a", "b"))
+        #  探一次就用完的 client：当场关掉，不把连接留给垃圾回收
+        fake.close.assert_called_once()
+
+    def test_discover_models_closes_client_on_failure_too(self) -> None:
+        import contextlib, io
+        fake = mock.MagicMock()
+        fake.with_options.return_value.models.list.side_effect = RuntimeError("connection refused")
+        #  关连接本身出错不能盖掉探测的结论
+        fake.close.side_effect = OSError("already closed")
+        with mock.patch.object(providers, "OpenAI", return_value=fake), \
+             contextlib.redirect_stderr(io.StringIO()) as err:
+            got = providers._discover_models(self.LOCAL, "local", "XIAOYU_PROVIDER_LOCAL")
+        self.assertEqual(got, ())
+        self.assertIn("connection refused", err.getvalue())
+        fake.close.assert_called_once()
 
     def test_discover_models_failure_returns_empty(self) -> None:
         import contextlib, io

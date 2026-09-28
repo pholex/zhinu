@@ -17,6 +17,7 @@ DeepSeek 官方名（deepseek-flash）和网关侧完全一致，
 
 from __future__ import annotations
 
+import contextlib
 import os
 import sys
 import threading
@@ -112,17 +113,23 @@ def _discover_models(base_url: str, api_key: str, label: str) -> tuple[str, ...]
     """探端点 /v1/models，返回它当前 serve 的 model id（去重排序）。失败/空 → 空
     元组：调用方据此**跳过注册**，绝不退化成通配（通配的具名 provider 会把一切
     模型名都吃掉、劫持网关路由）。失败只出声不抛——启动不该因端点没起来而崩。"""
+    client = None
     try:
-        page = _openai_class()(
+        client = _openai_class()(
             base_url=base_url, api_key=api_key, http_client=netproxy.http_client()
-        ).with_options(
-            timeout=_DISCOVER_TIMEOUT
-        ).models.list()
+        )
+        page = client.with_options(timeout=_DISCOVER_TIMEOUT).models.list()
+        #  清单在关连接之前取完：翻页是迭代时才发的请求
         models = tuple(sorted({m.id for m in page if getattr(m, "id", "").strip()}))
     except Exception as exc:
         reason = str(exc).splitlines()[0][:160] or type(exc).__name__
         print(f"[{label}：/v1/models 探测失败，该 provider 本次未注册：{reason}]", file=sys.stderr)
         return ()
+    finally:
+        #  这只 client 只为探一次清单：用完就关，别把连接留给垃圾回收去收
+        if client is not None:
+            with contextlib.suppress(Exception):
+                client.close()
     if not models:
         print(f"[{label}：/v1/models 返回空清单，该 provider 本次未注册]", file=sys.stderr)
     return models
