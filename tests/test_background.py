@@ -92,6 +92,28 @@ class TaskManagerTest(unittest.TestCase):
         self.assertEqual(task.exit_code, 3)
         self.assertIn("不到 1 秒", self.notify.texts()[0])
 
+    def test_shutdown_reaps_what_it_kills(self):
+        #  收场的那一刻就得收干净，不能指望 watcher 线程事后去做：
+        #  进程退出时它没有运行机会，子 agent 收工时调用方紧接着就往下走了
+        tasks = [self.start("sleep 30") for _ in range(3)]
+        with mock.patch.object(bg.TaskManager, "_watch", lambda *args, **kwargs: None):
+            late = self.start("sleep 30")  # 这一个压根没有 watcher
+        started = time.monotonic()
+        self.manager.shutdown()
+        self.assertLess(time.monotonic() - started, bg.TaskManager.SHUTDOWN_REAP_SECONDS + 2)
+        for task in [*tasks, late]:
+            self.assertIsNotNone(task.proc.returncode, f"{task.task_id} 被杀了却没被收掉")
+
+    def test_shutdown_gives_up_on_a_process_that_will_not_die(self):
+        task = self.start("sleep 30")
+        with mock.patch.object(bg, "kill_tree", lambda proc: None), \
+                mock.patch.object(bg.TaskManager, "SHUTDOWN_REAP_SECONDS", 0.3):
+            started = time.monotonic()
+            self.manager.shutdown()
+            self.assertLess(time.monotonic() - started, 2.0)  # 等不到就放手，不卡住收场
+        bg.kill_tree(task.proc)
+        task.proc.wait(timeout=5)
+
     def test_kill_suppresses_completion_notice(self):
         task = self.start("sleep 30")
         result = self.manager.kill(task.task_id)

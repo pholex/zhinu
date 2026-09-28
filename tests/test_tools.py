@@ -802,11 +802,65 @@ class TestBashAndSafety(ToolboxTestCase):
             grandchild.append(self._grandchild_pid())
             raise SystemExit(143)
 
+        spawned = self._record_spawns()
         with mock.patch.object(tools_module, "_wait_bounded", raise_system_exit):
             with self.assertRaises(SystemExit):
                 self.box.run("bash", {"command": "sleep 60 & echo $! > child.pid; wait"})
         self.assertTrue(_wait_dead(grandchild[0]), "SystemExit 后孙进程仍然活着")
         self.assertEqual(tools_module._FOREGROUND_PROCS, set())  # noqa: SLF001
+        #  杀只是发信号：还得收掉，不然它以僵尸形态挂到本进程退出
+        self.assertIsNotNone(spawned[0].returncode, "命令被杀了却没被收掉")
+
+    def _record_spawns(self) -> list:
+        """记下 bash 工具起的每一个进程对象（用例结束时还原）。"""
+        from xiaoyu import tools as tools_module
+
+        spawned: list = []
+        real = tools_module.subprocess.Popen
+
+        class Recording(real):  # type: ignore[misc, valid-type]
+            def __init__(self, *args, **kwargs):  # noqa: ANN002, ANN003
+                super().__init__(*args, **kwargs)
+                spawned.append(self)
+
+        patcher = mock.patch.object(tools_module.subprocess, "Popen", Recording)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        return spawned
+
+    @unittest.skipIf(os.name == "nt", "POSIX 专属：进程组语义")
+    def test_interrupted_command_is_reaped(self) -> None:
+        """Ctrl-C 与宿主打断两条路：杀完都要把进程收掉。"""
+        from xiaoyu import tools as tools_module
+        from xiaoyu.errors import Interrupted
+
+        self._without_sandbox()
+        for error in (KeyboardInterrupt(), Interrupted("宿主请求打断")):
+            with self.subTest(error=type(error).__name__):
+                spawned = self._record_spawns()
+
+                def interrupt(proc, pipes, deadline, stop_requested=None, error=error):  # noqa: ANN001
+                    raise error
+
+                with mock.patch.object(tools_module, "_wait_bounded", interrupt):
+                    with self.assertRaises(type(error)):
+                        self.box.run("bash", {"command": "sleep 60"})
+                self.assertIsNotNone(spawned[0].returncode, "命令被杀了却没被收掉")
+
+    def test_reaping_never_blocks_for_long(self) -> None:
+        import time
+
+        from xiaoyu import tools as tools_module
+
+        stuck = mock.Mock()
+        stuck.wait.side_effect = tools_module.subprocess.TimeoutExpired("x", 0.2)
+        started = time.monotonic()
+        tools_module._reap(stuck, timeout=0.2)  # noqa: SLF001
+        self.assertLess(time.monotonic() - started, 1.0)
+        stuck.wait.assert_called_once_with(timeout=0.2)
+        broken = mock.Mock()
+        broken.wait.side_effect = OSError("没这个进程")
+        tools_module._reap(broken)  # noqa: SLF001
 
     @unittest.skipIf(os.name == "nt", "POSIX 专属：进程组语义")
     def test_atexit_reaper_kills_foreground_command_in_other_thread(self) -> None:

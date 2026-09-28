@@ -1171,9 +1171,13 @@ class TestNoticeCapture(unittest.TestCase):
         from xiaoyu.tui import NoticeCapture
 
         sink, buffer = self.build()
-        with NoticeCapture(sink):
-            warnings.warn("接口要弃用了", DeprecationWarning, stacklevel=1)
-            logging.getLogger("httpx").error("连接被重置")
+        #  过滤规则自己定：DeprecationWarning 默认是被忽略的，能不能走到
+        #  showwarning 取决于跑用例时的 -W 参数——测的是"走到了之后去哪"
+        with warnings.catch_warnings():
+            warnings.simplefilter("always")
+            with NoticeCapture(sink):
+                warnings.warn("接口要弃用了", DeprecationWarning, stacklevel=1)
+                logging.getLogger("httpx").error("连接被重置")
         out = buffer.getvalue()
         self.assertIn("DeprecationWarning: 接口要弃用了", out)
         self.assertIn("httpx: 连接被重置", out)
