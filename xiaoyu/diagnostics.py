@@ -329,11 +329,43 @@ def check_bash_parser() -> Check:
     return Check("bash_parser", "ok", "命令解析器就绪（tree-sitter-bash）")
 
 
+#  env 里值是路径的键（按后缀认）。不按"值长得像绝对路径"认：`API_PREFIX=/v1`
+#  这类值也以 / 开头，却不是文件
+_PATH_ENV_SUFFIXES = ("_PATH", "_FILE", "_DIR", "_HOME", "_ROOT", "_CONFIG")
+
+
+def _dead_paths(entry: dict[str, Any]) -> list[str]:
+    """server 声明里指向不存在位置的绝对路径（args 与 env 两处）。
+
+    搬过目录、删过检出之后最常见的坏法：command 还在（npx / python），
+    参数里的脚本或数据目录没了——server 起得来，然后立刻退出。
+    占位符没兑现的值（`${VAR}`）不判，那是另一类问题。
+    """
+    candidates: list[str] = []
+    args = entry.get("args")
+    for arg in args if isinstance(args, list) else []:
+        if isinstance(arg, str) and not arg.startswith("-"):
+            candidates.append(arg)
+    env = entry.get("env")
+    for key, value in (env if isinstance(env, dict) else {}).items():
+        if isinstance(value, str) and str(key).upper().endswith(_PATH_ENV_SUFFIXES):
+            candidates.append(value)
+    dead: list[str] = []
+    for value in candidates:
+        if "${" in value or os.pathsep in value:
+            continue
+        expanded = os.path.expanduser(value)
+        if os.path.isabs(expanded) and not os.path.exists(expanded):
+            dead.append(value)
+    return dead
+
+
 def check_mcp_config(workspace: Path) -> Check:
     from . import mcp
 
     details: list[str] = []
     missing: list[str] = []
+    dead: list[str] = []
     status = "ok"
     total = 0
     for path in mcp.config_paths(workspace):
@@ -353,9 +385,16 @@ def check_mcp_config(workspace: Path) -> Check:
             command = entry.get("command") if isinstance(entry, dict) else None
             if not isinstance(command, str) or not command.strip() or entry.get("disabled"):
                 continue
-            #  只查"起不起得来"的第一步：命令在不在。不启动任何东西
-            if shutil.which(os.path.expanduser(command)) is None:
+            #  只查"起不起得来"的前两步：命令在不在、声明里的路径在不在。
+            #  不启动任何东西。找命令与真正启动时同一个函数（认配置里的 PATH）
+            env = entry.get("env")
+            declared = {
+                str(key): mcp._expand(str(value))
+                for key, value in (env if isinstance(env, dict) else {}).items()
+            }
+            if mcp.find_command(command, declared) is None:
                 missing.append(f"{name} 的启动命令 {command!r} 找不到")
+            dead += [f"{name} 的配置指向不存在的路径 {path!r}" for path in _dead_paths(entry)]
     if status == "fail":
         return Check("mcp_config", "fail", "MCP 配置文件损坏", details, remedy="修正 JSON 后重试")
     if not details:
@@ -363,8 +402,14 @@ def check_mcp_config(workspace: Path) -> Check:
     if missing:
         return Check(
             "mcp_config", "warn", f"{len(missing)} 个 MCP server 的启动命令找不到",
-            details + missing,
-            remedy="装上对应的程序，或在配置里把 command 写成绝对路径",
+            details + missing + dead,
+            remedy="装上对应的程序，或在配置的 env 里声明 PATH，或把 command 写成绝对路径",
+        )
+    if dead:
+        return Check(
+            "mcp_config", "warn", f"{len(dead)} 处 MCP 配置指向不存在的路径",
+            details + dead,
+            remedy="把配置里的路径改成现在的位置（目录搬过或检出被删）",
         )
     return Check("mcp_config", "ok", f"MCP 配置可解析（{total} 个 server）", details)
 

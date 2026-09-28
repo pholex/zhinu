@@ -181,6 +181,54 @@ class RemediesPointSomewhereRealTest(unittest.TestCase):
         self.assertEqual(len(flagged), 1)
         self.assertIn("ghost", flagged[0])
 
+    def test_mcp_command_is_found_through_declared_path(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = Path(tmp)
+            bin_dir = workspace / "bin"
+            bin_dir.mkdir()
+            name = "xiaoyu-fake-launcher" + (".cmd" if os.name == "nt" else "")
+            launcher = bin_dir / name
+            launcher.write_text("@echo off\n" if os.name == "nt" else "#!/bin/sh\n", encoding="utf-8")
+            launcher.chmod(0o755)
+            (workspace / ".mcp.json").write_text(
+                json.dumps({"mcpServers": {
+                    "declared": {"command": name, "env": {"PATH": str(bin_dir)}},
+                }}),
+                encoding="utf-8",
+            )
+            with mock.patch("xiaoyu.mcp.user_config_dir", lambda: workspace / "userconf"):
+                check = diagnostics.check_mcp_config(workspace)
+        self.assertEqual(check.status, "ok", check.details)
+
+    def test_mcp_config_pointing_at_missing_paths_is_flagged(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = Path(tmp)
+            gone = workspace / "moved-away"
+            (workspace / ".mcp.json").write_text(
+                json.dumps({"mcpServers": {
+                    "stale": {
+                        "command": sys.executable,
+                        "args": [str(gone / "server.py"), "--root", str(workspace), "-x"],
+                        "env": {
+                            "DATA_DIR": str(gone / "data"),
+                            #  以 / 开头但不是文件：键名不像路径就不查
+                            "API_PREFIX": "/v1",
+                            #  占位符没兑现是另一类问题；多目录列表里缺一两个属正常
+                            "CERT_FILE": "${XIAOYU_TEST_UNSET}/ca.pem",
+                            "PATH": os.pathsep.join([str(gone / "a"), str(gone / "b")]),
+                        },
+                    },
+                }}),
+                encoding="utf-8",
+            )
+            with mock.patch("xiaoyu.mcp.user_config_dir", lambda: workspace / "userconf"):
+                check = diagnostics.check_mcp_config(workspace)
+        self.assertEqual(check.status, "warn")
+        flagged = [line for line in check.details if "不存在的路径" in line]
+        self.assertEqual(len(flagged), 2, flagged)
+        self.assertTrue(any("server.py" in line for line in flagged))
+        self.assertTrue(any("data" in line for line in flagged))
+
     def test_oversized_sessions_remedy_names_no_missing_command(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             sessions = Path(tmp)

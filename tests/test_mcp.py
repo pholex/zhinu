@@ -1155,6 +1155,49 @@ class SafeEnvTest(unittest.TestCase):
         self.assertEqual(env["MYAPP_HOME"], "/declared")
 
 
+class FindCommandTest(unittest.TestCase):
+    """找启动命令：配置里声明的 PATH 优先，本进程的 PATH 兜底。"""
+
+    def setUp(self) -> None:
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.bin = Path(tmp.name) / "bin"
+        self.bin.mkdir()
+        #  Windows 上 which 只认 PATHEXT 里的扩展名
+        self.name = "xiaoyu-fake-launcher" + (".cmd" if os.name == "nt" else "")
+        launcher = self.bin / self.name
+        launcher.write_text("@echo off\n" if os.name == "nt" else "#!/bin/sh\n", encoding="utf-8")
+        launcher.chmod(0o755)
+
+    def test_declared_path_is_searched(self) -> None:
+        self.assertIsNone(mcp.find_command(self.name))
+        found = mcp.find_command(self.name, {"PATH": str(self.bin)})
+        self.assertIsNotNone(found)
+        self.assertEqual(Path(found).name.lower(), self.name)
+
+    def test_declared_path_key_is_case_insensitive(self) -> None:
+        self.assertIsNotNone(mcp.find_command(self.name, {"Path": str(self.bin)}))
+
+    def test_process_path_still_works_when_declared_path_lacks_it(self) -> None:
+        #  声明的 PATH 只列了运行时目录、启动命令在别处：此前起得来，现在也要起得来
+        found = mcp.find_command(sys.executable, {"PATH": str(self.bin)})
+        self.assertIsNotNone(found)
+
+    def test_missing_everywhere_is_none(self) -> None:
+        self.assertIsNone(mcp.find_command("xiaoyu-no-such-mcp-binary", {"PATH": str(self.bin)}))
+
+    def test_spawn_error_counts_both_paths(self) -> None:
+        spec = mcp.ServerSpec(
+            name="ghost", command="xiaoyu-no-such-mcp-binary", timeout=5.0,
+            env={"PATH": str(self.bin)},
+        )
+        manager = mcp.McpManager([spec])
+        manager.start()
+        self.addCleanup(manager.close)
+        manager.wait_ready(20.0)
+        self.assertIn("找不到启动命令", manager.describe())
+
+
 class RedactTest(unittest.TestCase):
     def test_common_credential_shapes(self):
         text = (

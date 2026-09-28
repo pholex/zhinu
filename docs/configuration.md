@@ -195,6 +195,11 @@ MCP 子进程的环境是**纯白名单**，所以像 aws-mcp 这类要 SigV4 �
 全部失败的；对在线的 server 就是干净重启一次）。它重读的是配置文件：在别的终端 export 的变量、
 会话启动后才改的 `.env`，本进程都看不到，那两种仍得重启会话。
 
+找启动命令（`npx` / `uvx` …）时先看该 server 的 `env` 块里声明的 `PATH`，再看小羽自己的
+`PATH`。小羽由编辑器或 systemd 拉起时自己的 `PATH` 往往很短，在 `env` 里补一行
+`"PATH": "/opt/homebrew/bin:${env:PATH}"` 即可，不必把 `command` 写成绝对路径。
+`xiaoyu doctor` 用同一套找法，并会指出 `args` / `env` 里已经不存在的路径。
+
 server 的工具描述 / schema 一变（多半是 `npx xxx@latest` 拉到了新版）就会被整代隔离，
 启动时直接摊出变了什么（描述逐行 diff、参数增删改），`/mcp diff <name>` 看全部，核对后
 `/mcp approve <name>`（不给名字 = 全部批准）。信得过来源、不想每次上游发版都重批的，
