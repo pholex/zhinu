@@ -134,6 +134,89 @@ class ConfigParsingTest(unittest.TestCase):
     def test_no_config_files(self):
         self.assertEqual(mcp.load_server_specs(self.workspace), [])
 
+    def keychain(self, secrets: dict[str, str]):
+        """假装在 macOS 上、Keychain 里存着这些值；返回打桩对象（看它被问过什么）。"""
+        platform = mock.patch.object(mcp.sys, "platform", "darwin")
+        platform.start()
+        self.addCleanup(platform.stop)
+        reader = mock.patch("xiaoyu.config._read_from_keychain", side_effect=secrets.get)
+        self.addCleanup(reader.stop)
+        return reader.start()
+
+    def quiet_specs(self) -> list:
+        with contextlib.redirect_stderr(io.StringIO()):
+            return mcp.load_server_specs(self.workspace)
+
+    def test_user_level_placeholder_falls_back_to_keychain(self):
+        asked = self.keychain({"XIAOYU_TEST_MCP_TOKEN": "来自钥匙串"})
+        self.write_user({"mcpServers": {
+            "local": {"command": "cmd", "env": {"TOKEN": "${XIAOYU_TEST_MCP_TOKEN}"}},
+            "remote": {"url": "https://mcp.example.com/mcp",
+                       "headers": {"Authorization": "Bearer ${env:XIAOYU_TEST_MCP_TOKEN}"}},
+        }})
+        specs = {spec.name: spec for spec in self.quiet_specs()}
+        self.assertEqual(specs["local"].env["TOKEN"], "来自钥匙串")
+        self.assertEqual(specs["remote"].headers["Authorization"], "Bearer 来自钥匙串")
+        self.assertTrue(asked.called)
+
+    def test_environment_wins_over_keychain_and_is_not_even_asked(self):
+        asked = self.keychain({"XIAOYU_TEST_MCP_TOKEN": "来自钥匙串"})
+        self.write_user({"mcpServers": {
+            "local": {"command": "cmd", "env": {"TOKEN": "${XIAOYU_TEST_MCP_TOKEN}"}},
+        }})
+        with mock.patch.dict(os.environ, {"XIAOYU_TEST_MCP_TOKEN": "来自环境"}):
+            (spec,) = self.quiet_specs()
+        self.assertEqual(spec.env["TOKEN"], "来自环境")
+        asked.assert_not_called()
+
+    def test_workspace_config_never_reaches_the_keychain(self):
+        #  仓库作者写的配置：开了这条路就是让仓库按名字探你的 Keychain
+        asked = self.keychain({"XIAOYU_TEST_MCP_TOKEN": "来自钥匙串", "XIAOYU_API_KEY": "模型密钥"})
+        self.write_workspace({"mcpServers": {
+            "a": {"command": "cmd", "env": {"T": "${XIAOYU_TEST_MCP_TOKEN}", "K": "${XIAOYU_API_KEY}"}},
+        }})
+        with mock.patch.dict(os.environ):
+            os.environ.pop("XIAOYU_API_KEY", None)
+            (spec,) = self.quiet_specs()
+        self.assertEqual(spec.env, {"T": "${XIAOYU_TEST_MCP_TOKEN}", "K": "${XIAOYU_API_KEY}"})
+        asked.assert_not_called()
+
+    def test_plugin_installed_entry_never_reaches_the_keychain(self):
+        #  插件包装进来的条目也落在用户级文件里，但声明出自别人之手
+        asked = self.keychain({"XIAOYU_TEST_MCP_TOKEN": "来自钥匙串"})
+        self.write_user({"mcpServers": {
+            "pack__srv": {"command": "cmd", "_plugin": "pack",
+                          "env": {"TOKEN": "${XIAOYU_TEST_MCP_TOKEN}"}},
+            "mine": {"command": "cmd", "env": {"TOKEN": "${XIAOYU_TEST_MCP_TOKEN}"}},
+        }})
+        specs = {spec.name: spec for spec in self.quiet_specs()}
+        self.assertEqual(specs["pack__srv"].env["TOKEN"], "${XIAOYU_TEST_MCP_TOKEN}")
+        self.assertEqual(specs["mine"].env["TOKEN"], "来自钥匙串")
+        self.assertEqual(asked.call_count, 1)
+
+    def test_missing_from_keychain_keeps_the_placeholder_and_warns(self):
+        self.keychain({})
+        self.write_user({"mcpServers": {
+            "local": {"command": "cmd", "env": {"TOKEN": "${XIAOYU_TEST_MCP_TOKEN}"}},
+        }})
+        stderr = io.StringIO()
+        with contextlib.redirect_stderr(stderr):
+            (spec,) = mcp.load_server_specs(self.workspace)
+        self.assertEqual(spec.env["TOKEN"], "${XIAOYU_TEST_MCP_TOKEN}")
+        self.assertIn("XIAOYU_TEST_MCP_TOKEN", stderr.getvalue())
+
+    def test_other_platforms_have_no_keychain(self):
+        reader = mock.patch("xiaoyu.config._read_from_keychain", return_value="不该被读到")
+        asked = reader.start()
+        self.addCleanup(reader.stop)
+        self.write_user({"mcpServers": {
+            "local": {"command": "cmd", "env": {"TOKEN": "${XIAOYU_TEST_MCP_TOKEN}"}},
+        }})
+        with mock.patch.object(mcp.sys, "platform", "linux"):
+            (spec,) = self.quiet_specs()
+        self.assertEqual(spec.env["TOKEN"], "${XIAOYU_TEST_MCP_TOKEN}")
+        asked.assert_not_called()
+
     def test_inherit_env_parsed_from_config(self):
         self.write_workspace(
             {"mcpServers": {"a": {"command": "cmd", "inheritEnv": ["MYAPP_*", ""]}}}

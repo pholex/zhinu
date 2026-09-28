@@ -190,7 +190,10 @@ xiaoyu plugin remove aws-core                                 # 删目录 + 摘�
 
 MCP 子进程的环境是**纯白名单**，所以像 aws-mcp 这类要 SigV4 凭证的 server，
 装完得自己在 `mcp.json` 的 `env` 块里用 `${env:AWS_PROFILE}` 之类显式点名——
-不点名只会得到一个莫名其妙的 401/403。远端 server 被 401/403 拒绝会整代停用、不自动重试；
+不点名只会得到一个莫名其妙的 401/403。macOS 上令牌不必明文进 `.env`：用户级 `mcp.json`
+里的 `${GITHUB_TOKEN}` 在环境变量里找不到时，会按同名去 Keychain 取
+（`security add-generic-password -U -s GITHUB_TOKEN -a "$USER" -w`）。这条回落只对你亲手写在
+用户级 `mcp.json` 里的声明生效；工作区 `.mcp.json` 与插件包装进来的条目不触发。远端 server 被 401/403 拒绝会整代停用、不自动重试；
 把 `mcp.json` 里的 headers / env 改好后 `/mcp reconnect <name>` 热恢复，不必重启会话（不给名字 =
 全部失败的；对在线的 server 就是干净重启一次）。它重读的是配置文件：在别的终端 export 的变量、
 会话启动后才改的 `.env`，本进程都看不到，那两种仍得重启会话。
