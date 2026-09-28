@@ -801,6 +801,10 @@ class _HttpChannel:
         try:
             stream = netproxy.urlopen(request, timeout=self._STREAM_TIMEOUT)
         except urllib.error.HTTPError as exc:
+            #  HTTPError 本身就是一个开着的响应：不关就是把连接留给垃圾回收。
+            #  405 是常态（多数 server 不提供这条流），漏的是每连一个 server 一条
+            with contextlib.suppress(Exception):
+                exc.close()
             if exc.code in (404, 405, 501):
                 return  # 规范允许不提供这条流
             print(
@@ -856,8 +860,14 @@ class _HttpChannel:
         request = urllib.request.Request(
             self.spec.url, headers=self._headers("application/json"), method="DELETE"
         )
-        with contextlib.suppress(Exception):
+        try:
             netproxy.urlopen(request, timeout=5.0).close()
+        except urllib.error.HTTPError as exc:
+            #  不支持 DELETE 的 server 回 405：同样是个开着的响应，要关
+            with contextlib.suppress(Exception):
+                exc.close()
+        except Exception:  # noqa: BLE001 - 尽力而为：关会话失败不该拦住关闭
+            pass
 
 
 def _read_capped(response: Any) -> bytes:
