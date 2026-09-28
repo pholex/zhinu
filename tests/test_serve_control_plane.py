@@ -244,6 +244,111 @@ class TestBudget(ServeCase):
 
 
 @unittest.skipUnless(HAS_FASTAPI, "需要可选额外 [serve]（fastapi + uvicorn）")
+class TestFork(ServeCase):
+    THREE_TURNS = "---\n".join(
+        'usage: {"prompt_tokens": 100, "completion_tokens": 50}\n' f"text: 第{n}轮的答复\n"
+        for n in "一二三四五"
+    )
+
+    def create(self, status: int = 200, **body: Any) -> dict[str, Any]:
+        response = self.client.post("/session", json=body, headers=self.headers())
+        self.assertEqual(response.status_code, status, response.text)
+        return response.json()
+
+    def run_turns(self, session_id: str, count: int) -> None:
+        for number in range(1, count + 1):
+            done = self.client.post(
+                f"/session/{session_id}/prompt", json={"text": f"问题{number}"}, headers=self.headers()
+            ).json()
+            self.assertEqual(done["detail"], "finished")
+
+    def history(self, session_id: str) -> list[tuple[str, str]]:
+        agent = self.client.app.state.sessions[session_id].agent
+        return [(m["role"], str(m.get("content"))) for m in agent.messages[1:]]
+
+    def check_fork_carries_history(self) -> None:
+        source = self.new_session()
+        self.run_turns(source, 3)
+        full = self.create(fork_from=source)
+        self.assertEqual(self.history(full["session_id"]), self.history(source))
+        self.assertEqual(full["turns"], 0)
+        #  用量从零记起：带走的是历史，不是来源花掉的 token
+        self.assertEqual(full["spend"]["tokens"], 0)
+        self.assertGreater(self.status(source)["spend"]["tokens"], 0)
+        (first,) = self.events(full["session_id"], limit=1)
+        self.assertEqual((first["kind"], first["source"]), ("session.forked", source))
+
+        part = self.create(fork_from={"session_id": source, "turns": 2})
+        kept = self.history(part["session_id"])
+        self.assertEqual(kept, self.history(source)[: len(kept)])
+        self.assertEqual([text for role, text in kept if role == "user"], ["问题1", "问题2"])
+
+        #  各走各的：分叉出去的接着跑，来源的历史一条不多
+        before = self.history(source)
+        self.run_turns(part["session_id"], 1)
+        self.assertEqual(self.history(source), before)
+        self.assertEqual(len(self.history(part["session_id"])), len(kept) + 2)
+        #  来源关掉也不影响已经分叉出去的
+        self.client.delete(f"/session/{source}", headers=self.headers())
+        self.run_turns(full["session_id"], 1)
+
+    def test_fork_carries_history_from_the_session_log(self):
+        self.start(self.THREE_TURNS, state_dir=Path(self.tmp) / "state")
+        self.check_fork_carries_history()
+
+    def test_fork_carries_history_without_persistence(self):
+        self.start(self.THREE_TURNS, persist=False)
+        self.check_fork_carries_history()
+
+    def test_fork_inherits_workspace_and_pinned_agent_unless_overridden(self):
+        self.start(self.THREE_TURNS)
+        sub = self.root / "sub"
+        sub.mkdir()
+        agent = self.client.post(
+            "/agent", json={"name": "a", "config": {"mode": "plan", "budget": {"tokens": 10**6}}},
+            headers=self.headers(),
+        ).json()
+        self.client.post(
+            f"/agent/{agent['agent_id']}", json={"config": {"mode": "auto"}}, headers=self.headers()
+        )
+        source = self.create(agent={"id": agent["agent_id"], "version": 1}, workspace=str(sub))
+        self.run_turns(source["session_id"], 1)
+        forked = self.create(fork_from=source["session_id"])
+        self.assertEqual(forked["workspace"], source["workspace"])
+        #  沿用的是来源钉住的那一版，不是 agent 的最新版
+        self.assertEqual((forked["agent"]["version"], forked["mode"]), (1, "plan"))
+        other = self.create(fork_from=source["session_id"], mode="default")
+        self.assertEqual((other["agent"], other["mode"]), (None, "default"))
+
+    def test_fork_rejects_what_it_cannot_honour(self):
+        self.start(
+            'tool_call: {"name": "bash", "arguments": {"command": "echo hi"}}\n---\n' + SIMPLE
+        )
+        source = self.new_session()
+        self.create(status=404, fork_from="sess-nope")
+        self.create(status=400, fork_from={"id": source})
+        #  来源还没有任何一轮：turns 取什么都超范围
+        self.create(status=400, fork_from={"session_id": source, "turns": 1})
+        self.client.post(
+            f"/session/{source}/prompt_async", json={"text": "干活"}, headers=self.headers()
+        )
+        waiting = self._wait_for(source, "waiting_for_approval")
+        busy = self.create(status=409, fork_from=source)
+        self.assertIn("正在跑", busy["detail"])
+        self.client.post(
+            f"/session/{source}/permissions",
+            json={"request_id": waiting["pending_approvals"][0]["request_id"], "decision": "allow"},
+            headers=self.headers(),
+        )
+        self._wait_for(source, "finished")
+        for turns in (0, 2, -1, "1", True, 1.5):
+            with self.subTest(turns=turns):
+                refused = self.create(status=400, fork_from={"session_id": source, "turns": turns})
+                self.assertIn("1 到 1", refused["detail"])
+        self.create(fork_from={"session_id": source, "turns": 1})
+
+
+@unittest.skipUnless(HAS_FASTAPI, "需要可选额外 [serve]（fastapi + uvicorn）")
 class TestPersistence(ServeCase):
     def test_sessions_and_agents_survive_restart(self):
         state = Path(self.tmp) / "state"

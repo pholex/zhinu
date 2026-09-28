@@ -290,6 +290,24 @@ curl -X POST :8420/agent/agent-3f9c… -d '{"config":{"mode":"plan"}}'  # → ve
 - `DELETE /agent/{id}` 是**归档**不是删除：只读、不再接受新会话、老会话照跑、历史版本
   可查（`GET /agent/{id}?versions=true`）。
 
+## 分叉：从另一个会话的历史起步
+
+```bash
+curl -X POST :8420/session -d '{"fork_from":"sess-…"}'                          # 带走全部历史
+curl -X POST :8420/session -d '{"fork_from":{"session_id":"sess-…","turns":3}}'  # 只带前 3 轮
+```
+
+新会话拿到的是来源历史的**副本**，写进它自己的会话日志；来源会话不受影响，之后关掉、
+删掉也不影响分叉出去的那个。适合"调研做完了，接下来分几路各试一种做法"：前面的
+上下文不必每路重跑一遍。
+
+- 没另给 `workspace` / `agent` / `model` / `mode` 就沿用来源的工作区与 agent 版本；
+  给了就以这次请求为准（比如同一段历史换个模型接着做）。
+- **预算不沿用**：新会话的用量从零记起，要设预算在这次请求里给。
+- 来源正在跑一轮时回 `409`——轮中的历史里有没配对的工具调用，抄走的是半截状态。
+- `turns` 超出来源的轮数回 `400`，错误里写明可取范围。
+- 新会话的事件流以 `session.forked`（带来源 id 与消息条数）开头。
+
 ## 预算（硬闸，不是提醒）
 
 ```bash
@@ -374,7 +392,7 @@ Windows 为 `%APPDATA%\xiaoyu\serve\<root slug>\`；启动后 `GET /health` 的 
 | GET | `/diagnostics` | 进程自诊断：RSS / 线程 / fd + 在册计量（会话、在途请求、MCP 连接、后台任务）。有 token 门——它暴露负载形态 |
 | POST · GET | `/agent` | 新建 agent 对象 · 列出 |
 | GET · POST · DELETE | `/agent/{id}` | 详情（`?versions=true`）· 更新→新版本 · 归档 |
-| POST | `/session` | 新建会话（`workspace` / `model` / `mode`，或 `agent` 引用 + `budget`） |
+| POST | `/session` | 新建会话（`workspace` / `model` / `mode`，或 `agent` 引用 + `budget`；`fork_from` 从另一个会话分叉） |
 | GET | `/session` | 列出会话 |
 | GET · DELETE | `/session/{id}` | 详情 · 关闭 |
 | POST | `/session/{id}/prompt` | 跑一轮，等结果 |

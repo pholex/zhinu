@@ -80,6 +80,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import copy
 import hmac
 import json
 import sys
@@ -131,7 +132,15 @@ from .serve_state import (
     public_agent,
     spend_of,
 )
-from .session_log import SessionLockedError, SessionLog, _workspace_slug, load_messages, sessions_dir
+from .session_log import (
+    LoadedMessages,
+    SessionLockedError,
+    SessionLog,
+    _workspace_slug,
+    load_messages,
+    sessions_dir,
+    turn_starts,
+)
 from .tools import Toolbox
 
 #  进程级计量：在册会话数 / 处理中的 HTTP 请求数（GET /diagnostics 读）
@@ -1014,6 +1023,7 @@ def create_app(cfg: ServeConfig):  # noqa: C901 - 路由表天然长，拆开反
         mode: str = "",
         agent: Any = None,
         budget: Any = None,
+        fork_from: Any = None,
     ) -> _Session:
         """装配一个会话并登记进注册表。REST 的 POST /session 与 MCP 的 xiaoyu
         工具共用这一个装配口——两张脸建出的会话必须一模一样，包括 approver 与
@@ -1023,7 +1033,17 @@ def create_app(cfg: ServeConfig):  # noqa: C901 - 路由表天然长，拆开反
         单独给（400）：钉版本的意义就是"这个会话的配置可被完整复现"，旁路
         覆盖会让版本号失去含义。没给 agent 就是老路——跟随服务端启动参数，
         model/mode 可临时覆盖。
+
+        `fork_from` 非空时新会话从另一个会话的历史起步（见 fork_history）：没另给
+        workspace / agent / model / mode 就沿用来源会话的工作区与 agent 版本。
+        预算不沿用——用量从零记起，要设预算在这次请求里给。
         """
+        source, history = fork_history(fork_from)
+        if source is not None:
+            if not workspace:
+                workspace = str(source.workspace)
+            if (agent is None or agent == "") and not model and not mode and source.agent_ref:
+                agent = {"id": source.agent_ref["id"], "version": source.agent_ref["version"]}
         target = resolve_workspace(workspace)
         session_id = f"sess-{uuid.uuid4().hex[:16]}"
         agent_ref: dict[str, Any] | None = None
@@ -1057,8 +1077,58 @@ def create_app(cfg: ServeConfig):  # noqa: C901 - 路由表天然长，拆开反
             budget=session_budget,
             pricing=agent_config.get("pricing") or {},
         )
+        if source is not None:
+            origin = source.agent.session_log
+            #  复制进新会话自己的日志：新会话自包含，来源关掉、删掉都不影响它
+            session.async_agent.restore(
+                history, source=str(origin.path) if origin is not None else ""
+            )
+            session.publish("session.forked", source=source.id, messages=len(history))
         manifests.save(session.manifest())
         return session
+
+    def fork_history(fork_from: Any) -> tuple[_Session | None, list[dict[str, Any]]]:
+        """`fork_from` → (来源会话, 要带走的历史)；没给返回 (None, [])。
+
+        接受会话 id，或 `{"session_id": ..., "turns": K}`（只带前 K 轮）。来源正在
+        跑一轮时拒绝（409）：轮中的历史里有没配对的工具调用，抄走的是半截状态。
+        """
+        if fork_from is None or fork_from == "":
+            return None, []
+        if isinstance(fork_from, str):
+            source_id, turns = fork_from, None
+        elif isinstance(fork_from, dict) and isinstance(fork_from.get("session_id"), str):
+            source_id, turns = fork_from["session_id"], fork_from.get("turns")
+        else:
+            raise HTTPException(
+                status_code=400, detail='fork_from 要么是会话 id，要么是 {"session_id": ..., "turns": K}'
+            )
+        source = pick(source_id)
+        if source.busy:
+            raise HTTPException(
+                status_code=409, detail="来源会话正在跑一轮，等它结束或 /abort 之后再分叉"
+            )
+        origin = source.agent.session_log
+        if origin is not None and origin.path.is_file():
+            #  与重启恢复同一条读法（压缩、清空都按日志里记的重放）
+            history: list[dict[str, Any]] = load_messages(origin.path)
+        else:
+            history = copy.deepcopy(source.agent.messages[1:])  # [0] 是 system
+        if turns is not None:
+            from .agent import SYNTHETIC_USER_TEXTS
+
+            starts = turn_starts(history, SYNTHETIC_USER_TEXTS)
+            if isinstance(turns, bool) or not isinstance(turns, int) or not 1 <= turns <= len(starts):
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"fork_from.turns 超出范围：来源会话有 {len(starts)} 轮，可取 1 到 {len(starts)}",
+                )
+            if turns < len(starts):
+                #  切片会丢掉读回时的损坏记录，带上它，restore 才能照常提示
+                history = LoadedMessages(
+                    history[: starts[turns]], getattr(history, "corrupt_lines", ())
+                )
+        return source, history
 
     def restore_sessions() -> None:
         """启动时按清单把上次的会话接回来（历史来自会话日志，游标接着编号）。
@@ -1356,8 +1426,19 @@ def create_app(cfg: ServeConfig):  # noqa: C901 - 路由表天然长，拆开反
             embed=True,
             description="本会话的硬预算 {tokens, usd}；缺省用 agent 的默认预算；usd 需要 agent 带 pricing",
         ),
+        fork_from: str | dict[str, Any] | None = Body(
+            default=None,
+            embed=True,
+            description=(
+                '从另一个会话的历史起步：会话 id，或 {"session_id": ..., "turns": K}（只带前 K 轮）。'
+                "来源会话不受影响；没另给 workspace / agent / model / mode 就沿用来源的"
+            ),
+        ),
     ) -> dict[str, Any]:
-        return make_session(workspace=workspace, model=model, mode=mode, agent=agent, budget=budget).info_dict()
+        return make_session(
+            workspace=workspace, model=model, mode=mode, agent=agent, budget=budget,
+            fork_from=fork_from,
+        ).info_dict()
 
     @app.get(
         "/session",
