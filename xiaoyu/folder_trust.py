@@ -559,6 +559,11 @@ def untrusted_note(decision: TrustDecision) -> str:
     """不信任时给用户的一行说明（CLI 打到 stderr / banner 下方）。"""
     names = {"mcp": ".mcp.json", "permission": ".xiaoyu/permissions.txt", "env": ".env"}
     found = " / ".join(names.get(kind, kind) for kind in decision.kinds)
+    #  工作区自带的技能跟着这道门的结论走（不单独问、不记指纹）：没加载要说一声
+    from . import skills
+
+    if decision.workspace is not None and skills.has_project_skills(decision.workspace):
+        found += " 与工作区自带的技能"
     if decision.changed:
         changed = " / ".join(names.get(kind, kind) for kind in decision.changed)
         return (

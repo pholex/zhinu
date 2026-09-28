@@ -349,6 +349,98 @@ class ScanTest(unittest.TestCase):
         self.assertIn("skill00", block)
 
 
+class ProjectSkillsTest(unittest.TestCase):
+    """工作区自带的技能：随仓库来、排在用户自己的之后、跟着信任门的结论走。"""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.user = Path(self.tmp.name) / "user-skills"
+        self.workspace = Path(self.tmp.name) / "repo"
+        self.workspace.mkdir()
+        for target, value in (("skill_dirs", [self.user]),):
+            patcher = mock.patch.object(skills, target, return_value=value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        patcher = mock.patch.object(skills.plugins, "installed_skill_dirs", return_value=[])
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        #  开发机 / CI 上设了这个变量的话，工作区技能会被整类关掉
+        patcher = mock.patch.dict(os.environ)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        os.environ.pop("XIAOYU_SKILLS_DIR", None)
+
+    def names(self, workspace: Path | None) -> list[str]:
+        with contextlib.redirect_stderr(io.StringIO()):
+            return [item.name for item in skills.scan_skills(workspace)]
+
+    def test_both_workspace_locations_are_scanned(self):
+        write_skill(self.workspace / ".xiaoyu" / "skills", "a", "name: a\ndescription: 甲")
+        write_skill(self.workspace / ".agents" / "skills", "b", "name: b\ndescription: 乙")
+        with contextlib.redirect_stderr(io.StringIO()):
+            found = {item.name: item for item in skills.scan_skills(self.workspace)}
+        self.assertEqual(sorted(found), ["a", "b"])
+        self.assertTrue(all(item.project for item in found.values()))
+
+    def test_no_workspace_means_no_project_skills(self):
+        write_skill(self.workspace / ".agents" / "skills", "b", "name: b\ndescription: 乙")
+        self.assertEqual(self.names(None), [])
+        self.assertTrue(skills.has_project_skills(self.workspace))
+        self.assertFalse(skills.has_project_skills(Path(self.tmp.name) / "elsewhere"))
+
+    def test_users_own_skill_wins_over_the_repos(self):
+        mine = write_skill(self.user, "deploy", "name: deploy\ndescription: 我自己的")
+        write_skill(self.workspace / ".agents" / "skills", "deploy", "name: deploy\ndescription: 仓库的")
+        stderr = io.StringIO()
+        with contextlib.redirect_stderr(stderr):
+            (found,) = skills.scan_skills(self.workspace)
+        self.assertEqual((found.path, found.description, found.project), (mine, "我自己的", False))
+        self.assertIn("撞名", stderr.getvalue())
+
+    def test_explicit_skills_dir_excludes_the_workspace(self):
+        write_skill(self.workspace / ".agents" / "skills", "b", "name: b\ndescription: 乙")
+        os.environ["XIAOYU_SKILLS_DIR"] = str(self.user)
+        self.assertEqual(self.names(self.workspace), [])
+
+    def test_fingerprint_covers_workspace_directories(self):
+        before = skills.sources_fingerprint(self.workspace)
+        write_skill(self.workspace / ".agents" / "skills", "b", "name: b\ndescription: 乙")
+        self.assertNotEqual(skills.sources_fingerprint(self.workspace), before)
+        self.assertEqual(len(skills.sources_fingerprint(None)), len(before) - 2)
+
+    def build_agent(self, *, trusted: bool):
+        from xiaoyu.agent import Agent
+        from xiaoyu.config import Config
+        from xiaoyu.providers import Registry
+        from xiaoyu.tools import Toolbox
+
+        config = Config(
+            base_url="http://unused", model="m", workspace=self.workspace,
+            enable_explore=False, workspace_trusted=trusted,
+        )
+        with contextlib.redirect_stderr(io.StringIO()):
+            return Agent(config, Toolbox(config), registry=Registry.for_client(object()))
+
+    def test_agent_loads_them_only_when_the_workspace_is_trusted(self):
+        write_skill(
+            self.workspace / ".xiaoyu" / "skills", "release",
+            "name: release\ndescription: 发版流程", body="先跑测试",
+        )
+        trusted = self.build_agent(trusted=True)
+        self.assertIn("- release: 发版流程", trusted.messages[0]["content"])
+        self.assertTrue(trusted.toolbox.run("skill", {"name": "release"}).endswith("先跑测试"))
+
+        untrusted = self.build_agent(trusted=False)
+        self.assertNotIn("release", untrusted.messages[0]["content"])
+        #  未命中会重扫磁盘：重扫同样不许把没过门的工作区扫进来
+        with contextlib.redirect_stderr(io.StringIO()):
+            missed = untrusted.toolbox.run("skill", {"name": "release"}) if untrusted.toolbox.get("skill") else "ERROR"
+        self.assertNotIn("先跑测试", missed)
+        added, _ = untrusted.reload_skills()
+        self.assertEqual(added, [])
+
+
 class AgentSkillIntegrationTest(unittest.TestCase):
     """技能挂上 Agent：索引进 system prompt、skill 工具按需加载正文。"""
 

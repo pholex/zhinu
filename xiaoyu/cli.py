@@ -3305,12 +3305,15 @@ def handle_slash(agent: Agent, line: str, select: Any = None) -> bool:
                 print(ui.secondary("  索引已重建（本轮 prompt cache 前缀作废，下一轮起重新累积）"))
         else:
             if not agent.skills:
-                print(ui.secondary("  没有发现技能。放到 ~/.agents/skills/<名字>/SKILL.md 即可被识别，"))
+                print(ui.secondary("  没有发现技能。放到 ~/.agents/skills/<名字>/SKILL.md 即可被识别"))
+                print(ui.secondary("  （随仓库共享的放工作区的 .xiaoyu/skills/ 或 .agents/skills/），"))
                 print(ui.secondary("  或用 xiaoyu plugin add <owner/repo> 装一个插件包"))
             for skill in agent.skills:
                 #  插件技能标出来源：名字里虽然带了包名前缀，但"这是装来的、能 update"
                 #  和"这是我自己写的"是两回事
                 origin = ui.secondary(f"  [插件 {skill.plugin}]") if skill.plugin else ""
+                if skill.project:
+                    origin = ui.secondary("  [工作区]")
                 print(f"  {skill.name}  {ui.secondary(skill.description or str(skill.path))}{origin}")
     elif command == "/model":
         if rest:

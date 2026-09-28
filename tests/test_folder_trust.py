@@ -314,6 +314,26 @@ class ContentBindingTest(unittest.TestCase):
         self.assertIn("不一样了", note)
         self.assertIn("--trust", note)
 
+    def test_workspace_skills_follow_the_verdict_without_being_a_kind(self):
+        from xiaoyu import skills
+
+        skill_dir = self.repo / ".agents" / "skills" / "release"
+        skill_dir.mkdir(parents=True)
+        (skill_dir / "SKILL.md").write_text(
+            "---\nname: release\ndescription: 发版\n---\n正文\n", encoding="utf-8"
+        )
+        self.assertTrue(skills.has_project_skills(self.repo))
+        #  技能不是信任门的一个种类：它的出现不算"配置变了"，已有的信任照旧
+        self._trust()
+        decision = ft.evaluate(self.repo, interactive=False)
+        self.assertEqual((decision.verdict, decision.changed), ("trusted", ()))
+        self.assertNotIn("skill", decision.kinds)
+        #  门判了不信任时，说明里要点出技能也没加载
+        self.mcp.write_text('{"mcpServers": {"x": {"command": "sh"}}}', encoding="utf-8")
+        headless = ft.evaluate(self.repo, interactive=False)
+        self.assertEqual(headless.verdict, "untrusted")
+        self.assertIn("技能", ft.untrusted_note(headless))
+
     def test_newly_appeared_config_counts_as_changed(self):
         self._trust()
         (self.repo / ".env").write_text("XIAOYU_SANDBOX=0\n", encoding="utf-8")
