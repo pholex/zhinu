@@ -59,6 +59,7 @@ curl -X POST :8420/session/$SID/prompt -d '{"text":"评估这个 PR 能不能合
 | `idle` | `interrupted` | 上一轮被 `/abort` 收掉 |
 | `idle` | `budget_reached` | **预算耗尽**（`budget_reason` 有原因），再提交 `409`，去 `/budget` 调高或撤掉 |
 | `idle` | `recovered` | serve 重启后从清单接回来的会话，还没跑过新的一轮 |
+| `idle` | `interrupted_by_restart` | 同上，但重启时**有一轮正在跑**：它没走到收尾，`lost_turn` 说明是第几轮、何时开始 |
 | `error` | `failed` | 上一轮抛异常，`error` 字段有原文 |
 
 `waiting_for_approval` 单独占一格是这一层最要紧的设计：编排器只看"还在跑"的话，
@@ -320,6 +321,12 @@ Windows 为 `%APPDATA%\xiaoyu\serve\<root slug>\`；启动后 `GET /health` 的 
 
 - 会话自动接回（`detail=recovered`），历史来自会话日志（`Agent.restore`，未配对的
   tool_call 会补"结果未知"），配置、agent 引用、预算、`turns` 随清单回来；
+- **在途的那一轮会被标出来**：开轮时清单就记下在途标记，收尾时清掉。重启时标记还在，
+  说明那一轮随进程一起没了——会话以 `detail=interrupted_by_restart` 接回，`/status` 的
+  `lost_turn`（`{"turn": 3, "started_at": …}`）与 `session.recovered` 事件里都带着它。
+  那一轮做到哪一步、副作用落没落地，服务端说不清：历史里能看到它已经发出的工具调用
+  （没等到结果的会补"结果未知"），要不要重做由编排方判断。标记留到下一轮开跑才清，
+  连着重启两次也不会丢；
 - **事件缓冲不落盘**——重启前的事件计入 `dropped_events`，`seq` 从上次水位**接着编号**：
   客户端手里的游标仍单调，拉到的是"中间缺一段"（协议里本来就有表达），不是"序号倒流"；
 - 恢复失败的清单（工作区没挂上、provider 没配）留在盘上、stderr 打一行、跳过——不删，

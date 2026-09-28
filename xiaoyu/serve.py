@@ -365,6 +365,10 @@ class _Session:
         self.detail = "idle"
         self.error = ""
         self.busy = False
+        #  正在跑的那一轮（开轮即落盘，见 start_turn）；lost_turn 是上一个进程里
+        #  没跑完就随进程一起没了的那一轮，留到下一轮开跑才清
+        self.in_flight: dict[str, Any] | None = None
+        self.lost_turn: dict[str, Any] | None = None
         self.last_result: dict[str, Any] | None = None
         #  agent 自带 MCP server 的会话私有 manager（assemble 里回填），关会话时收掉
         self.mcp_manager: Any = None
@@ -490,6 +494,7 @@ class _Session:
             "first_seq": self.first_seq,
             "dropped_events": self.dropped,
             "last_result": self.last_result,
+            "lost_turn": self.lost_turn,
             "updated_at": self.updated_at,
         }
 
@@ -518,6 +523,8 @@ class _Session:
             "next_seq": self.next_seq,
             "turns": self.turns,
             "created_at": self.created_at,
+            "in_flight": self.in_flight,
+            "lost_turn": self.lost_turn,
         }
 
     # ---------- 审批（工作线程 → 事件循环） ----------
@@ -1103,8 +1110,14 @@ def create_app(cfg: ServeConfig):  # noqa: C901 - 路由表天然长，拆开反
             session.dropped = resume_seq - 1
             session.turns = int(manifest.get("turns") or 0)
             session.created_at = float(manifest.get("created_at") or session.created_at)
-            session.detail = "recovered"
-            session.publish("session.recovered", messages=len(history))
+            #  清单里还挂着在途标记 = 那一轮没走到收尾进程就没了。它做到哪一步、
+            #  副作用落没落地，服务端说不清——编排方必须知道，不能当成"接回来了"
+            lost = manifest.get("in_flight") or manifest.get("lost_turn")
+            session.lost_turn = lost if isinstance(lost, dict) else None
+            session.detail = "interrupted_by_restart" if session.lost_turn else "recovered"
+            session.publish(
+                "session.recovered", messages=len(history), lost_turn=session.lost_turn
+            )
             manifests.save(session.manifest())
 
     def close_session(session: _Session) -> None:
@@ -1146,6 +1159,10 @@ def create_app(cfg: ServeConfig):  # noqa: C901 - 路由表天然长，拆开反
         session.status = "running"
         session.detail = "working"
         session.error = ""
+        session.lost_turn = None
+        session.in_flight = {"turn": session.turns + 1, "started_at": time.time()}
+        #  开轮就落盘：进程在轮中被杀时，清单是唯一还能说出"有一轮没跑完"的地方
+        manifests.save(session.manifest())
         session.publish("run.started", prompt=text)
         task = asyncio.create_task(_drive(session, text, output_schema))
         session._task = task
@@ -1194,6 +1211,7 @@ def create_app(cfg: ServeConfig):  # noqa: C901 - 路由表天然长，拆开反
             return result or {}
         finally:
             session.busy = False
+            session.in_flight = None
             manifests.save(session.manifest())
             #  会话若在跑的过程中被 DELETE，挂起的审批要有人收尸，否则工作线程
             #  一直阻塞到 approval_timeout。这里统一兜底放拒绝。

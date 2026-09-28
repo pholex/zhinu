@@ -287,6 +287,69 @@ class TestPersistence(ServeCase):
         #  同一会话日志续写（不是新开一份）；被关掉的会话日志作为留痕保留在盘上
         self.assertEqual(len(list((state / "logs").glob(f"*-id-{kept}.jsonl"))), 1)
 
+    def test_turn_in_flight_is_on_disk_while_running_and_cleared_after(self):
+        import json
+
+        state = Path(self.tmp) / "state"
+        script = 'tool_call: {"name": "bash", "arguments": {"command": "echo hi"}}\n---\n' + SIMPLE
+        self.start(script, state_dir=state)
+        session_id = self.new_session()
+        manifest = state / "sessions" / f"{session_id}.json"
+        self.assertIsNone(json.loads(manifest.read_text(encoding="utf-8"))["in_flight"])
+        self.client.post(
+            f"/session/{session_id}/prompt_async", json={"text": "干活"}, headers=self.headers()
+        )
+        #  卡在审批上 = 这一轮确定还在跑
+        waiting = self._wait_for(session_id, "waiting_for_approval")
+        on_disk = json.loads(manifest.read_text(encoding="utf-8"))
+        self.assertEqual(on_disk["in_flight"]["turn"], 1)
+        self.assertIsNone(waiting["lost_turn"])
+        request_id = waiting["pending_approvals"][0]["request_id"]
+        self.client.post(
+            f"/session/{session_id}/permissions",
+            json={"request_id": request_id, "decision": "allow"},
+            headers=self.headers(),
+        )
+        self._wait_for(session_id, "finished")
+        self.assertIsNone(json.loads(manifest.read_text(encoding="utf-8"))["in_flight"])
+
+    def test_turn_killed_by_restart_is_reported_until_next_turn(self):
+        import json
+
+        state = Path(self.tmp) / "state"
+        self.start(SIMPLE + "---\n" + SIMPLE, state_dir=state)
+        session_id = self.new_session()
+        first = self.client.post(
+            f"/session/{session_id}/prompt", json={"text": "第一轮"}, headers=self.headers()
+        ).json()
+        self.assertEqual(first["detail"], "finished")
+        self.client.__exit__(None, None, None)
+        #  进程在第二轮中途被杀：收尾没跑，清单停在开轮时写下的样子
+        manifest = state / "sessions" / f"{session_id}.json"
+        data = json.loads(manifest.read_text(encoding="utf-8"))
+        data["in_flight"] = {"turn": 2, "started_at": 1700000000.0}
+        manifest.write_text(json.dumps(data), encoding="utf-8")
+
+        for _ in range(2):  # 连着重启两次，标记不能丢
+            self.start(SIMPLE + "---\n" + SIMPLE, state_dir=state)
+            info = self.status(session_id)
+            self.assertEqual((info["status"], info["detail"]), ("idle", "interrupted_by_restart"))
+            self.assertEqual(info["lost_turn"], {"turn": 2, "started_at": 1700000000.0})
+            (recovered,) = self.events(session_id, limit=10)
+            self.assertEqual(recovered["kind"], "session.recovered")
+            self.assertEqual(recovered["lost_turn"]["turn"], 2)
+            self.client.__exit__(None, None, None)
+
+        self.start(SIMPLE + "---\n" + SIMPLE, state_dir=state)
+        again = self.client.post(
+            f"/session/{session_id}/prompt", json={"text": "重做"}, headers=self.headers()
+        ).json()
+        self.assertEqual(again["detail"], "finished")
+        self.assertIsNone(again["lost_turn"])
+        data = json.loads(manifest.read_text(encoding="utf-8"))
+        self.assertIsNone(data["in_flight"])
+        self.assertIsNone(data["lost_turn"])
+
     def test_session_locked_by_another_writer_is_skipped_not_fatal(self):
         from xiaoyu.session_log import SessionLog
 
