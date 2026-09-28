@@ -71,7 +71,9 @@
 
 from __future__ import annotations
 
+import contextlib
 import copy
+import json
 import re
 import threading
 import tomllib
@@ -105,6 +107,11 @@ MAX_ANSWER_CHARS = 4000
 MAX_FAILURE_CHARS = 1000
 #  resume 记录的滚动上限与"transcript 不得超过窗口多少"的闸（80%）
 MAX_RUNS = 16
+#  落盘存档的滚动上限（按会话）：比内存的宽——盘上放得下，句柄少变死链
+MAX_DISK_RUNS = 64
+#  句柄的形状（uuid4 hex 前 8 位）。resume_from 是模型填的，要拿它拼文件名，
+#  不合形状的一律不碰磁盘
+_RUN_ID_RE = re.compile(r"^[0-9a-f]{8}$")
 _SAFE_RESUME_RATIO = 0.8
 #  inherit = "distilled" 时父会话精简副本最多占子上下文窗口的比例
 _INHERIT_RATIO = 0.3
@@ -172,7 +179,11 @@ class AgentSpec:
 
 @dataclass
 class SubagentRun:
-    """一次委托的存档（resume_from 的取值来源）。纯内存，会话结束即弃。"""
+    """一次委托的存档（resume_from 的取值来源）。
+
+    内存里滚动保留；会话有日志文件时同时落盘到日志旁的存档目录（见 RunStore），
+    进程重启或 resume 之后历史里的句柄仍然接得上。
+    """
 
     id: str
     spec_name: str
@@ -187,20 +198,108 @@ class SubagentRun:
     workdir: Path | None = None
 
 
+def runs_dir_for(session_log_path: Path) -> Path:
+    """会话日志对应的委托存档目录：`<日志名>.runs/`，与日志同目录（不匹配 `*.jsonl`）。"""
+    return session_log_path.with_name(session_log_path.name + ".runs")
+
+
 class RunStore(dict):
-    """SubagentRun 存档 + 并发锁。
+    """SubagentRun 存档 + 并发锁 + 可选落盘。
 
     qixiang 的批量委托在工作线程里并发存档，dict 的滚动淘汰（读-改-写）
     需要锁护。做成 dict 子类：既有调用方/测试传普通 dict 也能跑
     （此时退回模块级兜底锁，见 _FALLBACK_STORE_LOCK）。
+
+    落盘：`locate` 给得出目录时，每次存档同时写一份 `<句柄>.json`。句柄写在
+    委托结论的尾部、随对话历史进了会话日志，而存档若只在内存，进程重启或
+    resume 之后历史里的句柄就全是死链。落盘是便利不是正确性前提：写不进去
+    只是退回纯内存的老样子。
     """
 
-    def __init__(self) -> None:
+    def __init__(self, locate: Callable[[], Path | None] | None = None) -> None:
         super().__init__()
         self.lock = threading.Lock()
         #  滚动淘汰上限。qixiang 会按批量大小抬高它——64 项的批出 64 个
         #  resume 句柄，16 格的存档转一圈就把报告里大半句柄变成死链
         self.capacity = MAX_RUNS
+        #  做成回调而不是路径：会话日志可能在存档构造之后才挂上
+        self._locate = locate
+        #  只读的额外来源：resume 把另一场会话的历史接进来时，那场会话的存档目录
+        self.sources: list[Path] = []
+
+    def directory(self) -> Path | None:
+        if self._locate is None:
+            return None
+        try:
+            return self._locate()
+        except Exception:  # noqa: BLE001 - 定位失败等于没有落盘位置，不拖垮委托
+            return None
+
+    def persist(self, run: SubagentRun) -> None:
+        directory = self.directory()
+        if directory is None:
+            return
+        payload = {
+            "id": run.id,
+            "spec_name": run.spec_name,
+            "model": run.model,
+            "messages": run.messages,
+            "worktree": str(run.worktree) if run.worktree is not None else None,
+            "isolated": run.isolated,
+            "workdir": str(run.workdir) if run.workdir is not None else None,
+        }
+        try:
+            #  transcript 里有工具输出，可能带着密钥：仅本人可读
+            fsguard.write_atomic(
+                directory / f"{run.id}.json",
+                json.dumps(payload, ensure_ascii=False, default=str),
+                private=True,
+            )
+        except (OSError, TypeError, ValueError):
+            return
+        self._prune(directory)
+
+    def _prune(self, directory: Path) -> None:
+        limit = max(MAX_DISK_RUNS, int(self.capacity))
+        with contextlib.suppress(OSError):
+            files = sorted(directory.glob("*.json"), key=lambda path: path.stat().st_mtime)
+            for stale in files[: max(0, len(files) - limit)]:
+                with contextlib.suppress(OSError):
+                    stale.unlink()
+
+    def recall(self, run_id: str) -> SubagentRun | None:
+        """内存里没有时从盘上找：先本会话的存档目录，再各个只读来源。"""
+        if not _RUN_ID_RE.match(run_id):
+            return None
+        own = self.directory()
+        for directory in ([own] if own is not None else []) + self.sources:
+            run = _read_run(directory / f"{run_id}.json", run_id)
+            if run is not None:
+                return run
+        return None
+
+
+def _read_run(path: Path, run_id: str) -> SubagentRun | None:
+    """读一份落盘的存档；文件不在、读不出、形状不对都当没有。"""
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    if not isinstance(data, dict) or data.get("id") != run_id:
+        return None
+    messages = data.get("messages")
+    if not isinstance(messages, list) or not all(isinstance(item, dict) for item in messages):
+        return None
+    worktree_path, workdir = data.get("worktree"), data.get("workdir")
+    return SubagentRun(
+        id=run_id,
+        spec_name=str(data.get("spec_name", "")),
+        model=str(data.get("model", "")),
+        messages=messages,
+        worktree=Path(worktree_path) if isinstance(worktree_path, str) else None,
+        isolated=bool(data.get("isolated")),
+        workdir=Path(workdir) if isinstance(workdir, str) else None,
+    )
 
 
 #  普通 dict 存档的兜底锁（测试直传 dict；单线程场景锁开销可忽略）
@@ -564,6 +663,9 @@ def execute_delegation(
     if rid is not None:
         with lock:
             record = store.get(rid)
+        if record is None and isinstance(store, RunStore):
+            #  内存里没有（滚动淘汰了，或这是重启 / resume 之后的新进程）：盘上找
+            record = store.recall(rid)
         if record is None:
             return DelegationResult(
                 error=(
@@ -847,25 +949,29 @@ def execute_delegation(
 
     #  -- 存档（失败的也记：从 failed 恢复继续修是 resume 的正当用法） --
     run_id = uuid.uuid4().hex[:8]
+    run = SubagentRun(
+        id=run_id,
+        spec_name=spec.name,
+        model=model,
+        messages=copy.deepcopy(sub_agent.messages),
+        worktree=kept,
+        #  隔离意图随存档传下去：只读追问轮、fail-open 退回主工作区的那次
+        #  都不改变"这条线本该隔离"
+        isolated=(
+            created is not None
+            or inherited_wt is not None
+            or bool(record is not None and record.isolated)
+        ),
+        workdir=workdir,
+    )
     with lock:
-        store[run_id] = SubagentRun(
-            id=run_id,
-            spec_name=spec.name,
-            model=model,
-            messages=copy.deepcopy(sub_agent.messages),
-            worktree=kept,
-            #  隔离意图随存档传下去：只读追问轮、fail-open 退回主工作区的那次
-            #  都不改变"这条线本该隔离"
-            isolated=(
-                created is not None
-                or inherited_wt is not None
-                or bool(record is not None and record.isolated)
-            ),
-            workdir=workdir,
-        )
+        store[run_id] = run
         limit = max(MAX_RUNS, int(getattr(store, "capacity", MAX_RUNS)))
         while len(store) > limit:
             store.pop(next(iter(store)))
+    if isinstance(store, RunStore):
+        #  写盘放在锁外：批量委托并发收工时不该排队等磁盘
+        store.persist(run)
 
     if not failure:
         sink.emit(Notice(f"  🤖 {spec.name} 完成：{len(sub_agent.trace)} 次工具调用"))

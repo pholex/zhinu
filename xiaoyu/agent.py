@@ -1197,14 +1197,22 @@ class Agent:
         #  声明式 subagent（agents/*.toml）：挂成与 explore
         #  同形态的委托工具。allow_explore 兼作"不套娃"闸门——子 agent 不再挂
         if nesting_ok and config.enable_agents:
-            from .agents import RunStore, load_agent_specs, make_subagent_tool
+            from .agents import RunStore, load_agent_specs, make_subagent_tool, runs_dir_for
 
             agent_specs, spec_problems = load_agent_specs(config.workspace)
             for problem in spec_problems:
                 self.sink.emit(Notice(f"[agents/：{problem}]", "warn"))
             #  resume 存档跨 spec 共享一本：句柄全局唯一，spec 归属在记录里查。
             #  RunStore 自带锁——七襄的批量委托在工作线程里并发存档
-            subagent_runs = RunStore()
+            #  有会话日志就落盘到它旁边：重启 / resume 之后历史里的句柄还接得上
+            subagent_runs = RunStore(
+                locate=lambda: (
+                    runs_dir_for(Path(path))
+                    if (path := getattr(self.session_log, "path", None))
+                    else None
+                )
+            )
+            self.subagent_runs = subagent_runs
             mounted_specs = []
             for spec in agent_specs:
                 if self.toolbox.get(spec.name) is not None:
@@ -1987,6 +1995,13 @@ class Agent:
             self._history_rewritten()
         if self.session_log and source:
             self.session_log.event("resumed_from", source=source)
+        if source and (runs := getattr(self, "subagent_runs", None)) is not None:
+            #  接进来的历史里带着那场会话的委托句柄：存档在它的日志旁边
+            from .agents import runs_dir_for
+
+            origin = runs_dir_for(Path(source))
+            if origin not in runs.sources:
+                runs.sources.append(origin)
         #  环境播报基线：来源文件里有就接上，没有就按未知处理——下一步把
         #  当前环境完整说一遍，不赌模型记得上次会话的环境
         if messages:
