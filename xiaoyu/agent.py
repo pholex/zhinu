@@ -914,10 +914,10 @@ class Agent:
                     notify=lambda text: self.sink.emit(Notice(text, "warn")),
                 )
         #  SKILL.md 技能：启动时扫描一次，索引要写进 system prompt，必须先于它构建
-        self.skills = skills.scan_skills() if config.enable_skills else []
+        self.skills = self._scan_skills() if config.enable_skills else []
         #  来源目录指纹：轮首差量检测（_refresh_skills）靠它把"无变化"的轮次
         #  压到几次 stat，不必每轮重读全部 frontmatter
-        self._skills_fingerprint = skills.sources_fingerprint() if config.enable_skills else ()
+        self._skills_fingerprint = self._skill_sources_state() if config.enable_skills else ()
         #  本会话已加载过的技能名：重复加载时给模型提示，省一轮全文
         self._loaded_skills: set[str] = set()
         #  自上次 update_plan 以来的执行类工具（bash/browser）调用数：
@@ -1197,14 +1197,22 @@ class Agent:
         #  声明式 subagent（agents/*.toml）：挂成与 explore
         #  同形态的委托工具。allow_explore 兼作"不套娃"闸门——子 agent 不再挂
         if nesting_ok and config.enable_agents:
-            from .agents import RunStore, load_agent_specs, make_subagent_tool
+            from .agents import RunStore, load_agent_specs, make_subagent_tool, runs_dir_for
 
             agent_specs, spec_problems = load_agent_specs(config.workspace)
             for problem in spec_problems:
                 self.sink.emit(Notice(f"[agents/：{problem}]", "warn"))
             #  resume 存档跨 spec 共享一本：句柄全局唯一，spec 归属在记录里查。
             #  RunStore 自带锁——七襄的批量委托在工作线程里并发存档
-            subagent_runs = RunStore()
+            #  有会话日志就落盘到它旁边：重启 / resume 之后历史里的句柄还接得上
+            subagent_runs = RunStore(
+                locate=lambda: (
+                    runs_dir_for(Path(path))
+                    if (path := getattr(self.session_log, "path", None))
+                    else None
+                )
+            )
+            self.subagent_runs = subagent_runs
             mounted_specs = []
             for spec in agent_specs:
                 if self.toolbox.get(spec.name) is not None:
@@ -1731,14 +1739,26 @@ class Agent:
             "确实无法在本机验证时，如实告诉用户「未经验证」，不要宣称已测试。"
         )
 
+    def _skills_workspace(self) -> Path | None:
+        """扫工作区自带技能时用的工作区；没过信任门的工作区不扫（返回 None）。"""
+        if getattr(self.config, "workspace_trusted", True):
+            return self.config.workspace
+        return None
+
+    def _scan_skills(self) -> list[skills.Skill]:
+        return skills.scan_skills(self._skills_workspace())
+
+    def _skill_sources_state(self) -> tuple:
+        return skills.sources_fingerprint(self._skills_workspace())
+
     def _load_skill(self, name: str) -> str:
         found = next((item for item in self.skills if item.name == name), None)
         if found is None and self.config.enable_skills:
             #  未命中先重扫磁盘再判死刑：技能可能是**本轮**刚落盘的（模型自己
             #  写的），轮首的 _refresh_skills 看不到轮内的新文件。skill 工具
             #  以磁盘为真，索引只是快照。
-            self.skills = skills.scan_skills()
-            self._skills_fingerprint = skills.sources_fingerprint()
+            self.skills = self._scan_skills()
+            self._skills_fingerprint = self._skill_sources_state()
             found = next((item for item in self.skills if item.name == name), None)
         if found is None:
             known = ", ".join(skill.name for skill in self.skills) or "（无）"
@@ -1832,11 +1852,11 @@ class Agent:
         """
         if not self.config.enable_skills:
             return
-        fingerprint = skills.sources_fingerprint()
+        fingerprint = self._skill_sources_state()
         if fingerprint == self._skills_fingerprint:
             return
         self._skills_fingerprint = fingerprint
-        fresh = skills.scan_skills()
+        fresh = self._scan_skills()
         old_names = {item.name for item in self.skills}
         new_names = {item.name for item in fresh}
         self.skills = fresh
@@ -1876,8 +1896,8 @@ class Agent:
         """
         old_names = {item.name for item in self.skills}
         if self.config.enable_skills:
-            self.skills = skills.scan_skills()
-            self._skills_fingerprint = skills.sources_fingerprint()
+            self.skills = self._scan_skills()
+            self._skills_fingerprint = self._skill_sources_state()
         else:
             self.skills = []
             self._skills_fingerprint = ()
@@ -1987,6 +2007,13 @@ class Agent:
             self._history_rewritten()
         if self.session_log and source:
             self.session_log.event("resumed_from", source=source)
+        if source and (runs := getattr(self, "subagent_runs", None)) is not None:
+            #  接进来的历史里带着那场会话的委托句柄：存档在它的日志旁边
+            from .agents import runs_dir_for
+
+            origin = runs_dir_for(Path(source))
+            if origin not in runs.sources:
+                runs.sources.append(origin)
         #  环境播报基线：来源文件里有就接上，没有就按未知处理——下一步把
         #  当前环境完整说一遍，不赌模型记得上次会话的环境
         if messages:

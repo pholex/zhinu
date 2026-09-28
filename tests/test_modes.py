@@ -122,6 +122,19 @@ class AutoApprovesTest(unittest.TestCase):
             with self.subTest(command=command):
                 self.assertFalse(self.approves("bash", {"command": command}))
 
+    def test_remote_command_still_asks(self) -> None:
+        """ssh 对端的 shell 不在沙箱里——对端就是本机时等于绕出去。"""
+        for command in ("ssh localhost id", "ssh build@ci.example.com uptime",
+                        "scp ./x localhost:/etc/x", "rsync -a ./ host:/tmp/y/",
+                        "env ssh h id", "bash -c 'sftp h'"):
+            with self.subTest(command=command):
+                self.assertFalse(self.approves("bash", {"command": command}))
+
+    def test_local_copy_is_not_remote(self) -> None:
+        for command in ("rsync -a src/ dst/", "scp a b"):
+            with self.subTest(command=command):
+                self.assertTrue(self.approves("bash", {"command": command}))
+
     def test_empty_command_asks(self) -> None:
         self.assertFalse(self.approves("bash", {"command": "   "}))
         self.assertFalse(self.approves("bash", {}))

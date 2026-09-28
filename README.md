@@ -28,7 +28,7 @@
 ```bash
 pip install "xiaoyu-agent[tui]"        # [tui]：补全 / 历史 / 粘贴折叠 / 贴图 / diff 高亮
 pip install "xiaoyu-agent[tui,serve]"  # 还要 HTTP API（n8n / Dify 编排）就带上 [serve]
-xiaoyu doctor                          # 体检：凭据有无 / 沙箱 / 磁盘 / MCP 配置（--json 给脚本，任一 FAIL 退出码 1）
+xiaoyu doctor                          # 体检：版本与安装方式 / 凭据有无 / 沙箱 / 磁盘 / MCP 配置（--json 给脚本，任一 FAIL 退出码 1）
 xiaoyu update                          # 升级（已装 serve 时自动一并升级）
 xiaoyu uninstall                       # 卸载；--purge 连配置目录一起删
 ```
@@ -87,7 +87,7 @@ REPL 里：`/help` `/tools` `/skills` `/model` `/effort` `/mode` `/usage` `/cont
 
 | 档 | 会不会问你 |
 |---|---|
-| **auto**（出厂默认） | 工作区内改文件、沙箱内跑命令免确认；危险命令、提权、写到工作区外仍要问 |
+| **auto**（出厂默认） | 工作区内改文件、沙箱内跑命令免确认；危险命令、提权、到远程主机上执行、写到工作区外仍要问 |
 | **确认** | 写文件、执行命令逐条确认 |
 | **plan** | 只读规划态：交计划后要你批准才执行 |
 | **`--yolo`** | 全放行，一路跑到底 |

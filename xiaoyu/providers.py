@@ -25,7 +25,6 @@ from typing import Any
 from urllib.parse import urlsplit
 
 import httpx
-from openai import OpenAI
 
 from . import netproxy
 from .config import GATEWAY_KEY_ENVS, Config, MissingConfig, find_api_key
@@ -82,6 +81,28 @@ _DISCOVER_TIMEOUT = 5.0
 _CONNECT_TIMEOUT = 15.0
 
 
+def _openai_class() -> Any:
+    """OpenAI client 类，用到时才 import。
+
+    openai 包一次 import 约 0.25 秒，占整个 CLI 启动耗时的大头，而
+    `--version` / `--help` / doctor / sessions 这些路径根本不出网。类缓存在
+    模块全局的 `OpenAI` 名下：既免重复 import，也让按名字打桩的测试照旧生效。
+    """
+    cls = globals().get("OpenAI")
+    if cls is None:
+        from openai import OpenAI as cls
+
+        globals()["OpenAI"] = cls
+    return cls
+
+
+def __getattr__(name: str) -> Any:
+    #  模块外按 `providers.OpenAI` 取值（含测试打桩时读原值）走这里
+    if name == "OpenAI":
+        return _openai_class()
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+
 def request_timeout(seconds: float) -> httpx.Timeout:
     """把配置里的单个超时秒数摊成 httpx 的四段超时（建连短、读写长）。"""
     return httpx.Timeout(seconds, connect=min(_CONNECT_TIMEOUT, seconds))
@@ -92,7 +113,7 @@ def _discover_models(base_url: str, api_key: str, label: str) -> tuple[str, ...]
     元组：调用方据此**跳过注册**，绝不退化成通配（通配的具名 provider 会把一切
     模型名都吃掉、劫持网关路由）。失败只出声不抛——启动不该因端点没起来而崩。"""
     try:
-        page = OpenAI(
+        page = _openai_class()(
             base_url=base_url, api_key=api_key, http_client=netproxy.http_client()
         ).with_options(
             timeout=_DISCOVER_TIMEOUT
@@ -576,7 +597,7 @@ class Registry:
 
         self._clients[name] = maybe_record(
             wrap_transport(
-                OpenAI(
+                _openai_class()(
                     base_url=provider.base_url,
                     api_key=provider.api_key,
                     timeout=self._timeout,

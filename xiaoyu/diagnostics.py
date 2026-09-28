@@ -198,6 +198,68 @@ def check_python() -> Check:
     return Check("python", "ok", f"Python {version}", [sys.executable])
 
 
+#  PyPI 上的发行名（`xiaoyu` 这个名字是别人的包）
+_DISTRIBUTION = "xiaoyu-agent"
+
+
+def _install_form(dist: Any) -> str:
+    """这份安装是怎么来的：可编辑安装 / pipx / uv tool / pip。认不出就只报安装器名。"""
+    try:
+        direct = json.loads(dist.read_text("direct_url.json") or "{}")
+    except (OSError, ValueError):
+        direct = {}
+    if isinstance(direct, dict) and (direct.get("dir_info") or {}).get("editable"):
+        return "可编辑安装（指向源码目录）"
+    prefix = sys.prefix.replace("\\", "/").lower()
+    if "/pipx/" in prefix:
+        return "pipx"
+    if "/uv/tools/" in prefix:
+        return "uv tool"
+    try:
+        installer = (dist.read_text("INSTALLER") or "").strip()
+    except OSError:
+        installer = ""
+    return installer or "未知安装器"
+
+
+def check_install() -> Check:
+    """小羽自身：跑的是哪个版本、代码在哪、怎么装的。
+
+    报 bug 时最先要对的就是这三样。顺带抓一种安静的错位：安装记录的版本和
+    实际加载的代码不是同一版（可编辑安装之后只 git pull 没重装、或 sys.path
+    上有另一份源码盖住了装好的那份）——`xiaoyu update` 读的是安装记录，
+    错位时它报的"已是最新版本"说的不是正在跑的这份代码。
+    """
+    from importlib import metadata
+
+    from . import __version__
+
+    code = Path(__file__).resolve().parent
+    details = [f"代码位置：{code}"]
+    try:
+        dist = metadata.distribution(_DISTRIBUTION)
+    except metadata.PackageNotFoundError:
+        return Check(
+            "install", "ok", f"xiaoyu {__version__}（未安装，直接从源码目录运行）", details
+        )
+    form = _install_form(dist)
+    details.append(f"安装方式：{form}")
+    recorded = dist.version
+    if recorded != __version__:
+        details.append(f"安装记录：{recorded}（{getattr(dist, '_path', '位置未知')}）")
+        return Check(
+            "install", "warn",
+            f"xiaoyu {__version__}，但安装记录是 {recorded}",
+            details,
+            remedy=(
+                "在源码目录重跑 pip install -e . 刷新安装记录"
+                if form.startswith("可编辑")
+                else f"重装一次：pip install --force-reinstall {_DISTRIBUTION}=={__version__}"
+            ),
+        )
+    return Check("install", "ok", f"xiaoyu {__version__}（{form}）", details)
+
+
 def check_config_dir(config_dir: Path) -> Check:
     details = [str(config_dir)]
     if not config_dir.exists():
@@ -329,11 +391,43 @@ def check_bash_parser() -> Check:
     return Check("bash_parser", "ok", "命令解析器就绪（tree-sitter-bash）")
 
 
+#  env 里值是路径的键（按后缀认）。不按"值长得像绝对路径"认：`API_PREFIX=/v1`
+#  这类值也以 / 开头，却不是文件
+_PATH_ENV_SUFFIXES = ("_PATH", "_FILE", "_DIR", "_HOME", "_ROOT", "_CONFIG")
+
+
+def _dead_paths(entry: dict[str, Any]) -> list[str]:
+    """server 声明里指向不存在位置的绝对路径（args 与 env 两处）。
+
+    搬过目录、删过检出之后最常见的坏法：command 还在（npx / python），
+    参数里的脚本或数据目录没了——server 起得来，然后立刻退出。
+    占位符没兑现的值（`${VAR}`）不判，那是另一类问题。
+    """
+    candidates: list[str] = []
+    args = entry.get("args")
+    for arg in args if isinstance(args, list) else []:
+        if isinstance(arg, str) and not arg.startswith("-"):
+            candidates.append(arg)
+    env = entry.get("env")
+    for key, value in (env if isinstance(env, dict) else {}).items():
+        if isinstance(value, str) and str(key).upper().endswith(_PATH_ENV_SUFFIXES):
+            candidates.append(value)
+    dead: list[str] = []
+    for value in candidates:
+        if "${" in value or os.pathsep in value:
+            continue
+        expanded = os.path.expanduser(value)
+        if os.path.isabs(expanded) and not os.path.exists(expanded):
+            dead.append(value)
+    return dead
+
+
 def check_mcp_config(workspace: Path) -> Check:
     from . import mcp
 
     details: list[str] = []
     missing: list[str] = []
+    dead: list[str] = []
     status = "ok"
     total = 0
     for path in mcp.config_paths(workspace):
@@ -353,9 +447,16 @@ def check_mcp_config(workspace: Path) -> Check:
             command = entry.get("command") if isinstance(entry, dict) else None
             if not isinstance(command, str) or not command.strip() or entry.get("disabled"):
                 continue
-            #  只查"起不起得来"的第一步：命令在不在。不启动任何东西
-            if shutil.which(os.path.expanduser(command)) is None:
+            #  只查"起不起得来"的前两步：命令在不在、声明里的路径在不在。
+            #  不启动任何东西。找命令与真正启动时同一个函数（认配置里的 PATH）
+            env = entry.get("env")
+            declared = {
+                str(key): mcp._expand(str(value))
+                for key, value in (env if isinstance(env, dict) else {}).items()
+            }
+            if mcp.find_command(command, declared) is None:
                 missing.append(f"{name} 的启动命令 {command!r} 找不到")
+            dead += [f"{name} 的配置指向不存在的路径 {path!r}" for path in _dead_paths(entry)]
     if status == "fail":
         return Check("mcp_config", "fail", "MCP 配置文件损坏", details, remedy="修正 JSON 后重试")
     if not details:
@@ -363,8 +464,14 @@ def check_mcp_config(workspace: Path) -> Check:
     if missing:
         return Check(
             "mcp_config", "warn", f"{len(missing)} 个 MCP server 的启动命令找不到",
-            details + missing,
-            remedy="装上对应的程序，或在配置里把 command 写成绝对路径",
+            details + missing + dead,
+            remedy="装上对应的程序，或在配置的 env 里声明 PATH，或把 command 写成绝对路径",
+        )
+    if dead:
+        return Check(
+            "mcp_config", "warn", f"{len(dead)} 处 MCP 配置指向不存在的路径",
+            details + dead,
+            remedy="把配置里的路径改成现在的位置（目录搬过或检出被删）",
         )
     return Check("mcp_config", "ok", f"MCP 配置可解析（{total} 个 server）", details)
 
@@ -459,6 +566,7 @@ def run_doctor(workspace: Path | None = None) -> list[Check]:
     workspace = (workspace or Path.cwd()).resolve()
     config_dir = user_config_dir()
     checks = [
+        check_install(),
         check_python(),
         check_config_dir(config_dir),
         check_disk({"配置目录": config_dir, "工作区": workspace}),

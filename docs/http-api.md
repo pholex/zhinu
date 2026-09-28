@@ -59,6 +59,7 @@ curl -X POST :8420/session/$SID/prompt -d '{"text":"评估这个 PR 能不能合
 | `idle` | `interrupted` | 上一轮被 `/abort` 收掉 |
 | `idle` | `budget_reached` | **预算耗尽**（`budget_reason` 有原因），再提交 `409`，去 `/budget` 调高或撤掉 |
 | `idle` | `recovered` | serve 重启后从清单接回来的会话，还没跑过新的一轮 |
+| `idle` | `interrupted_by_restart` | 同上，但重启时**有一轮正在跑**：它没走到收尾，`lost_turn` 说明是第几轮、何时开始 |
 | `error` | `failed` | 上一轮抛异常，`error` 字段有原文 |
 
 `waiting_for_approval` 单独占一格是这一层最要紧的设计：编排器只看"还在跑"的话，
@@ -289,6 +290,24 @@ curl -X POST :8420/agent/agent-3f9c… -d '{"config":{"mode":"plan"}}'  # → ve
 - `DELETE /agent/{id}` 是**归档**不是删除：只读、不再接受新会话、老会话照跑、历史版本
   可查（`GET /agent/{id}?versions=true`）。
 
+## 分叉：从另一个会话的历史起步
+
+```bash
+curl -X POST :8420/session -d '{"fork_from":"sess-…"}'                          # 带走全部历史
+curl -X POST :8420/session -d '{"fork_from":{"session_id":"sess-…","turns":3}}'  # 只带前 3 轮
+```
+
+新会话拿到的是来源历史的**副本**，写进它自己的会话日志；来源会话不受影响，之后关掉、
+删掉也不影响分叉出去的那个。适合"调研做完了，接下来分几路各试一种做法"：前面的
+上下文不必每路重跑一遍。
+
+- 没另给 `workspace` / `agent` / `model` / `mode` 就沿用来源的工作区与 agent 版本；
+  给了就以这次请求为准（比如同一段历史换个模型接着做）。
+- **预算不沿用**：新会话的用量从零记起，要设预算在这次请求里给。
+- 来源正在跑一轮时回 `409`——轮中的历史里有没配对的工具调用，抄走的是半截状态。
+- `turns` 超出来源的轮数回 `400`，错误里写明可取范围。
+- 新会话的事件流以 `session.forked`（带来源 id 与消息条数）开头。
+
 ## 预算（硬闸，不是提醒）
 
 ```bash
@@ -320,6 +339,12 @@ Windows 为 `%APPDATA%\xiaoyu\serve\<root slug>\`；启动后 `GET /health` 的 
 
 - 会话自动接回（`detail=recovered`），历史来自会话日志（`Agent.restore`，未配对的
   tool_call 会补"结果未知"），配置、agent 引用、预算、`turns` 随清单回来；
+- **在途的那一轮会被标出来**：开轮时清单就记下在途标记，收尾时清掉。重启时标记还在，
+  说明那一轮随进程一起没了——会话以 `detail=interrupted_by_restart` 接回，`/status` 的
+  `lost_turn`（`{"turn": 3, "started_at": …}`）与 `session.recovered` 事件里都带着它。
+  那一轮做到哪一步、副作用落没落地，服务端说不清：历史里能看到它已经发出的工具调用
+  （没等到结果的会补"结果未知"），要不要重做由编排方判断。标记留到下一轮开跑才清，
+  连着重启两次也不会丢；
 - **事件缓冲不落盘**——重启前的事件计入 `dropped_events`，`seq` 从上次水位**接着编号**：
   客户端手里的游标仍单调，拉到的是"中间缺一段"（协议里本来就有表达），不是"序号倒流"；
 - 恢复失败的清单（工作区没挂上、provider 没配）留在盘上、stderr 打一行、跳过——不删，
@@ -367,7 +392,7 @@ Windows 为 `%APPDATA%\xiaoyu\serve\<root slug>\`；启动后 `GET /health` 的 
 | GET | `/diagnostics` | 进程自诊断：RSS / 线程 / fd + 在册计量（会话、在途请求、MCP 连接、后台任务）。有 token 门——它暴露负载形态 |
 | POST · GET | `/agent` | 新建 agent 对象 · 列出 |
 | GET · POST · DELETE | `/agent/{id}` | 详情（`?versions=true`）· 更新→新版本 · 归档 |
-| POST | `/session` | 新建会话（`workspace` / `model` / `mode`，或 `agent` 引用 + `budget`） |
+| POST | `/session` | 新建会话（`workspace` / `model` / `mode`，或 `agent` 引用 + `budget`；`fork_from` 从另一个会话分叉） |
 | GET | `/session` | 列出会话 |
 | GET · DELETE | `/session/{id}` | 详情 · 关闭 |
 | POST | `/session/{id}/prompt` | 跑一轮，等结果 |

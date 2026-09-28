@@ -67,6 +67,8 @@ def make_explore_tool(
         sub_config = Config(
             base_url=config.base_url,
             model=config.explore_model,
+            #  备用链随主会话（理由见 agents.execute_delegation 的同一处）
+            fallback_models=list(config.fallback_models),
             summary_model=config.summary_model,
             explore_model=config.explore_model,
             vision_fallback_model=config.vision_fallback_model,

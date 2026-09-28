@@ -50,7 +50,8 @@ MODES: tuple[Mode, ...] = (
     Mode(DEFAULT, "", "确认", "写文件和执行命令逐条确认"),
     Mode(
         AUTO, "⏵⏵", "auto",
-        "工作区内改文件、沙箱内跑命令都自动放行；危险命令、提权、写到工作区外仍要你确认",
+        "工作区内改文件、沙箱内跑命令都自动放行；"
+        "危险命令、提权、到远程主机上执行、写到工作区外仍要你确认",
         style="text.accent",
     ),
     Mode(
@@ -173,6 +174,10 @@ def auto_approves(
             return False
         #  提权是唯一可能捅穿沙箱的动作（多半也会直接失败），别让它无声发生
         if command_check.privileged_command(command):
+            return False
+        #  ssh 一族的效果落在对端主机的 shell 里，沙箱管不到——对端是本机时
+        #  （ssh localhost …）等于从沙箱里绕出去
+        if command_check.remote_command(command):
             return False
         return True
     #  读工具越界（read_file/grep/list_files 读到工作区外）走到这里：

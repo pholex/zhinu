@@ -226,16 +226,32 @@ class ServerSpec:
 _ENV_PATTERN = re.compile(r"\$\{(?:env:)?([A-Za-z_][A-Za-z0-9_]*)\}")
 
 
-def _expand(value: str, extra: dict[str, str] | None = None) -> str:
+def _from_keychain(name: str) -> str | None:
+    """按变量名去 macOS Keychain 取值（service 与变量名同名）；别的平台恒为 None。"""
+    if sys.platform != "darwin":
+        return None
+    from . import config as config_module
+
+    return config_module._read_from_keychain(name)
+
+
+def _expand(value: str, extra: dict[str, str] | None = None, keychain: bool = False) -> str:
     #  未定义时保留 ${...} 字面量而非空串。
     #  extra = 宿主注入的环境（Config.extra_env）：daemon 嵌入场景没有 shell env，
     #  密钥走 Keychain→extra_env 进来，展开时优先于 os.environ——否则工作区
     #  .mcp.json 里的 ${VAR} 占位在无人值守进程里永远兑现不了。
+    #  keychain = 环境里都没有时再按同名去 Keychain 找。只给用户亲手写的声明开
+    #  （见 parse_server_mapping）：模型的 key 能放 Keychain，MCP 的令牌却只能
+    #  明文进 .env，说不过去；但这条路不能开给别人写的配置。
     def lookup(m: re.Match[str]) -> str:
         name = m.group(1)
         if extra and name in extra:
             return extra[name]
-        return os.environ.get(name, m.group(0))
+        if (found := os.environ.get(name)) is not None:
+            return found
+        if keychain and (secret := _from_keychain(name)):
+            return secret
+        return m.group(0)
 
     return _ENV_PATTERN.sub(lookup, value)
 
@@ -295,6 +311,29 @@ def _safe_env(
     if extra:
         env.update(extra)
     return env
+
+
+def declared_path(env: dict[str, str] | None) -> str:
+    """配置的 env 块里声明的 PATH（Windows 上键名大小写不敏感），没声明返回空串。"""
+    for key, value in (env or {}).items():
+        if key.upper() == "PATH" and isinstance(value, str):
+            return value
+    return ""
+
+
+def find_command(command: str, env: dict[str, str] | None = None) -> str | None:
+    """找 stdio server 的启动命令，返回可执行文件路径；找不到返回 None。
+
+    配置里声明了 PATH 就先按它找，找不到再退回本进程的 PATH。小羽被编辑器
+    （ACP）或 systemd（serve）拉起时自己的 PATH 往往很短，npx / uvx 都不在里面；
+    用户在 env 块里写了 PATH，server 进程拿得到，找启动命令这一步却不看——
+    结果只能把 command 写成绝对路径。退回本进程 PATH 是为了不破坏现状：
+    声明的 PATH 只列了 server 运行时要的目录、启动命令在别处，此前是起得来的。
+    """
+    expanded = os.path.expanduser(command)
+    if (declared := declared_path(env)) and (found := shutil.which(expanded, path=declared)):
+        return found
+    return shutil.which(expanded)
 
 
 #  server 报错文本里的凭据脱敏：server 把请求
@@ -394,7 +433,10 @@ def load_server_specs(
                     f"[工作区未受信任：{path} 里的 MCP server 不启动]", file=sys.stderr
                 )
             continue
-        for spec in _parse_config_file(path, extra_env):
+        #  Keychain 回落只给用户级文件：工作区那份是仓库作者写的
+        for spec in _parse_config_file(
+            path, extra_env, keychain=path != workspace / WORKSPACE_FILE
+        ):
             merged[spec.name] = spec
     specs = []
     for spec in merged.values():
@@ -436,7 +478,7 @@ def spec_fingerprint(spec: ServerSpec) -> str:
 
 
 def _parse_config_file(
-    path: Path, extra_env: dict[str, str] | None = None
+    path: Path, extra_env: dict[str, str] | None = None, keychain: bool = False
 ) -> list[ServerSpec]:
     if not path.is_file():
         return []
@@ -451,7 +493,7 @@ def _parse_config_file(
     servers = data.get("mcpServers")
     if not isinstance(servers, dict):
         return []
-    specs, problems = parse_server_mapping(servers, extra_env=extra_env)
+    specs, problems = parse_server_mapping(servers, extra_env=extra_env, keychain=keychain)
     for problem in problems:
         print(f"[MCP 配置 {path}：{problem}]", file=sys.stderr)
     return specs
@@ -462,6 +504,7 @@ def parse_server_mapping(
     *,
     extra_env: dict[str, str] | None = None,
     expand: bool = True,
+    keychain: bool = False,
 ) -> tuple[list[ServerSpec], list[str]]:
     """`mcpServers` 形状（name → 声明对象）→ (ServerSpec 列表, 跳过/忽略说明)。
 
@@ -470,16 +513,22 @@ def parse_server_mapping(
     `expand=False` 时 `${VAR}` 不兑现（协议通道来的值是对端算好的终值；拿本
     进程环境去改写它既不合预期、也给了对端一条读服务端环境变量的路——与 acp
     的 client_server_specs 同一条边界）。
+
+    `keychain=True` 时环境里没有的变量再按同名去 macOS Keychain 找。只该给
+    **用户级配置文件**开：工作区 `.mcp.json` 是仓库作者写的，开了等于让仓库按
+    名字探你的 Keychain。插件包装进来的条目（带 `_plugin` 记号）虽然也在用户级
+    文件里，声明同样出自别人之手，一样不给。
     """
     specs: list[ServerSpec] = []
     problems: list[str] = []
 
     unresolved: dict[str, None] = {}
+    own_words = False
 
     def ex(value: Any) -> str:
         if not expand:
             return str(value)
-        text = _expand(str(value), extra_env)
+        text = _expand(str(value), extra_env, keychain=keychain and own_words)
         #  展开之后还在的占位就是没定义的变量：字面量会原样递给 server——写在
         #  headers 里就是把 "${TOKEN}" 这几个字符当令牌发给远端
         for variable in _ENV_PATTERN.findall(text):
@@ -491,6 +540,7 @@ def parse_server_mapping(
         if not isinstance(raw, dict):
             problems.append(f"{name!r} 不是对象，已忽略")
             continue
+        own_words = not raw.get("_plugin")
         kind = raw.get("type")
         #  形状即类型：有 url 就是远端（Streamable HTTP），有 command 就是 stdio。
         #  type 字段只用来纠错，不作为唯一判据——各家生态里它时有时无。
@@ -1051,14 +1101,20 @@ class McpServer:
         #  ~ 展开 + which：Windows 上 npx/uvx 这类 .cmd 入口不经 shell 找不到，
         #  which 一次全平台通吃。
         expanded = os.path.expanduser(self.spec.command)
-        command = shutil.which(expanded)
+        command = find_command(self.spec.command, self.spec.env)
         if command is None:
             #  不拦的话经看门狗包一层照样起得来，然后立刻退出——报出来的是
             #  "server 进程已退出"，真因（命令不存在）只在日志文件里
+            searched = [
+                part
+                for source in (declared_path(self.spec.env), os.environ.get("PATH", ""))
+                for part in source.split(os.pathsep)
+                if part
+            ]
             where = (
                 "文件不存在或不可执行"
                 if os.sep in expanded or (os.altsep and os.altsep in expanded)
-                else f"PATH 的 {len(os.environ.get('PATH', '').split(os.pathsep))} 个目录里都没有"
+                else f"PATH 的 {len(dict.fromkeys(searched))} 个目录里都没有"
             )
             raise McpError(f"找不到启动命令 {self.spec.command!r}（{where}）")
         #  环境走 _safe_env 白名单（见模块 docstring）；配置里声明的 env 覆盖

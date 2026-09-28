@@ -1,7 +1,10 @@
 """SKILL.md 技能：与 Anthropic / agentskills.io 规范同形态。
 
-- 扫描目录（前者优先）：`~/.agents/skills/`（跨客户端规范库）、`<用户配置目录>/skills/`，
+- 扫描目录（前者优先）：`~/.agents/skills/`（跨客户端规范库）、`<用户配置目录>/skills/`、
+  工作区自带的 `<工作区>/.xiaoyu/skills/` 与 `<工作区>/.agents/skills/`，
   以及插件包带来的 `<用户配置目录>/plugins/<包名>/skills/`（见 `plugins.py`）
+- 工作区自带的技能排在用户自己的之后：同名时用户的胜出，仓库不能顶掉你已有的技能；
+  工作区没过信任门（见 `folder_trust.py`）时整类不加载
 - 每个技能一个目录，内含 `SKILL.md`：YAML frontmatter（name / description）+ markdown 正文
 - 渐进披露：索引（名字 + 一句话描述）进 system prompt，
   正文由模型用 `skill` 工具按需加载——技能再多也不占常驻上下文
@@ -30,6 +33,7 @@ class Skill:
     description: str
     path: Path  # SKILL.md 的完整路径
     plugin: str | None = None  # 来自哪个插件包；None = 散装技能目录
+    project: bool = False  # 工作区自带的（随仓库来的，不是用户自己装的）
     #  负例（"别用于…"）：写进索引帮模型排除误触发。实测负例能显著降低误选，
     #  且比在 description 里堆正例更省——它落在描述尾部，预算紧张时最先被截掉
     when_not: str = ""
@@ -41,6 +45,11 @@ class SkillSource:
 
     directory: Path
     plugin: str | None = None
+    project: bool = False
+
+
+#  工作区里放技能的位置（相对工作区根）：小羽自己的目录在前，跨客户端约定的在后
+PROJECT_SKILL_DIRS = ((".xiaoyu", "skills"), (".agents", "skills"))
 
 
 def skill_dirs() -> list[Path]:
@@ -58,18 +67,42 @@ def skill_dirs() -> list[Path]:
     return [*dirs, user_config_dir() / "skills"]
 
 
-def skill_sources() -> list[SkillSource]:
-    """全部扫描来源：散装目录在前，插件包在后。
+def project_skill_dirs(workspace: Path) -> list[Path]:
+    """工作区自带技能的目录（存在与否不论）。"""
+    return [workspace.joinpath(*parts) for parts in PROJECT_SKILL_DIRS]
+
+
+def has_project_skills(workspace: Path) -> bool:
+    """工作区里有没有自带技能（给"这次没加载"的提示用）。探测出错当没有。"""
+    try:
+        return any(
+            next(directory.glob("*/SKILL.md"), None) is not None
+            for directory in project_skill_dirs(workspace)
+        )
+    except OSError:
+        return False
+
+
+def skill_sources(workspace: Path | None = None) -> list[SkillSource]:
+    """全部扫描来源：散装目录在前，工作区自带的居中，插件包在后。
 
     插件排后面不是因为它次要，而是因为它带命名空间、本来就不会和散装技能撞名——
     排序只决定散装目录之间谁胜出。
+
+    `workspace` 给了才扫工作区自带的技能；要不要给由调用方按信任门的结论定
+    （不信任的工作区传 None）。XIAOYU_SKILLS_DIR 指定了技能目录时不扫工作区：
+    那个开关的语义就是"只认它"。
     """
     sources = [SkillSource(directory) for directory in skill_dirs()]
+    if workspace is not None and not os.environ.get("XIAOYU_SKILLS_DIR", "").strip():
+        sources += [
+            SkillSource(directory, project=True) for directory in project_skill_dirs(workspace)
+        ]
     sources += [SkillSource(path, plugin=name) for name, path in plugins.installed_skill_dirs()]
     return sources
 
 
-def sources_fingerprint() -> tuple:
+def sources_fingerprint(workspace: Path | None = None) -> tuple:
     """扫描来源目录的轻量指纹（路径 + 命名空间 + mtime）。
 
     给轮首的技能差量检测用：技能的**增删**表现为来源目录下子目录的增删，
@@ -79,7 +112,7 @@ def sources_fingerprint() -> tuple:
     不受影响。
     """
     rows = []
-    for source in skill_sources():
+    for source in skill_sources(workspace):
         try:
             mtime = source.directory.stat().st_mtime_ns
         except OSError:
@@ -230,7 +263,7 @@ def strip_frontmatter(text: str) -> str:
     return text
 
 
-def scan_skills() -> list[Skill]:
+def scan_skills(workspace: Path | None = None) -> list[Skill]:
     """扫描所有来源。同名技能第一个来源胜出，被盖掉的打一行 stderr。
 
     撞名以前是静默丢弃：装了两份同名技能时，模型加载到的是哪一份全凭目录顺序，
@@ -238,7 +271,7 @@ def scan_skills() -> list[Skill]:
     撞名只可能发生在散装目录之间，报出来的量很小。
     """
     found: dict[str, Skill] = {}
-    for source in skill_sources():
+    for source in skill_sources(workspace):
         if not source.directory.is_dir():
             continue
         for skill_md in sorted(source.directory.glob("*/SKILL.md")):
@@ -276,6 +309,7 @@ def scan_skills() -> list[Skill]:
                 description=meta.get("description", "").strip(),
                 path=skill_md,
                 plugin=source.plugin,
+                project=source.project,
                 when_not=meta.get("when_not", "").strip(),
             )
     return list(found.values())

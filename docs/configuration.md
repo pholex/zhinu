@@ -56,7 +56,7 @@ XIAOYU_API_KEY=<key>
 | `XIAOYU_EXPLORE_MODEL` | `deepseek-flash` | `explore` 子 agent 用的模型 |
 | `XIAOYU_BASE_URL` | — | OpenAI 兼容网关端点 |
 | `XIAOYU_API_KEY` | — | 网关 key（也认 `LITELLM_API_KEY`） |
-| `XIAOYU_FALLBACK_MODELS` | —（不降级） | 备用模型链，逗号分隔，主模型重试耗尽后依次切 |
+| `XIAOYU_FALLBACK_MODELS` | —（不降级） | 备用模型链，逗号分隔，主模型重试耗尽后依次切。委托出去的子 agent（含 explore、七襄、斗巧、宸枢成员）沿用同一条链，即使那次委托另外点名了模型 |
 | `XIAOYU_PROVIDERS` | 直连 → 网关 | 覆盖 provider 优先级（如 `gateway,deepseek` = 临时全走网关） |
 | `XIAOYU_VISION_MODELS` | — | 网关后面挂的视觉模型点名（`*` = 一律放行） |
 | `XIAOYU_SIGNATURE_MODELS` | — | 网关后面挂的签名型号点名（Gemini 系，工具重放需带回 thought_signature；`*` = 一律） |
@@ -84,8 +84,8 @@ XIAOYU_API_KEY=<key>
 | 变量 | 说明 |
 |---|---|
 | `XIAOYU_ENABLE_EXPLORE` | `explore` 检索子 agent |
-| `XIAOYU_ENABLE_SKILLS` | 扫描 `~/.agents/skills/` 与已装插件包下的 SKILL.md |
-| `XIAOYU_SKILLS_DIR` | 覆盖技能扫描目录（`os.pathsep` 分隔）：给了就只认它、不混默认目录（宿主指定技能库 / 测试隔离用） |
+| `XIAOYU_ENABLE_SKILLS` | 扫描 `~/.agents/skills/`、工作区自带的 `.xiaoyu/skills/` 与 `.agents/skills/`、已装插件包下的 SKILL.md |
+| `XIAOYU_SKILLS_DIR` | 覆盖技能扫描目录（`os.pathsep` 分隔）：给了就只认它、不混默认目录，工作区自带的也不扫（宿主指定技能库 / 测试隔离用） |
 | `XIAOYU_ENABLE_WEB_SEARCH` | `web_search` 工具 |
 | `XIAOYU_SEARCH_PROVIDER` | 搜索走哪家：目前只有 `xai`（默认，grok-4.6，真搜且带引用，单次约 0.65 元；需 `XAI_API_KEY`）。deepseek 官方 Responses 不支持内置搜索，已移除。后端没配 key 时不挂载 `web_search` 工具 |
 | `XIAOYU_ENABLE_BROWSER` | `browser` 浏览器工具（依赖可选 `[browser]` extra 的 playwright，没装时本来就不出现） |
@@ -190,10 +190,18 @@ xiaoyu plugin remove aws-core                                 # 删目录 + 摘�
 
 MCP 子进程的环境是**纯白名单**，所以像 aws-mcp 这类要 SigV4 凭证的 server，
 装完得自己在 `mcp.json` 的 `env` 块里用 `${env:AWS_PROFILE}` 之类显式点名——
-不点名只会得到一个莫名其妙的 401/403。远端 server 被 401/403 拒绝会整代停用、不自动重试；
+不点名只会得到一个莫名其妙的 401/403。macOS 上令牌不必明文进 `.env`：用户级 `mcp.json`
+里的 `${GITHUB_TOKEN}` 在环境变量里找不到时，会按同名去 Keychain 取
+（`security add-generic-password -U -s GITHUB_TOKEN -a "$USER" -w`）。这条回落只对你亲手写在
+用户级 `mcp.json` 里的声明生效；工作区 `.mcp.json` 与插件包装进来的条目不触发。远端 server 被 401/403 拒绝会整代停用、不自动重试；
 把 `mcp.json` 里的 headers / env 改好后 `/mcp reconnect <name>` 热恢复，不必重启会话（不给名字 =
 全部失败的；对在线的 server 就是干净重启一次）。它重读的是配置文件：在别的终端 export 的变量、
 会话启动后才改的 `.env`，本进程都看不到，那两种仍得重启会话。
+
+找启动命令（`npx` / `uvx` …）时先看该 server 的 `env` 块里声明的 `PATH`，再看小羽自己的
+`PATH`。小羽由编辑器或 systemd 拉起时自己的 `PATH` 往往很短，在 `env` 里补一行
+`"PATH": "/opt/homebrew/bin:${env:PATH}"` 即可，不必把 `command` 写成绝对路径。
+`xiaoyu doctor` 用同一套找法，并会指出 `args` / `env` 里已经不存在的路径。
 
 server 的工具描述 / schema 一变（多半是 `npx xxx@latest` 拉到了新版）就会被整代隔离，
 启动时直接摊出变了什么（描述逐行 diff、参数增删改），`/mcp diff <name>` 看全部，核对后

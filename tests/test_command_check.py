@@ -337,6 +337,29 @@ class EnvSplitStringTest(unittest.TestCase):
         self.assertEqual(self.split("rm \\q -rf"), ["rm", "\\q", "-rf"])
 
 
+class RemoteCommandTest(unittest.TestCase):
+    """覆盖面在语料库（remote.jsonl）；这里只测随平台而变的那一处。"""
+
+    def test_single_letter_host_versus_drive_letter(self) -> None:
+        from unittest import mock
+
+        from xiaoyu import command_check
+
+        #  h:/tmp 在 POSIX 上是主机 h 上的路径，在 Windows 上是 H 盘的路径。
+        #  语料库按"结论不随平台变"收样本，这一条放不进去
+        for command in ("rsync -a ./ h:/tmp/y/", "scp x C:/Users/u/x"):
+            with self.subTest(command=command, platform="posix"), \
+                    mock.patch.object(command_check.os, "name", "posix"):
+                self.assertIsNotNone(command_check.remote_command(command))
+            with self.subTest(command=command, platform="nt"), \
+                    mock.patch.object(command_check.os, "name", "nt"):
+                self.assertIsNone(command_check.remote_command(command))
+        #  多字母主机名在哪都是远端
+        for name in ("posix", "nt"):
+            with self.subTest(platform=name), mock.patch.object(command_check.os, "name", name):
+                self.assertIsNotNone(command_check.remote_command("rsync -a ./ host:/tmp/y/"))
+
+
 class CommandRiskTest(unittest.TestCase):
     def test_combines_both_directions(self):
         self.assertIsNotNone(command_risk("sudo rm -rf /tmp/x"))
