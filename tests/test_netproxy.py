@@ -98,12 +98,17 @@ class LoopbackBypassTest(unittest.TestCase):
     def test_registry_client_on_localhost_goes_direct(self) -> None:
         base = self.endpoint.replace("127.0.0.1", "localhost") + "/v1"
         registry = providers.Registry([providers.Provider("local", base, "k", ("m1",), "local")])
-        page = registry.client("local").models.list()
+        client = registry.client("local")
+        self.addCleanup(client.close)
+        page = client.models.list()
         self.assertEqual([m.id for m in page], ["m1"])
         self.assertEqual(self.proxy_hits, [])
 
     def test_anthropic_client_on_loopback_goes_direct(self) -> None:
         client = messages.client(f"{self.endpoint}/v1", "k", 5.0)
+        #  用完就关：留给垃圾回收的连接会在后面某条用例执行到一半时才被收走，
+        #  那一刻冒出来的 ResourceWarning 落在谁头上全凭运气
+        self.addCleanup(client.close)
         response = client._client.get(f"{self.endpoint}/v1/models")
         self.assertEqual(response.status_code, 200)
         self.assertEqual(self.proxy_hits, [])
@@ -119,7 +124,9 @@ class LoopbackBypassTest(unittest.TestCase):
         registry = providers.Registry(
             [providers.Provider("remote", "http://models.example.invalid/v1", "k", ("m1",), "r")]
         )
-        page = registry.client("remote").models.list()
+        client = registry.client("remote")
+        self.addCleanup(client.close)
+        page = client.models.list()
         self.assertEqual([m.id for m in page], ["m1"])
         self.assertEqual(self.proxy_hits, ["GET http://models.example.invalid/v1/models"])
 
@@ -147,7 +154,9 @@ class UnsupportedSchemeTest(unittest.TestCase):
                 registry = providers.Registry(
                     [providers.Provider("local", f"{self.endpoint}/v1", "k", ("m1",), "l")]
                 )
-                self.assertEqual([m.id for m in registry.client("local").models.list()], ["m1"])
+                client = registry.client("local")
+                self.addCleanup(client.close)
+                self.assertEqual([m.id for m in client.models.list()], ["m1"])
             #  远端 provider 构造也不能炸（不发请求，不打外网）
             providers.Registry(
                 [providers.Provider("remote", "https://api.example.invalid/v1", "k", ("m",), "r")]
@@ -172,9 +181,11 @@ class UnsupportedSchemeTest(unittest.TestCase):
     def test_subprocess_env_keeps_user_values(self) -> None:
         with proxy_env(ALL_PROXY="socks5://127.0.0.1:3", HTTPS_PROXY="socks4://127.0.0.1:4"), \
                 contextlib.redirect_stderr(io.StringIO()):
-            providers.Registry(
+            client = providers.Registry(
                 [providers.Provider("local", f"{self.endpoint}/v1", "k", ("m1",), "l")]
-            ).client("local").models.list()
+            ).client("local")
+            self.addCleanup(client.close)
+            client.models.list()
             self.assertEqual(os.environ["ALL_PROXY"], "socks5://127.0.0.1:3")
             child = subprocess.run(
                 [sys.executable, "-c", "import os;print(os.environ['ALL_PROXY'], os.environ['HTTPS_PROXY'])"],
