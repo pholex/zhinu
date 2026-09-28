@@ -22,6 +22,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import difflib
 import hashlib
 import json
@@ -30,6 +31,7 @@ import re
 import sys
 import threading
 import time
+import urllib.error
 import urllib.request
 from pathlib import Path
 from typing import Any
@@ -200,6 +202,10 @@ def osv_malware_check(command: str, args: list[str]) -> str | None:
             body = json.loads(response.read().decode("utf-8", errors="replace"))
     except Exception as exc:  # noqa: BLE001 - fail-open：预检失败不拦启动
         print(f"[MCP OSV 预检失败（放行）：{type(exc).__name__}: {exc}]", file=sys.stderr)
+        if isinstance(exc, urllib.error.HTTPError):
+            #  4xx / 5xx 的异常对象本身就是一个开着的响应，要关
+            with contextlib.suppress(Exception):
+                exc.close()
         return None
 
     malicious = [
