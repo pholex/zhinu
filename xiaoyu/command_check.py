@@ -19,6 +19,11 @@
   是另一类东西，所以扫描骨架抽成了共用的 ``_scan_script`` / ``_scan_segment``。
   给 auto 档用：沙箱能拦住越权写盘，但提权是唯一可能捅穿它的动作，得有人看着。
 
+- ``remote_command``：回答"这条命令的效果是不是落在另一台主机上"（ssh/scp/sftp/
+  rsync 的远端形态）。同样给 auto 档用：沙箱管的是本机文件系统，ssh 对端的 shell
+  不在它的管辖内——对端就是本机（`ssh localhost …`）时等于绕出沙箱。ssh 带的远端
+  命令同时当作一段脚本下钻，`ssh host 'sudo rm -rf …'` 里的 rm 和 sudo 照样挖得到。
+
 剥 wrapper 的关键是**认得每个 wrapper 的选项语法**：`sudo -u root rm` 里的 root
 是选项值不是命令名，`timeout 5 rm` 的 5 是 DURATION。只跳过 `-` 开头的 token 会把
 选项值当成命令，里面真正的 rm 就漏了。选项表见 ``_WRAPPERS``；表外的选项按
@@ -29,6 +34,7 @@ find 的 -exec/-execdir/-ok/-okdir 命令段单独切出来递归扫。
 
 from __future__ import annotations
 
+import os
 import re
 import shlex
 from dataclasses import dataclass, field
@@ -899,13 +905,17 @@ _REDIRECTION = re.compile(r"\d*(?:&>>?|>>?|>&|>\||<<<|<<-?|<>|<&|<)")
 
 
 def command_risk(command: str) -> str | None:
-    """给确认框用的汇总判定：危险操作优先，其次参数注入口。返回原因或 None。"""
+    """给确认框用的汇总判定：危险操作优先，其次参数注入口，再次远端执行。
+
+    返回原因或 None。远端执行排最后：它解释的是"auto 档为什么停下来问"，
+    前两类说的是命令本身有问题，更该先让人看见。
+    """
     if reason := dangerous_command(command):
         return reason
     for segment in _split_script(command):
         if reason := injection_risk(segment):
             return reason
-    return None
+    return remote_command(command)
 
 
 def dangerous_command(command: str) -> str | None:
@@ -925,6 +935,16 @@ def privileged_command(command: str) -> str | None:
     沙箱与逐次确认仍在。
     """
     return _scan_command(command, _privileged_hit)
+
+
+def remote_command(command: str) -> str | None:
+    """命令会在另一台主机上执行或落盘（ssh / scp / sftp / rsync 远端形态）时返回原因。
+
+    判的是**动词与形态**，不判对端是谁：要分清"本机"得枚举回环写法、主机名、
+    网卡地址、ssh_config 别名，枚举不全就是漏洞；而对端是不是本机，结论都一样——
+    那边的 shell 不受这边沙箱约束。`rsync -a src/ dst/` 这类纯本地形态不算。
+    """
+    return _scan_command(command, _remote_hit)
 
 
 def any_layer(command: str, predicate) -> bool:
@@ -949,6 +969,59 @@ def _privileged_hit(name: str, argv: list[str]) -> str | None:
     if name in _PRIVILEGE_ESCALATORS:
         return f"提权命令（{name}）"
     return None
+
+
+#  登录到对端 / 在对端执行：出现即算
+_REMOTE_SHELLS = {"ssh", "slogin", "mosh", "sftp", "ssh-copy-id"}
+#  拷贝类：本地到本地是日常（构建脚本里的 rsync），只认带远端参数的形态
+_REMOTE_COPIERS = {"scp", "rsync"}
+_REMOTE_URLS = ("ssh://", "scp://", "sftp://", "rsync://")
+#  host:path / user@host:path / host::module——冒号出现在第一个 / 之前（scp 自己的判法）
+_REMOTE_SPEC = re.compile(r"[^/:\s]+:")
+#  C:\\x、C:/x 在 Windows 上是盘符路径；别的平台上单字母也是合法主机名（h:/tmp）
+_DRIVE_LETTER = re.compile(r"[A-Za-z]:[\\/]")
+#  ssh 带值的短选项（其余短选项都是开关）；用来找出主机名之后的远端命令
+_SSH_VALUE_OPTIONS = frozenset("BbcDEeFIiJLlmOoPpQRSWw")
+
+
+def _remote_hit(name: str, argv: list[str]) -> str | None:
+    if name in _REMOTE_SHELLS:
+        return f"在远程主机上执行（{name}），不受本机沙箱约束"
+    if name in _REMOTE_COPIERS:
+        for arg in argv[1:]:
+            if arg.startswith("-"):
+                continue
+            if arg.startswith(_REMOTE_URLS) or (
+                _REMOTE_SPEC.match(arg)
+                and not (os.name == "nt" and _DRIVE_LETTER.match(arg))
+            ):
+                return f"向远程主机传输文件（{name}），不受本机沙箱约束"
+    return None
+
+
+def _ssh_remote_script(argv: list[str]) -> str:
+    """`ssh [选项] 主机 命令…` 里交给对端 shell 的那段源码；没带命令返回空串。
+
+    ssh 把主机名之后的参数用空格拼成一行交给对端 shell 解析，所以拼回去再扫。
+    """
+    index = 1
+    while index < len(argv):
+        token = argv[index]
+        if token == "--":
+            index += 1
+            break
+        if not token.startswith("-") or token == "-":
+            break
+        #  短选项可聚合（-tt、-vp2222）：带值选项之后的余下字符就是它的值，
+        #  后面没字符了才吃下一个 token
+        letters = token[1:]
+        for position, letter in enumerate(letters):
+            if letter in _SSH_VALUE_OPTIONS:
+                if position == len(letters) - 1:
+                    index += 1
+                break
+        index += 1
+    return " ".join(argv[index + 1:])
 
 
 def _split_script(script: str) -> list[str]:
@@ -1227,6 +1300,8 @@ def _inner_scripts(name: str, argv: list[str]) -> list[str]:
     if name == "eval" and len(argv) >= 2:
         #  eval 把全部参数拼成一段源码执行
         return [" ".join(argv[1:])]
+    if name in ("ssh", "slogin") and (script := _ssh_remote_script(argv)):
+        return [script]
     return []
 
 

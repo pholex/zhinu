@@ -39,6 +39,7 @@ _GUARDS = {
     "injection": lambda case: command_check.injection_risk(case["cmd"]),
     "dangerous": lambda case: command_check.dangerous_command(case["cmd"]),
     "privileged": lambda case: command_check.privileged_command(case["cmd"]),
+    "remote": lambda case: command_check.remote_command(case["cmd"]),
     "admission": lambda case: mcp_guard.admission_violation(
         case["cmd"], case.get("args", []), case.get("env", {})
     ),

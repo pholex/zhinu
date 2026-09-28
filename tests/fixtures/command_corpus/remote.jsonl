@@ -1,0 +1,31 @@
+{"cmd": "ssh localhost id", "guard": "remote", "expect": "block", "note": "对端是本机：绕出沙箱"}
+{"cmd": "ssh 127.0.0.1 id", "guard": "remote", "expect": "block", "note": "回环地址"}
+{"cmd": "ssh build@ci.example.com uptime", "guard": "remote", "expect": "block", "note": "远程主机同样不在沙箱内"}
+{"cmd": "ssh h", "guard": "remote", "expect": "block", "note": "不带命令的登录"}
+{"cmd": "/usr/bin/ssh h id", "guard": "remote", "expect": "block", "note": "绝对路径"}
+{"cmd": "env ssh h id", "guard": "remote", "expect": "block", "note": "env 包裹"}
+{"cmd": "timeout 5 sftp h", "guard": "remote", "expect": "block", "note": "timeout 包裹 sftp"}
+{"cmd": "bash -c 'ssh h id'", "guard": "remote", "expect": "block", "note": "shell 内联"}
+{"cmd": "echo \"$(ssh h id)\"", "guard": "remote", "expect": "block", "note": "命令替换"}
+{"cmd": "FOO=1 slogin h", "guard": "remote", "expect": "block", "note": "赋值前缀 + slogin"}
+{"cmd": "scp ./x localhost:/etc/x", "guard": "remote", "expect": "block", "note": "scp 写到对端"}
+{"cmd": "scp u@h:/etc/passwd .", "guard": "remote", "expect": "block", "note": "scp 从对端取"}
+{"cmd": "scp -P 2222 x scp://h/y", "guard": "remote", "expect": "block", "note": "URL 形态"}
+{"cmd": "rsync -a ./ localhost:/tmp/y/", "guard": "remote", "expect": "block", "note": "rsync 远端形态"}
+{"cmd": "rsync -a h::module/ x/", "guard": "remote", "expect": "block", "note": "rsync daemon 双冒号"}
+{"cmd": "rsync -a rsync://h/m/ x/", "guard": "remote", "expect": "block", "note": "rsync URL"}
+{"cmd": "ssh-copy-id u@h", "guard": "remote", "expect": "block", "note": "往对端装公钥"}
+{"cmd": "rsync -a src/ dst/", "guard": "remote", "expect": "allow", "note": "纯本地同步"}
+{"cmd": "rsync -a --exclude=a:b src/ dst/", "guard": "remote", "expect": "allow", "note": "选项值里的冒号"}
+{"cmd": "rsync -a ./a:b/ dst/", "guard": "remote", "expect": "allow", "note": "冒号在斜杠之后是文件名"}
+{"cmd": "scp a b", "guard": "remote", "expect": "allow", "note": "本地到本地"}
+{"cmd": "echo ssh host:path", "guard": "remote", "expect": "allow", "note": "只是字面量"}
+{"cmd": "git push origin main", "guard": "remote", "expect": "allow", "note": "git 自己的远端不归这条"}
+{"cmd": "ssh localhost 'rm -rf ~'", "guard": "dangerous", "expect": "block", "note": "ssh 带的远端命令里的 rm"}
+{"cmd": "ssh -p 2222 -i key -tt u@h rm -rf /x", "guard": "dangerous", "expect": "block", "note": "跳过带值选项找到远端命令"}
+{"cmd": "ssh -vp2222 h rm -f x", "guard": "dangerous", "expect": "block", "note": "聚合短选项里的带值选项"}
+{"cmd": "ssh -- h rm -f x", "guard": "dangerous", "expect": "block", "note": "-- 之后才是主机"}
+{"cmd": "ssh -p 22 h ls -rf", "guard": "dangerous", "expect": "allow", "note": "选项值不是命令"}
+{"cmd": "ssh localhost sudo id", "guard": "privileged", "expect": "block", "note": "对端提权"}
+{"cmd": "ssh h 'bash -c \"sudo id\"'", "guard": "privileged", "expect": "block", "note": "对端再套一层 shell"}
+{"cmd": "rsync -a ./ h:/tmp/y/", "guard": "remote", "expect": "block", "note": "单字母主机名不是盘符"}
