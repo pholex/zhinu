@@ -169,8 +169,10 @@ def upgrade_command() -> str | None:
     return "xiaoyu update"
 
 
-def pending_notice(current: str = __version__, now: float | None = None) -> str | None:
+def pending_notice(current: str | None = None, now: float | None = None) -> str | None:
     """按缓存判断这次启动要不要提一句；要提就返回那句话，并记下提过了。"""
+    #  版本号在调用时才取：写成默认参数的话，定义那一刻就钉死了
+    current = __version__ if current is None else current
     running = parse_version(current)
     if running is None:
         return None
