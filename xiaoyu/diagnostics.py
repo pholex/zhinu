@@ -202,7 +202,7 @@ def check_python() -> Check:
 _DISTRIBUTION = "xiaoyu-agent"
 
 
-def _install_form(dist: Any) -> str:
+def install_form(dist: Any) -> str:
     """这份安装是怎么来的：可编辑安装 / pipx / uv tool / pip。认不出就只报安装器名。"""
     try:
         direct = json.loads(dist.read_text("direct_url.json") or "{}")
@@ -242,7 +242,7 @@ def check_install() -> Check:
         return Check(
             "install", "ok", f"xiaoyu {__version__}（未安装，直接从源码目录运行）", details
         )
-    form = _install_form(dist)
+    form = install_form(dist)
     details.append(f"安装方式：{form}")
     recorded = dist.version
     if recorded != __version__:

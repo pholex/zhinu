@@ -29,7 +29,7 @@
 pip install "xiaoyu-agent[tui]"        # [tui]：补全 / 历史 / 粘贴折叠 / 贴图 / diff 高亮
 pip install "xiaoyu-agent[tui,serve]"  # 还要 HTTP API（n8n / Dify 编排）就带上 [serve]
 xiaoyu doctor                          # 体检：版本与安装方式 / 凭据有无 / 沙箱 / 磁盘 / MCP 配置（--json 给脚本，任一 FAIL 退出码 1）
-xiaoyu update                          # 升级（已装 serve 时自动一并升级）
+xiaoyu update                          # 升级（已装 serve 时自动一并升级；有新版时交互式启动会提一行）
 xiaoyu uninstall                       # 卸载；--purge 连配置目录一起删
 ```
 
