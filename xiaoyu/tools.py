@@ -265,6 +265,22 @@ def _trim_partial_utf8(data: bytes) -> bytes:
 _STOP_POLL_SECONDS = 0.2
 
 
+#  杀掉之后等它退出的上限（秒）。整组 SIGKILL 之后进程是毫秒级退出的，
+#  这个数只防意外：等不到就放手，打断不能因此卡住
+_REAP_SECONDS = 2.0
+
+
+def _reap(proc: subprocess.Popen, timeout: float = _REAP_SECONDS) -> None:
+    """把刚杀掉的进程收掉（有界）。
+
+    杀只是发信号；不 wait，它就以僵尸的形态挂着、占着进程表的一格，直到本进程
+    退出——常驻进程（serve、嵌入宿主）里每打断一次就攒一个。Popen 对象被回收时
+    也会因此报"subprocess still running"。
+    """
+    with contextlib.suppress(Exception):
+        proc.wait(timeout=timeout)
+
+
 def _wait_bounded(
     proc: subprocess.Popen,
     pipes: list[_BoundedPipe],
@@ -2350,6 +2366,7 @@ class Toolbox:
             #  收不到，不杀就成遗孤继续跑、还握着管道。中断语义必须是
             #  "真的停掉这条命令"，杀完再上抛给前端打中断提示。
             _kill_tree(proc)
+            _reap(proc)
             raise
         except subprocess.TimeoutExpired:
             _kill_tree(proc)
@@ -2373,6 +2390,7 @@ class Toolbox:
             #  等待期间的任何异常。命令在独立会话里收不到我们的信号，不收割就
             #  整树成孤儿一直活着——与 Ctrl-C 同理，杀完照常上抛。
             _kill_tree(proc)
+            _reap(proc)
             raise
         finally:
             _unregister_foreground(proc)

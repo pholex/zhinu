@@ -206,6 +206,9 @@ class TaskManager:
     （headless 嵌入宿主不接通知轨道时的退化形态）。
     """
 
+    #  收场时等被杀的进程退出的总上限（秒，全部任务合计）
+    SHUTDOWN_REAP_SECONDS = 3.0
+
     def __init__(self) -> None:
         self.notify: Callable[[str, str], None] | None = None
         self._tasks: dict[str, BackgroundTask] = {}
@@ -464,10 +467,21 @@ class TaskManager:
 
     def shutdown(self) -> None:
         """会话结束整体回收（atexit / 显式调用均幂等）：先杀进程，再删日志目录。"""
+        killed = []
         for task in self.all():
             if not task.done.is_set():
                 task.killed = True
                 kill_tree(task.proc)
+                killed.append(task)
+        #  杀只是发信号，还得等它们真的退出：不等的话进程以僵尸形态挂着，日志
+        #  句柄也没松开（下面删目录在 Windows 上因此删不掉）。平时这一步由各任务
+        #  的 watcher 线程做，但收场的两个时机都轮不到它——进程退出时 daemon
+        #  线程不再得到运行机会，子 agent 收工时调用方紧接着就往下走了。
+        #  整体有界：等不到就放手，收场不能因此卡住
+        deadline = time.monotonic() + self.SHUTDOWN_REAP_SECONDS
+        for task in killed:
+            with contextlib.suppress(Exception):
+                task.proc.wait(timeout=max(0.0, deadline - time.monotonic()))
         if self._log_dir is not None:
             #  Windows 上刚被杀的进程可能还没松开日志句柄，删不掉由 discard 吞掉，
             #  留给下次启动清扫
