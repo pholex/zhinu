@@ -248,9 +248,14 @@ class RefreshTest(UpdateCheckCase):
 
 
 class StartupTest(UpdateCheckCase):
+    #  用例里的版本号都是造出来的，与小羽真实的版本号无关：
+    #  跟真实版本号挂钩的用例，发一次版就可能变一次脸
+    RUNNING, NEWER = "1.2.3", "1.3.0"
+
     def start(self, interactive: bool = True):
         """返回 (提示, 联网次数)。后台线程等它跑完再数。"""
-        with mock.patch.object(update_check, "fetch_latest", return_value="0.53.0") as fetch:
+        with mock.patch.object(update_check, "__version__", self.RUNNING), \
+                mock.patch.object(update_check, "fetch_latest", return_value=self.NEWER) as fetch:
             out = io.StringIO()
             with contextlib.redirect_stdout(out), contextlib.redirect_stderr(out):
                 notice = update_check.startup_notice(interactive=interactive)
@@ -262,11 +267,19 @@ class StartupTest(UpdateCheckCase):
         return notice, fetch.call_count
 
     def test_first_launch_checks_quietly_and_the_next_one_tells(self) -> None:
-        with mock.patch.object(update_check, "__version__", "0.52.0"):
-            self.assertEqual(self.start(), (None, 1))
-            notice, fetched = self.start()
-        self.assertIn("0.53.0", notice)
+        self.assertEqual(self.start(), (None, 1))
+        notice, fetched = self.start()
+        self.assertIn(self.NEWER, notice)
+        self.assertIn(self.RUNNING, notice)
         self.assertEqual(fetched, 0)  # 一天内不再查
+
+    def test_running_version_is_read_at_call_time(self) -> None:
+        #  已经是最新版的不该被提醒：换一个"正在跑的版本"结论就该跟着变
+        self.write_state(latest=self.NEWER, checked_at=9e18)
+        with mock.patch.object(update_check, "__version__", self.NEWER):
+            self.assertIsNone(update_check.pending_notice(now=1000.0))
+        with mock.patch.object(update_check, "__version__", self.RUNNING):
+            self.assertIn(self.NEWER, update_check.pending_notice(now=1000.0))
 
     def test_switched_off_means_no_lookup_and_no_cache(self) -> None:
         for value in ("0", "false", "No", "OFF"):
