@@ -1141,6 +1141,7 @@ def resume_command(argv: list[str]) -> int:
             print(ui.secondary(f"已恢复会话（{len(loaded)} 条消息，来自 {chosen.path.name}{forked}）"))
         return run_once(agent, prompt, args.output_format, output_schema)
     print(build_banner(model_label(agent), str(config.workspace)))
+    print_update_notice()
     if budget_note := skills.budget_warning():
         print(ui.secondary(budget_note))
     print(ui.secondary(f"已恢复会话（{len(loaded)} 条消息，来自 {chosen.path.name}{forked}）"))
@@ -2581,6 +2582,14 @@ def _warn_env_problems() -> None:
         print(ui.warning(f"配置：{problem}"), file=sys.stderr)
 
 
+def print_update_notice() -> None:
+    """横幅之后提一句有新版（交互式启动专用，见 update_check 模块说明）。"""
+    from . import update_check
+
+    if notice := update_check.startup_notice():
+        print(ui.secondary(notice))
+
+
 def _trust_fingerprints(scope: str, workspace: Path) -> "dict[str, str] | None":
     """改工作区级 MCP 配置之前的指纹；用户级配置不归信任门管，返回 None。"""
     if scope != "project":
@@ -2829,6 +2838,7 @@ def main(argv: list[str] | None = None) -> int:
             print(ui.secondary(resumed))
         return run_once(agent, user_input, args.output_format, output_schema)
     print(build_banner(model_label(agent), str(config.workspace)))
+    print_update_notice()
     if env_files:
         print(ui.secondary("已加载 " + ", ".join(str(p) for p in env_files)))
     print(ui.secondary(sandbox_status(config)))

@@ -231,7 +231,7 @@ class RemediesPointSomewhereRealTest(unittest.TestCase):
             ("/opt/venv", "uv"),
         ):
             with self.subTest(prefix=prefix), mock.patch.object(sys, "prefix", prefix):
-                self.assertEqual(diagnostics._install_form(dist), expected)
+                self.assertEqual(diagnostics.install_form(dist), expected)
 
     def test_mcp_command_is_found_through_declared_path(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

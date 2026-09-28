@@ -25,6 +25,9 @@ from xiaoyu import tempdirs as _tempdirs  # noqa: E402
 
 _tempdirs._sweep_started = True
 
+#  新版本提示会联网查 PyPI、往配置目录写缓存：用例一律关着跑，测它的用例自己开
+os.environ["XIAOYU_UPDATE_CHECK"] = "0"
+
 #  开发机平时开着代理：HTTP(S)_PROXY / ALL_PROXY 漏进来的话，打 127.0.0.1 的
 #  假 server 用例、代理诊断的 stderr 断言都会随机器而变。统一清掉，要代理的用例
 #  自己设（见 test_netproxy）。Windows 的环境变量大小写不敏感，逐个 pop 两种写法无害
