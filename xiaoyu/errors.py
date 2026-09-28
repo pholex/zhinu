@@ -6,11 +6,11 @@
 
 from __future__ import annotations
 
+import sys
 from dataclasses import dataclass
 
 #  httpx 是 openai / anthropic 两个 SDK 共同的硬传递依赖，顶层 import 安全
 import httpx
-import openai
 
 
 class Interrupted(Exception):
@@ -153,6 +153,21 @@ _QUOTA_CODES = ("insufficient_quota", "credit_balance_exhausted", "billing_hard_
 _QUOTA_CODE_SUFFIXES = ("_spend_limit_exceeded", "_usage_limit_exceeded")
 
 
+def _is_openai(exc: Exception, *names: str) -> bool:
+    """`exc` 是不是 openai SDK 的这几类异常之一。
+
+    不 import openai：它一次 import 约 0.25 秒，而分类器被 CLI 启动路径间接
+    拖起。进程里还没人 import 过 openai，就不可能存在它的异常实例，直接判否。
+    """
+    module = sys.modules.get("openai")
+    if module is None:
+        return False
+    kinds = tuple(
+        kind for name in names if isinstance(kind := getattr(module, name, None), type)
+    )
+    return isinstance(exc, kinds)
+
+
 def _status_code(exc: Exception) -> int | None:
     """SDK 异常上的 HTTP 状态码。openai 和 anthropic（同为 Stainless 生成）的
     APIStatusError 都带 `.status_code`——鸭子取值，errors.py 就不必 import
@@ -188,7 +203,7 @@ def _is_quota(exc: Exception, text: str, status: int | None) -> bool:
     return (
         _BILLING_MARKER in text
         and status != 429
-        and not isinstance(exc, openai.RateLimitError)
+        and not _is_openai(exc, "RateLimitError")
         and not any(word in text for word in _THROTTLE_WORDS)
     )
 
@@ -205,10 +220,7 @@ def classify(exc: Exception) -> Verdict:
     text = str(exc).lower()
     status = _status_code(exc)
 
-    if isinstance(exc, openai.AuthenticationError | openai.PermissionDeniedError) or status in (
-        401,
-        403,
-    ):
+    if _is_openai(exc, "AuthenticationError", "PermissionDeniedError") or status in (401, 403):
         return Verdict("auth", False, False, "鉴权失败，请检查 XIAOYU_API_KEY 和端点")
 
     if _is_quota(exc, text, status):
@@ -224,7 +236,7 @@ def classify(exc: Exception) -> Verdict:
         return Verdict("context_overflow", True, True, "上下文超限，压缩后重试")
 
     if (
-        isinstance(exc, openai.RateLimitError)
+        _is_openai(exc, "RateLimitError")
         or status == 429
         or "rate limit" in text
         or "throttl" in text  # AWS 系措辞：ThrottlingException / throttled
@@ -234,10 +246,7 @@ def classify(exc: Exception) -> Verdict:
         return Verdict("rate_limit", True, False, "限流")
 
     if (
-        isinstance(
-            exc,
-            openai.APITimeoutError | openai.APIConnectionError | openai.InternalServerError,
-        )
+        _is_openai(exc, "APITimeoutError", "APIConnectionError", "InternalServerError")
         #  >=500 覆盖非 openai SDK 的服务端错误（含 anthropic 529 overloaded）
         or (status is not None and status >= 500)
         #  anthropic 的连接/超时异常是 `raise ... from <httpx 异常>`，认底因即可

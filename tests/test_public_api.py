@@ -101,6 +101,31 @@ class TestLazyImport(unittest.TestCase):
         self.assertEqual(version, xiaoyu.__version__)
         self.assertEqual(loaded, "", f"import xiaoyu 不该拖起：{loaded}")
 
+    def test_cli_startup_does_not_load_model_sdks(self) -> None:
+        """`--version` / `--help` / doctor 这类不出网的路径不该为模型 SDK 付 import 钱。
+
+        openai 一个包约 0.25 秒，曾占 CLI 启动耗时的七成；两个 SDK 都只在
+        真要构造 client 时才 import。
+        """
+        code = (
+            "import sys, xiaoyu.cli, xiaoyu.errors, xiaoyu.providers\n"
+            "print(','.join(m for m in ('openai', 'anthropic') if m in sys.modules))\n"
+        )
+        proc = subprocess.run(
+            [sys.executable, "-c", code], capture_output=True, text=True, encoding="utf-8", check=True, cwd=ROOT
+        )
+        self.assertEqual(proc.stdout.strip(), "", f"import xiaoyu.cli 不该拖起：{proc.stdout.strip()}")
+
+    def test_openai_class_stays_reachable_by_name(self) -> None:
+        #  懒导入后 `providers.OpenAI` 仍要取得到：按名字打桩的用例都靠它
+        import openai
+
+        from xiaoyu import providers
+
+        self.assertIs(providers.OpenAI, openai.OpenAI)
+        with self.assertRaises(AttributeError):
+            _ = providers.no_such_name
+
 
 if __name__ == "__main__":
     unittest.main()
