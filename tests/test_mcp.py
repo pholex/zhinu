@@ -2228,14 +2228,18 @@ class GenerationTest(unittest.TestCase):
         self.fail(message)
 
     def crash(self, manager: mcp.McpManager) -> None:
-        """经 die 工具把 server 进程当场打死，等 manager 觉察到断线。"""
-        server = manager._servers["gen"]
+        """经 die 工具把 server 进程当场打死，等那个进程退出。"""
+        #  盯的是被打死的**那一个**进程，不是"当前不在线"：重连只隔 0.02s 就把
+        #  新进程换上来，"不在线"这个状态只存在一瞬，轮询慢半拍就整段错过，
+        #  之后 alive() 恒为真、白等到超时。进程对象自己的退出是不会消失的事实
+        doomed = manager._servers["gen"]._proc
+        self.assertIsNotNone(doomed)
         out = find_tool(manager, "__die").handler()
         self.assertTrue(out.startswith("ERROR:"), out)
         #  请求在飞时进程退出：副作用可能已发生，必须告诉模型别自动重试
         self.assertIn("调用结果不确定", out)
         self.assertIn("不要自动重试", out)
-        self.wait_until(lambda: not server.alive(), message="进程未按预期退出")
+        self.wait_until(lambda: doomed.poll() is not None, message="进程未按预期退出")
 
     def test_crash_reconnects_with_identical_names(self):
         manager = self.make_manager()
