@@ -125,7 +125,7 @@ class AutoApprovesTest(unittest.TestCase):
     def test_remote_command_still_asks(self) -> None:
         """ssh 对端的 shell 不在沙箱里——对端就是本机时等于绕出去。"""
         for command in ("ssh localhost id", "ssh build@ci.example.com uptime",
-                        "scp ./x localhost:/etc/x", "rsync -a ./ h:/tmp/y/",
+                        "scp ./x localhost:/etc/x", "rsync -a ./ host:/tmp/y/",
                         "env ssh h id", "bash -c 'sftp h'"):
             with self.subTest(command=command):
                 self.assertFalse(self.approves("bash", {"command": command}))

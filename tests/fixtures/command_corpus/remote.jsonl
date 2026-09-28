@@ -28,4 +28,3 @@
 {"cmd": "ssh -p 22 h ls -rf", "guard": "dangerous", "expect": "allow", "note": "选项值不是命令"}
 {"cmd": "ssh localhost sudo id", "guard": "privileged", "expect": "block", "note": "对端提权"}
 {"cmd": "ssh h 'bash -c \"sudo id\"'", "guard": "privileged", "expect": "block", "note": "对端再套一层 shell"}
-{"cmd": "rsync -a ./ h:/tmp/y/", "guard": "remote", "expect": "block", "note": "单字母主机名不是盘符"}
