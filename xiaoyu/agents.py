@@ -802,6 +802,9 @@ def execute_delegation(
     sub_config = Config(
         base_url=config.base_url,
         model=model,
+        #  备用链随主会话：它说的是"这几个模型我都能接受"，与这次委托点名用谁
+        #  无关。批量扇出最容易撞上持续限流，恰恰最需要它
+        fallback_models=list(config.fallback_models),
         summary_model=config.summary_model,
         explore_model=config.explore_model,
         vision_fallback_model=config.vision_fallback_model,
@@ -936,6 +939,11 @@ def execute_delegation(
     answer = sub_agent.last_assistant_text()
     if answer == inherited_answer:
         answer = ""
+    #  降级是粘性的：点名的模型持续失败后，余下的活都是备用模型干的。结论头里
+    #  报实际干活的那个；存档仍记点名的（续跑时先回去试它，与主会话回探同一个道理）
+    served = str(sub_agent.config.model or model)
+    if served != model:
+        notes.append(f"{model} 持续失败，这次由备用模型 {served} 完成")
 
     #  -- worktree 收尾：本次新建的，干净就删、有改动就保留报路径；
     #     resume 复用的一律保留 --
@@ -979,7 +987,7 @@ def execute_delegation(
         failure=failure,
         answer=answer,
         run_id=run_id,
-        model=model,
+        model=served,
         tool_calls=len(sub_agent.trace),
         worktree=kept,
         notes=notes,

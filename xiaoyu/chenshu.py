@@ -1013,6 +1013,8 @@ class ChenshuRuntime:
                 base_url=self.config.base_url,
                 #  成员专属 > 主会话（与声明式 subagent 的优先级同一套）
                 model=model or self.config.model,
+                #  备用链随主会话（理由见 agents.execute_delegation 的同一处）
+                fallback_models=list(self.config.fallback_models),
                 summary_model=self.config.summary_model,
                 explore_model=self.config.explore_model,
                 vision_fallback_model=self.config.vision_fallback_model,
