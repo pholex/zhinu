@@ -10,6 +10,7 @@ from types import SimpleNamespace
 from typing import Any
 
 from xiaoyu import messages as msgs
+from xiaoyu import tokens
 from xiaoyu.agent import SERVER_COMPACTION_FALLBACK, Agent
 from xiaoyu.messages import COMPACTION_BETA, COMPACTION_KEY, supports_server_compaction
 from xiaoyu.providers import Registry
@@ -220,8 +221,13 @@ class AgentSideTest(AgentTestCase):
         })
         agent._anchor = None  # noqa: SLF001 —— 到达处的逻辑（见 _stream_once）
         self.assertEqual(agent._compaction_floor(), len(agent.messages) - 1)  # noqa: SLF001
-        #  floor 之前那 4 万字符不计入
-        self.assertLess(agent.context_tokens(), 5_000)
+        #  floor 之前那 4 万字符不计入。比相对量而非绝对阈值：system 含本机环境
+        #  探测、工具 schema 随功能增长，基线本身就会漂过任何写死的数
+        full = tokens.estimate_messages(agent.messages) + tokens.estimate_tools(
+            agent.toolbox.schemas()
+        )
+        dropped = tokens.estimate_messages([agent.messages[-2]])
+        self.assertLessEqual(agent.context_tokens(), full - dropped)
 
     def test_local_compaction_defers_until_fallback_line(self):
         agent = self.build([[chunk(content="ok"), usage_chunk(10, 2)]])
