@@ -29,8 +29,12 @@ _WAIT_RE = re.compile(r"\d+(?:\.\d+)?s 后重试")
 _TOKEN_SPAN = re.compile(r"(?:<tmp>|\{\{tmp\}\}|\{\{cwd\}\})[^\s\"'，。；：)\]]*")
 
 
+_TODAY = re.compile(r"\d{4}-\d{2}-\d{2}（星期[一二三四五六日]）")
+
+
 def _token_tmp_paths(value: str, tmp: str, token: str) -> str:
     """tmp 前缀 → token，并把 token 起始路径段里的反斜杠压成正斜杠。"""
+    value = _TODAY.sub("<today>", value)
     value = value.replace(tmp, token)
     flipped = tmp.replace("\\", "/")
     if flipped != tmp:
@@ -63,7 +67,7 @@ def _scrub_machine_bits(text: str, tmp: str) -> str:
 
 
 def normalize_system_prompt(text: str, tmp: str) -> str:
-    return _scrub_machine_bits(text.replace("\r\n", "\n"), tmp)
+    return _TODAY.sub("{{today}}", _scrub_machine_bits(text.replace("\r\n", "\n"), tmp))
 
 
 def normalize_tool_schemas(tools: Any, tmp: str) -> str:

@@ -1433,6 +1433,10 @@ class Agent:
         )
         if skills_block:
             segments.append(("技能索引", skills_block))
+        #  日期放在最后：它每天变一次，排在末尾就只让它自己这一小段错过缓存
+        segments.append(
+            ("日期", f"\n\n今天是 {world_state.today()}。会话跨天时会另行告知。")
+        )
         return segments
 
     def context_breakdown(self) -> list[tuple[str, int]]:
