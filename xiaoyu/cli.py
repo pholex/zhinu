@@ -225,7 +225,13 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def add_system_prompt_flags(parser: argparse.ArgumentParser) -> None:
-    """system prompt 的三个旗标，主命令与 resume 共用。"""
+    """system prompt 的四个旗标，主命令与 resume 共用。"""
+    parser.add_argument(
+        "--system-prompt",
+        dest="system_prompt",
+        metavar="TEXT",
+        help="自定义 system prompt，直接给文本；与 --system-prompt-file 同义（两者只能给一个）",
+    )
     parser.add_argument(
         "--system-prompt-file",
         dest="system_prompt_file",
@@ -268,14 +274,20 @@ def _read_prompt_file(flag: str, spec: str) -> str:
 def resolve_system_prompt_flags(args: argparse.Namespace) -> None:
     """把两个 -file 旗标读成文本，落到 args.system_prompt / args.append_system_prompt。
 
-    读不了、文件为空、--append-system-prompt 两种写法同时给，都抛 ValueError
+    读不了、文件为空、同一份提示词的文本与文件两种写法同时给，都抛 ValueError
     （消息面向用户）——启动期就报，别等装配完 agent 才发现提示词没生效。
     """
-    args.system_prompt = (
-        _read_prompt_file("--system-prompt-file", args.system_prompt_file)
-        if args.system_prompt_file
-        else None
-    )
+    if args.system_prompt_file:
+        if args.system_prompt is not None:
+            raise ValueError("--system-prompt 与 --system-prompt-file 只能给一个")
+        args.system_prompt = _read_prompt_file("--system-prompt-file", args.system_prompt_file)
+    elif args.system_prompt is not None:
+        #  文本写法原样使用（不剥注释，与 --append-system-prompt 一致）；
+        #  空串照文件为空处理——静默退回内置身份会让人以为顶替生效了
+        if not args.system_prompt.strip():
+            raise ValueError("--system-prompt 给的是空文本")
+    else:
+        args.system_prompt = None
     if args.append_system_prompt_file:
         if args.append_system_prompt:
             raise ValueError("--append-system-prompt 与 --append-system-prompt-file 只能给一个")
