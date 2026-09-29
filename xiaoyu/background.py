@@ -45,6 +45,11 @@ _BUCKET_REFILL_SECONDS = 2.0
 _AUTO_KILL_SECONDS = 30.0
 #  monitor 默认寿命（10 小时）
 MONITOR_DEFAULT_TIMEOUT = 36_000
+#  后台任务输出日志的上限与巡检间隔：前台命令的输出有界，后台这条路此前没有
+MAX_LOG_BYTES = 1024 * 1024 * 1024
+LOG_CHECK_INTERVAL = 5.0
+#  取输出时最多读进内存多少（头尾各一半）
+OUTPUT_READ_BYTES = 2 * 1024 * 1024
 
 
 #  记在 Popen 对象上的进程组 id（见 mark_group_leader）
@@ -99,6 +104,13 @@ def kill_tree(proc: subprocess.Popen) -> None:
         proc.kill()
 
 
+def _size_of(path: Path) -> int:
+    try:
+        return path.stat().st_size
+    except OSError:
+        return 0
+
+
 @dataclass
 class BackgroundTask:
     task_id: str
@@ -112,6 +124,8 @@ class BackgroundTask:
     exit_code: int | None = None
     #  kill_task 明确终止的任务不再发完成通知（kill 的返回值已经告知模型）
     killed: bool = False
+    #  被我们自己叫停的原因（日志超限）；空串 = 自然结束或超时
+    stopped_for: str = ""
 
     @property
     def status(self) -> str:
@@ -302,12 +316,28 @@ class TaskManager:
     # ---------- 生命周期 ----------
 
     def _watch(self, task: BackgroundTask, timeout: float | None) -> None:
+        deadline = None if timeout is None else time.monotonic() + timeout
         try:
-            task.proc.wait(timeout=timeout)
-        except subprocess.TimeoutExpired:
-            kill_tree(task.proc)
-            with contextlib.suppress(Exception):
-                task.proc.wait(timeout=10)
+            while True:
+                slice_s = LOG_CHECK_INTERVAL
+                if deadline is not None:
+                    slice_s = min(slice_s, max(0.0, deadline - time.monotonic()))
+                try:
+                    task.proc.wait(timeout=slice_s)
+                    break
+                except subprocess.TimeoutExpired:
+                    pass
+                if deadline is not None and time.monotonic() >= deadline:
+                    self._stop(task)
+                    break
+                if _size_of(task.log_path) > MAX_LOG_BYTES:
+                    #  失控打印、或跑了几小时的服务：日志没有上限的话会把磁盘写满
+                    task.stopped_for = (
+                        f"输出日志超过 {MAX_LOG_BYTES / 1048576:.0f} MiB 上限，已终止"
+                        "（要长期运行就把输出重定向到别处，或让它少打印）"
+                    )
+                    self._stop(task)
+                    break
         except Exception:  # noqa: BLE001 - watcher 线程绝不能带着异常死掉
             pass
         task.exit_code = task.proc.returncode
@@ -315,10 +345,24 @@ class TaskManager:
         TASKS_LIVE.dec()
         self._announce_completion(task)
 
+    @staticmethod
+    def _stop(task: BackgroundTask) -> None:
+        kill_tree(task.proc)
+        with contextlib.suppress(Exception):
+            task.proc.wait(timeout=10)
+
     def _announce_completion(self, task: BackgroundTask) -> None:
         if self.notify is None or task.killed:
             return
         seconds = task.elapsed()
+        if task.stopped_for:
+            self.notify(
+                f'后台任务 "{task.task_id}" 被终止：{task.stopped_for}。\n'
+                f"命令：{task.command} | 用时 {seconds:.1f}s\n"
+                f'用 task_output(task_ids=["{task.task_id}"]) 查看输出的头尾。',
+                f"task-done-{task.task_id}",
+            )
+            return
         if task.kind == "monitor":
             text = (
                 f'monitor "{task.task_id}" 已结束（exit {task.exit_code}）。\n'
@@ -445,10 +489,30 @@ class TaskManager:
         return f"已终止 {task_id}（{task.description}）。"
 
     def output_of(self, task: BackgroundTask) -> str:
+        """任务输出。日志很大时只读头尾各一段——整份读进内存的话，几十兆的日志
+        查几次就是几百兆，而回给模型的反正只有几万字符。"""
         try:
-            text = task.log_path.read_text(encoding="utf-8", errors="replace")
+            size = task.log_path.stat().st_size
+            with task.log_path.open("rb") as handle:
+                if size <= OUTPUT_READ_BYTES:
+                    data, omitted = handle.read(), 0
+                else:
+                    half = OUTPUT_READ_BYTES // 2
+                    head = handle.read(half)
+                    handle.seek(size - half)
+                    tail = handle.read(half)
+                    omitted = size - 2 * half
+                    data = (
+                        head
+                        + (
+                            f"\n…（中间省略 {omitted} 字节；完整日志在 {task.log_path}，"
+                            "用 grep / tail 取需要的部分）…\n"
+                        ).encode("utf-8")
+                        + tail
+                    )
         except OSError as exc:
             return f"（日志读取失败：{exc}）"
+        text = data.decode("utf-8", errors="replace")
         return text if text.strip() else "（暂无输出）"
 
     def still_running_line(self) -> str:

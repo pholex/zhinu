@@ -176,6 +176,62 @@ class TaskManagerTest(unittest.TestCase):
         self.manager.kill(monitor.task_id)
 
 
+@unittest.skipUnless(POSIX, "用例依赖 POSIX shell")
+class BoundedLogTest(unittest.TestCase):
+    """前台命令的输出有界，后台这条路也得有。"""
+
+    def setUp(self):
+        self.manager = bg.TaskManager()
+        self.notify = Collector()
+        self.manager.notify = self.notify
+        self.addCleanup(self.manager.shutdown)
+
+    def start(self, command: str, **kwargs):
+        task = self.manager.start(["/bin/sh", "-c", command], command=command, **kwargs)
+        self.assertNotIsInstance(task, str, task)
+        return task
+
+    def test_large_log_is_read_as_head_and_tail(self):
+        task = self.start("printf 'HEAD-MARK\\n'; yes filler | head -c 300000; printf 'TAIL-MARK\\n'")
+        self.assertTrue(task.done.wait(10))
+        with mock.patch.object(bg, "OUTPUT_READ_BYTES", 4096):
+            text = self.manager.output_of(task)
+        self.assertLess(len(text), 6000)
+        self.assertIn("HEAD-MARK", text)
+        self.assertIn("TAIL-MARK", text)
+        self.assertIn("中间省略", text)
+        self.assertIn(str(task.log_path), text)
+
+    def test_small_log_is_returned_whole(self):
+        task = self.start("echo one; echo two")
+        self.assertTrue(task.done.wait(10))
+        self.assertEqual(self.manager.output_of(task).split(), ["one", "two"])
+
+    def test_runaway_output_gets_the_task_stopped(self):
+        with mock.patch.object(bg, "MAX_LOG_BYTES", 50_000), \
+                mock.patch.object(bg, "LOG_CHECK_INTERVAL", 0.1):
+            task = self.start("yes 失控打印")
+            self.assertTrue(task.done.wait(15), "日志超限后任务应被终止")
+        self.assertIn("上限", task.stopped_for)
+        self.assertTrue(wait_until(lambda: any("被终止" in t for t in self.notify.texts())))
+        (text,) = [t for t in self.notify.texts() if task.task_id in t]
+        self.assertIn("日志超过", text)
+
+    def test_timeout_still_stops_the_task(self):
+        with mock.patch.object(bg, "LOG_CHECK_INTERVAL", 0.1):
+            task = self.start("sleep 30", timeout=0.5)
+            self.assertTrue(task.done.wait(15))
+        self.assertEqual(task.stopped_for, "")
+        self.assertNotEqual(task.exit_code, 0)
+
+    def test_quiet_task_is_left_alone(self):
+        with mock.patch.object(bg, "LOG_CHECK_INTERVAL", 0.05):
+            task = self.start("sleep 0.4; echo done")
+            self.assertTrue(task.done.wait(10))
+        self.assertEqual(task.exit_code, 0)
+        self.assertEqual(task.stopped_for, "")
+
+
 class RepeatFilterTest(unittest.TestCase):
     """原样重复的行不是新事件：不为它单独唤醒模型，但出现过几次要交代。"""
 
