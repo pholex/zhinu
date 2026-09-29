@@ -282,7 +282,7 @@ n8n 的 HTTP Request 节点默认超时是 300s，够 long-poll 的 60s 上限�
 
 ```bash
 # 建一次
-curl -X POST :8420/agent -d '{"name":"写手","config":{"model":"claude-opus-5","mode":"auto",
+curl -X POST :8420/agent -d '{"name":"写手","config":{"model":"claude-opus-5-5","mode":"auto",
   "append_system_prompt":"你是技术文档写手","budget":{"tokens":300000}}}'
 #  → {"agent_id":"agent-3f9c…","version":1,...}
 

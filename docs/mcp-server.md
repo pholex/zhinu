@@ -87,7 +87,7 @@ tools = await client.get_tools()   # → xiaoyu / xiaoyu_reply / xiaoyu_close
 
 # 直接喂给 LangGraph 的 agent：
 from langgraph.prebuilt import create_react_agent
-agent = create_react_agent("anthropic:claude-sonnet-5", tools)
+agent = create_react_agent("anthropic:claude-sonnet-5-5", tools)
 result = await agent.ainvoke(
     {"messages": [{"role": "user", "content": "让小羽修掉 src/foo.py 的类型错误并跑测试"}]}
 )
