@@ -27,6 +27,8 @@ _tempdirs._sweep_started = True
 
 #  新版本提示会联网查 PyPI、往配置目录写缓存：用例一律关着跑，测它的用例自己开
 os.environ["XIAOYU_UPDATE_CHECK"] = "0"
+#  开发机上为日常使用设的技能停用清单不该漏进测试：扫描结果会少东西
+os.environ.pop("XIAOYU_SKILLS_DISABLED", None)
 
 #  开发机平时开着代理：HTTP(S)_PROXY / ALL_PROXY 漏进来的话，打 127.0.0.1 的
 #  假 server 用例、代理诊断的 stderr 断言都会随机器而变。统一清掉，要代理的用例

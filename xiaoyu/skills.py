@@ -15,6 +15,7 @@
 
 from __future__ import annotations
 
+import fnmatch
 import os
 import sys
 from dataclasses import dataclass
@@ -263,7 +264,41 @@ def strip_frontmatter(text: str) -> str:
     return text
 
 
+DISABLED_ENV = "XIAOYU_SKILLS_DISABLED"
+
+
+def disabled_patterns() -> tuple[str, ...]:
+    """停用清单：逗号分隔的技能名，可用通配（`lark-*`、`aws-core:*`）。
+
+    技能库是几家客户端共用的（~/.agents/skills），为了给这一家的索引腾预算去删
+    文件，会把别家也删掉；只能在这一家这边点名不要。
+    """
+    raw = os.environ.get(DISABLED_ENV, "")
+    return tuple(part.strip().lower() for part in raw.split(",") if part.strip())
+
+
+def is_disabled(name: str, directory: str = "", patterns: tuple[str, ...] | None = None) -> bool:
+    """名字（带插件前缀的全名）或目录名，任一个命中停用清单即停用。"""
+    patterns = disabled_patterns() if patterns is None else patterns
+    if not patterns:
+        return False
+    candidates = {name.lower(), directory.lower()} - {""}
+    return any(fnmatch.fnmatchcase(item, pattern) for item in candidates for pattern in patterns)
+
+
+def disabled_skills(workspace: Path | None = None) -> list[str]:
+    """被停用清单挡掉的技能名（给 /skills 看的；正常扫描不含它们）。"""
+    return sorted(skill.name for skill in _scan(workspace, keep_disabled=True)[1])
+
+
 def scan_skills(workspace: Path | None = None) -> list[Skill]:
+    """扫描所有来源（停用清单点名的不进结果）。"""
+    return _scan(workspace)[0]
+
+
+def _scan(
+    workspace: Path | None = None, keep_disabled: bool = False
+) -> tuple[list[Skill], list[Skill]]:
     """扫描所有来源。同名技能第一个来源胜出，被盖掉的打一行 stderr。
 
     撞名以前是静默丢弃：装了两份同名技能时，模型加载到的是哪一份全凭目录顺序，
@@ -271,6 +306,8 @@ def scan_skills(workspace: Path | None = None) -> list[Skill]:
     撞名只可能发生在散装目录之间，报出来的量很小。
     """
     found: dict[str, Skill] = {}
+    disabled: list[Skill] = []
+    patterns = disabled_patterns()
     for source in skill_sources(workspace):
         if not source.directory.is_dir():
             continue
@@ -286,6 +323,14 @@ def scan_skills(workspace: Path | None = None) -> list[Skill]:
                 continue
             if source.plugin:
                 name = f"{source.plugin}{NAMESPACE_SEP}{name}"
+            if is_disabled(name, skill_md.parent.name, patterns):
+                #  在撞名判定之前就摘掉：停用的那份不该占着名字把后面同名的挡掉
+                if keep_disabled:
+                    disabled.append(
+                        Skill(name=name, description="", path=skill_md, plugin=source.plugin,
+                              project=source.project, when_not="")
+                    )
+                continue
             problems = frontmatter_problems(meta)
             if problems:
                 #  疑似笔误 + 没描述 = 多半就是把 description 拼错了：这样的技能
@@ -312,7 +357,7 @@ def scan_skills(workspace: Path | None = None) -> list[Skill]:
                 project=source.project,
                 when_not=meta.get("when_not", "").strip(),
             )
-    return list(found.values())
+    return list(found.values()), disabled
 
 
 def load_skill_body(skill: Skill) -> str:
@@ -395,13 +440,14 @@ class IndexReport:
         if self.omitted:
             return (
                 f"技能索引预算不足：{self.omitted}/{self.total} 个技能只剩名字甚至未列出。"
-                "小羽可能找不到它们——停用不用的技能/插件，或换上下文更大的模型。"
+                f"小羽可能找不到它们——用 {DISABLED_ENV} 停用不用的技能（逗号分隔，可通配），"
+                "或换上下文更大的模型。"
             )
         if self.truncated and self.truncated_chars / self.truncated > self.WARN_AVG_CHARS:
             return (
                 f"技能索引预算不足：{self.truncated}/{self.total} 个技能的描述被截短"
                 f"（平均少 {self.truncated_chars // self.truncated} 字）。"
-                "技能都还在，但匹配会变钝——停用不用的技能/插件可腾出预算。"
+                f"技能都还在，但匹配会变钝——用 {DISABLED_ENV} 停用不用的技能可腾出预算。"
             )
         return None
 

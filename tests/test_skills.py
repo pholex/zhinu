@@ -137,6 +137,39 @@ class ScanTest(unittest.TestCase):
         patcher.start()
         self.addCleanup(patcher.stop)
 
+    def test_disabled_list_hides_skills_by_name_or_directory(self):
+        """技能库是几家客户端共用的：给这一家的索引腾预算，不该靠删文件。"""
+        write_skill(self.primary, "deploy", "name: deploy\ndescription: 部署流程")
+        write_skill(self.primary, "lark-im", "name: lark-im\ndescription: 消息")
+        write_skill(self.primary, "lark-doc", "name: lark-doc\ndescription: 文档")
+        write_skill(self.primary, "dir-name", "name: shown-name\ndescription: 目录名和名字不同")
+        with mock.patch.dict(os.environ, {skills.DISABLED_ENV: "lark-*, Dir-Name ,不存在的"}):
+            names = [skill.name for skill in skills.scan_skills()]
+            hidden = skills.disabled_skills()
+        self.assertEqual(names, ["deploy"])
+        self.assertEqual(hidden, ["lark-doc", "lark-im", "shown-name"])
+        #  文件都还在
+        self.assertTrue((self.primary / "lark-im" / "SKILL.md").is_file())
+        with mock.patch.dict(os.environ, {skills.DISABLED_ENV: ""}):
+            self.assertEqual(len(skills.scan_skills()), 4)
+            self.assertEqual(skills.disabled_skills(), [])
+
+    def test_disabled_copy_does_not_shadow_a_later_one(self):
+        write_skill(self.primary, "old-deploy", "name: deploy\ndescription: 旧的")
+        write_skill(self.secondary, "deploy", "name: deploy\ndescription: 新的")
+        with mock.patch.dict(os.environ, {skills.DISABLED_ENV: "old-deploy"}):
+            (found,) = skills.scan_skills()
+        self.assertEqual(found.description, "新的")
+
+    def test_disabled_list_matches_plugin_namespace(self):
+        self.assertTrue(skills.is_disabled("aws-core:aws-iam", "aws-iam", ("aws-core:*",)))
+        self.assertFalse(skills.is_disabled("aws-iam", "aws-iam", ("aws-core:*",)))
+        self.assertFalse(skills.is_disabled("deploy", "deploy", ()))
+
+    def test_budget_warning_names_the_switch(self):
+        report = skills.IndexReport(total=10, omitted=3, truncated=0, truncated_chars=0)
+        self.assertIn(skills.DISABLED_ENV, report.warning())
+
     def test_scans_and_reads_metadata(self):
         write_skill(self.primary, "deploy", "name: deploy\ndescription: 部署流程")
         found = skills.scan_skills()

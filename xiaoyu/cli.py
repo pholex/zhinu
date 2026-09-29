@@ -3334,6 +3334,11 @@ def handle_slash(agent: Agent, line: str, select: Any = None) -> bool:
                 if skill.project:
                     origin = ui.secondary("  [工作区]")
                 print(f"  {skill.name}  {ui.secondary(skill.description or str(skill.path))}{origin}")
+            from . import skills as skills_mod
+
+            if hidden := skills_mod.disabled_skills(agent.config.workspace):
+                shown = "、".join(hidden[:12]) + (f" 等 {len(hidden)} 个" if len(hidden) > 12 else "")
+                print(ui.secondary(f"  已停用（{skills_mod.DISABLED_ENV}）：{shown}"))
     elif command == "/model":
         if rest:
             #  先解析再切：名字没人接就报错、原模型不动。否则"已切换到 grok"打了
