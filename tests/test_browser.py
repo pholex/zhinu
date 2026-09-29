@@ -137,6 +137,22 @@ class RegistrationTest(unittest.TestCase):
             session.return_value.run.return_value = "已打开"
             self.assertEqual(self.box._browser("open", url=inside.as_uri()), "已打开")
 
+    def test_file_url_with_a_drive_letter_is_read_as_a_path(self):
+        """Windows 上 file:///C:/x 的 path 段是 "/C:/x"：直接当路径用会多出开头的
+        斜杠，工作区里的文件也被判成在外面。"""
+        import urllib.parse
+        import urllib.request
+
+        inside = self.box.config.workspace / "sub dir" / "页面.html"
+        inside.parent.mkdir()
+        inside.write_text("<title>ok</title>", encoding="utf-8")
+        url = inside.as_uri()
+        recovered = Path(urllib.request.url2pathname(urllib.parse.urlsplit(url).path))
+        self.assertEqual(recovered.resolve(), inside.resolve())
+        with mock.patch.object(browser, "session") as session:
+            session.return_value.run.return_value = "已打开"
+            self.assertEqual(self.box._browser("open", url=url), "已打开")
+
     def test_relative_screenshot_path_lands_in_the_workspace(self):
         with mock.patch.object(browser, "session") as session:
             session.return_value.run.return_value = "ok"

@@ -364,6 +364,14 @@ class TestGrepBackendsAgree(ToolboxTestCase):
 class TestWriteBackFidelity(ToolboxTestCase):
     """改一处不该顺手把整份文件的换行、BOM、编码换掉。"""
 
+    def setUp(self) -> None:
+        super().setUp()
+        #  候选编码里有一项是本机代码页：西文 Windows 上它是 cp1252，几乎什么字节
+        #  都解得开，排在 GBK 前面就把 GBK 文件认成了它。钉住才测得到要测的东西
+        patcher = mock.patch("xiaoyu.tools.locale.getpreferredencoding", return_value="UTF-8")
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
     def put(self, name: str, data: bytes) -> Path:
         target = self.root / name
         target.write_bytes(data)
@@ -470,7 +478,9 @@ class TestBinaryAndImages(ToolboxTestCase):
     def test_ordinary_text_is_untouched(self) -> None:
         self.assertEqual(self.box.run("read_file", {"path": "calc.py"}), SAMPLE)
         (self.root / "gbk.txt").write_bytes("中文内容\n".encode("gbk"))
-        self.assertIn("中文内容", self.box.run("read_file", {"path": "gbk.txt"}))
+        #  钉住本机代码页，理由同 TestWriteBackFidelity.setUp
+        with mock.patch("xiaoyu.tools.locale.getpreferredencoding", return_value="UTF-8"):
+            self.assertIn("中文内容", self.box.run("read_file", {"path": "gbk.txt"}))
 
     def test_image_is_handed_to_the_model_instead_of_decoded(self) -> None:
         (self.root / "shot.png").write_bytes(_TINY_PNG)

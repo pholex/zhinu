@@ -23,6 +23,7 @@ import re
 import signal
 import unicodedata
 import urllib.parse
+import urllib.request
 import subprocess
 import sys
 import threading
@@ -1963,7 +1964,9 @@ class Toolbox:
         if action == "open" and url and url.strip().lower().startswith("file:"):
             #  file:// 加 read 能把任何本机文件读出来，绕过文件工具的全部护栏
             #  （工作区边界、特殊文件、体积上限）。只许工作区内的
-            local = Path(urllib.parse.unquote(urllib.parse.urlsplit(url).path))
+            #  url2pathname 而不是自己取 path 段：Windows 上 file:///C:/x 的 path 段是
+            #  "/C:/x"，当路径用会多出开头那个斜杠，工作区里的文件也被判成在外面
+            local = Path(urllib.request.url2pathname(urllib.parse.urlsplit(url).path))
             _, outside = self._resolve(str(local))
             if outside:
                 return (
