@@ -645,6 +645,19 @@ class RemoveTest(IsolatedConfigTest):
         self.assertIn("没有装过", err)
 
 
+class ListRedactionTest(IsolatedConfigTest):
+    def test_credentials_in_the_source_are_not_echoed(self):
+        src = make_bundle(self.root / "src")
+        self.assertEqual(self.run_cli(["add", str(src), "--accept-mcp"])[0], 0)
+        registry = plugins.load_registry()
+        registry["demo"]["source"] = "https://bob:ghp_secretsecretsecret1234@git.example/x/y.git"
+        plugins.save_registry(registry)
+        code, out, _ = self.run_cli(["list"])
+        self.assertEqual(code, 0)
+        self.assertNotIn("ghp_secretsecretsecret1234", out)
+        self.assertIn("git.example/x/y.git", out)
+
+
 class ListTest(IsolatedConfigTest):
     def test_empty_then_populated(self):
         code, out, _ = self.run_cli(["list"])

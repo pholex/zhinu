@@ -1350,6 +1350,30 @@ class RedactTest(unittest.TestCase):
         self.assertIn('"user": "bob"', mcp._redact(shapes[6]))
         self.assertIn("page=2", mcp._redact(shapes[7]))
 
+    def test_camel_case_keys_and_url_userinfo(self):
+        leaked = "S3CR3T-value-0123"
+        for text in (
+            f"https://mcp.exa.ai/mcp?exaApiKey={leaked}",
+            f"https://mcp.tavily.com/mcp/?tavilyApiKey={leaked}&x=1",
+            f"accessToken={leaked}",
+            f'{{"clientSecret": "{leaked}"}}',
+            f"https://bob:{leaked}@host.example/mcp",
+        ):
+            with self.subTest(text=text[:40]):
+                out = mcp._redact(text)
+                self.assertNotIn(leaked, out)
+                self.assertIn("[REDACTED]", out)
+        self.assertIn("x=1", mcp._redact(f"https://h/?tavilyApiKey={leaked}&x=1"))
+        self.assertIn("host.example/mcp", mcp._redact(f"https://bob:{leaked}@host.example/mcp"))
+
+    def test_display_url_keeps_only_where_it_points(self):
+        self.assertEqual(
+            mcp.display_url("https://bob:pw@mcp.example.com:8443/v1/mcp?exaApiKey=abc#frag"),
+            "https://mcp.example.com:8443/v1/mcp",
+        )
+        self.assertEqual(mcp.display_url("https://mcp.example.com/mcp"), "https://mcp.example.com/mcp")
+        self.assertNotIn("abc123secret", mcp.display_url("不是 url token=abc123secret"))
+
     def test_ordinary_words_are_not_eaten(self):
         for text in (
             "path /tmp/task-abcd_efgh_ijkl_mnop/file",
@@ -1359,6 +1383,9 @@ class RedactTest(unittest.TestCase):
             "invalid token",
             "no password provided",
             "secretary of state",
+            "see https://docs.example.com/guide: step one",
+            "myToken is the variable name",
+            "ratio 3:4 at 10:30@room",
         ):
             with self.subTest(text=text):
                 self.assertEqual(mcp._redact(text), text)

@@ -78,6 +78,7 @@ import sys
 import threading
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -423,8 +424,13 @@ def find_command(command: str, env: dict[str, str] | None = None) -> str | None:
 #  只作用于错误路径——正常输出里的 key=value 可能是用户要的真实数据。
 #  键名：单独成词，或挂在别的词后面（access_token / client_secret / x-api-key）
 _CREDENTIAL_KEY = (
+    r"(?:"
     r"(?:[A-Za-z0-9]+[_-])*"
     r"(?:token|api[_-]?key|apikey|password|passwd|secret|authorization|credential)"
+    #  驼峰写法（exaApiKey / tavilyApiKey / accessToken）：前面的词和关键词之间没有
+    #  分隔符，只能靠大写字母认边界，所以这一支区分大小写
+    r"|(?-i:[a-z][A-Za-z0-9]*(?:ApiKey|APIKey|Token|Secret|Password|Credential))"
+    r")"
 )
 _CREDENTIAL_PATTERN = re.compile(
     #  已知前缀的令牌。sk- 要求左边不是单词字符或路径分隔：`task-…`、`disk-…`、
@@ -433,12 +439,30 @@ _CREDENTIAL_PATTERN = re.compile(
     r"|(?<![A-Za-z0-9])github_pat_[A-Za-z0-9_]{20,}"
     r"|(?<![A-Za-z0-9_/.-])sk-[A-Za-z0-9_-]{16,}"
     r"|Bearer\s+\S+"
+    #  URL 里的账号密码（https://user:pass@host）
+    r"|(?<=://)[^/\s:@]+:[^/\s@]+(?=@)"
     #  键=值 / 键: 值 / "键": "值"（JSON）。值到空白、引号、逗号、& 为止；值前面
     #  带认证方案名（Authorization: Bearer xxx）时连方案后面的令牌一起盖掉
     rf"|(?<![A-Za-z0-9])[\"']?{_CREDENTIAL_KEY}[\"']?\s*[=:]\s*[\"']?"
     r"(?:(?:Bearer|Basic|Token)\s+)?[^\s\"',&}]+",
     re.IGNORECASE,
 )
+
+
+def display_url(url: str) -> str:
+    """给人和模型看的 URL：去掉账号密码与查询串，只留"连的是哪儿"。
+
+    远端 server 的凭据常常就写在 URL 里（`?exaApiKey=…`、`user:pass@host`）。
+    报错里带上完整 URL 的话，它会经工具结果进对话历史。
+    """
+    try:
+        parts = urllib.parse.urlsplit(url)
+    except ValueError:
+        return _redact(url)
+    if not parts.scheme or not parts.hostname:
+        return _redact(url)
+    host = parts.hostname + (f":{parts.port}" if parts.port else "")
+    return urllib.parse.urlunsplit((parts.scheme, host, parts.path, "", ""))
 
 
 def _redact(text: str) -> str:
@@ -1411,7 +1435,8 @@ class McpServer:
             )
             if self._http is not None:
                 return (
-                    f"ERROR: MCP server {self.spec.name} 的连接已断开（{self.spec.url}），"
+                    f"ERROR: MCP server {self.spec.name} 的连接已断开"
+                    f"（{display_url(self.spec.url)}），"
                     f"无法调用。{hint}"
                 )
             return (
@@ -1677,7 +1702,7 @@ class McpServer:
 
     def _exit_reason(self) -> str:
         if self._http is not None:
-            return f"与远端 server 的连接已断开（{self.spec.url}）"
+            return f"与远端 server 的连接已断开（{display_url(self.spec.url)}）"
         code = self._proc.returncode if self._proc else None
         return (
             f"server 进程已退出（exit {code}）。"
