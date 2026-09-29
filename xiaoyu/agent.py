@@ -2305,6 +2305,10 @@ class Agent:
         对应第 n 次）：压缩把消息改写后下标不可靠，原文匹配不上即说明该轮已被
         压缩合并——这时只回文件不回对话（跨 compaction 一律不硬截断的
         保守方向）。文件恢复委托 RewindStore（全成才丢点，失败保留重试）。
+
+        两样都回时**先文件、后对话**，文件没回成就不截对话：对话截断会落盘、
+        不可撤，而文件恢复可能失败（被编辑器或杀软占着、权限不够）。反过来做
+        的话，失败时留下的是"对话说没改过、文件其实是改过的"。
         """
         store = getattr(self.toolbox, "rewind", None)
         if store is None:
@@ -2333,22 +2337,28 @@ class Agent:
             if found < 0:
                 notes.append("该轮对话已被压缩合并，本次只回滚文件、不动对话")
                 conversation = False
-            else:
-                self.messages = self.messages[:found]
-                self._history_rewritten()
-                self.plan = []
-                if self.session_log:
-                    #  与 compact 同一套 replacement 机制：resume 重放时撞到即
-                    #  整体替换，不需要理解 rewind 语义
-                    self.session_log.event(
-                        "rewind", target=index, replacement=self.messages[1:]
-                    )
-                notes.append(f"对话已回滚到第 {index} 轮开始前（截掉其后的全部轮次）")
         if files:
             ok, summary = store.rewind_files(index)
-            notes.append(("文件：" if ok else "文件恢复出错：") + summary)
             if self.session_log:
                 self.session_log.event("rewind_files", target=index, ok=ok)
+            if not ok:
+                notes.append("文件恢复出错：" + summary)
+                if conversation:
+                    notes.append("对话没有回滚（文件回不去时对话也不动；修好后重试即可）")
+                return "；".join(notes)
+        if conversation:
+            self.messages = self.messages[:found]
+            self._history_rewritten()
+            self.plan = []
+            if self.session_log:
+                #  与 compact 同一套 replacement 机制：resume 重放时撞到即
+                #  整体替换，不需要理解 rewind 语义
+                self.session_log.event(
+                    "rewind", target=index, replacement=self.messages[1:]
+                )
+            notes.append(f"对话已回滚到第 {index} 轮开始前（截掉其后的全部轮次）")
+        if files:
+            notes.append("文件：" + summary)
         return "；".join(notes) if notes else "什么也没做。"
 
     def drop_from(self, start: int, reason: str) -> int:
