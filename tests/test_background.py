@@ -208,10 +208,18 @@ class BoundedLogTest(unittest.TestCase):
         self.assertEqual(self.manager.output_of(task).split(), ["one", "two"])
 
     def test_runaway_output_gets_the_task_stopped(self):
+        #  输出必须有界：用无限输出的命令的话，终止一旦没杀到它，它就一直写到把
+        #  磁盘写满（sh 把命令当子进程跑的系统上，只杀 sh 杀不到它）。这里写够
+        #  越线的量就停下睡着——杀没杀到都不会出事，而"被终止"仍然测得出来。
+        #  进程组与生产路径一致：生产上后台任务都是独立进程组，终止按组杀
         with mock.patch.object(bg, "MAX_LOG_BYTES", 50_000), \
                 mock.patch.object(bg, "LOG_CHECK_INTERVAL", 0.1):
-            task = self.start("yes 失控打印")
+            task = self.start(
+                "yes 失控打印 | head -c 400000; sleep 60",
+                popen_extra={"start_new_session": True},
+            )
             self.assertTrue(task.done.wait(15), "日志超限后任务应被终止")
+        self.assertLess(task.elapsed(), 30)
         self.assertIn("上限", task.stopped_for)
         self.assertTrue(wait_until(lambda: any("被终止" in t for t in self.notify.texts())))
         (text,) = [t for t in self.notify.texts() if task.task_id in t]
