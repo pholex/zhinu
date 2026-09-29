@@ -866,19 +866,23 @@ def create_app(cfg: ServeConfig):  # noqa: C901 - 路由表天然长，拆开反
 
     # ---------- 鉴权 ----------
 
-    async def require_token(
-        authorization: str = Header(default=""),
-        x_xiaoyu_token: str = Header(default=""),
-    ) -> None:
+    def header_token_ok(authorization: str, x_xiaoyu_token: str) -> bool:
+        """没配 token（只监听回环）恒真；配了就要对得上。"""
         if not cfg.token:
-            return
+            return True
         offered = x_xiaoyu_token or authorization.removeprefix("Bearer ").strip()
         #  常数时间比较：token 是长期凭据，别把它的前缀通过响应时间漏出去。
         #  **必须比 bytes**：starlette 按 latin-1 解 header，而
         #  compare_digest(str, str) 遇非 ASCII 直接抛 TypeError——那会让
         #  非 ASCII 的 token 整个服务不可用（每个请求 500），也让任何带非 ASCII
         #  Authorization 头的请求收到 500 而不是干净的 401。
-        if not hmac.compare_digest(offered.encode("utf-8"), cfg.token.encode("utf-8")):
+        return hmac.compare_digest(offered.encode("utf-8"), cfg.token.encode("utf-8"))
+
+    async def require_token(
+        authorization: str = Header(default=""),
+        x_xiaoyu_token: str = Header(default=""),
+    ) -> None:
+        if not header_token_ok(authorization, x_xiaoyu_token):
             raise HTTPException(status_code=401, detail="token 不对或缺失")
 
     guard = [Depends(require_token)]
@@ -1331,7 +1335,15 @@ def create_app(cfg: ServeConfig):  # noqa: C901 - 路由表天然长，拆开反
         return body
 
     @app.get("/health", summary="存活探针", tags=["system"], operation_id="health")
-    async def health() -> dict[str, Any]:
+    async def health(
+        authorization: str = Header(default=""),
+        x_xiaoyu_token: str = Header(default=""),
+    ) -> dict[str, Any]:
+        #  探针本身不要 token（负载均衡 / 容器编排的存活检查带不了凭据），但配了
+        #  token 的服务多半暴露在回环之外：工作区路径、状态目录、审批档这些是
+        #  部署细节，只回给对得上 token 的调用方，匿名探针只拿到"活着"和版本
+        if not header_token_ok(authorization, x_xiaoyu_token):
+            return {"ok": True, "version": app.version}
         return {
             "ok": True,
             "version": app.version,
