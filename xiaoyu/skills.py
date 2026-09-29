@@ -311,7 +311,7 @@ def _scan(
     for source in skill_sources(workspace):
         if not source.directory.is_dir():
             continue
-        for skill_md in sorted(source.directory.glob("*/SKILL.md")):
+        for skill_md in plugins.skill_files(source.directory):
             try:
                 #  glob 不看文件类型：仓库里 SKILL.md 可以是指向设备的链接
                 fsguard.require_regular(skill_md)

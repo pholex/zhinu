@@ -228,6 +228,57 @@ class InspectTest(IsolatedConfigTest):
             plugins.inspect_bundle(src)
 
 
+class DeclaredSkillPathsTest(IsolatedConfigTest):
+    """manifest 点名的技能路径与约定目录是叠加的，不是二选一。"""
+
+    def bundle(self, declared) -> Path:
+        src = make_bundle(self.root / "src")  # 自带 skills/hello
+        write_json(src / "plugin.json", {"name": "demo", "skills": declared})
+        return src
+
+    def extra_skill(self, src: Path, relative: str, name: str) -> None:
+        target = src / relative
+        target.mkdir(parents=True, exist_ok=True)
+        (target / "SKILL.md").write_text(
+            f"---\nname: {name}\ndescription: d\n---\n正文\n", encoding="utf-8"
+        )
+
+    def test_declared_directory_adds_to_the_default_one(self):
+        src = self.bundle(["./more"])
+        self.extra_skill(src, "more/second", "second")
+        self.assertEqual(plugins.scan_bundle_skills(src), ("hello", "second"))
+
+    def test_path_may_point_straight_at_one_skill(self):
+        src = self.bundle(["./solo"])
+        self.extra_skill(src, "solo", "solo")
+        self.assertEqual(plugins.scan_bundle_skills(src), ("hello", "solo"))
+
+    def test_installed_bundle_exposes_both_to_the_index(self):
+        from xiaoyu import skills as skills_mod
+
+        src = self.bundle(["./more", "./solo"])
+        self.extra_skill(src, "more/second", "second")
+        self.extra_skill(src, "solo", "solo")
+        self.assertEqual(self.run_cli(["add", str(src)])[0], 0)
+        names = {skill.name for skill in skills_mod.scan_skills() if skill.plugin == "demo"}
+        self.assertEqual(names, {"demo:hello", "demo:second", "demo:solo"})
+
+    def test_unusable_declared_paths_are_reported(self):
+        src = self.bundle(["./missing", "./empty", "../outside"])
+        (src / "empty").mkdir()
+        bundle = plugins.inspect_bundle(src)
+        text = "\n".join(bundle.notes)
+        self.assertIn("./missing 不存在", text)
+        self.assertIn("./empty 下面没有 SKILL.md", text)
+        self.assertIn("../outside 指到了包外", text)
+        self.assertEqual(plugins.scan_bundle_skills(src), ("hello",))
+
+    def test_declaring_the_default_directory_does_not_double_it(self):
+        src = self.bundle(["./skills"])
+        self.assertEqual(len(plugins.bundle_skill_dirs(src)), 1)
+        self.assertEqual(plugins.inspect_bundle(src).notes, ())
+
+
 class MarketplaceTest(IsolatedConfigTest):
     def test_neutral_and_claude_shapes(self):
         for relative, entry in (
