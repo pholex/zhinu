@@ -342,6 +342,17 @@ def inspect_bundle(root: Path, fallback_name: str | None = None) -> Bundle:
                     entry, note = _localize(name, str(server), entry)
                     if note:
                         notes.append(note)
+                entry, self_trust = _without_self_trust(entry)
+                if self_trust:
+                    notes.append(
+                        f"{server} 自带的信任声明（{'、'.join(self_trust)}）已忽略："
+                        "信任不能由被审查的一方自己声明，要给请装好后自己在 mcp.json 里加"
+                    )
+                if unsupported := _unsupported_placeholders(entry):
+                    notes.append(
+                        f"{server} 用到了 {'、'.join(unsupported)}，小羽没有插件配置项这一层，"
+                        "这些占位符会原样传给 server，多半起不来"
+                    )
                 mcp_servers[str(server)] = entry
 
     for hook in _scan_hooks(root, manifest):
@@ -844,6 +855,107 @@ def same_servers(left: dict[str, Any], right: dict[str, Any]) -> bool:
     }
 
 
+#  信任类开关：它们决定"这个 server 的输出/工具变更要不要再过人眼"，是用户对
+#  server 的判断。包自己写上等于被审查的一方给自己盖章，读声明时一律剥掉。
+SELF_TRUST_KEYS = ("trustContent", "trustToolChanges")
+
+_ENV_REFERENCE = re.compile(r"\$\{(?:env:)?([A-Za-z_][A-Za-z0-9_]*)\}")
+_CONFIG_PLACEHOLDER = re.compile(r"\$\{user_config\.[^}]*\}")
+
+
+def _without_self_trust(entry: dict[str, Any]) -> tuple[dict[str, Any], list[str]]:
+    dropped = [key for key in SELF_TRUST_KEYS if key in entry]
+    if not dropped:
+        return entry, []
+    return {key: value for key, value in entry.items() if key not in SELF_TRUST_KEYS}, dropped
+
+
+def _strings(value: Any):
+    if isinstance(value, str):
+        yield value
+    elif isinstance(value, dict):
+        for item in value.values():
+            yield from _strings(item)
+    elif isinstance(value, (list, tuple)):
+        for item in value:
+            yield from _strings(item)
+
+
+def _unsupported_placeholders(entry: dict[str, Any]) -> list[str]:
+    found: dict[str, None] = {}
+    for text in _strings(entry):
+        for hit in _CONFIG_PLACEHOLDER.findall(text):
+            found.setdefault(hit)
+    return list(found)
+
+
+def env_reads(entry: dict[str, Any]) -> list[str]:
+    """这条声明会从你的环境里读哪些变量：`${VAR}` 展开与 inheritEnv 点名都算。"""
+    names: dict[str, None] = {}
+    for text in _strings({key: value for key, value in entry.items() if key != "inheritEnv"}):
+        for name in _ENV_REFERENCE.findall(text):
+            names.setdefault(name)
+    inherit = entry.get("inheritEnv")
+    for name in inherit if isinstance(inherit, list) else []:
+        if isinstance(name, str) and name.strip():
+            names.setdefault(name.strip())
+    return list(names)
+
+
 def command_line(entry: dict[str, Any]) -> str:
-    """一条 MCP 声明的完整命令行，装之前摊给用户看。"""
+    """一条 MCP 声明连到哪：stdio 是完整命令行，远端是 url。装之前摊给用户看。"""
+    url = entry.get("url")
+    if isinstance(url, str) and url.strip():
+        return f"远端 {url.strip()}"
     return " ".join([str(entry.get("command", "?")), *(str(a) for a in entry.get("args") or [])])
+
+
+#  摘要里单独成行讲过的键；其余的键原样列出来——整条声明都要过人眼，
+#  不能只挑认识的几个字段展示
+_SUMMARIZED_KEYS = frozenset({"command", "args", "url", "type", "inheritEnv", OWNER_KEY})
+
+
+def _compact(value: Any, limit: int = 120) -> str:
+    text = value if isinstance(value, str) else json.dumps(value, ensure_ascii=False, sort_keys=True)
+    return text if len(text) <= limit else text[: limit - 1] + "…"
+
+
+def declaration_details(entry: dict[str, Any]) -> list[str]:
+    """命令行/url 之外还声明了什么：读哪些环境变量、带哪些请求头、其它每个字段。"""
+    lines: list[str] = []
+    if reads := env_reads(entry):
+        lines.append(f"会读取你的环境变量：{'、'.join(reads)}")
+    for key in sorted(entry):
+        if key in _SUMMARIZED_KEYS:
+            continue
+        value = entry[key]
+        if key in ("env", "headers") and isinstance(value, dict):
+            label = "设置环境变量" if key == "env" else "请求头"
+            lines.append(f"{label}：" + "、".join(f"{k}={_compact(v, 60)}" for k, v in value.items()))
+        else:
+            lines.append(f"{key}：{_compact(value)}")
+    return lines
+
+
+def declaration_changes(old: dict[str, Any], new: dict[str, Any]) -> list[str]:
+    """两条声明逐键比出来的差异。same_servers 判了"有变化"，这里就一定有内容——
+    只比命令行的话，换 url、加环境变量、改请求头这些变化会打印成一片空白。"""
+    old, new = strip_owner(old), strip_owner(new)
+    lines: list[str] = []
+    if command_line(old) != command_line(new):
+        lines.append(f"{command_line(old)}  →  {command_line(new)}")
+    before, after = env_reads(old), env_reads(new)
+    if added := [name for name in after if name not in before]:
+        lines.append(f"新增读取环境变量：{'、'.join(added)}")
+    if removed := [name for name in before if name not in after]:
+        lines.append(f"不再读取环境变量：{'、'.join(removed)}")
+    for key in sorted(set(old) | set(new)):
+        if key in ("command", "args", "url") or old.get(key) == new.get(key):
+            continue
+        if key not in old:
+            lines.append(f"新增 {key}：{_compact(new[key])}")
+        elif key not in new:
+            lines.append(f"去掉 {key}（原为 {_compact(old[key])}）")
+        else:
+            lines.append(f"{key}：{_compact(old[key])}  →  {_compact(new[key])}")
+    return lines

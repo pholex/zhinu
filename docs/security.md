@@ -138,7 +138,7 @@ xiaoyu --no-network          # 或 XIAOYU_SANDBOX_NETWORK=0，断掉沙箱内的
 | 某个 MCP server 的结果不套 `<untrusted_content>` | 该 server 声明里 `"trustContent": true` | 内网 runbook / 工单系统——你就是想让模型照它说的做 |
 | 逐条审批 / 沙箱 / 工作区信任门 / MCP 变更隔离 | `--yolo` / `--no-sandbox` / `--trust` / `XIAOYU_MCP_TRUST_CHANGES=1` | 原有开关，不变 |
 
-`trustContent` 只给 MCP：网页与联网搜索的来源不是你能背书的，没有对应开关。`--unattended` 在确认档单独开没有意义——那几项本来就走常规确认；出厂的 auto 档下它会让写可执行配置不再问。
+`trustContent` 只给 MCP：网页与联网搜索的来源不是你能背书的，没有对应开关。`trustContent` 与 `trustToolChanges` 只认你自己写进 mcp.json 的：插件包声明里自带的会在安装时剥掉并报出来——信任不能由被审查的一方自己声明。`--unattended` 在确认档单独开没有意义——那几项本来就走常规确认；出厂的 auto 档下它会让写可执行配置不再问。
 
 ### `--unguarded`：无护栏预设
 
