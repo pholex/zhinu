@@ -370,6 +370,20 @@ class TestRequestTranslation(unittest.TestCase):
             self.assertNotIn(key, request)
         self.assertEqual(request["metadata"], {"k": "v"})
 
+    def test_tool_choice_is_translated_to_object_form(self) -> None:
+        """chat 的裸串 tool_choice 在 Messages 上是硬 400——摘要前缀重放发的
+        "none" 曾因此每次都失败、静默退回转写姿势。"""
+        pick = lambda choice: msgs.to_request(  # noqa: E731
+            "m", [{"role": "user", "content": "hi"}], None, False, {"tool_choice": choice}
+        )["tool_choice"]
+        self.assertEqual(pick("none"), {"type": "none"})
+        self.assertEqual(pick("auto"), {"type": "auto"})
+        self.assertEqual(pick("required"), {"type": "any"})
+        self.assertEqual(
+            pick({"type": "function", "function": {"name": "bash"}}), {"type": "tool", "name": "bash"}
+        )
+        self.assertEqual(pick({"type": "none"}), {"type": "none"})
+
 
 class TestStreamTranslation(unittest.TestCase):
     def collect(self, events: list[Any]) -> tuple[str, dict[int, dict[str, Any]], Any]:

@@ -74,6 +74,18 @@ _PARAM_ALIASES = {"max_completion_tokens": "max_tokens"}
 #  只有 include_usage 一个用途，Messages 的 usage 一定随流回来，吃掉即可
 _DROPPED_PARAMS = ("temperature", "top_p", "top_k", "stream_options")
 
+
+def _tool_choice(value: Any) -> Any:
+    """chat 的 tool_choice → Messages 的对象形态。chat 允许裸字符串，Messages
+    一律要对象（裸串是硬 400「Input should be an object」，2026-09-29 实测
+    Claude 5 / 5.5 皆然）。注意 5.5 线不认强制调用（any / tool 是 400），
+    这里只做形态翻译，不替调用方改语义。认不出的形态原样透传。"""
+    if isinstance(value, str):
+        return {"type": {"required": "any"}.get(value, value)}
+    if isinstance(value, dict) and value.get("type") == "function":
+        return {"type": "tool", "name": (value.get("function") or {}).get("name", "")}
+    return value
+
 _CACHE_CONTROL = {"type": "ephemeral"}
 
 #  服务端压缩（beta）。内核用私有键 COMPACTION_KEY 表达"请在 N 输入 token 时
@@ -448,7 +460,7 @@ def to_request(
     if tools:
         request["tools"] = to_tools(tools)
     for key, value in passthrough.items():
-        request[_PARAM_ALIASES.get(key, key)] = value
+        request[_PARAM_ALIASES.get(key, key)] = _tool_choice(value) if key == "tool_choice" else value
     if effort:
         output_config = dict(request.get("output_config") or {})
         output_config["effort"] = effort
