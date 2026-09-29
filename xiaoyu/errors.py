@@ -238,6 +238,11 @@ def _error_code(exc: Exception) -> str:
     return code.lower() if isinstance(code, str) else ""
 
 
+def error_code(exc: BaseException) -> str:
+    """异常携带的结构化错误码（公开入口，留痕用）。"""
+    return _error_code(exc)  # type: ignore[arg-type]
+
+
 def _vendor_kind(exc: Exception) -> str:
     """厂商业务码对应的分类，认不出返回空串。结构化码优先，其次从
     `[码][文案][request_id]` 形态的 message 开头取。"""
@@ -361,6 +366,27 @@ def classify(exc: Exception) -> Verdict:
 #  Retry-After 的采信上限（秒）：服务端偶尔会给出几小时后的值，
 #  交互场景等不了，超过就按上限退避。
 RETRY_AFTER_CAP = 60.0
+
+
+_REQUEST_ID_HEADERS = ("x-request-id", "request-id", "x-amzn-requestid", "cf-ray")
+
+
+def request_id(exc: BaseException) -> str:
+    """上游给这次请求的编号：找厂商排查时对方第一句就是问它。取不到返回空串。"""
+    direct = getattr(exc, "request_id", None)
+    if isinstance(direct, str) and direct:
+        return direct
+    headers = getattr(getattr(exc, "response", None), "headers", None)
+    if headers is None:
+        return ""
+    for name in _REQUEST_ID_HEADERS:
+        try:
+            value = headers.get(name)
+        except Exception:  # noqa: BLE001 - headers 形状不对就当没有
+            return ""
+        if isinstance(value, str) and value:
+            return value
+    return ""
 
 
 def retry_after_seconds(exc: Exception) -> float | None:

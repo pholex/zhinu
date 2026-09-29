@@ -805,6 +805,12 @@ class Agent:
     #  上一次流的收尾状态（每次发请求前重置）。类级默认值：没发过请求就被问到也有定义
     _length_truncated = False
     _truncation_had_output = False
+    _content_filtered = False
+    _completion_tokens: int | None = None
+    _prompt_tokens_seen: int | None = None
+    _request_clock: float | None = None
+    _first_chunk_at: float | None = None
+    _response_id = ""
 
     def __init__(
         self,
@@ -3585,7 +3591,12 @@ class Agent:
             attempt += 1
             try:
                 message = self._stream_once(route, with_tools=with_tools, bypass_cache=after_empty)
-                if not media.text_of(message.get("content")).strip() and not message.get("tool_calls"):
+                empty = (
+                    not media.text_of(message.get("content")).strip()
+                    and not message.get("tool_calls")
+                )
+                self._log_request(route, attempt, "empty" if empty else "ok")
+                if empty:
                     zero_streak = zero_streak + 1 if self._completion_tokens == 0 else 0
                     if zero_streak >= self._DETERMINISTIC_EMPTY:
                         self.sink.emit(
@@ -3613,6 +3624,10 @@ class Agent:
                 #  中间夹了一次报错就不算"连续"
                 zero_streak = 0
                 verdict = classify(exc)
+                retrying = (
+                    verdict.retryable
+                    and attempt < self._RECOVERY_ATTEMPTS
+                )
                 if (
                     after_empty
                     and not verdict.should_compact
@@ -3630,15 +3645,18 @@ class Agent:
                             "warn",
                         )
                     )
+                    self._log_request(route, attempt, "error", exc=exc, verdict=verdict)
                     attempt -= 1
                     continue
                 if verdict.should_compact:
                     #  上下文超限：本地估算低估了才会走到这，立刻强制压缩
                     self.maybe_compact(force=True)
-                if not verdict.retryable or attempt == self._RECOVERY_ATTEMPTS:
+                if not retrying:
+                    self._log_request(route, attempt, "error", exc=exc, verdict=verdict)
                     raise
                 if budget is not None and not budget.take():
                     #  全链预算用完：交给外层换下一条路由（每条路由仍至少试一次）
+                    self._log_request(route, attempt, "error", exc=exc, verdict=verdict)
                     raise
                 #  服务端给了 Retry-After 就听它的；否则用指数退避。
                 #  再乘 ±25% jitter：
@@ -3648,6 +3666,7 @@ class Agent:
                     errors.retry_after_seconds(exc) or delay, self._RECOVERY_MAX_DELAY
                 )
                 wait *= random.uniform(0.75, 1.25)
+                self._log_request(route, attempt, "error", exc=exc, verdict=verdict, wait=wait)
                 self.sink.emit(
                     Notice(
                         f"[{verdict.hint}，{wait:.1f}s 后重试"
@@ -3659,6 +3678,63 @@ class Agent:
                 self._sleep(wait)
                 delay *= 2
         raise RuntimeError("unreachable")  # for 循环里必然 return 或 raise
+
+    def _log_request(
+        self,
+        route: Route,
+        attempt: int,
+        outcome: str,
+        *,
+        exc: BaseException | None = None,
+        verdict: Any = None,
+        wait: float | None = None,
+    ) -> None:
+        """每次模型请求（含每次重试）在会话日志里留一条事实。
+
+        重试、退避、换路由只发通知给当时坐在屏幕前的人，事后从日志里回答不了
+        "哪家失败了几次、什么状态码、等了多久、首字用了多长"。记的是事实，不含正文。
+        留痕本身出错不能连累请求。
+        """
+        if not self.session_log:
+            return
+        try:
+            now = time.monotonic()
+            started = getattr(self, "_request_clock", None)
+            first = getattr(self, "_first_chunk_at", None)
+            fields: dict[str, Any] = {
+                "provider": route.provider, "model": route.model,
+                "attempt": attempt, "outcome": outcome,
+            }
+            if started is not None:
+                fields["total_ms"] = round((now - started) * 1000)
+                if first is not None:
+                    fields["first_chunk_ms"] = round((first - started) * 1000)
+            if exc is None:
+                fields["prompt_tokens"] = getattr(self, "_prompt_tokens_seen", None)
+                fields["completion_tokens"] = self._completion_tokens
+                if self._length_truncated:
+                    fields["finish"] = "length"
+                elif self._content_filtered:
+                    fields["finish"] = "content_filter"
+                if getattr(self, "_response_id", ""):
+                    fields["response_id"] = self._response_id
+            else:
+                fields["error"] = type(exc).__name__
+                fields["message"] = str(exc)[:300]
+                if verdict is not None:
+                    fields["error_kind"] = verdict.kind
+                status = getattr(exc, "status_code", None)
+                if isinstance(status, int):
+                    fields["status"] = status
+                if code := errors.error_code(exc):
+                    fields["code"] = code
+                if found := errors.request_id(exc):
+                    fields["request_id"] = found
+                if wait is not None:
+                    fields["wait_s"] = round(wait, 2)
+            self.session_log.event("request", **fields)
+        except Exception:  # noqa: BLE001
+            pass
 
     def _cache_bypass_body(self, route: Route) -> dict[str, Any] | None:
         """这条路由空补全重发时并进请求体的"跳过缓存读取"字段；不该带返回 None。"""
@@ -3756,6 +3832,11 @@ class Agent:
         self._stream_finished = False
         #  这次请求 usage 报的 completion_tokens；None = 没收到 usage（判不出）
         self._completion_tokens: int | None = None
+        #  请求级留痕用（见 _log_request）：起点、首个 chunk 到达的时刻、上游响应编号
+        self._request_clock = time.monotonic()
+        self._first_chunk_at: float | None = None
+        self._response_id = ""
+        self._prompt_tokens_seen: int | None = None
         try:
             stream = route.client.chat.completions.create(**request)
             self._consume_stream(route, stream, content_parts, pending, reasoning)
@@ -3937,11 +4018,16 @@ class Agent:
             #  Interrupted（KeyboardInterrupt 子类）复用 _stream_once 里
             #  现成的收尾分支——半截话入历史、残缺 tool_calls 丢弃。
             self._checkpoint()
+            if self._first_chunk_at is None:
+                self._first_chunk_at = time.monotonic()
+            if not self._response_id and isinstance(getattr(chunk, "id", None), str):
+                self._response_id = chunk.id
             if getattr(chunk, "usage", None):
                 #  收到 usage 即视为正常收尾：有些端点不发 finish_reason，只在
                 #  最后给一个纯 usage chunk（断流判定见 _stream_once）
                 self._stream_finished = True
                 prompt_tokens = chunk.usage.prompt_tokens or 0
+                self._prompt_tokens_seen = prompt_tokens
                 self._completion_tokens = chunk.usage.completion_tokens
                 self.usage.add(
                     route.qualified,

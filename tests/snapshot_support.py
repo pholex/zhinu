@@ -117,6 +117,9 @@ def normalize_session_record(
     for key, value in record.items():
         if key in ("ts", "started_at"):
             out[key] = "<ts>"
+        elif key in ("total_ms", "first_chunk_ms", "wait_s"):
+            #  请求留痕里的耗时：字段在不在要进 golden，数值每次都不同
+            out[key] = "<ms>"
         elif key == "version":
             out[key] = "<version>"
         elif key == "tool_call_id" and isinstance(value, str):

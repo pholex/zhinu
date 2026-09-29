@@ -374,6 +374,79 @@ def switch_notices(agent):
     return [m for m in agent.messages if "模型已切换" in str(m.get("content"))]
 
 
+class RequestLogTest(AgentTestCase):
+    """每次模型请求（含每次重试）在会话日志里留一条事实。"""
+
+    class Log:
+        def __init__(self):
+            self.events = []
+
+        def event(self, kind, **fields):
+            self.events.append((kind, fields))
+
+        def append(self, message):
+            pass
+
+    def requests(self, agent):
+        return [fields for kind, fields in agent.session_log.events if kind == "request"]
+
+    def run_with_log(self, script):
+        agent = self.build(script)
+        agent.session_log = self.Log()
+        agent._sleep = lambda seconds: None
+        with contextlib.redirect_stdout(io.StringIO()):
+            agent.send("hi")
+        return agent
+
+    def test_failed_attempt_and_its_retry_are_both_recorded(self):
+        agent = self.run_with_log([rate_limit_error(), [chunk(content="好了"), usage_chunk(120, 5)]])
+        first, second = self.requests(agent)
+        self.assertEqual((first["attempt"], first["outcome"]), (1, "error"))
+        self.assertEqual(first["error_kind"], "rate_limit")
+        self.assertEqual(first["status"], 429)
+        self.assertEqual(first["error"], "RateLimitError")
+        self.assertGreater(first["wait_s"], 0)
+        self.assertEqual((second["attempt"], second["outcome"]), (2, "ok"))
+        self.assertEqual((second["prompt_tokens"], second["completion_tokens"]), (120, 5))
+        for record in (first, second):
+            self.assertEqual((record["provider"], record["model"]), ("gateway", "main-model"))
+            self.assertIn("total_ms", record)
+
+    def test_request_id_and_code_are_kept_when_the_upstream_gives_them(self):
+        response = httpx.Response(
+            429, request=httpx.Request("POST", "http://unused"),
+            headers={"x-request-id": "req-abc"},
+        )
+        exc = openai.RateLimitError("慢一点", response=response, body={"error": {"code": "1302"}})
+        agent = self.run_with_log([exc, [chunk(content="好了"), usage_chunk(10, 1)]])
+        first = self.requests(agent)[0]
+        self.assertEqual(first["request_id"], "req-abc")
+        self.assertEqual(first["code"], "1302")
+
+    def test_truncated_reply_is_marked(self):
+        agent = self.run_with_log([
+            [chunk(content="说到一半"), length_chunk(), usage_chunk(100, 50)],
+            [chunk(content="说完了"), usage_chunk(100, 5)],
+        ])
+        first, second = self.requests(agent)
+        self.assertEqual(first["finish"], "length")
+        self.assertNotIn("finish", second)
+
+    def test_a_broken_log_never_breaks_the_request(self):
+        agent = self.build([[chunk(content="好了"), usage_chunk(10, 1)]])
+
+        class Broken(self.Log):
+            def event(self, kind, **fields):
+                if kind == "request":
+                    raise OSError("磁盘满了")
+                super().event(kind, **fields)
+
+        agent.session_log = Broken()
+        with contextlib.redirect_stdout(io.StringIO()):
+            agent.send("hi")
+        self.assertEqual(agent.last_assistant_text(), "好了")
+
+
 class ModelSwitchNoticeTest(AgentTestCase):
     """换了模型要告诉新模型：以上 assistant 回复不是它说的——否则它会把前任的
     自述（"当前模型看不了图"之类）当成关于自己的事实。"""
