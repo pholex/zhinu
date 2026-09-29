@@ -469,8 +469,52 @@ def _read_for_edit(target: Path) -> tuple[str, str, bytes]:
             decoded = raw.decode(encoding)
         except UnicodeDecodeError:
             continue
+        #  文件开头的 BOM 不是正文：留在文本里的话，模型照抄首行做多行替换时，
+        #  匹配落在第 1 个字符之后，会被"old_str 从行中间开始"的护栏误拒
+        decoded = decoded.removeprefix("\ufeff")
         return decoded.replace("\r\n", "\n").replace("\r", "\n"), encoding, raw
     raise _Undecodable(str(target))
+
+
+def _encoding_of(raw: bytes) -> str:
+    """这段字节能无损解码的第一种候选编码；都解不开返回空串。"""
+    for encoding in _edit_encodings():
+        try:
+            raw.decode(encoding)
+        except UnicodeDecodeError:
+            continue
+        return encoding
+    return ""
+
+
+def _newline_of(raw: bytes) -> str:
+    """文件用的是哪种换行：按出现次数取多数，没有换行或数不出多数按 LF。"""
+    crlf = raw.count(b"\r\n")
+    lf = raw.count(b"\n") - crlf
+    cr = raw.count(b"\r") - crlf
+    if crlf > lf and crlf >= cr:
+        return "\r\n"
+    if cr > lf and cr > crlf:
+        return "\r"
+    return "\n"
+
+
+def _write_like_original(target: Path, text: str, encoding: str, raw: bytes | None) -> None:
+    """按原文件的样子写回：同样的编码、同样的换行、原来带 BOM 的还带。
+
+    读的时候换行统一成了 LF（匹配要用），写回时不还原的话，改一处就等于把整份
+    文件的换行全换掉——版本控制里显示成整篇都改了，团队里别人的编辑器和换行
+    检查跟着报。按字节写，不经文本模式的平台换行转换。
+    """
+    original = raw or b""
+    newline = _newline_of(original)
+    body = text.replace("\r\n", "\n").replace("\r", "\n")
+    if newline != "\n":
+        body = body.replace("\n", newline)
+    data = body.encode(encoding)
+    if original.startswith(codecs.BOM_UTF8) and codecs.lookup(encoding).name == "utf-8":
+        data = codecs.BOM_UTF8 + data
+    target.write_bytes(data)
 
 
 def _undecodable_error(path: str) -> str:
@@ -2018,21 +2062,36 @@ class Toolbox:
             if error := _unreadable_file_error(target, path, size_cap=False):
                 return error
         #  /rewind 快照：改前内容（新建文件记 None——回滚即删除）
+        previous: bytes | None = None
         if existed:
             try:
-                self.rewind.record(target, target.read_bytes())
+                previous = target.read_bytes()
+                self.rewind.record(target, previous)
             except OSError:
                 pass
         else:
             self.rewind.record(target, None)
+        converted = ""
         try:
             target.parent.mkdir(parents=True, exist_ok=True)
-            target.write_text(content, encoding="utf-8")
+            encoding = _encoding_of(previous) if previous else ""
+            if encoding:
+                #  覆盖已有文件：沿用它的编码与换行，和局部替换的承诺一致
+                try:
+                    content.encode(encoding)
+                except UnicodeEncodeError:
+                    converted = (
+                        f"；原文件是 {encoding} 编码，新内容里有它表示不了的字符，已改用 UTF-8"
+                    )
+                    encoding = "utf-8"
+                _write_like_original(target, content, encoding, previous)
+            else:
+                target.write_text(content, encoding="utf-8")
         except OSError as exc:
             return f"ERROR: 写入失败 {path}: {exc}"
         self._mark_read(target)
         action = "已覆盖" if existed else "已创建"
-        note = "（工作区之外）" if outside else ""
+        note = ("（工作区之外）" if outside else "") + converted
         lines = content.count("\n") + (1 if content and not content.endswith("\n") else 0)
         return f"{action}{note} {path}：{len(content)} 字符 / {lines} 行"
 
@@ -2090,7 +2149,7 @@ class Toolbox:
             return error
         self.rewind.record(target, raw)
         try:
-            target.write_text(updated, encoding=encoding)
+            _write_like_original(target, updated, encoding, raw)
         except OSError as exc:
             return f"ERROR: 写入失败 {path}: {exc}"
         self._mark_read(target, keep_level=True)
@@ -2166,7 +2225,7 @@ class Toolbox:
             return error
         self.rewind.record(target, raw if raw is not None else text.encode(encoding))
         try:
-            target.write_text(updated, encoding=encoding)
+            _write_like_original(target, updated, encoding, raw)
         except OSError as exc:
             return f"ERROR: 写入失败 {path}: {exc}"
         self._mark_read(target, keep_level=True)

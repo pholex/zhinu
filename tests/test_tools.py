@@ -10,6 +10,7 @@ from pathlib import Path
 from unittest import mock
 
 from xiaoyu.config import Config
+from xiaoyu import tools
 from xiaoyu.tools import PURPOSE_PARAM, Tool, Toolbox
 
 SAMPLE = """def add(a, b):
@@ -276,6 +277,86 @@ _TINY_PNG = bytes.fromhex(
     "89504e470d0a1a0a0000000d49484452000000010000000108060000001f15c489"
     "0000000d49444154789c6360000002000001e221bc330000000049454e44ae426082"
 )
+
+
+class TestWriteBackFidelity(ToolboxTestCase):
+    """改一处不该顺手把整份文件的换行、BOM、编码换掉。"""
+
+    def put(self, name: str, data: bytes) -> Path:
+        target = self.root / name
+        target.write_bytes(data)
+        return target
+
+    def test_crlf_survives_a_local_edit(self) -> None:
+        target = self.put("win.txt", b"alpha\r\nbeta\r\ngamma\r\n")
+        self.box.run("read_file", {"path": "win.txt"})
+        result = self.box.run(
+            "str_replace", {"path": "win.txt", "old_str": "beta", "new_str": "BETA\nextra"}
+        )
+        self.assertIn("已替换", result)
+        self.assertEqual(target.read_bytes(), b"alpha\r\nBETA\r\nextra\r\ngamma\r\n")
+
+    def test_lf_stays_lf(self) -> None:
+        target = self.put("unix.txt", b"alpha\nbeta\n")
+        self.box.run("read_file", {"path": "unix.txt"})
+        self.box.run("str_replace", {"path": "unix.txt", "old_str": "beta", "new_str": "BETA"})
+        self.assertEqual(target.read_bytes(), b"alpha\nBETA\n")
+
+    def test_crlf_survives_a_fuzzy_edit(self) -> None:
+        target = self.put("win.py", b"def f():\r\n    return 1  \r\n")
+        self.box.run("read_file", {"path": "win.py"})
+        result = self.box.run(
+            "str_replace", {"path": "win.py", "old_str": "    return 1", "new_str": "    return 2"}
+        )
+        self.assertNotIn("ERROR", result)
+        self.assertNotIn(b"\n", target.read_bytes().replace(b"\r\n", b""))
+        self.assertIn(b"return 2", target.read_bytes())
+
+    def test_bom_is_hidden_from_the_model_and_kept_on_disk(self) -> None:
+        target = self.put("bom.cs", b"\xef\xbb\xbfusing System;\r\nclass A {}\r\n")
+        shown = self.box.run("read_file", {"path": "bom.cs"})
+        self.assertTrue(shown.startswith("using System;"), repr(shown[:20]))
+        #  照抄首行做多行替换：BOM 留在文本里的话，匹配会落在第 1 个字符之后被误拒
+        result = self.box.run(
+            "str_replace",
+            {"path": "bom.cs", "old_str": "using System;", "new_str": "using System;\nusing System.IO;"},
+        )
+        self.assertIn("已替换", result)
+        self.assertEqual(
+            target.read_bytes(),
+            b"\xef\xbb\xbfusing System;\r\nusing System.IO;\r\nclass A {}\r\n",
+        )
+
+    def test_overwrite_keeps_encoding_and_newlines(self) -> None:
+        target = self.put("gbk.txt", "第一行\r\n第二行\r\n".encode("gbk"))
+        self.box.run("read_file", {"path": "gbk.txt"})
+        result = self.box.run("write_file", {"path": "gbk.txt", "content": "全新内容\n第二行\n"})
+        self.assertIn("已覆盖", result)
+        self.assertEqual(target.read_bytes(), "全新内容\r\n第二行\r\n".encode("gbk"))
+
+    def test_overwrite_says_so_when_it_has_to_change_the_encoding(self) -> None:
+        target = self.put("gbk.txt", "第一行\n".encode("gbk"))
+        self.box.run("read_file", {"path": "gbk.txt"})
+        result = self.box.run("write_file", {"path": "gbk.txt", "content": "表情 \U0001f600\n"})
+        self.assertIn("已改用 UTF-8", result)
+        self.assertEqual(target.read_bytes(), "表情 \U0001f600\n".encode("utf-8"))
+
+    def test_mixed_newlines_follow_the_majority(self) -> None:
+        self.assertEqual(tools._newline_of(b"a\r\nb\r\nc\n"), "\r\n")
+        self.assertEqual(tools._newline_of(b"a\nb\nc\r\n"), "\n")
+        self.assertEqual(tools._newline_of(b"a\rb\rc"), "\r")
+        self.assertEqual(tools._newline_of(b"no newline"), "\n")
+
+    def test_rewind_still_restores_the_exact_bytes(self) -> None:
+        original = b"\xef\xbb\xbfalpha\r\nbeta\r\n"
+        target = self.put("win.txt", original)
+        self.box.rewind.begin("改")
+        self.box.run("read_file", {"path": "win.txt"})
+        self.box.run("str_replace", {"path": "win.txt", "old_str": "beta", "new_str": "BETA"})
+        self.box.rewind.finish()
+        ok, _ = self.box.rewind.rewind_files(1)
+        self.assertTrue(ok)
+        self.assertEqual(target.read_bytes(), original)
 
 
 class TestBinaryAndImages(ToolboxTestCase):
