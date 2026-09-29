@@ -399,6 +399,61 @@ def switch_notices(agent):
     return [m for m in agent.messages if "模型已切换" in str(m.get("content"))]
 
 
+class ThinkingRejectedTest(AgentTestCase):
+    """服务端拒收回传的 thinking 块：不修的话每次请求都是同一个 400，会话卡死。"""
+
+    REJECTION = "messages.1.content.0: Invalid `signature` in `thinking` block"
+
+    def rejected(self, message: str = REJECTION, status: int = 400):
+        return openai.BadRequestError(message, response=_response(status), body=None)
+
+    def with_thinking(self, agent):
+        agent.messages.append({"role": "user", "content": "先前的问题"})
+        agent.messages.append({
+            "role": "assistant", "content": "先前的回答",
+            "_reasoning": {"items": [
+                {"type": "thinking", "thinking": "想了想", "signature": "sig"},
+                {"type": "redacted_thinking", "data": "xx"},
+            ]},
+        })
+
+    def test_recognition_is_narrow(self):
+        from xiaoyu.errors import thinking_rejected
+
+        self.assertTrue(thinking_rejected(self.rejected()))
+        self.assertTrue(thinking_rejected(self.rejected(
+            "`thinking` or `redacted_thinking` blocks in the latest assistant message "
+            "cannot be modified")))
+        self.assertFalse(thinking_rejected(self.rejected("max_tokens must be greater than thinking.budget_tokens")))
+        self.assertFalse(thinking_rejected(self.rejected("invalid tool schema")))
+        self.assertFalse(thinking_rejected(self.rejected(status=429)))
+
+    def test_blocks_are_dropped_and_the_request_resent_once(self):
+        agent = self.build([self.rejected(), [chunk(content="好了"), usage_chunk(10, 2)]])
+        self.with_thinking(agent)
+        buffer = io.StringIO()
+        with mock.patch("xiaoyu.agent.Agent._sleep") as sleep, contextlib.redirect_stdout(buffer):
+            agent.send("继续")
+        sleep.assert_not_called()
+        self.assertEqual(agent.last_assistant_text(), "好了")
+        self.assertEqual(len(self.client.completions.calls), 2)
+        self.assertFalse(any("_reasoning" in m for m in agent.messages))
+        self.assertIn("拒收了历史里的推理内容", buffer.getvalue())
+
+    def test_nothing_left_to_drop_means_the_error_stands(self):
+        agent = self.build([self.rejected()])
+        with contextlib.redirect_stdout(io.StringIO()), self.assertRaises(openai.BadRequestError):
+            agent.send("继续")
+        self.assertEqual(len(self.client.completions.calls), 1)
+
+    def test_a_second_rejection_does_not_loop(self):
+        agent = self.build([self.rejected(), self.rejected()])
+        self.with_thinking(agent)
+        with contextlib.redirect_stdout(io.StringIO()), self.assertRaises(openai.BadRequestError):
+            agent.send("继续")
+        self.assertEqual(len(self.client.completions.calls), 2)
+
+
 class RequestLogTest(AgentTestCase):
     """每次模型请求（含每次重试）在会话日志里留一条事实。"""
 

@@ -370,6 +370,22 @@ def classify(exc: Exception) -> Verdict:
 RETRY_AFTER_CAP = 60.0
 
 
+_THINKING_REJECTED = ("signature", "cannot be modified", "prefix_mismatch", "prefix mismatch")
+
+
+def thinking_rejected(exc: BaseException) -> bool:
+    """服务端拒收了我们回传的 thinking 块（签名对不上、或它绑定的会话前缀变了）。
+
+    匹配刻意收窄到"400 + 点名 thinking + 说的是签名/被改动"：认宽了会把别的请求
+    错误也当成这一类去修。
+    """
+    status = getattr(exc, "status_code", None)
+    if isinstance(status, int) and status != 400:
+        return False
+    text = str(exc).lower()
+    return "thinking" in text and any(marker in text for marker in _THINKING_REJECTED)
+
+
 _REQUEST_ID_HEADERS = ("x-request-id", "request-id", "x-amzn-requestid", "cf-ray")
 
 

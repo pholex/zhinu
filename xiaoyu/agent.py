@@ -3639,6 +3639,27 @@ class Agent:
                 #  中间夹了一次报错就不算"连续"
                 zero_streak = 0
                 verdict = classify(exc)
+                if errors.thinking_rejected(exc):
+                    #  历史一被改写，绑定前缀的 thinking 块本该当场作废（_history_rewritten）。
+                    #  走到这里说明有一处漏了，或这个端点的校验规则和官方不一样。不修的话
+                    #  那些块还在历史里，之后每一次请求都是同一个 400，会话就此卡死
+                    dropped = invalidate_bound_thinking(self.messages)
+                    if dropped:
+                        self._log_request(route, attempt, "error", exc=exc, verdict=verdict)
+                        if self.session_log:
+                            self.session_log.event(
+                                "thinking_rejected", route=route.qualified, dropped=dropped
+                            )
+                        self.sink.emit(
+                            Notice(
+                                f"[{route.qualified} 拒收了历史里的推理内容，"
+                                f"已丢弃 {dropped} 段后重发（回答不受影响，只少了一段推理连续性）]",
+                                "warn",
+                            )
+                        )
+                        #  丢了才重发，所以至多发生一次：下回再拒时已经没有可丢的
+                        attempt -= 1
+                        continue
                 retrying = (
                     verdict.retryable
                     and attempt < self._RECOVERY_ATTEMPTS
