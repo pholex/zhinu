@@ -22,6 +22,7 @@ import os
 import re
 import signal
 import unicodedata
+import urllib.parse
 import subprocess
 import sys
 import threading
@@ -1912,6 +1913,8 @@ class Toolbox:
                     "press=按键（key 如 Enter）；read=页面正文纯文本；"
                     "screenshot=截图存到 path（给用户看的，不会回传给你）；"
                     "close=关闭浏览器。"
+                    "点击打开了新标签页时会自动切过去。页面弹出确认框时默认取消并告诉你，"
+                    "确实要确认就带 dialog=accept 重做那一步。"
                     "默认无头启动独立 Chromium（无登录态）。要操作需要登录态的页面，"
                     "请用户以 --remote-debugging-port=9222 启动本机 Chrome 并设"
                     " XIAOYU_BROWSER_CDP=http://127.0.0.1:9222，即可接管已登录会话。"
@@ -1925,6 +1928,14 @@ class Toolbox:
                         "text": {"type": "string", "description": "fill 用"},
                         "key": {"type": "string", "description": "press 用"},
                         "path": {"type": "string", "description": "screenshot 用"},
+                        "dialog": {
+                            "type": "string",
+                            "enum": list(browser.DIALOG_CHOICES),
+                            "description": (
+                                "这一步里页面弹出确认框时怎么答：dismiss=取消（默认），"
+                                "accept=确认"
+                            ),
+                        },
                     },
                     "required": ["action"],
                 },
@@ -1947,9 +1958,23 @@ class Toolbox:
         text: str | None = None,
         key: str | None = None,
         path: str | None = None,
+        dialog: str | None = None,
     ) -> str:
+        if action == "open" and url and url.strip().lower().startswith("file:"):
+            #  file:// 加 read 能把任何本机文件读出来，绕过文件工具的全部护栏
+            #  （工作区边界、特殊文件、体积上限）。只许工作区内的
+            local = Path(urllib.parse.unquote(urllib.parse.urlsplit(url).path))
+            _, outside = self._resolve(str(local))
+            if outside:
+                return (
+                    f"ERROR: 浏览器只能打开工作区内的本地文件（{local} 在工作区之外）。"
+                    "要读那个文件请用 read_file。"
+                )
+        if action == "screenshot" and path:
+            #  相对路径按工作区解析，和别的文件工具一致（此前按进程的当前目录）
+            path = str(self._resolve(path)[0])
         return browser.session().run(
-            action, url=url, selector=selector, text=text, key=key, path=path
+            action, url=url, selector=selector, text=text, key=key, path=path, dialog=dialog
         )
 
     def _sandbox_note(self) -> str:
