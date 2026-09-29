@@ -2066,9 +2066,11 @@ def _print_bundle_summary(bundle) -> None:
         for server, entry in bundle.mcp_servers.items():
             name = plugins.mcp_server_name(bundle.name, server)
             print(f"    {ui.accent(name)}  {ui.secondary('·')}  {plugins.command_line(entry)}")
+            for line in plugins.declaration_details(entry):
+                print("      " + ui.secondary(ui.fit(line, reserve=6)))
     #  识别到但不装的东西逐条报出来：hooks 静默丢掉比不装更危险
     for note in bundle.notes:
-        print(ui.warning(f"  未安装：{note}"))
+        print(ui.warning(f"  注意：{note}"))
 
 
 def _confirm_mcp(bundle, accept: bool) -> bool:
@@ -2336,7 +2338,7 @@ def _update_one(name: str, meta: dict[str, Any], accept_mcp: bool) -> str:
     if bundle.version:
         parts.insert(0, f"版本 {bundle.version}")
     for note in bundle.notes:
-        print(ui.warning(f"  未安装：{note}"))
+        print(ui.warning(f"  注意：{note}"))
     return "，".join(parts)
 
 
@@ -2344,16 +2346,18 @@ def _print_mcp_diff(before: dict[str, Any], wanted: dict[str, Any]) -> None:
     from . import plugins
 
     for name in sorted(set(before) | set(wanted)):
-        old = plugins.command_line(before[name]) if name in before else None
-        new = plugins.command_line(wanted[name]) if name in wanted else None
-        if old == new:
-            continue
-        if old is None:
-            print(f"    + {ui.accent(name)}  {new}")
-        elif new is None:
-            print(f"    - {ui.accent(name)}  {old}")
+        if name not in before:
+            print(f"    + {ui.accent(name)}  {plugins.command_line(wanted[name])}")
+            for line in plugins.declaration_details(wanted[name]):
+                print("        " + ui.secondary(ui.fit(line, reserve=8)))
+        elif name not in wanted:
+            print(f"    - {ui.accent(name)}  {plugins.command_line(before[name])}")
         else:
-            print(f"    ~ {ui.accent(name)}  {old}  →  {new}")
+            changes = plugins.declaration_changes(before[name], wanted[name])
+            if changes:
+                print(f"    ~ {ui.accent(name)}")
+                for line in changes:
+                    print("        " + ui.fit(line, reserve=8))
 
 
 def plugin_remove_command(argv: list[str]) -> int:

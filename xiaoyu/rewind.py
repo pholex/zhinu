@@ -8,8 +8,8 @@ checkpoint 设计，按小羽体量裁剪：
 - **只追踪工具改过的文件**：bash 里改的、git 操作、workspace 外的路径都不在
   快照范围——/rewind 的提示里明说，不装作全能。
 - **恢复语义**："回到第 N 轮开始前"。从 ≥N 的所有点里取每个文件**最早**的
-  before 快照写回；before 是 None（当时不存在）就删除该文件。全部成功才丢弃
-  ≥N 的点，出错则整批保留供重试。
+  before 快照写回；before 是 None（当时不存在）就删除该文件。全成或全不动：
+  全部成功才丢弃 ≥N 的点；中途失败则把已写回的还原，快照整批保留供重试。
 - **外部改动检测**：恢复前把当前磁盘内容与最近一份 after 快照比对，不一致
   说明轮次之外有人改过（用户手改/别的进程），列出来让用户确认再动手。
 - **快照存原始字节，不解码**：编码（GBK 等）与换行（CRLF）原样恢复——存解码
@@ -144,34 +144,54 @@ class RewindStore:
     def rewind_files(self, index: int) -> tuple[bool, str]:
         """把 ≥index 各点覆盖的文件恢复到第 index 轮开始前。返回 (成功?, 摘要)。
 
-        全部成功才丢弃 ≥index 的点；有错整批保留（可修复后重试）。
+        全成或全不动：全部成功才丢弃 ≥index 的点；中途有一个写不回去，已经写回的
+        那些按原样还原，工作区停在动手之前的样子，快照整批保留供重试。停在半截
+        （一半文件是旧版、一半是新版）的工作区比不回滚更糟——而且重试时已回滚的
+        文件会被冲突检测当成"外部改动"报出来。
         """
         targets = self.files_from(index)
         if not targets:
             return True, "该点之后没有工具改动过的文件，文件无需恢复。"
-        restored, removed, errors = 0, 0, []
+        #  先看全再动手：特殊文件在动任何文件之前就拦下
+        blocked = [
+            #  写 FIFO 会阻塞到有读者、删掉又可能误伤外部建的节点：原样不动，
+            #  用户移走它之后可重试
+            f"{raw}: 现在是{kind}，不是普通文件，未恢复（移走后可重试）"
+            for raw in targets
+            if (kind := _special_kind(Path(raw))) is not None
+        ]
+        if blocked:
+            return False, "文件恢复没有开始（快照保留，可重试）：" + "；".join(blocked[:5])
+
+        restored, removed = 0, 0
+        undo: list[tuple[Path, bytes | None]] = []  # 动手前的样子，失败时逆序还原
+        failure = ""
         for raw, before in targets.items():
             path = Path(raw)
-            kind = _special_kind(path)
-            if kind is not None:
-                #  写 FIFO 会阻塞到有读者、删掉又可能误伤外部建的节点：原样不动，
-                #  记成失败（快照整批保留），用户移走它之后可重试
-                errors.append(f"{raw}: 现在是{kind}，不是普通文件，未恢复（移走后可重试）")
-                continue
             try:
+                existed = path.exists()
+                current = path.read_bytes() if existed else None
                 if before is None:
-                    if path.exists():
+                    if existed:
+                        undo.append((path, current))
                         path.unlink()
                         removed += 1
                 else:
+                    undo.append((path, current))
                     path.parent.mkdir(parents=True, exist_ok=True)
                     path.write_bytes(before)
                     restored += 1
             except OSError as exc:
-                errors.append(f"{raw}: {exc}")
-        if errors:
-            listed = "；".join(errors[:5])
-            return False, f"部分文件恢复失败（快照保留，可重试）：{listed}"
+                failure = f"{raw}: {exc}"
+                break
+        if failure:
+            stuck = _undo(undo)
+            if stuck:
+                return False, (
+                    f"文件恢复失败（{failure}），而且已写回的文件有 {len(stuck)} 个没能还原——"
+                    f"工作区现在是半回滚状态，请逐个核对：{'；'.join(stuck[:5])}（快照保留）"
+                )
+            return False, f"文件恢复失败，工作区保持原样（快照保留，可重试）：{failure}"
         self._points = [p for p in self._points if p.index < index]
         parts = []
         if restored:
@@ -183,6 +203,21 @@ class RewindStore:
     def drop_all(self) -> None:
         self._points.clear()
         self._current = None
+
+
+def _undo(journal: list[tuple[Path, bytes | None]]) -> list[str]:
+    """按逆序把动过的文件还原成动手前的样子，返回没能还原的。"""
+    stuck: list[str] = []
+    for path, content in reversed(journal):
+        try:
+            if content is None:
+                path.unlink(missing_ok=True)
+            else:
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_bytes(content)
+        except OSError as exc:
+            stuck.append(f"{path}: {exc}")
+    return stuck
 
 
 def _special_kind(path: Path) -> str | None:

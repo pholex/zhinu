@@ -234,6 +234,45 @@ class FanOutTest(QixiangTestCase):
         self.assertIn("resume_from='deadbeef'", result)
 
 
+class InterruptedTest(QixiangTestCase):
+    """打断照样往上抛，但已收束各项的结论与 resume 句柄要跟着出来——否则
+    存档还在，句柄却没人知道，花掉的那几项等于白跑。"""
+
+    def run_interrupted(self, total: int, after: int):
+        from xiaoyu.errors import PARTIAL_OUTPUT, Interrupted
+
+        self.config.qixiang_concurrency = 1
+        runs = RunStore()
+        self.sub_client = FakeClient([text_turn(f"第{n}项 " + LONG) for n in range(total)])
+        tool = make_qixiang_tool(
+            [READER], self.config, Registry.for_client(self.sub_client), Usage(),
+            PlainSink(indent="", verbose=False), lambda name, args: True, None, runs,
+            stop_requested=lambda: len(runs) >= after,
+        )
+        with contextlib.redirect_stdout(io.StringIO()), self.assertRaises(Interrupted) as caught:
+            tool.handler(
+                spec="reader", prompt_template="查 {{item}}",
+                items=[f"i{n}" for n in range(total)],
+            )
+        return getattr(caught.exception, PARTIAL_OUTPUT, None), runs
+
+    def test_finished_items_travel_with_the_interrupt(self):
+        report, runs = self.run_interrupted(total=6, after=2)
+        self.assertIsInstance(report, str)
+        self.assertIn("被打断", report)
+        handles = re.findall(r"resume_from: ([0-9a-f]{8})", report)
+        self.assertGreaterEqual(len(handles), 2)
+        self.assertTrue(set(handles) <= set(runs))
+        self.assertIn("第0项", report)
+        #  没跑到的项如实列为中止，不冒充完成
+        self.assertRegex(report, r"中止 [1-9]")
+        self.assertNotIn("完成 6", report)
+
+    def test_status_counts_running_items_as_aborted_when_cancelled(self):
+        state = _ItemState(index=0, label="x", task="t", started_at=1.0)
+        self.assertEqual(_status_of(state, cancelled=True), "aborted")
+
+
 class ConcurrentTest(QixiangTestCase):
     def test_parallel_batch_completes(self):
         self.config.qixiang_concurrency = 4

@@ -7,6 +7,7 @@ import stat
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from xiaoyu import rewind as rw
 from xiaoyu.config import Config
@@ -133,6 +134,94 @@ class SpecialFileTest(unittest.TestCase):
             self.assertEqual(target.read_text(encoding="utf-8"), "v0")
 
 
+class AllOrNothingTest(unittest.TestCase):
+    """文件恢复中途失败时，已经写回的要还原——停在半截的工作区比不回滚更糟。"""
+
+    def make(self, tmp: str):
+        root = Path(tmp).resolve()
+        first, second = root / "a.txt", root / "b.txt"
+        first.write_text("A0", encoding="utf-8")
+        second.write_text("B0", encoding="utf-8")
+        created = root / "new.txt"
+        store = rw.RewindStore()
+        store.begin("改三处")
+        store.record(first, b"A0")
+        store.record(created, None)
+        store.record(second, b"B0")
+        first.write_text("A1", encoding="utf-8")
+        created.write_text("N1", encoding="utf-8")
+        second.write_text("B1", encoding="utf-8")
+        store.finish()
+        return store, first, created, second
+
+    def failing_write(self, victim: Path):
+        real = Path.write_bytes
+
+        def write(path: Path, data: bytes, *args, **kwargs):
+            if path == victim and data == b"B0":
+                raise PermissionError(13, "被别的程序占用", str(path))
+            return real(path, data, *args, **kwargs)
+
+        return mock.patch.object(Path, "write_bytes", write)
+
+    def test_failure_midway_leaves_the_workspace_as_it_was(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store, first, created, second = self.make(tmp)
+            with self.failing_write(second):
+                ok, summary = store.rewind_files(1)
+            self.assertFalse(ok)
+            self.assertIn("保持原样", summary)
+            self.assertIn("b.txt", summary)
+            self.assertEqual(first.read_text(encoding="utf-8"), "A1")
+            self.assertEqual(created.read_text(encoding="utf-8"), "N1")
+            self.assertEqual(second.read_text(encoding="utf-8"), "B1")
+            #  快照保留；而且没有哪个文件被当成"外部改动"
+            self.assertEqual(len(store.points()), 1)
+            self.assertEqual(store.conflicts(1), [])
+
+    def test_retry_after_the_obstacle_is_gone_succeeds(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store, first, created, second = self.make(tmp)
+            with self.failing_write(second):
+                store.rewind_files(1)
+            ok, summary = store.rewind_files(1)
+            self.assertTrue(ok, summary)
+            self.assertEqual(first.read_text(encoding="utf-8"), "A0")
+            self.assertEqual(second.read_text(encoding="utf-8"), "B0")
+            self.assertFalse(created.exists())
+            self.assertEqual(store.points(), [])
+
+    def test_special_file_blocks_before_anything_is_touched(self):
+        if not hasattr(os, "mkfifo"):
+            self.skipTest("平台没有 mkfifo")
+        with tempfile.TemporaryDirectory() as tmp:
+            store, first, created, second = self.make(tmp)
+            second.unlink()
+            os.mkfifo(second)
+            ok, summary = store.rewind_files(1)
+            self.assertFalse(ok)
+            self.assertIn("FIFO", summary)
+            self.assertEqual(first.read_text(encoding="utf-8"), "A1")
+            self.assertTrue(created.exists())
+
+    def test_half_rolled_state_is_said_out_loud(self):
+        """还原本身也失败：这时工作区确实停在半截，必须明说，不能报成"保持原样"。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            store, first, created, second = self.make(tmp)
+            real = Path.write_bytes
+
+            def write(path: Path, data: bytes, *args, **kwargs):
+                if (path == second and data == b"B0") or (path == first and data == b"A1"):
+                    raise PermissionError(13, "占用", str(path))
+                return real(path, data, *args, **kwargs)
+
+            with mock.patch.object(Path, "write_bytes", write):
+                ok, summary = store.rewind_files(1)
+            self.assertFalse(ok)
+            self.assertIn("半回滚", summary)
+            self.assertIn("a.txt", summary)
+
+
 class ToolboxCaptureTest(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -205,6 +294,31 @@ class AgentRewindTest(unittest.TestCase):
         self.assertIn("回滚到第 2 轮", result)
         texts = [m.get("content") for m in agent.messages if m.get("role") == "user"]
         self.assertEqual(texts, ["第一件事"])
+
+    def test_conversation_is_kept_when_files_cannot_be_restored(self):
+        """对话截断会落盘、不可撤：文件回不去时对话也不动。"""
+        agent = self.make_agent()
+        target = agent.config.workspace / "a.txt"
+        target.write_text("v0", encoding="utf-8")
+        agent.toolbox.rewind.begin("第一轮")
+        agent.messages.append({"role": "user", "content": "第一轮"})
+        agent.toolbox.rewind.record(target, b"v0")
+        target.write_text("v1", encoding="utf-8")
+        agent.messages.append({"role": "assistant", "content": "改好了"})
+        agent.toolbox.rewind.finish()
+        before = list(agent.messages)
+
+        with mock.patch.object(Path, "write_bytes", side_effect=PermissionError(13, "占用")):
+            result = agent.rewind_to(1)
+        self.assertIn("文件恢复出错", result)
+        self.assertIn("对话没有回滚", result)
+        self.assertEqual(agent.messages, before)
+        self.assertEqual(target.read_text(encoding="utf-8"), "v1")
+
+        result = agent.rewind_to(1)
+        self.assertIn("对话已回滚", result)
+        self.assertEqual(len(agent.messages), len(before) - 2)
+        self.assertEqual(target.read_text(encoding="utf-8"), "v0")
 
     def test_duplicate_prompts_match_by_occurrence(self):
         agent = self.make_agent()

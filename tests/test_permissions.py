@@ -143,7 +143,8 @@ class CommandKeyGrantTest(unittest.TestCase):
         self.assertEqual(command_keys("git -C x status"), None)  # 参数注入口
         self.assertEqual(command_keys("rg foo src/"), ("rg",))
         self.assertEqual(command_keys("/usr/bin/rg foo"), ("rg",))
-        self.assertEqual(command_keys("npm -v"), ("npm",))  # 选项不是子命令
+        #  只有选项、没有子命令：范围就是这一条命令本身，不是整个 npm
+        self.assertEqual(command_keys("npm -v"), ("npm -v",))
         self.assertEqual(command_keys("git add . && git status | head"), ("git add", "git status", "head"))
         #  wrapper / shell -c / 批量执行器永远推不出键
         for command in ("sudo ls", "bash -c ls", "sh -c 'rm x'", "env FOO=1 ls", "xargs rm", "timeout 5 ls",
@@ -153,6 +154,97 @@ class CommandKeyGrantTest(unittest.TestCase):
         self.assertIsNone(command_keys("rm -rf build"))
         self.assertIsNone(command_keys("ls $(cat x)"))
         self.assertIsNone(command_keys(""))
+
+    def test_global_options_do_not_widen_the_key(self):
+        """子命令前面带全局选项时，键仍然取到子命令——退回整个命令头会让
+        批准一条只读查询变成放行该 CLI 的全部子命令。"""
+        from xiaoyu.permissions import command_keys
+
+        for command, key in (
+            ("kubectl -n prod get pods", "kubectl get"),
+            ("kubectl --context=other get pods", "kubectl get"),
+            ("git --no-pager log -3", "git log"),
+            ("docker --context prod ps", "docker ps"),
+            ("gh -R a/b pr list", "gh pr list"),
+            ("pnpm -F web run build", "pnpm run build"),
+            ("make -j8 test", "make test"),
+            ("cargo +nightly build", "cargo build"),
+        ):
+            self.assertEqual(command_keys(command), (key,), command)
+        #  不认识的前导选项分不清后面哪个词是子命令：推不出范围，只能逐次批准
+        for command in ("kubectl --kubeconfig x get pods", "docker -H tcp://h ps",
+                        "npm --userconfig x install"):
+            self.assertIsNone(command_keys(command), command)
+
+    def test_option_prefixed_grant_stays_on_its_subcommand(self):
+        perms = self.perms()
+        self.assertEqual(
+            perms.grant_session_call("bash", {"command": "kubectl -n prod get pods"}),
+            "kubectl get",
+        )
+        self.assertEqual(perms.decide("bash", {"command": "kubectl get svc"}), "allow")
+        for command in ("kubectl -n prod delete pod x", "kubectl --context other delete ns prod",
+                        "kubectl apply -f x.yaml"):
+            self.assertEqual(perms.decide("bash", {"command": command}), "ask", command)
+        perms = self.perms()
+        perms.grant_session_call("bash", {"command": "git --no-pager log -3"})
+        for command in ("git push --force", "git clean -fdx", "git checkout -- ."):
+            self.assertEqual(perms.decide("bash", {"command": command}), "ask", command)
+
+    def test_noun_verb_subcommands_key_on_the_verb(self):
+        from xiaoyu.permissions import command_keys
+
+        self.assertEqual(command_keys("gh repo view a/b"), ("gh repo view",))
+        self.assertEqual(command_keys("git stash list"), ("git stash list",))
+        self.assertEqual(command_keys("docker compose up -d"), ("docker compose up",))
+        self.assertEqual(command_keys("git remote -v"), ("git remote",))
+        perms = self.perms()
+        perms.grant_session_call("bash", {"command": "gh repo view a/b"})
+        self.assertEqual(perms.decide("bash", {"command": "gh repo delete a/b"}), "ask")
+        perms.grant_session_call("bash", {"command": "git stash list"})
+        self.assertEqual(perms.decide("bash", {"command": "git stash drop"}), "ask")
+
+    def test_interpreters_key_on_what_they_run(self):
+        from xiaoyu.permissions import command_keys
+
+        self.assertEqual(command_keys("python -m pytest tests/"), ("python -m pytest",))
+        self.assertEqual(command_keys("python3.12 -u -m pytest"), ("python3.12 -m pytest",))
+        self.assertEqual(command_keys("python -m pip list"), ("python -m pip list",))
+        self.assertEqual(command_keys("python scripts/x.py --flag"), ("python scripts/x.py",))
+        self.assertEqual(command_keys("node scripts/build.js"), ("node scripts/build.js",))
+        self.assertEqual(command_keys("python --version"), ("python --version",))
+        #  把参数当代码跑的形态、从标准输入读代码的裸解释器：永远逐次确认。
+        #  perl -E 是执行代码（python 的 -E 才是忽略环境变量），不能共用一张无害表
+        for command in ("python -c 'print(1)'", "node -e 'x'", "perl -E 'x'", "perl -e 'x'",
+                        "ruby -e 'x'", "php -r 'x'", "python", "node", "python -",
+                        "node --require ./x.js app.js"):
+            self.assertIsNone(command_keys(command), command)
+        perms = self.perms()
+        perms.grant_session_call("bash", {"command": "python -m pytest tests/"})
+        self.assertEqual(perms.decide("bash", {"command": "python -m pytest -k x"}), "allow")
+        for command in ("python -c 'import os'", "python -m pip install evil", "python other.py"):
+            self.assertEqual(perms.decide("bash", {"command": command}), "ask", command)
+        perms.grant_session_call("bash", {"command": "echo hi"})
+        self.assertEqual(perms.decide("bash", {"command": "echo hi | python"}), "ask")
+
+    def test_runners_key_on_the_inner_command(self):
+        from xiaoyu.permissions import command_keys
+
+        self.assertEqual(command_keys("uv run pytest -q"), ("uv run pytest",))
+        self.assertEqual(command_keys("uv -q run pytest"), ("uv run pytest",))
+        self.assertEqual(command_keys("uv run python -m pytest"), ("uv run python -m pytest",))
+        self.assertEqual(command_keys("npx eslint ."), ("npx eslint",))
+        self.assertEqual(command_keys("npm run build"), ("npm run build",))
+        for command in ("uv run python -c 'x'", "uv run bash -c ls", "npx sudo ls",
+                        "uv run --with x pytest", "npx -y pkg", "poetry run sh -c ls"):
+            self.assertIsNone(command_keys(command), command)
+        perms = self.perms()
+        perms.grant_session_call("bash", {"command": "uv run pytest"})
+        self.assertEqual(perms.decide("bash", {"command": "uv run pytest tests/"}), "allow")
+        self.assertEqual(perms.decide("bash", {"command": "uv run python -c 'x'"}), "ask")
+        self.assertEqual(perms.decide("bash", {"command": "uv run ruff check"}), "ask")
+        perms.grant_session_call("bash", {"command": "npm run build"})
+        self.assertEqual(perms.decide("bash", {"command": "npm run deploy"}), "ask")
 
     def test_git_status_grant_is_narrow(self):
         perms = self.perms()
@@ -593,6 +685,32 @@ class SuggestAllowRuleTest(unittest.TestCase):
     def test_bash_subcommand_granularity(self):
         rule = self.suggest("bash", {"command": "git status -sb"})
         self.assertEqual(rule, Rule("allow", "bash", "git status*"))
+
+    def test_suggested_rule_covers_the_call_and_nothing_wider(self):
+        """建议出来的规则要恰好盖住刚批准的那一类：自己能过，换个子命令不能过。"""
+        for approved, sibling in (
+            ("git --no-pager log -3", "git push --force"),
+            ("kubectl -n prod get pods", "kubectl -n prod delete pod x"),
+            ("docker --context prod ps", "docker --context prod run -v /:/host x"),
+            ("gh -R a/b pr list", "gh -R a/b repo delete a/b"),
+            ("python -m pytest tests/", "python -m pip install evil"),
+            ("uv run pytest -q", "uv run python -c 'x'"),
+            ("npm run build", "npm run deploy"),
+        ):
+            rule = self.suggest("bash", {"command": approved})
+            self.assertIsNotNone(rule, approved)
+            self.assertNotIn(rule.spec, ("git *", "kubectl *", "docker *", "gh *", "uv *"))
+            perms = Permissions(self.root, [rule])
+            self.assertEqual(perms.decide("bash", {"command": approved}), "allow", approved)
+            self.assertEqual(perms.decide("bash", {"command": sibling}), "ask", sibling)
+
+    def test_unknown_leading_option_derives_nothing(self):
+        for command in ("kubectl --kubeconfig x get pods", "uv run --with x pytest",
+                        "node -e 'x'", "python"):
+            self.assertIsNone(self.suggest("bash", {"command": command}), command)
+
+    def test_options_only_command_is_exact(self):
+        self.assertEqual(self.suggest("bash", {"command": "npm -v"}), Rule("allow", "bash", "npm -v"))
 
     def test_bash_bare_command_is_exact(self):
         """裸命令用精确匹配：ls* 会连 lsof 一起放行，宁窄勿宽。"""

@@ -111,6 +111,27 @@ class ValidationTest(DouqiaoTestCase):
         self.assertTrue(result.startswith("ERROR"))
 
 
+class InterruptedTest(DouqiaoTestCase):
+    def test_finished_seats_travel_with_the_interrupt(self):
+        from xiaoyu.errors import PARTIAL_OUTPUT, Interrupted
+
+        runs = RunStore()
+        self.sub_client = FakeClient([text_turn(f"第{n}席 " + LONG) for n in range(3)])
+        tool = make_douqiao_tool(
+            [READER], self.config, Registry.for_client(self.sub_client), Usage(),
+            PlainSink(indent="", verbose=False), lambda name, args: True, None, runs,
+            stop_requested=lambda: len(runs) >= 1,
+        )
+        with contextlib.redirect_stdout(io.StringIO()), self.assertRaises(Interrupted) as caught:
+            tool.handler(spec="thinker", task="设计一个方案", contestants=3)
+        report = getattr(caught.exception, PARTIAL_OUTPUT, None)
+        self.assertIsInstance(report, str)
+        self.assertIn("被打断", report)
+        self.assertIn("判官没有出场", report)
+        self.assertRegex(report, r"resume_from: [0-9a-f]{8}")
+        self.assertNotIn("👑", report)
+
+
 class ContestTest(DouqiaoTestCase):
     def test_judge_picks_winner(self):
         script = [

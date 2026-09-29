@@ -366,7 +366,7 @@ curl -X POST :8420/session/sess-…/budget -d '{"budget":null}'                #
 
 agent 对象、会话清单、会话日志默认落盘在用户配置目录下的 `serve/<root slug>/`——
 Linux/macOS 为 `~/.config/xiaoyu/serve/<root slug>/`（设了 `XDG_CONFIG_HOME` 则跟随它），
-Windows 为 `%APPDATA%\xiaoyu\serve\<root slug>\`；启动后 `GET /health` 的 `state_dir` 字段给出实际路径
+Windows 为 `%APPDATA%\xiaoyu\serve\<root slug>\`；启动后 `GET /health` 的 `state_dir` 字段给出实际路径（服务配了 token 时请求要带上）
 （`--state-dir` 改位置，`--no-persist` 全放内存）。serve 重启后：
 
 - 会话自动接回（`detail=recovered`），历史来自会话日志（`Agent.restore`，未配对的
@@ -378,7 +378,9 @@ Windows 为 `%APPDATA%\xiaoyu\serve\<root slug>\`；启动后 `GET /health` 的 
   （没等到结果的会补"结果未知"），要不要重做由编排方判断。标记留到下一轮开跑才清，
   连着重启两次也不会丢；
 - **事件缓冲不落盘**——重启前的事件计入 `dropped_events`，`seq` 从上次水位**接着编号**：
-  客户端手里的游标仍单调，拉到的是"中间缺一段"（协议里本来就有表达），不是"序号倒流"；
+  客户端手里的游标仍单调，拉到的是"中间缺一段"（协议里本来就有表达），不是"序号倒流"。
+  水位按块预留落盘：优雅停机后编号紧接着上次；进程中途被杀则从预留线接，`seq` 会跳过
+  一段（不到一个块），同样不会回头；
 - 恢复失败的清单（工作区没挂上、provider 没配）留在盘上、stderr 打一行、跳过——不删，
   因为失败可能是暂时的。`DELETE /session/{id}` 会删清单；会话日志作为留痕保留。
 - 会话日志同一时刻只允许一个进程续写（日志旁的 `*.jsonl.lock` 上的内核锁，进程退出
@@ -420,7 +422,7 @@ Windows 为 `%APPDATA%\xiaoyu\serve\<root slug>\`；启动后 `GET /health` 的 
 
 | 方法 | 路径 | |
 |---|---|---|
-| GET | `/health` | 存活探针（不需要 token） |
+| GET | `/health` | 存活探针（不需要 token；服务配了 token 而请求没带对时只回 `ok` 与 `version`，工作区路径等部署细节要带 token 才给） |
 | GET | `/diagnostics` | 进程自诊断：RSS / 线程 / fd + 在册计量（会话、在途请求、MCP 连接、后台任务）。有 token 门——它暴露负载形态 |
 | POST · GET | `/agent` | 新建 agent 对象 · 列出 |
 | GET · POST · DELETE | `/agent/{id}` | 详情（`?versions=true`）· 更新→新版本 · 归档 |

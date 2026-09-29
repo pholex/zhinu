@@ -1205,6 +1205,37 @@ class SafeEnvTest(unittest.TestCase):
         for leaked in ("XIAOYU_API_KEY", "AWS_SECRET_ACCESS_KEY", "GITHUB_TOKEN", "LD_PRELOAD"):
             self.assertNotIn(leaked, env)
 
+    def test_proxy_and_ca_settings_reach_the_server(self):
+        """小羽自己出网认代理，server 进程拿不到的话，代理环境下包下不了、API 连
+        不上，表象只是初始化超时。"""
+        network = {
+            "HTTPS_PROXY": "http://proxy.corp:8080", "https_proxy": "http://proxy.corp:8080",
+            "HTTP_PROXY": "http://proxy.corp:8080", "ALL_PROXY": "socks5://proxy.corp:1080",
+            "NO_PROXY": "localhost,.corp", "no_proxy": "localhost,.corp",
+            "SSL_CERT_FILE": "/etc/ca.pem", "SSL_CERT_DIR": "/etc/certs",
+            "REQUESTS_CA_BUNDLE": "/etc/ca.pem", "CURL_CA_BUNDLE": "/etc/ca.pem",
+            "NODE_EXTRA_CA_CERTS": "/etc/ca.pem",
+        }
+        with mock.patch.dict(
+            "os.environ", {"PATH": "/bin", "GITHUB_TOKEN": "秘", "PROXY_PASSWORD": "秘", **network},
+            clear=True,
+        ):
+            env = mcp._safe_env()
+        for key, value in network.items():
+            if os.name == "nt" and key != key.upper():
+                continue  # Windows 环境变量不分大小写，小写那份并进了大写的
+            self.assertEqual(env.get(key), value, key)
+        #  放行的只是这几个名字，不是"名字里带 proxy 的都放"
+        self.assertNotIn("PROXY_PASSWORD", env)
+        self.assertNotIn("GITHUB_TOKEN", env)
+
+    def test_server_declaration_can_still_override_the_proxy(self):
+        with mock.patch.dict(
+            "os.environ", {"PATH": "/bin", "HTTPS_PROXY": "http://proxy.corp:8080"}, clear=True
+        ):
+            env = mcp._safe_env({"HTTPS_PROXY": ""})
+        self.assertEqual(env["HTTPS_PROXY"], "")
+
     def test_declared_env_overrides_inherited(self):
         with mock.patch.dict("os.environ", {"PATH": "/bin"}, clear=True):
             env = mcp._safe_env({"PATH": "/custom"})

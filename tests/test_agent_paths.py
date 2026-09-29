@@ -116,6 +116,66 @@ class AgentTestCase(unittest.TestCase):
         return agent
 
 
+class TestInterruptedToolLeavesItsReport(AgentTestCase):
+    """批量委托被打断时把已收束各项的报告挂在异常上：主循环要把它作为这次调用的
+    结果写进历史，下一轮模型才看得到"完成了哪几项、句柄是什么"。"""
+
+    def build_with(self, handler):
+        from xiaoyu.tools import Tool
+
+        script = [[chunk(tool_calls=[call_fragment(0, "call_1", "batch", "{}")]), usage_chunk(10, 5)]]
+        agent = self.build(script)
+        agent.toolbox.register(
+            Tool(name="batch", description="d", parameters={"type": "object", "properties": {}},
+                 handler=handler, requires_approval=False)
+        )
+        return agent
+
+    def test_partial_report_becomes_the_tool_result(self) -> None:
+        from xiaoyu.errors import Interrupted, attach_partial
+
+        def handler() -> str:
+            exc = Interrupted("宿主请求打断")
+            attach_partial(exc, lambda: "[report · 被打断] 完成 3/6\nresume_from: abcd1234")
+            raise exc
+
+        agent = self.build_with(handler)
+        with contextlib.redirect_stdout(io.StringIO()), self.assertRaises(Interrupted):
+            agent.send("跑一批")
+        tool_messages = [m for m in agent.messages if m["role"] == "tool"]
+        self.assertEqual(len(tool_messages), 1)
+        self.assertEqual(tool_messages[0]["tool_call_id"], "call_1")
+        self.assertIn("resume_from: abcd1234", tool_messages[0]["content"])
+        #  之后的通用兜底不能再补一条占位把它挤掉
+        agent.close_open_tool_calls("用户中断")
+        self.assertEqual(len([m for m in agent.messages if m["role"] == "tool"]), 1)
+
+    def test_plain_interrupt_still_gets_the_generic_filler(self) -> None:
+        from xiaoyu.errors import Interrupted
+
+        def handler() -> str:
+            raise Interrupted("宿主请求打断")
+
+        agent = self.build_with(handler)
+        with contextlib.redirect_stdout(io.StringIO()), self.assertRaises(Interrupted):
+            agent.send("跑一批")
+        self.assertEqual([m for m in agent.messages if m["role"] == "tool"], [])
+        agent.close_open_tool_calls("用户中断")
+        (filler,) = [m for m in agent.messages if m["role"] == "tool"]
+        self.assertIn("用户中断", filler["content"])
+
+    def test_failing_report_builder_never_masks_the_interrupt(self) -> None:
+        from xiaoyu.errors import PARTIAL_OUTPUT, Interrupted, attach_partial
+
+        exc = Interrupted("x")
+
+        def broken() -> str:
+            raise RuntimeError("聚合炸了")
+
+        attach_partial(exc, broken)
+        self.assertFalse(hasattr(exc, PARTIAL_OUTPUT))
+
+
 # ---------- 主循环 ----------
 
 

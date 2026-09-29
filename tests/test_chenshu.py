@@ -218,6 +218,56 @@ class LifecycleTest(ChenshuCase):
         self.assertIn("M2", out)
         self.assertIn("M3", out)
 
+    def test_scalar_scope_is_one_item_not_characters(self):
+        """scope 传成单个字符串时不能按字符拆——"src" 拆成 s/r/c 会被静默登记。"""
+        self.init_repo()
+        runtime = self.make_runtime()
+        runtime.init()
+        runtime.plan([{"title": "改 src", "scope": "src"},
+                      {"title": "改文档", "scope": "docs/**", "deps": "M1"}])
+        first, second = runtime.missions
+        self.assertEqual(first.scope, ("src",))
+        self.assertEqual(second.scope, ("docs/**",))
+        self.assertEqual(second.deps, ("M1",))
+
+    def test_json_encoded_arrays_are_decoded(self):
+        self.init_repo()
+        runtime = self.make_runtime()
+        runtime.init()
+        runtime.plan([{"title": "改两处", "scope": '["src/a/", "src/b/"]'}])
+        self.assertEqual(runtime.missions[0].scope, ("src/a/", "src/b/"))
+
+    def test_wrong_typed_list_fields_are_rejected_by_name(self):
+        self.init_repo()
+        runtime = self.make_runtime()
+        runtime.init()
+        for bad in ({"title": "x", "scope": {"path": "src"}},
+                    {"title": "x", "scope": ["src", 3]},
+                    {"title": "x", "scope": ["src/"], "deps": 1}):
+            with self.assertRaises(ChenshuError) as caught:
+                runtime.plan([bad])
+            self.assertRegex(str(caught.exception), "scope|deps")
+        self.assertEqual(runtime.missions, [])
+
+    def test_scope_update_takes_scalar_as_one_item(self):
+        from xiaoyu.chenshu import CHENSHU
+
+        self.init_repo()
+        runtime = self.make_runtime()
+        runtime.init()
+        runtime.plan([{"title": "改 src", "scope": ["src/"]}])
+        runtime.mission_view(CHENSHU, "M1", {"scope": "lib"})
+        self.assertEqual(runtime.missions[0].scope, ("lib",))
+
+    def test_plan_tool_accepts_stringified_missions(self):
+        from xiaoyu.chenshu import _object_list
+
+        self.assertEqual(_object_list('[{"title": "a"}]', "missions"), [{"title": "a"}])
+        self.assertEqual(_object_list({"title": "a"}, "missions"), [{"title": "a"}])
+        self.assertEqual(_object_list(None, "missions"), [])
+        with self.assertRaises(ChenshuError):
+            _object_list("改一下 src", "missions")
+
 
 @unittest.skipUnless(HAS_GIT, "机器上没有 git")
 class CommsTest(ChenshuCase):

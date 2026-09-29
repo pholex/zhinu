@@ -6,11 +6,28 @@
 
 from __future__ import annotations
 
+import re
+import ssl
 import sys
 from dataclasses import dataclass
+from typing import Callable
 
 #  httpx 是 openai / anthropic 两个 SDK 共同的硬传递依赖，顶层 import 安全
 import httpx
+
+
+#  打断时挂在异常上的属性名：批量工具把已收束各项的报告放在这里再上抛，主循环
+#  把它作为这次工具调用的结果写进历史。打断语义不变（异常照样往上走），只是已经
+#  花掉的那些子 agent 的结论和续跑句柄不再跟着一起丢。
+PARTIAL_OUTPUT = "partial_output"
+
+
+def attach_partial(exc: BaseException, build: "Callable[[], str]") -> None:
+    """给正在上抛的异常挂上部分报告。生成报告本身出错不能盖掉原来的异常。"""
+    try:
+        setattr(exc, PARTIAL_OUTPUT, build())
+    except Exception:  # noqa: BLE001
+        pass
 
 
 class Interrupted(Exception):
@@ -82,7 +99,34 @@ _CONTEXT_MARKERS = (
     "too many tokens",
     "prompt is too long",
     "input is too long",
+    #  漏网会很贵：判成 fatal 整轮直接死、不压缩；判成 transient 更糟——同一个
+    #  超大请求带退避原样重发，烧光重试预算也不会触发压缩
+    "context window",  # "exceeds the context window of this model"
+    "context limit",  # "input length and max_tokens exceed context limit"
+    "maximum number of tokens allowed",  # "input token count … exceeds the maximum …"
+    "range of input length should be",
+    "token length exceed",  # "total message token length exceed model limit"
 )
+
+#  结构化错误码里的超限：码比措辞稳（文案会改、会被网关转写，码不会）
+_CONTEXT_CODES = (
+    "context_length_exceeded",
+    "context_window_exceeded",
+    "model_context_window_exceeded",
+)
+
+#  厂商业务码：这几家的错误体是 `{"code": "1302", "message": "中文文案"}`，流内错误
+#  事件里有时连结构化 code 都没有，只剩 `[1302][文案][request_id]` 形态的 message。
+#  措辞兜底全是英文，认不出中文文案——按码分类。只收语义确定的几个，拿不准的宁缺。
+_VENDOR_CODES = {
+    "1261": "context_overflow",  # 输入超长
+    "1113": "quota",  # 账户欠费 / 余额不足
+    "1304": "quota",  # 当日调用次数用尽：等多久都没用，换路由
+    "1302": "rate_limit",  # 并发过高
+    "1303": "rate_limit",  # 频率过高
+    "1305": "rate_limit",  # 触发流量限制
+}
+_BRACKETED_CODE = re.compile(r"^\s*\[(\d{3,6})\]\[")
 
 #  长得像上下文超限、实为限流的文案：Bedrock 的 ThrottlingException 原文是
 #  "Too many tokens, please wait before trying again"，会撞上 _CONTEXT_MARKERS
@@ -183,12 +227,39 @@ def _error_code(exc: Exception) -> str:
     异常只剩 `.body`，按 `{"code": …}` 与 `{"error": {"code": …}}` 两种形状各取一次。
     """
     code = getattr(exc, "code", None)
-    if not isinstance(code, str) or not code:
+    if not isinstance(code, (str, int)) or isinstance(code, bool) or code in ("", None):
         body = getattr(exc, "body", None)
         if isinstance(body, dict):
             inner = body.get("error")
             code = body.get("code") or (inner.get("code") if isinstance(inner, dict) else None)
+    if isinstance(code, int) and not isinstance(code, bool):
+        #  业务码有的厂商给数字、有的给数字串
+        code = str(code)
     return code.lower() if isinstance(code, str) else ""
+
+
+def _vendor_kind(exc: Exception) -> str:
+    """厂商业务码对应的分类，认不出返回空串。结构化码优先，其次从
+    `[码][文案][request_id]` 形态的 message 开头取。"""
+    code = _error_code(exc)
+    if code not in _VENDOR_CODES:
+        match = _BRACKETED_CODE.match(str(exc))
+        code = match.group(1) if match else ""
+    return _VENDOR_CODES.get(code, "")
+
+
+def _certificate_failure(exc: BaseException) -> bool:
+    """底因链上有没有证书校验失败。SDK 把它包成连接错误再抛，得顺着链找。"""
+    seen: set[int] = set()
+    current: BaseException | None = exc
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        if isinstance(current, ssl.SSLCertVerificationError):
+            return True
+        if "certificate verify failed" in str(current).lower():
+            return True
+        current = current.__cause__ or current.__context__
+    return False
 
 
 def _is_quota(exc: Exception, text: str, status: int | None) -> bool:
@@ -197,6 +268,8 @@ def _is_quota(exc: Exception, text: str, status: int | None) -> bool:
         return True
     code = _error_code(exc)
     if code and (code in _QUOTA_CODES or code.endswith(_QUOTA_CODE_SUFFIXES)):
+        return True
+    if _vendor_kind(exc) == "quota":
         return True
     if any(marker in text for marker in _QUOTA_MARKERS):
         return True
@@ -220,6 +293,16 @@ def classify(exc: Exception) -> Verdict:
     text = str(exc).lower()
     status = _status_code(exc)
 
+    if _certificate_failure(exc):
+        #  先于瞬时判定：SDK 把它包成连接错误，按瞬时处理就是重试几次再换路由——
+        #  而证书问题（公司代理做 TLS 中间人最常见）换哪条路都一样败，用户看到的
+        #  却只是"网络瞬时错误"
+        return Verdict(
+            "fatal", False, False,
+            "TLS 证书校验失败（重试无用）。走公司代理的话，把代理的根证书路径设给 "
+            "SSL_CERT_FILE；不是的话检查系统时间与端点地址",
+        )
+
     if _is_openai(exc, "AuthenticationError", "PermissionDeniedError") or status in (401, 403):
         return Verdict("auth", False, False, "鉴权失败，请检查 XIAOYU_API_KEY 和端点")
 
@@ -231,7 +314,12 @@ def classify(exc: Exception) -> Verdict:
         #  Bedrock 式"tokens 措辞的限流"：先于超限判定拦下，绝不触发压缩
         return Verdict("rate_limit", True, False, "限流")
 
-    if any(marker in text for marker in _CONTEXT_MARKERS):
+    vendor = _vendor_kind(exc)
+    if (
+        vendor == "context_overflow"
+        or _error_code(exc) in _CONTEXT_CODES
+        or any(marker in text for marker in _CONTEXT_MARKERS)
+    ):
         #  上下文超限：压缩后值得立刻重试
         return Verdict("context_overflow", True, True, "上下文超限，压缩后重试")
 
@@ -241,6 +329,7 @@ def classify(exc: Exception) -> Verdict:
         or "rate limit" in text
         or "throttl" in text  # AWS 系措辞：ThrottlingException / throttled
         or "429" in text
+        or vendor == "rate_limit"
         or any(marker in text for marker in _EXHAUSTED_MARKERS)
     ):
         return Verdict("rate_limit", True, False, "限流")
@@ -258,6 +347,12 @@ def classify(exc: Exception) -> Verdict:
 
     if isinstance(exc, StreamFailed):
         #  流跑起来了才炸、且措辞没落进上面任何一类：兜底成 transient（理由见类注释）
+        return Verdict("transient", True, False, f"流中途失败（{exc}）")
+
+    if status is None and _is_openai(exc, "APIError"):
+        #  chat 一路的同一种情况：流内错误事件在 HTTP 层是 200，SDK 抛的是没有状态码
+        #  的裸 APIError（带状态码的请求错误都是 APIStatusError，走不到这里）。措辞
+        #  兜底只认英文，厂商的中文文案一条都命不中——与 StreamFailed 同样兜底
         return Verdict("transient", True, False, f"流中途失败（{exc}）")
 
     return Verdict("fatal", False, False, f"{type(exc).__name__}: {exc}")

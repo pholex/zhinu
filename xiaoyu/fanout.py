@@ -18,7 +18,7 @@ from dataclasses import dataclass
 from typing import Any, Callable
 
 from .agents import DelegationResult
-from .errors import Interrupted
+from .errors import Interrupted, attach_partial  # noqa: F401 - 批量工具从这里取
 
 #  错峰间隔：首批并发槽位依次延后起步，避免同一瞬间打满 provider
 STAGGER_SECONDS = 0.3

@@ -698,6 +698,27 @@ def _platform_shell_note() -> str:
 PURPOSE_PARAM = "__tool_use_purpose"
 
 
+@dataclass(frozen=True)
+class _ReadMark:
+    """一个文件"读过"到什么程度，以及读的时候它是哪个版本。"""
+
+    mtime: float
+    size: int  # -1 = 当时取不到
+    whole: bool  # 模型手上有全文
+    seen: tuple[tuple[int, int], ...] = ()  # 分段读过的行范围（1 起、闭区间、已合并）
+    total: int = 0  # 分段读时文件的总行数
+
+
+def _merge_ranges(ranges: list[tuple[int, int]]) -> tuple[tuple[int, int], ...]:
+    merged: list[tuple[int, int]] = []
+    for start, end in sorted(ranges):
+        if merged and start <= merged[-1][1] + 1:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], end))
+        else:
+            merged.append((start, end))
+    return tuple(merged)
+
+
 @dataclass
 class Tool:
     name: str
@@ -949,7 +970,7 @@ class Toolbox:
         self.rewind = RewindStore()
         #  已用 read_file 读过的文件 → 当时的 mtime。
         #  用来强制"先读再改"，并检测读完之后文件被外部改动。
-        self._reads: dict[Path, float] = {}
+        self._reads: dict[Path, _ReadMark] = {}
         #  超长工具输出的落盘目录（spill）：
         #  懒创建，进程级临时目录，进程退出时连内容一起删（tempdirs）——召回靠
         #  内存里的 _spills 表，resume 后的新进程本来就取不回。
@@ -1430,8 +1451,8 @@ class Toolbox:
                 description=(
                     "读取文本文件内容。路径相对当前工作区解析。"
                     "大文件可以用 offset（起始行号，从 1 开始）和 limit（最多读多少行）只读一段。"
-                    "注意：只读了一段的文件不算「读过」，覆盖或改动它之前仍需完整读一遍。"
-                    "修改任何文件之前必须先完整读它。"
+                    "修改任何文件之前必须先读过它：局部修改（str_replace）读过要改的那一段即可，"
+                    "整体覆盖（write_file）要把全部内容都读到（分段读完也算）。"
                 ),
                 parameters={
                     "type": "object",
@@ -1458,7 +1479,7 @@ class Toolbox:
                 description=(
                     "把完整内容写入文件（整文件覆盖，不是补丁）。"
                     "只在新建文件或需要全量重写时用；改动已有文件的局部请用 str_replace。"
-                    "覆盖已有文件前必须先用 read_file 读过它。"
+                    "覆盖已有文件前必须先用 read_file 把它完整读过（只读过一部分的不能覆盖）。"
                     "父目录不存在会自动创建。"
                 ),
                 parameters={
@@ -1847,10 +1868,19 @@ class Toolbox:
             self._mark_read(target)
             return f"{prefix}(文件为空：{path})"
 
+        limit_chars = self.config.max_tool_output
         if offset is None and limit is None:
-            #  只有完整读过，才算"读过"——部分读不足以授权覆盖整个文件
-            self._mark_read(target)
-            return f"{prefix}{text}"
+            shown = f"{prefix}{text}"
+            if len(shown) <= limit_chars:
+                self._mark_read(target)
+                return shown
+            #  整读但装不下：回给模型的只有头尾预览，中段它没看见。记成"读过一部分"——
+            #  够做局部替换（old_str 得逐字对上），不够整体覆盖
+            self._mark_read(target, seen=())
+            return shown + (
+                f"\n[{path} 太长，上面只显示了头尾；没显示的部分用 offset/limit 分段读。"
+                "整体覆盖（write_file）要把各段都读到，局部修改（str_replace）现在就可以]"
+            )
 
         lines = text.splitlines()
         start = max(1, offset or 1)
@@ -1860,15 +1890,19 @@ class Toolbox:
         chunk = "\n".join(lines[start - 1 : end])
         note = (
             f"{prefix}[{path} 第 {start}-{end} 行，共 {len(lines)} 行；"
-            "这是部分内容，改动此文件前需完整读一遍]\n"
+            "这是部分内容：局部修改（str_replace）可以直接做，"
+            "整体覆盖（write_file）要把全部行都读到]\n"
         )
+        #  这一段自己也装不下的话，模型同样只看见头尾——不计入已读范围
+        fits = len(note) + len(chunk) <= limit_chars
+        self._mark_read(target, seen=((start, end),) if fits else (), total=len(lines))
         return note + chunk
 
     def _write_file(self, path: str, content: str) -> str:
         target, outside = self._resolve(path)
         existed = target.exists()
         if existed:
-            guard = self._guard_known(target, path)
+            guard = self._guard_known(target, path, whole=True)
             if guard:
                 return guard
             #  快照要 read_bytes 原文、写入要 open 它：FIFO 两步都会阻塞死
@@ -1950,7 +1984,7 @@ class Toolbox:
             target.write_text(updated, encoding=encoding)
         except OSError as exc:
             return f"ERROR: 写入失败 {path}: {exc}"
-        self._mark_read(target)
+        self._mark_read(target, keep_level=True)
 
         note = "（工作区之外）" if outside else ""
         delta = updated.count("\n") - text.count("\n")
@@ -2026,7 +2060,7 @@ class Toolbox:
             target.write_text(updated, encoding=encoding)
         except OSError as exc:
             return f"ERROR: 写入失败 {path}: {exc}"
-        self._mark_read(target)
+        self._mark_read(target, keep_level=True)
 
         offset = sum(len(line) + 1 for line in updated_lines[: found.line_index])
         note = "（工作区之外）" if outside else ""
@@ -2476,29 +2510,72 @@ class Toolbox:
 
     # ---------- 辅助 ----------
 
-    def _mark_read(self, target: Path) -> None:
-        """记下这个文件"已被读过"以及当时的 mtime。"""
-        try:
-            self._reads[target] = target.stat().st_mtime
-        except OSError:
-            self._reads[target] = 0.0
+    def _mark_read(
+        self,
+        target: Path,
+        seen: tuple[tuple[int, int], ...] | None = None,
+        total: int = 0,
+        keep_level: bool = False,
+    ) -> None:
+        """记下这个文件"已被读过"、读到了哪个程度，以及当时的 mtime 与大小。
 
-    def _guard_known(self, target: Path, shown: str) -> str | None:
-        """改动已有文件前的两道闸：必须读过，且读过之后没被别人改。"""
-        if target not in self._reads:
+        seen=None 是模型手上有全文（完整读过，或刚由它整个写出来）；给了 seen
+        就是只看过这些行范围（1 起、闭区间），同一版本文件的多次分段读累加，
+        凑齐全部行即等同全文。keep_level 给局部替换后用：文件版本换了、行号也
+        可能错位，全文的仍算全文，只读过一部分的清空已读范围但保留"读过"。
+        """
+        try:
+            stat_result = target.stat()
+            mtime, size = stat_result.st_mtime, stat_result.st_size
+        except OSError:
+            mtime, size = 0.0, -1
+        previous = self._reads.get(target)
+        if keep_level and previous is not None:
+            self._reads[target] = _ReadMark(mtime, size, previous.whole, (), 0)
+            return
+        if seen is None:
+            self._reads[target] = _ReadMark(mtime, size, True, (), 0)
+            return
+        ranges = list(seen)
+        whole = False
+        if previous is not None and (previous.mtime, previous.size) == (mtime, size):
+            #  同一版本上的又一次读：已读范围累加；之前就有全文的不降级
+            whole = previous.whole
+            ranges += previous.seen
+        merged = _merge_ranges(ranges)
+        if total and merged == ((1, total),):
+            whole = True
+        self._reads[target] = _ReadMark(mtime, size, whole, merged, total)
+
+    def _guard_known(self, target: Path, shown: str, whole: bool = False) -> str | None:
+        """改动已有文件前的两道闸：必须读过，且读过之后没被别人改。
+
+        whole=True 是整体覆盖：要求手上有全文。局部替换只要求读过——old_str 得
+        逐字对上、且在全文里唯一，这本身就证明模型知道它要改的那一段长什么样。
+        """
+        mark = self._reads.get(target)
+        if mark is None:
             return (
                 f"ERROR: 还没读过 {shown}，不能直接改。"
                 "请先用 read_file 读一遍（用 bash cat 看过不算，我要确保你手上是完整现状）。"
             )
         try:
-            current = target.stat().st_mtime
+            current = target.stat()
         except OSError:
             return None
-        if current > self._reads[target]:
+        #  mtime 比"不等"而不是"更新"、再加上大小：换回一份更旧的文件（git checkout、
+        #  从备份恢复）mtime 是往回走的，只比"更新"会漏掉
+        if current.st_mtime != mark.mtime or (mark.size >= 0 and current.st_size != mark.size):
             return (
                 f"ERROR: {shown} 在你上次 read_file 之后被改动过"
                 "（可能是你自己用 bash 改的，或外部编辑器改的）。"
                 "请重新 read_file 拿到最新内容再改，否则会覆盖掉别人的改动。"
+            )
+        if whole and not mark.whole:
+            return (
+                f"ERROR: {shown} 你只读过一部分，不能整体覆盖——没读到的内容会被直接丢掉。"
+                "局部修改请用 str_replace；确实要整体重写，先用 read_file 的 offset/limit "
+                "把没读到的行分段读完。"
             )
         return None
 

@@ -480,6 +480,13 @@ def to_request(
 # ---------- 响应方向：Messages → chat completions ----------
 
 
+#  回复没说完就停的两种停止原因：撞了输出上限，或者生成把上下文窗口填满了
+#  （请求本身成功，所以不是报错而是一个停止原因）。后一种不翻译的话内核会把
+#  半截回复当成完整回复——没有标记也没有告警，截在工具调用参数中间还会把残缺
+#  调用执行一次。
+_TRUNCATED_STOP_REASONS = ("max_tokens", "model_context_window_exceeded")
+
+
 def _refusal_detail(event: Any) -> str:
     """refusal 的可读详情：stop_details 里的 explanation/category 能拿多少拿多少。"""
     details = getattr(getattr(event, "delta", None), "stop_details", None)
@@ -595,7 +602,7 @@ def stream_chunks(events: Iterator[Any]) -> Iterator[Chunk]:
             if usage := getattr(event, "usage", None):
                 output_tokens = getattr(usage, "output_tokens", 0) or 0
             stop_reason = getattr(getattr(event, "delta", None), "stop_reason", None)
-            if stop_reason == "max_tokens":
+            if stop_reason in _TRUNCATED_STOP_REASONS:
                 #  截断翻译成 chat 的 finish_reason=length（与 responses 一路对齐）
                 yield Chunk(choices=[Choice(Delta(), finish_reason="length")])
             if stop_reason == "refusal":
@@ -619,7 +626,9 @@ def to_completion(response: Any) -> Completion:
         for block in (getattr(response, "content", None) or [])
         if getattr(block, "type", "") == "text"
     )
-    finish = "length" if getattr(response, "stop_reason", None) == "max_tokens" else None
+    finish = (
+        "length" if getattr(response, "stop_reason", None) in _TRUNCATED_STOP_REASONS else None
+    )
     return Completion(
         choices=[NonStreamChoice(Message(content=text), finish_reason=finish)],
         usage=_usage(getattr(response, "usage", None)),

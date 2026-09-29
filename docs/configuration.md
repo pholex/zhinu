@@ -189,7 +189,10 @@ xiaoyu plugin remove aws-core                                 # 删目录 + 摘�
   悄悄换掉 command 正是 MCP 生态最现实的攻击），不确认就不动已装的那份；
 - 写盘前还要过一遍 [MCP 准入规则](security.md)，和 `xiaoyu mcp add` 同一道门。
 
-MCP 子进程的环境是**纯白名单**，所以像 aws-mcp 这类要 SigV4 凭证的 server，
+MCP 子进程的环境是**纯白名单**（定位类变量，加上代理与自定义 CA 这几个出网设置：
+`HTTP_PROXY` / `HTTPS_PROXY` / `ALL_PROXY` / `NO_PROXY`、`SSL_CERT_FILE` / `SSL_CERT_DIR` /
+`REQUESTS_CA_BUNDLE` / `CURL_CA_BUNDLE` / `NODE_EXTRA_CA_CERTS`——不想让某个 server 走代理，
+在它的 `env` 块里把对应变量设成空串），所以像 aws-mcp 这类要 SigV4 凭证的 server，
 装完得自己在 `mcp.json` 的 `env` 块里用 `${env:AWS_PROFILE}` 之类显式点名——
 不点名只会得到一个莫名其妙的 401/403。macOS 上令牌不必明文进 `.env`：用户级 `mcp.json`
 里的 `${GITHUB_TOKEN}` 在环境变量里找不到时，会按同名去 Keychain 取

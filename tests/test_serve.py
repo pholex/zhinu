@@ -146,6 +146,19 @@ class TestBasics(ServeCase):
         self.assertTrue(body["ok"])
         self.assertEqual(body["root"], str(self.root))
 
+    def test_health_hides_deployment_details_from_anonymous_probe(self):
+        self.token = "s3cret"
+        client = self.start("text: 你好\n")
+        anonymous = client.get("/health")
+        self.assertEqual(anonymous.status_code, 200)
+        self.assertEqual(set(anonymous.json()), {"ok", "version"})
+        wrong = client.get("/health", headers={"Authorization": "Bearer nope"})
+        self.assertEqual(set(wrong.json()), {"ok", "version"})
+        full = client.get("/health", headers=self.headers()).json()
+        self.assertEqual(full["root"], str(self.root))
+        self.assertIn("state_dir", full)
+        self.assertIn("approval", full)
+
     def test_sync_prompt_returns_result(self):
         self.start("text: 干完了\n")
         session_id = self.new_session()

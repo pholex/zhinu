@@ -89,7 +89,7 @@ import time
 import uuid
 from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 from urllib.parse import urlsplit
 
 #  Request 必须在**模块全局**里解析得到，不能只在 create_app 内部 import：
@@ -151,6 +151,10 @@ REQUESTS_IN_FLIGHT = diagnostics.Gauge("serve.requests.in_flight")
 #  超出后从头丢，并把 first_seq/dropped 如实报给客户端——静默截断会让
 #  编排侧以为自己拉全了。
 DEFAULT_BUFFER = 5000
+#  游标水位按块预留：发出去的每个 seq 都小于盘上清单里的预留线。逐事件写盘不值得，
+#  只在开轮/收尾写又不够——轮中进程被杀时盘上还是开轮时的水位，重启后从那里接号
+#  就是把已经发给客户端的序号再发一遍（客户端拿旧游标一条都拉不到）。
+SEQ_RESERVE_BLOCK = 1000
 #  单条事件里超长字符串字段的上限。工具输出（尤其 bash / read）可以是 MB 级，
 #  常驻服务把它们全留在内存里迟早撑爆。截断处标记 *_truncated 与原始长度，
 #  客户端看得见自己拿到的是截断版。
@@ -387,6 +391,9 @@ class _Session:
         self.next_seq = 1
         self.first_seq = 1
         self.dropped = 0
+        #  已落盘的预留线与"越线了，去落盘"的回调（装配时接上清单存储）
+        self.seq_reserved = 0
+        self.on_reserve: Callable[[], None] | None = None
         self._tick = asyncio.Event()
 
         self.pending: dict[str, _Pending] = {}
@@ -426,6 +433,10 @@ class _Session:
             if cut:
                 clipped[f"{key}_truncated"] = True
                 clipped[f"{key}_chars"] = original
+        if self.next_seq >= self.seq_reserved:
+            self.seq_reserved = self.next_seq + SEQ_RESERVE_BLOCK
+            if self.on_reserve is not None:
+                self.on_reserve()
         record = {"seq": self.next_seq, "time": time.time(), **clipped}
         self.next_seq += 1
         self.events.append(record)
@@ -535,8 +546,12 @@ class _Session:
             "created_at": self.created_at,
         }
 
-    def manifest(self) -> dict[str, Any]:
-        """重启后重建本会话所需的全部信息（见 serve_state.SessionStore）。"""
+    def manifest(self, final: bool = False) -> dict[str, Any]:
+        """重启后重建本会话所需的全部信息（见 serve_state.SessionStore）。
+
+        `final` = 优雅停机时的最后一次落盘：之后不会再有事件，预留线收紧到实际
+        水位，重启后的编号紧接着上次，不留空档。
+        """
         return {
             "session_id": self.id,
             "workspace": str(self.workspace),
@@ -546,6 +561,7 @@ class _Session:
             "pricing": self.pricing,
             "session_log": str(self.agent.session_log.path) if self.agent.session_log else "",
             "next_seq": self.next_seq,
+            "seq_reserved": self.next_seq if final else max(self.seq_reserved, self.next_seq),
             "turns": self.turns,
             "created_at": self.created_at,
             "in_flight": self.in_flight,
@@ -825,7 +841,7 @@ def create_app(cfg: ServeConfig):  # noqa: C901 - 路由表天然长，拆开反
             #  优雅停机：把每个会话的游标水位落盘（next_seq 一直在涨，逐事件写盘
             #  不值得；停机时写一次即可让重启后的编号接得上）
             for session in sessions.values():
-                manifests.save(session.manifest())
+                manifests.save(session.manifest(final=True))
                 #  放掉会话日志的写锁（不写 exit：会话没结束，重启后按清单接回）。
                 #  进程真退出时内核也会放，但嵌入宿主可能在同一进程里停了再起
                 if session.agent.session_log is not None:
@@ -866,19 +882,23 @@ def create_app(cfg: ServeConfig):  # noqa: C901 - 路由表天然长，拆开反
 
     # ---------- 鉴权 ----------
 
-    async def require_token(
-        authorization: str = Header(default=""),
-        x_xiaoyu_token: str = Header(default=""),
-    ) -> None:
+    def header_token_ok(authorization: str, x_xiaoyu_token: str) -> bool:
+        """没配 token（只监听回环）恒真；配了就要对得上。"""
         if not cfg.token:
-            return
+            return True
         offered = x_xiaoyu_token or authorization.removeprefix("Bearer ").strip()
         #  常数时间比较：token 是长期凭据，别把它的前缀通过响应时间漏出去。
         #  **必须比 bytes**：starlette 按 latin-1 解 header，而
         #  compare_digest(str, str) 遇非 ASCII 直接抛 TypeError——那会让
         #  非 ASCII 的 token 整个服务不可用（每个请求 500），也让任何带非 ASCII
         #  Authorization 头的请求收到 500 而不是干净的 401。
-        if not hmac.compare_digest(offered.encode("utf-8"), cfg.token.encode("utf-8")):
+        return hmac.compare_digest(offered.encode("utf-8"), cfg.token.encode("utf-8"))
+
+    async def require_token(
+        authorization: str = Header(default=""),
+        x_xiaoyu_token: str = Header(default=""),
+    ) -> None:
+        if not header_token_ok(authorization, x_xiaoyu_token):
             raise HTTPException(status_code=401, detail="token 不对或缺失")
 
     guard = [Depends(require_token)]
@@ -989,6 +1009,14 @@ def create_app(cfg: ServeConfig):  # noqa: C901 - 路由表天然长，拆开反
             raise HTTPException(status_code=400, detail=f"工作区不存在：{candidate}")
         return candidate
 
+    def save_reservation(session: _Session) -> None:
+        """把抬高了的预留线落盘。写不进去不能连累事件发布：预留线没落盘的后果是
+        崩溃后序号可能重复，而在这儿抛出去的后果是这一轮直接断掉。"""
+        try:
+            manifests.save(session.manifest())
+        except Exception as exc:  # noqa: BLE001
+            print(f"serve: 会话 {session.id} 的游标水位没能落盘：{exc}", file=sys.stderr)
+
     def assemble(
         session_id: str,
         target: Path,
@@ -1028,6 +1056,7 @@ def create_app(cfg: ServeConfig):  # noqa: C901 - 路由表天然长，拆开反
         #  绑定后 approver / sink 才真正生效。绑定前不可能有一轮在跑（会话还没
         #  返回给调用方），所以这个窗口安全——但 approver 仍 fail closed 兜底
         session.mcp_manager = manager
+        session.on_reserve = lambda: save_reservation(session)
         loop = asyncio.get_running_loop()
         ref.bind(session, loop)
         #  通知是从工作线程、后台任务的 watcher 线程里投递的：转交给事件循环再动缓冲区
@@ -1195,9 +1224,13 @@ def create_app(cfg: ServeConfig):  # noqa: C901 - 路由表天然长，拆开反
             log.event("reopened", version=app.version, model=local.model, messages=len(history))
             #  copy=False：历史就在这个文件里，再抄一遍等于每次重启都把日志翻倍
             session.async_agent.restore(history, copy=False)
-            #  游标接着编号：重启前的事件计入 dropped，客户端手里的 from 仍单调
-            resume_seq = max(1, int(manifest.get("next_seq") or 1))
-            session.next_seq = session.first_seq = resume_seq
+            #  游标接着编号：重启前的事件计入 dropped，客户端手里的 from 仍单调。
+            #  从预留线接——上个进程发出去的序号都在它之下；优雅停机时它就是实际水位，
+            #  中途被杀时它比实际水位高出不到一个块，序号跳过一段但绝不回头
+            resume_seq = max(
+                1, int(manifest.get("next_seq") or 1), int(manifest.get("seq_reserved") or 0)
+            )
+            session.next_seq = session.first_seq = session.seq_reserved = resume_seq
             session.dropped = resume_seq - 1
             session.turns = int(manifest.get("turns") or 0)
             session.created_at = float(manifest.get("created_at") or session.created_at)
@@ -1331,7 +1364,15 @@ def create_app(cfg: ServeConfig):  # noqa: C901 - 路由表天然长，拆开反
         return body
 
     @app.get("/health", summary="存活探针", tags=["system"], operation_id="health")
-    async def health() -> dict[str, Any]:
+    async def health(
+        authorization: str = Header(default=""),
+        x_xiaoyu_token: str = Header(default=""),
+    ) -> dict[str, Any]:
+        #  探针本身不要 token（负载均衡 / 容器编排的存活检查带不了凭据），但配了
+        #  token 的服务多半暴露在回环之外：工作区路径、状态目录、审批档这些是
+        #  部署细节，只回给对得上 token 的调用方，匿名探针只拿到"活着"和版本
+        if not header_token_ok(authorization, x_xiaoyu_token):
+            return {"ok": True, "version": app.version}
         return {
             "ok": True,
             "version": app.version,

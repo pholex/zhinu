@@ -6,11 +6,15 @@
 
 from __future__ import annotations
 
+import contextlib
+import io
+import json
 import os
 import tempfile
 import unittest
 from pathlib import Path
 from typing import Any
+from unittest import mock
 
 from tests.test_serve import HAS_FASTAPI, ServeCase
 from xiaoyu.serve_state import AgentStore, Budget, StateError, budget_breach, spend_of
@@ -417,6 +421,65 @@ class TestPersistence(ServeCase):
         )
         self._wait_for(session_id, "finished")
         self.assertIsNone(json.loads(manifest.read_text(encoding="utf-8"))["in_flight"])
+
+    def test_cursor_never_runs_backwards_after_a_kill_mid_turn(self):
+        """轮中进程被杀：盘上清单是更早写下的，而客户端已经见过之后的序号。
+        重启后从盘上的实际水位接号，就是把发过的序号再发一遍——客户端拿着旧游标
+        一条都拉不到，`session.recovered` 和之后的事件全漏。"""
+        from xiaoyu import serve as serve_mod
+
+        state = Path(self.tmp) / "state"
+        self.start(SIMPLE + "---\n" + SIMPLE, state_dir=state)
+        session_id = self.new_session()
+        self.client.post(
+            f"/session/{session_id}/prompt", json={"text": "第一轮"}, headers=self.headers()
+        )
+        session = self.client.app.state.sessions[session_id]
+        #  第二轮跑到一半：又发了一批事件，跨过一次预留线
+        for index in range(serve_mod.SEQ_RESERVE_BLOCK + 50):
+            session.publish("text.delta", text=str(index))
+        seen = self.status(session_id)["next_seq"]
+        manifest = state / "sessions" / f"{session_id}.json"
+        killed_at = manifest.read_text(encoding="utf-8")
+        self.assertLess(json.loads(killed_at)["next_seq"], seen)  # 实际水位确实落后
+        self.client.__exit__(None, None, None)
+        manifest.write_text(killed_at, encoding="utf-8")  # 没有优雅停机那一次落盘
+
+        self.start(SIMPLE + "---\n" + SIMPLE, state_dir=state)
+        info = self.status(session_id)
+        self.assertGreaterEqual(info["first_seq"], seen)
+        after = self.client.get(
+            f"/session/{session_id}/events", params={"from": seen, "limit": 10},
+            headers=self.headers(),
+        ).json()
+        self.assertEqual([item["kind"] for item in after["events"]], ["session.recovered"])
+        self.assertGreaterEqual(after["events"][0]["seq"], seen)
+
+    def test_graceful_restart_continues_numbering_without_a_gap(self):
+        state = Path(self.tmp) / "state"
+        self.start(SIMPLE, state_dir=state)
+        session_id = self.new_session()
+        self.client.post(
+            f"/session/{session_id}/prompt", json={"text": "第一轮"}, headers=self.headers()
+        )
+        seen = self.status(session_id)["next_seq"]
+        self.client.__exit__(None, None, None)
+        self.start(SIMPLE, state_dir=state)
+        self.assertEqual(self.status(session_id)["first_seq"], seen)
+
+    def test_reservation_survives_a_failing_disk(self):
+        """预留线写不进去不能把事件发布一起带倒。"""
+        state = Path(self.tmp) / "state"
+        self.start(SIMPLE, state_dir=state)
+        session_id = self.new_session()
+        session = self.client.app.state.sessions[session_id]
+        with mock.patch(
+            "xiaoyu.serve_state.SessionStore.save", side_effect=OSError("磁盘满了")
+        ), contextlib.redirect_stderr(io.StringIO()) as err:
+            for index in range(1500):
+                session.publish("text.delta", text=str(index))
+        self.assertIn("游标水位", err.getvalue())
+        self.assertGreater(self.status(session_id)["next_seq"], 1500)
 
     def test_turn_killed_by_restart_is_reported_until_next_turn(self):
         import json

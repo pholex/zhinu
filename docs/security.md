@@ -110,7 +110,9 @@ xiaoyu --no-network          # 或 XIAOYU_SANDBOX_NETWORK=0，断掉沙箱内的
 
 第三方 server 是外部代码 + 外部工具描述，安全内建有五条：
 
-- 子进程**环境白名单**——你的 API key 不会漏给 server 进程。
+- 子进程**环境白名单**——你的 API key 不会漏给 server 进程。代理与自定义 CA 这几个出网
+  设置会传给它（不然代理环境下 server 连包都下不了）；代理地址里带账号密码的话，
+  装上的 server 读得到。
 - npx / uvx 包启动前查 **OSV 恶意包库**。
 - 内联攻击脚本形状的配置**拒绝启动**。
 - 工具描述 / schema 变更**自动隔离**（防 rug-pull）。隔离时直接摊出相对上次批准的差异
@@ -138,7 +140,7 @@ xiaoyu --no-network          # 或 XIAOYU_SANDBOX_NETWORK=0，断掉沙箱内的
 | 某个 MCP server 的结果不套 `<untrusted_content>` | 该 server 声明里 `"trustContent": true` | 内网 runbook / 工单系统——你就是想让模型照它说的做 |
 | 逐条审批 / 沙箱 / 工作区信任门 / MCP 变更隔离 | `--yolo` / `--no-sandbox` / `--trust` / `XIAOYU_MCP_TRUST_CHANGES=1` | 原有开关，不变 |
 
-`trustContent` 只给 MCP：网页与联网搜索的来源不是你能背书的，没有对应开关。`--unattended` 在确认档单独开没有意义——那几项本来就走常规确认；出厂的 auto 档下它会让写可执行配置不再问。
+`trustContent` 只给 MCP：网页与联网搜索的来源不是你能背书的，没有对应开关。`trustContent` 与 `trustToolChanges` 只认你自己写进 mcp.json 的：插件包声明里自带的会在安装时剥掉并报出来——信任不能由被审查的一方自己声明。`--unattended` 在确认档单独开没有意义——那几项本来就走常规确认；出厂的 auto 档下它会让写可执行配置不再问。
 
 ### `--unguarded`：无护栏预设
 

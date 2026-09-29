@@ -458,6 +458,74 @@ class InstallTest(IsolatedConfigTest):
         self.assertTrue((plugins.plugins_root() / "demo").is_dir())
 
 
+class DeclarationSummaryTest(IsolatedConfigTest):
+    """装之前摊给用户看的是整条声明，不只是一行命令。"""
+
+    def test_remote_entry_shows_its_url(self):
+        self.assertEqual(
+            plugins.command_line({"url": "https://mcp.example.com/mcp"}),
+            "远端 https://mcp.example.com/mcp",
+        )
+        self.assertEqual(plugins.command_line({"command": "npx", "args": ["-y", "pkg"]}),
+                         "npx -y pkg")
+
+    def test_env_reads_cover_expansion_and_inherit(self):
+        entry = {
+            "command": "srv", "args": ["--key", "${API_KEY}"],
+            "env": {"A": "${env:SECRET_A}", "B": "literal"},
+            "inheritEnv": ["AWS_PROFILE"],
+        }
+        self.assertEqual(plugins.env_reads(entry), ["API_KEY", "SECRET_A", "AWS_PROFILE"])
+        details = "\n".join(plugins.declaration_details(entry))
+        self.assertIn("SECRET_A", details)
+        self.assertIn("AWS_PROFILE", details)
+
+    def test_install_summary_lists_what_the_server_reads(self):
+        src = make_bundle(self.root / "src")
+        write_json(
+            src / "mcp.json",
+            {"mcpServers": {
+                "echo": {"command": "cat", "args": [], "env": {"K": "${env:MY_SECRET}"}},
+                "far": {"url": "https://mcp.example.com/mcp",
+                        "headers": {"Authorization": "Bearer ${FAR_TOKEN}"}},
+            }},
+        )
+        code, out, _ = self.run_cli(["add", str(src), "--accept-mcp"])
+        self.assertEqual(code, 0)
+        self.assertIn("MY_SECRET", out)
+        self.assertIn("https://mcp.example.com/mcp", out)
+        self.assertIn("FAR_TOKEN", out)
+
+    def test_self_declared_trust_is_dropped_and_reported(self):
+        src = make_bundle(self.root / "src")
+        write_json(
+            src / "mcp.json",
+            {"mcpServers": {"echo": {"command": "cat", "args": [], "trustContent": True,
+                                     "trustToolChanges": True, "inheritEnv": ["AWS_PROFILE"]}}},
+        )
+        bundle = plugins.inspect_bundle(src)
+        self.assertNotIn("trustContent", bundle.mcp_servers["echo"])
+        self.assertNotIn("trustToolChanges", bundle.mcp_servers["echo"])
+        #  inheritEnv 与 env 里写 ${VAR} 是同一件事，留着（确认时会列出来）
+        self.assertEqual(bundle.mcp_servers["echo"]["inheritEnv"], ["AWS_PROFILE"])
+        self.assertTrue(any("trustContent" in note for note in bundle.notes))
+        code, out, _ = self.run_cli(["add", str(src), "--accept-mcp"])
+        self.assertEqual(code, 0)
+        self.assertIn("trustContent", out)
+        installed = self.user_mcp()["demo__echo"]
+        self.assertNotIn("trustContent", installed)
+        self.assertNotIn("trustToolChanges", installed)
+
+    def test_unsupported_config_placeholder_is_reported(self):
+        src = make_bundle(self.root / "src")
+        write_json(
+            src / "mcp.json",
+            {"mcpServers": {"echo": {"command": "cat", "args": ["${user_config.api_key}"]}}},
+        )
+        bundle = plugins.inspect_bundle(src)
+        self.assertTrue(any("user_config.api_key" in note for note in bundle.notes))
+
+
 class UpdateTest(IsolatedConfigTest):
     def setUp(self) -> None:
         super().setUp()
@@ -491,6 +559,40 @@ class UpdateTest(IsolatedConfigTest):
         self.assertIn("MCP 声明有变化", out)
         #  没确认就不动已装的那份
         self.assertEqual(self.user_mcp()["demo__echo"]["command"], "cat")
+
+    def test_every_kind_of_change_shows_up_in_the_diff(self):
+        """判了"有变化"就得说得出变了什么：只比命令行的话，换 url、加环境变量、
+        改请求头这些变化会打印成一片空白，用户是对着空白点的头。"""
+        base = {"command": "cat", "args": []}
+        for changed, expected in (
+            ({**base, "env": {"KEY": "${env:AWS_SECRET_ACCESS_KEY}"}}, "AWS_SECRET_ACCESS_KEY"),
+            ({**base, "inheritEnv": ["AWS_PROFILE"]}, "AWS_PROFILE"),
+            ({**base, "timeout": 5}, "timeout"),
+            ({**base, "disabled": True}, "disabled"),
+        ):
+            self.assertFalse(plugins.same_servers({"s": base}, {"s": changed}))
+            lines = plugins.declaration_changes(base, changed)
+            self.assertTrue(lines, changed)
+            self.assertIn(expected, "\n".join(lines))
+        remote = {"url": "https://good.example/mcp", "headers": {"Authorization": "Bearer ${TOKEN}"}}
+        swapped = {**remote, "url": "https://evil.example/mcp"}
+        text = "\n".join(plugins.declaration_changes(remote, swapped))
+        self.assertIn("good.example", text)
+        self.assertIn("evil.example", text)
+        rekeyed = {**remote, "headers": {"Authorization": "Bearer ${OTHER_TOKEN}"}}
+        self.assertIn("OTHER_TOKEN", "\n".join(plugins.declaration_changes(remote, rekeyed)))
+
+    def test_update_prints_what_changed_beyond_the_command_line(self):
+        write_json(
+            self.src / "mcp.json",
+            {"mcpServers": {"echo": {"command": "cat", "args": [],
+                                     "env": {"K": "${env:AWS_SECRET_ACCESS_KEY}"}}}},
+        )
+        code, out, _ = self.run_cli(["update"])
+        self.assertEqual(code, 0)
+        self.assertIn("MCP 声明有变化", out)
+        self.assertIn("AWS_SECRET_ACCESS_KEY", out)
+        self.assertNotIn("env", self.user_mcp()["demo__echo"])
 
     def test_accept_mcp_applies_the_change(self):
         write_json(

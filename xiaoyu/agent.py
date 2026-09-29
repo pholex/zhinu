@@ -2305,6 +2305,10 @@ class Agent:
         对应第 n 次）：压缩把消息改写后下标不可靠，原文匹配不上即说明该轮已被
         压缩合并——这时只回文件不回对话（跨 compaction 一律不硬截断的
         保守方向）。文件恢复委托 RewindStore（全成才丢点，失败保留重试）。
+
+        两样都回时**先文件、后对话**，文件没回成就不截对话：对话截断会落盘、
+        不可撤，而文件恢复可能失败（被编辑器或杀软占着、权限不够）。反过来做
+        的话，失败时留下的是"对话说没改过、文件其实是改过的"。
         """
         store = getattr(self.toolbox, "rewind", None)
         if store is None:
@@ -2333,22 +2337,28 @@ class Agent:
             if found < 0:
                 notes.append("该轮对话已被压缩合并，本次只回滚文件、不动对话")
                 conversation = False
-            else:
-                self.messages = self.messages[:found]
-                self._history_rewritten()
-                self.plan = []
-                if self.session_log:
-                    #  与 compact 同一套 replacement 机制：resume 重放时撞到即
-                    #  整体替换，不需要理解 rewind 语义
-                    self.session_log.event(
-                        "rewind", target=index, replacement=self.messages[1:]
-                    )
-                notes.append(f"对话已回滚到第 {index} 轮开始前（截掉其后的全部轮次）")
         if files:
             ok, summary = store.rewind_files(index)
-            notes.append(("文件：" if ok else "文件恢复出错：") + summary)
             if self.session_log:
                 self.session_log.event("rewind_files", target=index, ok=ok)
+            if not ok:
+                notes.append("文件恢复出错：" + summary)
+                if conversation:
+                    notes.append("对话没有回滚（文件回不去时对话也不动；修好后重试即可）")
+                return "；".join(notes)
+        if conversation:
+            self.messages = self.messages[:found]
+            self._history_rewritten()
+            self.plan = []
+            if self.session_log:
+                #  与 compact 同一套 replacement 机制：resume 重放时撞到即
+                #  整体替换，不需要理解 rewind 语义
+                self.session_log.event(
+                    "rewind", target=index, replacement=self.messages[1:]
+                )
+            notes.append(f"对话已回滚到第 {index} 轮开始前（截掉其后的全部轮次）")
+        if files:
+            notes.append("文件：" + summary)
         return "；".join(notes) if notes else "什么也没做。"
 
     def drop_from(self, start: int, reason: str) -> int:
@@ -4307,14 +4317,24 @@ class Agent:
             #  就必须给终态，否则 TUI spinner 靠带外清扫、ACP client 的 tool_call
             #  永远停在 in_progress。历史侧的 tool 配对由 close_open_tool_calls
             #  兜底，这里只管事件面。
+            #  批量委托被打断时，已收束各项的报告挂在异常上（见 errors.attach_partial）：
+            #  作为这次调用的结果写进历史——否则那些子 agent 的结论和续跑句柄只剩
+            #  存档里有，下一轮模型看到的是一句通用的"已中断"
+            partial = getattr(exc, errors.PARTIAL_OUTPUT, None)
+            partial = partial if isinstance(partial, str) and partial.strip() else ""
             self.sink.emit(
                 ToolCompleted(
                     name,
-                    output=f"[执行被中断/异常：{type(exc).__name__}]",
+                    output=partial or f"[执行被中断/异常：{type(exc).__name__}]",
                     ok=False,
                     seconds=time.monotonic() - started,
                 )
             )
+            if partial:
+                try:
+                    self._record(self._tool_message(call, self.toolbox._bound_output(name, partial)))
+                except Exception:  # noqa: BLE001 - 记不进去也不能盖掉正在上抛的打断
+                    pass
             raise
         elapsed = time.monotonic() - started
         #  工具的原始输出：下面只会往它后面追加 harness 提示，回灌时据此只包原始那段

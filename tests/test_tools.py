@@ -132,7 +132,7 @@ class TestReadWrite(ToolboxTestCase):
         fifo = self.root / "pipe"
         os.mkfifo(fifo)
         #  假装读过（比如读完之后路径被换成了 FIFO），闸门之后的读取也不能挂
-        self.box._reads[fifo] = float("inf")
+        self.box._mark_read(fifo)
         result = self._run_bounded(
             "str_replace", {"path": "pipe", "old_str": "a", "new_str": "b"}, fifo
         )
@@ -161,15 +161,92 @@ class TestReadWrite(ToolboxTestCase):
         """只读了一段就允许覆盖整个文件，会丢掉没读到的部分。"""
         self.box.run("read_file", {"path": "calc.py", "offset": 1, "limit": 2})
         result = self.box.run("write_file", {"path": "calc.py", "content": "wiped"})
-        self.assertIn("还没读过", result)
+        self.assertIn("只读过一部分", result)
+        self.assertIn("str_replace", result)
         self.assertEqual(self.read(), SAMPLE)
 
-    def test_partial_read_does_not_authorize_str_replace(self) -> None:
+    def test_partial_read_authorizes_a_local_edit(self) -> None:
+        """局部替换的 old_str 得逐字对上、且在全文里唯一——这本身就证明模型知道
+        要改的那一段。为改大文件里的一处先整读一遍，是白付一次全文的上下文。"""
         self.box.run("read_file", {"path": "calc.py", "offset": 1, "limit": 2})
         result = self.box.run(
             "str_replace", {"path": "calc.py", "old_str": "a + b", "new_str": "a - b"}
         )
-        self.assertIn("还没读过", result)
+        self.assertIn("已替换", result)
+
+    def test_local_edit_after_partial_read_still_checks_the_whole_file(self) -> None:
+        (self.root / "dup.py").write_text("x = 1\n" * 3 + "y = 2\n", encoding="utf-8")
+        self.box.run("read_file", {"path": "dup.py", "offset": 4, "limit": 1})
+        result = self.box.run(
+            "str_replace", {"path": "dup.py", "old_str": "x = 1", "new_str": "x = 9"}
+        )
+        self.assertTrue(result.startswith("ERROR"), result)
+        self.assertEqual((self.root / "dup.py").read_text(encoding="utf-8").count("x = 1"), 3)
+
+    def test_reading_every_segment_adds_up_to_a_full_read(self) -> None:
+        total = len(SAMPLE.splitlines())
+        self.box.run("read_file", {"path": "calc.py", "offset": 1, "limit": 2})
+        blocked = self.box.run("write_file", {"path": "calc.py", "content": "x = 1\n"})
+        self.assertIn("只读过一部分", blocked)
+        self.box.run("read_file", {"path": "calc.py", "offset": 3, "limit": total})
+        result = self.box.run("write_file", {"path": "calc.py", "content": "x = 1\n"})
+        self.assertIn("已覆盖", result)
+
+    def test_gaps_between_segments_do_not_count(self) -> None:
+        total = len(SAMPLE.splitlines())
+        self.assertGreaterEqual(total, 4)
+        self.box.run("read_file", {"path": "calc.py", "offset": 1, "limit": 1})
+        self.box.run("read_file", {"path": "calc.py", "offset": 3, "limit": total})
+        result = self.box.run("write_file", {"path": "calc.py", "content": "wiped"})
+        self.assertIn("只读过一部分", result)
+        self.assertEqual(self.read(), SAMPLE)
+
+    def test_partial_read_never_downgrades_a_full_read(self) -> None:
+        self.box.run("read_file", {"path": "calc.py"})
+        self.box.run("read_file", {"path": "calc.py", "offset": 1, "limit": 1})
+        result = self.box.run("write_file", {"path": "calc.py", "content": "x = 1\n"})
+        self.assertIn("已覆盖", result)
+
+    def test_truncated_whole_read_does_not_authorize_overwrite(self) -> None:
+        """整读但装不下：模型拿到的只有头尾预览，中段它没看见。"""
+        big = self.root / "big.txt"
+        body = "".join(f"第 {n} 行 " + "x" * 40 + "\n" for n in range(2000))
+        big.write_text(body, encoding="utf-8")
+        self.assertGreater(len(body), self.box.config.max_tool_output)
+        shown = self.box.run("read_file", {"path": "big.txt"})
+        self.assertIn("分段读", shown)
+        result = self.box.run("write_file", {"path": "big.txt", "content": "wiped"})
+        self.assertIn("只读过一部分", result)
+        self.assertEqual(big.read_text(encoding="utf-8"), body)
+        edit = self.box.run(
+            "str_replace",
+            {"path": "big.txt", "old_str": "第 1000 行 ", "new_str": "第一千行 "},
+        )
+        self.assertIn("已替换", edit)
+        #  局部改过之后仍然只算读过一部分
+        again = self.box.run("write_file", {"path": "big.txt", "content": "wiped"})
+        self.assertIn("只读过一部分", again)
+
+    def test_swapping_in_an_older_copy_is_noticed(self) -> None:
+        """换回一份更旧的文件（git checkout、从备份恢复）mtime 是往回走的。"""
+        target = self.root / "calc.py"
+        self.box.run("read_file", {"path": "calc.py"})
+        stamp = target.stat().st_mtime
+        target.write_text(SAMPLE.replace("a + b", "a * b"), encoding="utf-8")
+        os.utime(target, (stamp - 100, stamp - 100))
+        result = self.box.run(
+            "str_replace", {"path": "calc.py", "old_str": "a * b", "new_str": "a - b"}
+        )
+        self.assertIn("被改动过", result)
+
+    def test_same_mtime_different_size_is_noticed(self) -> None:
+        target = self.root / "calc.py"
+        self.box.run("read_file", {"path": "calc.py"})
+        stamp = target.stat().st_mtime
+        target.write_text(SAMPLE + "# 追加\n", encoding="utf-8")
+        os.utime(target, (stamp, stamp))
+        result = self.box.run("write_file", {"path": "calc.py", "content": "x = 1\n"})
+        self.assertIn("被改动过", result)
 
     def test_full_read_authorizes_edit(self) -> None:
         self.box.run("read_file", {"path": "calc.py"})

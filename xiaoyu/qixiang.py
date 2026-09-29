@@ -41,7 +41,7 @@ from .agents import (
 )
 from .config import EFFORT_LEVELS, Config
 from .events import Notice, UISink
-from .fanout import Attempt, run_attempts
+from .fanout import Attempt, attach_partial, run_attempts
 from .providers import UnknownModel
 from .tools import Tool
 
@@ -313,23 +313,47 @@ def make_qixiang_tool(
                 + "）"
             )
         )
-        run_attempts(
-            attempts,
-            concurrency=concurrency,
-            timeout_s=timeout_s,
-            min_answer_chars=MIN_ANSWER_CHARS,
-            on_settled=on_settled,
-            stop_requested=stop_requested,
-        )
+        def report(cancelled: bool) -> str:
+            return _report(
+                states, attempts, cancelled=cancelled, spec_name=spec_name,
+                model_name=model_name, effort_level=effort_level, concurrency=concurrency,
+                timeout_s=timeout_s, per_item_cap=per_item_cap, sink=sink,
+            )
+
+        try:
+            run_attempts(
+                attempts,
+                concurrency=concurrency,
+                timeout_s=timeout_s,
+                min_answer_chars=MIN_ANSWER_CHARS,
+                on_settled=on_settled,
+                stop_requested=stop_requested,
+            )
+        except BaseException as exc:
+            #  用户打断 / 宿主叫停：照样往上抛，但已收束各项的结论与 resume 句柄
+            #  随异常带出去——不带的话存档还在，句柄却没人知道
+            attach_partial(exc, lambda: report(cancelled=True))
+            raise
+        return report(cancelled=False)
+
+    def _report(
+        states: list[_ItemState], attempts: list[Attempt], *, cancelled: bool,
+        spec_name: str, model_name: str, effort_level: str, concurrency: int,
+        timeout_s: int, per_item_cap: int, sink: Any,
+    ) -> str:
         for state, attempt in zip(states, attempts):
-            copy_back(state, attempt)
+            state.result = attempt.result
+            state.crash = attempt.crash
+            state.timed_out = attempt.timed_out
+            state.never_started = attempt.never_started
+            state.started_at = attempt.started_at
 
         #  ---------- 聚合 report：输入顺序，与完成先后无关 ----------
         counts = {"completed": 0, "partial": 0, "failed": 0, "aborted": 0, "error": 0}
         blocks: list[str] = []
         retry_ids: list[str] = []
         for state in states:
-            status = _status_of(state, cancelled=False)
+            status = _status_of(state, cancelled=cancelled)
             counts[status] += 1
             zh = {
                 "completed": "完成",
@@ -358,7 +382,7 @@ def make_qixiang_tool(
             elif result is not None and result.failure:
                 lines.append(f"ERROR: 子 agent 失败（{result.failure}）")
             elif result is None:
-                lines.append("未开始即被中止。")
+                lines.append("被打断时还没交卷。" if cancelled and state.started_at else "未开始即被中止。")
             elif status == "partial":
                 lines.append(f"{result.cut_short}，被叫停时交代的进度如下（不是最终结论，可续跑）：")
             if result is not None and result.answer and status in ("completed", "partial", "failed"):
@@ -371,7 +395,8 @@ def make_qixiang_tool(
             blocks.append("\n".join(lines))
 
         header = (
-            f"[七襄 report] spec={spec_name}"
+            ("[七襄 report · 被打断，以下是打断时的进度] " if cancelled else "[七襄 report] ")
+            + f"spec={spec_name}"
             + (f" · model={model_name}" if model_name else "")
             + (f" · effort={effort_level}" if effort_level else "")
             + f" · 完成 {counts['completed']} / 未做完 {counts['partial']} / "
@@ -388,7 +413,8 @@ def make_qixiang_tool(
             )
         sink.emit(
             Notice(
-                f"  🕸 七襄收束：完成 {counts['completed']}/{len(states)}"
+                f"  🕸 七襄{'被打断' if cancelled else '收束'}："
+                f"完成 {counts['completed']}/{len(states)}"
             )
         )
         return "\n\n".join([header, *hints, *blocks])

@@ -326,6 +326,22 @@ class TestStreamTranslation(unittest.TestCase):
         self.assertIn("连接断了", str(errored.exception))
         self.assertTrue(classify(errored.exception).retryable)
 
+    def test_failure_carries_the_error_code_for_classification(self) -> None:
+        """超限的文案不含任何可认的词，码才是稳定的判据：码丢了就会被兜底成
+        transient，同一个超大请求原样重发到预算烧光。"""
+        with self.assertRaises(StreamFailed) as failed:
+            list(responses.stream_chunks(iter([
+                event("response.failed", response=SimpleNamespace(error=SimpleNamespace(
+                    message="请求未能完成", code="context_length_exceeded"))),
+            ])))
+        self.assertIn("context_length_exceeded", str(failed.exception))
+        self.assertEqual(classify(failed.exception).kind, "context_overflow")
+        with self.assertRaises(StreamFailed) as errored:
+            list(responses.stream_chunks(iter([
+                event("error", message="余额不足", code="insufficient_quota")
+            ])))
+        self.assertEqual(classify(errored.exception).kind, "quota")
+
     def test_incomplete_keeps_partial_text_instead_of_raising(self) -> None:
         """截断/内容过滤不抛：chat 侧 finish_reason=length 也是照常返回半截正文。"""
         text, _, usage = self.collect([
