@@ -163,6 +163,185 @@ _NO_SESSION_KEY = frozenset(
 )
 
 
+#  子命令式 CLI 的全局选项：出现在子命令**之前**、不改变"这是哪一类操作"的选项。
+#  推导命令类时跳过它们再取子命令——`kubectl -n prod get pods` 与 `kubectl get pods`
+#  是同一类。只收确知无害的；表里没有的前导选项一律推不出范围（逐次确认），
+#  绝不退回"整个命令头"：那会让批准一条只读查询变成放行该 CLI 的全部子命令。
+#  flags = 不带值；valued = 下一个词是它的值（--opt=value 粘连形态按选项名查同一张表）。
+_COMMON_FLAGS = frozenset({"-q", "--quiet", "-v", "--verbose", "--no-color"})
+_GLOBAL_OPTIONS: dict[str, tuple[frozenset[str], frozenset[str]]] = {
+    "git": (frozenset({"--no-pager", "--no-replace-objects", "--no-optional-locks",
+                       "--literal-pathspecs", "--bare"}), frozenset()),
+    "kubectl": (frozenset(), frozenset({"-n", "--namespace", "--context", "--cluster",
+                                        "--user", "--request-timeout"})),
+    "docker": (frozenset({"-D", "--debug"}),
+               frozenset({"-c", "--context", "-l", "--log-level"})),
+    "gh": (frozenset(), frozenset({"-R", "--repo"})),
+    "npm": (_COMMON_FLAGS | {"-s", "--silent"}, frozenset({"--prefix"})),
+    "pnpm": (_COMMON_FLAGS | {"-s", "--silent", "-r", "--recursive", "-w", "--workspace-root"},
+             frozenset({"-F", "--filter", "-C", "--dir"})),
+    "yarn": (_COMMON_FLAGS | {"-s", "--silent"}, frozenset({"--cwd"})),
+    "cargo": (_COMMON_FLAGS | {"--locked", "--offline", "--frozen"}, frozenset({"--color"})),
+    "pip": (_COMMON_FLAGS | {"--no-cache-dir", "--disable-pip-version-check", "--no-input",
+                             "--isolated"}, frozenset()),
+    "uv": (_COMMON_FLAGS | {"--offline", "--no-cache", "--no-progress"}, frozenset({"--color"})),
+    "poetry": (_COMMON_FLAGS | {"-vv", "-vvv", "-n", "--no-interaction", "--no-ansi", "--ansi",
+                                "--no-plugins"}, frozenset()),
+    "brew": (_COMMON_FLAGS | {"-d", "--debug"}, frozenset()),
+    "make": (frozenset({"-s", "--silent", "-k", "--keep-going", "-B", "--always-make"}),
+             frozenset()),
+    "go": (frozenset(), frozenset()),
+    "conda": (frozenset(), frozenset()),
+}
+_GLOBAL_OPTIONS["pip3"] = _GLOBAL_OPTIONS["pip"]
+_MAKE_JOBS = re.compile(r"-j\d+$")
+_CARGO_TOOLCHAIN = re.compile(r"\+[\w.-]+$")
+
+#  脚本运行器：第三个词才是"跑哪个脚本"——`npm run build` 与 `npm run deploy` 不是一件事
+_SCRIPT_RUNNERS = frozenset({("npm", "run"), ("pnpm", "run"), ("yarn", "run"), ("bun", "run"),
+                             ("npm", "run-script")})
+
+#  透传运行器：后面跟的是另一条命令，范围按里面那条命令算（`uv run pytest` 放行后
+#  `uv run python -c …` 照问）。运行器自己的选项不解析——带选项就推不出范围。
+_PASSTHROUGH_RUNNERS = frozenset({
+    ("uv", "run"), ("poetry", "run"), ("conda", "run"),
+    ("npm", "exec"), ("pnpm", "exec"), ("pnpm", "dlx"), ("yarn", "exec"), ("yarn", "dlx"),
+})
+_PASSTHROUGH_HEADS = frozenset({"npx", "bunx", "uvx"})
+
+#  名词-动词式子命令：第二个词只是对象类别，第三个词才是操作——`gh repo view` 与
+#  `gh repo delete`、`git stash list` 与 `git stash drop` 不是一类
+_NESTED_SUBCOMMANDS = frozenset({
+    *(("gh", noun) for noun in (
+        "pr", "issue", "repo", "release", "run", "workflow", "secret", "variable", "gist",
+        "label", "cache", "codespace", "project", "ruleset", "extension", "auth", "config",
+        "alias", "ssh-key", "gpg-key", "search")),
+    *(("docker", noun) for noun in (
+        "compose", "container", "image", "volume", "network", "system", "buildx", "context",
+        "builder", "plugin")),
+    *(("git", noun) for noun in ("stash", "remote", "worktree", "submodule", "bisect", "notes")),
+    *(("kubectl", noun) for noun in ("config", "rollout", "auth")),
+    *(("uv", noun) for noun in ("pip", "tool", "python")),
+    ("go", "mod"), ("poetry", "env"), ("poetry", "self"), ("brew", "services"),
+    ("conda", "env"), ("conda", "config"), ("npm", "config"), ("npm", "cache"),
+})
+
+#  解释器：范围取到"跑的是哪个模块/脚本"。-c / -e 之类把参数当代码跑的形态不在
+#  无害选项表里，自然推不出范围。各家同一个字母含义不同（python -E 是忽略环境变量，
+#  perl -E 是执行代码），所以无害选项按解释器分别列，不共用。
+_INTERPRETER = re.compile(
+    r"(?:python|pypy)(?:\d+(?:\.\d+)?)?$|(?:py|node|ruby|perl|php|lua|Rscript|julia)$"
+)
+_PYTHON_FLAGS = frozenset({"-u", "-B", "-q", "-O", "-OO", "-s", "-S", "-E", "-I", "-b", "-d", "-P"})
+_INFO_FLAGS = frozenset({"--version", "--help", "-h", "-V"})
+_MAX_PREFIX_DEPTH = 4
+
+
+def _option_name(token: str) -> str:
+    return token.split("=", 1)[0] if token.startswith("--") and "=" in token else token
+
+
+#  持久规则的模式后缀：命令头后面要隔一个空格（`ls *`，否则 `ls*` 连 lsof 一起放行），
+#  子命令后面沿用粘连写法（`git status*`），整条精确的不带通配
+_EXACT, _AFTER_HEAD, _AFTER_SUB = "", " *", "*"
+
+
+def _exact_if_options_only(argv: list[str]) -> tuple[str, int, str] | None:
+    """整条命令除了命令头全是选项（`npm -v` / `git --version`）：没有子命令可取，
+    范围就是这一条命令本身。后面还跟着位置参数就说不清哪个是子命令——推不出。"""
+    if all(token.startswith("-") for token in argv[1:]):
+        return " ".join([Path(argv[0]).name, *argv[1:]]), len(argv), _EXACT
+    return None
+
+
+def _stable_prefix(argv: list[str], depth: int = 0) -> tuple[str, int, str] | None:
+    """一条简单命令的"命令类"：(范围键, 原始 argv 里属于前缀的词数, 规则模式后缀)。
+
+    范围键是归一后的（全局选项已剥掉），给会话授权做相等比较；词数给持久规则
+    拼字面前缀用（规则按命令文本匹配，得保留用户实际写的那些选项）。
+    推不出返回 None。调用方已经拦过危险命令、注入口与 wrapper 头。
+    """
+    if not argv or depth > _MAX_PREFIX_DEPTH:
+        return None
+    head = Path(argv[0]).name
+    if head in _NO_SESSION_KEY:
+        return None
+
+    if head in _PASSTHROUGH_HEADS:
+        return _through_runner(argv, 1, head, depth)
+
+    if _INTERPRETER.match(head):
+        harmless = _PYTHON_FLAGS if head.startswith(("python", "pypy")) or head == "py" else frozenset()
+        index = 1
+        while index < len(argv):
+            token = argv[index]
+            if token == "-m" and harmless is _PYTHON_FLAGS:
+                #  -m 后面是"另一条命令"：python -m pip list 与 python -m pip install
+                #  不是一类，范围按模块自己的子命令算
+                if index + 1 >= len(argv):
+                    return None
+                return _through_runner(argv, index + 1, f"{head} -m", depth)
+            if not token.startswith("-"):
+                return f"{head} {token}", index + 1, _AFTER_SUB
+            if token in _INFO_FLAGS:
+                return _exact_if_options_only(argv)
+            if token not in harmless:
+                return None
+            index += 1
+        #  没给脚本的裸解释器从标准输入读代码（echo … | python）：推不出范围
+        return None
+
+    if head not in _MULTIWORD_PREFIXES:
+        return head, 1, _EXACT if len(argv) == 1 else _AFTER_HEAD
+
+    flags, valued = _GLOBAL_OPTIONS.get(head, (frozenset(), frozenset()))
+    index = 1
+    while index < len(argv):
+        token = argv[index]
+        if not token.startswith("-"):
+            if head == "cargo" and index == 1 and _CARGO_TOOLCHAIN.match(token):
+                index += 1
+                continue
+            break
+        name = _option_name(token)
+        if name in valued:
+            index += 1 if name != token else 2
+        elif token in flags or (head == "make" and _MAKE_JOBS.match(token)):
+            index += 1
+        else:
+            return _exact_if_options_only(argv)
+    if index >= len(argv):
+        return _exact_if_options_only(argv)
+    sub = argv[index]
+    if (head, sub) in _PASSTHROUGH_RUNNERS:
+        return _through_runner(argv, index + 1, f"{head} {sub}", depth)
+    if (head, sub) in _SCRIPT_RUNNERS and index + 1 < len(argv):
+        script = argv[index + 1]
+        if script.startswith("-"):
+            return None
+        return f"{head} {sub} {script}", index + 2, _AFTER_SUB
+    if (head, sub) in _NESTED_SUBCOMMANDS and index + 1 < len(argv):
+        verb = argv[index + 1]
+        if not verb.startswith("-"):
+            return f"{head} {sub} {verb}", index + 2, _AFTER_SUB
+    return f"{head} {sub}", index + 1, _AFTER_SUB
+
+
+def _through_runner(argv: list[str], start: int, label: str,
+                    depth: int) -> tuple[str, int, str] | None:
+    """透传运行器后面那条命令的范围，拼上运行器前缀。"""
+    inner = argv[start:]
+    if not inner:
+        return label, len(argv), _EXACT
+    if inner[0].startswith("-") or command_check.injection_risk_argv(inner):
+        return None
+    found = _stable_prefix(inner, depth + 1)
+    if found is None:
+        return None
+    key, used, suffix = found
+    return f"{label} {key}", start + used, suffix
+
+
 def _plain_argvs(command: str) -> list[list[str]] | None:
     """命令 → 各段 argv；看不懂返回 None（与 _allowed 同一保守面）。"""
     if os.name != "nt" and bash_ast.available():
@@ -199,13 +378,10 @@ def command_keys(command: str) -> tuple[str, ...] | None:
     for argv in argvs:
         if not argv or command_check.injection_risk_argv(argv):
             return None
-        head = Path(argv[0]).name
-        if head in _NO_SESSION_KEY:
+        found = _stable_prefix(argv)
+        if found is None:
             return None
-        if head in _MULTIWORD_PREFIXES and len(argv) > 1 and not argv[1].startswith("-"):
-            keys.append(f"{head} {argv[1]}")
-        else:
-            keys.append(head)
+        keys.append(found[0])
     return tuple(keys)
 
 
@@ -256,13 +432,18 @@ def suggest_allow_rule(name: str, args: dict, workspace: Path) -> Rule | None:
             return None
     if not argv or command_check.injection_risk_argv(argv):
         return None
-    if len(argv) == 1:
-        #  裸命令（ls）用精确匹配：ls* 会连 lsof 一起放行，宁窄勿宽
-        spec = argv[0]
-    elif argv[0] in _MULTIWORD_PREFIXES and not argv[1].startswith("-"):
-        spec = f"{argv[0]} {argv[1]}*"
-    else:
-        spec = f"{argv[0]} *"
+    found = _stable_prefix(argv)
+    if found is None:
+        return None
+    _, used, suffix = found
+    literal = argv[:used]
+    if any(not token or _has_glob(token) or any(ch.isspace() for ch in token)
+           for token in literal):
+        #  规则是命令文本上的 fnmatch 模式：前缀里的词自带通配符或空白就拼不出
+        #  一条"恰好是它"的模式，宁可不给这个选项
+        return None
+    #  裸命令（ls）与纯选项命令（npm -v）是精确匹配，宁窄勿宽
+    spec = " ".join(literal) + suffix
     rule = Rule("allow", "bash", spec)
     return None if banned_allow_reason(rule) else rule
 
