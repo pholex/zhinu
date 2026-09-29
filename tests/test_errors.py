@@ -224,9 +224,34 @@ class RetryAfterTest(unittest.TestCase):
         self.assertIsNone(retry_after_seconds(ValueError("没有 response")))
 
     def test_garbage_and_nonpositive_values(self):
-        #  HTTP-date 形式的 Retry-After 不解析（极少见，不为它引入日期解析）
-        self.assertIsNone(retry_after_seconds(rate_limit_error("Wed, 21 Oct 2026 07:28:00 GMT")))
+        self.assertIsNone(retry_after_seconds(rate_limit_error("in a while")))
         self.assertIsNone(retry_after_seconds(rate_limit_error("0")))
+        #  已经过去的时刻：不用等
+        self.assertIsNone(retry_after_seconds(rate_limit_error("Wed, 21 Oct 2015 07:28:00 GMT")))
+
+    def test_http_date(self):
+        from datetime import datetime, timedelta, timezone
+        from email.utils import format_datetime
+
+        from xiaoyu.errors import retry_after_asked
+
+        moment = datetime.now(timezone.utc) + timedelta(seconds=30)
+        asked = retry_after_asked(rate_limit_error(format_datetime(moment, usegmt=True)))
+        self.assertIsNotNone(asked)
+        self.assertTrue(25 < asked <= 30, asked)
+
+    def test_asked_is_not_capped(self):
+        from xiaoyu.errors import retry_after_asked
+
+        self.assertEqual(retry_after_asked(rate_limit_error("7200")), 7200.0)
+
+    def test_told_not_to_retry(self):
+        from xiaoyu.errors import told_not_to_retry
+
+        self.assertTrue(told_not_to_retry(_DuckStatusError("err", 429, {"x-should-retry": "false"})))
+        self.assertFalse(told_not_to_retry(_DuckStatusError("err", 429, {"x-should-retry": "true"})))
+        self.assertFalse(told_not_to_retry(rate_limit_error("7")))
+        self.assertFalse(told_not_to_retry(ValueError("没有 response")))
 
     def test_capped(self):
         #  服务端偶尔给几小时后的值，交互场景等不了
@@ -535,6 +560,59 @@ class FallbackChainTest(AgentTestCase):
         self.assertEqual(agent.config.model, "backup-model")
         #  换模型后的用量记到备用路由名下（按路由分账不能混：同名模型可能跑在两家上）
         self.assertIn("gateway/backup-model", agent.usage.by_model)
+
+    def test_long_retry_after_switches_route_instead_of_waiting(self):
+        """服务端要求等 120 秒：原地等到上限再发必然再挨一次，白耗预算。"""
+        self.config.fallback_models = ["backup-model"]
+        agent = self.build([rate_limit_error("120"), [chunk(content="备用顶上"), usage_chunk(10, 2)]])
+        buffer = io.StringIO()
+        with mock.patch("xiaoyu.agent.Agent._sleep") as sleep, contextlib.redirect_stdout(buffer):
+            agent.send("hi")
+        sleep.assert_not_called()
+        models = [call["model"] for call in self.client.completions.calls]
+        self.assertEqual(models, ["main-model", "backup-model"])
+        self.assertIn("要求等 120s", buffer.getvalue())
+
+    def test_long_retry_after_is_honoured_when_there_is_nowhere_else_to_go(self):
+        agent = self.build([rate_limit_error("120"), [chunk(content="等到了"), usage_chunk(10, 2)]])
+        with mock.patch("xiaoyu.agent.Agent._sleep") as sleep, contextlib.redirect_stdout(io.StringIO()):
+            agent.send("hi")
+        (waited,) = [call.args[0] for call in sleep.call_args_list]
+        #  照它说的等、只往上抖：早于它说的时刻醒来必然再挨一次
+        self.assertTrue(120 <= waited <= 132, waited)
+        self.assertEqual(agent.last_assistant_text(), "等到了")
+
+    def test_hours_long_retry_after_is_reported_not_waited(self):
+        agent = self.build([rate_limit_error("7200")])
+        buffer = io.StringIO()
+        with mock.patch("xiaoyu.agent.Agent._sleep") as sleep, contextlib.redirect_stdout(buffer), \
+                self.assertRaises(openai.RateLimitError):
+            agent.send("hi")
+        sleep.assert_not_called()
+        self.assertEqual(len(self.client.completions.calls), 1)
+        self.assertIn("7200s", buffer.getvalue())
+
+    def test_short_retry_after_is_waited_in_place(self):
+        self.config.fallback_models = ["backup-model"]
+        agent = self.build([rate_limit_error("7"), [chunk(content="好了"), usage_chunk(10, 2)]])
+        with mock.patch("xiaoyu.agent.Agent._sleep") as sleep, contextlib.redirect_stdout(io.StringIO()):
+            agent.send("hi")
+        (waited,) = [call.args[0] for call in sleep.call_args_list]
+        self.assertTrue(7 <= waited <= 7.7, waited)
+        self.assertEqual([c["model"] for c in self.client.completions.calls], ["main-model"] * 2)
+
+    def test_server_saying_do_not_retry_is_obeyed(self):
+        self.config.fallback_models = ["backup-model"]
+        told = openai.InternalServerError(
+            "别重试", response=_response(500, {"x-should-retry": "false"}), body=None
+        )
+        agent = self.build([told, [chunk(content="备用顶上"), usage_chunk(10, 2)]])
+        with mock.patch("xiaoyu.agent.Agent._sleep") as sleep, contextlib.redirect_stdout(io.StringIO()):
+            agent.send("hi")
+        sleep.assert_not_called()
+        self.assertEqual(
+            [c["model"] for c in self.client.completions.calls], ["main-model", "backup-model"]
+        )
 
     def test_fatal_error_does_not_switch(self):
         self.config.fallback_models = ["backup-model"]

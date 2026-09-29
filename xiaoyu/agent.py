@@ -3360,6 +3360,10 @@ class Agent:
     _RECOVERY_DELAY = 2.0
     #  单次退避上限（秒）：指数递增和 Retry-After 都不许超过它
     _RECOVERY_MAX_DELAY = 60.0
+    #  服务端点名要等的时长超过上面那条线时：还有别的路由就直接换（原地等到上限再发
+    #  必然再挨一次、白耗预算）；没有别的路由可换才老实等，最多等到这条线。再长就
+    #  不等了，把服务端要求的时长如实报给用户
+    _RECOVERY_LONG_WAIT = 300.0
     #  一次请求（整条降级链）共享的重试预算：每条路由的首次尝试不计，只计重试。
     #  不共享时 N 条路由 × 每条 3 次，一次持续故障放大成 3N 个请求、十几分钟退避；
     #  共享后最坏 N + 4 次，而每条路由仍至少被试一次
@@ -3487,7 +3491,10 @@ class Agent:
                 #  粘性状态仍是单个字符串，/model、banner、SessionLog 都不用改。
                 self.switch_model(self.registry.sticky_name(route), sticky=True)
             try:
-                return self._stream_retrying(route, with_tools=with_tools, budget=budget)
+                return self._stream_retrying(
+                    route, with_tools=with_tools, budget=budget,
+                    has_alternative=index < len(chain) - 1,
+                )
             except _DeterministicEmpty as exc:
                 #  确定性空补全：同一路由再发也是空，直接换下一条路由。已是最后一条
                 #  就把空消息交回去，由 send() 的空回复护栏（nudge → 显式告警）兜底，
@@ -3562,7 +3569,11 @@ class Agent:
         return message
 
     def _stream_retrying(
-        self, route: Route, with_tools: bool = True, budget: "_RetryBudget | None" = None
+        self,
+        route: Route,
+        with_tools: bool = True,
+        budget: "_RetryBudget | None" = None,
+        has_alternative: bool = False,
     ) -> dict[str, Any]:
         """单个模型内的重试层：分类后退避重试，耗尽或不可重试则抛出。
 
@@ -3627,7 +3638,20 @@ class Agent:
                 retrying = (
                     verdict.retryable
                     and attempt < self._RECOVERY_ATTEMPTS
+                    and not errors.told_not_to_retry(exc)
                 )
+                asked = errors.retry_after_asked(exc)
+                if retrying and asked is not None and asked > self._RECOVERY_MAX_DELAY:
+                    if has_alternative or asked > self._RECOVERY_LONG_WAIT:
+                        retrying = False
+                        self.sink.emit(
+                            Notice(
+                                f"[{verdict.hint}：{route.qualified} 要求等 {asked:.0f}s，"
+                                + ("不原地等，换下一条路由]" if has_alternative
+                                   else "超出愿意等的时长，这次不重试]"),
+                                "warn",
+                            )
+                        )
                 if (
                     after_empty
                     and not verdict.should_compact
@@ -3662,10 +3686,11 @@ class Agent:
                 #  再乘 ±25% jitter：
                 #  同一网关后面的多个会话同时被限流时，不 jitter 会同时醒来再挤一次。
                 #  退避等待始终打印出来：用户看得见在等什么，不会误判成假死。
-                wait = min(
-                    errors.retry_after_seconds(exc) or delay, self._RECOVERY_MAX_DELAY
-                )
-                wait *= random.uniform(0.75, 1.25)
+                if asked is not None:
+                    #  服务端点了名就照它说的等，只往上抖：早于它说的时刻醒来必然再挨一次
+                    wait = min(asked, self._RECOVERY_LONG_WAIT) * random.uniform(1.0, 1.1)
+                else:
+                    wait = min(delay, self._RECOVERY_MAX_DELAY) * random.uniform(0.75, 1.25)
                 self._log_request(route, attempt, "error", exc=exc, verdict=verdict, wait=wait)
                 self.sink.emit(
                     Notice(

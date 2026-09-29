@@ -9,8 +9,10 @@ from __future__ import annotations
 import re
 import ssl
 import sys
+from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
 from dataclasses import dataclass
-from typing import Callable
+from typing import Any, Callable
 
 #  httpx 是 openai / anthropic 两个 SDK 共同的硬传递依赖，顶层 import 安全
 import httpx
@@ -389,17 +391,18 @@ def request_id(exc: BaseException) -> str:
     return ""
 
 
-def retry_after_seconds(exc: Exception) -> float | None:
-    """从异常里挖 Retry-After 头（秒）。挖不到或不是数字返回 None。
+def _headers(exc: BaseException) -> Any:
+    return getattr(getattr(exc, "response", None), "headers", None)
 
-    服务端明确说了等多久，就该听它的而不是盲目指数退避——
-    限流窗口没过去之前，早重试只是白挨一次 429。
+
+def retry_after_asked(exc: BaseException) -> float | None:
+    """服务端要求等多久（秒，不封顶）。挖不到返回 None。
 
     `retry-after-ms` 优先于 `retry-after`：OpenAI 系两个头一起发，秒级那个是向下
     取整的（"等 1.4 秒"会写成 `retry-after: 1`），照它重试仍在窗口内、白挨一次。
+    `retry-after` 也可以是一个 HTTP 日期（"到这个时刻再来"），按距现在多久算。
     """
-    response = getattr(exc, "response", None)
-    headers = getattr(response, "headers", None)
+    headers = _headers(exc)
     if headers is None:
         return None
     try:
@@ -414,9 +417,40 @@ def retry_after_seconds(exc: Exception) -> float | None:
         try:
             seconds = float(value) / divisor
         except (TypeError, ValueError):
-            #  HTTP-date 形式的 Retry-After 极少见，不为它引入日期解析；
-            #  解析不了就当这个头没有，接着看下一个候选
-            continue
+            seconds = _seconds_until(value) if divisor == 1.0 else 0.0
         if seconds > 0:
-            return min(seconds, RETRY_AFTER_CAP)
+            return seconds
     return None
+
+
+def _seconds_until(http_date: Any) -> float:
+    try:
+        moment = parsedate_to_datetime(str(http_date))
+    except (TypeError, ValueError):
+        return 0.0
+    if moment.tzinfo is None:
+        moment = moment.replace(tzinfo=timezone.utc)
+    return (moment - datetime.now(timezone.utc)).total_seconds()
+
+
+def retry_after_seconds(exc: Exception) -> float | None:
+    """服务端要求的等待时长，封顶到 RETRY_AFTER_CAP。
+
+    服务端明确说了等多久，就该听它的而不是盲目指数退避——
+    限流窗口没过去之前，早重试只是白挨一次 429。
+    """
+    asked = retry_after_asked(exc)
+    return None if asked is None else min(asked, RETRY_AFTER_CAP)
+
+
+def told_not_to_retry(exc: BaseException) -> bool:
+    """服务端用 `x-should-retry: false` 明说了"别重试"：它比我们更清楚这次失败是不是
+    等一等就能好的。"""
+    headers = _headers(exc)
+    if headers is None:
+        return False
+    try:
+        value = headers.get("x-should-retry")
+    except Exception:  # noqa: BLE001
+        return False
+    return isinstance(value, str) and value.strip().lower() == "false"
