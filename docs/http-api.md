@@ -28,6 +28,15 @@ coding agent 一轮动辄几分钟，而编排器的 HTTP 节点普遍有分钟�
 
 异步那条的配套是状态轮询和事件游标，见下面两节。
 
+**重发不重跑**：两个端点都认 `Idempotency-Key` 请求头。编排器等不到响应就会重发
+（同步端点最常见——它自己的 HTTP 超时先到），而那一轮其实已经跑完或还在跑。带着同一个键
+重发不会再开一轮：还在跑就等同一轮的结果，已经跑完就直接拿回那一轮的结果，响应里带
+`"duplicate": true` 与轮号。同一个键配不同的指令是 409；服务重启前没跑完的那一轮，
+重启后带着它的键重发也是 409（做到哪一步说不清，不替你决定重跑）。每个会话记最近 64 个键。
+
+`POST /session/{id}/abort` 可带 `{"turn": N}`：只打断第 N 轮（轮号在 `/status` 的
+`in_flight.turn`）。它已经结束时返回 `"aborted": false`，不会误伤后面那一轮。
+
 两个端点都可带 `output_schema`（JSON Schema）：要求这一轮以符合它的**对象**收尾，
 而不是一段正文。模型经 `structured_output` 工具交回，结果在 `result.output`
 （`prompt` 直接返回；`prompt_async` 在 `GET /status` 的 `last_result.output`）。

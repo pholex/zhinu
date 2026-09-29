@@ -481,6 +481,104 @@ class TestPersistence(ServeCase):
         self.assertIn("游标水位", err.getvalue())
         self.assertGreater(self.status(session_id)["next_seq"], 1500)
 
+    def test_resubmitting_with_the_same_key_does_not_run_again(self):
+        """编排器等不到响应就会重发，而那一轮其实已经跑完。"""
+        self.start(SIMPLE + "---\n" + SIMPLE)
+        session_id = self.new_session()
+        headers = {**self.headers(), "Idempotency-Key": "job-42"}
+        first = self.client.post(
+            f"/session/{session_id}/prompt", json={"text": "干活"}, headers=headers
+        ).json()
+        self.assertNotIn("duplicate", first)
+        again = self.client.post(
+            f"/session/{session_id}/prompt", json={"text": "干活"}, headers=headers
+        ).json()
+        self.assertTrue(again["duplicate"])
+        self.assertEqual(again["turn"], 1)
+        self.assertEqual(again["result"], first["result"])
+        self.assertEqual(self.status(session_id)["turns"], 1)
+        #  换一个键（或不带键）才是新的一轮
+        fresh = self.client.post(
+            f"/session/{session_id}/prompt", json={"text": "干活"},
+            headers={**self.headers(), "Idempotency-Key": "job-43"},
+        ).json()
+        self.assertNotIn("duplicate", fresh)
+        self.assertEqual(self.status(session_id)["turns"], 2)
+
+    def test_same_key_with_a_different_instruction_is_refused(self):
+        self.start(SIMPLE + "---\n" + SIMPLE)
+        session_id = self.new_session()
+        headers = {**self.headers(), "Idempotency-Key": "job-42"}
+        self.client.post(f"/session/{session_id}/prompt", json={"text": "干活"}, headers=headers)
+        clash = self.client.post(
+            f"/session/{session_id}/prompt_async", json={"text": "别的活"}, headers=headers
+        )
+        self.assertEqual(clash.status_code, 409)
+        self.assertEqual(self.status(session_id)["turns"], 1)
+
+    def test_async_resubmission_is_accepted_without_a_second_run(self):
+        self.start(SIMPLE + "---\n" + SIMPLE)
+        session_id = self.new_session()
+        headers = {**self.headers(), "Idempotency-Key": "job-7"}
+        first = self.client.post(
+            f"/session/{session_id}/prompt_async", json={"text": "干活"}, headers=headers
+        )
+        self.assertEqual(first.status_code, 202)
+        again = self.client.post(
+            f"/session/{session_id}/prompt_async", json={"text": "干活"}, headers=headers
+        )
+        self.assertEqual(again.status_code, 202)
+        self.assertTrue(again.json()["duplicate"])
+        self._wait_for(session_id, "finished")
+        self.assertEqual(self.status(session_id)["turns"], 1)
+
+    def test_key_of_a_turn_lost_to_a_restart_is_not_silently_rerun(self):
+        state = Path(self.tmp) / "state"
+        self.start(SIMPLE + "---\n" + SIMPLE, state_dir=state)
+        session_id = self.new_session()
+        self.client.__exit__(None, None, None)
+        manifest = state / "sessions" / f"{session_id}.json"
+        data = json.loads(manifest.read_text(encoding="utf-8"))
+        data["in_flight"] = {"turn": 1, "started_at": 1700000000.0, "key": "job-9"}
+        manifest.write_text(json.dumps(data), encoding="utf-8")
+
+        self.start(SIMPLE + "---\n" + SIMPLE, state_dir=state)
+        retry = self.client.post(
+            f"/session/{session_id}/prompt", json={"text": "干活"},
+            headers={**self.headers(), "Idempotency-Key": "job-9"},
+        )
+        self.assertEqual(retry.status_code, 409)
+        self.assertIn("没跑完", retry.json()["detail"])
+        other = self.client.post(
+            f"/session/{session_id}/prompt", json={"text": "干活"},
+            headers={**self.headers(), "Idempotency-Key": "job-10"},
+        )
+        self.assertEqual(other.status_code, 200)
+
+    def test_overlong_key_is_rejected(self):
+        self.start(SIMPLE)
+        session_id = self.new_session()
+        response = self.client.post(
+            f"/session/{session_id}/prompt", json={"text": "干活"},
+            headers={**self.headers(), "Idempotency-Key": "k" * 300},
+        )
+        self.assertEqual(response.status_code, 400)
+
+    def test_late_abort_does_not_hit_the_next_turn(self):
+        self.start(SIMPLE + "---\n" + SIMPLE)
+        session_id = self.new_session()
+        self.client.post(
+            f"/session/{session_id}/prompt", json={"text": "第一轮"}, headers=self.headers()
+        )
+        late = self.client.post(
+            f"/session/{session_id}/abort", json={"turn": 1}, headers=self.headers()
+        ).json()
+        self.assertFalse(late["aborted"])
+        self.assertIsNone(late["running_turn"])
+        #  不带轮号的老用法不变
+        plain = self.client.post(f"/session/{session_id}/abort", headers=self.headers()).json()
+        self.assertTrue(plain["aborted"])
+
     def test_turn_killed_by_restart_is_reported_until_next_turn(self):
         import json
 
