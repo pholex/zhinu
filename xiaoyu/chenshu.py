@@ -223,6 +223,26 @@ def _string_list(value: Any, field_name: str) -> tuple[str, ...]:
     return tuple(items)
 
 
+def _check_scope(title: str, scope: tuple[str, ...], taken: list[tuple[str, str]]) -> None:
+    """build mission 的 scope 要过的三条：有、不等于整仓、与别的 mission 不相交。
+    `taken` 是别的 mission 占着的 (mission id, scope)。"""
+    if not scope:
+        raise ChenshuError(f"ERROR: build mission「{title}」必须给 scope。")
+    for pattern in scope:
+        if not _scope_stem(pattern):
+            raise ChenshuError(
+                f"ERROR: 「{title}」的 scope {pattern!r} 等于整个仓库"
+                "——拆细到目录/文件。"
+            )
+        for owner_id, other in taken:
+            if scopes_conflict(pattern, other):
+                raise ChenshuError(
+                    f"ERROR: 「{title}」的 scope {pattern!r} 与 "
+                    f"{owner_id} 的 {other!r} 重叠——scope 必须两两"
+                    "不相交（共享文件归属唯一一个 mission）。"
+                )
+
+
 def _object_list(value: Any, field_name: str) -> list[Any]:
     value = _decoded(value)
     if value is None:
@@ -507,21 +527,7 @@ class ChenshuRuntime:
                     )
                 scope = _string_list(raw.get("scope"), "scope")
                 if kind == "build":
-                    if not scope:
-                        raise ChenshuError(f"ERROR: build mission「{title}」必须给 scope。")
-                    for pattern in scope:
-                        if not _scope_stem(pattern):
-                            raise ChenshuError(
-                                f"ERROR: 「{title}」的 scope {pattern!r} 等于整个仓库"
-                                "——拆细到目录/文件。"
-                            )
-                        for owner_id, other in taken:
-                            if scopes_conflict(pattern, other):
-                                raise ChenshuError(
-                                    f"ERROR: 「{title}」的 scope {pattern!r} 与 "
-                                    f"{owner_id} 的 {other!r} 重叠——scope 必须两两"
-                                    "不相交（共享文件归属唯一一个 mission）。"
-                                )
+                    _check_scope(title, scope, taken)
                 deps = _string_list(raw.get("deps"), "deps")
                 mid = f"M{len(self.missions) + len(new) + 1}"
                 for dep in deps:
@@ -1225,7 +1231,21 @@ class ChenshuRuntime:
                 if "scope" in patch:
                     if caller != CHENSHU:
                         raise ChenshuError("ERROR: scope 只有总枢能改。")
-                    mission.scope = _string_list(patch["scope"], "scope")
+                    scope = _string_list(patch["scope"], "scope")
+                    if mission.kind == "build":
+                        #  和建 mission 时同一道检查：改 scope 是同一件事的另一个入口，
+                        #  这里不查的话，建的时候拦下的整仓 scope、重叠 scope 改一下就进来了
+                        _check_scope(
+                            mission.title, scope,
+                            [
+                                (other.id, pattern)
+                                for other in self.missions
+                                if other.id != mission.id
+                                and other.kind == "build" and other.status != "merged"
+                                for pattern in other.scope
+                            ],
+                        )
+                    mission.scope = scope
                     self.log(CHENSHU, "mission.scope", mission=mission.id, scope=";".join(mission.scope))
                 self._save()
                 if status or note:
