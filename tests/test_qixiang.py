@@ -234,6 +234,107 @@ class FanOutTest(QixiangTestCase):
         self.assertIn("resume_from='deadbeef'", result)
 
 
+class ObservingSinkTest(unittest.TestCase):
+    """批量运行时子 agent 的告警不能一句都出不来：卡在限流退避上和正在干活，
+    从外面看要分得清。"""
+
+    def test_keeps_warnings_and_last_action_drops_the_chatter(self):
+        from xiaoyu.events import Notice, ObservingSink, TextDelta, ToolRunning
+
+        observer = ObservingSink("甲")
+        self.assertEqual(observer.activity(), "")
+        observer.emit(TextDelta("一大段正文"))
+        observer.emit(ToolRunning("bash", {"command": "ls"}))
+        observer.emit(Notice("[压缩完成]", "info"))
+        observer.emit(Notice("[限流，30.0s 后重试（1/2）]", "warn"))
+        self.assertEqual(observer.drain(), ["[限流，30.0s 后重试（1/2）]"])
+        self.assertEqual(observer.drain(), [])
+        activity = observer.activity()
+        self.assertIn("最近调用 bash", activity)
+        self.assertIn("限流", activity)
+
+    def test_the_same_warning_is_not_repeated_within_the_window(self):
+        from xiaoyu.events import Notice, ObservingSink
+
+        observer = ObservingSink()
+        for _ in range(5):
+            observer.emit(Notice("[同一句告警]", "warn"))
+        observer.emit(Notice("[另一句]", "error"))
+        self.assertEqual(observer.drain(), ["[同一句告警]", "[另一句]"])
+
+    def test_reporter_relays_warnings_with_the_item_label(self):
+        from xiaoyu.events import Notice, ObservingSink
+
+        shown: list = []
+
+        class Sink:
+            def emit(self, event):
+                shown.append(event)
+
+        first, second = ObservingSink("甲"), ObservingSink("乙")
+        report = qixiang_mod.make_progress_reporter(
+            [("甲", first, lambda: True), ("乙", second, lambda: True)], Sink(), "🕸 七襄"
+        )
+        report()
+        self.assertEqual(shown, [])
+        second.emit(Notice("[限流，5.0s 后重试（1/2）]", "warn"))
+        report()
+        (event,) = shown
+        self.assertEqual(event.level, "warn")
+        self.assertIn("[乙]", event.text)
+        self.assertIn("限流", event.text)
+
+    def test_heartbeat_after_a_long_quiet_spell(self):
+        from xiaoyu.events import ObservingSink, ToolRunning
+
+        shown: list = []
+
+        class Sink:
+            def emit(self, event):
+                shown.append(event)
+
+        running, done = ObservingSink("甲"), ObservingSink("乙")
+        running.emit(ToolRunning("bash", {}))
+        done.emit(ToolRunning("grep", {}))
+        clock = {"now": 1000.0}
+        with mock.patch.object(qixiang_mod.time, "monotonic", lambda: clock["now"]):
+            report = qixiang_mod.make_progress_reporter(
+                [("甲", running, lambda: True), ("乙", done, lambda: False)], Sink(), "🕸 七襄"
+            )
+            clock["now"] += 10
+            report()
+            self.assertEqual(shown, [])
+            clock["now"] += 25
+            report()
+        (event,) = shown
+        self.assertIn("[甲] 仍在跑", event.text)
+        self.assertIn("bash", event.text)
+
+    def test_retry_notice_of_a_batch_item_reaches_the_user(self):
+        from .test_errors import rate_limit_error
+
+        class Case(QixiangTestCase):
+            def runTest(self):  # pragma: no cover - 只借 setUp
+                pass
+
+        case = Case()
+        case.setUp()
+        self.addCleanup(case.doCleanups)
+        case.config.qixiang_concurrency = 1
+        tool = case.make_tool(
+            [READER],
+            [rate_limit_error(), text_turn("甲的结论 " + LONG), text_turn("乙的结论 " + LONG)],
+        )
+        buffer = io.StringIO()
+        with mock.patch("xiaoyu.agent.Agent._sleep"), contextlib.redirect_stdout(buffer):
+            result = tool.handler(
+                spec="reader", prompt_template="查 {{item}}", items=["甲", "乙"]
+            )
+        self.assertIn("完成 2", result)
+        self.assertIn("限流", buffer.getvalue())
+        self.assertIn("[甲]", buffer.getvalue())
+
+
 class InterruptedTest(QixiangTestCase):
     """打断照样往上抛，但已收束各项的结论与 resume 句柄要跟着出来——否则
     存档还在，句柄却没人知道，花掉的那几项等于白跑。"""

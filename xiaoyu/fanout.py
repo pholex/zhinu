@@ -18,6 +18,7 @@ from dataclasses import dataclass
 from typing import Any, Callable
 
 from .agents import DelegationResult
+from .events import ObservingSink  # noqa: F401 - 批量工具从这里取
 from .errors import Interrupted, attach_partial  # noqa: F401 - 批量工具从这里取
 
 #  错峰间隔：首批并发槽位依次延后起步，避免同一瞬间打满 provider
@@ -25,6 +26,9 @@ STAGGER_SECONDS = 0.3
 #  短结论追问阈值：批量/竞赛模式下父 agent 无法逐个便宜追问，
 #  收束前把太短的交接补全一轮（200 字符以下基本不可能是完整交接）
 MIN_ANSWER_CHARS = 200
+
+#  多久没有任何一项收束就报一次"都在干什么"
+HEARTBEAT_SECONDS = 30.0
 
 OnAgent = Callable[[Any], None]
 
@@ -52,6 +56,7 @@ def run_attempts(
     min_answer_chars: int = MIN_ANSWER_CHARS,
     on_settled: Callable[[Attempt, int, int], None] | None = None,
     stop_requested: Callable[[], bool] | None = None,
+    on_tick: Callable[[], None] | None = None,
 ) -> None:
     """并发跑完全部尝试；结果写回各 Attempt。
 
@@ -62,6 +67,7 @@ def run_attempts(
       deadline 边上完赛的尝试会被巡检误标超时、好答案被藏。
     - 用户中止（BaseException）：叫停所有在飞 agent、等一小段让存档
       落地（resume 句柄仍有效）后原样上抛。
+    - on_tick 每个 tick 在调用方线程里叫一次，给调用方转述旁观到的告警。
     - stop_requested（父级的"我被打断了吗"）每个 tick 问一次：宿主经
       interrupt() 叫停父级时没有异常会落到这个线程上，得自己去看。
     """
@@ -123,6 +129,12 @@ def run_attempts(
                 #  走下面的中止分支：叫停在飞的、保住存档、原样上抛
                 raise Interrupted("宿主请求打断")
             finished, pending = wait(pending, timeout=1.0, return_when=FIRST_COMPLETED)
+            if on_tick is not None:
+                #  调用方线程里的例行回调（转述告警、报心跳）；它出错不能打断调度
+                try:
+                    on_tick()
+                except Exception:  # noqa: BLE001
+                    pass
             for future in finished:
                 settled += 1
                 if on_settled is not None:

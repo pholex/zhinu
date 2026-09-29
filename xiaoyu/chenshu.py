@@ -55,7 +55,7 @@ from typing import Any, Callable
 
 from . import fsguard, ui, worktree
 from .config import EFFORT_LEVELS, Config
-from .events import Notice, UISink
+from .events import Notice, ObservingSink, UISink
 from .providers import UnknownModel
 from .tools import Tool, Toolbox
 
@@ -268,6 +268,7 @@ class ChenshuRuntime:
         self.events: queue.Queue[str] = queue.Queue()
         self._threads: dict[str, threading.Thread] = {}
         self._agents: dict[str, Any] = {}
+        self._observers: dict[str, ObservingSink] = {}
         self._seq = 0
         #  上次的 state.json 读不出来时：(留证的路径, 原因)，init 报给总枢后清掉
         self._unreadable_state: tuple[Path, str] | None = None
@@ -1087,6 +1088,7 @@ class ChenshuRuntime:
             toolbox = Toolbox(sub_config, only=list(tools))
             for tool in make_member_tools(self, name, reviewer=kind == "reviewer"):
                 toolbox.register(tool)
+            observer = ObservingSink(name)
             guard = _write_guard(workdir) if kind == "worker" and mission is not None and mission.kind == "build" else (lambda n, a: True)
             agent = Agent(
                 sub_config,
@@ -1097,10 +1099,11 @@ class ChenshuRuntime:
                 allow_explore=False,
                 approver=guard,
                 permissions=self.permissions,
-                sink=_SilentSink(),
+                sink=observer,
             )
             with self.lock:
                 self._agents[name] = agent
+                self._observers[name] = observer
             system = (
                 f"你是「{name}」，宸枢舰队的{'评审员' if kind == 'reviewer' else '执行成员'}。"
                 "所有 user 消息来自编排方（总枢）。你无法与最终用户对话；最后一条消息"
@@ -1185,9 +1188,13 @@ class ChenshuRuntime:
                 collected.append(self.events.get_nowait())
         if not collected:
             live = [name for name, t in self._threads.items() if t.is_alive()]
+            doing = "；".join(
+                f"{name}（{activity}）" if (activity := self._activity(name)) else name
+                for name in live
+            )
             return (
                 f"{timeout}s 内没有新事件。"
-                + (f"在跑：{', '.join(live)}。继续 chenshu_wait 或先处理别的。"
+                + (f"在跑：{doing}。继续 chenshu_wait 或先处理别的。"
                    if live else "没有在跑的成员——检查是否该 spawn / merge / teardown。")
             )
         return "事件：\n" + "\n---\n".join(collected)
@@ -1238,6 +1245,10 @@ class ChenshuRuntime:
                 lines.append(f"note: {note}")
             return "\n".join(lines)
 
+    def _activity(self, name: str) -> str:
+        observer = self._observers.get(name)
+        return observer.activity() if observer is not None else ""
+
     # ---------- status / teardown ----------
 
     def status(self) -> str:
@@ -1273,6 +1284,7 @@ class ChenshuRuntime:
                 lines.append(
                     f"  {member.name} [{member.kind}→{target}] {live}"
                     + (f" · {member.model}" if member.model and member.model != self.config.model else "")
+                    + (f" · {doing}" if live == "在跑" and (doing := self._activity(member.name)) else "")
                 )
                 if member.handoff and member.status in ("done", "failed"):
                     lines.append(f"    交接：{ui.preview(member.handoff, 120)}")
@@ -1391,11 +1403,9 @@ def _write_guard(workdir: Path) -> Callable[[str, dict[str, Any]], Any]:
     return approve
 
 
-class _SilentSink:
-    """worker 线程的静默 sink：N 个成员的工具刷屏不可读，进度走事件/通知轨道。"""
-
-    def emit(self, event: Any) -> None:  # noqa: ARG002
-        pass
+#  成员线程的 sink：工具刷屏不转发，告警与最近动作留着，给仪表盘和等待超时的
+#  文案用——"在跑"两个字分不清它是在干活还是卡在限流退避上
+_SilentSink = ObservingSink
 
 
 # ---------- 工具装配 ----------

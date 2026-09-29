@@ -28,6 +28,7 @@ resume 句柄照常返回，由上层自行定夺（fail-open 只在评审环节
 from __future__ import annotations
 
 import re
+import contextlib
 import threading
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -47,7 +48,7 @@ from .config import Config
 from .events import Notice, UISink
 from .fanout import Attempt, attach_partial, run_attempts
 from .providers import UnknownModel
-from .qixiang import MIN_ANSWER_CHARS, _CONTINUATION_TASK, _NullSink
+from .qixiang import MIN_ANSWER_CHARS, _CONTINUATION_TASK, _NullSink, make_progress_reporter
 from .tools import Tool, Toolbox
 
 MIN_CONTESTANTS = 2
@@ -87,6 +88,8 @@ class _Seat:
     never_started: bool = False
     #  worktree 改动清单（收束后算一次，判官提示与报告共用）
     files: list[str] = field(default_factory=list)
+    #  旁观这一席的 sink：告警与最近动作（见 fanout.ObservingSink）
+    observer: Any = field(default_factory=_NullSink)
 
     @property
     def finished(self) -> bool:
@@ -231,7 +234,7 @@ def make_douqiao_tool(
                     task=full_task,
                     capability_mode=cap_param,
                     isolation=iso_value,
-                    child_sink=_NullSink(),
+                    child_sink=seat.observer,
                     on_agent=register,
                     require_isolation=iso_value == "worktree",
                     model_override=seat.model_override,
@@ -239,23 +242,40 @@ def make_douqiao_tool(
 
             return primary
 
-        def follow_up(run_id: str, register: Any) -> DelegationResult:
-            #  追问轮收紧到 read-only：它只要更完整的自述；首轮的干净
-            #  worktree 已回收，带写工具 resume 会落回主工作区（理由同七襄）
-            return execute_delegation(
-                target, config, registry, usage, sink, locked_approver,
-                permissions, runs, mcp_manager,
-                task=_CONTINUATION_TASK,
-                capability_mode="read-only",
-                resume_from=run_id,
-                child_sink=_NullSink(),
-                on_agent=register,
-            )
+        def make_follow_up(seat: _Seat) -> Any:
+            def follow_up(run_id: str, register: Any) -> DelegationResult:
+                #  追问轮收紧到 read-only：它只要更完整的自述；首轮的干净
+                #  worktree 已回收，带写工具 resume 会落回主工作区（理由同七襄）
+                return execute_delegation(
+                    target, config, registry, usage, sink, locked_approver,
+                    permissions, runs, mcp_manager,
+                    task=_CONTINUATION_TASK,
+                    capability_mode="read-only",
+                    resume_from=run_id,
+                    child_sink=seat.observer,
+                    on_agent=register,
+                )
+
+            return follow_up
 
         attempts = [
-            Attempt(index=seat.index - 1, primary=make_primary(seat), follow_up=follow_up)
+            Attempt(
+                index=seat.index - 1, primary=make_primary(seat), follow_up=make_follow_up(seat)
+            )
             for seat in seats
         ]
+
+        def still_running(attempt: Attempt) -> Any:
+            return lambda: (
+                attempt.started_at is not None and attempt.result is None
+                and not attempt.crash and not attempt.never_started
+            )
+
+        progress = make_progress_reporter(
+            [(f"#{seat.index}", seat.observer, still_running(attempt))
+             for seat, attempt in zip(seats, attempts)],
+            sink, "🏮 斗巧",
+        )
 
         def copy_back(seat: _Seat, attempt: Attempt) -> None:
             seat.result = attempt.result
@@ -266,6 +286,7 @@ def make_douqiao_tool(
         def on_settled(attempt: Attempt, settled: int, total_n: int) -> None:
             seat = seats[attempt.index]
             copy_back(seat, attempt)
+            progress.settled()
             mark = "✓" if seat.finished else "⊘"
             sink.emit(Notice(f"  🏮 斗巧：#{seat.index} {mark} 交卷（{settled}/{total_n}）"))
 
@@ -391,11 +412,16 @@ def make_douqiao_tool(
                 min_answer_chars=MIN_ANSWER_CHARS,
                 on_settled=on_settled,
                 stop_requested=stop_requested,
+                on_tick=progress,
             )
         except BaseException as exc:
             #  打断照样往上抛，但已交卷席位的成果与 resume 句柄随异常带出去
             attach_partial(exc, interrupted_report)
             raise
+        finally:
+            #  最后一个 tick 之后才冒出来的告警也要转述
+            with contextlib.suppress(Exception):
+                progress()
         collect()
 
         finished_seats = [seat for seat in seats if seat.finished]
