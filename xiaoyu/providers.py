@@ -180,7 +180,7 @@ class Preset:
 #  补一家 = 加一行；在此之前，未内置的厂商走下面的通用 env 兜底。
 #
 #  ⚠️ 名额纪律（2026-08-13 定）：直连内置总量 ≤16 个 model，单家 ≤3 个
-#  （同代 family 如 gpt-5.6 三兄弟是上限情形），绝大多数厂商只留最新旗舰 1-2 个，
+#  （同代 family 如 gpt-6 三兄弟是上限情形），绝大多数厂商只留最新旗舰 1-2 个，
 #  **滚动替换而非累积**——新旗舰入册、旧型号下架（下架 ≠ 不能用，网关通配仍转发，
 #  见 anthropic 条目里 haiku 的先例）。小名额是逐型号实测纪律成立的前提：
 #  每个在册型号的协议选边 / vision / reasoning 回传都要有实测数字，500 家的
@@ -304,16 +304,25 @@ PRESETS: dict[str, Preset] = {
     "openai": Preset(
         name="openai",
         base_url="https://api.openai.com/v1",
-        #  5.6 线三兄弟（sol / terra / luna）为现役，旧的 5.5 / 5.4-mini 不再内置
-        models=("gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"),
+        #  2026-09-29 换代 5.6 → 6（滚动替换）：6 线三兄弟（astra / sol / luna）为现役。
+        #  实测：Responses 上 tool_call、收图（纯红）、加密 reasoning 回传均通；
+        #  chat completions 带 tools 仍 400，与 5.6 同
+        models=("gpt-6-astra", "gpt-6-sol", "gpt-6-luna"),
         key_envs=("OPENAI_API_KEY",),
         label="直连 openai",
-        #  ⚠️ 必须走 Responses：5.6 线在 /v1/chat/completions 上带 tools 直接 400
+        #  ⚠️ 必须走 Responses：5.6 起（含 6 线）在 /v1/chat/completions 上带 tools 直接 400
         #  （"use /v1/responses or set reasoning_effort to 'none'"）。小羽每轮都带
         #  工具，关推理不可接受，所以整个 openai 直连改走 Responses——翻译在
         #  responses.py，内核与历史形态不变
         responses_models=(WILDCARD,),
-        #  2026-08-12 实测三兄弟全部收图：红/绿两轮都答对
+        #  2026-09-29 逐档实测（Responses reasoning.effort）：三兄弟都不认 minimal，
+        #  astra 还不认 none（官方迁移指南：astra 用 low 代替 none）；low~max 全认
+        effort_levels=(
+            ("gpt-6-astra", ("low", "medium", "high", "xhigh", "max")),
+            ("gpt-6-sol", ("none", "low", "medium", "high", "xhigh", "max")),
+            ("gpt-6-luna", ("none", "low", "medium", "high", "xhigh", "max")),
+        ),
+        #  2026-08-12 实测 5.6 三兄弟全部收图（红/绿两轮都答对），2026-09-29 在 6 线三兄弟上复测仍通
         vision_models=(WILDCARD,),
     ),
     #  2026-08-07 实测过 chat completions 与 /responses 都通、模型名正确
