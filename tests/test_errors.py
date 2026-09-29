@@ -675,6 +675,127 @@ class StreamTruncationTest(AgentTestCase):
         self.assertFalse((self.root / "a.py").exists())
 
 
+def _stream_error(message: str, body=None) -> openai.APIError:
+    """流内错误事件的样子：没有状态码的裸 APIError。"""
+    return openai.APIError(message, request=httpx.Request("POST", "http://unused"), body=body)
+
+
+class ContextOverflowWordingTest(unittest.TestCase):
+    """超限漏判的代价：fatal 是整轮直接死、不压缩；transient 是同一个超大请求
+    带退避原样重发，烧光重试预算也不触发压缩。"""
+
+    WORDINGS = (
+        "input length and max_tokens exceed context limit: 188240 + 21333 > 200000",
+        "Your input exceeds the context window of this model",
+        "The input token count (1200000) exceeds the maximum number of tokens allowed (1048576)",
+        "Range of input length should be [1, 98304]",
+        "total message token length exceed model limit",
+        "prompt is too long: 215000 tokens > 200000 maximum",
+    )
+
+    def test_every_wording_compacts_whatever_carries_it(self):
+        for wording in self.WORDINGS:
+            for exc in (RuntimeError(wording), StreamFailed(wording), _stream_error(wording)):
+                verdict = classify(exc)
+                self.assertEqual(verdict.kind, "context_overflow", (type(exc).__name__, wording))
+                self.assertTrue(verdict.should_compact)
+
+    def test_structured_code_wins_over_unfamiliar_wording(self):
+        for code in ("context_length_exceeded", "context_window_exceeded",
+                     "model_context_window_exceeded"):
+            exc = _stream_error("请求被拒绝", body={"error": {"code": code}})
+            self.assertEqual(classify(exc).kind, "context_overflow", code)
+
+    def test_throttle_wording_about_tokens_is_still_not_overflow(self):
+        verdict = classify(RuntimeError("Too many tokens, please wait before trying again."))
+        self.assertEqual(verdict.kind, "rate_limit")
+
+
+class VendorCodeTest(unittest.TestCase):
+    """错误体是 {"code": "1302", "message": "中文文案"} 的厂商：措辞兜底全是英文，
+    只能按码分。"""
+
+    def test_codes_map_to_their_kind(self):
+        for code, kind in (("1261", "context_overflow"), ("1113", "quota"), ("1304", "quota"),
+                           ("1302", "rate_limit"), ("1303", "rate_limit"), ("1305", "rate_limit")):
+            for body in ({"error": {"code": code}}, {"code": code}, {"code": int(code)}):
+                exc = _stream_error("您的请求未能完成", body=body)
+                self.assertEqual(classify(exc).kind, kind, (code, body))
+
+    def test_code_embedded_in_bracketed_message(self):
+        exc = _stream_error("[1302][您的账户已达到速率限制][req-1]")
+        self.assertEqual(classify(exc).kind, "rate_limit")
+        self.assertEqual(classify(StreamFailed("[1261][输入超长][req-2]")).kind, "context_overflow")
+
+    def test_balance_exhausted_with_429_is_not_retried_as_throttling(self):
+        exc = _DuckStatusError("余额不足", 429)
+        exc.body = {"error": {"code": "1113"}}
+        verdict = classify(exc)
+        self.assertEqual(verdict.kind, "quota")
+        self.assertFalse(verdict.retryable)
+
+    def test_numbers_inside_ordinary_text_are_not_codes(self):
+        self.assertEqual(classify(RuntimeError("line 1302: unexpected token")).kind, "fatal")
+
+
+class BareStreamErrorTest(unittest.TestCase):
+    def test_unrecognised_stream_error_is_transient_not_fatal(self):
+        """chat 一路的流内错误没有状态码；判 fatal 就是不退避不换路由打死整轮。"""
+        verdict = classify(_stream_error("服务繁忙，请稍后再试"))
+        self.assertEqual(verdict.kind, "transient")
+        self.assertTrue(verdict.retryable)
+
+    def test_request_errors_with_a_status_stay_fatal(self):
+        exc = openai.BadRequestError(
+            "invalid tool schema",
+            response=httpx.Response(400, request=httpx.Request("POST", "http://unused")),
+            body=None,
+        )
+        self.assertEqual(classify(exc).kind, "fatal")
+
+    def test_plain_exceptions_stay_fatal(self):
+        self.assertEqual(classify(RuntimeError("服务繁忙")).kind, "fatal")
+
+
+class CertificateFailureTest(unittest.TestCase):
+    """证书校验失败被 SDK 包成连接错误：按瞬时处理就是重试几次再换路由，
+    而换哪条路都一样败。"""
+
+    def wrapped(self) -> Exception:
+        import ssl
+
+        try:
+            try:
+                raise ssl.SSLCertVerificationError(
+                    1, "certificate verify failed: self-signed certificate in certificate chain"
+                )
+            except ssl.SSLCertVerificationError as inner:
+                try:
+                    raise httpx.ConnectError("tls failed") from inner
+                except httpx.ConnectError as middle:
+                    raise openai.APIConnectionError(
+                        message="Connection error.",
+                        request=httpx.Request("POST", "http://unused"),
+                    ) from middle
+        except openai.APIConnectionError as exc:
+            return exc
+
+    def test_is_fatal_and_points_at_the_ca_bundle(self):
+        verdict = classify(self.wrapped())
+        self.assertEqual(verdict.kind, "fatal")
+        self.assertFalse(verdict.retryable)
+        self.assertIn("SSL_CERT_FILE", verdict.hint)
+
+    def test_wording_only_is_enough(self):
+        exc = RuntimeError("[SSL: CERTIFICATE_VERIFY_FAILED] certificate verify failed")
+        self.assertEqual(classify(exc).kind, "fatal")
+        self.assertIn("证书", classify(exc).hint)
+
+    def test_ordinary_connection_errors_stay_transient(self):
+        exc = openai.APIConnectionError(request=httpx.Request("POST", "http://unused"))
+        self.assertEqual(classify(exc).kind, "transient")
+
+
 class StreamFailedTest(unittest.TestCase):
     """流跑起来了才收到服务端错误事件：HTTP 层是 200，没有状态码可判。
 

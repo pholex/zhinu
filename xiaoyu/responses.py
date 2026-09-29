@@ -513,13 +513,23 @@ def stream_chunks(events: Iterator[Any]) -> Iterator[Chunk]:
 
 
 def _failure(event: Any) -> str:
+    """失败原因的文本。错误码一并带上：分类器只拿得到这句话，而码比措辞稳——
+    超限的文案是 "exceeds the context window"，码是 context_length_exceeded。"""
     if message := getattr(event, "message", None):  # error 事件自带 message
-        return str(message)
+        return _with_code(str(message), getattr(event, "code", None))
     response = getattr(event, "response", None)
     for attr in ("error", "incomplete_details"):
         if detail := getattr(response, attr, None):
-            return str(getattr(detail, "message", None) or getattr(detail, "reason", detail))
+            text = str(getattr(detail, "message", None) or getattr(detail, "reason", detail))
+            return _with_code(text, getattr(detail, "code", None))
     return str(getattr(event, "type", "unknown"))
+
+
+def _with_code(text: str, code: Any) -> str:
+    if isinstance(code, (str, int)) and not isinstance(code, bool) and str(code):
+        if str(code).lower() not in text.lower():
+            return f"{text}（{code}）"
+    return text
 
 
 def to_completion(response: Any) -> Completion:
