@@ -292,6 +292,49 @@ class CommandKeyGrantTest(unittest.TestCase):
         self.assertEqual(perms.decide("bash", {"command": "git push origin main"}), "deny")
 
 
+class AskRuleTest(unittest.TestCase):
+    """ask：介于放行和拦死之间——别的照常自动跑，唯独点了名的先问。"""
+
+    def perms(self, *lines: str) -> Permissions:
+        return Permissions(Path("/tmp"), [parse_rule(line) for line in lines])
+
+    def test_parses_and_prints(self):
+        rule = parse_rule("ask bash(git push*)")
+        self.assertEqual(rule, Rule("ask", "bash", "git push*"))
+        self.assertEqual(str(rule), "ask bash(git push*)")
+
+    def test_hit_is_reported_with_its_rule(self):
+        perms = self.perms("ask bash(git push*)")
+        decision, rule = perms.explain("bash", {"command": "git push --force"})
+        self.assertEqual((decision, str(rule)), ("ask", "ask bash(git push*)"))
+        #  没有规则管的：同样是 ask，但不带规则
+        self.assertEqual(perms.explain("bash", {"command": "ls"}), ("ask", None))
+
+    def test_beats_a_wider_allow_and_a_session_grant(self):
+        perms = self.perms("allow bash(git *)", "ask bash(git push*)")
+        self.assertEqual(perms.decide("bash", {"command": "git status"}), "allow")
+        self.assertIsNotNone(perms.explain("bash", {"command": "git push"})[1])
+        perms.grant_session_call("bash", {"command": "git push"})
+        self.assertIsNotNone(perms.explain("bash", {"command": "git push origin main"})[1])
+
+    def test_deny_still_wins(self):
+        perms = self.perms("ask bash(git push*)", "deny bash(git push --force*)")
+        self.assertEqual(perms.decide("bash", {"command": "git push --force"}), "deny")
+
+    def test_matches_the_command_not_the_spelling(self):
+        perms = self.perms("ask bash(npm publish*)")
+        for command in ("npm publish", "/usr/local/bin/npm publish --tag next",
+                        "env CI=1 npm publish", "cd pkg && npm publish"):
+            self.assertIsNotNone(perms.explain("bash", {"command": command})[1], command)
+        self.assertIsNone(perms.explain("bash", {"command": "npm install"})[1])
+
+    def test_self_test_lines_accept_ask(self):
+        perms = self.perms("allow bash(git *)", "ask bash(git push*)")
+        tests = [perm_mod.RuleTest("ask", "bash", "git push", "f"),
+                 perm_mod.RuleTest("allow", "bash", "git status", "f")]
+        self.assertEqual(perms.run_self_tests(tests), [])
+
+
 class PersistenceTest(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()

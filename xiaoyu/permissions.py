@@ -450,7 +450,7 @@ def suggest_allow_rule(name: str, args: dict, workspace: Path) -> Rule | None:
 
 @dataclass(frozen=True)
 class Rule:
-    behavior: str  # "allow" | "deny"
+    behavior: str  # "allow" | "deny" | "ask"
     tool: str
     #  None = 整个工具；bash 的 spec 是命令 fnmatch 模式；文件工具的 spec 是路径 glob
     spec: str | None = None
@@ -460,7 +460,7 @@ class Rule:
         return f"{self.behavior} {target}"
 
 
-_RULE_LINE = re.compile(r"^(allow|deny)\s+([A-Za-z_][\w-]*)(?:\((.*)\))?\s*$")
+_RULE_LINE = re.compile(r"^(allow|deny|ask)\s+([A-Za-z_][\w-]*)(?:\((.*)\))?\s*$")
 
 
 def parse_rule(text: str) -> Rule | None:
@@ -603,28 +603,37 @@ class Permissions:
         return decision
 
     def explain(self, name: str, args: dict) -> tuple[str, Rule | None]:
-        """decide 的带出处版本：返回 (判定, 命中的 deny 规则)。
+        """decide 的带出处版本：返回 (判定, 命中的 deny / ask 规则)。
 
         deny 时携带命中的规则原文——"为什么被拒"要让用户和模型都看得见，否则模型只能瞎猜
         换写法，用户也不知道该去改哪条规则。
-        allow / ask 不带规则：allow 可能来自会话授权或多条规则联合判定，
+        ask 带着规则 = 命中了一条 ask 规则（任何模式下都得问）；不带 = 只是没有
+        规则管它、走常规确认。allow 不带规则：它可能来自会话授权或多条规则联合判定，
         没有单一出处，硬给一条反而误导。
         """
         #  1. deny：任一规则命中即拦，bypass-immune
         for rule in self.rules:
             if rule.behavior == "deny" and self._deny_matches(rule, name, args):
                 return "deny", rule
-        #  2. 会话授权：工具名（非命令类）或命令键（bash，每段都要已放行）
+        #  2. ask：介于放行和拦死之间——"照常自动跑，唯独这几样先问我"。排在会话
+        #  授权与 allow 之前：答过一次"本会话允许"、或恰好有条更宽的 allow，都不该
+        #  把它架空。匹配口径与 deny 相同（按命令本身认，不按写法认）
+        for rule in self.rules:
+            if rule.behavior == "ask" and self._deny_matches(
+                Rule("deny", rule.tool, rule.spec), name, args
+            ):
+                return "ask", rule
+        #  3. 会话授权：工具名（非命令类）或命令键（bash，每段都要已放行）
         if name in self.session_allowed:
             return "allow", None
         if name == "bash" and self.session_commands:
             keys = command_keys(str(args.get("command", "")))
             if keys and all(key in self.session_commands for key in keys):
                 return "allow", None
-        #  3. allow 规则（bash 是多条规则联合判定：每一段命中任一条即可）
+        #  4. allow 规则（bash 是多条规则联合判定：每一段命中任一条即可）
         if self._allowed(name, args):
             return "allow", None
-        #  4. 常规确认流程
+        #  5. 常规确认流程
         return "ask", None
 
     def _deny_matches(self, rule: Rule, name: str, args: dict) -> bool:
@@ -778,5 +787,7 @@ class Permissions:
         if not lines:
             lines.append("没有配置任何权限规则（写文件/执行命令走逐次确认）。")
             lines.append(f"规则文件：{user_rules_path()}")
-            lines.append("行格式：allow bash(git *) / deny bash(curl *) / allow write_file")
+            lines.append(
+                "行格式：allow bash(git *) / deny bash(curl *) / ask bash(git push*) / allow write_file"
+            )
         return "\n".join(lines)

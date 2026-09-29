@@ -4443,10 +4443,13 @@ class Agent:
         #  过审时路径的落点：下面所有判定（越界、可执行配置、deny）都是对着它做的，
         #  执行前要再核一次它没被换走（见 Toolbox.target_moved）
         reviewed_target = self.toolbox.resolved_target(args)
+        #  用户自己写的 ask 规则同理：他要的就是"别的照常自动跑，唯独这一样先问我"
+        asked_by_rule = decision == "ask" and deny_rule is not None
         must_confirm = not self.config.unattended and (
             name == "exit_plan_mode"
             or (name == "bash" and bool(str(args.get("sandbox_permissions", "") or "").strip()))
             or guarded is not None
+            or asked_by_rule
         )
         #  auto 档：沙箱兜得住的那部分免确认（工作区内改文件、沙箱内跑命令）。
         #  写成 `not must_confirm and …` 而不是指望 exit_plan_mode 恰好不在
@@ -4467,12 +4470,15 @@ class Agent:
             (decision != "allow" or must_confirm)
             and not auto_ok
             and not plan_file_access
-            and self.toolbox.needs_approval(name, args)
+            #  ask 规则点了名的，连平时免确认的工具也要问
+            and (self.toolbox.needs_approval(name, args) or (asked_by_rule and must_confirm))
             and (must_confirm or not self.config.auto_approve)
         ):
             #  模型自述的调用目的：确认框上方展示，"这条命令要干嘛"不用人肉猜
             if purpose:
                 self.sink.emit(ToolPurpose(name, purpose))
+            if asked_by_rule:
+                self.sink.emit(Notice(f"  ⚠ 命中了你配置的规则「{deny_rule}」，这一步要你点头", "warn"))
             if guarded is not None:
                 #  为什么这一笔在 auto / --yolo 下也要问，得让人看得见
                 self.sink.emit(Notice(f"  ⚠ 要写的是可执行配置——{guarded}", "warn"))
