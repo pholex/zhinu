@@ -502,6 +502,41 @@ class TestChatPassthrough(unittest.TestCase):
         #  原始历史不许被就地改写：内核还要拿它继续对话
         self.assertIn(REASONING_KEY, history[1])
 
+    def test_cache_key_is_dropped_on_chat(self) -> None:
+        sent = self.send(model="m", messages=[{"role": "user", "content": "hi"}],
+                         **{responses.CACHE_KEY: "k"})
+        self.assertEqual(sorted(sent), ["messages", "model"])
+
+
+class TestPromptCacheKey(unittest.TestCase):
+    """缓存路由键：xai 2026-09-29 实测不带时 6k 前缀只命中 ~19%，带上后 ~99%。"""
+
+    def test_responses_request_carries_prompt_cache_key(self) -> None:
+        api = FakeResponses(events=[text_delta("好"), completed(5, 6)])
+        list(responses_transport(api).chat.completions.create(
+            model="grok-4.7", messages=[{"role": "user", "content": "hi"}], stream=True,
+            **{responses.CACHE_KEY: "abc"},
+        ))
+        self.assertEqual(api.calls[0]["prompt_cache_key"], "abc")
+        self.assertNotIn(responses.CACHE_KEY, api.calls[0])
+
+    def test_key_follows_the_session_file_and_hides_its_name(self) -> None:
+        from pathlib import Path
+
+        from xiaoyu.agent import Agent
+
+        def key(log: Any) -> str:
+            return Agent._prompt_cache_key(  # 只读两个属性，免建整个 Agent
+                SimpleNamespace(session_log=log, _cache_key_fallback="fallback")
+            )
+
+        first = key(SimpleNamespace(path=Path("/s/2026-09-29-abc.jsonl")))
+        #  resume 同一个会话文件 = 同一把键；文件名本身不外发
+        self.assertEqual(first, key(SimpleNamespace(path=Path("/other/2026-09-29-abc.jsonl"))))
+        self.assertNotIn("abc", first)
+        self.assertNotEqual(first, key(SimpleNamespace(path=Path("/s/2026-09-29-xyz.jsonl"))))
+        self.assertEqual(key(None), "fallback")
+
 
 def broken_arguments_history() -> list[dict[str, Any]]:
     """模型曾吐过坏参数的历史：每路调用都已回了结果（坏的那几路是 ERROR）。"""

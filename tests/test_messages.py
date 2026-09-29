@@ -681,6 +681,19 @@ class TestReasoningReplay(unittest.TestCase):
 
 
 class TestDuckClient(unittest.TestCase):
+    def test_cache_key_does_not_leak_into_messages(self) -> None:
+        """缓存路由键只有 Responses 一路认；漏进 Messages 是未知参数 400。"""
+        from xiaoyu.responses import CACHE_KEY
+
+        api = FakeMessagesAPI(events=[message_start(input_tokens=5), message_stop()])
+        client, _ = anthropic_transport(api)
+        list(client.chat.completions.create(
+            model="claude-opus-5-5", messages=[{"role": "user", "content": "hi"}],
+            stream=True, **{CACHE_KEY: "k"},
+        ))
+        self.assertNotIn(CACHE_KEY, api.calls[0])
+        self.assertNotIn("prompt_cache_key", api.calls[0])
+
     def test_stream_call_translates_request_and_response(self) -> None:
         api = FakeMessagesAPI(
             events=[

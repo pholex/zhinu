@@ -7,6 +7,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import platform
 import queue
@@ -14,6 +15,7 @@ import random
 import re
 import threading
 import time
+import uuid
 from pathlib import Path
 from dataclasses import dataclass, field
 from typing import Any, Callable, Protocol
@@ -70,7 +72,7 @@ from .messages import (
     supports_server_compaction,
     supports_task_budget,
 )
-from .responses import OPERATOR_KEY, REASONING_KEY, TOOL_EXTRAS_KEY
+from .responses import CACHE_KEY, OPERATOR_KEY, REASONING_KEY, TOOL_EXTRAS_KEY
 from .tools import PURPOSE_PARAM, Tool, Toolbox, coerce_to_schema, wrap_untrusted
 
 #  approver(tool_name, args) -> True=允许；(True, 附言)=允许且附言随 tool result
@@ -996,6 +998,8 @@ class Agent:
         self._cache_bypass_refused: set[str] = set()
         #  已经说过「这条路由不认这一档」的组合，不每次请求都说一遍
         self._effort_notified: set[tuple[str, str]] = set()
+        #  没有会话日志（子 agent / eval / 嵌入）时的缓存路由键：本实例内稳定即可
+        self._cache_key_fallback = uuid.uuid4().hex
         self.compactor = Compactor(
             context_limit=config.context_limit,
             compact_at=config.compact_at,
@@ -3276,6 +3280,8 @@ class Agent:
                 extra: dict[str, Any] = (
                     {"tools": schemas, "tool_choice": "none"} if schemas else {}
                 )
+                #  逐字重放前缀就是为了吃缓存，路由键要与正常轮次同一把
+                extra[CACHE_KEY] = self._prompt_cache_key()
                 response = route.client.chat.completions.create(
                     model=route.model,
                     messages=[*prefix, {"role": "user", "content": PREFIX_SUMMARY_INSTRUCTION}],
@@ -3733,6 +3739,17 @@ class Agent:
                 delay *= 2
         raise RuntimeError("unreachable")  # for 循环里必然 return 或 raise
 
+    def _prompt_cache_key(self) -> str:
+        """本会话的缓存路由键（Responses 一路翻成 prompt_cache_key，见 responses.CACHE_KEY）。
+
+        取会话日志文件名的摘要：resume 同一个文件就是同一把键，服务端缓存还热时
+        能接着命中；取摘要而不是原名，文件名不外发。没有会话日志退到实例级随机键。
+        会话日志在 /new 等场合会换，所以每次请求现算而不是构造时定死"""
+        path = getattr(self.session_log, "path", None) if self.session_log is not None else None
+        if isinstance(path, Path):
+            return hashlib.sha256(path.stem.encode()).hexdigest()[:32]
+        return self._cache_key_fallback
+
     def _effort_on(self, route: Route) -> str:
         """这次请求带哪一档推理深度。
 
@@ -3867,6 +3884,7 @@ class Agent:
             "messages": outgoing,
             "stream": True,
             "stream_options": {"include_usage": True},
+            CACHE_KEY: self._prompt_cache_key(),
         }
         if with_tools:
             request["tools"] = (
