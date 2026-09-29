@@ -404,7 +404,7 @@ class TestOrderAndKeys(ProviderTestCase):
             registry = providers.build(config(base_url=""))
         self.assertEqual([p.name for p in registry.providers], ["anthropic", "openai"])
         self.assertEqual(registry.resolve("gpt-5.6-sol").provider, "openai")
-        self.assertEqual(registry.resolve("claude-opus-5").provider, "anthropic")
+        self.assertEqual(registry.resolve("claude-opus-5-5").provider, "anthropic")
 
     def test_openai_client_speaks_responses_protocol(self) -> None:
         """openai 直连必须说 Responses：gpt-5.6 线在 chat completions 上带 tools
@@ -417,7 +417,7 @@ class TestOrderAndKeys(ProviderTestCase):
                 registry.client("openai").protocol_for("gpt-5.6-sol"), "responses"
             )
             anthropic = registry.client("anthropic")
-            self.assertEqual(anthropic.protocol_for("claude-opus-5"), "anthropic")
+            self.assertEqual(anthropic.protocol_for("claude-opus-5-5"), "anthropic")
             self.assertIsInstance(anthropic._inner, openai.OpenAI)
 
     def test_deepseek_flash_stays_on_chat(self) -> None:

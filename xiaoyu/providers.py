@@ -261,9 +261,10 @@ PRESETS: dict[str, Preset] = {
         #  只留旗舰与主力两档。claude-haiku-4-5 官方仍在售，但我们不用它（上一代小杯，
         #  便宜档已由 deepseek-flash 覆盖）——不内置不等于不能用：
         #  网关通配仍能转发，config.CONTEXT_WINDOWS 里的 haiku 200K 例外因此保留
-        models=("claude-opus-5", "claude-sonnet-5"),
+        models=("claude-opus-5-5", "claude-sonnet-5-5"),
         key_envs=("ANTHROPIC_API_KEY",),
         label="直连 anthropic",
+        #  2026-09-29 换代 5 → 5.5（滚动替换），实测两个型号 tool_use / 收图（纯绿）均通。
         #  2026-08-12 实测两个型号都收图：绿/紫两轮都答对。
         #  ⚠️ 这一条的第一版是**错的**（记成"官方 OpenAI 兼容层丢掉 image 部件"），
         #  根因在探测脚本而不在端点：提示词里加了"看不到就回答：看不到图"，

@@ -112,7 +112,7 @@ qixiang(
 douqiao(
   spec="architect",
   task="为 X 模块设计缓存失效策略，给出完整方案与取舍理由",
-  models=["deepseek-flash", "kimi-k3", "claude-sonnet-5"],   # 异构竞争，每模型一席
+  models=["deepseek-flash", "kimi-k3", "claude-sonnet-5-5"],   # 异构竞争，每模型一席
   criteria="正确性优先；其次是实现复杂度"                       # 可省
 )
 ```
