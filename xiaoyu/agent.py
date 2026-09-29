@@ -453,7 +453,7 @@ PLAN_MODE_LEAVE_NOTE = "[系统提示] 用户已关闭 plan mode，可以正常�
 #  插话包装：中途插话裸放进历史时，
 #  模型容易把它当成全新任务、丢下在飞的活儿改道。三件套对症：说明这是工作
 #  中途来的消息 + <user_query> 划清消息边界 + 尾句提醒把旧账收完。
-INTERJECTION_NOTE = "用户在你工作过程中发来一条消息："
+INTERJECTION_NOTE = media.MIDTURN_PREFIX
 INTERJECTION_TAIL = "处理这条消息，同时确保完成之前尚未完成的任务，不要把在做的事丢在半路。"
 #  超长插话的截断上限（字符数。Python 按字符切片，天然不会切坏多字节字符，
 #  无需额外的 UTF-8 边界对齐）
@@ -2274,7 +2274,9 @@ class Agent:
         """
         consumed = self._consume_inbox(midturn=True)
         for text in self.drain_steers():
-            self._record({"role": "user", "content": wrap_interjection(text)})
+            self._record(
+                {"role": "user", "content": wrap_interjection(text), media.MIDTURN_KEY: True}
+            )
             self.sink.emit(SteerAccepted(text))
             if self.session_log:
                 self.session_log.event("steer")

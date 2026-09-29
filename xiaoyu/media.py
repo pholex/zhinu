@@ -246,6 +246,16 @@ def is_injected_user_text(text: str, exclude: frozenset[str] | set[str] = frozen
 #  区别只在出网：operator 会被翻成会话中的 system（权威通道），这一类永远是
 #  user。两者在回放 / 数轮次 / 蒸馏时一视同仁：都不是用户说的话
 INJECTED_KEY = "_injected"
+#  中途插话的记号：它是用户的原话（压缩时照样当原话备份），但不是一轮的开头——
+#  数轮次的地方靠这个记号把它和真正的轮次分开。旧日志里没有记号，按开头那句认
+MIDTURN_KEY = "_midturn"
+MIDTURN_PREFIX = "用户在你工作过程中发来一条消息："
+
+
+def is_midturn_message(message: dict[str, Any]) -> bool:
+    if message.get(MIDTURN_KEY):
+        return True
+    return text_of(message.get("content")).startswith(MIDTURN_PREFIX)
 #  落笔时盖的章（字面量而不是 import：media 在 responses 的下层）
 _HARNESS_MARKS = ("_operator", INJECTED_KEY)
 

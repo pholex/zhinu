@@ -867,8 +867,9 @@ def turn_starts(
 
     小羽的会话文件没有显式 turn 标记，按 user 消息近似：harness 注入的
     已知文案（nudge / 收尾指令 / plan mode 说明）用 exclude_texts 剔除；
-    steer 插话与真轮次无法机械区分，会被当成一轮列出——列表带预览，
-    由用户看着选，误差可接受。压缩 replacement 里备份的用户原话同理。
+    中途插话带着记号（旧日志按开头那句认），不算一轮——算进去的话这里数出来的
+    轮数就和会话自己报的对不上，按轮数分叉的调用方带走的会比它要的少。
+    压缩 replacement 里备份的用户原话仍会被当成一轮列出。
     """
     starts: list[int] = []
     for index, message in enumerate(messages):
@@ -876,6 +877,8 @@ def turn_starts(
             continue
         #  harness 注入的说明（plan mode 进出、环境差分等）不算一轮，判据全仓一份
         if media.is_injected_message(message, exclude_texts):
+            continue
+        if media.is_midturn_message(message):
             continue
         starts.append(index)
     return starts
