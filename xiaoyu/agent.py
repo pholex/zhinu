@@ -71,7 +71,7 @@ from .messages import (
     supports_task_budget,
 )
 from .responses import OPERATOR_KEY, REASONING_KEY, TOOL_EXTRAS_KEY
-from .tools import PURPOSE_PARAM, Tool, Toolbox, wrap_untrusted
+from .tools import PURPOSE_PARAM, Tool, Toolbox, coerce_to_schema, wrap_untrusted
 
 #  approver(tool_name, args) -> True=允许；(True, 附言)=允许且附言随 tool result
 #  回灌模型；False / "" / (False, 理由)=拒绝；非空 str（或 Deny.reason）=拒绝并附理由。
@@ -1546,7 +1546,7 @@ class Agent:
     def _structured_output(self, **data: Any) -> str:
         schema = self.output_schema or {}
         wrapped = schema.get("type") != "object" or "properties" not in schema
-        value = data.get("value") if wrapped else data
+        value = coerce_to_schema(data.get("value") if wrapped else data, schema)
         problems = _schema_problems(value, schema)
         if problems:
             return "ERROR: 结果不符合 schema：" + "；".join(problems[:5]) + "。请修正后重新调用。"

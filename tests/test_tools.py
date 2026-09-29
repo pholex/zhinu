@@ -271,6 +271,79 @@ class TestReadWrite(ToolboxTestCase):
         self.assertIn("已覆盖", result)
 
 
+class TestArgumentCoercion(ToolboxTestCase):
+    """模型把数字 / 布尔 / 数组写成字符串传进来：按 schema 声明的类型还原。"""
+
+    def probe(self, **properties):
+        seen: dict = {}
+
+        def handler(**kwargs) -> str:
+            seen.update(kwargs)
+            return "ok"
+
+        self.box.register(Tool(
+            name="probe", description="d",
+            parameters={"type": "object", "properties": properties},
+            handler=handler, requires_approval=False,
+        ))
+        return seen
+
+    def test_string_false_is_not_truthy(self) -> None:
+        """"false" 是非空字符串，直接判真假恰好是反的——静默错行为，最糟的一种。"""
+        seen = self.probe(background={"type": "boolean"}, force={"type": "boolean"})
+        self.box.run("probe", {"background": "false", "force": "TRUE"})
+        self.assertIs(seen["background"], False)
+        self.assertIs(seen["force"], True)
+
+    def test_numbers_written_as_strings(self) -> None:
+        seen = self.probe(timeout={"type": "integer"}, ratio={"type": "number"},
+                          whole={"type": "integer"})
+        self.box.run("probe", {"timeout": " 300 ", "ratio": "0.5", "whole": 5.0})
+        self.assertEqual(seen, {"timeout": 300, "ratio": 0.5, "whole": 5})
+        self.assertIsInstance(seen["timeout"], int)
+        self.assertIsInstance(seen["whole"], int)
+
+    def test_json_encoded_containers_including_nested_fields(self) -> None:
+        seen = self.probe(
+            items={"type": "array", "items": {"type": "integer"}},
+            options={"type": "object", "properties": {"deep": {"type": "boolean"}}},
+        )
+        self.box.run("probe", {"items": '["1", 2]', "options": '{"deep": "true", "x": "1"}'})
+        self.assertEqual(seen["items"], [1, 2])
+        self.assertEqual(seen["options"], {"deep": True, "x": "1"})
+
+    def test_unconvertible_value_names_the_field(self) -> None:
+        seen = self.probe(timeout={"type": "integer"})
+        result = self.box.run("probe", {"timeout": "五秒"})
+        self.assertTrue(result.startswith("ERROR"), result)
+        self.assertIn("timeout", result)
+        self.assertIn("整数", result)
+        self.assertEqual(seen, {})
+
+    def test_strings_stay_strings_and_unions_are_not_guessed(self) -> None:
+        seen = self.probe(
+            pattern={"type": "string"}, either={"type": ["string", "integer"]}, loose={},
+        )
+        self.box.run("probe", {"pattern": "42", "either": "7", "loose": "true", "extra": "1"})
+        self.assertEqual(seen, {"pattern": "42", "either": "7", "loose": "true", "extra": "1"})
+
+    def test_callers_dict_is_left_alone(self) -> None:
+        self.probe(timeout={"type": "integer"})
+        args = {"timeout": "5"}
+        self.box.run("probe", args)
+        self.assertEqual(args, {"timeout": "5"})
+
+    def test_builtin_tools_accept_stringly_numbers(self) -> None:
+        result = self.box.run("read_file", {"path": "calc.py", "offset": "2", "limit": "1"})
+        self.assertIn("第 2-2 行", result)
+
+    def test_background_flag_as_string_does_not_start_a_background_task(self) -> None:
+        if self.box.get("bash") is None:
+            self.skipTest("没有 bash 工具")
+        result = self.box.run("bash", {"command": "echo 前台", "run_in_background": "false"})
+        self.assertIn("前台", result)
+
+
 class TestStrReplace(ToolboxTestCase):
     def test_requires_prior_read(self) -> None:
         result = self.box.run(

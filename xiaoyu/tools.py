@@ -698,6 +698,69 @@ def _platform_shell_note() -> str:
 PURPOSE_PARAM = "__tool_use_purpose"
 
 
+_INTEGER_TEXT = re.compile(r"[+-]?\d+$")
+_NUMBER_TEXT = re.compile(r"[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?$")
+_BOOLEAN_TEXT = {"true": True, "false": False, "1": True, "0": False}
+_TYPE_NAMES = {"integer": "整数", "number": "数字", "boolean": "布尔值（true / false）"}
+_MAX_COERCE_DEPTH = 8
+
+
+def coerce_to_schema(value: Any, schema: Any, depth: int = 0) -> Any:
+    """按 schema 声明的类型，把模型写成字符串的数字 / 布尔 / 数组 / 对象还原成真类型。
+
+    模型经常把 `300` 写成 `"300"`、把 `false` 写成 `"false"`、把数组整个序列化成
+    一个 JSON 字符串。不还原的后果各不相同：`"false"` 是非空字符串，直接拿去判真假
+    恰好是反的；`"5"` 进了算术才炸，那时进程可能已经起来了。
+
+    只按声明转、只转认得出的：联合类型与没声明类型的不猜，转不动的原样留着。
+    """
+    if not isinstance(schema, dict) or depth > _MAX_COERCE_DEPTH:
+        return value
+    kind = schema.get("type")
+    if not isinstance(kind, str):
+        return value
+    if isinstance(value, str):
+        text = value.strip()
+        if kind == "integer" and _INTEGER_TEXT.match(text):
+            return int(text)
+        if kind == "number" and _NUMBER_TEXT.match(text):
+            return int(text) if _INTEGER_TEXT.match(text) else float(text)
+        if kind == "boolean" and text.lower() in _BOOLEAN_TEXT:
+            return _BOOLEAN_TEXT[text.lower()]
+        if kind in ("array", "object") and text[:1] in ("[", "{"):
+            try:
+                decoded = json.loads(text)
+            except ValueError:
+                return value
+            if not isinstance(decoded, list if kind == "array" else dict):
+                return value
+            value = decoded
+    if kind == "integer" and isinstance(value, float) and value.is_integer():
+        return int(value)
+    if kind == "object" and isinstance(value, dict):
+        properties = schema.get("properties")
+        if isinstance(properties, dict):
+            return {
+                key: coerce_to_schema(item, properties[key], depth + 1)
+                if key in properties else item
+                for key, item in value.items()
+            }
+    if kind == "array" and isinstance(value, list) and isinstance(schema.get("items"), dict):
+        return [coerce_to_schema(item, schema["items"], depth + 1) for item in value]
+    return value
+
+
+def _mistyped_argument(args: dict[str, Any], schema: Any) -> str:
+    """还原之后仍然是字符串的数字 / 布尔参数：点名字段。交给 handler 的话，报出来的
+    是一句 Python 的类型错误，模型看不出是哪个参数、该改成什么。"""
+    properties = schema.get("properties") if isinstance(schema, dict) else None
+    for key, declared in (properties or {}).items():
+        kind = declared.get("type") if isinstance(declared, dict) else None
+        if isinstance(kind, str) and kind in _TYPE_NAMES and isinstance(args.get(key), str):
+            return f"{key} 应为{_TYPE_NAMES[kind]}，收到的是字符串 {args[key]!r}"
+    return ""
+
+
 @dataclass(frozen=True)
 class _ReadMark:
     """一个文件"读过"到什么程度，以及读的时候它是哪个版本。"""
@@ -1373,6 +1436,11 @@ class Toolbox:
         blocked = self._streak_block_message(name)
         if blocked:
             return blocked
+
+        if isinstance(args, dict):
+            args = coerce_to_schema(args, {**tool.parameters, "type": "object"})
+            if problem := _mistyped_argument(args, tool.parameters):
+                return f"ERROR: 调用 {name} 的参数不对：{problem}"
 
         try:
             output = self._bound_output(name, tool.handler(**args))

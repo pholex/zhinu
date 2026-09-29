@@ -50,9 +50,19 @@ class OutputSchemaTest(E2ECase):
         self.assertEqual(result["output"], {"title": "x", "score": 1})
         self.assertEqual(self.kinds(events).count("request.started"), 2)
 
-    def test_invalid_args_rejected_then_retry(self):
+    def test_number_written_as_string_is_accepted(self):
+        """"3" 能无歧义地读成 3：为它顶回去重来一轮是白花一次模型调用。"""
         script = (
             'tool_call: {"name": "structured_output", "arguments": {"title": "x", "score": "3"}}\n'
+        )
+        events, result, code, stderr = self.run_cli(script, extra_args=self.schema_args())
+        self.assertEqual(code, 0, stderr)
+        self.assertEqual(result["output"], {"title": "x", "score": 3})
+        self.assertEqual(self.kinds(events).count("request.started"), 1)
+
+    def test_invalid_args_rejected_then_retry(self):
+        script = (
+            'tool_call: {"name": "structured_output", "arguments": {"title": "x", "score": "三分"}}\n'
             "---\n"
             'tool_call: {"name": "structured_output", "arguments": {"title": "x", "score": 3}}\n'
         )
