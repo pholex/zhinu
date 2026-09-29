@@ -11,7 +11,7 @@
 搜索、抓取、筛选全在厂商服务端发生，本地不落任何中间结果。
 
 后端按 XIAOYU_SEARCH_PROVIDER 选（config.search_provider），目前只有 xai
-（grok-4.6：2026-08 五题正确性 5/5、每题带结构化引用，单次约 0.65 元）。
+（grok-4.7；前代 grok-4.6 2026-08 五题正确性 5/5、每题带结构化引用，单次约 0.65 元）。
 deepseek 后端 2026-09-14 移除：官方 Responses 文档写明 web_search 等内置工具被忽略，
 复测 deepseek-flash 3 题里服务端 0 次真搜索（2 题把调用标记吐进正文、1 题用训练知识作答）。
 """
@@ -38,7 +38,7 @@ class SearchBackend:
 
 #  模型选各家里"够用且便宜"的档：搜索是有界辅助任务，不需要旗舰。
 SEARCH_BACKENDS: dict[str, SearchBackend] = {
-    "xai": SearchBackend("xai", "grok-4.6"),
+    "xai": SearchBackend("xai", "grok-4.7"),
 }
 
 #  搜索结论太长就挤占主上下文，与 explore 同一约束

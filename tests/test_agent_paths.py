@@ -1018,15 +1018,15 @@ class TestSlashCommands(AgentTestCase):
         """/model 先解析再切：没人接的名字报错、原模型不动；接住的打出走哪家。"""
         agent = self.build([])
         agent.registry = Registry(
-            [Provider("xai", "", "", ("grok-4.6",), "直连 xai")],
+            [Provider("xai", "", "", ("grok-4.7",), "直连 xai")],
             clients={"xai": self.client},
         )
         _, out = self.run_slash(agent, "/model grok")
         self.assertIn("没有 provider 提供模型 grok", out)
         self.assertEqual(agent.config.model, "main-model", "解析失败不该切换")
-        _, out = self.run_slash(agent, "/model grok-4.6")
-        self.assertIn("已切换到 grok-4.6（直连 xai）", out)
-        self.assertEqual(agent.config.model, "grok-4.6")
+        _, out = self.run_slash(agent, "/model grok-4.7")
+        self.assertIn("已切换到 grok-4.7（直连 xai）", out)
+        self.assertEqual(agent.config.model, "grok-4.7")
 
     def test_model_switch_on_gateway_prechecks_remote_listing(self) -> None:
         """通配 provider 什么名字都接：切换后现场探清单，不在里面就告警但仍切换。"""
@@ -1037,7 +1037,7 @@ class TestSlashCommands(AgentTestCase):
 
             @property
             def models(self):
-                page = [types.SimpleNamespace(id=name) for name in ("grok-4.6", "deepseek-flash")]
+                page = [types.SimpleNamespace(id=name) for name in ("grok-4.7", "deepseek-flash")]
                 return types.SimpleNamespace(list=lambda: page)
 
         agent = self.build([])
@@ -1047,8 +1047,8 @@ class TestSlashCommands(AgentTestCase):
         self.assertIn("已切换到 grok（网关）", out)
         self.assertIn("网关清单里没有 grok", out)
         self.assertEqual(agent.config.model, "grok", "只告警不拦：网关清单未必全")
-        _, out = self.run_slash(agent, "/model grok-4.6")
-        self.assertIn("已切换到 grok-4.6（网关）", out)
+        _, out = self.run_slash(agent, "/model grok-4.7")
+        self.assertIn("已切换到 grok-4.7（网关）", out)
         self.assertNotIn("清单里没有", out)
         #  清单探不到：说明无法预检，仍切换
         agent.registry = Registry([Provider("gw", "", "", (), "网关")], clients={"gw": FakeClient([])})

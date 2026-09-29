@@ -329,17 +329,21 @@ PRESETS: dict[str, Preset] = {
     "xai": Preset(
         name="xai",
         base_url="https://api.x.ai/v1",
-        #  2026-08-13 由 grok-4.5 滚动替换为 4.6（同代升级款，按纪律换不叠）：
-        #  实测 /responses 通、内核端到端 3 轮工具调用通
-        models=("grok-4.6",),
+        #  2026-08-13 由 grok-4.5 滚动替换为 4.6，2026-09-29 再换 4.7（同代升级款，按纪律换不叠）。
+        #  4.7 实测：/responses 上 tool_call、收图（600px 纯绿）、内置 web_search 均通
+        models=("grok-4.7",),
         key_envs=("XAI_API_KEY",),
         label="直连 xai",
-        #  实测是完整实现：加密 reasoning（4.5 是 668~855 字符，4.6 约 1300）与
+        #  实测是完整实现：加密 reasoning（4.5 是 668~855 字符，4.6 约 1300，4.7 约 2270；
+        #  4.7 起不列 include 也总是回传）与
         #  server-side state 都真——除 openai 外唯一吃得满 reasoning 回传的一家
         responses_models=(WILDCARD,),
         #  2026-08-12 实测收图（4.5 红/绿两轮都答对），2026-08-13 在 4.6 上复测
         #  绿/紫两轮仍都答对。⚠️ 图别小于 512 像素，8×8 会被明确回绝
         #  （"below the minimum of 512 pixels"）
+        #  官方 /v1/language-models 列 low~xhigh；2026-09-29 逐档实测 none 与 max 都 400
+        #  （minimal 不报错但不在官方清单，不登记，就近落 low）
+        effort_levels=(("grok-4.7", ("low", "medium", "high", "xhigh")),),
         vision_models=(WILDCARD,),
     ),
     #  ⚠️ AWS Bedrock Mantle 刻意不内置（2026-08-11 实测后撤销）：
