@@ -2261,19 +2261,28 @@ class Toolbox:
             return f"ERROR: 路径不存在：{path}"
 
         #  绝对路径起：rg 不经沙箱、不经确认，不能让 PATH 上工作区里的同名程序顶替
+        #  三个后端搜的范围要一样，否则同一个问题在不同机器上答案不同：
+        #  --hidden：rg 默认跳过点开头的目录，.github/ 里的引用搜不到，模型会据此
+        #    断定"没有任何地方引用"（另两个后端搜得到）；.git 等由下面的排除表挡
+        #  --no-config：不读用户的 ripgrep 配置，它能改掉输出形态
+        #  模式一律走 -e、路径前加 --：模式以 - 开头时不被当成选项
         if rg := sandbox.host_which("rg"):
-            command = [rg, "--line-number", "--no-heading", "--color", "never", "-e", pattern]
+            command = [
+                rg, "--line-number", "--no-heading", "--color", "never",
+                "--hidden", "--no-config", "-e", pattern,
+            ]
             for skip in sorted(_SKIP_DIRS):
                 command += ["--glob", f"!{skip}/**"]
             if glob:
                 command += ["--glob", glob]
-            command.append(str(target))
+            command += ["--", str(target)]
         elif grep := _locate_grep():
-            command = [grep, "-rnE", pattern, str(target)]
+            command = [grep, "-rnE", "-e", pattern]
             for skip in sorted(_SKIP_DIRS):
                 command.append(f"--exclude-dir={skip}")
             if glob:
                 command.append(f"--include={glob}")
+            command += ["--", str(target)]
         else:
             return self._grep_python(pattern, target, glob, max_matches)
 

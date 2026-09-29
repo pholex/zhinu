@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import os
 import re
 import tempfile
@@ -277,6 +278,58 @@ _TINY_PNG = bytes.fromhex(
     "89504e470d0a1a0a0000000d49484452000000010000000108060000001f15c489"
     "0000000d49444154789c6360000002000001e221bc330000000049454e44ae426082"
 )
+
+
+class TestGrepBackendsAgree(ToolboxTestCase):
+    """同一个问题在不同机器上答案要一样：三个后端搜的范围相同。"""
+
+    def setUp(self) -> None:
+        super().setUp()
+        workflows = self.root / ".github" / "workflows"
+        workflows.mkdir(parents=True)
+        (workflows / "ci.yml").write_text("run: make release-check\n", encoding="utf-8")
+        (self.root / ".git").mkdir()
+        (self.root / ".git" / "config").write_text("release-check\n", encoding="utf-8")
+        (self.root / "opts.txt").write_text("pass --verbose here\n", encoding="utf-8")
+
+    def backends(self):
+        from xiaoyu import sandbox
+
+        real_which = sandbox.host_which
+        if real_which("rg"):
+            yield "rg", contextlib.nullcontext()
+        if tools._locate_grep():
+            yield "grep", mock.patch.object(sandbox, "host_which", return_value=None)
+        yield "python", contextlib.ExitStack()
+
+    def search(self, name: str, guard, **args) -> str:
+        with guard:
+            if name == "python":
+                with mock.patch.object(tools.sandbox, "host_which", return_value=None), \
+                        mock.patch.object(tools, "_locate_grep", return_value=None):
+                    return self.box.run("grep", args)
+            return self.box.run("grep", args)
+
+    def test_hidden_directories_are_searched_everywhere(self) -> None:
+        for name, guard in self.backends():
+            result = self.search(name, guard, pattern="release-check")
+            self.assertIn(".github/workflows/ci.yml", result, name)
+            self.assertNotIn(".git/config", result, name)
+
+    def test_pattern_starting_with_a_dash_is_a_pattern(self) -> None:
+        for name, guard in self.backends():
+            result = self.search(name, guard, pattern="--verbose")
+            self.assertIn("opts.txt", result, name)
+            self.assertNotIn("ERROR", result, name)
+
+    def test_user_ripgrep_config_is_ignored(self) -> None:
+        if not tools.sandbox.host_which("rg"):
+            self.skipTest("没有 ripgrep")
+        config = self.root / "rgrc"
+        config.write_text("--files-with-matches\n", encoding="utf-8")
+        with mock.patch.dict(os.environ, {"RIPGREP_CONFIG_PATH": str(config)}):
+            result = self.box.run("grep", {"pattern": "release-check"})
+        self.assertIn("make release-check", result)
 
 
 class TestWriteBackFidelity(ToolboxTestCase):
