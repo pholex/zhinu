@@ -96,7 +96,8 @@ class RunResult:
     #  （已按 schema 轻校验）；没要 schema、或模型没给，都是 None
     output: Any = None
     #  本轮怎么停的：done（模型自然收尾）/ turn_cap（轮数预算用尽，已让模型交代现场）/
-    #  budget（token 软预算到线，同上）/ interrupted。宿主据此决定是调预算续跑还是结案
+    #  budget（token 软预算到线，同上）/ truncated（回复撞了输出长度上限，自动续写
+    #  用尽或无从续起，最后一条是半截）/ interrupted。宿主据此决定是调预算续跑还是结案
     stopped: str = "done"
 
 

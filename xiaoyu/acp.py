@@ -241,7 +241,9 @@ def _text_content(text: str) -> dict[str, Any]:
 EFFORT_DEFAULT = "default"
 
 #  Agent.last_stop → 规范里的 stopReason（没列的都是 end_turn）
-_STOP_REASONS = {"turn_cap": "max_turn_requests", "budget": "max_tokens"}
+_STOP_REASONS = {
+    "turn_cap": "max_turn_requests", "budget": "max_tokens", "truncated": "max_tokens",
+}
 
 
 def _tool_title(name: str, args: dict[str, Any]) -> str:

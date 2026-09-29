@@ -263,6 +263,19 @@ EMPTY_REPLY_NUDGE = (
     "总结改了什么、用户接下来如何验证。"
 )
 
+#  回复撞了输出长度上限时的续写指令。「发继续可接着写」只对坐在终端前的人成立：
+#  子 agent、批量委托、serve 上没有人会发，父级拿到半截结果还被告知正常完成。
+#  必须带上"拆小"——最常见的是一个超大的 write_file 参数被截断，原样再来一次
+#  只会在同一处再截一次。
+TRUNCATED_CONTINUE_NUDGE = (
+    "你上一条回复撞到了输出长度上限，在中途被截断。"
+    "请从断点接着往下，不要重复已经输出的内容，也不必为此道歉或复述。"
+    "如果被截断的是工具调用的参数（比如一次写入很长的文件），"
+    "把它拆成几次更小的调用：先写开头一段，再分次追加。"
+)
+#  一轮里最多续写几次：每次续写都是一次完整的模型调用，模型若始终拆不小就别再烧了
+MAX_TRUNCATION_CONTINUES = 3
+
 #  达到单轮工具调用上限时的收尾指令：与其静默截断，不如让模型交代现场
 WRAPUP_INSTRUCTION = """已达到本轮工具调用次数上限，请立刻停止操作，不要再调用任何工具。
 直接用几句话总结：
@@ -492,6 +505,7 @@ SYNTHETIC_USER_TEXTS = frozenset(
         BUDGET_WRAPUP_INSTRUCTION,
         TURN_EXTENSION_OFFER,
         EMPTY_REPLY_NUDGE,
+        TRUNCATED_CONTINUE_NUDGE,
         PLAN_MODE_ENTER_NOTE,
         PLAN_MODE_LEAVE_NOTE,
         CRYSTALLIZE_NUDGE,
@@ -788,6 +802,10 @@ def _schema_problems(value: Any, schema: dict[str, Any], path: str = "$") -> lis
 SERVER_COMPACTION_FALLBACK = 0.92
 
 class Agent:
+    #  上一次流的收尾状态（每次发请求前重置）。类级默认值：没发过请求就被问到也有定义
+    _length_truncated = False
+    _truncation_had_output = False
+
     def __init__(
         self,
         config: Config,
@@ -2287,6 +2305,16 @@ class Agent:
         """
         self._record({"role": "user", "content": text, OPERATOR_KEY: True})
 
+    def _continue_after_truncation(self, attempt: int) -> None:
+        if self.session_log:
+            self.session_log.event("truncated_continue", attempt=attempt)
+        self.sink.emit(
+            Notice(
+                f"[已请模型从断点接着写（{attempt}/{MAX_TRUNCATION_CONTINUES}）]", "warn"
+            )
+        )
+        self._record_operator(TRUNCATED_CONTINUE_NUDGE)
+
     def _record_injected(self, text: str) -> None:
         """harness 放进历史、但内容不可信的消息：出网永远是 role=user。
 
@@ -2472,6 +2500,8 @@ class Agent:
         nudged_structured = False
         #  「只说不做」轻推每轮只顶一次：模型再 narration 一次就放它收尾，不成死循环
         nudged_promise = False
+        #  撞输出长度上限后的自动续写次数（上限 MAX_TRUNCATION_CONTINUES）
+        truncations = 0
         #  轮数预算：撞顶可申请延期（见 _offer_extension），总追加量有上限
         steps = 0
         turn_budget = self.config.max_iterations
@@ -2497,8 +2527,29 @@ class Agent:
             self._begin_step()
             message = self._stream_with_recovery()
             self._record(message)
+            truncated = self._length_truncated
+            #  什么都没吐出来就撞了上限（输出额度被推理吃光）：没有断点可接，
+            #  续写只会原样再来一次
+            resumable = truncated and self._truncation_had_output
+            if resumable and truncations >= MAX_TRUNCATION_CONTINUES:
+                resumable = False
+                self.sink.emit(
+                    Notice(
+                        f"[连续 {MAX_TRUNCATION_CONTINUES} 次撞到输出长度上限，不再自动续写。"
+                        "发「继续」可接着写]",
+                        "warn",
+                    )
+                )
 
             calls = message.get("tool_calls")
+            if truncated and not calls:
+                if not resumable:
+                    #  宿主和父 agent 要能把"没说完"和"正常收尾"分开
+                    self.last_stop = "truncated"
+                    return
+                truncations += 1
+                self._continue_after_truncation(truncations)
+                continue
             if not calls:
                 if media.text_of(message.get("content")).strip():
                     #  模型已给出收尾正文，但期间用户插了话：不结束本轮，
@@ -2596,6 +2647,10 @@ class Agent:
                 #  同一批里后面的调用不该在打断之后照跑
                 self._checkpoint()
                 self._record(self._execute(call))
+            if resumable:
+                #  截断前写完整的调用照常执行了，被丢弃的那个还得重来——同样要提醒拆小
+                truncations += 1
+                self._continue_after_truncation(truncations)
             #  structured_output 已落：这就是收尾，不再让模型多说一轮
             if self.output_schema is not None and self.structured_output is not None:
                 return
@@ -3697,6 +3752,7 @@ class Agent:
         self.sink.emit(RequestStarted(route.model))
         self._content_filtered = False
         self._length_truncated = False
+        self._truncation_had_output = False
         self._stream_finished = False
         #  这次请求 usage 报的 completion_tokens；None = 没收到 usage（判不出）
         self._completion_tokens: int | None = None
@@ -3764,8 +3820,10 @@ class Agent:
             marker = "[输出达到模型长度上限，在此截断" + (
                 f"；{dropped} 个没写完的工具调用已丢弃]" if dropped else "]"
             )
+            self._truncation_had_output = bool(text.strip() or dropped or pending)
             text = f"{text}\n{marker}" if text else marker
-            self.sink.emit(Notice(marker + ("——发「继续」可接着写" if not pending else ""), "warn"))
+            #  接下来怎么办（自动续写 / 到此为止）由轮循环说，这里只报事实
+            self.sink.emit(Notice(marker, "warn"))
 
         if text or pending:
             #  空补全不算出了回复：它会被原地重发，交代留给真出内容的那次

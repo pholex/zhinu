@@ -346,6 +346,7 @@ class DelegationResult:
 STOP_REASONS = {
     "turn_cap": "撞了轮数上限",
     "budget": "token 预算用尽",
+    "truncated": "回复撞了输出长度上限、没说完",
 }
 
 

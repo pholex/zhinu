@@ -527,23 +527,54 @@ def length_chunk():
 class LengthTruncationTest(AgentTestCase):
     """被长度上限截断：残缺工具调用不执行、不当空补全重发，轮末告诉用户与模型。"""
 
-    def test_truncated_tool_call_dropped_and_turn_ends(self):
-        agent = self.build([[
-            chunk(content="我来写文件"),
-            chunk(tool_calls=[call_fragment(0, "c1", "write_file", '{"path": "a.py", "content": "def')]),
-            length_chunk(),
-            usage_chunk(100, 50),
-        ]])
+    CUT_WRITE = [
+        chunk(content="我来写文件"),
+        chunk(tool_calls=[call_fragment(0, "c1", "write_file", '{"path": "a.py", "content": "def')]),
+        length_chunk(),
+        usage_chunk(100, 50),
+    ]
+
+    def test_truncated_tool_call_is_dropped_then_the_model_is_asked_to_continue(self):
+        """「发继续可接着写」只对坐在终端前的人成立：无人值守的路径上没人会发。"""
+        from xiaoyu.agent import TRUNCATED_CONTINUE_NUDGE
+
+        agent = self.build([
+            self.CUT_WRITE,
+            [chunk(tool_calls=[call_fragment(
+                0, "c2", "write_file", '{"path": "a.py", "content": "def f(): pass\\n"}')]),
+             usage_chunk(100, 20)],
+            [chunk(content="写好了"), usage_chunk(100, 5)],
+        ])
         buffer = io.StringIO()
         with contextlib.redirect_stdout(buffer):
             agent.send("写个文件")
-        self.assertEqual(len(self.client.completions.calls), 1)
+        self.assertEqual(len(self.client.completions.calls), 3)
+        self.assertTrue((self.root / "a.py").exists())
+        cut = next(m for m in agent.messages if m["role"] == "assistant")
+        self.assertFalse(cut.get("tool_calls"))
+        self.assertIn("长度上限", cut["content"])
+        nudges = [m for m in agent.messages if m.get("content") == TRUNCATED_CONTINUE_NUDGE]
+        self.assertEqual(len(nudges), 1)
+        self.assertIn("拆成", TRUNCATED_CONTINUE_NUDGE)
+        self.assertIn("接着写（1/3）", buffer.getvalue())
+        self.assertEqual(agent.last_stop, "done")
+        self.assertEqual(agent.last_assistant_text(), "写好了")
+
+    def test_gives_up_after_three_continuations_and_says_so(self):
+        agent = self.build([self.CUT_WRITE] * 4)
+        buffer = io.StringIO()
+        with contextlib.redirect_stdout(buffer):
+            agent.send("写个文件")
+        self.assertEqual(len(self.client.completions.calls), 4)
+        self.assertEqual(agent.last_stop, "truncated")
+        self.assertIn("不再自动续写", buffer.getvalue())
         self.assertFalse((self.root / "a.py").exists())
-        last = agent.messages[-1]
-        self.assertEqual(last["role"], "assistant")
-        self.assertFalse(last.get("tool_calls"))
-        self.assertIn("长度上限", last["content"])
-        self.assertIn("长度上限", buffer.getvalue())
+        self.assertEqual(agent.messages[-1]["role"], "assistant")
+
+    def test_continuation_nudge_is_not_mistaken_for_the_users_words(self):
+        from xiaoyu.agent import SYNTHETIC_USER_TEXTS, TRUNCATED_CONTINUE_NUDGE
+
+        self.assertIn(TRUNCATED_CONTINUE_NUDGE, SYNTHETIC_USER_TEXTS)
 
     def test_complete_calls_before_the_cut_still_run(self):
         agent = self.build([
@@ -559,12 +590,32 @@ class LengthTruncationTest(AgentTestCase):
         calls = [m for m in agent.messages if m.get("tool_calls")]
         self.assertEqual([c["id"] for c in calls[0]["tool_calls"]], ["c1"])
         self.assertEqual(agent.last_assistant_text(), "读完了")
+        #  被丢弃的那个调用还得重来：工具结果之后同样提醒拆小，且顺序是
+        #  assistant(调用) → tool 结果 → 提醒
+        from xiaoyu.agent import TRUNCATED_CONTINUE_NUDGE
+
+        roles = [m["role"] for m in agent.messages[1:]]
+        self.assertEqual(roles, ["user", "assistant", "tool", "user", "assistant"])
+        self.assertEqual(agent.messages[4]["content"], TRUNCATED_CONTINUE_NUDGE)
 
     def test_empty_truncated_completion_not_retried(self):
+        """什么都没吐出来就撞了上限（输出额度被推理吃光）：没有断点可接。"""
         agent = self.build([[length_chunk(), usage_chunk(100, 4096)]])
         with contextlib.redirect_stdout(io.StringIO()):
             agent.send("hi")
         self.assertEqual(len(self.client.completions.calls), 1)
+        self.assertEqual(agent.last_stop, "truncated")
+
+    def test_truncated_text_reply_is_continued(self):
+        agent = self.build([
+            [chunk(content="第一段，说到一半"), length_chunk(), usage_chunk(100, 50)],
+            [chunk(content="接着说完了"), usage_chunk(100, 5)],
+        ])
+        with contextlib.redirect_stdout(io.StringIO()):
+            agent.send("讲讲")
+        self.assertEqual(len(self.client.completions.calls), 2)
+        self.assertEqual(agent.last_stop, "done")
+        self.assertEqual(agent.last_assistant_text(), "接着说完了")
 
 
 class ContentFilterTest(AgentTestCase):
