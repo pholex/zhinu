@@ -69,6 +69,12 @@ TOOL_EXTRAS_KEY = "_tool_extras"
 #  function call 400 拒收（非当前轮容忍，2026-08-24 实测）；补这个占位串即通过
 DUMMY_SIGNATURE = "context_engineering_is_the_way_to_go"
 
+#  请求参数上的私有键：本会话稳定的缓存路由键。Responses 一路翻成标准字段
+#  `prompt_cache_key`——同一会话的请求被路由到同一台服务器，缓存命中才稳定
+#  （xAI 官方"强烈建议"：不带时常落到缓存冷的机器上全价付输入；OpenAI 同名字段
+#  同样用于缓存路由）。chat / Messages 两路没有对应物，在 _dispatch 入口摘掉
+CACHE_KEY = "_cache_key"
+
 #  拿回 reasoning 状态所必须的 include。实测 xai / qwen / deepseek 的 Responses
 #  端点都容得下这个参数（不支持推理的模型只是不回而已），所以无条件发。
 _REASONING_INCLUDE = ["reasoning.encrypted_content"]
@@ -625,6 +631,9 @@ class _Completions:
         tools: list[dict[str, Any]] | None,
         extra: dict[str, Any],
     ) -> Any:
+        #  只有 Responses 一路用得上，先摘出来，别漏成另两路的未知参数
+        extra = dict(extra)
+        cache_key = extra.pop(CACHE_KEY, None)
         if self._speaks_anthropic(model):
             #  ⚠️ 和 Responses 一路同理，**不能**先 strip_private：`_reasoning`
             #  正是 to_request 要消费的东西。净化是结构性的——逐块重建，
@@ -653,6 +662,8 @@ class _Completions:
         #  stream_options 只有 include_usage 一个用途，Responses 的 usage 一定随
         #  response.completed 回来，不需要开关；吃掉即可
         request = to_request(model, messages, tools, extra, self._provider)
+        if cache_key:
+            request["prompt_cache_key"] = cache_key
         if not stream:
             return to_completion(self._inner.responses.create(**request))
         return stream_chunks(iter(self._inner.responses.create(stream=True, **request)))
