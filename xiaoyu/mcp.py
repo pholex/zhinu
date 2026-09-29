@@ -262,6 +262,19 @@ _SAFE_ENV_KEYS = frozenset(
     {"PATH", "HOME", "USER", "LOGNAME", "LANG", "LC_ALL", "LC_CTYPE", "TERM", "SHELL", "TMPDIR"}
 )
 _SAFE_ENV_PREFIXES = ("XDG_",)
+#  出网类：代理与自定义 CA。小羽自己出网认这些，server 进程却拿不到的话，
+#  代理环境下 `npx -y <包>` 下不了包、server 连不上它的 API，表象只是初始化超时，
+#  完全指不到"没走代理"上。它们不是 server 的凭据，是"这台机器怎么上网"。
+#  代理地址里可能带账号密码——放行是权衡过的：不放行的代价是整类环境不可用，
+#  而能读到它的 server 本来就是用户点头装上、要靠这条代理出网的。
+#  大小写两种写法各家工具认的不一样，都收。
+_NETWORK_ENV_KEYS = frozenset(
+    {
+        "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY",
+        "SSL_CERT_FILE", "SSL_CERT_DIR", "REQUESTS_CA_BUNDLE", "CURL_CA_BUNDLE",
+        "NODE_EXTRA_CA_CERTS",
+    }
+)
 #  Windows 定位类（大小写不敏感比较）：都是路径/系统信息，不携带秘密
 _SAFE_ENV_KEYS_WINDOWS = frozenset(
     {
@@ -299,6 +312,7 @@ def _safe_env(
         key: value
         for key, value in os.environ.items()
         if key in _SAFE_ENV_KEYS
+        or key.upper() in _NETWORK_ENV_KEYS
         or key.startswith(_SAFE_ENV_PREFIXES)
         or (os.name == "nt" and key.upper() in _SAFE_ENV_KEYS_WINDOWS)
     }
