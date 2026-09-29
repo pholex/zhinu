@@ -23,6 +23,7 @@ from __future__ import annotations
 import hashlib
 import json
 from dataclasses import dataclass, field
+from datetime import date
 from typing import TYPE_CHECKING, Any, Callable, Protocol
 
 if TYPE_CHECKING:  # pragma: no cover
@@ -37,6 +38,17 @@ TAG_CLOSE = "</world_state>"
 RENDER_CAP = 2000
 #  项目指令变更时随播报附带正文的上限；超过只说"已更新，请重读"
 PROJECT_TEXT_CAP = 1200
+
+
+_WEEKDAYS = "一二三四五六日"
+
+
+def today() -> str:
+    """今天的日期（本机时区，到天）。模型不知道今天几号，而它自己意识不到该去查：
+    写文档和更新日志时落的是训练截止那年，搜"最新版本"带的是错的年份。
+    粒度只到天：一天之内文本不变，不给缓存前缀添乱。"""
+    now = date.today()
+    return f"{now.isoformat()}（星期{_WEEKDAYS[now.weekday()]}）"
 
 
 class Section(Protocol):
@@ -170,6 +182,8 @@ def default_sections() -> list[Section]:
         NamesSection("skills", lambda a: [item.name for item in a.skills], "技能"),
         NamesSection("tools", lambda a: list(a.toolbox.names()), "工具"),
         ProjectInstructionsSection(),
+        #  会话开头的日期在 system prompt 里；这里管的是会话跨了天、或隔了几天才恢复
+        ValueSection("date", lambda a: today(), lambda v: f"今天是 {v}"),
         ValueSection(
             "context_window",
             lambda a: a._context_window,  # noqa: SLF001

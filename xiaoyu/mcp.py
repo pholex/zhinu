@@ -78,12 +78,13 @@ import sys
 import threading
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Iterator
 
-from . import diagnostics, fsguard, mcp_guard, media, netproxy
+from . import diagnostics, fsguard, mcp_guard, mcp_watchdog, media, netproxy
 from .config import Config, user_config_dir
 
 #  活着的 MCP 连接数（stdio 子进程 + HTTP 会话），/diagnostics 与 doctor 可见
@@ -286,6 +287,74 @@ _SAFE_ENV_KEYS_WINDOWS = frozenset(
 )
 
 
+#  关停每一步等多久；中间隔着看门狗时 terminate 那一步另加它的宽限（见 _shutdown_proc）
+_HANGUP_WAIT = 2.0
+_WATCHDOG_MARGIN = 1.5
+#  关管道句柄最多等多久：还有进程握着写端时，关读端会和读线程争锁
+_CLOSE_WAIT = 2.0
+
+
+def _descendants(pid: int) -> list[int]:
+    """pid 的全部后代（POSIX）。查不了返回空——调用方退化为只杀直接子进程。"""
+    try:
+        listing = subprocess.run(
+            ["ps", "-A", "-o", "pid=,ppid="],
+            capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=5,
+        ).stdout
+    except (OSError, subprocess.SubprocessError):
+        return []
+    children: dict[int, list[int]] = {}
+    for line in listing.splitlines():
+        parts = line.split()
+        if len(parts) == 2 and parts[0].isdigit() and parts[1].isdigit():
+            children.setdefault(int(parts[1]), []).append(int(parts[0]))
+    found: list[int] = []
+    queue = [pid]
+    while queue:
+        for child in children.get(queue.pop(), []):
+            if child not in found:
+                found.append(child)
+                queue.append(child)
+    return found
+
+
+def _kill_with_descendants(proc: subprocess.Popen) -> None:
+    """硬杀，连后代一起。真 server 在看门狗另开的会话里，只杀我们拉起的那个进程
+    （看门狗）够不着它；后代要在动手**之前**查好——父进程一死，孤儿被收养，
+    就再也顺着父子关系找不到了。"""
+    if os.name == "nt":
+        #  taskkill /T 按树杀；Windows 上没有进程组信号可用
+        with contextlib.suppress(Exception):
+            subprocess.run(
+                ["taskkill", "/T", "/F", "/PID", str(proc.pid)],
+                capture_output=True, timeout=10,
+            )
+        with contextlib.suppress(OSError):
+            proc.kill()
+        return
+    import signal
+
+    doomed = _descendants(proc.pid)
+    with contextlib.suppress(OSError):
+        proc.kill()
+    for pid in doomed:
+        with contextlib.suppress(OSError):
+            os.kill(pid, signal.SIGKILL)
+
+
+def _close_streams(proc: subprocess.Popen) -> None:
+    """管道句柄显式关掉（留给 GC 会攒出 ResourceWarning），但不无限等。"""
+    def close() -> None:
+        for stream in (proc.stdin, proc.stdout):
+            if stream:
+                with contextlib.suppress(OSError, ValueError):
+                    stream.close()
+
+    worker = threading.Thread(target=close, name="xiaoyu-mcp-close", daemon=True)
+    worker.start()
+    worker.join(_CLOSE_WAIT)
+
+
 def _inherited(names: list[str] | None) -> dict[str, str]:
     """按点名/前缀从父环境取变量（见 ServerSpec.inherit_env）。取不到的跳过。"""
     picked: dict[str, str] = {}
@@ -355,8 +424,13 @@ def find_command(command: str, env: dict[str, str] | None = None) -> str | None:
 #  只作用于错误路径——正常输出里的 key=value 可能是用户要的真实数据。
 #  键名：单独成词，或挂在别的词后面（access_token / client_secret / x-api-key）
 _CREDENTIAL_KEY = (
+    r"(?:"
     r"(?:[A-Za-z0-9]+[_-])*"
     r"(?:token|api[_-]?key|apikey|password|passwd|secret|authorization|credential)"
+    #  驼峰写法（exaApiKey / tavilyApiKey / accessToken）：前面的词和关键词之间没有
+    #  分隔符，只能靠大写字母认边界，所以这一支区分大小写
+    r"|(?-i:[a-z][A-Za-z0-9]*(?:ApiKey|APIKey|Token|Secret|Password|Credential))"
+    r")"
 )
 _CREDENTIAL_PATTERN = re.compile(
     #  已知前缀的令牌。sk- 要求左边不是单词字符或路径分隔：`task-…`、`disk-…`、
@@ -365,12 +439,30 @@ _CREDENTIAL_PATTERN = re.compile(
     r"|(?<![A-Za-z0-9])github_pat_[A-Za-z0-9_]{20,}"
     r"|(?<![A-Za-z0-9_/.-])sk-[A-Za-z0-9_-]{16,}"
     r"|Bearer\s+\S+"
+    #  URL 里的账号密码（https://user:pass@host）
+    r"|(?<=://)[^/\s:@]+:[^/\s@]+(?=@)"
     #  键=值 / 键: 值 / "键": "值"（JSON）。值到空白、引号、逗号、& 为止；值前面
     #  带认证方案名（Authorization: Bearer xxx）时连方案后面的令牌一起盖掉
     rf"|(?<![A-Za-z0-9])[\"']?{_CREDENTIAL_KEY}[\"']?\s*[=:]\s*[\"']?"
     r"(?:(?:Bearer|Basic|Token)\s+)?[^\s\"',&}]+",
     re.IGNORECASE,
 )
+
+
+def display_url(url: str) -> str:
+    """给人和模型看的 URL：去掉账号密码与查询串，只留"连的是哪儿"。
+
+    远端 server 的凭据常常就写在 URL 里（`?exaApiKey=…`、`user:pass@host`）。
+    报错里带上完整 URL 的话，它会经工具结果进对话历史。
+    """
+    try:
+        parts = urllib.parse.urlsplit(url)
+    except ValueError:
+        return _redact(url)
+    if not parts.scheme or not parts.hostname:
+        return _redact(url)
+    host = parts.hostname + (f":{parts.port}" if parts.port else "")
+    return urllib.parse.urlunsplit((parts.scheme, host, parts.path, "", ""))
 
 
 def _redact(text: str) -> str:
@@ -989,6 +1081,7 @@ class McpServer:
         self._next_id = 0
         self._write_lock = threading.Lock()
         self._dead = False
+        self._terminate_wait = _HANGUP_WAIT
         #  熔断状态：连续传输层失败计数 + 熔断截止时刻（monotonic）
         self._failures = 0
         self._breaker_until = 0.0
@@ -1155,7 +1248,9 @@ class McpServer:
         #  父进程死亡看门狗（mcp_watchdog.py）：start_new_session 让 server 躲开
         #  Ctrl-C，副作用是小羽被 kill -9 后它们变永久孤儿——看门狗轮询 ppid
         #  补上这一半。stdio 全程透传，协议不经手。
+        self._terminate_wait = _HANGUP_WAIT
         if _enabled("XIAOYU_MCP_WATCHDOG"):
+            self._terminate_wait = mcp_watchdog.TERM_GRACE + _WATCHDOG_MARGIN
             argv = [
                 sys.executable, "-m", "xiaoyu.mcp_watchdog",
                 "--ppid", str(os.getpid()), "--", *argv,
@@ -1272,24 +1367,23 @@ class McpServer:
         try:
             if proc.poll() is None:
                 #  尽量体面：先关 stdin（stdio server 的约定退出信号），
-                #  不走再 terminate，最后 kill 兜底
-                for hangup in (
-                    lambda: proc.stdin and proc.stdin.close(),
-                    proc.terminate,
-                    proc.kill,
+                #  不走再 terminate，最后整树杀兜底。
+                #  terminate 之后等多久取决于中间有没有看门狗：它收到 TERM 后要先给
+                #  真 server 一段宽限再补 KILL，我们等得比它短的话，会在它补刀之前
+                #  把它杀掉——真 server 就成了没人管的孤儿
+                for hangup, patience in (
+                    (lambda: proc.stdin and proc.stdin.close(), _HANGUP_WAIT),
+                    (proc.terminate, self._terminate_wait),
+                    (lambda: _kill_with_descendants(proc), _HANGUP_WAIT),
                 ):
                     try:
                         hangup()
-                        proc.wait(timeout=2)
+                        proc.wait(timeout=patience)
                         return
                     except (OSError, subprocess.TimeoutExpired, ValueError):
                         continue
         finally:
-            #  管道句柄显式关掉：留给 GC 会攒出 ResourceWarning
-            for stream in (proc.stdin, proc.stdout):
-                if stream:
-                    with contextlib.suppress(OSError, ValueError):
-                        stream.close()
+            _close_streams(proc)
 
     # ---- 协议 ----
 
@@ -1341,7 +1435,8 @@ class McpServer:
             )
             if self._http is not None:
                 return (
-                    f"ERROR: MCP server {self.spec.name} 的连接已断开（{self.spec.url}），"
+                    f"ERROR: MCP server {self.spec.name} 的连接已断开"
+                    f"（{display_url(self.spec.url)}），"
                     f"无法调用。{hint}"
                 )
             return (
@@ -1607,7 +1702,7 @@ class McpServer:
 
     def _exit_reason(self) -> str:
         if self._http is not None:
-            return f"与远端 server 的连接已断开（{self.spec.url}）"
+            return f"与远端 server 的连接已断开（{display_url(self.spec.url)}）"
         code = self._proc.returncode if self._proc else None
         return (
             f"server 进程已退出（exit {code}）。"

@@ -55,7 +55,7 @@ from typing import Any, Callable
 
 from . import fsguard, ui, worktree
 from .config import EFFORT_LEVELS, Config
-from .events import Notice, UISink
+from .events import Notice, ObservingSink, UISink
 from .providers import UnknownModel
 from .tools import Tool, Toolbox
 
@@ -223,6 +223,26 @@ def _string_list(value: Any, field_name: str) -> tuple[str, ...]:
     return tuple(items)
 
 
+def _check_scope(title: str, scope: tuple[str, ...], taken: list[tuple[str, str]]) -> None:
+    """build mission 的 scope 要过的三条：有、不等于整仓、与别的 mission 不相交。
+    `taken` 是别的 mission 占着的 (mission id, scope)。"""
+    if not scope:
+        raise ChenshuError(f"ERROR: build mission「{title}」必须给 scope。")
+    for pattern in scope:
+        if not _scope_stem(pattern):
+            raise ChenshuError(
+                f"ERROR: 「{title}」的 scope {pattern!r} 等于整个仓库"
+                "——拆细到目录/文件。"
+            )
+        for owner_id, other in taken:
+            if scopes_conflict(pattern, other):
+                raise ChenshuError(
+                    f"ERROR: 「{title}」的 scope {pattern!r} 与 "
+                    f"{owner_id} 的 {other!r} 重叠——scope 必须两两"
+                    "不相交（共享文件归属唯一一个 mission）。"
+                )
+
+
 def _object_list(value: Any, field_name: str) -> list[Any]:
     value = _decoded(value)
     if value is None:
@@ -268,6 +288,7 @@ class ChenshuRuntime:
         self.events: queue.Queue[str] = queue.Queue()
         self._threads: dict[str, threading.Thread] = {}
         self._agents: dict[str, Any] = {}
+        self._observers: dict[str, ObservingSink] = {}
         self._seq = 0
         #  上次的 state.json 读不出来时：(留证的路径, 原因)，init 报给总枢后清掉
         self._unreadable_state: tuple[Path, str] | None = None
@@ -506,21 +527,7 @@ class ChenshuRuntime:
                     )
                 scope = _string_list(raw.get("scope"), "scope")
                 if kind == "build":
-                    if not scope:
-                        raise ChenshuError(f"ERROR: build mission「{title}」必须给 scope。")
-                    for pattern in scope:
-                        if not _scope_stem(pattern):
-                            raise ChenshuError(
-                                f"ERROR: 「{title}」的 scope {pattern!r} 等于整个仓库"
-                                "——拆细到目录/文件。"
-                            )
-                        for owner_id, other in taken:
-                            if scopes_conflict(pattern, other):
-                                raise ChenshuError(
-                                    f"ERROR: 「{title}」的 scope {pattern!r} 与 "
-                                    f"{owner_id} 的 {other!r} 重叠——scope 必须两两"
-                                    "不相交（共享文件归属唯一一个 mission）。"
-                                )
+                    _check_scope(title, scope, taken)
                 deps = _string_list(raw.get("deps"), "deps")
                 mid = f"M{len(self.missions) + len(new) + 1}"
                 for dep in deps:
@@ -1087,6 +1094,7 @@ class ChenshuRuntime:
             toolbox = Toolbox(sub_config, only=list(tools))
             for tool in make_member_tools(self, name, reviewer=kind == "reviewer"):
                 toolbox.register(tool)
+            observer = ObservingSink(name)
             guard = _write_guard(workdir) if kind == "worker" and mission is not None and mission.kind == "build" else (lambda n, a: True)
             agent = Agent(
                 sub_config,
@@ -1097,10 +1105,11 @@ class ChenshuRuntime:
                 allow_explore=False,
                 approver=guard,
                 permissions=self.permissions,
-                sink=_SilentSink(),
+                sink=observer,
             )
             with self.lock:
                 self._agents[name] = agent
+                self._observers[name] = observer
             system = (
                 f"你是「{name}」，宸枢舰队的{'评审员' if kind == 'reviewer' else '执行成员'}。"
                 "所有 user 消息来自编排方（总枢）。你无法与最终用户对话；最后一条消息"
@@ -1185,9 +1194,13 @@ class ChenshuRuntime:
                 collected.append(self.events.get_nowait())
         if not collected:
             live = [name for name, t in self._threads.items() if t.is_alive()]
+            doing = "；".join(
+                f"{name}（{activity}）" if (activity := self._activity(name)) else name
+                for name in live
+            )
             return (
                 f"{timeout}s 内没有新事件。"
-                + (f"在跑：{', '.join(live)}。继续 chenshu_wait 或先处理别的。"
+                + (f"在跑：{doing}。继续 chenshu_wait 或先处理别的。"
                    if live else "没有在跑的成员——检查是否该 spawn / merge / teardown。")
             )
         return "事件：\n" + "\n---\n".join(collected)
@@ -1218,7 +1231,21 @@ class ChenshuRuntime:
                 if "scope" in patch:
                     if caller != CHENSHU:
                         raise ChenshuError("ERROR: scope 只有总枢能改。")
-                    mission.scope = _string_list(patch["scope"], "scope")
+                    scope = _string_list(patch["scope"], "scope")
+                    if mission.kind == "build":
+                        #  和建 mission 时同一道检查：改 scope 是同一件事的另一个入口，
+                        #  这里不查的话，建的时候拦下的整仓 scope、重叠 scope 改一下就进来了
+                        _check_scope(
+                            mission.title, scope,
+                            [
+                                (other.id, pattern)
+                                for other in self.missions
+                                if other.id != mission.id
+                                and other.kind == "build" and other.status != "merged"
+                                for pattern in other.scope
+                            ],
+                        )
+                    mission.scope = scope
                     self.log(CHENSHU, "mission.scope", mission=mission.id, scope=";".join(mission.scope))
                 self._save()
                 if status or note:
@@ -1237,6 +1264,10 @@ class ChenshuRuntime:
             for note in mission.notes[-5:]:
                 lines.append(f"note: {note}")
             return "\n".join(lines)
+
+    def _activity(self, name: str) -> str:
+        observer = self._observers.get(name)
+        return observer.activity() if observer is not None else ""
 
     # ---------- status / teardown ----------
 
@@ -1273,6 +1304,7 @@ class ChenshuRuntime:
                 lines.append(
                     f"  {member.name} [{member.kind}→{target}] {live}"
                     + (f" · {member.model}" if member.model and member.model != self.config.model else "")
+                    + (f" · {doing}" if live == "在跑" and (doing := self._activity(member.name)) else "")
                 )
                 if member.handoff and member.status in ("done", "failed"):
                     lines.append(f"    交接：{ui.preview(member.handoff, 120)}")
@@ -1391,11 +1423,9 @@ def _write_guard(workdir: Path) -> Callable[[str, dict[str, Any]], Any]:
     return approve
 
 
-class _SilentSink:
-    """worker 线程的静默 sink：N 个成员的工具刷屏不可读，进度走事件/通知轨道。"""
-
-    def emit(self, event: Any) -> None:  # noqa: ARG002
-        pass
+#  成员线程的 sink：工具刷屏不转发，告警与最近动作留着，给仪表盘和等待超时的
+#  文案用——"在跑"两个字分不清它是在干活还是卡在限流退避上
+_SilentSink = ObservingSink
 
 
 # ---------- 工具装配 ----------

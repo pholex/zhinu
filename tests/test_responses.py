@@ -562,6 +562,36 @@ class TestBrokenToolArguments(unittest.TestCase):
         self.assertEqual([item["arguments"] for item in items], EXPECTED_ARGUMENTS)
         self.assertEqual(history, broken_arguments_history())
 
+    def test_nameless_call_gets_a_placeholder_on_the_way_out(self) -> None:
+        """没写工具名的调用已经回过「未知工具」，但空名字留在历史里，校验函数名的
+        端点每次回放都拒。"""
+        def history():
+            return [
+                {"role": "user", "content": "hi"},
+                {"role": "assistant", "content": None, "tool_calls": [
+                    {"id": "a", "type": "function", "function": {"name": "", "arguments": "{}"}},
+                    {"id": "b", "type": "function", "function": {"arguments": '{"x": 1}'}},
+                    {"id": "c", "type": "function", "function": {"name": "f", "arguments": "{}"}},
+                ]},
+                {"role": "tool", "tool_call_id": "a", "content": "ERROR: 未知工具 ''"},
+                {"role": "tool", "tool_call_id": "b", "content": "ERROR: 未知工具 ''"},
+                {"role": "tool", "tool_call_id": "c", "content": "ok"},
+            ]
+
+        original = history()
+        repaired = responses.repair_tool_arguments(original)
+        names = [call["function"]["name"] for call in repaired[1]["tool_calls"]]
+        self.assertEqual(names, [responses.NAMELESS_TOOL, responses.NAMELESS_TOOL, "f"])
+        self.assertEqual(repaired[1]["tool_calls"][1]["function"]["arguments"], '{"x": 1}')
+        self.assertEqual(original, history())
+
+        inner = FakeClient(FakeResponses())
+        Transport(inner, responses.CHAT).chat.completions.create(
+            model="chat-only-model", messages=original
+        )
+        sent = inner.chat.completions.calls[0]["messages"]
+        self.assertTrue(all(call["function"]["name"] for call in sent[1]["tool_calls"]))
+
     def test_clean_history_is_reused_without_copies(self) -> None:
         history = [
             {"role": "user", "content": "hi"},

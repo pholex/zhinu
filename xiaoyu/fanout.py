@@ -18,6 +18,7 @@ from dataclasses import dataclass
 from typing import Any, Callable
 
 from .agents import DelegationResult
+from .events import ObservingSink  # noqa: F401 - 批量工具从这里取
 from .errors import Interrupted, attach_partial  # noqa: F401 - 批量工具从这里取
 
 #  错峰间隔：首批并发槽位依次延后起步，避免同一瞬间打满 provider
@@ -25,6 +26,14 @@ STAGGER_SECONDS = 0.3
 #  短结论追问阈值：批量/竞赛模式下父 agent 无法逐个便宜追问，
 #  收束前把太短的交接补全一轮（200 字符以下基本不可能是完整交接）
 MIN_ANSWER_CHARS = 200
+
+#  多久没有任何一项收束就报一次"都在干什么"
+HEARTBEAT_SECONDS = 30.0
+
+#  连续这么多项都因为同一个换谁来都一样的原因失败，余下没起步的就不再起步
+BREAKER_STREAK = 3
+#  换一项重试也不会好的失败：鉴权不过、额度用尽
+_HOPELESS_KINDS = ("auth", "quota")
 
 OnAgent = Callable[[Any], None]
 
@@ -52,7 +61,9 @@ def run_attempts(
     min_answer_chars: int = MIN_ANSWER_CHARS,
     on_settled: Callable[[Attempt, int, int], None] | None = None,
     stop_requested: Callable[[], bool] | None = None,
-) -> None:
+    on_tick: Callable[[], None] | None = None,
+    breaker: int = 0,
+) -> str:
     """并发跑完全部尝试；结果写回各 Attempt。
 
     - 超时从**实际启动**起算（排队不计），巡检逐 tick 补发中断——中断
@@ -62,12 +73,39 @@ def run_attempts(
       deadline 边上完赛的尝试会被巡检误标超时、好答案被藏。
     - 用户中止（BaseException）：叫停所有在飞 agent、等一小段让存档
       落地（resume 句柄仍有效）后原样上抛。
+    - breaker > 0：连续这么多项都因鉴权 / 额度失败时，余下没起步的不再起步
+      （记成 never_started），返回值说明原因；正常跑完返回空串。已经在跑的
+      不打断。各项用的模型不同时不要开（一项的 key 失效说明不了别的项）。
+    - on_tick 每个 tick 在调用方线程里叫一次，给调用方转述旁观到的告警。
     - stop_requested（父级的"我被打断了吗"）每个 tick 问一次：宿主经
       interrupt() 叫停父级时没有异常会落到这个线程上，得自己去看。
     """
     cancel_event = threading.Event()
     live: dict[int, Any] = {}
     live_lock = threading.Lock()
+
+    breaker_state: dict[str, Any] = {"streak": [], "tripped": ""}
+    breaker_lock = threading.Lock()
+
+    def note_outcome(attempt: Attempt) -> None:
+        if not breaker:
+            return
+        kind = attempt.result.failure_kind if attempt.result is not None else ""
+        with breaker_lock:
+            if kind not in _HOPELESS_KINDS:
+                breaker_state["streak"] = []
+                return
+            streak = [*breaker_state["streak"], kind][-breaker:]
+            breaker_state["streak"] = streak
+            if breaker_state["tripped"] or len(streak) < breaker or len(set(streak)) != 1:
+                return
+            #  建一个完整的工作副本再失败、再建下一个——几十项就是几十次白建，
+            #  外加一份几十条同因失败的报告
+            reason = {"auth": "鉴权失败", "quota": "额度用尽"}[kind]
+            breaker_state["tripped"] = (
+                f"连续 {breaker} 项都因{reason}而失败，余下没起步的项不再起步"
+            )
+            cancel_event.set()
 
     def runner(attempt: Attempt) -> None:
         delay = (
@@ -110,6 +148,9 @@ def run_attempts(
         finally:
             with live_lock:
                 live.pop(attempt.index, None)
+            #  熔断判定放在工作线程里、交还线程之前：放到调度循环里判的话，线程一
+            #  空出来下一项就已经起步了，总是多跑一项
+            note_outcome(attempt)
 
     pool = ThreadPoolExecutor(
         max_workers=max(1, concurrency), thread_name_prefix="fanout"
@@ -123,6 +164,12 @@ def run_attempts(
                 #  走下面的中止分支：叫停在飞的、保住存档、原样上抛
                 raise Interrupted("宿主请求打断")
             finished, pending = wait(pending, timeout=1.0, return_when=FIRST_COMPLETED)
+            if on_tick is not None:
+                #  调用方线程里的例行回调（转述告警、报心跳）；它出错不能打断调度
+                try:
+                    on_tick()
+                except Exception:  # noqa: BLE001
+                    pass
             for future in finished:
                 settled += 1
                 if on_settled is not None:
@@ -142,6 +189,7 @@ def run_attempts(
                         if agent is not None:
                             agent.interrupt()
         pool.shutdown(wait=True)
+        return breaker_state["tripped"]
     except BaseException:
         cancel_event.set()
         with live_lock:

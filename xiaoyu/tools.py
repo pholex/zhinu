@@ -22,6 +22,7 @@ import os
 import re
 import signal
 import unicodedata
+import urllib.parse
 import subprocess
 import sys
 import threading
@@ -30,7 +31,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
 
-from . import browser, fsguard, mcp, sandbox, tempdirs
+from . import browser, fsguard, mcp, media, sandbox, tempdirs
 from .background import (
     MONITOR_DEFAULT_TIMEOUT,
     TaskManager,
@@ -424,6 +425,36 @@ def _unreadable_file_error(target: Path, shown: str, size_cap: bool = True) -> s
     return None
 
 
+_SNIFF_BYTES = 8192
+
+
+def _binary_file_error(target: Path, shown: str) -> str | None:
+    """文本工具读到二进制文件：拒读并指路；是文本返回 None。
+
+    判据是开头一段里有没有 NUL 字节——文本文件里不会有，二进制几乎必有。有损解码
+    硬读的话，回给模型的是几万字符的乱码（还夹着控制字符），占掉上下文却什么
+    信息都没有。
+    """
+    try:
+        with open(target, "rb") as handle:
+            head = handle.read(_SNIFF_BYTES)
+        size = target.stat().st_size
+    except OSError:
+        return None
+    if head.startswith((b"\xff\xfe", b"\xfe\xff")):
+        return (
+            f"ERROR: {shown} 是 UTF-16 编码的文本，read_file 读不了。先用 bash 转成 UTF-8 再读："
+            f"iconv -f UTF-16 -t UTF-8 {shown}"
+        )
+    if b"\0" not in head:
+        return None
+    return (
+        f"ERROR: {shown} 是二进制文件（{size} 字节），read_file 只读文本。"
+        f"想知道它是什么：bash 跑 file {shown}；要看字节：xxd {shown} | head；"
+        "PDF 用 pdftotext，压缩包用 unzip -l 或 tar -tf，数据库用对应的命令行客户端。"
+    )
+
+
 def _read_for_edit(target: Path) -> tuple[str, str, bytes]:
     """严格解码读文件，返回 (文本, 编码, 原始字节)；解不开抛 _Undecodable。
 
@@ -439,8 +470,52 @@ def _read_for_edit(target: Path) -> tuple[str, str, bytes]:
             decoded = raw.decode(encoding)
         except UnicodeDecodeError:
             continue
+        #  文件开头的 BOM 不是正文：留在文本里的话，模型照抄首行做多行替换时，
+        #  匹配落在第 1 个字符之后，会被"old_str 从行中间开始"的护栏误拒
+        decoded = decoded.removeprefix("\ufeff")
         return decoded.replace("\r\n", "\n").replace("\r", "\n"), encoding, raw
     raise _Undecodable(str(target))
+
+
+def _encoding_of(raw: bytes) -> str:
+    """这段字节能无损解码的第一种候选编码；都解不开返回空串。"""
+    for encoding in _edit_encodings():
+        try:
+            raw.decode(encoding)
+        except UnicodeDecodeError:
+            continue
+        return encoding
+    return ""
+
+
+def _newline_of(raw: bytes) -> str:
+    """文件用的是哪种换行：按出现次数取多数，没有换行或数不出多数按 LF。"""
+    crlf = raw.count(b"\r\n")
+    lf = raw.count(b"\n") - crlf
+    cr = raw.count(b"\r") - crlf
+    if crlf > lf and crlf >= cr:
+        return "\r\n"
+    if cr > lf and cr > crlf:
+        return "\r"
+    return "\n"
+
+
+def _write_like_original(target: Path, text: str, encoding: str, raw: bytes | None) -> None:
+    """按原文件的样子写回：同样的编码、同样的换行、原来带 BOM 的还带。
+
+    读的时候换行统一成了 LF（匹配要用），写回时不还原的话，改一处就等于把整份
+    文件的换行全换掉——版本控制里显示成整篇都改了，团队里别人的编辑器和换行
+    检查跟着报。按字节写，不经文本模式的平台换行转换。
+    """
+    original = raw or b""
+    newline = _newline_of(original)
+    body = text.replace("\r\n", "\n").replace("\r", "\n")
+    if newline != "\n":
+        body = body.replace("\n", newline)
+    data = body.encode(encoding)
+    if original.startswith(codecs.BOM_UTF8) and codecs.lookup(encoding).name == "utf-8":
+        data = codecs.BOM_UTF8 + data
+    target.write_bytes(data)
 
 
 def _undecodable_error(path: str) -> str:
@@ -622,6 +697,11 @@ def _hardened_env(extra: dict[str, str] | None = None) -> dict[str, str]:
     }
     if extra:
         env.update(extra)
+    #  Python 子进程的输出流钉成 UTF-8：管道另一头的 stdout 在 Windows 上默认走
+    #  本地代码页，模型写的脚本一打印 ✓ 或 emoji 就直接 UnicodeEncodeError 崩掉——
+    #  我们这头能解 GBK 输出，却救不了那头自己崩。setdefault：用户环境里点了名的
+    #  照他的；只动流编码，不开 PYTHONUTF8（那个连带改文件与 locale 的默认编码）
+    env.setdefault("PYTHONIOENCODING", "utf-8")
     secrets = non_inheritable_env_names()
     return {key: value for key, value in env.items() if key.upper() not in secrets}
 
@@ -696,6 +776,69 @@ def _platform_shell_note() -> str:
 #  确认框里展示给用户——审批时"这条命令要干嘛"不用人肉猜。
 #  执行前由 agent 剥离，不进 handler。
 PURPOSE_PARAM = "__tool_use_purpose"
+
+
+_INTEGER_TEXT = re.compile(r"[+-]?\d+$")
+_NUMBER_TEXT = re.compile(r"[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?$")
+_BOOLEAN_TEXT = {"true": True, "false": False, "1": True, "0": False}
+_TYPE_NAMES = {"integer": "整数", "number": "数字", "boolean": "布尔值（true / false）"}
+_MAX_COERCE_DEPTH = 8
+
+
+def coerce_to_schema(value: Any, schema: Any, depth: int = 0) -> Any:
+    """按 schema 声明的类型，把模型写成字符串的数字 / 布尔 / 数组 / 对象还原成真类型。
+
+    模型经常把 `300` 写成 `"300"`、把 `false` 写成 `"false"`、把数组整个序列化成
+    一个 JSON 字符串。不还原的后果各不相同：`"false"` 是非空字符串，直接拿去判真假
+    恰好是反的；`"5"` 进了算术才炸，那时进程可能已经起来了。
+
+    只按声明转、只转认得出的：联合类型与没声明类型的不猜，转不动的原样留着。
+    """
+    if not isinstance(schema, dict) or depth > _MAX_COERCE_DEPTH:
+        return value
+    kind = schema.get("type")
+    if not isinstance(kind, str):
+        return value
+    if isinstance(value, str):
+        text = value.strip()
+        if kind == "integer" and _INTEGER_TEXT.match(text):
+            return int(text)
+        if kind == "number" and _NUMBER_TEXT.match(text):
+            return int(text) if _INTEGER_TEXT.match(text) else float(text)
+        if kind == "boolean" and text.lower() in _BOOLEAN_TEXT:
+            return _BOOLEAN_TEXT[text.lower()]
+        if kind in ("array", "object") and text[:1] in ("[", "{"):
+            try:
+                decoded = json.loads(text)
+            except ValueError:
+                return value
+            if not isinstance(decoded, list if kind == "array" else dict):
+                return value
+            value = decoded
+    if kind == "integer" and isinstance(value, float) and value.is_integer():
+        return int(value)
+    if kind == "object" and isinstance(value, dict):
+        properties = schema.get("properties")
+        if isinstance(properties, dict):
+            return {
+                key: coerce_to_schema(item, properties[key], depth + 1)
+                if key in properties else item
+                for key, item in value.items()
+            }
+    if kind == "array" and isinstance(value, list) and isinstance(schema.get("items"), dict):
+        return [coerce_to_schema(item, schema["items"], depth + 1) for item in value]
+    return value
+
+
+def _mistyped_argument(args: dict[str, Any], schema: Any) -> str:
+    """还原之后仍然是字符串的数字 / 布尔参数：点名字段。交给 handler 的话，报出来的
+    是一句 Python 的类型错误，模型看不出是哪个参数、该改成什么。"""
+    properties = schema.get("properties") if isinstance(schema, dict) else None
+    for key, declared in (properties or {}).items():
+        kind = declared.get("type") if isinstance(declared, dict) else None
+        if isinstance(kind, str) and kind in _TYPE_NAMES and isinstance(args.get(key), str):
+            return f"{key} 应为{_TYPE_NAMES[kind]}，收到的是字符串 {args[key]!r}"
+    return ""
 
 
 @dataclass(frozen=True)
@@ -1374,6 +1517,11 @@ class Toolbox:
         if blocked:
             return blocked
 
+        if isinstance(args, dict):
+            args = coerce_to_schema(args, {**tool.parameters, "type": "object"})
+            if problem := _mistyped_argument(args, tool.parameters):
+                return f"ERROR: 调用 {name} 的参数不对：{problem}"
+
         try:
             output = self._bound_output(name, tool.handler(**args))
         except Interrupted:
@@ -1450,6 +1598,7 @@ class Toolbox:
                 name="read_file",
                 description=(
                     "读取文本文件内容。路径相对当前工作区解析。"
+                    "图片（png / jpg / gif / webp）也用它：图会直接交给你看。"
                     "大文件可以用 offset（起始行号，从 1 开始）和 limit（最多读多少行）只读一段。"
                     "修改任何文件之前必须先读过它：局部修改（str_replace）读过要改的那一段即可，"
                     "整体覆盖（write_file）要把全部内容都读到（分段读完也算）。"
@@ -1764,6 +1913,8 @@ class Toolbox:
                     "press=按键（key 如 Enter）；read=页面正文纯文本；"
                     "screenshot=截图存到 path（给用户看的，不会回传给你）；"
                     "close=关闭浏览器。"
+                    "点击打开了新标签页时会自动切过去。页面弹出确认框时默认取消并告诉你，"
+                    "确实要确认就带 dialog=accept 重做那一步。"
                     "默认无头启动独立 Chromium（无登录态）。要操作需要登录态的页面，"
                     "请用户以 --remote-debugging-port=9222 启动本机 Chrome 并设"
                     " XIAOYU_BROWSER_CDP=http://127.0.0.1:9222，即可接管已登录会话。"
@@ -1777,6 +1928,14 @@ class Toolbox:
                         "text": {"type": "string", "description": "fill 用"},
                         "key": {"type": "string", "description": "press 用"},
                         "path": {"type": "string", "description": "screenshot 用"},
+                        "dialog": {
+                            "type": "string",
+                            "enum": list(browser.DIALOG_CHOICES),
+                            "description": (
+                                "这一步里页面弹出确认框时怎么答：dismiss=取消（默认），"
+                                "accept=确认"
+                            ),
+                        },
                     },
                     "required": ["action"],
                 },
@@ -1799,9 +1958,23 @@ class Toolbox:
         text: str | None = None,
         key: str | None = None,
         path: str | None = None,
+        dialog: str | None = None,
     ) -> str:
+        if action == "open" and url and url.strip().lower().startswith("file:"):
+            #  file:// 加 read 能把任何本机文件读出来，绕过文件工具的全部护栏
+            #  （工作区边界、特殊文件、体积上限）。只许工作区内的
+            local = Path(urllib.parse.unquote(urllib.parse.urlsplit(url).path))
+            _, outside = self._resolve(str(local))
+            if outside:
+                return (
+                    f"ERROR: 浏览器只能打开工作区内的本地文件（{local} 在工作区之外）。"
+                    "要读那个文件请用 read_file。"
+                )
+        if action == "screenshot" and path:
+            #  相对路径按工作区解析，和别的文件工具一致（此前按进程的当前目录）
+            path = str(self._resolve(path)[0])
         return browser.session().run(
-            action, url=url, selector=selector, text=text, key=key, path=path
+            action, url=url, selector=selector, text=text, key=key, path=path, dialog=dialog
         )
 
     def _sandbox_note(self) -> str:
@@ -1844,6 +2017,16 @@ class Toolbox:
         if target.is_dir():
             return f"ERROR: {path} 是目录，不是文件。用 list_files 看目录。"
         if error := _unreadable_file_error(target, path):
+            return error
+        if target.suffix.lower() in media.IMAGE_SUFFIXES:
+            #  图片交给模型自己看：解码成文本只会得到乱码
+            ref, problem = media.accept_file(target)
+            if not ref:
+                return f"ERROR: {path} 是图片，但没能读进来：{problem}"
+            self.push_media(media.image_part(ref))
+            where = "（工作区之外）" if outside else ""
+            return f"[{path}{where} 是图片（{media.label(ref)}），见下一条消息里的图片]"
+        if error := _binary_file_error(target, path):
             return error
         try:
             text, encoding, _ = _read_for_edit(target)
@@ -1909,21 +2092,36 @@ class Toolbox:
             if error := _unreadable_file_error(target, path, size_cap=False):
                 return error
         #  /rewind 快照：改前内容（新建文件记 None——回滚即删除）
+        previous: bytes | None = None
         if existed:
             try:
-                self.rewind.record(target, target.read_bytes())
+                previous = target.read_bytes()
+                self.rewind.record(target, previous)
             except OSError:
                 pass
         else:
             self.rewind.record(target, None)
+        converted = ""
         try:
             target.parent.mkdir(parents=True, exist_ok=True)
-            target.write_text(content, encoding="utf-8")
+            encoding = _encoding_of(previous) if previous else ""
+            if encoding:
+                #  覆盖已有文件：沿用它的编码与换行，和局部替换的承诺一致
+                try:
+                    content.encode(encoding)
+                except UnicodeEncodeError:
+                    converted = (
+                        f"；原文件是 {encoding} 编码，新内容里有它表示不了的字符，已改用 UTF-8"
+                    )
+                    encoding = "utf-8"
+                _write_like_original(target, content, encoding, previous)
+            else:
+                target.write_text(content, encoding="utf-8")
         except OSError as exc:
             return f"ERROR: 写入失败 {path}: {exc}"
         self._mark_read(target)
         action = "已覆盖" if existed else "已创建"
-        note = "（工作区之外）" if outside else ""
+        note = ("（工作区之外）" if outside else "") + converted
         lines = content.count("\n") + (1 if content and not content.endswith("\n") else 0)
         return f"{action}{note} {path}：{len(content)} 字符 / {lines} 行"
 
@@ -1981,7 +2179,7 @@ class Toolbox:
             return error
         self.rewind.record(target, raw)
         try:
-            target.write_text(updated, encoding=encoding)
+            _write_like_original(target, updated, encoding, raw)
         except OSError as exc:
             return f"ERROR: 写入失败 {path}: {exc}"
         self._mark_read(target, keep_level=True)
@@ -2057,7 +2255,7 @@ class Toolbox:
             return error
         self.rewind.record(target, raw if raw is not None else text.encode(encoding))
         try:
-            target.write_text(updated, encoding=encoding)
+            _write_like_original(target, updated, encoding, raw)
         except OSError as exc:
             return f"ERROR: 写入失败 {path}: {exc}"
         self._mark_read(target, keep_level=True)
@@ -2093,19 +2291,28 @@ class Toolbox:
             return f"ERROR: 路径不存在：{path}"
 
         #  绝对路径起：rg 不经沙箱、不经确认，不能让 PATH 上工作区里的同名程序顶替
+        #  三个后端搜的范围要一样，否则同一个问题在不同机器上答案不同：
+        #  --hidden：rg 默认跳过点开头的目录，.github/ 里的引用搜不到，模型会据此
+        #    断定"没有任何地方引用"（另两个后端搜得到）；.git 等由下面的排除表挡
+        #  --no-config：不读用户的 ripgrep 配置，它能改掉输出形态
+        #  模式一律走 -e、路径前加 --：模式以 - 开头时不被当成选项
         if rg := sandbox.host_which("rg"):
-            command = [rg, "--line-number", "--no-heading", "--color", "never", "-e", pattern]
+            command = [
+                rg, "--line-number", "--no-heading", "--color", "never",
+                "--hidden", "--no-config", "-e", pattern,
+            ]
             for skip in sorted(_SKIP_DIRS):
                 command += ["--glob", f"!{skip}/**"]
             if glob:
                 command += ["--glob", glob]
-            command.append(str(target))
+            command += ["--", str(target)]
         elif grep := _locate_grep():
-            command = [grep, "-rnE", pattern, str(target)]
+            command = [grep, "-rnE", "-e", pattern]
             for skip in sorted(_SKIP_DIRS):
                 command.append(f"--exclude-dir={skip}")
             if glob:
                 command.append(f"--include={glob}")
+            command += ["--", str(target)]
         else:
             return self._grep_python(pattern, target, glob, max_matches)
 

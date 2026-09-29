@@ -9,6 +9,7 @@
 - `/allow` / `/deny` 配权限规则：命中 allow 免确认，命中 deny 强制拦截。
 - **`deny` 与危险命令硬拦截（`rm -rf /`、fork bomb 一类）是 bypass-immune 的**：`--yolo` 也拦得住。审批是"用户想不想"，这一层是"绝不"。
   `deny bash(curl *)` 按命令本身认，不按写法认：`/usr/bin/curl`、`env curl`、`"curl"`、`FOO=1 curl`、`bash -c 'curl …'`、`$(curl …)` 都拦。它仍是按字面匹配的规则而不是沙箱——脚本文件里写的、解释器里拼出来的命令它看不见，要挡住出网得靠沙箱的网络策略。
+  还有一档 `ask`（如 `ask bash(git push*)`）：介于放行和拦死之间——别的照常自动跑，唯独点了名的这几样先问你。它在 auto 档、`--yolo`、答过「本会话允许」、有更宽的 allow 规则时照样问；匹配口径与 deny 相同。`--unattended` 会把它和别的必问一起放开（无人值守里没人按键），要硬拦请用 deny。
 - **写可执行配置必问**：`.mcp.json`、`.env`、`.xiaoyu/`、`.git/` 之下的文件由 `write_file` / `str_replace` 改动时，auto 档、`--yolo`、allow 规则都免不掉这一问（任意子目录里的同名文件、指过去的符号链接一样算）。这一笔写下去，下次启动拉起什么进程、哪些命令免确认就由模型说了算，等于模型给自己的下一次运行放权。
 - **过审的落点执行前再核一次**：确认框挂着的那段时间里，路径上某一级被换成指向别处的符号链接的话，这次调用不执行。这把窗口从"你按键的几秒到几分钟"收到了两次系统调用之间，没有彻底关上。
 - `exit_plan_mode` 的审批同样 bypass-immune：`--yolo` 也要问。否则模型能自行退出 plan 档，"批准后才执行"就是空话。无人值守里确实没人按键时用 `--unattended` 显式放开（见文末[放开护栏](#放开护栏unattended--xiaoyu_hardline0--trustcontent--unguarded)）。

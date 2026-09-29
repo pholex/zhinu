@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import os
 import re
 import tempfile
@@ -10,6 +11,7 @@ from pathlib import Path
 from unittest import mock
 
 from xiaoyu.config import Config
+from xiaoyu import tools
 from xiaoyu.tools import PURPOSE_PARAM, Tool, Toolbox
 
 SAMPLE = """def add(a, b):
@@ -269,6 +271,294 @@ class TestReadWrite(ToolboxTestCase):
         self.box.run("read_file", {"path": "calc.py"})
         result = self.box.run("write_file", {"path": "calc.py", "content": "x = 1\n"})
         self.assertIn("已覆盖", result)
+
+
+#  1×1 的 PNG：够让图片入口认出类型
+_TINY_PNG = bytes.fromhex(
+    "89504e470d0a1a0a0000000d49484452000000010000000108060000001f15c489"
+    "0000000d49444154789c6360000002000001e221bc330000000049454e44ae426082"
+)
+
+
+class TestSubprocessStreamEncoding(ToolboxTestCase):
+    def test_python_children_print_utf8_by_default(self) -> None:
+        with mock.patch.dict(os.environ, {"PATH": os.environ.get("PATH", "")}, clear=True):
+            self.assertEqual(tools._hardened_env()["PYTHONIOENCODING"], "utf-8")
+
+    def test_the_users_own_choice_wins(self) -> None:
+        with mock.patch.dict(os.environ, {"PYTHONIOENCODING": "gbk"}):
+            self.assertEqual(tools._hardened_env()["PYTHONIOENCODING"], "gbk")
+        self.assertEqual(
+            tools._hardened_env({"PYTHONIOENCODING": "latin-1"})["PYTHONIOENCODING"], "latin-1"
+        )
+
+    def test_a_script_printing_symbols_survives_a_non_utf8_locale(self) -> None:
+        if self.box.get("bash") is None or os.name == "nt":
+            self.skipTest("需要 POSIX bash")
+        import sys as _sys
+
+        script = self.root / "say.py"
+        script.write_text("print('完成 \u2713 \U0001f389')\n", encoding="utf-8")
+        with mock.patch.dict(os.environ, {"LC_ALL": "C", "LANG": "C"}):
+            os.environ.pop("PYTHONIOENCODING", None)
+            os.environ.pop("PYTHONUTF8", None)
+            result = self.box.run(
+                "bash", {"command": f"PYTHONUTF8=0 {_sys.executable} -X utf8=0 say.py"}
+            )
+        self.assertIn("完成 \u2713", result)
+        self.assertNotIn("UnicodeEncodeError", result)
+
+
+class TestGrepBackendsAgree(ToolboxTestCase):
+    """同一个问题在不同机器上答案要一样：三个后端搜的范围相同。"""
+
+    def setUp(self) -> None:
+        super().setUp()
+        workflows = self.root / ".github" / "workflows"
+        workflows.mkdir(parents=True)
+        (workflows / "ci.yml").write_text("run: make release-check\n", encoding="utf-8")
+        (self.root / ".git").mkdir()
+        (self.root / ".git" / "config").write_text("release-check\n", encoding="utf-8")
+        (self.root / "opts.txt").write_text("pass --verbose here\n", encoding="utf-8")
+
+    def backends(self):
+        from xiaoyu import sandbox
+
+        real_which = sandbox.host_which
+        if real_which("rg"):
+            yield "rg", contextlib.nullcontext()
+        if tools._locate_grep():
+            yield "grep", mock.patch.object(sandbox, "host_which", return_value=None)
+        yield "python", contextlib.ExitStack()
+
+    def search(self, name: str, guard, **args) -> str:
+        with guard:
+            if name == "python":
+                with mock.patch.object(tools.sandbox, "host_which", return_value=None), \
+                        mock.patch.object(tools, "_locate_grep", return_value=None):
+                    return self.box.run("grep", args)
+            return self.box.run("grep", args)
+
+    def test_hidden_directories_are_searched_everywhere(self) -> None:
+        for name, guard in self.backends():
+            result = self.search(name, guard, pattern="release-check")
+            self.assertIn(".github/workflows/ci.yml", result, name)
+            self.assertNotIn(".git/config", result, name)
+
+    def test_pattern_starting_with_a_dash_is_a_pattern(self) -> None:
+        for name, guard in self.backends():
+            result = self.search(name, guard, pattern="--verbose")
+            self.assertIn("opts.txt", result, name)
+            self.assertNotIn("ERROR", result, name)
+
+    def test_user_ripgrep_config_is_ignored(self) -> None:
+        if not tools.sandbox.host_which("rg"):
+            self.skipTest("没有 ripgrep")
+        config = self.root / "rgrc"
+        config.write_text("--files-with-matches\n", encoding="utf-8")
+        with mock.patch.dict(os.environ, {"RIPGREP_CONFIG_PATH": str(config)}):
+            result = self.box.run("grep", {"pattern": "release-check"})
+        self.assertIn("make release-check", result)
+
+
+class TestWriteBackFidelity(ToolboxTestCase):
+    """改一处不该顺手把整份文件的换行、BOM、编码换掉。"""
+
+    def put(self, name: str, data: bytes) -> Path:
+        target = self.root / name
+        target.write_bytes(data)
+        return target
+
+    def test_crlf_survives_a_local_edit(self) -> None:
+        target = self.put("win.txt", b"alpha\r\nbeta\r\ngamma\r\n")
+        self.box.run("read_file", {"path": "win.txt"})
+        result = self.box.run(
+            "str_replace", {"path": "win.txt", "old_str": "beta", "new_str": "BETA\nextra"}
+        )
+        self.assertIn("已替换", result)
+        self.assertEqual(target.read_bytes(), b"alpha\r\nBETA\r\nextra\r\ngamma\r\n")
+
+    def test_lf_stays_lf(self) -> None:
+        target = self.put("unix.txt", b"alpha\nbeta\n")
+        self.box.run("read_file", {"path": "unix.txt"})
+        self.box.run("str_replace", {"path": "unix.txt", "old_str": "beta", "new_str": "BETA"})
+        self.assertEqual(target.read_bytes(), b"alpha\nBETA\n")
+
+    def test_crlf_survives_a_fuzzy_edit(self) -> None:
+        target = self.put("win.py", b"def f():\r\n    return 1  \r\n")
+        self.box.run("read_file", {"path": "win.py"})
+        result = self.box.run(
+            "str_replace", {"path": "win.py", "old_str": "    return 1", "new_str": "    return 2"}
+        )
+        self.assertNotIn("ERROR", result)
+        self.assertNotIn(b"\n", target.read_bytes().replace(b"\r\n", b""))
+        self.assertIn(b"return 2", target.read_bytes())
+
+    def test_bom_is_hidden_from_the_model_and_kept_on_disk(self) -> None:
+        target = self.put("bom.cs", b"\xef\xbb\xbfusing System;\r\nclass A {}\r\n")
+        shown = self.box.run("read_file", {"path": "bom.cs"})
+        self.assertTrue(shown.startswith("using System;"), repr(shown[:20]))
+        #  照抄首行做多行替换：BOM 留在文本里的话，匹配会落在第 1 个字符之后被误拒
+        result = self.box.run(
+            "str_replace",
+            {"path": "bom.cs", "old_str": "using System;", "new_str": "using System;\nusing System.IO;"},
+        )
+        self.assertIn("已替换", result)
+        self.assertEqual(
+            target.read_bytes(),
+            b"\xef\xbb\xbfusing System;\r\nusing System.IO;\r\nclass A {}\r\n",
+        )
+
+    def test_overwrite_keeps_encoding_and_newlines(self) -> None:
+        target = self.put("gbk.txt", "第一行\r\n第二行\r\n".encode("gbk"))
+        self.box.run("read_file", {"path": "gbk.txt"})
+        result = self.box.run("write_file", {"path": "gbk.txt", "content": "全新内容\n第二行\n"})
+        self.assertIn("已覆盖", result)
+        self.assertEqual(target.read_bytes(), "全新内容\r\n第二行\r\n".encode("gbk"))
+
+    def test_overwrite_says_so_when_it_has_to_change_the_encoding(self) -> None:
+        target = self.put("gbk.txt", "第一行\n".encode("gbk"))
+        self.box.run("read_file", {"path": "gbk.txt"})
+        result = self.box.run("write_file", {"path": "gbk.txt", "content": "表情 \U0001f600\n"})
+        self.assertIn("已改用 UTF-8", result)
+        self.assertEqual(target.read_bytes(), "表情 \U0001f600\n".encode("utf-8"))
+
+    def test_mixed_newlines_follow_the_majority(self) -> None:
+        self.assertEqual(tools._newline_of(b"a\r\nb\r\nc\n"), "\r\n")
+        self.assertEqual(tools._newline_of(b"a\nb\nc\r\n"), "\n")
+        self.assertEqual(tools._newline_of(b"a\rb\rc"), "\r")
+        self.assertEqual(tools._newline_of(b"no newline"), "\n")
+
+    def test_rewind_still_restores_the_exact_bytes(self) -> None:
+        original = b"\xef\xbb\xbfalpha\r\nbeta\r\n"
+        target = self.put("win.txt", original)
+        self.box.rewind.begin("改")
+        self.box.run("read_file", {"path": "win.txt"})
+        self.box.run("str_replace", {"path": "win.txt", "old_str": "beta", "new_str": "BETA"})
+        self.box.rewind.finish()
+        ok, _ = self.box.rewind.rewind_files(1)
+        self.assertTrue(ok)
+        self.assertEqual(target.read_bytes(), original)
+
+
+class TestBinaryAndImages(ToolboxTestCase):
+    def test_binary_file_is_refused_with_directions(self) -> None:
+        """有损解码硬读二进制，回给模型的是几万字符的乱码。"""
+        blob = self.root / "app.bin"
+        blob.write_bytes(b"\x7fELF\x02\x01\x01\x00" + bytes(range(256)) * 200)
+        result = self.box.run("read_file", {"path": "app.bin"})
+        self.assertTrue(result.startswith("ERROR"), result[:80])
+        self.assertIn("二进制", result)
+        self.assertIn("file app.bin", result)
+        self.assertLess(len(result), 400)
+        self.assertNotIn("\x00", result)
+        #  拒读的文件不算读过
+        edit = self.box.run("write_file", {"path": "app.bin", "content": "x"})
+        self.assertIn("还没读过", edit)
+
+    def test_pdf_is_refused(self) -> None:
+        (self.root / "doc.pdf").write_bytes(b"%PDF-1.7\n%\xe2\xe3\xcf\xd3\n1 0 obj\x00\x00stream")
+        result = self.box.run("read_file", {"path": "doc.pdf"})
+        self.assertIn("pdftotext", result)
+
+    def test_utf16_text_gets_a_conversion_hint(self) -> None:
+        (self.root / "wide.txt").write_bytes("你好\n".encode("utf-16"))
+        result = self.box.run("read_file", {"path": "wide.txt"})
+        self.assertIn("UTF-16", result)
+        self.assertIn("iconv", result)
+
+    def test_ordinary_text_is_untouched(self) -> None:
+        self.assertEqual(self.box.run("read_file", {"path": "calc.py"}), SAMPLE)
+        (self.root / "gbk.txt").write_bytes("中文内容\n".encode("gbk"))
+        self.assertIn("中文内容", self.box.run("read_file", {"path": "gbk.txt"}))
+
+    def test_image_is_handed_to_the_model_instead_of_decoded(self) -> None:
+        (self.root / "shot.png").write_bytes(_TINY_PNG)
+        result = self.box.run("read_file", {"path": "shot.png"})
+        self.assertIn("是图片", result)
+        self.assertNotIn("IHDR", result)
+        (part,) = self.box.take_media()
+        self.assertEqual(part["type"], "image_url")
+        self.assertEqual(self.box.take_media(), [])
+
+    def test_image_that_is_not_an_image_says_so(self) -> None:
+        (self.root / "fake.png").write_text("其实是文本", encoding="utf-8")
+        result = self.box.run("read_file", {"path": "fake.png"})
+        self.assertTrue(result.startswith("ERROR"), result)
+        self.assertEqual(self.box.take_media(), [])
+
+
+class TestArgumentCoercion(ToolboxTestCase):
+    """模型把数字 / 布尔 / 数组写成字符串传进来：按 schema 声明的类型还原。"""
+
+    def probe(self, **properties):
+        seen: dict = {}
+
+        def handler(**kwargs) -> str:
+            seen.update(kwargs)
+            return "ok"
+
+        self.box.register(Tool(
+            name="probe", description="d",
+            parameters={"type": "object", "properties": properties},
+            handler=handler, requires_approval=False,
+        ))
+        return seen
+
+    def test_string_false_is_not_truthy(self) -> None:
+        """"false" 是非空字符串，直接判真假恰好是反的——静默错行为，最糟的一种。"""
+        seen = self.probe(background={"type": "boolean"}, force={"type": "boolean"})
+        self.box.run("probe", {"background": "false", "force": "TRUE"})
+        self.assertIs(seen["background"], False)
+        self.assertIs(seen["force"], True)
+
+    def test_numbers_written_as_strings(self) -> None:
+        seen = self.probe(timeout={"type": "integer"}, ratio={"type": "number"},
+                          whole={"type": "integer"})
+        self.box.run("probe", {"timeout": " 300 ", "ratio": "0.5", "whole": 5.0})
+        self.assertEqual(seen, {"timeout": 300, "ratio": 0.5, "whole": 5})
+        self.assertIsInstance(seen["timeout"], int)
+        self.assertIsInstance(seen["whole"], int)
+
+    def test_json_encoded_containers_including_nested_fields(self) -> None:
+        seen = self.probe(
+            items={"type": "array", "items": {"type": "integer"}},
+            options={"type": "object", "properties": {"deep": {"type": "boolean"}}},
+        )
+        self.box.run("probe", {"items": '["1", 2]', "options": '{"deep": "true", "x": "1"}'})
+        self.assertEqual(seen["items"], [1, 2])
+        self.assertEqual(seen["options"], {"deep": True, "x": "1"})
+
+    def test_unconvertible_value_names_the_field(self) -> None:
+        seen = self.probe(timeout={"type": "integer"})
+        result = self.box.run("probe", {"timeout": "五秒"})
+        self.assertTrue(result.startswith("ERROR"), result)
+        self.assertIn("timeout", result)
+        self.assertIn("整数", result)
+        self.assertEqual(seen, {})
+
+    def test_strings_stay_strings_and_unions_are_not_guessed(self) -> None:
+        seen = self.probe(
+            pattern={"type": "string"}, either={"type": ["string", "integer"]}, loose={},
+        )
+        self.box.run("probe", {"pattern": "42", "either": "7", "loose": "true", "extra": "1"})
+        self.assertEqual(seen, {"pattern": "42", "either": "7", "loose": "true", "extra": "1"})
+
+    def test_callers_dict_is_left_alone(self) -> None:
+        self.probe(timeout={"type": "integer"})
+        args = {"timeout": "5"}
+        self.box.run("probe", args)
+        self.assertEqual(args, {"timeout": "5"})
+
+    def test_builtin_tools_accept_stringly_numbers(self) -> None:
+        result = self.box.run("read_file", {"path": "calc.py", "offset": "2", "limit": "1"})
+        self.assertIn("第 2-2 行", result)
+
+    def test_background_flag_as_string_does_not_start_a_background_task(self) -> None:
+        if self.box.get("bash") is None:
+            self.skipTest("没有 bash 工具")
+        result = self.box.run("bash", {"command": "echo 前台", "run_in_background": "false"})
+        self.assertIn("前台", result)
 
 
 class TestStrReplace(ToolboxTestCase):

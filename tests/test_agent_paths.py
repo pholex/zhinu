@@ -116,6 +116,64 @@ class AgentTestCase(unittest.TestCase):
         return agent
 
 
+class TestAskRule(AgentTestCase):
+    """ask 规则：自动放行的模式下，点了名的那几样照样要问。"""
+
+    def run_bash(self, command: str, rules: list[str], approve: bool, **config):
+        from xiaoyu.permissions import Permissions, parse_rule
+
+        for key, value in config.items():
+            setattr(self.config, key, value)
+        asked: list = []
+
+        def approver(name, args):
+            asked.append((name, args.get("command")))
+            return approve
+
+        script = [
+            [chunk(tool_calls=[call_fragment(0, "c1", "bash", json.dumps({"command": command}))]),
+             usage_chunk(10, 5)],
+            [chunk(content="完"), usage_chunk(10, 1)],
+        ]
+        agent = self.build(
+            script, approver=approver,
+            permissions=Permissions(self.root, [parse_rule(line) for line in rules]),
+        )
+        buffer = io.StringIO()
+        with contextlib.redirect_stdout(buffer):
+            agent.send("干活")
+        (result,) = [m for m in agent.messages if m["role"] == "tool"]
+        return asked, result["content"], buffer.getvalue()
+
+    def test_named_command_is_asked_even_when_everything_is_auto_approved(self) -> None:
+        asked, result, shown = self.run_bash(
+            "git push origin main", ["ask bash(git push*)"], approve=False, auto_approve=True
+        )
+        self.assertEqual(asked, [("bash", "git push origin main")])
+        self.assertIn("拒绝", result)
+        self.assertIn("ask bash(git push*)", shown)
+
+    def test_everything_else_still_runs_without_asking(self) -> None:
+        asked, result, _ = self.run_bash(
+            "echo hello", ["ask bash(git push*)"], approve=False, auto_approve=True
+        )
+        self.assertEqual(asked, [])
+        self.assertIn("hello", result)
+
+    def test_a_wider_allow_rule_does_not_override_it(self) -> None:
+        asked, _, _ = self.run_bash(
+            "git push", ["allow bash(git *)", "ask bash(git push*)"], approve=False,
+        )
+        self.assertEqual(asked, [("bash", "git push")])
+
+    def test_unattended_releases_it_like_the_other_must_asks(self) -> None:
+        asked, _, _ = self.run_bash(
+            "echo pushed", ["ask bash(echo *)"], approve=False,
+            auto_approve=True, unattended=True,
+        )
+        self.assertEqual(asked, [])
+
+
 class TestInterruptedToolLeavesItsReport(AgentTestCase):
     """批量委托被打断时把已收束各项的报告挂在异常上：主循环要把它作为这次调用的
     结果写进历史，下一轮模型才看得到"完成了哪几项、句柄是什么"。"""

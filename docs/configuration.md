@@ -67,7 +67,7 @@ XIAOYU_API_KEY=<key>
 
 | 变量 | 默认值 | 说明 |
 |---|---|---|
-| `XIAOYU_EFFORT` | 不传 | 推理深度 `low / medium / high / xhigh / max`（OpenAI 线另有 `none / minimal`）。同一个名字出内核，按协议翻译成 `reasoning_effort` / `reasoning.effort` / `output_config.effort`；上游不认的取值会 400。命令行 `--effort`，会话里 `/effort`，子 agent 可在 spec 里单独声明 |
+| `XIAOYU_EFFORT` | 不传 | 推理深度 `low / medium / high / xhigh / max`（OpenAI 线另有 `none / minimal`）。同一个名字出内核，按协议翻译成 `reasoning_effort` / `reasoning.effort` / `output_config.effort`；你给自己点名的模型配的取值原样发，上游不认会 400；换到降级链上的模型、或由子 agent 继承过去时，对实测过档位范围的型号就近换成它认的一档并提示（没实测过的型号不改）。命令行 `--effort`，会话里 `/effort`，子 agent 可在 spec 里单独声明 |
 | `XIAOYU_CONTEXT_LIMIT` | 按模型查表 | 上下文上限（token）覆写 |
 | `XIAOYU_COMPACT_AT` | `0.7` | 用量占到这个比例时触发回收/压缩；取 0.05~1 的比例，写成 `70` 这类整数会被忽略并在启动时提示 |
 | `XIAOYU_BUDGET_TOKENS` | 不限 | 本会话 token 软预算（prompt+completion 累计，≥5000 才生效）：模型按 50/80/95% 收到倒计时（operator 通道），到线前一步优雅收尾交代现场，而不是被硬闸中途砍断；直连支持型号（Opus 5/4.8/4.7/Fable/Mythos/Sonnet 5）另附 Anthropic 原生 `task_budget`（服务端倒计时）。命令行 `--budget-tokens` |
@@ -85,6 +85,7 @@ XIAOYU_API_KEY=<key>
 |---|---|
 | `XIAOYU_ENABLE_EXPLORE` | `explore` 检索子 agent |
 | `XIAOYU_ENABLE_SKILLS` | 扫描 `~/.agents/skills/`、工作区自带的 `.xiaoyu/skills/` 与 `.agents/skills/`、已装插件包下的 SKILL.md |
+| `XIAOYU_SKILLS_DISABLED` | 停用清单（不是开关）：逗号分隔的技能名，可通配，如 `lark-*,remotion-*,aws-core:*`。按带插件前缀的全名或目录名匹配。技能库是几家客户端共用的，要给索引腾预算时在这里点名，不必去删文件；`/skills` 会列出被停用的 |
 | `XIAOYU_SKILLS_DIR` | 覆盖技能扫描目录（`os.pathsep` 分隔）：给了就只认它、不混默认目录，工作区自带的也不扫（宿主指定技能库 / 测试隔离用） |
 | `XIAOYU_ENABLE_WEB_SEARCH` | `web_search` 工具 |
 | `XIAOYU_SEARCH_PROVIDER` | 搜索走哪家：目前只有 `xai`（默认，grok-4.6，真搜且带引用，单次约 0.65 元；需 `XAI_API_KEY`）。deepseek 官方 Responses 不支持内置搜索，已移除。后端没配 key 时不挂载 `web_search` 工具 |

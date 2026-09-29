@@ -30,7 +30,7 @@ import threading
 import time
 
 _DEFAULT_POLL = 2.0
-_TERM_GRACE = 3.0
+TERM_GRACE = 3.0
 
 
 def _signal_child(child: subprocess.Popen, sig: int) -> None:
@@ -38,8 +38,15 @@ def _signal_child(child: subprocess.Popen, sig: int) -> None:
     try:
         if os.name == "nt":
             #  Windows 没有 SIGKILL 也没有进程组信号（引用 signal.SIGKILL 会直接
-            #  AttributeError）：terminate/kill 同为 TerminateProcess 硬杀，
-            #  孙进程（npx.cmd 再拉起的 node）收不到——那需要 Job Object，暂不做
+            #  AttributeError）。只 kill 直接子进程的话孙进程收不到（npx.cmd 再拉起的
+            #  node 才是真 server），按树杀
+            try:
+                subprocess.run(
+                    ["taskkill", "/T", "/F", "/PID", str(child.pid)],
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=10,
+                )
+            except (OSError, subprocess.SubprocessError):
+                pass
             child.kill()
         else:
             os.killpg(child.pid, sig)
@@ -72,7 +79,7 @@ def _parent_alive(ppid: int) -> bool:
 def _shutdown_child(child: subprocess.Popen) -> None:
     """体面关停：TERM → 宽限 → KILL。"""
     _signal_child(child, signal.SIGTERM)
-    deadline = time.monotonic() + _TERM_GRACE
+    deadline = time.monotonic() + TERM_GRACE
     while time.monotonic() < deadline:
         if child.poll() is not None:
             return

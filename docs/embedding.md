@@ -43,7 +43,7 @@ agent = xiaoyu.Agent(config, approver=approve)
 result = xiaoyu.measured_send(agent, "把 README 的安装一节翻成英文")
 print(result.text)          # 本轮交付正文
 print(result.usage)         # 本轮 usage 增量：turns / prompt_tokens / completion_tokens / by_model
-print(result.stopped)       # done / turn_cap / budget / interrupted
+print(result.stopped)       # done / turn_cap / budget / truncated / interrupted
 ```
 
 同一个 `Agent` 实例可以被反复 `measured_send()`，上下文自动接上——常驻宿主
@@ -185,7 +185,7 @@ host.watch_notifications(on_notification)   # 在事件循环里调用；传 Non
 | `duration_seconds` | 墙钟耗时 |
 | `context_tokens` | 跑完后的上下文水位，宿主据此决定何时 `recycle()` |
 | `interrupted` | 被 `interrupt()` 收掉为 `True`——打断是宿主自己的动作，不以异常弹回 |
-| `stopped` | `done` / `turn_cap` / `budget` / `interrupted` |
+| `stopped` | `done` / `turn_cap` / `budget` / `truncated`（回复撞了输出长度上限，自动续写 3 次后仍没说完） / `interrupted` |
 | `output` | 带 `output_schema` 跑的那一轮，模型交回的结构化对象；否则 `None` |
 
 真正的错误（网络、配置、bug）照常抛出；`Interrupted` 只在直接调 `Agent.send()`

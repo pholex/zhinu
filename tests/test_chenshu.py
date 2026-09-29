@@ -259,6 +259,29 @@ class LifecycleTest(ChenshuCase):
         runtime.mission_view(CHENSHU, "M1", {"scope": "lib"})
         self.assertEqual(runtime.missions[0].scope, ("lib",))
 
+    def test_scope_update_goes_through_the_same_checks_as_planning(self):
+        """改 scope 是同一件事的另一个入口：建的时候拦下的，改一下不该就进来了。"""
+        from xiaoyu.chenshu import CHENSHU
+
+        self.init_repo()
+        runtime = self.make_runtime()
+        runtime.init()
+        runtime.plan([{"title": "改 API", "scope": ["src/api/"]},
+                      {"title": "改文档", "scope": ["docs/"]}])
+        for bad, reason in (
+            (["**"], "整个仓库"),
+            ([], "必须给 scope"),
+            (["docs/guide/"], "重叠"),
+            (["src/api/", "docs/"], "重叠"),
+        ):
+            with self.assertRaises(ChenshuError) as caught:
+                runtime.mission_view(CHENSHU, "M1", {"scope": bad})
+            self.assertIn(reason, str(caught.exception), bad)
+        self.assertEqual(runtime.missions[0].scope, ("src/api/",))
+        #  和自己原来的 scope 重叠不算冲突：收窄、放宽到没人占的地方都行
+        runtime.mission_view(CHENSHU, "M1", {"scope": ["src/api/v2/", "src/lib/"]})
+        self.assertEqual(runtime.missions[0].scope, ("src/api/v2/", "src/lib/"))
+
     def test_plan_tool_accepts_stringified_missions(self):
         from xiaoyu.chenshu import _object_list
 

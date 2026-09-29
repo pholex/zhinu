@@ -43,3 +43,5 @@
 
 
 要为本 agent 新增能力（技能 SKILL.md、工具插件、MCP server、hooks）时，先完整阅读随包分发的扩展指南再动手：{{extending_doc}}
+
+今天是 {{today}}。会话跨天时会另行告知。

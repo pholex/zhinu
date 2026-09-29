@@ -1350,6 +1350,30 @@ class RedactTest(unittest.TestCase):
         self.assertIn('"user": "bob"', mcp._redact(shapes[6]))
         self.assertIn("page=2", mcp._redact(shapes[7]))
 
+    def test_camel_case_keys_and_url_userinfo(self):
+        leaked = "S3CR3T-value-0123"
+        for text in (
+            f"https://mcp.exa.ai/mcp?exaApiKey={leaked}",
+            f"https://mcp.tavily.com/mcp/?tavilyApiKey={leaked}&x=1",
+            f"accessToken={leaked}",
+            f'{{"clientSecret": "{leaked}"}}',
+            f"https://bob:{leaked}@host.example/mcp",
+        ):
+            with self.subTest(text=text[:40]):
+                out = mcp._redact(text)
+                self.assertNotIn(leaked, out)
+                self.assertIn("[REDACTED]", out)
+        self.assertIn("x=1", mcp._redact(f"https://h/?tavilyApiKey={leaked}&x=1"))
+        self.assertIn("host.example/mcp", mcp._redact(f"https://bob:{leaked}@host.example/mcp"))
+
+    def test_display_url_keeps_only_where_it_points(self):
+        self.assertEqual(
+            mcp.display_url("https://bob:pw@mcp.example.com:8443/v1/mcp?exaApiKey=abc#frag"),
+            "https://mcp.example.com:8443/v1/mcp",
+        )
+        self.assertEqual(mcp.display_url("https://mcp.example.com/mcp"), "https://mcp.example.com/mcp")
+        self.assertNotIn("abc123secret", mcp.display_url("不是 url token=abc123secret"))
+
     def test_ordinary_words_are_not_eaten(self):
         for text in (
             "path /tmp/task-abcd_efgh_ijkl_mnop/file",
@@ -1359,6 +1383,9 @@ class RedactTest(unittest.TestCase):
             "invalid token",
             "no password provided",
             "secretary of state",
+            "see https://docs.example.com/guide: step one",
+            "myToken is the variable name",
+            "ratio 3:4 at 10:30@room",
         ):
             with self.subTest(text=text):
                 self.assertEqual(mcp._redact(text), text)
@@ -1638,6 +1665,84 @@ class EndToEndTest(unittest.TestCase):
         manager = self.make_manager()
         log = mcp.McpManager._log_path("fake")
         self.assertTrue(log.is_file())
+
+
+@unittest.skipIf(os.name == "nt", "用例依赖 POSIX 信号")
+class StubbornServerShutdownTest(unittest.TestCase):
+    """不理会 stdin 关闭、也不理会 TERM 的 server：关停要在有限时间内完成，
+    而且不能留下没人管的进程。"""
+
+    STUBBORN = (
+        "import os, signal, sys, time\n"
+        "signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
+        "open(sys.argv[1], 'w').write(str(os.getpid()))\n"
+        "while True:\n"
+        "    time.sleep(0.2)\n"
+    )
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+        self.script = self.root / "stubborn.py"
+        self.script.write_text(self.STUBBORN, encoding="utf-8")
+        self.pidfile = self.root / "pid"
+
+    def alive(self, pid: int) -> bool:
+        try:
+            os.kill(pid, 0)
+        except OSError:
+            return False
+        return True
+
+    def spawn(self, watchdog: bool) -> tuple[mcp.McpServer, int]:
+        spec = mcp.ServerSpec(
+            name="stubborn", command=sys.executable,
+            args=[str(self.script), str(self.pidfile)], timeout=5.0,
+        )
+        server = mcp.McpServer(spec, self.root / "stubborn.log")
+        with mock.patch.dict(os.environ, {"XIAOYU_MCP_WATCHDOG": "1" if watchdog else "0"}):
+            server._spawn()
+        deadline = time.monotonic() + 10
+        while not self.pidfile.exists() or not self.pidfile.read_text().strip():
+            self.assertLess(time.monotonic(), deadline, "server 没起来")
+            time.sleep(0.05)
+        pid = int(self.pidfile.read_text())
+        self.addCleanup(lambda: self.alive(pid) and os.kill(pid, 9))
+        return server, pid
+
+    def test_behind_the_watchdog(self):
+        server, pid = self.spawn(watchdog=True)
+        self.assertNotEqual(pid, server._proc.pid)  # 真 server 是看门狗的孩子
+        started = time.monotonic()
+        server._shutdown_proc()
+        self.assertLess(time.monotonic() - started, 15)
+        deadline = time.monotonic() + 5
+        while self.alive(pid) and time.monotonic() < deadline:
+            time.sleep(0.05)
+        self.assertFalse(self.alive(pid), "真 server 成了孤儿")
+
+    def test_without_the_watchdog(self):
+        server, pid = self.spawn(watchdog=False)
+        started = time.monotonic()
+        server._shutdown_proc()
+        self.assertLess(time.monotonic() - started, 10)
+        deadline = time.monotonic() + 5
+        while self.alive(pid) and time.monotonic() < deadline:
+            time.sleep(0.05)
+        self.assertFalse(self.alive(pid))
+
+    def test_parent_outwaits_the_watchdogs_grace(self):
+        from xiaoyu import mcp_watchdog
+
+        server, _ = self.spawn(watchdog=True)
+        self.assertGreater(server._terminate_wait, mcp_watchdog.TERM_GRACE)
+        server._shutdown_proc()
+
+    def test_descendants_are_found_before_the_parent_dies(self):
+        server, pid = self.spawn(watchdog=True)
+        self.assertIn(pid, mcp._descendants(server._proc.pid))
+        server._shutdown_proc()
 
 
 class RobustnessTest(unittest.TestCase):

@@ -27,8 +27,10 @@ spec 并行执行，全部收束后按**输入顺序**聚合成一份 report 带
 
 from __future__ import annotations
 
+import contextlib
 import threading
-from dataclasses import dataclass
+import time
+from dataclasses import dataclass, field
 from typing import Any, Callable
 
 from . import ui
@@ -41,7 +43,14 @@ from .agents import (
 )
 from .config import EFFORT_LEVELS, Config
 from .events import Notice, UISink
-from .fanout import Attempt, attach_partial, run_attempts
+from .fanout import (
+    BREAKER_STREAK,
+    HEARTBEAT_SECONDS,
+    Attempt,
+    ObservingSink,
+    attach_partial,
+    run_attempts,
+)
 from .providers import UnknownModel
 from .tools import Tool
 
@@ -63,12 +72,42 @@ _REPORT_BUDGET = 24_000
 _PER_ITEM_FLOOR = 600
 
 
-class _NullSink:
-    """批量运行时子 agent 的静默 sink：N 个 worker 的工具刷屏毫无可读性，
-    进度由七襄自己在主线程逐项播报。"""
+#  批量运行时子 agent 的 sink：工具刷屏不转发，告警与最近动作留着（见 ObservingSink）
+_NullSink = ObservingSink
 
-    def emit(self, event: Any) -> None:  # noqa: ARG002
-        pass
+
+def make_progress_reporter(
+    observers: list[tuple[str, ObservingSink, Callable[[], bool]]],
+    sink: Any,
+    badge: str,
+) -> Callable[[], None]:
+    """批量调度每个 tick 叫一次的播报：转述各项旁观到的告警；长时间没有任何一项
+    收束时，报一次还在跑的各项最近在干什么。observers 每项是
+    (标签, 旁观 sink, 这一项是否还在跑)。"""
+    state = {"quiet_since": time.monotonic()}
+
+    def report() -> None:
+        spoke = False
+        for label, observer, _running in observers:
+            for text in observer.drain():
+                spoke = True
+                sink.emit(Notice(f"  {badge} [{ui.preview(label, 40)}] {text}", "warn"))
+        now = time.monotonic()
+        if spoke:
+            state["quiet_since"] = now
+            return
+        if now - state["quiet_since"] < HEARTBEAT_SECONDS:
+            return
+        state["quiet_since"] = now
+        for label, observer, running in observers:
+            if running() and (activity := observer.activity()):
+                sink.emit(Notice(f"  {badge} [{ui.preview(label, 40)}] 仍在跑：{activity}"))
+
+    def settled() -> None:
+        state["quiet_since"] = time.monotonic()
+
+    report.settled = settled  # type: ignore[attr-defined]
+    return report
 
 
 @dataclass
@@ -84,6 +123,7 @@ class _ItemState:
     timed_out: bool = False
     started_at: float | None = None
     never_started: bool = False
+    observer: ObservingSink = field(default_factory=ObservingSink)
 
 
 def _status_of(state: _ItemState, cancelled: bool) -> str:
@@ -255,7 +295,7 @@ def make_qixiang_tool(
                     #  resume 项沿用上次的隔离，isolation 本就被忽略
                     isolation=None if state.resume_from else iso_value,
                     resume_from=state.resume_from,
-                    child_sink=_NullSink(),
+                    child_sink=state.observer,
                     on_agent=register,
                     #  批量并行写不许退回主工作区（worktree 建不出来=该项不执行）。
                     #  resume 项看的是存档里"上次是否隔离"，与本批的 isolation 无关
@@ -268,25 +308,44 @@ def make_qixiang_tool(
 
             return primary
 
-        def follow_up(run_id: str, register: Any) -> DelegationResult:
-            #  追问轮一律收紧到 read-only：它只要一份更完整的交接，不需要写；
-            #  首轮的干净 worktree 已被回收，只读续跑直接在主工作区看即可，
-            #  不必为一轮追问重建目录
-            return execute_delegation(
-                target, config, registry, usage, sink, locked_approver,
-                permissions, runs, mcp_manager,
-                task=_CONTINUATION_TASK,
-                capability_mode="read-only",
-                resume_from=run_id,
-                child_sink=_NullSink(),
-                on_agent=register,
-                effort_override=effort_level,
-            )
+        def make_follow_up(state: _ItemState) -> Any:
+            def follow_up(run_id: str, register: Any) -> DelegationResult:
+                #  追问轮一律收紧到 read-only：它只要一份更完整的交接，不需要写；
+                #  首轮的干净 worktree 已被回收，只读续跑直接在主工作区看即可，
+                #  不必为一轮追问重建目录
+                return execute_delegation(
+                    target, config, registry, usage, sink, locked_approver,
+                    permissions, runs, mcp_manager,
+                    task=_CONTINUATION_TASK,
+                    capability_mode="read-only",
+                    resume_from=run_id,
+                    child_sink=state.observer,
+                    on_agent=register,
+                    effort_override=effort_level,
+                )
+
+            return follow_up
 
         attempts = [
-            Attempt(index=state.index, primary=make_primary(state), follow_up=follow_up)
+            Attempt(
+                index=state.index, primary=make_primary(state), follow_up=make_follow_up(state)
+            )
             for state in states
         ]
+        for state in states:
+            state.observer.label = state.label
+
+        def still_running(attempt: Attempt) -> Callable[[], bool]:
+            return lambda: (
+                attempt.started_at is not None and attempt.result is None
+                and not attempt.crash and not attempt.never_started
+            )
+
+        progress = make_progress_reporter(
+            [(state.label, state.observer, still_running(attempt))
+             for state, attempt in zip(states, attempts)],
+            sink, "🕸 七襄",
+        )
 
         def copy_back(state: _ItemState, attempt: Attempt) -> None:
             state.result = attempt.result
@@ -297,6 +356,7 @@ def make_qixiang_tool(
         def on_settled(attempt: Attempt, settled: int, total_n: int) -> None:
             state = states[attempt.index]
             copy_back(state, attempt)
+            progress.settled()
             status = _status_of(state, cancelled=False)
             mark = {"completed": "✓", "failed": "✗", "partial": "◐"}.get(status, "⊘")
             sink.emit(
@@ -315,29 +375,37 @@ def make_qixiang_tool(
         )
         def report(cancelled: bool) -> str:
             return _report(
-                states, attempts, cancelled=cancelled, spec_name=spec_name,
+                states, attempts, cancelled=cancelled, tripped=tripped[0], spec_name=spec_name,
                 model_name=model_name, effort_level=effort_level, concurrency=concurrency,
                 timeout_s=timeout_s, per_item_cap=per_item_cap, sink=sink,
             )
 
+        tripped = [""]
         try:
-            run_attempts(
+            tripped[0] = run_attempts(
                 attempts,
                 concurrency=concurrency,
                 timeout_s=timeout_s,
                 min_answer_chars=MIN_ANSWER_CHARS,
                 on_settled=on_settled,
                 stop_requested=stop_requested,
-            )
+                on_tick=progress,
+                breaker=BREAKER_STREAK,
+            ) or ""
         except BaseException as exc:
             #  用户打断 / 宿主叫停：照样往上抛，但已收束各项的结论与 resume 句柄
             #  随异常带出去——不带的话存档还在，句柄却没人知道
             attach_partial(exc, lambda: report(cancelled=True))
             raise
+        finally:
+            #  最后一个 tick 之后才冒出来的告警也要转述
+            with contextlib.suppress(Exception):
+                progress()
         return report(cancelled=False)
 
     def _report(
         states: list[_ItemState], attempts: list[Attempt], *, cancelled: bool,
+        tripped: str = "",
         spec_name: str, model_name: str, effort_level: str, concurrency: int,
         timeout_s: int, per_item_cap: int, sink: Any,
     ) -> str:
@@ -404,6 +472,8 @@ def make_qixiang_tool(
             f"（共 {len(states)} 项，并发 {concurrency}）"
         )
         hints: list[str] = []
+        if tripped:
+            hints.append(f"⚠ {tripped}——这不是换一项就能好的问题，先把它解决再重跑。")
         if retry_ids:
             resume_obj = ", ".join(f'"{rid}": "<续跑指令>"' for rid in retry_ids[:4])
             hints.append(

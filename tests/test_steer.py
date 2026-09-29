@@ -109,6 +109,72 @@ class SteerTest(AgentTestCase):
         self.assertEqual(agent.drain_steers(), [])
 
 
+class TurnCountingTest(AgentTestCase):
+    """中途插话是用户的原话，但不是一轮的开头。"""
+
+    def run_two_turns_with_a_steer(self):
+        from xiaoyu.agent import SYNTHETIC_USER_TEXTS
+
+        agent = None
+
+        def on_event(event):
+            if isinstance(event, TextEnd) and not fired:
+                fired.append(True)
+                agent.steer("顺便把测试也跑一下")
+
+        fired: list = []
+        sink = ListSink(on_event)
+        agent = self.build(
+            [[chunk(content="第一轮答完")], [chunk(content="测试也跑了")], [chunk(content="第二轮")]],
+            sink=sink,
+        )
+        agent.send("第一个问题")
+        agent.send("第二个问题")
+        return agent, SYNTHETIC_USER_TEXTS
+
+    def test_steer_is_not_counted_as_a_turn(self):
+        from xiaoyu import media
+        from xiaoyu.session_log import turn_starts
+
+        agent, synthetic = self.run_two_turns_with_a_steer()
+        steers = [m for m in agent.messages if m.get(media.MIDTURN_KEY)]
+        self.assertEqual(len(steers), 1)
+        starts = turn_starts(agent.messages, synthetic)
+        self.assertEqual(
+            [agent.messages[index]["content"] for index in starts], ["第一个问题", "第二个问题"]
+        )
+
+    def test_old_logs_without_the_mark_are_recognised_by_wording(self):
+        from xiaoyu.session_log import turn_starts
+
+        messages = [
+            {"role": "system", "content": "s"},
+            {"role": "user", "content": "第一个问题"},
+            {"role": "assistant", "content": "答"},
+            {"role": "user", "content": wrap_interjection("插一句")},
+            {"role": "assistant", "content": "好"},
+        ]
+        self.assertEqual(turn_starts(messages), [1])
+
+    def test_steer_still_counts_as_the_users_own_words(self):
+        """压缩时要当原话备份：不能被归进 harness 注入的那一类。"""
+        from xiaoyu import media
+
+        agent, synthetic = self.run_two_turns_with_a_steer()
+        (steer,) = [m for m in agent.messages if m.get(media.MIDTURN_KEY)]
+        self.assertFalse(media.is_injected_message(steer, synthetic))
+
+    def test_the_mark_never_leaves_the_process(self):
+        from xiaoyu import media
+
+        from xiaoyu import responses
+
+        agent, _ = self.run_two_turns_with_a_steer()
+        #  出网口统一摘掉下划线开头的私有键；桩 client 接在那之前，所以直接验出网口
+        for message in responses.strip_private(agent.messages):
+            self.assertNotIn(media.MIDTURN_KEY, message)
+
+
 class WrapInterjectionTest(unittest.TestCase):
     """插话的包装格式：说明 + <user_query> + 收尾提醒。"""
 

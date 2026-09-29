@@ -43,7 +43,7 @@ from .compaction import (
     is_degenerate_summary,
     microcompact,
 )
-from .config import Config
+from .config import EFFORT_LEVELS, Config
 from .errors import Interrupted, classify
 from .providers import Registry, Route, UnknownModel
 from .permissions import Permissions
@@ -71,7 +71,7 @@ from .messages import (
     supports_task_budget,
 )
 from .responses import OPERATOR_KEY, REASONING_KEY, TOOL_EXTRAS_KEY
-from .tools import PURPOSE_PARAM, Tool, Toolbox, wrap_untrusted
+from .tools import PURPOSE_PARAM, Tool, Toolbox, coerce_to_schema, wrap_untrusted
 
 #  approver(tool_name, args) -> True=允许；(True, 附言)=允许且附言随 tool result
 #  回灌模型；False / "" / (False, 理由)=拒绝；非空 str（或 Deny.reason）=拒绝并附理由。
@@ -263,6 +263,19 @@ EMPTY_REPLY_NUDGE = (
     "总结改了什么、用户接下来如何验证。"
 )
 
+#  回复撞了输出长度上限时的续写指令。「发继续可接着写」只对坐在终端前的人成立：
+#  子 agent、批量委托、serve 上没有人会发，父级拿到半截结果还被告知正常完成。
+#  必须带上"拆小"——最常见的是一个超大的 write_file 参数被截断，原样再来一次
+#  只会在同一处再截一次。
+TRUNCATED_CONTINUE_NUDGE = (
+    "你上一条回复撞到了输出长度上限，在中途被截断。"
+    "请从断点接着往下，不要重复已经输出的内容，也不必为此道歉或复述。"
+    "如果被截断的是工具调用的参数（比如一次写入很长的文件），"
+    "把它拆成几次更小的调用：先写开头一段，再分次追加。"
+)
+#  一轮里最多续写几次：每次续写都是一次完整的模型调用，模型若始终拆不小就别再烧了
+MAX_TRUNCATION_CONTINUES = 3
+
 #  达到单轮工具调用上限时的收尾指令：与其静默截断，不如让模型交代现场
 WRAPUP_INSTRUCTION = """已达到本轮工具调用次数上限，请立刻停止操作，不要再调用任何工具。
 直接用几句话总结：
@@ -440,7 +453,7 @@ PLAN_MODE_LEAVE_NOTE = "[系统提示] 用户已关闭 plan mode，可以正常�
 #  插话包装：中途插话裸放进历史时，
 #  模型容易把它当成全新任务、丢下在飞的活儿改道。三件套对症：说明这是工作
 #  中途来的消息 + <user_query> 划清消息边界 + 尾句提醒把旧账收完。
-INTERJECTION_NOTE = "用户在你工作过程中发来一条消息："
+INTERJECTION_NOTE = media.MIDTURN_PREFIX
 INTERJECTION_TAIL = "处理这条消息，同时确保完成之前尚未完成的任务，不要把在做的事丢在半路。"
 #  超长插话的截断上限（字符数。Python 按字符切片，天然不会切坏多字节字符，
 #  无需额外的 UTF-8 边界对齐）
@@ -492,6 +505,7 @@ SYNTHETIC_USER_TEXTS = frozenset(
         BUDGET_WRAPUP_INSTRUCTION,
         TURN_EXTENSION_OFFER,
         EMPTY_REPLY_NUDGE,
+        TRUNCATED_CONTINUE_NUDGE,
         PLAN_MODE_ENTER_NOTE,
         PLAN_MODE_LEAVE_NOTE,
         CRYSTALLIZE_NUDGE,
@@ -788,6 +802,16 @@ def _schema_problems(value: Any, schema: dict[str, Any], path: str = "$") -> lis
 SERVER_COMPACTION_FALLBACK = 0.92
 
 class Agent:
+    #  上一次流的收尾状态（每次发请求前重置）。类级默认值：没发过请求就被问到也有定义
+    _length_truncated = False
+    _truncation_had_output = False
+    _content_filtered = False
+    _completion_tokens: int | None = None
+    _prompt_tokens_seen: int | None = None
+    _request_clock: float | None = None
+    _first_chunk_at: float | None = None
+    _response_id = ""
+
     def __init__(
         self,
         config: Config,
@@ -970,6 +994,8 @@ class Agent:
         self._last_route: tuple[str, str] | None = None
         #  拒收"跳过缓存读取"字段（400/422）的 provider：本会话对它们不再带（见 _stream_retrying）
         self._cache_bypass_refused: set[str] = set()
+        #  已经说过「这条路由不认这一档」的组合，不每次请求都说一遍
+        self._effort_notified: set[tuple[str, str]] = set()
         self.compactor = Compactor(
             context_limit=config.context_limit,
             compact_at=config.compact_at,
@@ -1409,6 +1435,10 @@ class Agent:
         )
         if skills_block:
             segments.append(("技能索引", skills_block))
+        #  日期放在最后：它每天变一次，排在末尾就只让它自己这一小段错过缓存
+        segments.append(
+            ("日期", f"\n\n今天是 {world_state.today()}。会话跨天时会另行告知。")
+        )
         return segments
 
     def context_breakdown(self) -> list[tuple[str, int]]:
@@ -1528,7 +1558,7 @@ class Agent:
     def _structured_output(self, **data: Any) -> str:
         schema = self.output_schema or {}
         wrapped = schema.get("type") != "object" or "properties" not in schema
-        value = data.get("value") if wrapped else data
+        value = coerce_to_schema(data.get("value") if wrapped else data, schema)
         problems = _schema_problems(value, schema)
         if problems:
             return "ERROR: 结果不符合 schema：" + "；".join(problems[:5]) + "。请修正后重新调用。"
@@ -2244,7 +2274,9 @@ class Agent:
         """
         consumed = self._consume_inbox(midturn=True)
         for text in self.drain_steers():
-            self._record({"role": "user", "content": wrap_interjection(text)})
+            self._record(
+                {"role": "user", "content": wrap_interjection(text), media.MIDTURN_KEY: True}
+            )
             self.sink.emit(SteerAccepted(text))
             if self.session_log:
                 self.session_log.event("steer")
@@ -2286,6 +2318,16 @@ class Agent:
         后台任务通知走 _record_injected）。
         """
         self._record({"role": "user", "content": text, OPERATOR_KEY: True})
+
+    def _continue_after_truncation(self, attempt: int) -> None:
+        if self.session_log:
+            self.session_log.event("truncated_continue", attempt=attempt)
+        self.sink.emit(
+            Notice(
+                f"[已请模型从断点接着写（{attempt}/{MAX_TRUNCATION_CONTINUES}）]", "warn"
+            )
+        )
+        self._record_operator(TRUNCATED_CONTINUE_NUDGE)
 
     def _record_injected(self, text: str) -> None:
         """harness 放进历史、但内容不可信的消息：出网永远是 role=user。
@@ -2472,6 +2514,8 @@ class Agent:
         nudged_structured = False
         #  「只说不做」轻推每轮只顶一次：模型再 narration 一次就放它收尾，不成死循环
         nudged_promise = False
+        #  撞输出长度上限后的自动续写次数（上限 MAX_TRUNCATION_CONTINUES）
+        truncations = 0
         #  轮数预算：撞顶可申请延期（见 _offer_extension），总追加量有上限
         steps = 0
         turn_budget = self.config.max_iterations
@@ -2497,8 +2541,29 @@ class Agent:
             self._begin_step()
             message = self._stream_with_recovery()
             self._record(message)
+            truncated = self._length_truncated
+            #  什么都没吐出来就撞了上限（输出额度被推理吃光）：没有断点可接，
+            #  续写只会原样再来一次
+            resumable = truncated and self._truncation_had_output
+            if resumable and truncations >= MAX_TRUNCATION_CONTINUES:
+                resumable = False
+                self.sink.emit(
+                    Notice(
+                        f"[连续 {MAX_TRUNCATION_CONTINUES} 次撞到输出长度上限，不再自动续写。"
+                        "发「继续」可接着写]",
+                        "warn",
+                    )
+                )
 
             calls = message.get("tool_calls")
+            if truncated and not calls:
+                if not resumable:
+                    #  宿主和父 agent 要能把"没说完"和"正常收尾"分开
+                    self.last_stop = "truncated"
+                    return
+                truncations += 1
+                self._continue_after_truncation(truncations)
+                continue
             if not calls:
                 if media.text_of(message.get("content")).strip():
                     #  模型已给出收尾正文，但期间用户插了话：不结束本轮，
@@ -2596,6 +2661,10 @@ class Agent:
                 #  同一批里后面的调用不该在打断之后照跑
                 self._checkpoint()
                 self._record(self._execute(call))
+            if resumable:
+                #  截断前写完整的调用照常执行了，被丢弃的那个还得重来——同样要提醒拆小
+                truncations += 1
+                self._continue_after_truncation(truncations)
             #  structured_output 已落：这就是收尾，不再让模型多说一轮
             if self.output_schema is not None and self.structured_output is not None:
                 return
@@ -3299,6 +3368,10 @@ class Agent:
     _RECOVERY_DELAY = 2.0
     #  单次退避上限（秒）：指数递增和 Retry-After 都不许超过它
     _RECOVERY_MAX_DELAY = 60.0
+    #  服务端点名要等的时长超过上面那条线时：还有别的路由就直接换（原地等到上限再发
+    #  必然再挨一次、白耗预算）；没有别的路由可换才老实等，最多等到这条线。再长就
+    #  不等了，把服务端要求的时长如实报给用户
+    _RECOVERY_LONG_WAIT = 300.0
     #  一次请求（整条降级链）共享的重试预算：每条路由的首次尝试不计，只计重试。
     #  不共享时 N 条路由 × 每条 3 次，一次持续故障放大成 3N 个请求、十几分钟退避；
     #  共享后最坏 N + 4 次，而每条路由仍至少被试一次
@@ -3426,7 +3499,10 @@ class Agent:
                 #  粘性状态仍是单个字符串，/model、banner、SessionLog 都不用改。
                 self.switch_model(self.registry.sticky_name(route), sticky=True)
             try:
-                return self._stream_retrying(route, with_tools=with_tools, budget=budget)
+                return self._stream_retrying(
+                    route, with_tools=with_tools, budget=budget,
+                    has_alternative=index < len(chain) - 1,
+                )
             except _DeterministicEmpty as exc:
                 #  确定性空补全：同一路由再发也是空，直接换下一条路由。已是最后一条
                 #  就把空消息交回去，由 send() 的空回复护栏（nudge → 显式告警）兜底，
@@ -3501,7 +3577,11 @@ class Agent:
         return message
 
     def _stream_retrying(
-        self, route: Route, with_tools: bool = True, budget: "_RetryBudget | None" = None
+        self,
+        route: Route,
+        with_tools: bool = True,
+        budget: "_RetryBudget | None" = None,
+        has_alternative: bool = False,
     ) -> dict[str, Any]:
         """单个模型内的重试层：分类后退避重试，耗尽或不可重试则抛出。
 
@@ -3530,7 +3610,12 @@ class Agent:
             attempt += 1
             try:
                 message = self._stream_once(route, with_tools=with_tools, bypass_cache=after_empty)
-                if not media.text_of(message.get("content")).strip() and not message.get("tool_calls"):
+                empty = (
+                    not media.text_of(message.get("content")).strip()
+                    and not message.get("tool_calls")
+                )
+                self._log_request(route, attempt, "empty" if empty else "ok")
+                if empty:
                     zero_streak = zero_streak + 1 if self._completion_tokens == 0 else 0
                     if zero_streak >= self._DETERMINISTIC_EMPTY:
                         self.sink.emit(
@@ -3558,6 +3643,44 @@ class Agent:
                 #  中间夹了一次报错就不算"连续"
                 zero_streak = 0
                 verdict = classify(exc)
+                if errors.thinking_rejected(exc):
+                    #  历史一被改写，绑定前缀的 thinking 块本该当场作废（_history_rewritten）。
+                    #  走到这里说明有一处漏了，或这个端点的校验规则和官方不一样。不修的话
+                    #  那些块还在历史里，之后每一次请求都是同一个 400，会话就此卡死
+                    dropped = invalidate_bound_thinking(self.messages)
+                    if dropped:
+                        self._log_request(route, attempt, "error", exc=exc, verdict=verdict)
+                        if self.session_log:
+                            self.session_log.event(
+                                "thinking_rejected", route=route.qualified, dropped=dropped
+                            )
+                        self.sink.emit(
+                            Notice(
+                                f"[{route.qualified} 拒收了历史里的推理内容，"
+                                f"已丢弃 {dropped} 段后重发（回答不受影响，只少了一段推理连续性）]",
+                                "warn",
+                            )
+                        )
+                        #  丢了才重发，所以至多发生一次：下回再拒时已经没有可丢的
+                        attempt -= 1
+                        continue
+                retrying = (
+                    verdict.retryable
+                    and attempt < self._RECOVERY_ATTEMPTS
+                    and not errors.told_not_to_retry(exc)
+                )
+                asked = errors.retry_after_asked(exc)
+                if retrying and asked is not None and asked > self._RECOVERY_MAX_DELAY:
+                    if has_alternative or asked > self._RECOVERY_LONG_WAIT:
+                        retrying = False
+                        self.sink.emit(
+                            Notice(
+                                f"[{verdict.hint}：{route.qualified} 要求等 {asked:.0f}s，"
+                                + ("不原地等，换下一条路由]" if has_alternative
+                                   else "超出愿意等的时长，这次不重试]"),
+                                "warn",
+                            )
+                        )
                 if (
                     after_empty
                     and not verdict.should_compact
@@ -3575,24 +3698,29 @@ class Agent:
                             "warn",
                         )
                     )
+                    self._log_request(route, attempt, "error", exc=exc, verdict=verdict)
                     attempt -= 1
                     continue
                 if verdict.should_compact:
                     #  上下文超限：本地估算低估了才会走到这，立刻强制压缩
                     self.maybe_compact(force=True)
-                if not verdict.retryable or attempt == self._RECOVERY_ATTEMPTS:
+                if not retrying:
+                    self._log_request(route, attempt, "error", exc=exc, verdict=verdict)
                     raise
                 if budget is not None and not budget.take():
                     #  全链预算用完：交给外层换下一条路由（每条路由仍至少试一次）
+                    self._log_request(route, attempt, "error", exc=exc, verdict=verdict)
                     raise
                 #  服务端给了 Retry-After 就听它的；否则用指数退避。
                 #  再乘 ±25% jitter：
                 #  同一网关后面的多个会话同时被限流时，不 jitter 会同时醒来再挤一次。
                 #  退避等待始终打印出来：用户看得见在等什么，不会误判成假死。
-                wait = min(
-                    errors.retry_after_seconds(exc) or delay, self._RECOVERY_MAX_DELAY
-                )
-                wait *= random.uniform(0.75, 1.25)
+                if asked is not None:
+                    #  服务端点了名就照它说的等，只往上抖：早于它说的时刻醒来必然再挨一次
+                    wait = min(asked, self._RECOVERY_LONG_WAIT) * random.uniform(1.0, 1.1)
+                else:
+                    wait = min(delay, self._RECOVERY_MAX_DELAY) * random.uniform(0.75, 1.25)
+                self._log_request(route, attempt, "error", exc=exc, verdict=verdict, wait=wait)
                 self.sink.emit(
                     Notice(
                         f"[{verdict.hint}，{wait:.1f}s 后重试"
@@ -3604,6 +3732,89 @@ class Agent:
                 self._sleep(wait)
                 delay *= 2
         raise RuntimeError("unreachable")  # for 循环里必然 return 或 raise
+
+    def _effort_on(self, route: Route) -> str:
+        """这次请求带哪一档推理深度。
+
+        用户给自己点名的模型配的档位原样发：不认就让上游 400，宁可报错也不静默改。
+        但档位是跟着会话走的，换到降级链上的模型、或由子 agent 继承过去时，没有
+        人为这个组合点过头——主模型宕机、最需要降级的时候，却因为备用模型不认
+        这一档而 400。这些场合就近换成它认的一档，并说一声。
+        """
+        wanted = self.config.effort
+        primary = self._preferred_model or self.config.model
+        chosen_by_user = (
+            self.config.subagent_depth == 0
+            and route.model == self.registry._pinned(primary)[1]  # noqa: SLF001
+        )
+        if chosen_by_user:
+            return wanted
+        effort = providers.effort_for(route.provider, route.model, wanted, EFFORT_LEVELS)
+        if effort != wanted and (route.qualified, wanted) not in self._effort_notified:
+            self._effort_notified.add((route.qualified, wanted))
+            self.sink.emit(
+                Notice(
+                    f"[{route.qualified} 不认推理深度 {wanted}，这条路由上改用 {effort}]", "info"
+                )
+            )
+        return effort
+
+    def _log_request(
+        self,
+        route: Route,
+        attempt: int,
+        outcome: str,
+        *,
+        exc: BaseException | None = None,
+        verdict: Any = None,
+        wait: float | None = None,
+    ) -> None:
+        """每次模型请求（含每次重试）在会话日志里留一条事实。
+
+        重试、退避、换路由只发通知给当时坐在屏幕前的人，事后从日志里回答不了
+        "哪家失败了几次、什么状态码、等了多久、首字用了多长"。记的是事实，不含正文。
+        留痕本身出错不能连累请求。
+        """
+        if not self.session_log:
+            return
+        try:
+            now = time.monotonic()
+            started = getattr(self, "_request_clock", None)
+            first = getattr(self, "_first_chunk_at", None)
+            fields: dict[str, Any] = {
+                "provider": route.provider, "model": route.model,
+                "attempt": attempt, "outcome": outcome,
+            }
+            if started is not None:
+                fields["total_ms"] = round((now - started) * 1000)
+                if first is not None:
+                    fields["first_chunk_ms"] = round((first - started) * 1000)
+            if exc is None:
+                fields["prompt_tokens"] = getattr(self, "_prompt_tokens_seen", None)
+                fields["completion_tokens"] = self._completion_tokens
+                if self._length_truncated:
+                    fields["finish"] = "length"
+                elif self._content_filtered:
+                    fields["finish"] = "content_filter"
+                if getattr(self, "_response_id", ""):
+                    fields["response_id"] = self._response_id
+            else:
+                fields["error"] = type(exc).__name__
+                fields["message"] = str(exc)[:300]
+                if verdict is not None:
+                    fields["error_kind"] = verdict.kind
+                status = getattr(exc, "status_code", None)
+                if isinstance(status, int):
+                    fields["status"] = status
+                if code := errors.error_code(exc):
+                    fields["code"] = code
+                if found := errors.request_id(exc):
+                    fields["request_id"] = found
+                if wait is not None:
+                    fields["wait_s"] = round(wait, 2)
+            self.session_log.event("request", **fields)
+        except Exception:  # noqa: BLE001
+            pass
 
     def _cache_bypass_body(self, route: Route) -> dict[str, Any] | None:
         """这条路由空补全重发时并进请求体的"跳过缓存读取"字段；不该带返回 None。"""
@@ -3664,7 +3875,7 @@ class Agent:
         if self.config.effort:
             #  统一用 chat 的名字出内核；Responses / Messages 两路在 Transport
             #  里各自翻译（见 responses.to_request / messages.to_request）
-            request["reasoning_effort"] = self.config.effort
+            request["reasoning_effort"] = self._effort_on(route)
         if (
             with_tools
             and (hint := self._task_budget_hint()) is not None
@@ -3697,9 +3908,15 @@ class Agent:
         self.sink.emit(RequestStarted(route.model))
         self._content_filtered = False
         self._length_truncated = False
+        self._truncation_had_output = False
         self._stream_finished = False
         #  这次请求 usage 报的 completion_tokens；None = 没收到 usage（判不出）
         self._completion_tokens: int | None = None
+        #  请求级留痕用（见 _log_request）：起点、首个 chunk 到达的时刻、上游响应编号
+        self._request_clock = time.monotonic()
+        self._first_chunk_at: float | None = None
+        self._response_id = ""
+        self._prompt_tokens_seen: int | None = None
         try:
             stream = route.client.chat.completions.create(**request)
             self._consume_stream(route, stream, content_parts, pending, reasoning)
@@ -3764,8 +3981,10 @@ class Agent:
             marker = "[输出达到模型长度上限，在此截断" + (
                 f"；{dropped} 个没写完的工具调用已丢弃]" if dropped else "]"
             )
+            self._truncation_had_output = bool(text.strip() or dropped or pending)
             text = f"{text}\n{marker}" if text else marker
-            self.sink.emit(Notice(marker + ("——发「继续」可接着写" if not pending else ""), "warn"))
+            #  接下来怎么办（自动续写 / 到此为止）由轮循环说，这里只报事实
+            self.sink.emit(Notice(marker, "warn"))
 
         if text or pending:
             #  空补全不算出了回复：它会被原地重发，交代留给真出内容的那次
@@ -3879,11 +4098,16 @@ class Agent:
             #  Interrupted（KeyboardInterrupt 子类）复用 _stream_once 里
             #  现成的收尾分支——半截话入历史、残缺 tool_calls 丢弃。
             self._checkpoint()
+            if self._first_chunk_at is None:
+                self._first_chunk_at = time.monotonic()
+            if not self._response_id and isinstance(getattr(chunk, "id", None), str):
+                self._response_id = chunk.id
             if getattr(chunk, "usage", None):
                 #  收到 usage 即视为正常收尾：有些端点不发 finish_reason，只在
                 #  最后给一个纯 usage chunk（断流判定见 _stream_once）
                 self._stream_finished = True
                 prompt_tokens = chunk.usage.prompt_tokens or 0
+                self._prompt_tokens_seen = prompt_tokens
                 self._completion_tokens = chunk.usage.completion_tokens
                 self.usage.add(
                     route.qualified,
@@ -4219,10 +4443,13 @@ class Agent:
         #  过审时路径的落点：下面所有判定（越界、可执行配置、deny）都是对着它做的，
         #  执行前要再核一次它没被换走（见 Toolbox.target_moved）
         reviewed_target = self.toolbox.resolved_target(args)
+        #  用户自己写的 ask 规则同理：他要的就是"别的照常自动跑，唯独这一样先问我"
+        asked_by_rule = decision == "ask" and deny_rule is not None
         must_confirm = not self.config.unattended and (
             name == "exit_plan_mode"
             or (name == "bash" and bool(str(args.get("sandbox_permissions", "") or "").strip()))
             or guarded is not None
+            or asked_by_rule
         )
         #  auto 档：沙箱兜得住的那部分免确认（工作区内改文件、沙箱内跑命令）。
         #  写成 `not must_confirm and …` 而不是指望 exit_plan_mode 恰好不在
@@ -4243,12 +4470,15 @@ class Agent:
             (decision != "allow" or must_confirm)
             and not auto_ok
             and not plan_file_access
-            and self.toolbox.needs_approval(name, args)
+            #  ask 规则点了名的，连平时免确认的工具也要问
+            and (self.toolbox.needs_approval(name, args) or (asked_by_rule and must_confirm))
             and (must_confirm or not self.config.auto_approve)
         ):
             #  模型自述的调用目的：确认框上方展示，"这条命令要干嘛"不用人肉猜
             if purpose:
                 self.sink.emit(ToolPurpose(name, purpose))
+            if asked_by_rule:
+                self.sink.emit(Notice(f"  ⚠ 命中了你配置的规则「{deny_rule}」，这一步要你点头", "warn"))
             if guarded is not None:
                 #  为什么这一笔在 auto / --yolo 下也要问，得让人看得见
                 self.sink.emit(Notice(f"  ⚠ 要写的是可执行配置——{guarded}", "warn"))

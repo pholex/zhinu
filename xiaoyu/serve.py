@@ -81,6 +81,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import copy
+import hashlib
 import hmac
 import json
 import sys
@@ -155,6 +156,9 @@ DEFAULT_BUFFER = 5000
 #  只在开轮/收尾写又不够——轮中进程被杀时盘上还是开轮时的水位，重启后从那里接号
 #  就是把已经发给客户端的序号再发一遍（客户端拿旧游标一条都拉不到）。
 SEQ_RESERVE_BLOCK = 1000
+#  每个会话记住最近多少个幂等键，以及键的长度上限
+IDEMPOTENCY_KEEP = 64
+IDEMPOTENCY_KEY_MAX = 200
 #  单条事件里超长字符串字段的上限。工具输出（尤其 bash / read）可以是 MB 级，
 #  常驻服务把它们全留在内存里迟早撑爆。截断处标记 *_truncated 与原始长度，
 #  客户端看得见自己拿到的是截断版。
@@ -394,6 +398,8 @@ class _Session:
         #  已落盘的预留线与"越线了，去落盘"的回调（装配时接上清单存储）
         self.seq_reserved = 0
         self.on_reserve: Callable[[], None] | None = None
+        #  幂等键 → 那一次提交的记录（轮号、指令摘要、任务、结果）。在跑的那条不淘汰
+        self.submissions: dict[str, dict[str, Any]] = {}
         self._tick = asyncio.Event()
 
         self.pending: dict[str, _Pending] = {}
@@ -530,6 +536,7 @@ class _Session:
             "first_seq": self.first_seq,
             "dropped_events": self.dropped,
             "last_result": self.last_result,
+            "in_flight": self.in_flight,
             "lost_turn": self.lost_turn,
             "updated_at": self.updated_at,
         }
@@ -1265,8 +1272,67 @@ def create_app(cfg: ServeConfig):  # noqa: C901 - 路由表天然长，拆开反
         if session.mcp_manager is not None:
             session.mcp_manager.close()
 
+    def earlier_submission(session: _Session, key: str, text: str) -> dict[str, Any] | None:
+        """带着同一个幂等键的上一次提交；没有返回 None。
+
+        编排器等不到响应就会重发（同步端点最常见：它自己的 HTTP 超时先到）。那一轮
+        其实已经跑完、或还在跑——再开一轮就是把同一件事做两遍，副作用也落两遍。
+        """
+        if not key:
+            return None
+        if len(key) > IDEMPOTENCY_KEY_MAX:
+            raise HTTPException(
+                status_code=400, detail=f"Idempotency-Key 太长（上限 {IDEMPOTENCY_KEY_MAX} 字符）"
+            )
+        digest = hashlib.sha256(text.encode("utf-8")).hexdigest()[:16]
+        record = session.submissions.get(key)
+        if record is not None:
+            if record["digest"] != digest:
+                raise HTTPException(
+                    status_code=409,
+                    detail="这个 Idempotency-Key 已经用在另一条指令上了；新的指令请换一个键",
+                )
+            return record
+        lost = session.lost_turn or {}
+        if lost.get("key") == key:
+            #  服务重启前这个键对应的那一轮没跑完。做到哪一步、副作用落没落地说不清，
+            #  悄悄重跑是替调用方做了一个它没同意的决定
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"带着这个 Idempotency-Key 的第 {lost.get('turn')} 轮在服务重启前没跑完，"
+                    "不自动重跑。先看 /status 与会话历史确认它做到了哪一步；"
+                    "确定要重做就换一个键提交"
+                ),
+            )
+        return None
+
+    def remember_submission(session: _Session, key: str, text: str, task: asyncio.Task) -> None:
+        if not key:
+            return
+        record: dict[str, Any] = {
+            "digest": hashlib.sha256(text.encode("utf-8")).hexdigest()[:16],
+            "turn": session.turns + 1,
+            "task": task,
+            "result": None,
+        }
+        session.submissions[key] = record
+
+        def settle(done: asyncio.Task) -> None:
+            record["task"] = None
+            if not done.cancelled() and done.exception() is None:
+                record["result"] = done.result()
+
+        task.add_done_callback(settle)
+        finished = [name for name, item in session.submissions.items() if item["task"] is None]
+        for name in finished[: max(0, len(session.submissions) - IDEMPOTENCY_KEEP)]:
+            session.submissions.pop(name, None)
+
     async def start_turn(
-        session: _Session, text: str, output_schema: dict[str, Any] | None = None
+        session: _Session,
+        text: str,
+        output_schema: dict[str, Any] | None = None,
+        key: str = "",
     ) -> asyncio.Task:
         """开一轮。已经在跑就 409——同步架构下同一 Agent 一次只能跑一轮，
         默默排队会让编排器以为自己的第二次提交立刻生效了。"""
@@ -1285,11 +1351,14 @@ def create_app(cfg: ServeConfig):  # noqa: C901 - 路由表天然长，拆开反
         session.error = ""
         session.lost_turn = None
         session.in_flight = {"turn": session.turns + 1, "started_at": time.time()}
+        if key:
+            session.in_flight["key"] = key
         #  开轮就落盘：进程在轮中被杀时，清单是唯一还能说出"有一轮没跑完"的地方
         manifests.save(session.manifest())
         session.publish("run.started", prompt=text)
         task = asyncio.create_task(_drive(session, text, output_schema))
         session._task = task
+        remember_submission(session, key, text, task)
         return task
 
     async def _drive(
@@ -1549,9 +1618,20 @@ def create_app(cfg: ServeConfig):  # noqa: C901 - 路由表天然长，拆开反
             embed=True,
             description="JSON Schema：要求本轮以符合它的对象收尾，结果在 result.output（模型没给则 null）",
         ),
+        idempotency_key: str = Header(
+            default="", description="重发同一次提交时带同一个键：不会再跑一轮，拿回的是那一轮的结果"
+        ),
     ) -> dict[str, Any]:
         session = pick(session_id)
-        task = await start_turn(session, text, output_schema)
+        key = idempotency_key.strip()
+        if (earlier := earlier_submission(session, key, text)) is not None:
+            task = earlier["task"]
+            result = await task if task is not None else earlier["result"]
+            return {
+                "session_id": session_id, **session.status_dict(),
+                "result": result, "duplicate": True, "turn": earlier["turn"],
+            }
+        task = await start_turn(session, text, output_schema, key)
         result = await task
         return {"session_id": session_id, **session.status_dict(), "result": result}
 
@@ -1572,9 +1652,18 @@ def create_app(cfg: ServeConfig):  # noqa: C901 - 路由表天然长，拆开反
             embed=True,
             description="JSON Schema：要求本轮以符合它的对象收尾，结果在 result.output（模型没给则 null）",
         ),
+        idempotency_key: str = Header(
+            default="", description="重发同一次提交时带同一个键：不会再跑一轮"
+        ),
     ) -> dict[str, Any]:
         session = pick(session_id)
-        await start_turn(session, text, output_schema)
+        key = idempotency_key.strip()
+        if (earlier := earlier_submission(session, key, text)) is not None:
+            return {
+                "session_id": session_id, "accepted": True, **session.status_dict(),
+                "duplicate": True, "turn": earlier["turn"],
+            }
+        await start_turn(session, text, output_schema, key)
         return {"session_id": session_id, "accepted": True, **session.status_dict()}
 
     @app.get(
@@ -1799,8 +1888,22 @@ def create_app(cfg: ServeConfig):  # noqa: C901 - 路由表天然长，拆开反
         dependencies=guard,
         operation_id="abort",
     )
-    async def session_abort(session_id: str) -> dict[str, Any]:
+    async def session_abort(
+        session_id: str,
+        turn: int | None = Body(
+            default=None, embed=True,
+            description="要打断的是第几轮（/status 的 in_flight）。给了就只打断那一轮：它已经结束、"
+            "在跑的是别的轮时什么都不做",
+        ),
+    ) -> dict[str, Any]:
         session = pick(session_id)
+        running = (session.in_flight or {}).get("turn") if session.busy else None
+        if turn is not None and turn != running:
+            #  迟到的 abort：它想停的那一轮已经结束，这时候打断只会误伤后面那一轮
+            return {
+                "session_id": session_id, "aborted": False, "running_turn": running,
+                "detail": f"第 {turn} 轮不在跑" + (f"（在跑的是第 {running} 轮）" if running else ""),
+            }
         session.async_agent.interrupt()
         #  打断时挂着审批的话，工作线程还堵在 Event 上——先把它放掉，
         #  否则 interrupt 要等到 approval_timeout 才生效

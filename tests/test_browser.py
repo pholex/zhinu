@@ -68,6 +68,43 @@ class ValidationTest(unittest.TestCase):
         out = self.session.run("fill", selector="#x")
         self.assertIn("text", out)
 
+    def test_open_refuses_schemes_that_are_not_pages(self):
+        for url in ("javascript:alert(1)", "chrome://settings", "view-source:https://x",
+                    "example.com"):
+            out = self.session.run("open", url=url)
+            self.assertTrue(out.startswith("ERROR"), url)
+            self.assertIn("协议", out)
+
+    def test_dialog_choice_is_validated(self):
+        out = self.session.run("snapshot", dialog="maybe")
+        self.assertTrue(out.startswith("ERROR"), out)
+
+    def test_falls_back_to_a_system_browser_when_the_bundled_one_is_missing(self):
+        attempts: list = []
+
+        class Launcher:
+            def launch(self, **kwargs):
+                attempts.append(kwargs.get("channel"))
+                if kwargs.get("channel") != "msedge":
+                    raise RuntimeError("Executable doesn't exist at /x/chromium")
+                return "edge"
+
+        self.session._pw = mock.Mock(chromium=Launcher())
+        self.assertEqual(self.session._launch(), "edge")
+        self.assertEqual(attempts, [None, "chrome", "msedge"])
+        self.assertEqual(self.session._launched_with, "msedge")
+        self.session._pw = None
+
+    def test_other_launch_failures_are_not_masked_by_the_fallback(self):
+        class Launcher:
+            def launch(self, **kwargs):
+                raise RuntimeError("sandbox 起不来")
+
+        self.session._pw = mock.Mock(chromium=Launcher())
+        with self.assertRaises(RuntimeError):
+            self.session._launch()
+        self.session._pw = None
+
     def test_close_without_start_is_fine(self):
         """没启动过就 close 不该炸——模型完全可能上来先 close。"""
         self.assertIn("关闭", self.session.run("close"))
@@ -87,6 +124,25 @@ class RegistrationTest(unittest.TestCase):
             enable_plugins=False,
         )
         self.box = Toolbox(self.config)
+
+    def test_local_files_outside_the_workspace_are_refused(self):
+        """file:// 加 read 能把任何本机文件读出来，绕过文件工具的全部护栏。"""
+        with mock.patch.object(browser, "session") as session:
+            out = self.box._browser("open", url="file:///etc/passwd")
+            self.assertTrue(out.startswith("ERROR"), out)
+            self.assertIn("工作区之外", out)
+            session.assert_not_called()
+            inside = self.box.config.workspace / "page.html"
+            inside.write_text("<title>ok</title>", encoding="utf-8")
+            session.return_value.run.return_value = "已打开"
+            self.assertEqual(self.box._browser("open", url=inside.as_uri()), "已打开")
+
+    def test_relative_screenshot_path_lands_in_the_workspace(self):
+        with mock.patch.object(browser, "session") as session:
+            session.return_value.run.return_value = "ok"
+            self.box._browser("screenshot", path="shots/a.png")
+            sent = session.return_value.run.call_args.kwargs["path"]
+        self.assertEqual(Path(sent), (self.box.config.workspace / "shots" / "a.png").resolve())
 
     def test_registered_with_gating(self):
         tool = self.box.get("browser")
@@ -124,6 +180,14 @@ class RealBrowserTest(unittest.TestCase):
     def tearDownClass(cls):
         cls.session.close()
 
+    def test_the_very_first_call_of_a_session_works(self):
+        """事件监听是在建页时挂上的：挂不上的话，每个会话的第一次调用就报错。"""
+        fresh = browser.BrowserSession()
+        self.addCleanup(fresh.close)
+        out = fresh.run("open", url=_PAGE)
+        self.assertNotIn("ERROR", out)
+        self.assertIn("probe", out)
+
     def test_open_returns_snapshot(self):
         out = self.session.run("open", url=_PAGE)
         self.assertIn("probe", out)
@@ -145,6 +209,64 @@ class RealBrowserTest(unittest.TestCase):
         self.session.run("open", url=_PAGE)
         out = self.session.run("click", selector="text=不存在的按钮")
         self.assertIn("ERROR", out)
+
+    def page(self, name: str, body: str) -> str:
+        """测试页落成文件再打开：data: 地址不声明字符集，中文会乱码；浏览器也
+        不许从链接跳到 data: 地址。"""
+        directory = tempfile.mkdtemp()
+        self.addCleanup(lambda: __import__("shutil").rmtree(directory, ignore_errors=True))
+        target = Path(directory) / name
+        target.write_text(
+            f"<!doctype html><meta charset='utf-8'><title>{name}</title>{body}", encoding="utf-8"
+        )
+        return target.as_uri()
+
+    CONFIRM = (
+        "<button onclick=\"document.getElementById('o').textContent="
+        "confirm('确定删除？') ? 'deleted' : 'kept'\">Del</button><div id='o'></div>"
+    )
+
+    def test_confirm_is_dismissed_by_default_and_the_model_is_told(self):
+        self.session.run("open", url=self.page("confirm.html", self.CONFIRM))
+        out = self.session.run("click", selector="text=Del")
+        self.assertIn("confirm", out)
+        self.assertIn("确定删除？", out)
+        self.assertIn("已取消", out)
+        self.assertIn("dialog=accept", out)
+        self.assertIn("kept", self.session.run("read"))
+
+    def test_confirm_can_be_accepted_on_request(self):
+        self.session.run("open", url=self.page("confirm.html", self.CONFIRM))
+        out = self.session.run("click", selector="text=Del", dialog="accept")
+        self.assertIn("已确认", out)
+        self.assertIn("deleted", self.session.run("read"))
+
+    def test_alert_does_not_block_and_is_reported(self):
+        body = (
+            "<button onclick=\"alert('保存成功'); "
+            "document.getElementById('o').textContent='after'\">Go</button><div id='o'></div>"
+        )
+        self.session.run("open", url=self.page("alert.html", body))
+        out = self.session.run("click", selector="text=Go")
+        self.assertIn("保存成功", out)
+        self.assertIn("已确认", out)
+        self.assertIn("after", self.session.run("read"))
+
+    def test_link_opening_a_new_tab_is_followed(self):
+        second = self.page("second-page.html", "<p>arrived</p>")
+        first = self.page("first.html", f"<a target='_blank' href='{second}'>Next</a>")
+        self.session.run("open", url=first)
+        out = self.session.run("click", selector="text=Next")
+        self.assertIn("新标签页", out)
+        self.assertIn("second-page", out)
+        self.assertIn("arrived", self.session.run("read"))
+        #  之后的动作落在新标签页上
+        self.assertIn("second-page", self.session.run("snapshot"))
+
+    def test_ordinary_click_stays_on_the_same_tab(self):
+        self.session.run("open", url=_PAGE)
+        out = self.session.run("click", selector="text=Add")
+        self.assertNotIn("新标签页", out)
 
     def test_screenshot_saves_file(self):
         self.session.run("open", url=_PAGE)

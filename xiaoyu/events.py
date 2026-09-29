@@ -20,6 +20,9 @@ TUI，将来可能的 headless/SSE/IDE 插件——消费同一套词汇。今�
 
 from __future__ import annotations
 
+import threading
+import time
+
 from dataclasses import asdict, dataclass
 from typing import Any, ClassVar, Literal, Protocol
 
@@ -160,3 +163,67 @@ class UISink(Protocol):
     """前端的唯一入口：消费事件流。实现方决定画在哪、怎么画、忽略哪些。"""
 
     def emit(self, event: UIEvent) -> None: ...
+
+
+#  同一句告警多久之内不重复转述
+REPEAT_WINDOW = 30.0
+
+
+class ObservingSink:
+    """子 agent 的旁观 sink：不转发正文和工具刷屏（N 个并发的刷屏毫无可读性），
+    但也不是什么都丢。
+
+    全丢的代价：重试、退避、换路由这些告警本来是为了"让人看得见在等什么、不会
+    误判成假死"才打印的，批量运行时却一句都出不来——卡在限流退避上和正在干活，
+    从外面看一模一样。这里只留两样：最近一次动作，和还没转述过的告警。
+
+    emit 在子 agent 的工作线程里被调用，所以只记不发；转述由调用方在自己的线程
+    里取走（drain）再发。
+    """
+
+    def __init__(self, label: str = "") -> None:
+        self.label = label
+        self._lock = threading.Lock()
+        self._last_tool = ""
+        self._last_at: float | None = None
+        self._last_warning = ""
+        self._queued: list[str] = []
+        self._said: dict[str, float] = {}
+
+    def emit(self, event: Any) -> None:
+        kind = getattr(event, "kind", "")
+        now = time.monotonic()
+        with self._lock:
+            if kind == "tool.running":
+                self._last_tool = str(getattr(event, "name", ""))
+                self._last_at = now
+            elif kind == "notice" and getattr(event, "level", "info") in ("warn", "error"):
+                text = str(getattr(event, "text", "")).strip()
+                if not text:
+                    return
+                self._last_warning = text
+                self._last_at = now
+                if now - self._said.get(text, float("-inf")) >= REPEAT_WINDOW:
+                    self._said[text] = now
+                    self._queued.append(text)
+            elif kind in ("request.started", "text.delta"):
+                self._last_at = now
+
+    def drain(self) -> list[str]:
+        """还没转述过的告警（取完即清）。"""
+        with self._lock:
+            queued, self._queued = self._queued, []
+        return queued
+
+    def activity(self) -> str:
+        """一句话：最近在干什么。还没有任何动静返回空串。"""
+        with self._lock:
+            tool, at, warning = self._last_tool, self._last_at, self._last_warning
+        if at is None:
+            return ""
+        parts = [f"{time.monotonic() - at:.0f}s 前还有动静"]
+        if tool:
+            parts.append(f"最近调用 {tool}")
+        if warning:
+            parts.append(f"最近告警 {warning}")
+        return "；".join(parts)

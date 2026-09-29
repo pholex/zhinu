@@ -2220,6 +2220,11 @@ def plugin_list_command(argv: list[str]) -> int:
         meta = recorded.get(name) or {}
         version = meta.get("version") or ""
         source = meta.get("source") or "（来源未知，装的时候没记上或账本被删过）"
+        #  来源可能是带令牌的 git 地址（https://user:token@host/…）：列表会被截图、
+        #  被贴进工单，账号密码不回显
+        from .mcp import _redact
+
+        source = _redact(str(source))
         head = ui.accent(name) + (f" {version}" if version else "")
         print(f"  {head}  {ui.secondary('·')}  {ui.secondary(source)}")
         skill_names = plugins.scan_bundle_skills(path)
@@ -3329,6 +3334,11 @@ def handle_slash(agent: Agent, line: str, select: Any = None) -> bool:
                 if skill.project:
                     origin = ui.secondary("  [工作区]")
                 print(f"  {skill.name}  {ui.secondary(skill.description or str(skill.path))}{origin}")
+            from . import skills as skills_mod
+
+            if hidden := skills_mod.disabled_skills(agent.config.workspace):
+                shown = "、".join(hidden[:12]) + (f" 等 {len(hidden)} 个" if len(hidden) > 12 else "")
+                print(ui.secondary(f"  已停用（{skills_mod.DISABLED_ENV}）：{shown}"))
     elif command == "/model":
         if rest:
             #  先解析再切：名字没人接就报错、原模型不动。否则"已切换到 grok"打了

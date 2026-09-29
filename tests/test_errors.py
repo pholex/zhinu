@@ -224,9 +224,34 @@ class RetryAfterTest(unittest.TestCase):
         self.assertIsNone(retry_after_seconds(ValueError("没有 response")))
 
     def test_garbage_and_nonpositive_values(self):
-        #  HTTP-date 形式的 Retry-After 不解析（极少见，不为它引入日期解析）
-        self.assertIsNone(retry_after_seconds(rate_limit_error("Wed, 21 Oct 2026 07:28:00 GMT")))
+        self.assertIsNone(retry_after_seconds(rate_limit_error("in a while")))
         self.assertIsNone(retry_after_seconds(rate_limit_error("0")))
+        #  已经过去的时刻：不用等
+        self.assertIsNone(retry_after_seconds(rate_limit_error("Wed, 21 Oct 2015 07:28:00 GMT")))
+
+    def test_http_date(self):
+        from datetime import datetime, timedelta, timezone
+        from email.utils import format_datetime
+
+        from xiaoyu.errors import retry_after_asked
+
+        moment = datetime.now(timezone.utc) + timedelta(seconds=30)
+        asked = retry_after_asked(rate_limit_error(format_datetime(moment, usegmt=True)))
+        self.assertIsNotNone(asked)
+        self.assertTrue(25 < asked <= 30, asked)
+
+    def test_asked_is_not_capped(self):
+        from xiaoyu.errors import retry_after_asked
+
+        self.assertEqual(retry_after_asked(rate_limit_error("7200")), 7200.0)
+
+    def test_told_not_to_retry(self):
+        from xiaoyu.errors import told_not_to_retry
+
+        self.assertTrue(told_not_to_retry(_DuckStatusError("err", 429, {"x-should-retry": "false"})))
+        self.assertFalse(told_not_to_retry(_DuckStatusError("err", 429, {"x-should-retry": "true"})))
+        self.assertFalse(told_not_to_retry(rate_limit_error("7")))
+        self.assertFalse(told_not_to_retry(ValueError("没有 response")))
 
     def test_capped(self):
         #  服务端偶尔给几小时后的值，交互场景等不了
@@ -374,6 +399,134 @@ def switch_notices(agent):
     return [m for m in agent.messages if "模型已切换" in str(m.get("content"))]
 
 
+class ThinkingRejectedTest(AgentTestCase):
+    """服务端拒收回传的 thinking 块：不修的话每次请求都是同一个 400，会话卡死。"""
+
+    REJECTION = "messages.1.content.0: Invalid `signature` in `thinking` block"
+
+    def rejected(self, message: str = REJECTION, status: int = 400):
+        return openai.BadRequestError(message, response=_response(status), body=None)
+
+    def with_thinking(self, agent):
+        agent.messages.append({"role": "user", "content": "先前的问题"})
+        agent.messages.append({
+            "role": "assistant", "content": "先前的回答",
+            "_reasoning": {"items": [
+                {"type": "thinking", "thinking": "想了想", "signature": "sig"},
+                {"type": "redacted_thinking", "data": "xx"},
+            ]},
+        })
+
+    def test_recognition_is_narrow(self):
+        from xiaoyu.errors import thinking_rejected
+
+        self.assertTrue(thinking_rejected(self.rejected()))
+        self.assertTrue(thinking_rejected(self.rejected(
+            "`thinking` or `redacted_thinking` blocks in the latest assistant message "
+            "cannot be modified")))
+        self.assertFalse(thinking_rejected(self.rejected("max_tokens must be greater than thinking.budget_tokens")))
+        self.assertFalse(thinking_rejected(self.rejected("invalid tool schema")))
+        self.assertFalse(thinking_rejected(self.rejected(status=429)))
+
+    def test_blocks_are_dropped_and_the_request_resent_once(self):
+        agent = self.build([self.rejected(), [chunk(content="好了"), usage_chunk(10, 2)]])
+        self.with_thinking(agent)
+        buffer = io.StringIO()
+        with mock.patch("xiaoyu.agent.Agent._sleep") as sleep, contextlib.redirect_stdout(buffer):
+            agent.send("继续")
+        sleep.assert_not_called()
+        self.assertEqual(agent.last_assistant_text(), "好了")
+        self.assertEqual(len(self.client.completions.calls), 2)
+        self.assertFalse(any("_reasoning" in m for m in agent.messages))
+        self.assertIn("拒收了历史里的推理内容", buffer.getvalue())
+
+    def test_nothing_left_to_drop_means_the_error_stands(self):
+        agent = self.build([self.rejected()])
+        with contextlib.redirect_stdout(io.StringIO()), self.assertRaises(openai.BadRequestError):
+            agent.send("继续")
+        self.assertEqual(len(self.client.completions.calls), 1)
+
+    def test_a_second_rejection_does_not_loop(self):
+        agent = self.build([self.rejected(), self.rejected()])
+        self.with_thinking(agent)
+        with contextlib.redirect_stdout(io.StringIO()), self.assertRaises(openai.BadRequestError):
+            agent.send("继续")
+        self.assertEqual(len(self.client.completions.calls), 2)
+
+
+class RequestLogTest(AgentTestCase):
+    """每次模型请求（含每次重试）在会话日志里留一条事实。"""
+
+    class Log:
+        def __init__(self):
+            self.events = []
+
+        def event(self, kind, **fields):
+            self.events.append((kind, fields))
+
+        def append(self, message):
+            pass
+
+    def requests(self, agent):
+        return [fields for kind, fields in agent.session_log.events if kind == "request"]
+
+    def run_with_log(self, script):
+        agent = self.build(script)
+        agent.session_log = self.Log()
+        agent._sleep = lambda seconds: None
+        with contextlib.redirect_stdout(io.StringIO()):
+            agent.send("hi")
+        return agent
+
+    def test_failed_attempt_and_its_retry_are_both_recorded(self):
+        agent = self.run_with_log([rate_limit_error(), [chunk(content="好了"), usage_chunk(120, 5)]])
+        first, second = self.requests(agent)
+        self.assertEqual((first["attempt"], first["outcome"]), (1, "error"))
+        self.assertEqual(first["error_kind"], "rate_limit")
+        self.assertEqual(first["status"], 429)
+        self.assertEqual(first["error"], "RateLimitError")
+        self.assertGreater(first["wait_s"], 0)
+        self.assertEqual((second["attempt"], second["outcome"]), (2, "ok"))
+        self.assertEqual((second["prompt_tokens"], second["completion_tokens"]), (120, 5))
+        for record in (first, second):
+            self.assertEqual((record["provider"], record["model"]), ("gateway", "main-model"))
+            self.assertIn("total_ms", record)
+
+    def test_request_id_and_code_are_kept_when_the_upstream_gives_them(self):
+        response = httpx.Response(
+            429, request=httpx.Request("POST", "http://unused"),
+            headers={"x-request-id": "req-abc"},
+        )
+        exc = openai.RateLimitError("慢一点", response=response, body={"error": {"code": "1302"}})
+        agent = self.run_with_log([exc, [chunk(content="好了"), usage_chunk(10, 1)]])
+        first = self.requests(agent)[0]
+        self.assertEqual(first["request_id"], "req-abc")
+        self.assertEqual(first["code"], "1302")
+
+    def test_truncated_reply_is_marked(self):
+        agent = self.run_with_log([
+            [chunk(content="说到一半"), length_chunk(), usage_chunk(100, 50)],
+            [chunk(content="说完了"), usage_chunk(100, 5)],
+        ])
+        first, second = self.requests(agent)
+        self.assertEqual(first["finish"], "length")
+        self.assertNotIn("finish", second)
+
+    def test_a_broken_log_never_breaks_the_request(self):
+        agent = self.build([[chunk(content="好了"), usage_chunk(10, 1)]])
+
+        class Broken(self.Log):
+            def event(self, kind, **fields):
+                if kind == "request":
+                    raise OSError("磁盘满了")
+                super().event(kind, **fields)
+
+        agent.session_log = Broken()
+        with contextlib.redirect_stdout(io.StringIO()):
+            agent.send("hi")
+        self.assertEqual(agent.last_assistant_text(), "好了")
+
+
 class ModelSwitchNoticeTest(AgentTestCase):
     """换了模型要告诉新模型：以上 assistant 回复不是它说的——否则它会把前任的
     自述（"当前模型看不了图"之类）当成关于自己的事实。"""
@@ -463,6 +616,59 @@ class FallbackChainTest(AgentTestCase):
         #  换模型后的用量记到备用路由名下（按路由分账不能混：同名模型可能跑在两家上）
         self.assertIn("gateway/backup-model", agent.usage.by_model)
 
+    def test_long_retry_after_switches_route_instead_of_waiting(self):
+        """服务端要求等 120 秒：原地等到上限再发必然再挨一次，白耗预算。"""
+        self.config.fallback_models = ["backup-model"]
+        agent = self.build([rate_limit_error("120"), [chunk(content="备用顶上"), usage_chunk(10, 2)]])
+        buffer = io.StringIO()
+        with mock.patch("xiaoyu.agent.Agent._sleep") as sleep, contextlib.redirect_stdout(buffer):
+            agent.send("hi")
+        sleep.assert_not_called()
+        models = [call["model"] for call in self.client.completions.calls]
+        self.assertEqual(models, ["main-model", "backup-model"])
+        self.assertIn("要求等 120s", buffer.getvalue())
+
+    def test_long_retry_after_is_honoured_when_there_is_nowhere_else_to_go(self):
+        agent = self.build([rate_limit_error("120"), [chunk(content="等到了"), usage_chunk(10, 2)]])
+        with mock.patch("xiaoyu.agent.Agent._sleep") as sleep, contextlib.redirect_stdout(io.StringIO()):
+            agent.send("hi")
+        (waited,) = [call.args[0] for call in sleep.call_args_list]
+        #  照它说的等、只往上抖：早于它说的时刻醒来必然再挨一次
+        self.assertTrue(120 <= waited <= 132, waited)
+        self.assertEqual(agent.last_assistant_text(), "等到了")
+
+    def test_hours_long_retry_after_is_reported_not_waited(self):
+        agent = self.build([rate_limit_error("7200")])
+        buffer = io.StringIO()
+        with mock.patch("xiaoyu.agent.Agent._sleep") as sleep, contextlib.redirect_stdout(buffer), \
+                self.assertRaises(openai.RateLimitError):
+            agent.send("hi")
+        sleep.assert_not_called()
+        self.assertEqual(len(self.client.completions.calls), 1)
+        self.assertIn("7200s", buffer.getvalue())
+
+    def test_short_retry_after_is_waited_in_place(self):
+        self.config.fallback_models = ["backup-model"]
+        agent = self.build([rate_limit_error("7"), [chunk(content="好了"), usage_chunk(10, 2)]])
+        with mock.patch("xiaoyu.agent.Agent._sleep") as sleep, contextlib.redirect_stdout(io.StringIO()):
+            agent.send("hi")
+        (waited,) = [call.args[0] for call in sleep.call_args_list]
+        self.assertTrue(7 <= waited <= 7.7, waited)
+        self.assertEqual([c["model"] for c in self.client.completions.calls], ["main-model"] * 2)
+
+    def test_server_saying_do_not_retry_is_obeyed(self):
+        self.config.fallback_models = ["backup-model"]
+        told = openai.InternalServerError(
+            "别重试", response=_response(500, {"x-should-retry": "false"}), body=None
+        )
+        agent = self.build([told, [chunk(content="备用顶上"), usage_chunk(10, 2)]])
+        with mock.patch("xiaoyu.agent.Agent._sleep") as sleep, contextlib.redirect_stdout(io.StringIO()):
+            agent.send("hi")
+        sleep.assert_not_called()
+        self.assertEqual(
+            [c["model"] for c in self.client.completions.calls], ["main-model", "backup-model"]
+        )
+
     def test_fatal_error_does_not_switch(self):
         self.config.fallback_models = ["backup-model"]
         script = [ValueError("boom")]
@@ -527,23 +733,54 @@ def length_chunk():
 class LengthTruncationTest(AgentTestCase):
     """被长度上限截断：残缺工具调用不执行、不当空补全重发，轮末告诉用户与模型。"""
 
-    def test_truncated_tool_call_dropped_and_turn_ends(self):
-        agent = self.build([[
-            chunk(content="我来写文件"),
-            chunk(tool_calls=[call_fragment(0, "c1", "write_file", '{"path": "a.py", "content": "def')]),
-            length_chunk(),
-            usage_chunk(100, 50),
-        ]])
+    CUT_WRITE = [
+        chunk(content="我来写文件"),
+        chunk(tool_calls=[call_fragment(0, "c1", "write_file", '{"path": "a.py", "content": "def')]),
+        length_chunk(),
+        usage_chunk(100, 50),
+    ]
+
+    def test_truncated_tool_call_is_dropped_then_the_model_is_asked_to_continue(self):
+        """「发继续可接着写」只对坐在终端前的人成立：无人值守的路径上没人会发。"""
+        from xiaoyu.agent import TRUNCATED_CONTINUE_NUDGE
+
+        agent = self.build([
+            self.CUT_WRITE,
+            [chunk(tool_calls=[call_fragment(
+                0, "c2", "write_file", '{"path": "a.py", "content": "def f(): pass\\n"}')]),
+             usage_chunk(100, 20)],
+            [chunk(content="写好了"), usage_chunk(100, 5)],
+        ])
         buffer = io.StringIO()
         with contextlib.redirect_stdout(buffer):
             agent.send("写个文件")
-        self.assertEqual(len(self.client.completions.calls), 1)
+        self.assertEqual(len(self.client.completions.calls), 3)
+        self.assertTrue((self.root / "a.py").exists())
+        cut = next(m for m in agent.messages if m["role"] == "assistant")
+        self.assertFalse(cut.get("tool_calls"))
+        self.assertIn("长度上限", cut["content"])
+        nudges = [m for m in agent.messages if m.get("content") == TRUNCATED_CONTINUE_NUDGE]
+        self.assertEqual(len(nudges), 1)
+        self.assertIn("拆成", TRUNCATED_CONTINUE_NUDGE)
+        self.assertIn("接着写（1/3）", buffer.getvalue())
+        self.assertEqual(agent.last_stop, "done")
+        self.assertEqual(agent.last_assistant_text(), "写好了")
+
+    def test_gives_up_after_three_continuations_and_says_so(self):
+        agent = self.build([self.CUT_WRITE] * 4)
+        buffer = io.StringIO()
+        with contextlib.redirect_stdout(buffer):
+            agent.send("写个文件")
+        self.assertEqual(len(self.client.completions.calls), 4)
+        self.assertEqual(agent.last_stop, "truncated")
+        self.assertIn("不再自动续写", buffer.getvalue())
         self.assertFalse((self.root / "a.py").exists())
-        last = agent.messages[-1]
-        self.assertEqual(last["role"], "assistant")
-        self.assertFalse(last.get("tool_calls"))
-        self.assertIn("长度上限", last["content"])
-        self.assertIn("长度上限", buffer.getvalue())
+        self.assertEqual(agent.messages[-1]["role"], "assistant")
+
+    def test_continuation_nudge_is_not_mistaken_for_the_users_words(self):
+        from xiaoyu.agent import SYNTHETIC_USER_TEXTS, TRUNCATED_CONTINUE_NUDGE
+
+        self.assertIn(TRUNCATED_CONTINUE_NUDGE, SYNTHETIC_USER_TEXTS)
 
     def test_complete_calls_before_the_cut_still_run(self):
         agent = self.build([
@@ -559,12 +796,32 @@ class LengthTruncationTest(AgentTestCase):
         calls = [m for m in agent.messages if m.get("tool_calls")]
         self.assertEqual([c["id"] for c in calls[0]["tool_calls"]], ["c1"])
         self.assertEqual(agent.last_assistant_text(), "读完了")
+        #  被丢弃的那个调用还得重来：工具结果之后同样提醒拆小，且顺序是
+        #  assistant(调用) → tool 结果 → 提醒
+        from xiaoyu.agent import TRUNCATED_CONTINUE_NUDGE
+
+        roles = [m["role"] for m in agent.messages[1:]]
+        self.assertEqual(roles, ["user", "assistant", "tool", "user", "assistant"])
+        self.assertEqual(agent.messages[4]["content"], TRUNCATED_CONTINUE_NUDGE)
 
     def test_empty_truncated_completion_not_retried(self):
+        """什么都没吐出来就撞了上限（输出额度被推理吃光）：没有断点可接。"""
         agent = self.build([[length_chunk(), usage_chunk(100, 4096)]])
         with contextlib.redirect_stdout(io.StringIO()):
             agent.send("hi")
         self.assertEqual(len(self.client.completions.calls), 1)
+        self.assertEqual(agent.last_stop, "truncated")
+
+    def test_truncated_text_reply_is_continued(self):
+        agent = self.build([
+            [chunk(content="第一段，说到一半"), length_chunk(), usage_chunk(100, 50)],
+            [chunk(content="接着说完了"), usage_chunk(100, 5)],
+        ])
+        with contextlib.redirect_stdout(io.StringIO()):
+            agent.send("讲讲")
+        self.assertEqual(len(self.client.completions.calls), 2)
+        self.assertEqual(agent.last_stop, "done")
+        self.assertEqual(agent.last_assistant_text(), "接着说完了")
 
 
 class ContentFilterTest(AgentTestCase):

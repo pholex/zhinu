@@ -83,6 +83,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from . import compaction, fsguard, media, tokens, ui, worktree
+from .errors import classify
 from .config import EFFORT_LEVELS, Config, user_config_dir
 from .events import Notice, UISink
 from .tools import Tool, Toolbox
@@ -325,6 +326,8 @@ class DelegationResult:
 
     error: str = ""
     failure: str = ""
+    #  failure 的分类（errors.classify 的 kind）；批量调度据此认"全是同一个原因"
+    failure_kind: str = ""
     answer: str = ""
     run_id: str = ""
     model: str = ""
@@ -346,6 +349,7 @@ class DelegationResult:
 STOP_REASONS = {
     "turn_cap": "撞了轮数上限",
     "budget": "token 预算用尽",
+    "truncated": "回复撞了输出长度上限、没说完",
 }
 
 
@@ -927,10 +931,12 @@ def execute_delegation(
     #  本次一个字没产出时，不能把它当成本次的结论（或失败前的部分结论）交回去
     inherited_answer = sub_agent.last_assistant_text()
     failure = ""
+    failure_kind = ""
     try:
         sub_agent.send(relocation + task)
     except Exception as exc:  # noqa: BLE001 - 委托失败不该打断主流程
         failure = f"{type(exc).__name__}: {exc}"
+        failure_kind = classify(exc).kind
         if len(failure) > MAX_FAILURE_CHARS:
             failure = failure[:MAX_FAILURE_CHARS] + "…（已截断）"
     finally:
@@ -985,6 +991,7 @@ def execute_delegation(
         sink.emit(Notice(f"  🤖 {spec.name} 完成：{len(sub_agent.trace)} 次工具调用"))
     return DelegationResult(
         failure=failure,
+        failure_kind=failure_kind,
         answer=answer,
         run_id=run_id,
         model=served,

@@ -93,6 +93,10 @@ def strip_private(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return cleaned
 
 
+#  回放时顶替空工具名的占位：只出现在发送副本里，不对应任何真实工具
+NAMELESS_TOOL = "unnamed_tool"
+
+
 def _repaired_arguments(raw: Any) -> str | None:
     """一个 tool_call 的 arguments 出网前的修复结果；原样可发返回 None。
 
@@ -138,11 +142,20 @@ def repair_tool_arguments(messages: list[dict[str, Any]]) -> list[dict[str, Any]
                 continue
             function = call.get("function") or {}
             fixed = _repaired_arguments(function.get("arguments"))
-            if fixed is None:
+            name = function.get("name")
+            nameless = not (isinstance(name, str) and name.strip())
+            if fixed is None and not nameless:
                 continue
+            patched = dict(function)
+            if fixed is not None:
+                patched["arguments"] = fixed
+            if nameless:
+                #  没写工具名的调用同理：那次已经回了"未知工具"，但空名字留在历史里，
+                #  校验函数名的端点每次回放都拒
+                patched["name"] = NAMELESS_TOOL
             if new_calls is None:
                 new_calls = list(calls)
-            new_calls[position] = {**call, "function": {**function, "arguments": fixed}}
+            new_calls[position] = {**call, "function": patched}
         out.append(message if new_calls is None else {**message, "tool_calls": new_calls})
     return out
 

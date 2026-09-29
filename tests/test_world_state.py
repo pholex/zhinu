@@ -8,6 +8,7 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from xiaoyu import modes, session_log, world_state
 from xiaoyu.agents import distill_history
@@ -144,6 +145,40 @@ class WorldStateTest(AgentTestCase):
         with contextlib.redirect_stdout(io.StringIO()):
             agent.send("三")
         self.assertEqual(len(notes(agent)), 1)
+
+
+class DateTest(AgentTestCase):
+    """模型不知道今天几号，而它自己意识不到该去查。"""
+
+    def test_session_starts_knowing_the_date_without_an_extra_message(self) -> None:
+        with mock.patch.object(world_state, "today", return_value="2026-09-29（星期二）"):
+            agent = self.build([text_turn()])
+            with contextlib.redirect_stdout(io.StringIO()):
+                agent.send("一")
+        self.assertIn("今天是 2026-09-29（星期二）", agent.messages[0]["content"])
+        self.assertEqual(notes(agent), [])
+
+    def test_crossing_midnight_is_announced_once(self) -> None:
+        with mock.patch.object(world_state, "today", return_value="2026-09-29（星期二）"):
+            agent = self.build([text_turn(), text_turn(), text_turn()])
+            with contextlib.redirect_stdout(io.StringIO()):
+                agent.send("一")
+        system_before = agent.messages[0]["content"]
+        with mock.patch.object(world_state, "today", return_value="2026-09-30（星期三）"):
+            with contextlib.redirect_stdout(io.StringIO()):
+                agent.send("二")
+                agent.send("三")
+        (note,) = notes(agent)
+        self.assertIn("今天是 2026-09-30（星期三）", note)
+        #  system prompt 是缓存前缀，会话内不动
+        self.assertEqual(agent.messages[0]["content"], system_before)
+
+    def test_today_names_the_weekday(self) -> None:
+        from datetime import date
+
+        text = world_state.today()
+        self.assertTrue(text.startswith(date.today().isoformat()))
+        self.assertRegex(text, r"（星期[一二三四五六日]）$")
 
 
 class SectionUnitTest(unittest.TestCase):

@@ -195,32 +195,68 @@ def _declared_skill_paths(root: Path) -> list[str]:
     return [item for item in declared if isinstance(item, str) and item.strip()]
 
 
+def skill_files(directory: Path) -> list[Path]:
+    """一个技能来源目录下的全部 SKILL.md。
+
+    目录本身就是一个技能（里面直接放着 SKILL.md）也认——manifest 点名的路径
+    既可以指向放着一堆技能的目录，也可以直接指向某一个技能。
+    """
+    found = sorted(directory.glob("*/SKILL.md"))
+    own = directory / "SKILL.md"
+    return [own, *found] if own.is_file() else found
+
+
+def declared_skill_problems(root: Path) -> list[str]:
+    """manifest 点名的技能路径里用不上的那些，各一句原因（装包时报给用户）。"""
+    problems: list[str] = []
+    try:
+        base = root.resolve()
+    except OSError:
+        return problems
+    for raw in _declared_skill_paths(root):
+        candidate = root / raw
+        try:
+            resolved = candidate.resolve()
+        except OSError:
+            problems.append(f"manifest 点名的技能路径 {raw} 读不了")
+            continue
+        if resolved != base and base not in resolved.parents:
+            problems.append(f"manifest 点名的技能路径 {raw} 指到了包外，不认")
+        elif not candidate.is_dir():
+            problems.append(f"manifest 点名的技能路径 {raw} 不存在")
+        elif not skill_files(candidate):
+            problems.append(f"manifest 点名的技能路径 {raw} 下面没有 SKILL.md")
+    return problems
+
+
 def bundle_skill_dirs(root: Path) -> list[Path]:
-    """一个包里放技能的目录：约定的 `skills/`，加上 manifest 点名的那些。
+    """一个包里放技能的目录：约定的 `skills/`，**加上** manifest 点名的那些。
+
+    两者是叠加的，不是二选一：同时带着约定目录和额外点名目录的包，只认前者
+    就会悄悄丢掉后者里的技能。
 
     manifest 点名的路径必须落在包内：绝对路径、`..` 跳出去的、经符号链接指到
     包外的一律不认——包是从网上拉来的，不能让一行 manifest 把包外的目录变成
-    技能来源。只有约定目录的包不读 manifest（这条路每次构造 Agent 都走）。
+    技能来源。
     """
     found: dict[Path, None] = {}
     default = root / SKILLS_DIRNAME
     if default.is_dir():
         found[default] = None
-    else:
+    try:
+        base = root.resolve()
+    except OSError:
+        return list(found)
+    for raw in _declared_skill_paths(root):
+        candidate = root / raw
         try:
-            base = root.resolve()
+            resolved = candidate.resolve()
         except OSError:
-            return list(found)
-        for raw in _declared_skill_paths(root):
-            candidate = root / raw
-            try:
-                resolved = candidate.resolve()
-            except OSError:
-                continue
-            if resolved != base and base not in resolved.parents:
-                continue
-            if candidate.is_dir():
-                found[candidate] = None
+            continue
+        if resolved != base and base not in resolved.parents:
+            continue
+        if candidate.is_dir() and resolved != default.resolve():
+            found[candidate] = None
     return list(found)
 
 
@@ -235,7 +271,7 @@ def scan_bundle_skills(root: Path) -> tuple[str, ...]:
 
     names = []
     for skills_dir in bundle_skill_dirs(root):
-        for md in skills_dir.glob("*/SKILL.md"):
+        for md in skill_files(skills_dir):
             try:
                 meta = skills_module.parse_frontmatter(
                     md.read_text(encoding="utf-8", errors="replace")
@@ -355,6 +391,7 @@ def inspect_bundle(root: Path, fallback_name: str | None = None) -> Bundle:
                     )
                 mcp_servers[str(server)] = entry
 
+    notes.extend(declared_skill_problems(root))
     for hook in _scan_hooks(root, manifest):
         notes.append(f"带 {hook}，本通道不安装 hooks")
 
