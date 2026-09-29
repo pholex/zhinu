@@ -696,6 +696,11 @@ def _hardened_env(extra: dict[str, str] | None = None) -> dict[str, str]:
     }
     if extra:
         env.update(extra)
+    #  Python 子进程的输出流钉成 UTF-8：管道另一头的 stdout 在 Windows 上默认走
+    #  本地代码页，模型写的脚本一打印 ✓ 或 emoji 就直接 UnicodeEncodeError 崩掉——
+    #  我们这头能解 GBK 输出，却救不了那头自己崩。setdefault：用户环境里点了名的
+    #  照他的；只动流编码，不开 PYTHONUTF8（那个连带改文件与 locale 的默认编码）
+    env.setdefault("PYTHONIOENCODING", "utf-8")
     secrets = non_inheritable_env_names()
     return {key: value for key, value in env.items() if key.upper() not in secrets}
 

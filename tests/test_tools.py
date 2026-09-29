@@ -280,6 +280,35 @@ _TINY_PNG = bytes.fromhex(
 )
 
 
+class TestSubprocessStreamEncoding(ToolboxTestCase):
+    def test_python_children_print_utf8_by_default(self) -> None:
+        with mock.patch.dict(os.environ, {"PATH": os.environ.get("PATH", "")}, clear=True):
+            self.assertEqual(tools._hardened_env()["PYTHONIOENCODING"], "utf-8")
+
+    def test_the_users_own_choice_wins(self) -> None:
+        with mock.patch.dict(os.environ, {"PYTHONIOENCODING": "gbk"}):
+            self.assertEqual(tools._hardened_env()["PYTHONIOENCODING"], "gbk")
+        self.assertEqual(
+            tools._hardened_env({"PYTHONIOENCODING": "latin-1"})["PYTHONIOENCODING"], "latin-1"
+        )
+
+    def test_a_script_printing_symbols_survives_a_non_utf8_locale(self) -> None:
+        if self.box.get("bash") is None or os.name == "nt":
+            self.skipTest("需要 POSIX bash")
+        import sys as _sys
+
+        script = self.root / "say.py"
+        script.write_text("print('完成 \u2713 \U0001f389')\n", encoding="utf-8")
+        with mock.patch.dict(os.environ, {"LC_ALL": "C", "LANG": "C"}):
+            os.environ.pop("PYTHONIOENCODING", None)
+            os.environ.pop("PYTHONUTF8", None)
+            result = self.box.run(
+                "bash", {"command": f"PYTHONUTF8=0 {_sys.executable} -X utf8=0 say.py"}
+            )
+        self.assertIn("完成 \u2713", result)
+        self.assertNotIn("UnicodeEncodeError", result)
+
+
 class TestGrepBackendsAgree(ToolboxTestCase):
     """同一个问题在不同机器上答案要一样：三个后端搜的范围相同。"""
 
