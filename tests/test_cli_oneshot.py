@@ -119,6 +119,20 @@ class SystemPromptFileFlagsTest(unittest.TestCase):
         args = self.resolve("--append-system-prompt-file", str(path))
         self.assertEqual(args.append_system_prompt, "署名用 [C]")
 
+    def test_system_prompt_text(self) -> None:
+        args = self.resolve("--system-prompt", "<!-- 原样 -->你是炉匠")
+        self.assertEqual(args.system_prompt, "<!-- 原样 -->你是炉匠")
+
+    def test_system_prompt_text_and_file_conflict(self) -> None:
+        path = self.root / "persona.txt"
+        path.write_text("x", encoding="utf-8")
+        with self.assertRaisesRegex(ValueError, "只能给一个"):
+            self.resolve("--system-prompt", "y", "--system-prompt-file", str(path))
+
+    def test_system_prompt_empty_text(self) -> None:
+        with self.assertRaisesRegex(ValueError, "空文本"):
+            self.resolve("--system-prompt", "  ")
+
     def test_append_text_and_file_conflict(self) -> None:
         path = self.root / "extra.txt"
         path.write_text("x", encoding="utf-8")
