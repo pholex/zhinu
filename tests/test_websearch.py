@@ -69,14 +69,14 @@ class TestWebSearchTool(unittest.TestCase):
         out = _tool(_registry(_response()), usage).handler(query="X 是什么")
         self.assertIn("结论：X", out)
         self.assertIn("联网搜索结论", out)
-        entry = usage.by_model["xai/grok-4.6"]
+        entry = usage.by_model["xai/grok-4.7"]
         self.assertEqual((entry.prompt_tokens, entry.completion_tokens, entry.calls), (100, 20, 1))
 
     def test_request_uses_builtin_tool(self):
         registry = _registry(_response())
         _tool(registry).handler(query="q")
         request = registry.client("xai").responses.create.last_request
-        self.assertEqual(request["model"], "grok-4.6")
+        self.assertEqual(request["model"], "grok-4.7")
         self.assertEqual(request["tools"], [{"type": "web_search"}])
 
     def test_deepseek_backend_removed(self):
@@ -94,10 +94,10 @@ class TestWebSearchTool(unittest.TestCase):
         self.assertTrue(tool.available())
         out = tool.handler(query="q")
         request = registry.client("xai").responses.create.last_request
-        self.assertEqual(request["model"], "grok-4.6")
-        self.assertIn("grok-4.6", out)
+        self.assertEqual(request["model"], "grok-4.7")
+        self.assertIn("grok-4.7", out)
         self.assertIn("https://c.com", out)
-        self.assertIn("xai/grok-4.6", usage.by_model)
+        self.assertIn("xai/grok-4.7", usage.by_model)
 
     def test_default_backend_is_xai_and_hidden_without_key(self):
         """默认后端 xai（deepseek-flash 服务端搜索实测不执行）；没配 xai 直连时工具不可见，

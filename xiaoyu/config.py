@@ -50,13 +50,16 @@ CONTEXT_WINDOWS: tuple[tuple[str, int], ...] = (
     ("claude-", 1_000_000),  # opus-5 / sonnet-5 / fable-5 均 1M（官方文档 2026-08）
     ("gpt-5", 400_000),  # GPT-5 系官方数值
     ("gemini-3.7-flash", 1_048_576),  # Models API inputTokenLimit（2026-08-24 实测）
-    #  ⚠️ grok-4.6 的真实窗口是 500k，这里**故意填 280k**——这一格是压缩预算
+    #  ⚠️ grok-4.6 / 4.7 的真实窗口都是 500k，这里**故意填 280k**——这一格是压缩预算
     #  而不是规格表（兜底的 180k 同理）。xAI 对 prompt 达到 200k 的请求整单翻倍
-    #  计价（$2/$6 → $4/$12，含缓存档），所以按默认 compact_at=0.7 取
+    #  计价（$2/$6 → $4/$12，含缓存档；4.7 的 long_context_threshold 仍是 200000），所以按默认 compact_at=0.7 取
     #  280k × 0.7 = 196k，压缩阈值刚好卡在 200k 悬崖之下。真要用满 500k：
     #  XIAOYU_CONTEXT_LIMIT=500000（明码标价地多花一倍钱）。
     #  改 compact_at 时记得这一格是跟着 0.7 算的。
-    ("grok-4.6", 280_000),
+    ("grok-4.", 280_000),
+    #  gpt-6 三兄弟官方 1,050,000 窗口，同理按压缩预算填：prompt 超 272K 整单
+    #  input/缓存 2x、output 1.5x，272K / 0.7 ≈ 388K，压缩阈值卡在悬崖之下
+    ("gpt-6", 388_000),
 )
 FALLBACK_CONTEXT_LIMIT = 180_000
 
@@ -303,7 +306,7 @@ class Config:
     enable_web_search: bool = True
     #  web_search 用哪家的内置搜索（websearch.SEARCH_BACKENDS 的键）。
     #  目前只有 xai（2026-09-14 起）：deepseek 官方 Responses 忽略 web_search 等内置工具，
-    #  实测服务端不真正搜索，后端已移除。grok-4.6 实测真搜且带引用，单次约 0.65 元
+    #  实测服务端不真正搜索，后端已移除。grok-4.7 实测真搜且带引用，单次约 0.3 元（2026-09-29 一题 3 次搜索 $0.042；4.6 时约 0.65 元）
     #  （token 贵 + 每次搜索按次收费，2026-08 对比实测见 playbook）。没配 XAI_API_KEY 时
     #  web_search 不进 schemas（见 websearch 的 check_fn），不会拿到坏结果
     search_provider: str = "xai"
