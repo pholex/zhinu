@@ -30,7 +30,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
 
-from . import browser, fsguard, mcp, sandbox, tempdirs
+from . import browser, fsguard, mcp, media, sandbox, tempdirs
 from .background import (
     MONITOR_DEFAULT_TIMEOUT,
     TaskManager,
@@ -422,6 +422,36 @@ def _unreadable_file_error(target: Path, shown: str, size_cap: bool = True) -> s
             "再用 bash 的 head / tail / sed -n '起,止p' 取需要的片段。"
         )
     return None
+
+
+_SNIFF_BYTES = 8192
+
+
+def _binary_file_error(target: Path, shown: str) -> str | None:
+    """文本工具读到二进制文件：拒读并指路；是文本返回 None。
+
+    判据是开头一段里有没有 NUL 字节——文本文件里不会有，二进制几乎必有。有损解码
+    硬读的话，回给模型的是几万字符的乱码（还夹着控制字符），占掉上下文却什么
+    信息都没有。
+    """
+    try:
+        with open(target, "rb") as handle:
+            head = handle.read(_SNIFF_BYTES)
+        size = target.stat().st_size
+    except OSError:
+        return None
+    if head.startswith((b"\xff\xfe", b"\xfe\xff")):
+        return (
+            f"ERROR: {shown} 是 UTF-16 编码的文本，read_file 读不了。先用 bash 转成 UTF-8 再读："
+            f"iconv -f UTF-16 -t UTF-8 {shown}"
+        )
+    if b"\0" not in head:
+        return None
+    return (
+        f"ERROR: {shown} 是二进制文件（{size} 字节），read_file 只读文本。"
+        f"想知道它是什么：bash 跑 file {shown}；要看字节：xxd {shown} | head；"
+        "PDF 用 pdftotext，压缩包用 unzip -l 或 tar -tf，数据库用对应的命令行客户端。"
+    )
 
 
 def _read_for_edit(target: Path) -> tuple[str, str, bytes]:
@@ -1518,6 +1548,7 @@ class Toolbox:
                 name="read_file",
                 description=(
                     "读取文本文件内容。路径相对当前工作区解析。"
+                    "图片（png / jpg / gif / webp）也用它：图会直接交给你看。"
                     "大文件可以用 offset（起始行号，从 1 开始）和 limit（最多读多少行）只读一段。"
                     "修改任何文件之前必须先读过它：局部修改（str_replace）读过要改的那一段即可，"
                     "整体覆盖（write_file）要把全部内容都读到（分段读完也算）。"
@@ -1912,6 +1943,16 @@ class Toolbox:
         if target.is_dir():
             return f"ERROR: {path} 是目录，不是文件。用 list_files 看目录。"
         if error := _unreadable_file_error(target, path):
+            return error
+        if target.suffix.lower() in media.IMAGE_SUFFIXES:
+            #  图片交给模型自己看：解码成文本只会得到乱码
+            ref, problem = media.accept_file(target)
+            if not ref:
+                return f"ERROR: {path} 是图片，但没能读进来：{problem}"
+            self.push_media(media.image_part(ref))
+            where = "（工作区之外）" if outside else ""
+            return f"[{path}{where} 是图片（{media.label(ref)}），见下一条消息里的图片]"
+        if error := _binary_file_error(target, path):
             return error
         try:
             text, encoding, _ = _read_for_edit(target)

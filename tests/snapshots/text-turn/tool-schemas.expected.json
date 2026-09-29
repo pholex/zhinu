@@ -1,7 +1,7 @@
 [
   {
     "function": {
-      "description": "读取文本文件内容。路径相对当前工作区解析。大文件可以用 offset（起始行号，从 1 开始）和 limit（最多读多少行）只读一段。修改任何文件之前必须先读过它：局部修改（str_replace）读过要改的那一段即可，整体覆盖（write_file）要把全部内容都读到（分段读完也算）。",
+      "description": "读取文本文件内容。路径相对当前工作区解析。图片（png / jpg / gif / webp）也用它：图会直接交给你看。大文件可以用 offset（起始行号，从 1 开始）和 limit（最多读多少行）只读一段。修改任何文件之前必须先读过它：局部修改（str_replace）读过要改的那一段即可，整体覆盖（write_file）要把全部内容都读到（分段读完也算）。",
       "name": "read_file",
       "parameters": {
         "properties": {

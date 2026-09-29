@@ -271,6 +271,60 @@ class TestReadWrite(ToolboxTestCase):
         self.assertIn("已覆盖", result)
 
 
+#  1×1 的 PNG：够让图片入口认出类型
+_TINY_PNG = bytes.fromhex(
+    "89504e470d0a1a0a0000000d49484452000000010000000108060000001f15c489"
+    "0000000d49444154789c6360000002000001e221bc330000000049454e44ae426082"
+)
+
+
+class TestBinaryAndImages(ToolboxTestCase):
+    def test_binary_file_is_refused_with_directions(self) -> None:
+        """有损解码硬读二进制，回给模型的是几万字符的乱码。"""
+        blob = self.root / "app.bin"
+        blob.write_bytes(b"\x7fELF\x02\x01\x01\x00" + bytes(range(256)) * 200)
+        result = self.box.run("read_file", {"path": "app.bin"})
+        self.assertTrue(result.startswith("ERROR"), result[:80])
+        self.assertIn("二进制", result)
+        self.assertIn("file app.bin", result)
+        self.assertLess(len(result), 400)
+        self.assertNotIn("\x00", result)
+        #  拒读的文件不算读过
+        edit = self.box.run("write_file", {"path": "app.bin", "content": "x"})
+        self.assertIn("还没读过", edit)
+
+    def test_pdf_is_refused(self) -> None:
+        (self.root / "doc.pdf").write_bytes(b"%PDF-1.7\n%\xe2\xe3\xcf\xd3\n1 0 obj\x00\x00stream")
+        result = self.box.run("read_file", {"path": "doc.pdf"})
+        self.assertIn("pdftotext", result)
+
+    def test_utf16_text_gets_a_conversion_hint(self) -> None:
+        (self.root / "wide.txt").write_bytes("你好\n".encode("utf-16"))
+        result = self.box.run("read_file", {"path": "wide.txt"})
+        self.assertIn("UTF-16", result)
+        self.assertIn("iconv", result)
+
+    def test_ordinary_text_is_untouched(self) -> None:
+        self.assertEqual(self.box.run("read_file", {"path": "calc.py"}), SAMPLE)
+        (self.root / "gbk.txt").write_bytes("中文内容\n".encode("gbk"))
+        self.assertIn("中文内容", self.box.run("read_file", {"path": "gbk.txt"}))
+
+    def test_image_is_handed_to_the_model_instead_of_decoded(self) -> None:
+        (self.root / "shot.png").write_bytes(_TINY_PNG)
+        result = self.box.run("read_file", {"path": "shot.png"})
+        self.assertIn("是图片", result)
+        self.assertNotIn("IHDR", result)
+        (part,) = self.box.take_media()
+        self.assertEqual(part["type"], "image_url")
+        self.assertEqual(self.box.take_media(), [])
+
+    def test_image_that_is_not_an_image_says_so(self) -> None:
+        (self.root / "fake.png").write_text("其实是文本", encoding="utf-8")
+        result = self.box.run("read_file", {"path": "fake.png"})
+        self.assertTrue(result.startswith("ERROR"), result)
+        self.assertEqual(self.box.take_media(), [])
+
+
 class TestArgumentCoercion(ToolboxTestCase):
     """模型把数字 / 布尔 / 数组写成字符串传进来：按 schema 声明的类型还原。"""
 
