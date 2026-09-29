@@ -188,6 +188,52 @@ class ChenshuError(RuntimeError):
     """工具层直接把它的文案回给模型。"""
 
 
+def _decoded(value: Any) -> Any:
+    """模型偶尔把数组参数整个序列化成 JSON 字符串传进来：认得出就还原，认不出原样返回。"""
+    if isinstance(value, str) and value.lstrip().startswith(("[", "{")):
+        try:
+            return json.loads(value)
+        except ValueError:
+            return value
+    return value
+
+
+def _string_list(value: Any, field_name: str) -> tuple[str, ...]:
+    """字符串数组参数的归一。
+
+    传单个字符串时当成只有一项——直接遍历字符串会按字符拆开，"src" 变成
+    s / r / c 三条 scope 被静默登记，之后 merge 的 scope 闸必然全拒，而报错
+    离真正的原因很远。类型对不上的直接点名字段拒绝。
+    """
+    value = _decoded(value)
+    if value is None:
+        return ()
+    if isinstance(value, str):
+        value = [value]
+    if not isinstance(value, (list, tuple)):
+        raise ChenshuError(f"ERROR: {field_name} 必须是字符串数组，收到的是 {type(value).__name__}。")
+    items: list[str] = []
+    for item in value:
+        if not isinstance(item, str):
+            raise ChenshuError(
+                f"ERROR: {field_name} 的每一项必须是字符串，收到的是 {type(item).__name__}。"
+            )
+        if item.strip():
+            items.append(item.strip())
+    return tuple(items)
+
+
+def _object_list(value: Any, field_name: str) -> list[Any]:
+    value = _decoded(value)
+    if value is None:
+        return []
+    if isinstance(value, dict):
+        return [value]
+    if not isinstance(value, (list, tuple)):
+        raise ChenshuError(f"ERROR: {field_name} 必须是对象数组，收到的是 {type(value).__name__}。")
+    return list(value)
+
+
 class ChenshuRuntime:
     """宸枢的进程内运行时 + 磁盘协议 store。
 
@@ -458,9 +504,7 @@ class ChenshuRuntime:
                     raise ChenshuError(
                         f"ERROR: kind 只能是 {'/'.join(MISSION_KINDS)}，不认识 {kind!r}。"
                     )
-                scope = tuple(
-                    str(s).strip() for s in raw.get("scope", []) if str(s).strip()
-                )
+                scope = _string_list(raw.get("scope"), "scope")
                 if kind == "build":
                     if not scope:
                         raise ChenshuError(f"ERROR: build mission「{title}」必须给 scope。")
@@ -477,7 +521,7 @@ class ChenshuRuntime:
                                     f"{owner_id} 的 {other!r} 重叠——scope 必须两两"
                                     "不相交（共享文件归属唯一一个 mission）。"
                                 )
-                deps = tuple(str(d).strip() for d in raw.get("deps", []) if str(d).strip())
+                deps = _string_list(raw.get("deps"), "deps")
                 mid = f"M{len(self.missions) + len(new) + 1}"
                 for dep in deps:
                     if dep not in known and dep not in {m.id for m in new}:
@@ -1174,7 +1218,7 @@ class ChenshuRuntime:
                 if "scope" in patch:
                     if caller != CHENSHU:
                         raise ChenshuError("ERROR: scope 只有总枢能改。")
-                    mission.scope = tuple(str(s).strip() for s in patch["scope"] if str(s).strip())
+                    mission.scope = _string_list(patch["scope"], "scope")
                     self.log(CHENSHU, "mission.scope", mission=mission.id, scope=";".join(mission.scope))
                 self._save()
                 if status or note:
@@ -1461,7 +1505,7 @@ def make_chenshu_tools(runtime: ChenshuRuntime) -> list[Tool]:
                     "deps": {"type": "array", "items": {"type": "string"}}},
                     "required": ["title"]}}},
              "required": ["missions"]},
-            _wrap(lambda missions: runtime.plan(list(missions or []))),
+            _wrap(lambda missions: runtime.plan(_object_list(missions, "missions"))),
             check_fn=active,
         ),
         _tool(
