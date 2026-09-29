@@ -234,6 +234,52 @@ class FanOutTest(QixiangTestCase):
         self.assertIn("resume_from='deadbeef'", result)
 
 
+class BreakerTest(QixiangTestCase):
+    """鉴权不过、额度用尽：换一项重试也不会好，别把余下的每一项都跑一遍再失败。"""
+
+    def auth_error(self):
+        import httpx
+        import openai
+
+        response = httpx.Response(401, request=httpx.Request("POST", "http://unused"))
+        return openai.AuthenticationError("bad key", response=response, body=None)
+
+    def test_stops_starting_items_after_three_hopeless_failures(self):
+        self.config.qixiang_concurrency = 1
+        tool = self.make_tool([READER], [self.auth_error() for _ in range(6)])
+        result = self.call(
+            tool, spec="reader", prompt_template="查 {{item}}",
+            items=[f"i{n}" for n in range(6)],
+        )
+        self.assertEqual(len(self.sub_client.completions.calls), 3)
+        self.assertIn("连续 3 项都因鉴权失败", result)
+        self.assertIn("失败 3", result)
+        self.assertIn("中止 3", result)
+
+    def test_ordinary_failures_do_not_trip_it(self):
+        self.config.qixiang_concurrency = 1
+        script = [RuntimeError("这一项自己的问题") for _ in range(4)]
+        tool = self.make_tool([READER], script)
+        result = self.call(
+            tool, spec="reader", prompt_template="查 {{item}}",
+            items=[f"i{n}" for n in range(4)],
+        )
+        self.assertEqual(len(self.sub_client.completions.calls), 4)
+        self.assertNotIn("不再起步", result)
+
+    def test_a_success_in_between_resets_the_streak(self):
+        self.config.qixiang_concurrency = 1
+        script = [self.auth_error(), self.auth_error(), text_turn("好了 " + LONG),
+                  self.auth_error(), self.auth_error()]
+        tool = self.make_tool([READER], script)
+        result = self.call(
+            tool, spec="reader", prompt_template="查 {{item}}",
+            items=[f"i{n}" for n in range(5)],
+        )
+        self.assertEqual(len(self.sub_client.completions.calls), 5)
+        self.assertNotIn("不再起步", result)
+
+
 class ObservingSinkTest(unittest.TestCase):
     """批量运行时子 agent 的告警不能一句都出不来：卡在限流退避上和正在干活，
     从外面看要分得清。"""

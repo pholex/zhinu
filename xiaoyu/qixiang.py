@@ -43,7 +43,14 @@ from .agents import (
 )
 from .config import EFFORT_LEVELS, Config
 from .events import Notice, UISink
-from .fanout import HEARTBEAT_SECONDS, Attempt, ObservingSink, attach_partial, run_attempts
+from .fanout import (
+    BREAKER_STREAK,
+    HEARTBEAT_SECONDS,
+    Attempt,
+    ObservingSink,
+    attach_partial,
+    run_attempts,
+)
 from .providers import UnknownModel
 from .tools import Tool
 
@@ -368,13 +375,14 @@ def make_qixiang_tool(
         )
         def report(cancelled: bool) -> str:
             return _report(
-                states, attempts, cancelled=cancelled, spec_name=spec_name,
+                states, attempts, cancelled=cancelled, tripped=tripped[0], spec_name=spec_name,
                 model_name=model_name, effort_level=effort_level, concurrency=concurrency,
                 timeout_s=timeout_s, per_item_cap=per_item_cap, sink=sink,
             )
 
+        tripped = [""]
         try:
-            run_attempts(
+            tripped[0] = run_attempts(
                 attempts,
                 concurrency=concurrency,
                 timeout_s=timeout_s,
@@ -382,7 +390,8 @@ def make_qixiang_tool(
                 on_settled=on_settled,
                 stop_requested=stop_requested,
                 on_tick=progress,
-            )
+                breaker=BREAKER_STREAK,
+            ) or ""
         except BaseException as exc:
             #  用户打断 / 宿主叫停：照样往上抛，但已收束各项的结论与 resume 句柄
             #  随异常带出去——不带的话存档还在，句柄却没人知道
@@ -396,6 +405,7 @@ def make_qixiang_tool(
 
     def _report(
         states: list[_ItemState], attempts: list[Attempt], *, cancelled: bool,
+        tripped: str = "",
         spec_name: str, model_name: str, effort_level: str, concurrency: int,
         timeout_s: int, per_item_cap: int, sink: Any,
     ) -> str:
@@ -462,6 +472,8 @@ def make_qixiang_tool(
             f"（共 {len(states)} 项，并发 {concurrency}）"
         )
         hints: list[str] = []
+        if tripped:
+            hints.append(f"⚠ {tripped}——这不是换一项就能好的问题，先把它解决再重跑。")
         if retry_ids:
             resume_obj = ", ".join(f'"{rid}": "<续跑指令>"' for rid in retry_ids[:4])
             hints.append(
