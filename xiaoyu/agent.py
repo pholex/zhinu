@@ -206,8 +206,7 @@ def normalize_questions(questions: Any) -> list[dict[str, Any]] | str:
 #  用户给了自定义 system prompt（Config.system_prompt / --system-prompt-file）时，
 #  身份与风格两段让位给用户那份，**运行纪律始终保留**——工具怎么用、计划怎么记、
 #  <untrusted_content> 不照做，是 harness 能正常且安全运转的前提，不是人格的一部分。
-SYSTEM_IDENTITY = """你是小羽（Xiaoyu），一个在终端里干活的编码 agent。
-名字取自董永传说中七仙女天羽——织女织布，你织代码。"""
+SYSTEM_IDENTITY = """你是小羽（Xiaoyu），一个在终端里干活的编码 agent。"""
 
 SYSTEM_HARNESS_RULES = """工作方式：
 - **跨文件探查一律先用 explore**。凡是"这个符号定义在哪""谁调用了它""这条链路怎么走"
