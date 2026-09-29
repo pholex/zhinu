@@ -67,7 +67,7 @@ XIAOYU_API_KEY=<key>
 
 | 变量 | 默认值 | 说明 |
 |---|---|---|
-| `XIAOYU_EFFORT` | 不传 | 推理深度 `low / medium / high / xhigh / max`（OpenAI 线另有 `none / minimal`）。同一个名字出内核，按协议翻译成 `reasoning_effort` / `reasoning.effort` / `output_config.effort`；上游不认的取值会 400。命令行 `--effort`，会话里 `/effort`，子 agent 可在 spec 里单独声明 |
+| `XIAOYU_EFFORT` | 不传 | 推理深度 `low / medium / high / xhigh / max`（OpenAI 线另有 `none / minimal`）。同一个名字出内核，按协议翻译成 `reasoning_effort` / `reasoning.effort` / `output_config.effort`；你给自己点名的模型配的取值原样发，上游不认会 400；换到降级链上的模型、或由子 agent 继承过去时，对实测过档位范围的型号就近换成它认的一档并提示（没实测过的型号不改）。命令行 `--effort`，会话里 `/effort`，子 agent 可在 spec 里单独声明 |
 | `XIAOYU_CONTEXT_LIMIT` | 按模型查表 | 上下文上限（token）覆写 |
 | `XIAOYU_COMPACT_AT` | `0.7` | 用量占到这个比例时触发回收/压缩；取 0.05~1 的比例，写成 `70` 这类整数会被忽略并在启动时提示 |
 | `XIAOYU_BUDGET_TOKENS` | 不限 | 本会话 token 软预算（prompt+completion 累计，≥5000 才生效）：模型按 50/80/95% 收到倒计时（operator 通道），到线前一步优雅收尾交代现场，而不是被硬闸中途砍断；直连支持型号（Opus 5/4.8/4.7/Fable/Mythos/Sonnet 5）另附 Anthropic 原生 `task_budget`（服务端倒计时）。命令行 `--budget-tokens` |

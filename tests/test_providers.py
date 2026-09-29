@@ -635,6 +635,78 @@ class TestCrossProviderFallback(ProviderTestCase):
         self.assertEqual(list(agent.usage.by_model), [f"{GATEWAY}/deepseek-flash"])
 
 
+class TestEffortPerModel(ProviderTestCase):
+    """档位跟着会话走，但各型号认的档位不一样。"""
+
+    ORDER = ("none", "minimal", "low", "medium", "high", "xhigh", "max")
+
+    def test_known_model_gets_the_nearest_level_it_accepts(self) -> None:
+        pick = lambda wanted: providers.effort_for("zhipu", "glm-5.3", wanted, self.ORDER)  # noqa: E731
+        self.assertEqual(pick("low"), "low")
+        self.assertEqual(pick("high"), "high")
+        self.assertEqual(pick("medium"), "high")  # 一样近时取高的
+        self.assertEqual(pick("xhigh"), "max")  # high 与 max 一样近，取高的
+        self.assertEqual(pick("minimal"), "low")
+        self.assertEqual(pick("none"), "low")
+        self.assertEqual(pick(""), "")
+
+    def test_unmeasured_routes_are_left_alone(self) -> None:
+        for provider, model in (("zhipu", "glm-9"), ("deepseek", "deepseek-flash"),
+                                (GATEWAY, "glm-5.3"), ("nobody", "x")):
+            self.assertEqual(providers.effort_for(provider, model, "medium", self.ORDER), "medium")
+
+    def agent(self, direct_script: list, backup_script: list, **cfg_extra):
+        direct, backup = FakeClient(direct_script), FakeClient(backup_script)
+        registry = Registry(
+            [
+                Provider("deepseek", "u", "k", DS_MODELS, "直连 deepseek"),
+                Provider("zhipu", "u", "k", ("glm-5.3",), "直连 zhipu"),
+            ],
+            clients={"deepseek": direct, "zhipu": backup},
+        )
+        cfg = config(auto_approve=True, enable_skills=False, enable_plugins=False,
+                     effort="medium", **cfg_extra)
+        return Agent(cfg, registry=registry, usage=Usage()), direct, backup
+
+    def run_once(self, agent: Agent) -> str:
+        buffer = io.StringIO()
+        with mock.patch("xiaoyu.agent.Agent._sleep"), contextlib.redirect_stdout(buffer):
+            agent.send("hi")
+        return buffer.getvalue()
+
+    def test_fallback_route_gets_a_level_it_accepts(self) -> None:
+        """主模型宕机、最需要降级的时候，不该因为备用模型不认这一档而 400。"""
+        failure = openai.InternalServerError("炸了", response=_response(500), body=None)
+        agent, direct, backup = self.agent(
+            [failure, failure, failure], [[chunk(content="备用顶上"), usage_chunk(10, 2)]],
+            fallback_models=["glm-5.3"],
+        )
+        agent.config.model = DS_MODELS[0]
+        shown = self.run_once(agent)
+        self.assertEqual({c["reasoning_effort"] for c in direct.completions.calls}, {"medium"})
+        (sent,) = backup.completions.calls
+        self.assertEqual(sent["reasoning_effort"], "high")
+        self.assertIn("不认推理深度 medium", shown)
+
+    def test_the_users_own_pick_is_sent_as_is(self) -> None:
+        """用户给自己点名的模型配的档位原样发：不认就让上游报错，不静默改。"""
+        agent, direct, backup = self.agent([], [[chunk(content="好"), usage_chunk(10, 2)]])
+        agent.config.model = "glm-5.3"
+        shown = self.run_once(agent)
+        (sent,) = backup.completions.calls
+        self.assertEqual(sent["reasoning_effort"], "medium")
+        self.assertNotIn("不认推理深度", shown)
+
+    def test_inherited_effort_is_adjusted_for_a_sub_agent(self) -> None:
+        agent, direct, backup = self.agent(
+            [], [[chunk(content="好"), usage_chunk(10, 2)]], subagent_depth=1
+        )
+        agent.config.model = "glm-5.3"
+        self.run_once(agent)
+        (sent,) = backup.completions.calls
+        self.assertEqual(sent["reasoning_effort"], "high")
+
+
 class TestRetryBudgetAndPreferredProbe(TestCrossProviderFallback):
     """重试不随路由条数成倍放大；粘性降级冷却到期后回探首选模型。"""
 

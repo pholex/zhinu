@@ -43,7 +43,7 @@ from .compaction import (
     is_degenerate_summary,
     microcompact,
 )
-from .config import Config
+from .config import EFFORT_LEVELS, Config
 from .errors import Interrupted, classify
 from .providers import Registry, Route, UnknownModel
 from .permissions import Permissions
@@ -994,6 +994,8 @@ class Agent:
         self._last_route: tuple[str, str] | None = None
         #  拒收"跳过缓存读取"字段（400/422）的 provider：本会话对它们不再带（见 _stream_retrying）
         self._cache_bypass_refused: set[str] = set()
+        #  已经说过「这条路由不认这一档」的组合，不每次请求都说一遍
+        self._effort_notified: set[tuple[str, str]] = set()
         self.compactor = Compactor(
             context_limit=config.context_limit,
             compact_at=config.compact_at,
@@ -3729,6 +3731,32 @@ class Agent:
                 delay *= 2
         raise RuntimeError("unreachable")  # for 循环里必然 return 或 raise
 
+    def _effort_on(self, route: Route) -> str:
+        """这次请求带哪一档推理深度。
+
+        用户给自己点名的模型配的档位原样发：不认就让上游 400，宁可报错也不静默改。
+        但档位是跟着会话走的，换到降级链上的模型、或由子 agent 继承过去时，没有
+        人为这个组合点过头——主模型宕机、最需要降级的时候，却因为备用模型不认
+        这一档而 400。这些场合就近换成它认的一档，并说一声。
+        """
+        wanted = self.config.effort
+        primary = self._preferred_model or self.config.model
+        chosen_by_user = (
+            self.config.subagent_depth == 0
+            and route.model == self.registry._pinned(primary)[1]  # noqa: SLF001
+        )
+        if chosen_by_user:
+            return wanted
+        effort = providers.effort_for(route.provider, route.model, wanted, EFFORT_LEVELS)
+        if effort != wanted and (route.qualified, wanted) not in self._effort_notified:
+            self._effort_notified.add((route.qualified, wanted))
+            self.sink.emit(
+                Notice(
+                    f"[{route.qualified} 不认推理深度 {wanted}，这条路由上改用 {effort}]", "info"
+                )
+            )
+        return effort
+
     def _log_request(
         self,
         route: Route,
@@ -3845,7 +3873,7 @@ class Agent:
         if self.config.effort:
             #  统一用 chat 的名字出内核；Responses / Messages 两路在 Transport
             #  里各自翻译（见 responses.to_request / messages.to_request）
-            request["reasoning_effort"] = self.config.effort
+            request["reasoning_effort"] = self._effort_on(route)
         if (
             with_tools
             and (hint := self._task_budget_hint()) is not None

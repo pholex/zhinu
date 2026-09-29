@@ -161,6 +161,10 @@ class Preset:
     #  说 Anthropic Messages 协议的型号（`*` = 整家）。优先级高于 responses_models。
     #  见 messages.py（为什么原生协议优于官方 OpenAI 兼容端点）
     anthropic_models: tuple[str, ...] = ()
+    #  各型号认哪几档推理深度：((型号, (档位…)), …)。**只写实测过的**——没列的型号
+    #  不做任何钳制。用途见 effort_for：降级链、子 agent 这些"没有人点名过这个组合"
+    #  的场合，带着别的型号的档位过来时就近换成它认的，而不是换来一个 400
+    effort_levels: tuple[tuple[str, tuple[str, ...]], ...] = ()
     #  不会 function calling、工具调用要走文本协议的型号（`*` = 整家）。
     #  内置厂商目前没有一家需要（名额纪律只收旗舰，旗舰都会 function calling）；
     #  字段留着是让 preset 与通用 env 兜底形状一致。见 textcalls.py
@@ -245,6 +249,7 @@ PRESETS: dict[str, Preset] = {
         models=("glm-5.3",),
         key_envs=("ZHIPU_API_KEY",),
         label="直连 zhipu",
+        effort_levels=(("glm-5.3", ("low", "high", "max")),),
         #  ⚠️ glm-5.3 仍不收图（2026-08-24 复测）：chat 端点同款 400「messages.
         #  content.type 参数非法，取值范围 ['text']」。zhipu 的视觉能力在另外的
         #  型号上，我们没内置
@@ -392,6 +397,31 @@ class Route:
     def qualified(self) -> str:
         """全限定名 `provider/model`。用于记账、粘性降级、显式寻址。"""
         return f"{self.provider}/{self.model}"
+
+
+def accepted_efforts(provider: str, model: str) -> tuple[str, ...]:
+    """这条路由认哪几档推理深度；不知道返回空元组（不钳制）。"""
+    preset = PRESETS.get(provider)
+    if preset is None:
+        return ()
+    return next((levels for name, levels in preset.effort_levels if name == model), ())
+
+
+def effort_for(provider: str, model: str, wanted: str, order: tuple[str, ...]) -> str:
+    """`wanted` 这一档在这条路由上该发什么：认就原样，不认就取最近的一档。
+
+    距离按档位在 `order` 里的位置算；一样近时取高的那档——走到要换档的地方
+    多半是降级链在救场，宁可多想一点也别把质量再降一截。不知道这条路由认什么
+    （没实测过）就原样返回。
+    """
+    accepted = accepted_efforts(provider, model)
+    if not wanted or not accepted or wanted in accepted or wanted not in order:
+        return wanted
+    target = order.index(wanted)
+    ranked = [level for level in accepted if level in order]
+    if not ranked:
+        return wanted
+    return min(ranked, key=lambda level: (abs(order.index(level) - target), -order.index(level)))
 
 
 class UnknownModel(MissingConfig):
