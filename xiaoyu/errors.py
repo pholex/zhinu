@@ -10,9 +10,24 @@ import re
 import ssl
 import sys
 from dataclasses import dataclass
+from typing import Callable
 
 #  httpx 是 openai / anthropic 两个 SDK 共同的硬传递依赖，顶层 import 安全
 import httpx
+
+
+#  打断时挂在异常上的属性名：批量工具把已收束各项的报告放在这里再上抛，主循环
+#  把它作为这次工具调用的结果写进历史。打断语义不变（异常照样往上走），只是已经
+#  花掉的那些子 agent 的结论和续跑句柄不再跟着一起丢。
+PARTIAL_OUTPUT = "partial_output"
+
+
+def attach_partial(exc: BaseException, build: "Callable[[], str]") -> None:
+    """给正在上抛的异常挂上部分报告。生成报告本身出错不能盖掉原来的异常。"""
+    try:
+        setattr(exc, PARTIAL_OUTPUT, build())
+    except Exception:  # noqa: BLE001
+        pass
 
 
 class Interrupted(Exception):

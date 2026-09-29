@@ -4307,14 +4307,24 @@ class Agent:
             #  就必须给终态，否则 TUI spinner 靠带外清扫、ACP client 的 tool_call
             #  永远停在 in_progress。历史侧的 tool 配对由 close_open_tool_calls
             #  兜底，这里只管事件面。
+            #  批量委托被打断时，已收束各项的报告挂在异常上（见 errors.attach_partial）：
+            #  作为这次调用的结果写进历史——否则那些子 agent 的结论和续跑句柄只剩
+            #  存档里有，下一轮模型看到的是一句通用的"已中断"
+            partial = getattr(exc, errors.PARTIAL_OUTPUT, None)
+            partial = partial if isinstance(partial, str) and partial.strip() else ""
             self.sink.emit(
                 ToolCompleted(
                     name,
-                    output=f"[执行被中断/异常：{type(exc).__name__}]",
+                    output=partial or f"[执行被中断/异常：{type(exc).__name__}]",
                     ok=False,
                     seconds=time.monotonic() - started,
                 )
             )
+            if partial:
+                try:
+                    self._record(self._tool_message(call, self.toolbox._bound_output(name, partial)))
+                except Exception:  # noqa: BLE001 - 记不进去也不能盖掉正在上抛的打断
+                    pass
             raise
         elapsed = time.monotonic() - started
         #  工具的原始输出：下面只会往它后面追加 harness 提示，回灌时据此只包原始那段

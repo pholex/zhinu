@@ -45,7 +45,7 @@ from .agents import (
 )
 from .config import Config
 from .events import Notice, UISink
-from .fanout import Attempt, run_attempts
+from .fanout import Attempt, attach_partial, run_attempts
 from .providers import UnknownModel
 from .qixiang import MIN_ANSWER_CHARS, _CONTINUATION_TASK, _NullSink
 from .tools import Tool, Toolbox
@@ -271,19 +271,132 @@ def make_douqiao_tool(
 
         label = "、".join(s.model_label or "（随 spec）" for s in seats)
         sink.emit(Notice(f"  🏮 斗巧开赛：{spec_name} × {total} 席（{label}）"))
-        run_attempts(
-            attempts,
-            concurrency=concurrency,
-            timeout_s=timeout_s,
-            min_answer_chars=MIN_ANSWER_CHARS,
-            on_settled=on_settled,
-            stop_requested=stop_requested,
-        )
-        for seat, attempt in zip(seats, attempts):
-            copy_back(seat, attempt)
-        for seat in seats:
-            if seat.result is not None and seat.result.worktree is not None:
-                seat.files = _worktree_files(seat.result.worktree)
+        def render(judge_result: DelegationResult | None, winner: _Seat | None,
+                   picked: int | None, cancelled: bool = False) -> str:
+            #  ---------- report ----------
+            finished_seats = [seat for seat in seats if seat.finished]
+            lines: list[str] = []
+            forfeited = total - len(finished_seats)
+            header = (
+                ("[斗巧 report · 被打断，未评审，以下是打断时的进度] " if cancelled else "[斗巧 report] ")
+                + f"spec={spec_name} · {len(finished_seats)} 席完赛"
+                + (f" / {forfeited} 席弃权" if forfeited else "")
+            )
+            if winner is not None:
+                header += f" · 胜者 #{winner.index}" + (
+                    f"（{winner.model_label}）" if winner.model_label else ""
+                )
+            lines.append(header)
+            if cancelled:
+                lines.append(
+                    "比赛被打断，判官没有出场——已交卷席位的成果与各席存档如下，"
+                    "可用各自的 resume_from 续跑。"
+                )
+            elif len(finished_seats) < MIN_CONTESTANTS:
+                lines.append(
+                    "完赛席位不足两席，无赛可评——已完赛的成果与弃权席位的存档如下，"
+                    "可用各自的 resume_from 续跑后再战。"
+                )
+            elif judge_result is not None and judge_result.failure:
+                partial = judge_result.answer
+                if len(partial) > _PER_SEAT_CAP:
+                    partial = partial[:_PER_SEAT_CAP] + "\n…（截断）"
+                lines.append(
+                    f"判官中途失败（{judge_result.failure}），未产生有效裁决——"
+                    "各席成果如下，自行定夺或重开一局只比评审。"
+                    + (f"\n判官中断前的部分输出（仅供参考，不作数）：\n{partial}" if partial else "")
+                )
+            elif judge_result is None or not judge_result.answer:
+                lines.append("判官没有给出任何输出——各席成果如下，自行定夺。")
+            else:
+                lines.append("判官裁决：")
+                verdict_text = judge_result.answer
+                if len(verdict_text) > _PER_SEAT_CAP:
+                    verdict_text = verdict_text[:_PER_SEAT_CAP] + "\n…（裁决过长已截断）"
+                lines.append(verdict_text)
+                if winner is None and picked is not None:
+                    lines.append(
+                        f"⚠ 判官点名 #{picked}，但该席不在完赛之列（弃权或编号有误）"
+                        "——请核对裁决原文后自行认定胜者。"
+                    )
+                elif winner is None:
+                    lines.append(
+                        "⚠ 裁决文本里没有可解析的「胜者：#N」，胜者以上文为准自行认定。"
+                    )
+
+            for seat in seats:
+                tag = "完赛" if seat.finished else "弃权"
+                crown = " 👑" if winner is seat else ""
+                head = f"--- #{seat.index} {tag}{crown}"
+                if seat.model_label:
+                    head += f" · model={seat.model_label}"
+                elif seat.result is not None and seat.result.model:
+                    head += f" · model={seat.result.model}"
+                lines.append(head)
+                result = seat.result
+                if result is not None and result.run_id:
+                    lines.append(f"resume_from: {result.run_id}")
+                if result is not None and result.worktree is not None:
+                    lines.append(
+                        f"worktree: {result.worktree}（改动 {len(seat.files)} 处；"
+                        "胜者方案 git -C 该路径 diff 查看，确认后 git apply 取回）"
+                    )
+                if seat.crash:
+                    lines.append(f"ERROR: 执行线程异常（{seat.crash}）")
+                elif seat.never_started:
+                    lines.append("未开始即被中止。")
+                elif cancelled and result is None:
+                    lines.append("被打断时还没交卷。")
+                elif seat.timed_out:
+                    lines.append(f"超时中止（>{timeout_s}s），已存档可续跑。")
+                elif result is not None and result.error:
+                    lines.append(result.error)
+                elif result is not None and result.failure:
+                    lines.append(f"ERROR: 织手失败（{result.failure}）")
+                elif result is not None and result.cut_short:
+                    lines.append(f"（{result.cut_short}，被叫停时交代的进度，方案未必完整）")
+                if result is not None and result.answer and seat.finished:
+                    answer = result.answer
+                    if len(answer) > _PER_SEAT_CAP:
+                        answer = answer[:_PER_SEAT_CAP] + "\n…（自述过长已截断，完整上下文可 resume 追问）"
+                    lines.append(answer)
+                for note in result.notes if result is not None else []:
+                    lines.append(note)
+            sink.emit(
+                Notice(
+                    "  🏮 斗巧"
+                    + ("被打断：未评审" if cancelled else "收枢：")
+                    + ("" if cancelled else
+                       f"胜者 #{winner.index}" if winner is not None else "未决出胜者")
+                )
+            )
+            return "\n\n".join(lines)
+
+        def collect() -> None:
+            for seat, attempt in zip(seats, attempts):
+                copy_back(seat, attempt)
+            for seat in seats:
+                if seat.result is not None and seat.result.worktree is not None:
+                    seat.files = _worktree_files(seat.result.worktree)
+
+        def interrupted_report() -> str:
+            collect()
+            return render(None, None, None, cancelled=True)
+
+        try:
+            run_attempts(
+                attempts,
+                concurrency=concurrency,
+                timeout_s=timeout_s,
+                min_answer_chars=MIN_ANSWER_CHARS,
+                on_settled=on_settled,
+                stop_requested=stop_requested,
+            )
+        except BaseException as exc:
+            #  打断照样往上抛，但已交卷席位的成果与 resume 句柄随异常带出去
+            attach_partial(exc, interrupted_report)
+            raise
+        collect()
 
         finished_seats = [seat for seat in seats if seat.finished]
 
@@ -310,93 +423,7 @@ def make_douqiao_tool(
                         (seat for seat in finished_seats if seat.index == picked), None
                     )
 
-        #  ---------- report ----------
-        lines: list[str] = []
-        forfeited = total - len(finished_seats)
-        header = (
-            f"[斗巧 report] spec={spec_name} · {len(finished_seats)} 席完赛"
-            + (f" / {forfeited} 席弃权" if forfeited else "")
-        )
-        if winner is not None:
-            header += f" · 胜者 #{winner.index}" + (
-                f"（{winner.model_label}）" if winner.model_label else ""
-            )
-        lines.append(header)
-        if len(finished_seats) < MIN_CONTESTANTS:
-            lines.append(
-                "完赛席位不足两席，无赛可评——已完赛的成果与弃权席位的存档如下，"
-                "可用各自的 resume_from 续跑后再战。"
-            )
-        elif judge_result is not None and judge_result.failure:
-            partial = judge_result.answer
-            if len(partial) > _PER_SEAT_CAP:
-                partial = partial[:_PER_SEAT_CAP] + "\n…（截断）"
-            lines.append(
-                f"判官中途失败（{judge_result.failure}），未产生有效裁决——"
-                "各席成果如下，自行定夺或重开一局只比评审。"
-                + (f"\n判官中断前的部分输出（仅供参考，不作数）：\n{partial}" if partial else "")
-            )
-        elif judge_result is None or not judge_result.answer:
-            lines.append("判官没有给出任何输出——各席成果如下，自行定夺。")
-        else:
-            lines.append("判官裁决：")
-            verdict_text = judge_result.answer
-            if len(verdict_text) > _PER_SEAT_CAP:
-                verdict_text = verdict_text[:_PER_SEAT_CAP] + "\n…（裁决过长已截断）"
-            lines.append(verdict_text)
-            if winner is None and picked is not None:
-                lines.append(
-                    f"⚠ 判官点名 #{picked}，但该席不在完赛之列（弃权或编号有误）"
-                    "——请核对裁决原文后自行认定胜者。"
-                )
-            elif winner is None:
-                lines.append(
-                    "⚠ 裁决文本里没有可解析的「胜者：#N」，胜者以上文为准自行认定。"
-                )
-
-        for seat in seats:
-            tag = "完赛" if seat.finished else "弃权"
-            crown = " 👑" if winner is seat else ""
-            head = f"--- #{seat.index} {tag}{crown}"
-            if seat.model_label:
-                head += f" · model={seat.model_label}"
-            elif seat.result is not None and seat.result.model:
-                head += f" · model={seat.result.model}"
-            lines.append(head)
-            result = seat.result
-            if result is not None and result.run_id:
-                lines.append(f"resume_from: {result.run_id}")
-            if result is not None and result.worktree is not None:
-                lines.append(
-                    f"worktree: {result.worktree}（改动 {len(seat.files)} 处；"
-                    "胜者方案 git -C 该路径 diff 查看，确认后 git apply 取回）"
-                )
-            if seat.crash:
-                lines.append(f"ERROR: 执行线程异常（{seat.crash}）")
-            elif seat.never_started:
-                lines.append("未开始即被中止。")
-            elif seat.timed_out:
-                lines.append(f"超时中止（>{timeout_s}s），已存档可续跑。")
-            elif result is not None and result.error:
-                lines.append(result.error)
-            elif result is not None and result.failure:
-                lines.append(f"ERROR: 织手失败（{result.failure}）")
-            elif result is not None and result.cut_short:
-                lines.append(f"（{result.cut_short}，被叫停时交代的进度，方案未必完整）")
-            if result is not None and result.answer and seat.finished:
-                answer = result.answer
-                if len(answer) > _PER_SEAT_CAP:
-                    answer = answer[:_PER_SEAT_CAP] + "\n…（自述过长已截断，完整上下文可 resume 追问）"
-                lines.append(answer)
-            for note in result.notes if result is not None else []:
-                lines.append(note)
-        sink.emit(
-            Notice(
-                "  🏮 斗巧收枢："
-                + (f"胜者 #{winner.index}" if winner is not None else "未决出胜者")
-            )
-        )
-        return "\n\n".join(lines)
+        return render(judge_result, winner, picked)
 
     spec_names = sorted(spec_map)
     return Tool(
