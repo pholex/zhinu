@@ -1,6 +1,6 @@
 """把 OpenAI 的 Responses API 包成 chat completions 的形状。
 
-**为什么必须有这一层**：gpt-5.6 线（sol / terra / luna）在 `/v1/chat/completions`
+**为什么必须有这一层**：gpt-5.6 起的推理线（现役 gpt-6 astra / sol / luna）在 `/v1/chat/completions`
 上「带 tools 就 400」，报错原文明确给了两条路——改走 `/v1/responses`，或者
 `reasoning_effort='none'`。小羽是 agent，每一轮都带工具 schema，第二条等于把 5.6
 永久降级成非推理档；所以只剩第一条。
