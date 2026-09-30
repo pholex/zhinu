@@ -43,6 +43,11 @@ runner 本身是一次性的隔离机器，所以 CI 里用 `--yolo` 是合理�
 | `json` | 末尾一个对象：`result` / `usage` / `model` / `session_log`，出错时带 `error` | **推荐** |
 | `stream-json` | 每个事件一行 JSON，末行 `kind=result` | 要实时转发进度时用 |
 
+一次性模式跑完这一轮就退出，**不等后台任务**。模型起了后台命令又没等它跑完时，收尾对象里
+会多一个 `background_tasks_terminated`（每项 `task_id` / `command` / `elapsed_seconds`；
+`text` 格式打到 stderr）——这时 `result` 里那句"已在后台启动"不可信，要它跑完就让命令在
+前台执行。没有任务被终止时这个字段不出现。
+
 ### `--output-schema`：按结论分支，不按退出码
 
 退出码只说明**进程怎么结束的**，不说明**任务做成了没有**：
