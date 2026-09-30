@@ -47,12 +47,16 @@ _GENERIC_SUFFIX = "_BASE_URL"
 #  是 loopback 就填占位符；远端端点仍守"没 key 就不注册"——这条纪律的意义是
 #  把配置错误拦在启动期，而漏配 key 的远端地址正是它要拦的那种错误
 LOCAL_PLACEHOLDER_KEY = "local"
-#  Bedrock 的激活变量：值 = AWS 区域（`1` / `default` 等简写 = us-east-1）。
-#  凭据本身走 AWS 默认凭证链，不经这里、也永远不进 Provider.api_key
+#  Bedrock 的区域变量：值 = AWS 区域（`1` / `default` 等简写 = us-east-1）。设了它
+#  即激活（IAM 路线：凭据走 AWS 默认凭证链，不经这里）；没设但找到了 Bedrock API key
+#  也激活，区域取默认值
 BEDROCK_REGION_ENV = "XIAOYU_BEDROCK_REGION"
+#  ⚠️ 区域只认这一个名字。刻意不读 AWS_REGION / AWS_DEFAULT_REGION（那是 aws cli /
+#  SDK 的，几乎每台 AWS 机器都有，读了等于"有 AWS 环境就悄悄换路由"），也不自造
+#  AWS_ 前缀的名字（AWS 没定义过 AWS_BEDROCK_REGION，起这种名会被当成官方变量去查）
 DEFAULT_BEDROCK_REGION = "us-east-1"
 _BEDROCK_REGION_SHORTHANDS = frozenset({"1", "true", "yes", "on", "default"})
-#  无 key 型 provider 的 api_key 占位：OpenAI 兼容面的内层 client 构造要一个非空串，
+#  IAM 路线下 Provider.api_key 的占位：OpenAI 兼容面的内层 client 构造要一个非空串，
 #  但 Bedrock 的每一个请求都走 Messages 一路的 SigV4 client，这个值从不出网
 IAM_PLACEHOLDER_KEY = "aws-iam"
 _LOCAL_HOSTS = frozenset({"localhost", "127.0.0.1", "::1", "0.0.0.0"})
@@ -181,9 +185,10 @@ class Preset:
     #  目前只有 Gemini：签名随流藏在 tool_calls[].extra_content 里，重放时缺了
     #  当前轮直接 400。存取纪律见 responses.restore_tool_extras
     signature_models: tuple[str, ...] = ()
-    #  凭据不是 API key 而是云厂商自己的凭证链（目前只有 Bedrock：AWS 默认链——
-    #  环境变量 / profile / SSO / 容器与实例角色）时，用这个环境变量激活并指定
-    #  区域；非空即"无 key 型" preset：key_envs 留空，向导与 doctor 按区域问/报
+    #  凭据可以不是 API key 而是云厂商自己的凭证链（目前只有 Bedrock：AWS 默认链——
+    #  环境变量 / profile / SSO / 容器与实例角色）时，用这个环境变量激活并指定区域。
+    #  非空即"区域型" preset：key_envs 里的 key 是可选的第二种鉴权，key 与区域变量
+    #  任一存在即注册；向导与 doctor 两样都问/报
     region_env: str = ""
 
 
@@ -358,14 +363,18 @@ PRESETS: dict[str, Preset] = {
         effort_levels=(("grok-4.7", ("low", "medium", "high", "xhigh")),),
         vision_models=(WILDCARD,),
     ),
-    #  AWS Bedrock 上的 Claude，**只凭 AWS 凭证**（IAM 执行角色 / profile / SSO）
-    #  走 bedrock-runtime 的原生 Messages 协议（anthropic SDK 的 AnthropicBedrock：
-    #  SigV4 签名，/model/{id}/invoke[-with-response-stream]）。不需要 Anthropic key，
-    #  也不需要网关——这是它存在的全部理由：AWS 容器（AgentCore Runtime / ECS /
-    #  EC2）里最自然的凭证是执行角色，不是一把要另外托管的 key。
-    #  激活：XIAOYU_BEDROCK_REGION=us-east-1（无 key 可探，所以必须显式点名；
-    #  不自动嗅探 AWS 凭证——有 AWS profile 的机器不该悄悄换路由）。
-    #  依赖：boto3/botocore 只在这一家用得上，走可选 extra `xiaoyu-agent[bedrock]`。
+    #  AWS Bedrock 上的 Claude，走 bedrock-runtime 的原生 Messages 协议（anthropic SDK
+    #  的 AnthropicBedrock：/model/{id}/invoke[-with-response-stream]）。两种鉴权：
+    #    - **AWS 凭证链**（IAM 执行角色 / profile / SSO，SigV4）：不需要任何 key，也不
+    #      需要网关——AWS 容器（AgentCore Runtime / ECS / EC2）里最自然的凭证是执行
+    #      角色，不是一把要另外托管的 key。激活：XIAOYU_BEDROCK_REGION=us-east-1
+    #      （无 key 可探，所以必须显式点名；不自动嗅探 AWS 凭证——有 AWS profile
+    #      的机器不该悄悄换路由）。依赖 boto3/botocore，走可选 extra `xiaoyu-agent[bedrock]`
+    #    - **Bedrock API key**（控制台生成的长期 key，`ABSK…`；Bearer 头，不要 botocore）：
+    #      只认 AWS 官方变量名 AWS_BEARER_TOKEN_BEDROCK（SDK 与 boto3 都认），不加
+    #      自造别名。找到 key 即激活，区域没设就用默认。2026-09-30 实测该 key
+    #      （控制台长期 key，ABSK…）在 bedrock-runtime 上非流式/流式均通
+    #  有 key 用 key、没 key 走凭证链——同一个 client 类，区别只是签名方式。
     #  2026-09-30 实测（us-east-1）：非流式 / stream / tool_use 往返 / 收图（600px
     #  纯色答对）/ output_config.effort / cache_control（次轮 cache_read 命中）/
     #  beta.messages / thinking 块回放（签名校验为真，篡改即 400）全通。
@@ -382,8 +391,8 @@ PRESETS: dict[str, Preset] = {
         #  与 anthropic 直连的 opus-5-5 / sonnet-5-5 不重叠（那两个照旧直连），
         #  这里只收 Bedrock 独有的一档。要别的型号用 bedrock/ 前缀点名
         models=("global.anthropic.claude-fable-5-1",),
-        key_envs=(),
-        label="Bedrock（IAM）",
+        key_envs=("AWS_BEARER_TOKEN_BEDROCK",),
+        label="Bedrock",
         region_env=BEDROCK_REGION_ENV,
         #  2026-09-30 实测 fable-5-1 收图（600px 纯蓝答对）
         vision_models=(WILDCARD,),
@@ -684,7 +693,8 @@ class Registry:
                 from . import messages
 
                 if p.aws_region:
-                    return messages.bedrock_client(p.aws_region, t)
+                    key = None if p.api_key == IAM_PLACEHOLDER_KEY else p.api_key
+                    return messages.bedrock_client(p.aws_region, t, api_key=key)
                 return messages.client(p.base_url, p.api_key, t)
 
         #  snapshot 录制（XIAOYU_SNAPSHOT_RECORD）包在最外侧：录到的
@@ -874,7 +884,8 @@ NO_PROVIDER_HINT = (
     "       DEEPSEEK_API_KEY=<你的-deepseek-key>\n"
     "       （同理：MOONSHOT_API_KEY / QWEN_API_KEY / ZHIPU_API_KEY\n"
     "         / ANTHROPIC_API_KEY / OPENAI_API_KEY / XAI_API_KEY / GEMINI_API_KEY）\n"
-    "     AWS Bedrock 上的 Claude 不要 key，只要 AWS 凭证：XIAOYU_BEDROCK_REGION=us-east-1\n"
+    "     AWS Bedrock 上的 Claude：AWS_BEARER_TOKEN_BEDROCK=<Bedrock API key>，或不要 key、\n"
+    "       只凭 AWS 凭证链：XIAOYU_BEDROCK_REGION=us-east-1\n"
     "  3. 走 OpenAI 兼容网关（LiteLLM、vLLM、各家官方 API…）：\n"
     "       XIAOYU_BASE_URL=https://<你的网关>/v1  +  XIAOYU_API_KEY=<key>\n"
     "       （本机 localhost 端点可以不给 key）\n"
@@ -993,7 +1004,7 @@ def _generic_names() -> list[str]:
 
 def bedrock_region() -> str:
     """XIAOYU_BEDROCK_REGION 的取值：区域名；简写（1/true/default…）= us-east-1；
-    未设或空 = ""（Bedrock 不注册）。"""
+    未设或空 = ""（没有 key 时 Bedrock 不注册；有 key 时由调用方取默认区域）。"""
     raw = os.environ.get(BEDROCK_REGION_ENV, "").strip()
     if not raw:
         return ""
@@ -1027,18 +1038,19 @@ def _make(name: str, config: Config) -> Provider | None:
 
     if preset := PRESETS.get(name):
         if preset.region_env:
-            #  无 key 型：激活变量给区域，凭据交给 AWS 默认链（是否真有凭证要到
-            #  第一次请求才知道——SDK 会如实抛 NoCredentialsError / 403，不会
-            #  悄悄换路由）
-            region = bedrock_region()
+            #  区域型：有 key 用 key（Bearer），没 key 就要区域变量显式激活、凭据交给
+            #  AWS 默认链（是否真有凭证要到第一次请求才知道——SDK 会如实抛
+            #  NoCredentialsError / 403，不会悄悄换路由）
+            key = find_api_key(preset.key_envs)
+            region = bedrock_region() or (DEFAULT_BEDROCK_REGION if key else "")
             if not region:
                 return None
             return Provider(
                 preset.name,
                 f"https://bedrock-runtime.{region}.amazonaws.com",
-                IAM_PLACEHOLDER_KEY,
+                key or IAM_PLACEHOLDER_KEY,
                 preset.models,
-                f"{preset.label} {region}",
+                f"{preset.label}（{'API key' if key else 'IAM'}）{region}",
                 preset.responses_models,
                 preset.vision_models,
                 preset.anthropic_models,

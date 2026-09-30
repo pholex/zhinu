@@ -184,6 +184,11 @@ class LoadDotenvChainTest(IsolatedConfigTest):
         self.assertNotIn("XIAOYU_MODEL", os.environ)
 
 
+def _wizard_direct_prompts() -> int:
+    """向导在直连环节会问几次：普通厂商问一次 key；区域型（Bedrock）问 key 再问区域。"""
+    return sum(2 if preset.region_env else 1 for preset in providers.PRESETS.values())
+
+
 class ConfigCommandTest(IsolatedConfigTest):
     def run_cmd(self, argv: list[str]) -> tuple[int, str]:
         out = io.StringIO()
@@ -261,7 +266,7 @@ class ConfigCommandTest(IsolatedConfigTest):
         #  依次：各家直连 key（全部回车=不用直连）、网关端点、主模型、摘要模型（回车=默认）、
         #        备用降级链（回车=不配）、网关 API key
         answers = iter(
-            [""] * len(providers.PRESETS)
+            [""] * _wizard_direct_prompts()
             + ["https://gw/v1", "main-model", "", "", "typed-key"]
         )
         with mock.patch.object(cli.sys.stdin, "isatty", return_value=True), mock.patch(
@@ -289,7 +294,7 @@ class ConfigCommandTest(IsolatedConfigTest):
         #        网关端点（回车=不用）、主模型、摘要模型、备用链（都回车）
         answers = iter(
             ["sk-direct"]
-            + [""] * (len(providers.PRESETS) - 1)
+            + [""] * (_wizard_direct_prompts() - 1)
             + ["", "", "", ""]
         )
         with mock.patch.object(cli.sys.stdin, "isatty", return_value=True), mock.patch(

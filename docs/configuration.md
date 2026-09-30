@@ -33,22 +33,27 @@ GEMINI_API_KEY=<key>
 
 每家走哪种 wire 协议（chat completions / Responses / Anthropic Messages）、哪些型号能看图，都是按型号内置好的，不用管。
 
-### AWS Bedrock：只凭 AWS 凭证，不要 key
+### AWS Bedrock：AWS 凭证链或 Bedrock API key
 
-在 AWS 容器（AgentCore Runtime / ECS / EC2）里跑时，最自然的凭证是执行角色而不是一把 key。Bedrock 直连走 bedrock-runtime 的原生 Messages 协议，凭据用 AWS 默认凭证链（环境变量 / profile / SSO / 容器与实例角色），**不需要 Anthropic key，也不需要网关**：
+Bedrock 直连走 bedrock-runtime 的原生 Messages 协议，两种鉴权任选：
 
 ```ini
+# ① 只凭 AWS 凭证链（IAM 执行角色 / profile / SSO），不需要任何 key——AWS 容器里的自然形态
 XIAOYU_BEDROCK_REGION=us-east-1        # 激活信号 = 区域；写 1 / default 等价于 us-east-1
+# ② Bedrock API key（控制台生成的长期 key）：找到 key 即激活，区域缺省 us-east-1
+AWS_BEARER_TOKEN_BEDROCK=<key>         # AWS 官方变量名
 XIAOYU_MODEL=global.anthropic.claude-fable-5-1
 ```
 
 ```sh
-pip install 'xiaoyu-agent[bedrock]'     # SigV4 签名要 botocore；缺包时首个请求前会提示
+pip install 'xiaoyu-agent[bedrock]'     # 仅 ① 需要：SigV4 签名要 botocore；缺包时首个请求前会提示
 ```
 
 要点：
 
-- **必须显式设置**，不自动嗅探 AWS 凭证——机器上有 AWS profile 不等于想让模型请求走 Bedrock。
+- 有 key 用 key，没 key 走凭证链。① **必须显式设区域**，不自动嗅探 AWS 凭证——机器上有 AWS profile 不等于想让模型请求走 Bedrock。
+- 区域只认 `XIAOYU_BEDROCK_REGION`，刻意不读 aws cli 的 `AWS_REGION` / `AWS_DEFAULT_REGION`（几乎每台 AWS 机器都有，读了等于有 AWS 环境就自动换路由）。
+- Bedrock 有 bedrock-runtime 与 Bedrock Mantle 两种端点，这里走的是 runtime。
 - 内置型号只有 `global.anthropic.claude-fable-5-1`（anthropic 直连已有的 opus-5-5 / sonnet-5-5 不重复收）。其它推理 profile 或 ARN 用显式寻址：`/model bedrock/us.anthropic.claude-opus-5-5`。
 - 模型 id 要用**推理 profile**（`global.` / `us.` / `eu.` 前缀）——裸 id `anthropic.claude-fable-5-1` 在 Bedrock 上不能按需调用，会 400。
 - 没有凭证、模型未开通、区域不支持时如实报错（NoCredentials / 403 / 400），不会悄悄换到别的模型；换路由仍只按 `XIAOYU_FALLBACK_MODELS` 的显式降级链走。
@@ -78,7 +83,8 @@ XIAOYU_API_KEY=<key>
 | `XIAOYU_EXPLORE_MODEL` | `deepseek-flash` | `explore` 子 agent 用的模型 |
 | `XIAOYU_BASE_URL` | — | OpenAI 兼容网关端点 |
 | `XIAOYU_API_KEY` | — | 网关 key（也认 `LITELLM_API_KEY`） |
-| `XIAOYU_BEDROCK_REGION` | —（不注册） | 激活 AWS Bedrock 直连并指定区域（`1` / `default` = `us-east-1`）；凭据走 AWS 默认凭证链，见上方"AWS Bedrock" |
+| `XIAOYU_BEDROCK_REGION` | —（有 key 时 `us-east-1`） | AWS Bedrock 区域，设了即激活 IAM 路线（`1` / `default` = `us-east-1`）；见上方"AWS Bedrock" |
+| `AWS_BEARER_TOKEN_BEDROCK` | — | Bedrock API key（AWS 官方变量名），找到即激活 Bedrock 直连 |
 | `XIAOYU_FALLBACK_MODELS` | —（不降级） | 备用模型链，逗号分隔，主模型重试耗尽后依次切。委托出去的子 agent（含 explore、七襄、斗巧、宸枢成员）沿用同一条链，即使那次委托另外点名了模型 |
 | `XIAOYU_PROVIDERS` | 直连 → 网关 | 覆盖 provider 优先级（如 `gateway,deepseek` = 临时全走网关） |
 | `XIAOYU_VISION_MODELS` | — | 网关后面挂的视觉模型点名（`*` = 一律放行） |

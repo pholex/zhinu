@@ -694,18 +694,21 @@ BEDROCK_EXTRA_HINT = (
 )
 
 
-def bedrock_client(region: str, timeout: float | httpx.Timeout) -> Any:
-    """构造走 AWS 凭证链的 Bedrock client（同 SDK 的 AnthropicBedrock）。
+def bedrock_client(
+    region: str, timeout: float | httpx.Timeout, api_key: str | None = None
+) -> Any:
+    """构造 Bedrock client（同 SDK 的 AnthropicBedrock）。
 
-    凭据不经小羽：SDK 每个请求用 botocore 的默认链（环境变量 / profile / SSO /
-    容器与实例角色）取凭证并做 SigV4。region 决定端点 bedrock-runtime.{region}；
+    api_key 给了就是 Bedrock API key（Bearer 头，不要 botocore）；没给则凭据不经
+    小羽：SDK 每个请求用 botocore 的默认链（环境变量 / profile / SSO / 容器与
+    实例角色）取凭证并做 SigV4。region 决定端点 bedrock-runtime.{region}；
     模型 id 由调用方按 Bedrock 的写法给（推理 profile 或 ARN），这里不改名。
     没有凭证时 SDK 如实抛错（botocore NoCredentialsError），classify 判 fatal——
     不会被当成瞬时错误重试、也不会换到别家。
     """
     import importlib.util
 
-    if importlib.util.find_spec("botocore") is None:
+    if api_key is None and importlib.util.find_spec("botocore") is None:
         from .config import MissingConfig
 
         raise MissingConfig(BEDROCK_EXTRA_HINT)
@@ -714,6 +717,7 @@ def bedrock_client(region: str, timeout: float | httpx.Timeout) -> Any:
     from . import netproxy
 
     return anthropic.AnthropicBedrock(
+        api_key=api_key,
         aws_region=region,
         timeout=timeout,
         max_retries=0,

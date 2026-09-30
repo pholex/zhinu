@@ -698,7 +698,51 @@ class TestBedrock(ProviderTestCase):
         self.assertIsInstance(client, FakeBedrock)
         self.assertEqual(made[0]["aws_region"], "ap-northeast-1")
         self.assertEqual(made[0]["max_retries"], 0)
-        self.assertNotIn("api_key", made[0], "凭据走 AWS 链，绝不把占位 key 交给 SDK")
+        self.assertIsNone(made[0]["api_key"], "凭据走 AWS 链，绝不把占位 key 交给 SDK")
+
+    def test_api_key_alone_activates_with_default_region(self) -> None:
+        """有 Bedrock API key 就注册（同其它直连：key 即开关），区域缺省 us-east-1；
+        只认 AWS 官方名 AWS_BEARER_TOKEN_BEDROCK；有 key 时不要求 botocore。"""
+        #  留一个网关，Registry 才建得起来；断言的是 bedrock 这一家不在
+        with isolated_env({"BEDROCK_MANTLE_API_KEY": "ABSK-test", "XIAOYU_API_KEY": "k"}):
+            self.assertIsNone(providers.build(config()).get("bedrock"), "非官方旧名不认")
+        for env_name in ("AWS_BEARER_TOKEN_BEDROCK",):
+            with isolated_env({env_name: "ABSK-test"}):
+                registry = providers.build(config(base_url=""))
+            bedrock = registry.get("bedrock")
+            assert bedrock is not None, env_name
+            self.assertEqual(bedrock.aws_region, "us-east-1")
+            self.assertIn("API key", bedrock.display)
+            made: list[dict] = []
+
+            class FakeBedrock:
+                def __init__(self, **kw) -> None:
+                    made.append(kw)
+
+            import anthropic
+
+            with mock.patch.object(anthropic, "AnthropicBedrock", FakeBedrock):
+                with mock.patch("importlib.util.find_spec", return_value=None):
+                    registry.resolve(self.MODEL).client.anthropic_client()
+            self.assertEqual(made[0]["api_key"], "ABSK-test")
+            self.assertEqual(made[0]["aws_region"], "us-east-1")
+
+    def test_region_ignores_aws_cli_and_legacy_variables(self) -> None:
+        """区域只认 XIAOYU_BEDROCK_REGION：AWS_REGION 是 aws cli 的（几乎每台 AWS
+        机器都有，读了等于自动激活），BEDROCK_MANTLE_REGION 是非官方旧名。"""
+        with isolated_env(
+            {
+                "AWS_REGION": "us-west-2",
+                "AWS_DEFAULT_REGION": "us-west-2",
+                "BEDROCK_MANTLE_REGION": "us-west-2",
+                "XIAOYU_API_KEY": "k",
+            }
+        ):
+            self.assertEqual(providers.bedrock_region(), "")
+            registry = providers.build(config())
+            self.assertIsNone(registry.get("bedrock"))
+        with isolated_env({"AWS_REGION": "us-west-2", "AWS_BEARER_TOKEN_BEDROCK": "ABSK-test"}):
+            self.assertEqual(providers.build(config(base_url="")).get("bedrock").aws_region, "us-east-1")
 
     def test_missing_botocore_is_a_readable_error(self) -> None:
         from xiaoyu import messages
@@ -731,13 +775,15 @@ class TestBedrock(ProviderTestCase):
         self.assertEqual(context_window("my.custom.anthropic.thing"), FALLBACK_CONTEXT_LIMIT)
 
     def test_aws_credentials_are_not_stripped_from_subprocess_env(self) -> None:
-        """无 key 型 preset 不往子进程密钥剥除名单里加任何名字：容器里 agent 跑
-        aws CLI 就靠这些变量。"""
+        """AWS 凭证与区域变量不进子进程密钥剥除名单：容器里 agent 跑 aws CLI
+        就靠这些变量；只剥 Bedrock API key。"""
         from xiaoyu.tools import non_inheritable_env_names
 
         names = non_inheritable_env_names()
         for name in ("AWS_PROFILE", "AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "XIAOYU_BEDROCK_REGION"):
             self.assertNotIn(name, names)
+        #  Bedrock API key 是小羽自己的密钥，照常剥
+        self.assertIn("AWS_BEARER_TOKEN_BEDROCK", names)
 
 
 class TestEffortPerModel(ProviderTestCase):
