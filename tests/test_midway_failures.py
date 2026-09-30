@@ -20,6 +20,7 @@ from types import SimpleNamespace
 from unittest import mock
 
 from xiaoyu import background as bg
+from xiaoyu import agents as agents_mod
 from xiaoyu import worktree as worktree_mod
 from xiaoyu.agent import Usage
 from xiaoyu.agents import AgentSpec, RunStore, make_subagent_tool
@@ -275,6 +276,88 @@ class InterruptedDelegationTest(AgentTestCase):
     def test_exit_request_is_never_turned_into_a_failed_delegation(self) -> None:
         _, store = self.delegate([cut_off_stream("收到", SystemExit(143))], SystemExit)
         self.assertEqual(len(store), 1)
+
+
+class ForkSeedTest(AgentTestCase):
+    """fork 继承：正在进行的这次委托，在子 agent 眼里不该是一次"已放弃"的调用。"""
+
+    ABANDONED = "按已放弃处理"
+
+    @staticmethod
+    def call(call_id: str, name: str = "worker") -> dict:
+        return {"id": call_id, "type": "function", "function": {"name": name, "arguments": "{}"}}
+
+    def test_forked_child_never_sees_its_own_delegation_as_abandoned(self) -> None:
+        spec = AgentSpec(
+            name="worker", description="干活", system_prompt="接着干，工作区 {workspace}",
+            tools=("read_file", "grep", "list_files"), inherit="fork",
+        )
+        store = RunStore()
+        agent = self.build([
+            [chunk(content="读到了 add 函数")],
+            delegate_call("d1", "worker", "接着干"),
+            [chunk(content="子 agent 结论")],
+            [chunk(content="主收尾")],
+        ])
+        agent.toolbox.register(
+            make_subagent_tool(
+                spec, self.config, agent.registry, agent.usage, agent.sink,
+                agent.approver, agent.permissions, runs=store,
+                parent_history=lambda: agent.messages,
+            )
+        )
+        with contextlib.redirect_stdout(io.StringIO()):
+            agent.send("第一件事")
+            agent.send("委托一下")
+        #  第三次请求是子 agent 发的：看它实际发出去的历史（假 client 记的是活的
+        #  列表，之后的答复也会追加进去——截到委托任务那一条为止）
+        sent = self.client.completions.calls[2]["messages"]
+        task_at = [m.get("content") for m in sent].index("接着干")
+        sent = sent[: task_at + 1]
+        self.assertFalse([m for m in sent if self.ABANDONED in str(m.get("content"))])
+        self.assertFalse([m for m in sent if m.get("tool_calls") or m.get("role") == "tool"])
+        #  父会话的上下文照样逐字带着
+        self.assertTrue(any(m.get("content") == "第一件事" for m in sent))
+        self.assertTrue(any(m.get("content") == "委托一下" for m in sent))
+        #  存档里也没有这句话
+        (run,) = store.values()
+        self.assertNotIn(self.ABANDONED, json.dumps(run.messages, ensure_ascii=False))
+        #  父会话自己的历史不受影响：委托调用与它的结果都在
+        self.assertTrue(any(m.get("tool_calls") for m in agent.messages))
+
+    def test_answered_siblings_stay_and_pending_calls_go(self) -> None:
+        history = [
+            {"role": "system", "content": "s"},
+            {"role": "user", "content": "干活"},
+            {"role": "assistant", "content": "", "tool_calls": [
+                self.call("c1", "read_file"), self.call("c2"), self.call("c3", "grep"),
+            ]},
+            {"role": "tool", "tool_call_id": "c1", "content": "文件内容"},
+        ]
+        seed = agents_mod.fork_seed(history)
+        self.assertEqual([m["role"] for m in seed], ["user", "assistant", "tool"])
+        self.assertEqual([c["id"] for c in seed[1]["tool_calls"]], ["c1"])
+        #  动的是副本
+        self.assertEqual(len(history[2]["tool_calls"]), 3)
+
+    def test_assistant_with_text_keeps_the_text(self) -> None:
+        history = [
+            {"role": "system", "content": "s"},
+            {"role": "user", "content": "干活"},
+            {"role": "assistant", "content": "我交给 worker", "tool_calls": [self.call("c1")]},
+        ]
+        seed = agents_mod.fork_seed(history)
+        self.assertEqual(seed[-1], {"role": "assistant", "content": "我交给 worker"})
+
+    def test_earlier_settled_turns_are_untouched(self) -> None:
+        history = [
+            {"role": "system", "content": "s"},
+            {"role": "user", "content": "干活"},
+            {"role": "assistant", "content": "", "tool_calls": [self.call("c1", "read_file")]},
+            {"role": "tool", "tool_call_id": "c1", "content": "文件内容"},
+            {"role": "assistant", "content": "读完了"},
+        ]
+        self.assertEqual(agents_mod.fork_seed(history), history[1:])
 
 
 if __name__ == "__main__":

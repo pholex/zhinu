@@ -353,6 +353,41 @@ STOP_REASONS = {
 }
 
 
+def fork_seed(history: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """fork 继承的起始历史：父历史去掉 system 头的副本，剥掉还在途的工具调用。
+
+    委托发生在父 agent 一批工具调用执行到一半：末尾那条 assistant 里，这次委托
+    调用本身（连同排在它后面的兄弟调用）还没有结果。原样带走的话，子 agent
+    发请求前的历史修复会给它们补上"未返回结果、按已放弃处理"——对子 agent 是
+    句假话，它会以为委托或兄弟调用失败了。
+
+    只动最后一条带 tool_calls 的 assistant：已有结果的调用保留；剥完既没有调用
+    也没有正文的，整条丢掉。
+    """
+    seed = copy.deepcopy(history[1:])
+    for index in range(len(seed) - 1, -1, -1):
+        message = seed[index]
+        if message.get("role") == "assistant" and message.get("tool_calls"):
+            break
+    else:
+        return seed
+    answered: set[str] = set()
+    for later in seed[index + 1 :]:
+        if later.get("role") != "tool":
+            break
+        answered.add(later.get("tool_call_id", ""))
+    settled = [call for call in message["tool_calls"] if call.get("id") in answered]
+    if len(settled) == len(message["tool_calls"]):
+        return seed
+    if settled:
+        message["tool_calls"] = settled
+    elif media.text_of(message.get("content")).strip():
+        del message["tool_calls"]
+    else:
+        del seed[index]
+    return seed
+
+
 def _interrupted_report(
     spec_name: str, answer: str, run_id: str, kept: Path | None
 ) -> str:
@@ -943,7 +978,7 @@ def execute_delegation(
             #  （system[0] 换成子 agent 自己的）。子 agent 的 prompt cache 在它自己
             #  的多轮里命中；超窗时它首轮 maybe_compact() 自愈。私有键（reasoning/
             #  compaction）不跨家回放，但换模型时无害地被丢
-            seed = copy.deepcopy(parent_history()[1:])
+            seed = fork_seed(parent_history())
     memory_note = (
         "父会话的对话记忆你拿到的是精简副本（见下方历史）"
         if seed
