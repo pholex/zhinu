@@ -55,6 +55,7 @@ from typing import Any, Callable
 
 from . import fsguard, ui, worktree
 from .config import EFFORT_LEVELS, Config
+from .errors import Interrupted
 from .events import Notice, ObservingSink, UISink
 from .providers import UnknownModel
 from .tools import Tool, Toolbox
@@ -69,6 +70,8 @@ SURVEY_TOOLS = ("read_file", "grep", "list_files")
 REVIEW_TOOLS = ("read_file", "grep", "list_files", "bash")
 _WAIT_DEFAULT = 300
 _WAIT_MAX = 600
+#  等事件时多久问一次"被打断了吗"
+_WAIT_POLL_SECONDS = 0.2
 _INBOX_LIMIT = 20
 _SLUG_RE = re.compile(r"[^a-z0-9]+")
 _NAME_RE = re.compile(r"^[a-z][a-z0-9_-]{1,31}$")
@@ -273,6 +276,7 @@ class ChenshuRuntime:
         permissions: Any,
         notify: Callable[[str, str], None] | None = None,
         hooks: Callable[[], Any] | None = None,
+        stop_requested: Callable[[], bool] | None = None,
     ) -> None:
         self.config = config
         self.registry = registry
@@ -281,6 +285,8 @@ class ChenshuRuntime:
         self.permissions = permissions
         #  总枢会话的钩子引擎（取值回调）：成员的工具调用照样过用户挂的工具类钩子
         self.hooks = hooks
+        #  总枢会话的"我被打断了吗"：chenshu_wait 的长等待靠它及时收手
+        self.stop_requested = stop_requested
         self.notify = notify or (lambda text, key="": None)
         self.root = config.workspace / ".xiaoyu" / "chenshu"
         self.lock = threading.RLock()
@@ -1192,12 +1198,28 @@ class ChenshuRuntime:
             parts.append(f"工作区还有 {len(dirty.splitlines())} 处改动没提交")
         return "；".join(parts)
 
+    def _next_event(self, timeout: float) -> str:
+        """等下一条事件，最多 timeout 秒（到点抛 queue.Empty）；宿主叫停就抛
+        Interrupted。切片等的理由同 Toolbox._wait_task：打断只是个标志，叫不醒
+        一个阻塞着的 Queue.get。成员照常在跑，事件留在队列里等下次来取。"""
+        if self.stop_requested is None:
+            return self.events.get(timeout=timeout)
+        deadline = time.monotonic() + timeout
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise queue.Empty
+            with contextlib.suppress(queue.Empty):
+                return self.events.get(timeout=min(_WAIT_POLL_SECONDS, remaining))
+            if self.stop_requested():
+                raise Interrupted("宿主请求打断")
+
     def wait(self, timeout: int) -> str:
         self._require_active()
         timeout = max(1, min(int(timeout or _WAIT_DEFAULT), _WAIT_MAX))
         collected: list[str] = []
         with contextlib.suppress(queue.Empty):
-            collected.append(self.events.get(timeout=timeout))
+            collected.append(self._next_event(timeout))
             while True:
                 collected.append(self.events.get_nowait())
         if not collected:

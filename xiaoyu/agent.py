@@ -1379,6 +1379,7 @@ class Agent:
                 config, self.registry, self.usage, self.sink,
                 self.permissions, notify=self.notify,
                 hooks=lambda: self.hook_engine,
+                stop_requested=self.interrupt_requested,
             )
             for tool in make_chenshu_tools(self.chenshu):
                 if self.toolbox.get(tool.name) is None:

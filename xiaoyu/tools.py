@@ -2681,6 +2681,25 @@ class Toolbox:
                 )
         return output
 
+    def _wait_task(self, task: Any, deadline: float) -> None:
+        """等一个后台任务结束，不超过 deadline；宿主叫停就抛 Interrupted。
+
+        宿主的 interrupt() 只是置个标志，打不断一个阻塞着的 Event.wait——不切片
+        问的话，serve 的 abort、ACP 的 cancel 都要等这里最长十分钟的等待自己到点。
+        任务本身不动：等的人走了，它照常在后台跑、完成时照常通知。
+        """
+        while not task.done.is_set():
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return
+            if self.stop_requested is None:
+                task.done.wait(remaining)
+                return
+            if task.done.wait(min(_STOP_POLL_SECONDS, remaining)):
+                return
+            if self.stop_requested():
+                raise Interrupted("宿主请求打断")
+
     def _task_output(self, task_ids: Any, timeout: int | None = None) -> str:
         """后台任务快照 / 有界等待。宽进：单个 id 裸字符串也收（模型常这么写）。"""
         if isinstance(task_ids, str):
@@ -2702,7 +2721,7 @@ class Toolbox:
                 sections.append(f"{task_id}：not_found。已知任务：{known}")
                 continue
             if wait:
-                task.done.wait(max(0.0, deadline - time.monotonic()))
+                self._wait_task(task, deadline)
             status = task.status
             head = f"{task_id}：{status}"
             if task.done.is_set():
