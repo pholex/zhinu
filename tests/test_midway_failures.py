@@ -487,5 +487,87 @@ class FillerPlacementTest(AgentTestCase):
         self.assertEqual(healed[5]["content"], "后一轮的结果")
 
 
+class ResumedBackgroundTasksTest(AgentTestCase):
+    """接回来的历史里提到的后台任务：编号不撞，且交代一句它们已经不在了。"""
+
+    STARTED = (
+        "后台任务已启动：task-3\n日志：/tmp/x/task-3.log\n"
+        '完成时会自动通知你；中途要看输出用 task_output(task_ids=["task-3"])。'
+    )
+
+    def history(self, *extra: dict) -> list[dict]:
+        return [
+            {"role": "user", "content": "跑个构建"},
+            {"role": "assistant", "content": "", "tool_calls": [tool_call("c1", "bash")]},
+            {"role": "tool", "tool_call_id": "c1", "content": self.STARTED},
+            {"role": "assistant", "content": "已在后台启动，完成后通知"},
+            *extra,
+        ]
+
+    def restored(self, messages: list[dict]):
+        agent = self.build([])
+        self.addCleanup(agent.toolbox.tasks.shutdown)
+        with contextlib.redirect_stdout(io.StringIO()):
+            agent.restore(messages, copy=False)
+        return agent
+
+    def notes(self, agent) -> list[dict]:
+        return [
+            m for m in agent.messages
+            if str(m.get("content")).startswith(agent.TASK_RECONCILE_MARK)
+        ]
+
+    def test_mentioned_tasks_are_declared_gone_once(self) -> None:
+        agent = self.restored(self.history())
+        (note,) = self.notes(agent)
+        self.assertIs(agent.messages[-1], note)
+        self.assertTrue(note.get("_operator"))
+        self.assertIn("task-3", note["content"])
+        self.assertIn("not_found", note["content"])
+        #  再接回一次（历史里已有这条说明）：不重复交代
+        again = self.restored([dict(m) for m in agent.messages[1:]])
+        self.assertEqual(len(self.notes(again)), 1)
+
+    @unittest.skipUnless(POSIX, "用例依赖 POSIX shell")
+    def test_new_tasks_are_numbered_after_the_ones_in_history(self) -> None:
+        agent = self.restored(self.history())
+        output = agent.toolbox.run("bash", {"command": "true", "run_in_background": True})
+        self.assertIn("后台任务已启动：task-4", output)
+        #  旧 id 查不到，与说明里的说法一致
+        self.assertIn("task-3：not_found", agent.toolbox.run("task_output", {"task_ids": ["task-3"]}))
+
+    def test_tasks_started_after_the_last_note_get_their_own_note(self) -> None:
+        first = self.restored(self.history())
+        later = [
+            *[dict(m) for m in first.messages[1:]],
+            {"role": "user", "content": "[monitor \"task-5\" 已结束（exit 0）。]", "_injected": True},
+        ]
+        second = self.restored(later)
+        notes = self.notes(second)
+        self.assertEqual(len(notes), 2)
+        self.assertIn("task-5", notes[-1]["content"])
+        self.assertNotIn("task-3", notes[-1]["content"])
+
+    def test_session_that_never_used_background_tasks_gets_nothing(self) -> None:
+        history = [
+            {"role": "user", "content": "看看 task-12 这张工单"},
+            {"role": "assistant", "content": "", "tool_calls": [tool_call("c1", "grep")]},
+            {"role": "tool", "tool_call_id": "c1", "content": "docs/plan.md:3: task-12 待排期"},
+            {"role": "assistant", "content": "找到了"},
+        ]
+        agent = self.restored([dict(m) for m in history])
+        self.assertEqual(agent.messages[1:], history)
+        self.assertEqual(agent.toolbox.tasks._counter, 0)
+
+    def test_note_lands_after_the_crash_filler(self) -> None:
+        agent = self.restored([
+            *self.history(),
+            {"role": "user", "content": "再跑一个"},
+            {"role": "assistant", "content": "", "tool_calls": [tool_call("c2", "bash")]},
+        ])
+        self.assertEqual(shape(agent.messages[-3:]), ["assistant", "tool:c2", "user"])
+        self.assertEqual(len(self.notes(agent)), 1)
+
+
 if __name__ == "__main__":
     unittest.main()

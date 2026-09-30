@@ -22,6 +22,7 @@ from dataclasses import dataclass, field
 from typing import Any, Callable, Protocol
 
 from . import (
+    background,
     diagnostics,
     envprobe,
     errors,
@@ -2151,6 +2152,9 @@ class Agent:
         #  正常退出路径都会先补齐），用"结果未知"文案补齐——修复写进新会话
         #  文件（copy=False 时写进续写的原文件），下次 resume 不必再修。
         self.close_open_tool_calls(self.UNKNOWN_TOOL_OUTCOME)
+        #  排在补齐之后：这条说明要落在历史尾部，不能插进调用与它的结果之间
+        if messages:
+            self._reconcile_background_tasks()
         #  读回时的中段坏行（session_log.load_messages 记在返回值上）：被跳过的
         #  可能是带 tool_calls 的 assistant，发请求前的历史修复还会连带删掉对应
         #  tool 结果——历史被改写了，必须让用户知道，不能静默
@@ -2183,6 +2187,52 @@ class Agent:
                         "warn",
                     )
                 )
+
+    #  接回历史后的后台任务对账说明以它开头（也靠它认出"这之前的已经交代过"）
+    TASK_RECONCILE_MARK = "[后台任务对账]"
+
+    def _reconcile_background_tasks(self) -> None:
+        """历史是接回来的：里面点过名的后台任务不在这个进程的任务表里。
+
+        两件事。编号：新任务从历史里出现过的最大号之后起编，不与旧的撞号。
+        交代：历史里还写着"完成时会自动通知你"，而通知永远不会来——留一条说明，
+        免得模型干等或拿旧 id 去查。只在确有提及时说，且只说上一条说明之后
+        新提到的：反复 resume 不重复唠叨，没用过后台任务的会话一个字不加。
+
+        说明走 operator 通道：整句是 harness 自己的话，编号是从文本里认出数字
+        后重新拼的，不夹带历史里的任何原文。
+        """
+        tasks = getattr(self.toolbox, "tasks", None)
+        if tasks is None:
+            return
+        seen: set[int] = set()
+        unexplained: set[int] = set()
+        for message in self.messages[1:]:
+            text = media.text_of(message.get("content"))
+            if message.get(OPERATOR_KEY) and text.startswith(self.TASK_RECONCILE_MARK):
+                unexplained.clear()
+                continue
+            for call in message.get("tool_calls") or []:
+                text += "\n" + str((call.get("function") or {}).get("arguments") or "")
+            numbers = background.mentioned_task_numbers(text)
+            seen |= numbers
+            unexplained |= numbers
+        if seen:
+            tasks.reserve_ids(max(seen))
+        #  同一个进程里接回、任务表里确实还有的不算
+        stale = sorted(n for n in unexplained if tasks.get(f"task-{n}") is None)
+        if not stale:
+            return
+        listed = "、".join(f"task-{n}" for n in stale[:8])
+        if len(stale) > 8:
+            listed += f" 等 {len(stale)} 个"
+        self._record_operator(
+            f"{self.TASK_RECONCILE_MARK} 这段历史是接回来的。其中提到的后台任务 / monitor"
+            f"（{listed}）不在当前的任务表里：原来的进程退出时会终止它们，"
+            "task_output / kill_task 查不到这些 id（not_found），也不会再有完成通知或 "
+            "monitor 事件——不要等。需要它们的结果就重新执行；拿不准命令是否还在跑，"
+            "先用 ps 核实。之后新起的任务编号接在它们后面，不会撞号。"
+        )
 
     def interrupt(self) -> None:
         """请求打断当前正在进行的生成（线程安全，可从任意线程/协程调用）。

@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import contextlib
 import os
+import re
 import subprocess
 import threading
 import time
@@ -102,6 +103,27 @@ def kill_tree(proc: subprocess.Popen) -> None:
                 os.killpg(pgid, signal.SIGKILL)
     with contextlib.suppress(Exception):
         proc.kill()
+
+
+#  任务 id 的形态（TaskManager.start 里生成），以及历史里点名它的那些文案都带的
+#  字眼：启动回执、完成通知、monitor 事件、task_output / kill_task 的调用参数
+_TASK_ID = re.compile(r"\btask-(\d+)\b")
+_TASK_CONTEXT = re.compile(r"后台任务|monitor|task_output|kill_task|task_ids?")
+
+
+def mentioned_task_numbers(text: str) -> set[int]:
+    """一段历史文本里点到名的后台任务编号。
+
+    只认与后台任务字眼同一行的 task-N：grep 结果、用户自己的工单号里碰巧出现的
+    task-12 不算。
+    """
+    found: set[int] = set()
+    if "task-" not in text:
+        return found
+    for line in text.splitlines():
+        if _TASK_CONTEXT.search(line):
+            found.update(int(number) for number in _TASK_ID.findall(line))
+    return found
 
 
 def _size_of(path: Path) -> int:
@@ -232,6 +254,15 @@ class TaskManager:
         self._atexit_registered = False
 
     # ---------- 启动 ----------
+
+    def reserve_ids(self, highest: int) -> None:
+        """新任务的编号从 highest 之后起编（只升不降）。
+
+        编号是每个进程从 1 起编的。接回来的历史里那句"task-1 完成会通知你"说的
+        是上一个进程的任务——这边新起的再叫 task-1，模型会把两者当成同一个。
+        """
+        with self._lock:
+            self._counter = max(self._counter, highest)
 
     def _log_file(self, task_id: str) -> Path:
         if self._log_dir is None:
