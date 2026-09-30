@@ -323,10 +323,15 @@ def check_providers() -> Check:
     absent: list[str] = []
     for name, preset in PRESETS.items():
         if preset.region_env:
-            #  无 key 型：只看激活变量。AWS 凭证本身有没有、对不对，这里不探
-            #  （探一次要出网），首个请求会如实报
+            #  区域型：有 key 报 key，没 key 报区域（IAM 路线）。AWS 凭证本身有没有、
+            #  对不对，这里不探（探一次要出网），首个请求会如实报
             region = bedrock_region()
-            (present if region else absent).append(f"{name}（{region}）" if region else name)
+            if find_api_key(preset.key_envs):
+                present.append(f"{name}（API key）")
+            elif region:
+                present.append(f"{name}（IAM，{region}）")
+            else:
+                absent.append(name)
             continue
         (present if find_api_key(preset.key_envs) else absent).append(name)
     gateway_url = os.environ.get("XIAOYU_BASE_URL", "").strip()

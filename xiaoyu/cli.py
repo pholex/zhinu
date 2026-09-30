@@ -574,20 +574,28 @@ def config_wizard() -> int:
     #  厂商清单直接遍历 PRESETS：补一家 preset，向导自动多问一家，两处不会脱节。
     has_direct = False
     for preset in providers.PRESETS.values():
+        existing = bool(find_api_key(preset.key_envs))
         if preset.region_env:
-            #  无 key 型（Bedrock）：问的是区域不是密钥，凭据走 AWS 自己的链
+            #  区域型（Bedrock）：key 可选（Bedrock API key），没 key 就问区域、
+            #  凭据走 AWS 自己的链；两样任一有就算配上了
+            if existing:
+                print(ui.secondary(f"已检测到 {preset.name} API key（永不回显）。"))
+            elif key := ask_key(
+                f"{preset.name} API key（模型 {'、'.join(preset.models)}；"
+                "留空 = 不用 key，改走 AWS 凭证链）"
+            ):
+                values[preset.key_envs[0]] = key
+                existing = True
             current = providers.bedrock_region()
             tip = (
-                f"{preset.name}：AWS 区域（凭据走 AWS 默认凭证链，不需要 key；"
-                f"模型 {'、'.join(preset.models)}；"
-                + (f"当前 {current}，回车 = 沿用" if current else "留空 = 不用 Bedrock")
-                + "）"
+                f"{preset.name}：AWS 区域"
+                + ("" if existing else "（凭据走 AWS 默认凭证链；留空 = 不用 Bedrock）")
+                + (f"（当前 {current}，回车 = 沿用）" if current else "")
             )
             if region := ask(preset.region_env, tip):
                 values[preset.region_env] = region
-            has_direct = has_direct or bool(region or current)
+            has_direct = has_direct or existing or bool(region or current)
             continue
-        existing = bool(find_api_key(preset.key_envs))
         if existing:
             source = (
                 "环境变量或 .env"
