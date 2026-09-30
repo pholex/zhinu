@@ -15,6 +15,7 @@ import textwrap
 import threading
 import time
 import unittest
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from unittest import mock
 
@@ -337,6 +338,226 @@ class BootThreadFailureTest(_StdioCase):
             sorted(recorded["fake"]), ["echo", "late", "nest", "never", "strict"]
         )
         self.assertEqual(len(manager.ready_tools()), 5)
+
+
+class _Handler(BaseHTTPRequestHandler):
+    """假的 Streamable HTTP MCP server。每个 tools/call 从 script 弹一个动作：
+
+    plain 直接回 JSON / linger SSE 里立刻给应答、流拖着不关 / silent 只发心跳
+    永不应答 / ping 先在流里反向发一个 ping、等到我方答复才给应答 /
+    notify 先发 list_changed 再给应答、流拖着不关 / no_reply 发一条通知就关流 /
+    slow 压着响应头不发（等 release）。
+    """
+
+    protocol_version = "HTTP/1.1"
+    script: list = []
+    seen: list = []
+    ping_answered = threading.Event()
+    release = threading.Event()
+
+    def log_message(self, *args):
+        pass
+
+    def _status(self, code: int) -> None:
+        self.send_response(code)
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+
+    def _json(self, payload: dict, session: str = "") -> None:
+        body = json.dumps(payload).encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        if session:
+            self.send_header("Mcp-Session-Id", session)
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _open_stream(self) -> None:
+        #  不给长度：流到连接关闭为止，什么时候关由这边说了算
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream")
+        self.send_header("Connection", "close")
+        self.end_headers()
+        self.close_connection = True
+
+    def _event(self, payload: dict) -> None:
+        self.wfile.write(f"data: {json.dumps(payload)}\n\n".encode())
+        self.wfile.flush()
+
+    def _heartbeats(self, seconds: float) -> None:
+        deadline = time.monotonic() + seconds
+        while time.monotonic() < deadline and not type(self).release.is_set():
+            self.wfile.write(b": keep-alive\n\n")
+            self.wfile.flush()
+            time.sleep(0.05)
+
+    def do_POST(self) -> None:
+        cls = type(self)
+        length = int(self.headers.get("Content-Length") or 0)
+        message = json.loads(self.rfile.read(length) or b"{}")
+        cls.seen.append(message)
+        method, mid = message.get("method"), message.get("id")
+        if method is None:
+            #  我方对反向请求的答复
+            if mid == "srv-ping":
+                cls.ping_answered.set()
+            self._status(202)
+        elif method == "initialize":
+            self._json({"jsonrpc": "2.0", "id": mid, "result": {
+                "protocolVersion": "2025-06-18", "capabilities": {"tools": {}},
+                "serverInfo": {"name": "fake-http", "version": "1"}}}, session="sess-1")
+        elif mid is None:
+            self._status(202)
+        elif method == "tools/list":
+            self._json({"jsonrpc": "2.0", "id": mid, "result": {"tools": [
+                {"name": "echo", "description": "d",
+                 "inputSchema": {"type": "object", "properties": {}}}]}})
+        else:
+            #  客户端拿到想要的就挂断，写端撞上断开的连接属预期
+            try:
+                self._call(cls.script.pop(0) if cls.script else "plain", mid)
+            except OSError:
+                pass
+
+    def _call(self, action: str, mid) -> None:
+        cls = type(self)
+
+        def reply(text: str = "应答") -> dict:
+            return {"jsonrpc": "2.0", "id": mid,
+                    "result": {"content": [{"type": "text", "text": text}]}}
+
+        if action == "plain":
+            self._json(reply())
+        elif action == "slow":
+            cls.release.wait(6)
+            self._json(reply("迟到的应答"))
+        elif action == "linger":
+            self._open_stream()
+            self._event(reply())
+            self._heartbeats(4)
+        elif action == "silent":
+            self._open_stream()
+            self._heartbeats(6)
+        elif action == "ping":
+            self._open_stream()
+            self._event({"jsonrpc": "2.0", "id": "srv-ping", "method": "ping"})
+            answered = cls.ping_answered.wait(4)
+            self._event(reply("ping 已答" if answered else "ping 没人答"))
+        elif action == "notify":
+            self._open_stream()
+            self._event({"jsonrpc": "2.0", "method": "notifications/tools/list_changed"})
+            self._event(reply())
+            self._heartbeats(4)
+        elif action == "no_reply":
+            self._open_stream()
+            self._event({"jsonrpc": "2.0", "method": "notifications/progress", "params": {}})
+
+    def do_GET(self) -> None:
+        self._status(405)
+
+    def do_DELETE(self) -> None:
+        self._status(200)
+
+
+class _HttpCase(unittest.TestCase):
+    """本机假 HTTP MCP server 的夹具（本类不含用例）。"""
+
+    def setUp(self):
+        _Handler.script = []
+        _Handler.seen = []
+        _Handler.ping_answered = threading.Event()
+        _Handler.release = threading.Event()
+        self.httpd = ThreadingHTTPServer(("127.0.0.1", 0), _Handler)
+        threading.Thread(target=self.httpd.serve_forever, daemon=True).start()
+        self.url = f"http://127.0.0.1:{self.httpd.server_address[1]}/mcp"
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+
+        def teardown():
+            _Handler.release.set()
+            self.httpd.shutdown()
+            self.httpd.server_close()
+
+        self.addCleanup(teardown)
+
+    def make_server(self, timeout: float) -> mcp.McpServer:
+        spec = mcp.ServerSpec(name="remote", command="", url=self.url, timeout=timeout)
+        server = mcp.McpServer(spec, Path(self.tmp.name) / "remote.log")
+        self.addCleanup(server.close)
+        server.bootstrap()
+        return server
+
+    def readers(self) -> list[threading.Thread]:
+        return [t for t in threading.enumerate() if t.name.startswith("xiaoyu-mcp-post-")]
+
+    def wait_until(self, predicate, timeout: float = 10.0, message: str = "等待超时"):
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if predicate():
+                return
+            time.sleep(0.02)
+        self.fail(message)
+
+
+class HttpRoundtripTest(_HttpCase):
+    """一次 HTTP 调用多久回来由两件事决定：应答到了没有、总时限到了没有。
+    流什么时候关、server 发不发心跳，都不该算进去。"""
+
+    def test_returns_when_the_answer_arrives_not_when_the_stream_ends(self):
+        server = self.make_server(timeout=10.0)
+        _Handler.script = ["linger"]
+        started = time.monotonic()
+        self.assertEqual(server.call_tool("echo", {}), "应答")
+        self.assertLess(time.monotonic() - started, 2.0, "等到流关闭才返回")
+
+    def test_heartbeats_do_not_extend_the_total_time_limit(self):
+        server = self.make_server(timeout=1.0)
+        _Handler.script = ["silent"]
+        started = time.monotonic()
+        out = server.call_tool("echo", {})
+        elapsed = time.monotonic() - started
+        self.assertIn("超时", out)
+        self.assertIn("调用结果不确定", out)
+        self.assertLess(elapsed, 3.0, "心跳一直在给超时续期")
+        self.assertTrue(server.alive(), "一次超时不能把 server 判死")
+        #  那条流还在发心跳：读线程不该留在上面，写锁也不该还被占着
+        self.wait_until(lambda: not self.readers(), 3.0, "读线程还挂在没人要的流上")
+        started = time.monotonic()
+        self.assertEqual(server.call_tool("echo", {}), "应答")
+        self.assertLess(time.monotonic() - started, 2.0, "下一个调用被上一条流挡住了")
+
+    def test_server_request_inside_the_stream_is_answered_mid_call(self):
+        """server 在应答流里夹一个 ping、等我方答了才给结果：答复必须在这次
+        往返当中发出去，而不是等流结束（那时 server 早等不及了）。"""
+        server = self.make_server(timeout=8.0)
+        _Handler.script = ["ping"]
+        self.assertEqual(server.call_tool("echo", {}), "ping 已答")
+
+    def test_notifications_before_the_answer_are_still_dispatched(self):
+        server = self.make_server(timeout=10.0)
+        changed = threading.Event()
+        server.on_tools_changed = changed.set
+        _Handler.script = ["notify"]
+        started = time.monotonic()
+        self.assertEqual(server.call_tool("echo", {}), "应答")
+        self.assertLess(time.monotonic() - started, 2.0)
+        self.assertTrue(changed.is_set(), "应答之前的 list_changed 通知丢了")
+
+    def test_stream_that_ends_without_the_answer_fails_without_waiting(self):
+        server = self.make_server(timeout=6.0)
+        _Handler.script = ["no_reply"]
+        started = time.monotonic()
+        out = server.call_tool("echo", {})
+        self.assertLess(time.monotonic() - started, 3.0, "流都关了还在等应答")
+        self.assertIn("没有给出", out)
+        self.assertIn("调用结果不确定", out)
+        self.assertTrue(server.alive())
+
+    def test_plain_json_answer_still_works(self):
+        server = self.make_server(timeout=5.0)
+        self.assertEqual(server.call_tool("echo", {}), "应答")
+        self.wait_until(lambda: not self.readers(), 3.0, "读线程没有随往返结束")
 
 
 if __name__ == "__main__":

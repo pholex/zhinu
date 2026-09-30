@@ -74,6 +74,7 @@ import json
 import os
 import re
 import shutil
+import socket
 import subprocess
 import sys
 import threading
@@ -804,9 +805,11 @@ class _HttpChannel:
     与 stdio 的结构差异（看代码前先知道这三条，否则会觉得少了半个 server）：
 
     1. **没有常驻读线程**：请求的响应就在这次 POST 的响应体里——`application/json`
-       一条、`text/event-stream` 若干条，发完当场派发。所以一个 server 的请求是
+       一条、`text/event-stream` 若干条，读到一条派发一条，读到本次请求的应答
+       就收流（流什么时候关是 server 的事，不等它）。一个 server 的请求是
        **串行**的（写锁包住整个往返）；stdio 那边靠 id 关联可以多条在飞，这里
-       不做——MCP 调用本来一问一答，为并发引入连接池不值。
+       不做——MCP 调用本来一问一答，为并发引入连接池不值。往返有 wall-clock
+       总时限：socket 超时只管"多久没动静"，server 的心跳行会不断给它续期。
     2. **server→client 方向要单开一条 GET SSE 长流**：
        notifications/tools/list_changed（rug-pull 监督的触发源）只走那条。
        server 回 405 就是"我不提供"，按没有处理，不当失败。
@@ -849,8 +852,21 @@ class _HttpChannel:
         headers.update(self.spec.headers)
         return headers
 
-    def post(self, payload: dict[str, Any], timeout: float) -> list[dict[str, Any]]:
-        """发一条 JSON-RPC 消息，返回这次往返里收到的全部消息（可能为空）。"""
+    def post(
+        self,
+        payload: dict[str, Any],
+        timeout: float,
+        dispatch: Callable[[dict[str, Any]], None] | None = None,
+        exchange: "_Exchange | None" = None,
+    ) -> list[dict[str, Any]]:
+        """发一条 JSON-RPC 消息，收到的消息**边读边交**给 dispatch。
+
+        payload 是请求（带 id）时，读到它的应答就收流返回：SSE 应答的流什么时候
+        关由 server 决定，读到流结束才返回等于把调用的时长交给对端。
+        不给 dispatch 就把消息攒起来返回。exchange 是等待方的遥控器（见
+        _Exchange）：总时限到了或不想等了，由它从别的线程掐断这次往返。
+        timeout 是 socket 的空闲超时，不是总时限——总时限归等待方管。
+        """
         body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
         request = urllib.request.Request(
             self.spec.url,
@@ -873,32 +889,53 @@ class _HttpChannel:
             raise McpError(f"等待 {name} 应答超时（{timeout:g}s）", kind="timeout") from exc
         except (http.client.HTTPException, OSError) as exc:
             raise McpError(f"与 {name} 的连接在应答前中断：{exc}", kind="dropped") from exc
+        if exchange is not None and not exchange.attach(response):
+            #  等待方已经放手：这条应答没人要了
+            response.close()
+            return []
+        collected: list[dict[str, Any]] = []
+        deliver = dispatch if dispatch is not None else collected.append
+        awaited = payload.get("id") if "method" in payload else None
         with response:
             try:
-                return self._read_messages(response)
+                for message in self._read_messages(response):
+                    deliver(message)
+                    if (
+                        awaited is not None
+                        and "method" not in message
+                        and message.get("id") == awaited
+                    ):
+                        break
+                return collected
             except TimeoutError as exc:
                 raise McpError(f"读取 {name} 的应答超时（{timeout:g}s）", kind="timeout") from exc
             except (http.client.HTTPException, OSError) as exc:
                 raise McpError(f"读取 {name} 的应答时连接中断：{exc}", kind="dropped") from exc
             except ValueError as exc:  # JSONDecodeError 是它的子类
                 raise McpError(f"{name} 的应答不是合法 JSON：{exc}", kind="malformed") from exc
+            finally:
+                #  读完了，接下来由本线程自己关：等待方不必再来掐
+                if exchange is not None:
+                    exchange.detach()
 
-    def _read_messages(self, response: Any) -> list[dict[str, Any]]:
+    def _read_messages(self, response: Any) -> "Iterator[dict[str, Any]]":
         #  会话 id 只在 initialize 的响应里出现，但每次都读一遍无害
         if new_id := response.headers.get("Mcp-Session-Id"):
             self.session_id = new_id
         kind = (response.headers.get("Content-Type") or "").split(";")[0].strip()
         if response.status == 202:
-            return []  # 通知被接收，无响应体
+            return  # 通知被接收，无响应体
         if kind == "text/event-stream":
-            return list(_read_sse(response))
+            yield from _read_sse(response)
+            return
         raw = _read_capped(response).decode("utf-8", "replace").strip()
         if not raw:
-            return []
+            return
         message = json.loads(raw)
         if isinstance(message, dict):
-            return [message]
-        return [item for item in message if isinstance(item, dict)] if isinstance(message, list) else []
+            yield message
+        elif isinstance(message, list):
+            yield from (item for item in message if isinstance(item, dict))
 
     def _http_error(self, exc: urllib.error.HTTPError) -> McpError:
         """非 2xx 状态码 → 分好类的 McpError（去向见 McpError 分类表）。"""
@@ -1014,6 +1051,62 @@ class _HttpChannel:
                 exc.close()
         except Exception:  # noqa: BLE001 - 尽力而为：关会话失败不该拦住关闭
             pass
+
+
+def _hang_up(response: Any) -> None:
+    """从别的线程掐断一条正在被读的应答。
+
+    不能直接 close：读线程阻塞在读里时握着缓冲区的锁，close 要等它读完才拿得到
+    ——等于陪它一起卡住。对底层 socket 做 shutdown 不用等谁：阻塞的读立刻以
+    "对端已关闭"返回，读线程自己收场、自己关。摸不到 socket 时退而求其次，
+    把 close 放到旁路线程里去等。
+    """
+    try:
+        response.fp.raw._sock.shutdown(socket.SHUT_RDWR)
+    except Exception:  # noqa: BLE001 - 响应已关 / 内部结构对不上：交给旁路线程兜底
+
+        def close() -> None:
+            with contextlib.suppress(Exception):
+                response.close()
+
+        threading.Thread(target=close, name="xiaoyu-mcp-hangup", daemon=True).start()
+
+
+class _Exchange:
+    """一次 POST 往返的遥控器。
+
+    读应答的线程阻塞在 socket 上，看不了时钟；等待方（发起请求的线程）看着
+    时钟却够不着连接。往返开始时两边各拿着它：读线程把响应挂上来，等待方
+    不想等了（拿到应答 / 总时限到 / 调用方放弃）就 abandon——连接被掐断，
+    读线程随即收场。先 abandon 后才拿到响应的，attach 返回 False，读线程
+    当场把它关掉。
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._response: Any = None
+        self.abandoned = False
+        #  读线程收场时填（持 server 的条件变量）：finished 立起时 error 已定
+        self.finished = False
+        self.error: McpError | None = None
+
+    def attach(self, response: Any) -> bool:
+        with self._lock:
+            if self.abandoned:
+                return False
+            self._response = response
+            return True
+
+    def detach(self) -> None:
+        with self._lock:
+            self._response = None
+
+    def abandon(self) -> None:
+        with self._lock:
+            self.abandoned = True
+            response, self._response = self._response, None
+        if response is not None:
+            _hang_up(response)
 
 
 def _read_capped(response: Any) -> bytes:
@@ -1566,23 +1659,19 @@ class McpServer:
             return call(common[0])
 
     def _request(self, method: str, params: dict[str, Any], timeout: float) -> dict[str, Any]:
+        """发一个请求并等它的应答。timeout 是整个往返的 wall-clock 总时限，
+        两种传输同一个意思。"""
         with self._cond:
             if self._dead:
                 raise McpError(self._exit_reason())
             self._next_id += 1
             request_id = self._next_id
-        self._send({"jsonrpc": "2.0", "id": request_id, "method": method, "params": params})
-        deadline = time.monotonic() + timeout
-        with self._cond:
-            while request_id not in self._responses:
-                #  走到这里请求已经发出：此后的退出/超时都是"结果不确定"
-                if self._dead:
-                    raise McpError(self._exit_reason(), kind="dropped")
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
-                    raise McpError(f"{method} 超时（{timeout:g}s）", kind="timeout")
-                self._cond.wait(remaining)
-            reply = self._responses.pop(request_id)
+        payload = {"jsonrpc": "2.0", "id": request_id, "method": method, "params": params}
+        if self._http is not None:
+            reply = self._roundtrip(payload, timeout)
+        else:
+            self._send(payload)
+            reply = self._await_reply(request_id, method, timeout, time.monotonic() + timeout)
         if "error" in reply:
             error = reply["error"] if isinstance(reply["error"], dict) else {}
             raise McpError(
@@ -1592,6 +1681,35 @@ class McpServer:
             )
         result = reply.get("result")
         return result if isinstance(result, dict) else {}
+
+    def _await_reply(
+        self,
+        request_id: int,
+        method: str,
+        timeout: float,
+        deadline: float,
+        exchange: _Exchange | None = None,
+    ) -> dict[str, Any]:
+        """等 request_id 的应答落进响应槽，到 deadline 为止。
+
+        走到这里请求已经发出：此后的退出/超时都是"结果不确定"。exchange 是
+        HTTP 往返的读线程状态——它收场了而应答没来，就不必再等。
+        """
+        with self._cond:
+            while request_id not in self._responses:
+                if exchange is not None and exchange.finished:
+                    #  规范：应答只会出现在这次 POST 自己的响应体里。流正常结束
+                    #  却没有它，等到总时限也不会有
+                    raise exchange.error or McpError(
+                        f"server 结束了应答却没有给出 {method} 的结果", kind="malformed"
+                    )
+                if self._dead:
+                    raise McpError(self._exit_reason(), kind="dropped")
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise McpError(f"{method} 超时（{timeout:g}s）", kind="timeout")
+                self._cond.wait(remaining)
+            return self._responses.pop(request_id)
 
     def _notify(self, method: str) -> None:
         self._send({"jsonrpc": "2.0", "method": method})
@@ -1661,8 +1779,8 @@ class McpServer:
         """一条收到的 JSON-RPC 消息 → 响应槽 / 反向请求应答 / 变更通知。
 
         stdio 与 HTTP 共用。generation 是 stdio 读线程的代际守卫（restart 换代
-        后，旧线程迟到的响应不能污染新一代的 id 空间）；HTTP 那边响应就在本次
-        POST 的响应体里、不存在迟到，传 None 即可。
+        后，旧线程迟到的响应不能污染新一代的 id 空间）；HTTP 那边的守卫在
+        读线程自己手里（见 _pump_exchange），传 None 即可。
         """
         if generation is not None and self._proc is not generation:
             return
@@ -1688,25 +1806,84 @@ class McpServer:
                 self._cond.notify_all()
 
     def _post(self, payload: dict[str, Any]) -> None:
-        """HTTP 传输的发送：一次往返，收到的消息当场派发。
+        """HTTP 传输发一条不等应答的消息（通知、对 server 反向请求的答复）。
 
-        写锁包住整个往返（不只是"写"）：远端没有 id 关联的读线程兜底，两个
-        请求交叉在飞时后到的响应会落进先到那次的 read——串行是这里的正确性
-        前提，不是性能取舍。
+        不拿写锁：这类消息没有应答可错配；而答复 server 的反向请求往往就发生在
+        一次请求的往返当中（server 在应答流里夹一个 ping，等我方答了才继续）
+        ——那时写锁正被那次往返握着，再去拿就是自己等自己。
         """
         channel = self._http
         if channel is None:
             raise McpError("server 未启动")
-        method = payload.get("method")
-        timeout = self.spec.timeout if method != "initialize" else INIT_TIMEOUT
+        try:
+            channel.post(payload, self.spec.timeout, dispatch=self._dispatch)
+        except McpError as exc:
+            self._http_failed(channel, payload.get("method"), exc)
+            raise
+
+    def _roundtrip(self, payload: dict[str, Any], timeout: float) -> dict[str, Any]:
+        """HTTP 传输的一次请求往返：POST 出去，等到这个 id 的应答为止。
+
+        写锁包住整个往返：同一个 server 的请求串行（见 _HttpChannel）。往返本身
+        有 timeout 这个总时限，所以排在后面的请求等得再久也有界。
+        读应答放在独立线程里（_pump_exchange），本线程只看响应槽和时钟——
+        应答一到就走，不等流结束；总时限一到也走，不管 server 还在不在发心跳。
+        无论怎么离开都把连接掐掉，读线程不会留在那条流上。
+        """
+        channel = self._http
+        if channel is None:
+            raise McpError("server 未启动")
+        method = str(payload.get("method"))
+        exchange = _Exchange()
         try:
             with self._write_lock:
-                messages = channel.post(payload, timeout)
+                deadline = time.monotonic() + timeout
+                threading.Thread(
+                    target=self._pump_exchange,
+                    args=(channel, payload, timeout, exchange),
+                    name=f"xiaoyu-mcp-post-{self.spec.name}",
+                    daemon=True,
+                ).start()
+                try:
+                    return self._await_reply(payload["id"], method, timeout, deadline, exchange)
+                finally:
+                    exchange.abandon()
         except McpError as exc:
             self._http_failed(channel, method, exc)
             raise
-        for message in messages:
-            self._dispatch(message)
+
+    def _pump_exchange(
+        self,
+        channel: _HttpChannel,
+        payload: dict[str, Any],
+        timeout: float,
+        exchange: _Exchange,
+    ) -> None:
+        """HTTP 往返的读线程：发出请求，把读到的消息逐条派发，收场时报告结局。"""
+
+        def deliver(message: dict[str, Any]) -> None:
+            #  等待方已经放手、或 restart 换了通道之后才读到的，不再派发
+            if exchange.abandoned or self._http is not channel:
+                return
+            try:
+                self._dispatch(message)
+            except Exception:  # noqa: BLE001 - 一条消息处理出错只丢这一条（与 stdio 读线程同一条规矩）
+                pass
+
+        error: McpError | None = None
+        try:
+            channel.post(payload, timeout, dispatch=deliver, exchange=exchange)
+        except McpError as exc:
+            error = exc
+        except Exception as exc:  # noqa: BLE001 - 读线程不能带着异常无声退场，等待方要有个结局
+            error = McpError(
+                f"读取 {self.spec.name} 的应答时出错：{type(exc).__name__}: {exc}",
+                kind="malformed",
+            )
+        with self._cond:
+            exchange.error = error
+            exchange.finished = True
+            self._cond.notify_all()
 
     def _http_failed(self, channel: _HttpChannel, method: Any, exc: McpError) -> None:
         """HTTP 往返出错后的去向，按 exc.kind 分流（见 McpError 分类表）：
