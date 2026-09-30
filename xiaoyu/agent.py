@@ -3374,9 +3374,22 @@ class Agent:
             self.session_log.event("compact_end", ok=True)
 
     def summary_models(self) -> list[Route]:
-        """摘要的尝试顺序：先便宜的（连它的影子兜底），失败再回退主模型。"""
-        names = [self.config.summary_model or self.config.model, self.config.model]
-        return self._routes(names)
+        """摘要的尝试顺序：先便宜的（连它的影子兜底），失败再回退主模型。
+
+        摘要模型没有 provider 能接时（只配了一家、而摘要模型的默认值落在别家）
+        整条链就是主模型：摘要模型是辅助角色，它配不上不该让压缩无路可走。
+        主模型自己解析不了则照常抛。
+        """
+        main = self.config.model
+        summary = self.config.summary_model or main
+        try:
+            return self._routes([summary, main])
+        except UnknownModel:
+            #  _routes 对打头的名字解析不了是直接抛（主请求链要的语义），这里打头的
+            #  却是摘要模型——去掉它再解析一次，轮到主模型打头
+            if summary == main:
+                raise
+            return self._routes([main])
 
     def _routes(self, names: list[str]) -> list[Route]:
         """一串模型名 → 路由链：每个名字展开成「主路由 + 影子兜底」，按 (家, 名) 去重保序。
@@ -4167,10 +4180,11 @@ class Agent:
             calls = [pending[index] for index in sorted(pending)]
             #  id 一路都没给的调用（无 index 流的病理形状）补本地 id：重放和
             #  tool result 都靠 tool_call_id 配对，空 id 两头全断（签名也会因
-            #  没有键可挂而丢）。id 只在本会话内闭环消费，本地合成即自洽
-            for position, call in enumerate(calls):
+            #  没有键可挂而丢）。id 只在本会话内闭环消费，本地合成即自洽——但必须
+            #  整个会话内不重复：按位置编号每轮都从 0 起，跨轮撞号，调用与结果配错对
+            for call in calls:
                 if not call["id"]:
-                    call["id"] = f"call_local_{position}"
+                    call["id"] = f"call_local_{uuid.uuid4().hex[:12]}"
             #  分片上攒的 extra_content（Gemini thought_signature）挪进私有键：
             #  留在 tool_call 里会漏进 wire（strip_private 只摘消息级键）。
             #  纪律同 _reasoning——签名是模型私有状态，记下产出路由，

@@ -108,6 +108,16 @@ _CONTEXT_MARKERS = (
     "maximum number of tokens allowed",  # "input token count … exceeds the maximum …"
     "range of input length should be",
     "token length exceed",  # "total message token length exceed model limit"
+    #  Bedrock 上的 Claude 按字节数报超限，整句里没有 token / context 字样
+    "too many total text bytes",
+    #  Bedrock Mantle（经网关转出来的样本）。两条互不包含，各收一条；
+    #  不缩成裸 "model maximum"——输出上限类的请求错误也会这么说
+    "exceed model maximum",
+    "exceed customer model maximum",
+    #  vLLM 的两种写法。后一条出自对其源码文案的记忆（"… is longer than the
+    #  maximum model length of N"），没有对着真实服务核对过
+    "exceeds the max_model_len",
+    "maximum model length",
 )
 
 #  结构化错误码里的超限：码比措辞稳（文案会改、会被网关转写，码不会）
@@ -144,7 +154,6 @@ _THROTTLE_NOT_OVERFLOW = ("too many tokens, please wait",)
 _QUOTA_MARKERS = (
     "insufficient_quota",
     "insufficient quota",
-    "exceeded your current quota",
     "monthly usage limit",
     "budget has been exceeded",
     "out of budget",
@@ -160,6 +169,14 @@ _QUOTA_MARKERS = (
     "_usage_limit_exceeded",
     "billing_hard_limit_reached",
 )
+
+#  两家共用的一句话：OpenAI 余额用尽与 Gemini 的每分钟限流都说 "You exceeded your
+#  current quota, please check your plan and billing details"。单看这句分不出来，
+#  要看服务端有没有同时说"等一等再来"（见 _says_wait）：说了就是限流。
+#  Gemini 那一侧的文案出自对公开样本的记忆，没有对着真实 API 核对过，所以判据
+#  收得很窄——只有这句和下面的 "billing" 单词让位给"等一等"，_QUOTA_MARKERS 里
+#  其余各条与结构化错误码不让位，一票判定为额度。
+_SHARED_QUOTA_WORDING = ("exceeded your current quota",)
 
 #  "billing" 单词太宽：限流文案里常附一句"去 billing 页面提额"之类的链接。
 #  只在文案不像限流时才认它是额度问题（限流等得起，误判成 quota 会跳过退避
@@ -189,9 +206,21 @@ _TRANSIENT_MARKERS = (
     "try again in",
 )
 
+#  4xx 里"原样再发一次可能就好"的几个状态码。408（请求超时）与 409（锁冲突）是
+#  两个 SDK 自带重试策略都认的码——重试收归主循环、SDK 的 max_retries 设成 0 之后，
+#  这里不认就没人接了。424 是 Bedrock 报"模型侧处理出错"用的码：依据只有 AWS 文档
+#  的说法，没有对着真实响应核对过；按瞬时处理，判错的代价是有界的几次重发。
+_TRANSIENT_STATUSES = (408, 409, 424)
+
 #  gRPC 系（Gemini / Vertex）的限流码。Google 对"每分钟配额用尽"也报这个，
 #  按限流处理正合适——退避等一等就过去了，和 _QUOTA_MARKERS 那种充值才能解的不同
 _EXHAUSTED_MARKERS = ("resource exhausted", "resource_exhausted")
+
+#  正文里点名的等待时长：Gemini 429 的 "Please retry in 35.2s" 与 RetryInfo 里的
+#  `retryDelay: "35s"`（文本已小写）。只认带秒数的明确写法，"1m30s" 这类不猜
+_BODY_RETRY_DELAY = re.compile(
+    r"retry in (\d+(?:\.\d+)?)\s?s\b|retrydelay\W{1,8}(\d+(?:\.\d+)?)s\b"
+)
 
 #  结构化错误码（exc.code / body.error.code）的精确值与后缀：流式里冒出来的
 #  错误常常只有 body，str(exc) 里不一定带码
@@ -269,6 +298,28 @@ def _certificate_failure(exc: BaseException) -> bool:
     return False
 
 
+def _body_retry_delay(text: str) -> float | None:
+    """正文里服务端点名的等待秒数，没写返回 None。text 须已小写。"""
+    match = _BODY_RETRY_DELAY.search(text)
+    if match is None:
+        return None
+    seconds = float(match.group(1) or match.group(2))
+    return seconds if seconds > 0 else None
+
+
+def _says_wait(text: str) -> bool:
+    """服务端有没有表示"等一等就过去"：gRPC 的限流码，或正文里点名了等多久。"""
+    return (
+        any(marker in text for marker in _EXHAUSTED_MARKERS)
+        or _BODY_RETRY_DELAY.search(text) is not None
+    )
+
+
+def _quota_worded_throttle(text: str) -> bool:
+    """措辞像额度用尽、实为限流（见 _SHARED_QUOTA_WORDING）。"""
+    return _says_wait(text) and any(marker in text for marker in _SHARED_QUOTA_WORDING)
+
+
 def _is_quota(exc: Exception, text: str, status: int | None) -> bool:
     #  402 Payment Required 无论文案都是额度问题
     if status == 402:
@@ -279,6 +330,11 @@ def _is_quota(exc: Exception, text: str, status: int | None) -> bool:
     if _vendor_kind(exc) == "quota":
         return True
     if any(marker in text for marker in _QUOTA_MARKERS):
+        return True
+    if _says_wait(text):
+        #  下面两条判据都可能是限流文案的一部分；服务端既然说了等一等，就不是额度
+        return False
+    if any(marker in text for marker in _SHARED_QUOTA_WORDING):
         return True
     return (
         _BILLING_MARKER in text
@@ -338,6 +394,7 @@ def classify(exc: Exception) -> Verdict:
         or "429" in text
         or vendor == "rate_limit"
         or any(marker in text for marker in _EXHAUSTED_MARKERS)
+        or _quota_worded_throttle(text)
     ):
         return Verdict("rate_limit", True, False, "限流")
 
@@ -345,8 +402,13 @@ def classify(exc: Exception) -> Verdict:
         _is_openai(exc, "APITimeoutError", "APIConnectionError", "InternalServerError")
         #  >=500 覆盖非 openai SDK 的服务端错误（含 anthropic 529 overloaded）
         or (status is not None and status >= 500)
+        or status in _TRANSIENT_STATUSES
         #  anthropic 的连接/超时异常是 `raise ... from <httpx 异常>`，认底因即可
         or isinstance(exc.__cause__, httpx.HTTPError)
+        #  流迭代到一半断开时两个 SDK 都不包装：抛出来的就是裸的 httpx 传输层异常
+        #  （对端关连接、分块读到一半、读超时）。证书失败也以 ConnectError 的形态
+        #  出现，它在上面的 _certificate_failure 已经先行判掉，走不到这里
+        or isinstance(exc, httpx.TransportError)
         #  没有状态码可判的流内错误事件，只剩措辞可认（见 _TRANSIENT_MARKERS）
         or any(marker in text for marker in _TRANSIENT_MARKERS)
     ):
@@ -413,6 +475,15 @@ def _headers(exc: BaseException) -> Any:
 
 def retry_after_asked(exc: BaseException) -> float | None:
     """服务端要求等多久（秒，不封顶）。挖不到返回 None。
+
+    响应头优先；头里没给再看正文——有的服务端（Gemini）把等待时长写在错误文案里。
+    """
+    asked = _header_retry_after(exc)
+    return asked if asked is not None else _body_retry_delay(str(exc).lower())
+
+
+def _header_retry_after(exc: BaseException) -> float | None:
+    """响应头里的等待时长。
 
     `retry-after-ms` 优先于 `retry-after`：OpenAI 系两个头一起发，秒级那个是向下
     取整的（"等 1.4 秒"会写成 `retry-after: 1`），照它重试仍在窗口内、白挨一次。
