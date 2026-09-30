@@ -3974,6 +3974,16 @@ class Agent:
                     if not self._shrink_after_overflow():
                         self._log_request(route, attempt, "error", exc=exc, verdict=verdict)
                         raise ContextOverflow() from exc
+                    if verdict.retryable and not errors.told_not_to_retry(exc):
+                        #  缩小了就立刻重发，不计次、不耗链上的重试预算、也不退避：发出去的
+                        #  已是另一个请求，被拒也不是因为对面忙。计次的话收紧还没见底次数
+                        #  先用完，最后一档写进了历史却发不出去，抛的还是上游的原始报错。
+                        #  不会没完没了：每次重发都以估算确实变小为前提，摘要压过一次后
+                        #  可压区间就空了，收紧也只有有限的几档
+                        self._log_request(route, attempt, "error", exc=exc, verdict=verdict)
+                        self.sink.emit(Notice("[上下文超限，历史已缩小，重发]", "warn"))
+                        attempt -= 1
+                        continue
                 if not retrying:
                     self._log_request(route, attempt, "error", exc=exc, verdict=verdict)
                     raise

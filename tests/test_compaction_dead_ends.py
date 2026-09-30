@@ -444,26 +444,45 @@ class TestOverflowRecovery(AgentTestCase):
         self.assertEqual(session_log.load_messages(log.path), agent.messages[1:])
         self.assertFalse(session_log.has_orphan_compact(log.path))
 
-    def test_second_overflow_with_nothing_left_to_shrink_stops(self) -> None:
-        """收紧到底仍被拒：不再发第三次。"""
-        agent = self.build([RuntimeError(OVERFLOW_TEXT) for _ in range(5)])
+    def rejected_all_the_way(self, overhead: int) -> list[dict]:
+        """服务端一路拒到底，返回依次发出去的请求。
+
+        收紧从哪一档起步，取决于工具 schema 的开销离预算多远；这个开销随环境变
+        （装没装浏览器依赖差一个工具，system prompt 也略有出入）。由调用方钉住，
+        两条路各测一遍，而不是看这台机器恰好落在预算线的哪一边。
+        """
+        agent = self.build([RuntimeError(OVERFLOW_TEXT) for _ in range(8)])
         self.oversized_tail(agent)
-        #  收紧分几档走完，取决于工具 schema 的开销离预算多远；这个开销随环境变
-        #  （装没装浏览器依赖差一个工具，system prompt 也略有出入）。钉住它，让
-        #  两档见底这个场景在哪台机器上都成立，而不是恰好压在预算线上
         with (
-            mock.patch.object(tokens, "estimate_tools", return_value=6_000),
-            self.assertRaises(compaction.ContextOverflow),
+            mock.patch.object(tokens, "estimate_tools", return_value=overhead),
+            self.assertRaises(compaction.ContextOverflow) as caught,
         ):
             self.send(agent)
-        #  每次重发之前历史都确实更小；缩到底之后不再发
-        sizes = [
-            tokens.estimate_messages(call["messages"])
-            for call in self.client.completions.calls
-        ]
+        self.assert_actionable(caught.exception)
+        calls = self.client.completions.calls
+        #  每次重发之前历史都确实更小
+        sizes = [tokens.estimate_messages(call["messages"]) for call in calls]
         self.assertEqual(sizes, sorted(sizes, reverse=True))
         self.assertEqual(len(set(sizes)), len(sizes))
-        self.assertLess(self.main_requests(), 5)
+        #  被拒不是因为对面忙：缩小了就立刻重发，不退避
+        self.assertEqual(self.waits, [])
+        #  最后发出去的已是最重的一档：没有哪一档写进了历史却没发
+        for message in calls[-1]["messages"]:
+            if message.get("role") == "tool":
+                self.assertLessEqual(len(message["content"]), compaction.TIGHTEN_CAPS[-1])
+        return calls
+
+    def test_second_overflow_with_nothing_left_to_shrink_stops(self) -> None:
+        """最轻的一档就超预算：从第二档起步，两档见底后不再发。"""
+        self.assertEqual(len(self.rejected_all_the_way(overhead=6_000)), 3)
+
+    def test_every_tier_is_sent_before_giving_up(self) -> None:
+        """三档走满要发四次，比单个模型的重试次数多：缩小后的重发不占那个次数。"""
+        from xiaoyu.agent import Agent
+
+        calls = self.rejected_all_the_way(overhead=1_000)
+        self.assertEqual(len(calls), len(compaction.TIGHTEN_CAPS) + 1)
+        self.assertGreater(len(calls), Agent._RECOVERY_ATTEMPTS)
 
     def test_normal_compaction_never_tightens(self) -> None:
         """没有超限报错时，保留段里的大结果原样不动。"""
