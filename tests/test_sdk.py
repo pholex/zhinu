@@ -36,6 +36,20 @@ class SDKTests(unittest.TestCase):
         self.addCleanup(self.tmp.cleanup)
         self.workspace = Path(self.tmp.name).resolve()
 
+    def test_build_metadata_reads_utf8_with_a_windows_default_encoding(self):
+        import runpy
+        from unittest.mock import Mock
+        root = Path(__file__).resolve().parents[1]
+        setup = Mock()
+        def read_text(path, encoding=None, **kwargs):
+            return path.read_bytes().decode(encoding or "cp1252")
+        with patch.dict(sys.modules, {"setuptools": SimpleNamespace(setup=setup)}), \
+             patch.object(Path, "read_text", read_text), \
+             patch.object(Path, "write_text") as write:
+            runpy.run_path(str(root / "packages/xiaoyu-agent-sdk/setup.py"))
+        self.assertEqual(setup.call_args.kwargs["version"], __import__("xiaoyu").__version__)
+        self.assertEqual(write.call_args.kwargs["encoding"], "utf-8")
+
     def options(self, script, **kwargs):
         client = FakeClient(script)
         return SessionOptions(ModelOptions("test-model", client=client), self.workspace,

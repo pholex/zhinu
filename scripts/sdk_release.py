@@ -18,7 +18,7 @@ PROJECTS = {"kernel": "xiaoyu-agent", "sdk": "xiaoyu-agent-sdk"}
 
 
 def verify(root: Path, *, commit: str | None = None, version: str | None = None) -> dict:
-    manifest = json.loads((root / "release-manifest.json").read_text())
+    manifest = json.loads((root / "release-manifest.json").read_text(encoding="utf-8"))
     if commit and (manifest["commit"] != commit or manifest["dirty"]):
         raise ValueError("Release must come from the exact clean tested commit")
     if version and manifest["version"] != version:

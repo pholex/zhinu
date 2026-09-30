@@ -23,7 +23,7 @@ def main() -> None:
         parser.error("Output directory must be empty; preserve previous release artifacts for retries")
     commit = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=root, text=True).strip()
     dirty = bool(subprocess.check_output(["git", "status", "--porcelain"], cwd=root, text=True).strip())
-    version = re.search(r'^__version__ = "([^"]+)"', (root / "xiaoyu/__init__.py").read_text(), re.M).group(1)
+    version = re.search(r'^__version__ = "([^"]+)"', (root / "xiaoyu/__init__.py").read_text(encoding="utf-8"), re.M).group(1)
     for name, source, namespace in (
         ("kernel", root, "xiaoyu"),
         ("sdk", root / "packages/xiaoyu-agent-sdk", "xiaoyu_agent_sdk"),
@@ -52,7 +52,7 @@ def main() -> None:
             if path.suffix in (".whl", ".gz")
         },
     }
-    (out / "release-manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
+    (out / "release-manifest.json").write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
 
 
 if __name__ == "__main__":
