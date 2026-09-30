@@ -10,16 +10,24 @@ from __future__ import annotations
 import contextlib
 import io
 import json
+import shutil
+import subprocess
 import sys
 import threading
 import time
 import unittest
-from pathlib import Path
 from types import SimpleNamespace
+from unittest import mock
 
 from xiaoyu import background as bg
+from xiaoyu import worktree as worktree_mod
 from xiaoyu.agent import Usage
+from xiaoyu.agents import AgentSpec, RunStore, make_subagent_tool
 from xiaoyu.cli import run_once
+
+from .test_agent_paths import AgentTestCase, call_fragment, chunk
+
+HAS_GIT = shutil.which("git") is not None
 
 POSIX = sys.platform != "win32"
 
@@ -180,6 +188,93 @@ class OneShotBackgroundReportTest(unittest.TestCase):
         with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
             code = run_once(agent, "干活", "json")
         return code, out.getvalue(), err.getvalue()
+
+
+def delegate_call(call_id: str, name: str, task: str) -> list:
+    return [chunk(tool_calls=[call_fragment(0, call_id, name, json.dumps({"task": task}))])]
+
+
+def cut_off_stream(spoken: str, exc: BaseException):
+    """说到一半被掐断的流（脚本项给生成器，假 client 原样交出去）。"""
+    yield chunk(content=spoken)
+    raise exc
+
+
+@unittest.skipUnless(HAS_GIT, "机器上没有 git")
+class InterruptedDelegationTest(AgentTestCase):
+    """单发委托跑到一半被 Ctrl-C：打断照常上抛，但存档与有改动的 worktree 留得住。"""
+
+    SPEC = AgentSpec(
+        name="builder", description="d", system_prompt="工作区 {workspace}",
+        tools=("read_file", "write_file"), isolation="worktree",
+    )
+
+    def setUp(self) -> None:
+        super().setUp()
+        for args in (
+            ["init", "-q"],
+            ["config", "user.email", "t@t"],
+            ["config", "user.name", "t"],
+            ["add", "-A"],
+            ["commit", "-qm", "init"],
+        ):
+            subprocess.run(["git", "-C", str(self.root), *args], check=True, capture_output=True)
+        #  worktree 基目录落在临时区，不碰真机配置
+        patcher = mock.patch.object(worktree_mod, "user_config_dir", lambda: self.root / "cfg")
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def delegate(self, sub_script: list, exc_type: type[BaseException]):
+        store = RunStore()
+        agent = self.build([delegate_call("d1", "builder", "写个文件"), *sub_script])
+        agent.toolbox.register(
+            make_subagent_tool(
+                self.SPEC, self.config, agent.registry, agent.usage, agent.sink,
+                agent.approver, agent.permissions, runs=store,
+            )
+        )
+        with contextlib.redirect_stdout(io.StringIO()), self.assertRaises(exc_type):
+            agent.send("委托一下")
+        return agent, store
+
+    def test_ctrl_c_keeps_the_archive_and_the_dirty_worktree(self) -> None:
+        write = json.dumps({"path": "new.txt", "content": "hi"})
+        agent, store = self.delegate(
+            [
+                [chunk(tool_calls=[call_fragment(0, "w1", "write_file", write)])],
+                cut_off_stream("写了一半", KeyboardInterrupt()),
+            ],
+            KeyboardInterrupt,
+        )
+        (run,) = store.values()
+        self.assertIsNotNone(run.worktree)
+        self.assertTrue((run.worktree / "new.txt").is_file())
+        self.assertTrue(run.isolated)
+        #  存档里是子 agent 真正走到的地方：写文件那一步在
+        self.assertTrue(any(m.get("role") == "tool" for m in run.messages))
+        #  句柄与路径作为这次委托调用的结果进了父会话历史
+        (result,) = [m for m in agent.messages if m["role"] == "tool"]
+        self.assertEqual(result["tool_call_id"], "d1")
+        self.assertIn("没有做完", result["content"])
+        self.assertIn(f"resume_from: {run.id}", result["content"])
+        self.assertIn(str(run.worktree), result["content"])
+        self.assertIn("写了一半", result["content"])
+
+    def test_interrupted_run_with_nothing_written_leaves_no_worktree(self) -> None:
+        agent, store = self.delegate(
+            [cut_off_stream("还没动手", KeyboardInterrupt())], KeyboardInterrupt
+        )
+        (run,) = store.values()
+        self.assertIsNone(run.worktree)
+        base = self.root / "cfg" / "worktrees"
+        self.assertEqual([p for p in base.rglob("*") if p.is_file()] if base.is_dir() else [], [])
+        (result,) = [m for m in agent.messages if m["role"] == "tool"]
+        self.assertIn(f"resume_from: {run.id}", result["content"])
+        self.assertNotIn("worktree", result["content"])
+
+    def test_exit_request_is_never_turned_into_a_failed_delegation(self) -> None:
+        _, store = self.delegate([cut_off_stream("收到", SystemExit(143))], SystemExit)
+        self.assertEqual(len(store), 1)
 
 
 if __name__ == "__main__":

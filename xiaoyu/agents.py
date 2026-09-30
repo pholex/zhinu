@@ -83,7 +83,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from . import compaction, fsguard, media, tokens, ui, worktree
-from .errors import classify
+from .errors import attach_partial, classify
 from .config import EFFORT_LEVELS, Config, user_config_dir
 from .events import Notice, UISink
 from .tools import Tool, Toolbox
@@ -351,6 +351,25 @@ STOP_REASONS = {
     "budget": "token 预算用尽",
     "truncated": "回复撞了输出长度上限、没说完",
 }
+
+
+def _interrupted_report(
+    spec_name: str, answer: str, run_id: str, kept: Path | None
+) -> str:
+    """单发委托被打断时，留给父会话的那条工具结果：做到哪、从哪接着做。"""
+    lines = [f"[已中断] 子 agent {spec_name} 被打断，**没有做完**。"]
+    if answer:
+        lines.append(f"[打断前的部分结论，未必完整]\n{answer}")
+    lines.append(
+        f"resume_from: {run_id}"
+        f"（要在这个子 agent 的上下文上继续，调 {spec_name} 时带上它）"
+    )
+    if kept is not None:
+        lines.append(
+            f"改动在独立 worktree：{kept}（主工作区未动；"
+            "用 git -C 该路径 diff 查看，确认后 git apply 取回）"
+        )
+    return "\n".join(lines)
 
 
 def reap_background(agent: Any) -> int:
@@ -974,6 +993,50 @@ def execute_delegation(
     #  继承来的历史（fork / 精简副本 / resume 存档）末尾可能已有别人的答复：
     #  本次一个字没产出时，不能把它当成本次的结论（或失败前的部分结论）交回去
     inherited_answer = sub_agent.last_assistant_text()
+
+    def fresh_answer() -> str:
+        answer = sub_agent.last_assistant_text()
+        return "" if answer == inherited_answer else answer
+
+    def settle() -> tuple[Path | None, str]:
+        """worktree 收尾 + 存档，返回（保留下来的 worktree，resume 句柄）。"""
+        #  -- worktree 收尾：本次新建的，干净就删、有改动就保留报路径；
+        #     resume 复用的一律保留 --
+        kept = inherited_wt
+        if created is not None:
+            if worktree.dirty(created):
+                kept = created
+            else:
+                worktree.remove(config.workspace, created)
+                kept = None
+
+        #  -- 存档（失败的也记：从 failed 恢复继续修是 resume 的正当用法） --
+        run_id = uuid.uuid4().hex[:8]
+        run = SubagentRun(
+            id=run_id,
+            spec_name=spec.name,
+            model=model,
+            messages=copy.deepcopy(sub_agent.messages),
+            worktree=kept,
+            #  隔离意图随存档传下去：只读追问轮、fail-open 退回主工作区的那次
+            #  都不改变"这条线本该隔离"
+            isolated=(
+                created is not None
+                or inherited_wt is not None
+                or bool(record is not None and record.isolated)
+            ),
+            workdir=workdir,
+        )
+        with lock:
+            store[run_id] = run
+            limit = max(MAX_RUNS, int(getattr(store, "capacity", MAX_RUNS)))
+            while len(store) > limit:
+                store.pop(next(iter(store)))
+        if isinstance(store, RunStore):
+            #  写盘放在锁外：批量委托并发收工时不该排队等磁盘
+            store.persist(run)
+        return kept, run_id
+
     failure = ""
     failure_kind = ""
     try:
@@ -983,53 +1046,31 @@ def execute_delegation(
         failure_kind = classify(exc).kind
         if len(failure) > MAX_FAILURE_CHARS:
             failure = failure[:MAX_FAILURE_CHARS] + "…（已截断）"
+    except BaseException as exc:
+        #  Ctrl-C / 进程被要求退出：用户要停的是整件事，不是"这次委托失败了"——
+        #  照样往上抛。但子 agent 已经做了的不能跟着丢：存档照落、有改动的
+        #  worktree 留着，句柄与路径挂在异常上带出去（主循环把它写成这次调用的
+        #  结果）。不带的话存档无人知晓，半成品 worktree 的路径也没有任何地方记着
+
+        def interrupted_report() -> str:
+            #  先停后台任务再看 worktree：它们可能还在往里写
+            reap_background(sub_agent)
+            kept, run_id = settle()
+            return _interrupted_report(spec.name, fresh_answer(), run_id, kept)
+
+        attach_partial(exc, interrupted_report)
+        raise
     finally:
         if reaped := reap_background(sub_agent):
             notes.append(f"子 agent 留下的 {reaped} 个后台任务已终止")
-    answer = sub_agent.last_assistant_text()
-    if answer == inherited_answer:
-        answer = ""
+    answer = fresh_answer()
     #  降级是粘性的：点名的模型持续失败后，余下的活都是备用模型干的。结论头里
     #  报实际干活的那个；存档仍记点名的（续跑时先回去试它，与主会话回探同一个道理）
     served = str(sub_agent.config.model or model)
     if served != model:
         notes.append(f"{model} 持续失败，这次由备用模型 {served} 完成")
 
-    #  -- worktree 收尾：本次新建的，干净就删、有改动就保留报路径；
-    #     resume 复用的一律保留 --
-    kept = inherited_wt
-    if created is not None:
-        if worktree.dirty(created):
-            kept = created
-        else:
-            worktree.remove(config.workspace, created)
-            kept = None
-
-    #  -- 存档（失败的也记：从 failed 恢复继续修是 resume 的正当用法） --
-    run_id = uuid.uuid4().hex[:8]
-    run = SubagentRun(
-        id=run_id,
-        spec_name=spec.name,
-        model=model,
-        messages=copy.deepcopy(sub_agent.messages),
-        worktree=kept,
-        #  隔离意图随存档传下去：只读追问轮、fail-open 退回主工作区的那次
-        #  都不改变"这条线本该隔离"
-        isolated=(
-            created is not None
-            or inherited_wt is not None
-            or bool(record is not None and record.isolated)
-        ),
-        workdir=workdir,
-    )
-    with lock:
-        store[run_id] = run
-        limit = max(MAX_RUNS, int(getattr(store, "capacity", MAX_RUNS)))
-        while len(store) > limit:
-            store.pop(next(iter(store)))
-    if isinstance(store, RunStore):
-        #  写盘放在锁外：批量委托并发收工时不该排队等磁盘
-        store.persist(run)
+    kept, run_id = settle()
 
     if not failure:
         sink.emit(Notice(f"  🤖 {spec.name} 完成：{len(sub_agent.trace)} 次工具调用"))
