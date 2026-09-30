@@ -47,6 +47,14 @@ _GENERIC_SUFFIX = "_BASE_URL"
 #  是 loopback 就填占位符；远端端点仍守"没 key 就不注册"——这条纪律的意义是
 #  把配置错误拦在启动期，而漏配 key 的远端地址正是它要拦的那种错误
 LOCAL_PLACEHOLDER_KEY = "local"
+#  Bedrock 的激活变量：值 = AWS 区域（`1` / `default` 等简写 = us-east-1）。
+#  凭据本身走 AWS 默认凭证链，不经这里、也永远不进 Provider.api_key
+BEDROCK_REGION_ENV = "XIAOYU_BEDROCK_REGION"
+DEFAULT_BEDROCK_REGION = "us-east-1"
+_BEDROCK_REGION_SHORTHANDS = frozenset({"1", "true", "yes", "on", "default"})
+#  无 key 型 provider 的 api_key 占位：OpenAI 兼容面的内层 client 构造要一个非空串，
+#  但 Bedrock 的每一个请求都走 Messages 一路的 SigV4 client，这个值从不出网
+IAM_PLACEHOLDER_KEY = "aws-iam"
 _LOCAL_HOSTS = frozenset({"localhost", "127.0.0.1", "::1", "0.0.0.0"})
 
 
@@ -173,6 +181,10 @@ class Preset:
     #  目前只有 Gemini：签名随流藏在 tool_calls[].extra_content 里，重放时缺了
     #  当前轮直接 400。存取纪律见 responses.restore_tool_extras
     signature_models: tuple[str, ...] = ()
+    #  凭据不是 API key 而是云厂商自己的凭证链（目前只有 Bedrock：AWS 默认链——
+    #  环境变量 / profile / SSO / 容器与实例角色）时，用这个环境变量激活并指定
+    #  区域；非空即"无 key 型" preset：key_envs 留空，向导与 doctor 按区域问/报
+    region_env: str = ""
 
 
 #  ⚠️ 只内置能确认的厂商。猜错的代价是用户配好了却 404——这类数据宁可缺也不能错
@@ -346,13 +358,42 @@ PRESETS: dict[str, Preset] = {
         effort_levels=(("grok-4.7", ("low", "medium", "high", "xhigh")),),
         vision_models=(WILDCARD,),
     ),
-    #  ⚠️ AWS Bedrock Mantle 刻意不内置（2026-08-11 实测后撤销）：
-    #  其 OpenAI 兼容端点 https://bedrock-mantle.{region}.api.aws/v1 确实存在
-    #  （API key 鉴权），但 Claude 系与 openai.gpt-5.x 都只挂各自原生协议
-    #  （/v1/chat/completions 与 /v1/responses 均明确拒绝）；chat completions
-    #  只对开放权重/第三方模型开放（gpt-oss、deepseek.v3.2、kimi-k2.5 实测通），
-    #  而那些都有更优直连。等内核会说 Anthropic Messages 协议再回来；
-    #  在那之前 bedrock Claude 经 OpenAI 兼容网关转发。
+    #  AWS Bedrock 上的 Claude，**只凭 AWS 凭证**（IAM 执行角色 / profile / SSO）
+    #  走 bedrock-runtime 的原生 Messages 协议（anthropic SDK 的 AnthropicBedrock：
+    #  SigV4 签名，/model/{id}/invoke[-with-response-stream]）。不需要 Anthropic key，
+    #  也不需要网关——这是它存在的全部理由：AWS 容器（AgentCore Runtime / ECS /
+    #  EC2）里最自然的凭证是执行角色，不是一把要另外托管的 key。
+    #  激活：XIAOYU_BEDROCK_REGION=us-east-1（无 key 可探，所以必须显式点名；
+    #  不自动嗅探 AWS 凭证——有 AWS profile 的机器不该悄悄换路由）。
+    #  依赖：boto3/botocore 只在这一家用得上，走可选 extra `xiaoyu-agent[bedrock]`。
+    #  2026-09-30 实测（us-east-1）：非流式 / stream / tool_use 往返 / 收图（600px
+    #  纯色答对）/ output_config.effort / cache_control（次轮 cache_read 命中）/
+    #  beta.messages / thinking 块回放（签名校验为真，篡改即 400）全通。
+    #  ⚠️ 裸 id anthropic.claude-fable-5-1 **不能按需调用**（400："with on-demand
+    #  throughput isn't supported"），必须用推理 profile：global.（全球跨区）或
+    #  us.（美区跨区）前缀。其它 profile / ARN 用 `bedrock/<id>` 显式寻址即可。
+    #  历史：2026-08-11 曾评估 Bedrock Mantle 的 OpenAI 兼容端点并放弃——Claude 在
+    #  那上面只挂原生协议（chat/completions 与 responses 都拒绝）；如今内核自己会说
+    #  Messages 协议，直接走 bedrock-runtime，Mantle 不再需要。
+    "bedrock": Preset(
+        name="bedrock",
+        #  占位：真实端点按区域在 _make 里拼（bedrock-runtime.{region}.amazonaws.com）
+        base_url="",
+        #  与 anthropic 直连的 opus-5-5 / sonnet-5-5 不重叠（那两个照旧直连），
+        #  这里只收 Bedrock 独有的一档。要别的型号用 bedrock/ 前缀点名
+        models=("global.anthropic.claude-fable-5-1",),
+        key_envs=(),
+        label="Bedrock（IAM）",
+        region_env=BEDROCK_REGION_ENV,
+        #  2026-09-30 实测 fable-5-1 收图（600px 纯蓝答对）
+        vision_models=(WILDCARD,),
+        anthropic_models=(WILDCARD,),
+        #  2026-09-30 逐档实测：none / minimal 均 400（"unknown variant"），五档全通；
+        #  模型卡：adaptive thinking 常开不可关，effort 默认 high
+        effort_levels=(
+            ("global.anthropic.claude-fable-5-1", ("low", "medium", "high", "xhigh", "max")),
+        ),
+    ),
 }
 
 
@@ -381,6 +422,8 @@ class Provider:
     #  只有网关会置位（见 _gateway_cache_bypass）：直连厂商的官方端点对未知
     #  请求体字段可能直接 400，绝不能发
     response_cache: bool = False
+    #  非空 = 请求走 AWS 凭证链签名的 Bedrock client（见 Registry._build_client）
+    aws_region: str = ""
 
     @property
     def wildcard(self) -> bool:
@@ -640,6 +683,8 @@ class Registry:
             def factory(p: Provider = provider, t: httpx.Timeout = self._timeout) -> Any:
                 from . import messages
 
+                if p.aws_region:
+                    return messages.bedrock_client(p.aws_region, t)
                 return messages.client(p.base_url, p.api_key, t)
 
         #  snapshot 录制（XIAOYU_SNAPSHOT_RECORD）包在最外侧：录到的
@@ -829,6 +874,7 @@ NO_PROVIDER_HINT = (
     "       DEEPSEEK_API_KEY=<你的-deepseek-key>\n"
     "       （同理：MOONSHOT_API_KEY / QWEN_API_KEY / ZHIPU_API_KEY\n"
     "         / ANTHROPIC_API_KEY / OPENAI_API_KEY / XAI_API_KEY / GEMINI_API_KEY）\n"
+    "     AWS Bedrock 上的 Claude 不要 key，只要 AWS 凭证：XIAOYU_BEDROCK_REGION=us-east-1\n"
     "  3. 走 OpenAI 兼容网关（LiteLLM、vLLM、各家官方 API…）：\n"
     "       XIAOYU_BASE_URL=https://<你的网关>/v1  +  XIAOYU_API_KEY=<key>\n"
     "       （本机 localhost 端点可以不给 key）\n"
@@ -945,6 +991,17 @@ def _generic_names() -> list[str]:
     return sorted(found)
 
 
+def bedrock_region() -> str:
+    """XIAOYU_BEDROCK_REGION 的取值：区域名；简写（1/true/default…）= us-east-1；
+    未设或空 = ""（Bedrock 不注册）。"""
+    raw = os.environ.get(BEDROCK_REGION_ENV, "").strip()
+    if not raw:
+        return ""
+    if raw.lower() in _BEDROCK_REGION_SHORTHANDS:
+        return DEFAULT_BEDROCK_REGION
+    return raw
+
+
 def _make(name: str, config: Config) -> Provider | None:
     """按名字造 provider。配不全（缺端点或缺 key）就返回 None。"""
     if name == SCRIPTED_PROVIDER:
@@ -969,6 +1026,26 @@ def _make(name: str, config: Config) -> Provider | None:
         )
 
     if preset := PRESETS.get(name):
+        if preset.region_env:
+            #  无 key 型：激活变量给区域，凭据交给 AWS 默认链（是否真有凭证要到
+            #  第一次请求才知道——SDK 会如实抛 NoCredentialsError / 403，不会
+            #  悄悄换路由）
+            region = bedrock_region()
+            if not region:
+                return None
+            return Provider(
+                preset.name,
+                f"https://bedrock-runtime.{region}.amazonaws.com",
+                IAM_PLACEHOLDER_KEY,
+                preset.models,
+                f"{preset.label} {region}",
+                preset.responses_models,
+                preset.vision_models,
+                preset.anthropic_models,
+                preset.text_tool_models,
+                preset.signature_models,
+                aws_region=region,
+            )
         key = find_api_key(preset.key_envs)
         if not key:
             return None

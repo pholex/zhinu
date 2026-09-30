@@ -48,7 +48,7 @@ xiaoyu config --show      # 看生效配置与来源（key 永不回显）
 DEEPSEEK_API_KEY=<your-key>
 ```
 
-内置直连 deepseek / moonshot / qwen / zhipu / anthropic / gemini / openai / xai，键名一律用厂商原生名。或者走 OpenAI 兼容网关：
+内置直连 deepseek / moonshot / qwen / zhipu / anthropic / gemini / openai / xai，键名一律用厂商原生名；AWS Bedrock 上的 Claude 不要 key，只凭 AWS 凭证（`XIAOYU_BEDROCK_REGION=us-east-1`，详见 [docs/configuration.md](docs/configuration.md)）。或者走 OpenAI 兼容网关：
 
 ```ini
 XIAOYU_BASE_URL=https://<你的网关>/v1
