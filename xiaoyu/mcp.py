@@ -44,7 +44,8 @@
   想免确认用 /allow 权限规则，决定权在用户手里。
 - **熔断**：一个 server 连续 3 次传输层失败后熔断 60 秒，期间调用
   立即返回并明确告诉模型"不要立刻重试"——同步主循环里每次干等满超时，
-  几个回合就能烧光一轮预算。
+  几个回合就能烧光一轮预算。server 明确答复的错误（JSON-RPC error、HTTP 4xx）
+  不计：那是这一次请求的问题，不是 server 的。
 - **schema 归一**：server 返回的 inputSchema 做最小消毒（可空 type 数组折叠、
   required 剪掉不存在的属性、裸字符串 schema 替换、缺 type 补 object）——
   严格校验的端点（Gemini/Kimi/OpenAI strict）会因一个畸形 schema 把整个
@@ -125,7 +126,8 @@ WORKSPACE_FILE = ".mcp.json"
 
 
 #  McpError.kind 的取值 = 出错后的去向。HTTP 传输全部分类；stdio 只分
-#  timeout / dropped（请求在飞时超时 / 进程退出），其余沿用未分类（空串）。
+#  timeout / dropped / rpc（请求在飞时超时 / 进程退出 / server 答了 error），
+#  其余沿用未分类（空串）。
 #    connect          请求没送到（拒绝连接 / DNS / 建连超时）      → 判断线，走重连
 #    session_expired  带会话的请求被回 404（规范：须重新 initialize）→ 判断线，走重连
 #    dropped          请求发出后连接中断（重置 / 对端关闭 / 进程退出）→ 判断线，走重连；结果不确定
@@ -135,10 +137,14 @@ WORKSPACE_FILE = ".mcp.json"
 #    malformed        应答解析不了                                  → 只报错；结果不确定
 #    too_large        应答体超过上限（见 _HTTP_BODY_CAP 一组常量）    → 只报错；结果不确定
 #    http             其余 4xx（server 明确拒收，请求没执行）         → 只报错
+#    rpc              JSON-RPC error 应答（参数非法、方法不存在…）     → 只报错；两种传输都有
 _RECONNECT_KINDS = frozenset({"connect", "session_expired", "dropped"})
 #  "结果不确定"：请求已送达 server 却没拿到可信应答——tools/call 的副作用可能
 #  已经发生，自动重试可能把一次写操作做成两次
 _OUTCOME_UNKNOWN_KINDS = frozenset({"dropped", "timeout", "server", "malformed", "too_large"})
+#  "server 给了明确答复"：它在正常收发，错在这一次请求本身（多半是模型把参数
+#  写错了）。不算进熔断的连败，反而证明 server 是健康的
+_ANSWERED_KINDS = frozenset({"rpc", "http"})
 
 
 class McpError(RuntimeError):
@@ -1120,8 +1126,10 @@ class McpServer:
         self.connected_at: float | None = None
 
     #  熔断参数：3 连败开路、60s 后自动半开。
-    #  只数传输层失败（超时/进程退出/JSON-RPC error）；isError 是业务失败，
-    #  server 本身是健康的，不算。
+    #  只数"server 没能好好应答"的失败（超时 / 进程退出 / 连接中断 / 5xx /
+    #  应答解析不了）。server 明确答复的不算：isError 是业务失败，JSON-RPC error
+    #  与 HTTP 4xx 是这一次请求被拒（见 _ANSWERED_KINDS）——模型连着写错三次
+    #  参数，不该把一个健康 server 的全部工具一起关掉 60 秒。
     _BREAKER_THRESHOLD = 3
     _BREAKER_COOLDOWN = 60.0
 
@@ -1460,10 +1468,13 @@ class McpServer:
                 timeout=self.spec.timeout,
             )
         except McpError as exc:
-            self._failures += 1
-            if self._failures >= self._BREAKER_THRESHOLD:
-                self._breaker_until = time.monotonic() + self._BREAKER_COOLDOWN
+            if exc.kind in _ANSWERED_KINDS:
                 self._failures = 0
+            else:
+                self._failures += 1
+                if self._failures >= self._BREAKER_THRESHOLD:
+                    self._breaker_until = time.monotonic() + self._BREAKER_COOLDOWN
+                    self._failures = 0
             text = f"ERROR: MCP 调用失败（{self.spec.name}/{tool}）：{_redact(str(exc))}"
             if exc.kind == "auth":
                 return text + (
@@ -1541,6 +1552,7 @@ class McpServer:
             error = reply["error"] if isinstance(reply["error"], dict) else {}
             raise McpError(
                 f"{error.get('message', '未知错误')}（code {error.get('code')}）",
+                kind="rpc",
                 data=error.get("data"),
             )
         result = reply.get("result")
