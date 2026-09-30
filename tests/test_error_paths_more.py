@@ -450,3 +450,136 @@ class MoreOverflowWordingTest(unittest.TestCase):
             verdict = classify(_StatusError(wording, 400))
             self.assertEqual(verdict.kind, "fatal", wording)
             self.assertFalse(verdict.should_compact, wording)
+
+
+# ---------- 措辞像额度用尽、实为限流 ----------
+
+#  Gemini 每分钟限流的 429。**文案出自对公开样本的记忆，没有对着真实 API 核对过**：
+#  它与 OpenAI 余额用尽共用第一句话，区别在 RESOURCE_EXHAUSTED 状态与点名的等待时长
+_GEMINI_SENTENCE = (
+    "You exceeded your current quota, please check your plan and billing details. "
+    "For more information on this error, head to: https://ai.google.dev/gemini-api/docs/rate-limits. "
+    "* Quota exceeded for metric: generativelanguage.googleapis.com/generate_content_requests, "
+    "limit: 10\nPlease retry in 35.2s."
+)
+_GEMINI_BODY = [
+    {
+        "error": {
+            "code": 429,
+            "message": _GEMINI_SENTENCE,
+            "status": "RESOURCE_EXHAUSTED",
+            "details": [
+                {"@type": "type.googleapis.com/google.rpc.RetryInfo", "retryDelay": "35s"}
+            ],
+        }
+    }
+]
+
+
+def _rate_limited(message: str, body=None, headers=None) -> openai.RateLimitError:
+    response = httpx.Response(
+        429, request=httpx.Request("POST", "http://unused"), headers=headers
+    )
+    return openai.RateLimitError(message, response=response, body=body)
+
+
+def _gemini_samples() -> list[Exception]:
+    return [
+        #  经 OpenAI 兼容端点：SDK 把整个错误体拼进异常文本
+        _rate_limited(f"Error code: 429 - {_GEMINI_BODY}", body=_GEMINI_BODY),
+        #  网关转写后只剩文本
+        RuntimeError(f"429 RESOURCE_EXHAUSTED. {_GEMINI_BODY[0]}"),
+        #  没有状态码、没有 gRPC 码，只剩那句话和等待时长
+        RuntimeError(_GEMINI_SENTENCE),
+    ]
+
+
+class QuotaWordedThrottleTest(unittest.TestCase):
+    def test_gemini_per_minute_limit_is_rate_limit(self):
+        for exc in _gemini_samples():
+            with self.subTest(carrier=type(exc).__name__, text=str(exc)[:40]):
+                verdict = classify(exc)
+                self.assertEqual(verdict.kind, "rate_limit")
+                self.assertTrue(verdict.retryable)
+                self.assertFalse(verdict.should_compact)
+
+    def test_exhausted_balance_is_still_quota(self):
+        """真·余额用尽：同一句话，但服务端没说等一等。"""
+        sentence = "You exceeded your current quota, please check your plan and billing details."
+        body = {"message": sentence, "type": "insufficient_quota", "code": "insufficient_quota"}
+        for exc in (
+            _rate_limited(sentence),
+            _rate_limited(f"Error code: 429 - {{'error': {body}}}", body=body),
+            RuntimeError(sentence),
+            RuntimeError("insufficient_quota"),
+        ):
+            with self.subTest(carrier=type(exc).__name__, text=str(exc)[:40]):
+                verdict = classify(exc)
+                self.assertEqual(verdict.kind, "quota")
+                self.assertFalse(verdict.retryable)
+
+    def test_unambiguous_quota_signals_do_not_yield(self):
+        """结构化错误码与点名余额/预算的措辞：即使带着 gRPC 限流码或等待时长也是额度。"""
+        coded = _rate_limited(
+            "RESOURCE_EXHAUSTED: please retry in 5s",
+            body={"code": "insufficient_quota", "message": "x"},
+        )
+        for exc in (
+            coded,
+            RuntimeError("RESOURCE_EXHAUSTED: insufficient_quota, retry in 5s"),
+            RuntimeError("Budget has been exceeded! Max budget: 10.0. retryDelay: 30s"),
+        ):
+            with self.subTest(text=str(exc)[:40]):
+                self.assertEqual(classify(exc).kind, "quota")
+
+
+class BodyRetryDelayTest(unittest.TestCase):
+    def test_delay_is_read_from_the_message(self):
+        from xiaoyu.errors import retry_after_asked
+
+        first, second, third = _gemini_samples()
+        self.assertEqual(retry_after_asked(first), 35.2)
+        self.assertEqual(retry_after_asked(second), 35.2)
+        self.assertEqual(retry_after_asked(third), 35.2)
+        #  只有 RetryInfo 没有那句话时认 retryDelay
+        for text in (
+            "RESOURCE_EXHAUSTED {'retryDelay': '12s'}",
+            'RESOURCE_EXHAUSTED {"retryDelay": "12s"}',
+            'RESOURCE_EXHAUSTED {\\"retryDelay\\": \\"12s\\"}',
+        ):
+            self.assertEqual(retry_after_asked(RuntimeError(text)), 12.0, text)
+
+    def test_nothing_parseable_means_nothing_passed_on(self):
+        from xiaoyu.errors import retry_after_asked
+
+        for text in (
+            "rate limited",
+            "please retry in a moment",
+            "Please retry in 1m30s.",
+            "retry in 0s",
+            "retryDelay: soon",
+        ):
+            self.assertIsNone(retry_after_asked(RuntimeError(text)), text)
+
+    def test_header_wins_over_the_message(self):
+        from xiaoyu.errors import retry_after_asked
+
+        exc = _rate_limited("Please retry in 35.2s.", headers={"retry-after": "7"})
+        self.assertEqual(retry_after_asked(exc), 7.0)
+
+
+class QuotaWordedThrottleRecoveryTest(AgentTestCase):
+    """主循环：按服务端在正文里点名的时长等，然后原地重发。"""
+
+    def test_waits_as_long_as_the_message_says(self):
+        agent = self.build(
+            [_gemini_samples()[0], [chunk(content="好了"), usage_chunk(10, 2)]]
+        )
+        with mock.patch("xiaoyu.agent.Agent._sleep") as fake_sleep, \
+                contextlib.redirect_stdout(io.StringIO()):
+            agent.send("问")
+        (waited,) = [call.args[0] for call in fake_sleep.call_args_list]
+        #  只往上抖：早于服务端说的时刻醒来必然再挨一次
+        self.assertGreaterEqual(waited, 35.2)
+        self.assertLessEqual(waited, 35.2 * 1.1 + 1e-9)
+        self.assertEqual(agent.last_assistant_text(), "好了")
