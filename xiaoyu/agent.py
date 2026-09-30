@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import hashlib
+import inspect
 import json
 import platform
 import queue
@@ -115,7 +116,8 @@ class Allow:
     note 非空时随 tool result 回灌模型（与 (True, 附言) 等价）。
     updated_args 非 None 时以它**整体替换**本次调用的参数再执行——宿主"批准但
     改写"的通道，典型用法是把只读形命令包上 OS 级沙箱后放行。替换发生在权限规则与
-    needs_approval 判定之后：改写出来的参数是宿主自己的责任，不再过一遍规则。
+    needs_approval 判定之后；改写出来的参数只再过一遍 deny 规则（deny 对审批改写
+    同样生效），allow / ask 不重判。
     """
 
     note: str = ""
@@ -129,13 +131,35 @@ class Deny:
     reason: str = ""
 
 
+def verdict_problem(verdict: Any) -> str:
+    """Approver 返回值的形状认不认识：认识返回空串，不认识返回一句说明。
+
+    审批是闸，闸上"看不懂的答复"只能算没批准——按真值判会把没 await 的协程
+    对象、`{"approved": False}` 这类字典、宿主自定义的结果对象统统当成批准。
+    认的形状只有：bool、None、str、Allow / Deny、以及头元素是 bool / None / str
+    的元组。
+    """
+    if verdict is None or isinstance(verdict, (bool, str, Allow, Deny)):
+        return ""
+    if isinstance(verdict, tuple):
+        if not verdict or verdict[0] is None or isinstance(verdict[0], (bool, str)):
+            return ""
+        return f"元组头元素是 {type(verdict[0]).__name__}，不是 bool / str"
+    if inspect.isawaitable(verdict):
+        return "返回的是没有 await 的协程对象——异步审批要经 AsyncApprover 接入"
+    return f"返回了 {type(verdict).__name__}，不是 bool / str / tuple / Allow / Deny"
+
+
 def normalize_verdict(verdict: Any) -> tuple[bool, str, str, dict[str, Any] | None]:
     """把 Approver 的多形态返回值归一成 (批准?, 附言, 拒绝理由, 改写参数)。
 
     简写形态的语义完整保留：True=批准；(True, 附言)=批准并附言；非空 str=
-    拒绝并附理由；其余 falsy=普通拒绝。(False, 理由) 的理由**不再被静默丢弃**
-    ——它就是拒绝理由（此前这条路会把理由吞掉，宿主以为回灌了模型其实没有）。
-    改写参数只能经 Allow(updated_args=…) 表达，简写形态没有这个通道。
+    拒绝并附理由；False / None / 空串=普通拒绝。(False, 理由) 的理由**不再被
+    静默丢弃**——它就是拒绝理由（此前这条路会把理由吞掉，宿主以为回灌了模型
+    其实没有）。改写参数只能经 Allow(updated_args=…) 表达，简写形态没有这个通道。
+
+    **批准只认 True 本身**（或 Allow）：形状不认识的返回值一律拒绝，不按真值
+    猜（见 verdict_problem）。
     """
     if isinstance(verdict, Allow):
         updated = dict(verdict.updated_args) if verdict.updated_args is not None else None
@@ -148,12 +172,17 @@ def normalize_verdict(verdict: Any) -> tuple[bool, str, str, dict[str, Any] | No
         #  头元素本身是字符串时沿用裸 str 的语义：非空=拒绝理由
         if isinstance(flag, str):
             return False, "", flag.strip() or text, None
-        if flag:
+        if flag is True:
             return True, text, "", None
-        return False, "", text, None
+        if flag is False or flag is None:
+            return False, "", text, None
+        return False, "", "", None
     if isinstance(verdict, str):
         return False, "", verdict.strip(), None
-    return bool(verdict), "", "", None
+    if inspect.iscoroutine(verdict):
+        #  不会有人 await 它了：关掉，免得解释器再补一条 never awaited 的告警
+        verdict.close()
+    return verdict is True, "", "", None
 
 
 def normalize_questions(questions: Any) -> list[dict[str, Any]] | str:
@@ -833,6 +862,16 @@ class Agent:
     ) -> None:
         self.config = config
         self.toolbox = toolbox or Toolbox(config)
+        if approver is not None and (
+            inspect.iscoroutinefunction(approver)
+            or inspect.iscoroutinefunction(getattr(approver, "__call__", None))
+        ):
+            #  async def 调出来的是协程对象，没人 await 就永远没有答复。运行期
+            #  也会按拒绝处理（verdict_problem），但接线错误该在接线时就炸
+            raise TypeError(
+                "approver 不能是 async 函数：审批在工作线程里同步调用，"
+                "异步审批请用 xiaoyu.AsyncApprover(fn, loop) 包一层"
+            )
         #  默认放行，交互式 CLI 会传入真正的确认函数。
         self.approver: Approver = approver or (lambda name, args: True)
         #  提问通道（ask_user 工具）：None = 前端没有提问界面，工具不进 schemas
@@ -4499,7 +4538,23 @@ class Agent:
             if guarded is not None:
                 #  为什么这一笔在 auto / --yolo 下也要问，得让人看得见
                 self.sink.emit(Notice(f"  ⚠ 要写的是可执行配置——{guarded}", "warn"))
-            approved, note, reason, updated = normalize_verdict(self.approver(name, args))
+            verdict = self.approver(name, args)
+            malformed = verdict_problem(verdict)
+            approved, note, reason, updated = normalize_verdict(verdict)
+            if malformed:
+                #  闸坏了要让人看见：静默拒绝的话，宿主只会觉得"模型怎么什么都不干"
+                self.trace.append(
+                    {"tool": name, "args": args, "ok": False, "output": "DENIED_BAD_VERDICT"}
+                )
+                self.sink.emit(
+                    Notice(f"  ⚠ 审批回调的返回值无法识别，已按拒绝处理：{malformed}", "warn")
+                )
+                self.sink.emit(ToolDenied(name, by="user"))
+                return self._tool_message(
+                    call,
+                    "ERROR: 这次调用没有执行——宿主的审批回调返回了无法识别的结果，"
+                    "按拒绝处理。这是接入配置问题，重试不会变：请把情况告诉用户。",
+                )
             if not approved:
                 self.trace.append({"tool": name, "args": args, "ok": False, "output": "DENIED"})
                 self.sink.emit(ToolDenied(name, by="user"))

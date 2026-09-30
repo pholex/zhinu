@@ -74,8 +74,9 @@ async def main() -> None:
     async_agent.recycle()                              # 清对话重开，对象不重建
 ```
 
-⚠️ 把 `async def` 直接传给 `Agent(approver=...)` 是错的：传进去的是没被
-await 的协程对象，被当真值 = 永远批准。异步审批必须经 `AsyncApprover`。
+⚠️ 把 `async def` 直接传给 `Agent(approver=...)` 是错的：调出来的是没被
+await 的协程对象，永远等不到答复——`Agent` 构造时直接抛 `TypeError`。异步审批
+必须经 `AsyncApprover`。
 
 ## 审批契约
 
@@ -88,6 +89,10 @@ await 的协程对象，被当真值 = 永远批准。异步审批必须经 `Asy
 | `Allow(updated_args={...})` | 批准并**整体替换**本次参数（宿主"包沙箱再放行"的通道） |
 | `False` / `""` / `None` | 拒绝 |
 | `"理由"` / `(False, "理由")` / `Deny("理由")` | 拒绝并把理由回灌模型——拒绝即改指令 |
+
+**批准只认 `True` 本身或 `Allow`**。表里没有的形状（字典、自定义结果对象、
+数字、协程对象……）一律按拒绝处理，并发一条告警说明返回值无法识别——审批是闸，
+看不懂的答复不按真值猜。
 
 规则：`Allow.updated_args` 改写后的参数**仍要过一遍 deny 规则**（deny 的
 bypass-immune 承诺对审批改写同样成立）；`normalize_verdict()` 是把这些形态归一

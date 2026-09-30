@@ -37,9 +37,9 @@ source=str(path)) 接回——与 CLI `xiaoyu resume` 走同一条路径。常�
 tuple[bool, str] | Allow | Deny]`，见 `agent.Approver`），执行时机在 `send()`
 的工作线程里，不在事件循环线程。宿主如果
 要在审批过程中等一个异步结果（飞书审批卡的点击，可能要等几十秒），直接把一个
-`async def` 传给 `Agent(approver=...)` 是错的——那样传进去的是"没被 await 过的协程
-对象"本身，会被误判成真值（永远批准）。正确写法是 `AsyncApprover`：把宿主的
-async 审批函数桥接成一个真正同步、Agent 认识的 approver。
+`async def` 传给 `Agent(approver=...)` 是错的——调出来的是"没被 await 过的协程
+对象"，永远等不到答复；`Agent` 构造时就会抛 TypeError。正确写法是
+`AsyncApprover`：把宿主的 async 审批函数桥接成一个真正同步、Agent 认识的 approver。
 
     async def approve(name: str, args: dict):
         card = await send_feishu_approval_card(name, args)

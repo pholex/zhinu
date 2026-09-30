@@ -16,7 +16,8 @@ import types
 import unittest
 from pathlib import Path
 
-from xiaoyu.agent import Agent, Allow, Deny, normalize_verdict
+from xiaoyu.agent import Agent, Allow, Deny, normalize_verdict, verdict_problem
+from xiaoyu.events import Notice
 from xiaoyu.providers import Registry
 from xiaoyu.tools import Toolbox
 from xiaoyu.config import Config
@@ -47,6 +48,39 @@ class TestNormalizeVerdict(unittest.TestCase):
         self.assertEqual(normalize_verdict(Allow(note="加 -n 试跑")), (True, "加 -n 试跑", "", None))
         self.assertEqual(normalize_verdict(Deny()), (False, "", "", None))
         self.assertEqual(normalize_verdict(Deny(reason="超出授权")), (False, "", "超出授权", None))
+
+    def test_unrecognized_shapes_are_denied(self) -> None:
+        """批准只认 True 本身：看不懂的答复不按真值猜。"""
+
+        class HostVerdict:
+            approved = False
+
+        for verdict in ({"approved": False}, {"approved": True}, HostVerdict(), 1, [True], object()):
+            with self.subTest(verdict=verdict):
+                self.assertFalse(normalize_verdict(verdict)[0])
+                self.assertTrue(verdict_problem(verdict))
+
+    def test_tuple_head_must_be_true_itself(self) -> None:
+        self.assertFalse(normalize_verdict(({"approved": False}, "why"))[0])
+        self.assertTrue(verdict_problem(({"approved": False}, "why")))
+        self.assertFalse(normalize_verdict((1, "附言"))[0])
+        self.assertEqual(normalize_verdict((None, "没空")), (False, "", "没空", None))
+
+    def test_unawaited_coroutine_is_denied_and_closed(self) -> None:
+        async def approve(name, args):
+            return True
+
+        pending = approve("bash", {})
+        self.assertIn("AsyncApprover", verdict_problem(pending))
+        self.assertFalse(normalize_verdict(pending)[0])
+        #  已被关掉：再 send 会抛 StopIteration 之外的 RuntimeError
+        with self.assertRaises(RuntimeError):
+            pending.send(None)
+
+    def test_recognized_shapes_report_no_problem(self) -> None:
+        for verdict in (True, False, None, "", "理由", (True, "x"), (False,), (), ("不行", ""), Allow(), Deny()):
+            with self.subTest(verdict=verdict):
+                self.assertEqual(verdict_problem(verdict), "")
 
     def test_allow_updated_args_is_copied(self) -> None:
         original = {"command": "echo hi"}
@@ -130,3 +164,37 @@ class VerdictAgentTestCase(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+    def test_unrecognized_verdict_blocks_execution_and_warns(self) -> None:
+        """宿主回了个字典：调用不执行，模型被告知是接入问题，前端有告警。"""
+        seen: list[object] = []
+
+        class Sink:
+            def emit(self, event) -> None:
+                seen.append(event)
+
+        agent = self.build_with_bash_call(lambda name, args: {"approved": False})
+        agent.sink = Sink()
+        agent.send("跑一下")
+        output = self.tool_messages(agent)[-1]
+        self.assertNotIn("ORIGINAL", output)
+        self.assertIn("无法识别", output)
+        self.assertTrue(
+            any(isinstance(e, Notice) and "无法识别" in e.text for e in seen),
+            [e for e in seen if isinstance(e, Notice)],
+        )
+        self.assertEqual(agent.trace[-1]["output"], "DENIED_BAD_VERDICT")
+
+    def test_async_function_as_approver_is_rejected_at_construction(self) -> None:
+        async def approve(name, args):
+            return True
+
+        class AsyncCallable:
+            async def __call__(self, name, args):
+                return True
+
+        for approver in (approve, AsyncCallable()):
+            with self.subTest(approver=approver):
+                with self.assertRaises(TypeError) as ctx:
+                    self.build_with_bash_call(approver)
+                self.assertIn("AsyncApprover", str(ctx.exception))
