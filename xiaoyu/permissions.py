@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import fnmatch
 import functools
+import json
 import os
 import re
 import shlex
@@ -452,6 +453,36 @@ def command_keys(command: str) -> tuple[str, ...] | None:
     return tuple(keys)
 
 
+#  MCP 工具默认不进工具表，模型经这个转发器点名调用（见 tools.py 的检索模式）。
+#  判权限时它不是一个工具，而是参数里点名的那一个
+FORWARDER_TOOL = "use_tool"
+_FORWARDED_PREFIX = "mcp__"
+
+
+def call_identity(name: str, args: dict) -> tuple[str, dict]:
+    """一次调用在权限上"到底是谁"：返回 (工具名, 参数)。
+
+    转发器调用按它点名的工具算：规则、会话授权、「总是允许」的推导全都落在
+    `mcp__<server>__<tool>` 上，与不走检索模式时完全一致。不拆的话所有 MCP 工具
+    共用一个名字——`deny mcp__x__delete` 不命中，答一次「本会话允许」就把每个
+    server 的每个工具都放行了。点名不成形（不是 MCP 全限定名）的原样返回，
+    那种调用本来也执行不了。
+    """
+    if name != FORWARDER_TOOL:
+        return name, args
+    target = args.get("tool_name")
+    if not isinstance(target, str) or not target.strip().startswith(_FORWARDED_PREFIX):
+        return name, args
+    inner = args.get("tool_input")
+    if isinstance(inner, str):
+        #  与转发器自己的宽进口径一致：参数对象偶尔被整个序列化成字符串
+        try:
+            inner = json.loads(inner)
+        except ValueError:
+            inner = None
+    return target.strip(), inner if isinstance(inner, dict) else {}
+
+
 def suggest_allow_rule(name: str, args: dict, workspace: Path) -> Rule | None:
     """从一次待确认的调用推导「总是允许」的持久规则；推不出返回 None。
 
@@ -465,6 +496,7 @@ def suggest_allow_rule(name: str, args: dict, workspace: Path) -> Rule | None:
     4. 推导结果必须过 banned_allow_reason——python * 这类任意代码执行入口
        在这里就被拦下，不会出现"界面提供了选项、落盘时才报错"。
     """
+    name, args = call_identity(name, args)
     if name != "bash":
         path = args.get("path")
         if isinstance(path, str) and path:
@@ -531,11 +563,19 @@ class Rule:
         return f"{self.behavior} {target}"
 
 
-_RULE_LINE = re.compile(r"^(allow|deny|ask)\s+([A-Za-z_][\w-]*)(?:\((.*)\))?\s*$")
+#  行首关键字不分大小写（Deny / DENY 是同一个意思，没有第二种读法）；工具名照旧
+#  区分——它要和注册的名字逐字对上
+_RULE_LINE = re.compile(
+    r"^(allow|deny|ask)\s+([A-Za-z_][\w-]*)(?:\((.*)\))?\s*$", re.IGNORECASE
+)
 
 
 def parse_rule(text: str) -> Rule | None:
-    """解析一条规则；解析不了返回 None（fail-closed：坏规则不生效）。"""
+    """解析一条规则；解析不了返回 None。
+
+    坏的 allow 不生效是 fail-closed，坏的 deny / ask 不生效却是护栏没了——所以
+    调用方拿到 None 必须让人看见（规则文件加载时逐行报，见 _parse_rules_file）。
+    """
     match = _RULE_LINE.match(text.strip())
     if not match:
         return None
@@ -545,7 +585,41 @@ def parse_rule(text: str) -> Rule | None:
         if not spec:
             #  空括号 bash() 是笔误而不是"整个工具"：宁可无效也不猜意图
             return None
-    return Rule(behavior, tool, spec)
+    return Rule(behavior.lower(), tool, spec)
+
+
+#  常见的叫错名字：写了规则却永远不命中，比写不进去更糟——用户以为护栏在
+_TOOL_ALIASES = {
+    "shell": "bash",
+    "sh": "bash",
+    "terminal": "bash",
+    "exec": "bash",
+    "read": "read_file",
+    "write": "write_file",
+    "edit": "str_replace",
+}
+_SECOND_RULE = re.compile(r"\)\s*,\s*[A-Za-z_][\w-]*\s*\(")
+
+
+def rule_lint(rule: Rule) -> str:
+    """规则能解析、但多半不会按用户想的生效：返回一句说明，没问题返回空串。
+
+    只报拿得准的几类，规则本身照常加载——插件工具的名字我们管不着，宁可少报。
+    """
+    tool = rule.tool
+    if not tool.startswith("mcp__"):
+        if tool.lower() in _TOOL_ALIASES:
+            return f"没有叫 {tool} 的工具，是不是 {_TOOL_ALIASES[tool.lower()]}？"
+        if tool != tool.lower():
+            return f"工具名区分大小写，内置工具都是小写——是不是 {tool.lower()}？"
+    if rule.spec and _SECOND_RULE.search(rule.spec):
+        return "一行只能写一条规则，逗号后面的部分被当成了模式的一部分"
+    return ""
+
+
+#  行尾注释：`deny bash(curl *)  # 临时`。不剥的话整行解析不了，规则静默失效。
+#  只认"规则主体之后、空白加 #"——模式里的 # 在括号内，不会被误剥
+_TRAILING_COMMENT = re.compile(r"^(\S+\s+[A-Za-z_][\w-]*(?:\(.*?\))?)\s+#.*$")
 
 
 @dataclass(frozen=True)
@@ -578,11 +652,18 @@ def _parse_rules_file(path: Path) -> tuple[list[Rule], list[RuleTest]]:
         #  坏字节不该让整份规则作废：里面的 deny 是用户明令禁止的事，
         #  能认出来的行照常生效
         raw = path.read_text(encoding="utf-8", errors="replace")
-    except OSError:
+    except (FileNotFoundError, NotADirectoryError):
+        return [], []
+    except OSError as exc:
+        #  文件在、却读不了：里面的 deny / ask 是用户明令要拦的事，不能悄悄当没有
+        print(
+            f"[权限规则读不了] {path}: {exc} —— 这份文件里的规则（含 deny / ask）都没生效",
+            file=sys.stderr,
+        )
         return [], []
     rules: list[Rule] = []
     tests: list[RuleTest] = []
-    for line in raw.splitlines():
+    for lineno, line in enumerate(raw.splitlines(), start=1):
         line = line.strip()
         if match := _TEST_LINE.match(line):
             expected, tool, argument = match.groups()
@@ -590,13 +671,30 @@ def _parse_rules_file(path: Path) -> tuple[list[Rule], list[RuleTest]]:
             continue
         if not line or line.startswith("#"):
             continue
+        if match := _TRAILING_COMMENT.match(line):
+            line = match.group(1)
         rule = parse_rule(line)
         if rule is None:
+            print(
+                f"[权限规则被忽略] {path}:{lineno}: {line} —— 解析不了，这一行没生效。"
+                "行格式：allow|deny|ask 工具名(模式)，一行一条",
+                file=sys.stderr,
+            )
             continue
         if reason := banned_allow_reason(rule):
             #  手改文件绕过 add_persistent 的校验也拦得住：坏规则不生效并当场报警
             print(f"[权限规则被忽略] {path}: {rule} —— {reason}", file=sys.stderr)
             continue
+        if hint := rule_lint(rule):
+            print(f"[权限规则可能不会命中] {path}:{lineno}: {rule} —— {hint}", file=sys.stderr)
+        if rule.behavior == "allow" and rule.tool == FORWARDER_TOOL:
+            #  照旧生效（写的人可能就是这个意思），但得让他知道范围：早先确认框的
+            #  「总是允许」对 MCP 工具落的就是这一条，本意多半只是放行其中一个
+            print(
+                f"[权限规则范围很宽] {path}:{lineno}: {rule} —— 它放行的是所有 MCP 工具；"
+                "只想放行某一个请改成 allow mcp__<server>__<tool>",
+                file=sys.stderr,
+            )
         rules.append(rule)
     return rules, tests
 
@@ -682,28 +780,38 @@ class Permissions:
         规则管它、走常规确认。allow 不带规则：它可能来自会话授权或多条规则联合判定，
         没有单一出处，硬给一条反而误导。
         """
+        #  转发器调用按它点名的工具判（见 call_identity）。写给转发器本身的规则
+        #  （deny use_tool = 所有 MCP 工具）照旧认：两个身份各判一遍
+        identities = [call_identity(name, args)]
+        if identities[0][0] != name:
+            identities.append((name, args))
         #  1. deny：任一规则命中即拦，bypass-immune
         for rule in self.rules:
-            if rule.behavior == "deny" and self._deny_matches(rule, name, args):
+            if rule.behavior == "deny" and any(
+                self._deny_matches(rule, tool, call_args) for tool, call_args in identities
+            ):
                 return "deny", rule
         #  2. ask：介于放行和拦死之间——"照常自动跑，唯独这几样先问我"。排在会话
         #  授权与 allow 之前：答过一次"本会话允许"、或恰好有条更宽的 allow，都不该
         #  把它架空。匹配口径与 deny 相同（按命令本身认，不按写法认）
         for rule in self.rules:
-            if rule.behavior == "ask" and self._deny_matches(
-                Rule("deny", rule.tool, rule.spec), name, args
+            if rule.behavior == "ask" and any(
+                self._deny_matches(Rule("deny", rule.tool, rule.spec), tool, call_args)
+                for tool, call_args in identities
             ):
                 return "ask", rule
-        #  3. 会话授权：工具名（非命令类）或命令键（bash，每段都要已放行）
-        if name in self.session_allowed:
-            return "allow", None
-        if name == "bash" and self.session_commands:
-            keys = command_keys(str(args.get("command", "")))
-            if keys and all(key in self.session_commands for key in keys):
+        for tool, call_args in identities:
+            #  3. 会话授权：工具名（非命令类）或命令键（bash，每段都要已放行）
+            if tool in self.session_allowed:
                 return "allow", None
-        #  4. allow 规则（bash 是多条规则联合判定：每一段命中任一条即可）
-        if self._allowed(name, args):
-            return "allow", None
+            if tool == "bash" and self.session_commands:
+                keys = command_keys(str(call_args.get("command", "")))
+                if keys and all(key in self.session_commands for key in keys):
+                    return "allow", None
+        for tool, call_args in identities:
+            #  4. allow 规则（bash 是多条规则联合判定：每一段命中任一条即可）
+            if self._allowed(tool, call_args):
+                return "allow", None
         #  5. 常规确认流程
         return "ask", None
 
@@ -793,6 +901,10 @@ class Permissions:
     def _match_path(self, spec: str, path: object) -> bool:
         if not isinstance(path, str) or not path:
             return False
+        if spec.startswith("~"):
+            #  规则里写 ~/.ssh/* 是最自然的写法；比较对象是展开后的绝对路径，
+            #  不展开就永远对不上
+            spec = os.path.expanduser(spec)
         candidate = Path(path).expanduser()
         if not candidate.is_absolute():
             candidate = self.workspace / candidate
@@ -813,6 +925,7 @@ class Permissions:
     def session_grant_label(self, name: str, args: dict) -> str | None:
         """确认框"本会话允许"选项的文案主体；None = 这次调用推不出会话授权范围，
         选项不该出现。一处定义，三个前端（TUI / 明文 / ACP）同用。"""
+        name, args = call_identity(name, args)
         if name != "bash":
             return name
         keys = command_keys(str(args.get("command", "")))
@@ -824,6 +937,9 @@ class Permissions:
         label = self.session_grant_label(name, args)
         if label is None:
             return None
+        #  转发器调用记的是它点名的那个工具，不是转发器——否则答一次就把所有
+        #  MCP 工具都放行了
+        name, args = call_identity(name, args)
         if name == "bash":
             self.session_commands.update(command_keys(str(args.get("command", ""))) or ())
         else:

@@ -323,6 +323,15 @@ def _scan(
                 continue
             if source.plugin:
                 name = f"{source.plugin}{NAMESPACE_SEP}{name}"
+            elif source.project and NAMESPACE_SEP in name:
+                #  `<插件>:<技能>` 这个形态是留给插件包的。仓库自带的技能排在插件
+                #  之前扫，自己起一个带前缀的名字就能把已装插件的同名技能顶掉
+                print(
+                    f"[技能 {name!r} 跳过：工作区自带的技能名不能含 {NAMESPACE_SEP!r}"
+                    f"（那是插件包的命名空间）（{skill_md}）]",
+                    file=sys.stderr,
+                )
+                continue
             if is_disabled(name, skill_md.parent.name, patterns):
                 #  在撞名判定之前就摘掉：停用的那份不该占着名字把后面同名的挡掉
                 if keep_disabled:

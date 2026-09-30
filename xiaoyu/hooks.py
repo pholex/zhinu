@@ -44,6 +44,7 @@ from typing import Any
 from .config import user_config_dir
 
 EVENTS = ("PreToolUse", "PostToolUse", "UserPromptSubmit", "Stop")
+_ENTRY_KEYS = frozenset({"event", "matcher", "command", "timeout"})
 
 _DEFAULT_TIMEOUT = 30.0
 _MAX_TIMEOUT = 600.0
@@ -87,11 +88,25 @@ def load_hooks(path: Path | None = None) -> tuple[list[Hook], list[str]]:
         data = tomllib.loads(path.read_text(encoding="utf-8", errors="replace"))
     except (OSError, tomllib.TOMLDecodeError) as exc:
         return [], [f"hooks.toml 解析失败：{exc}"]
+    #  不认识的键要说出来：[[hooks]] 写成 [[hook]]，整份配置一条都不加载，
+    #  用户以为挂上的护栏其实不存在
+    for key in data:
+        if key != "hooks":
+            problems.append(f"顶层键 {key!r} 不认识，已忽略——条目要写在 [[hooks]] 下")
+    entries = data.get("hooks") or []
+    if not isinstance(entries, list):
+        problems.append("hooks 应当是表数组（[[hooks]]），整段已忽略")
+        entries = []
     hooks: list[Hook] = []
-    for index, entry in enumerate(data.get("hooks") or [], start=1):
+    for index, entry in enumerate(entries, start=1):
         if not isinstance(entry, dict):
             problems.append(f"第 {index} 条不是表")
             continue
+        if unknown := sorted(set(entry) - _ENTRY_KEYS):
+            problems.append(
+                f"第 {index} 条有不认识的键 {'、'.join(unknown)}，已忽略"
+                f"（可用：{'、'.join(sorted(_ENTRY_KEYS))}）"
+            )
         event = str(entry.get("event", ""))
         command = str(entry.get("command", "")).strip()
         if event not in EVENTS:
@@ -110,6 +125,9 @@ def load_hooks(path: Path | None = None) -> tuple[list[Hook], list[str]]:
         try:
             timeout = float(entry.get("timeout", _DEFAULT_TIMEOUT))
         except (TypeError, ValueError):
+            problems.append(
+                f"第 {index} 条 timeout={entry.get('timeout')!r} 不是数字，按 {_DEFAULT_TIMEOUT:g}s 算"
+            )
             timeout = _DEFAULT_TIMEOUT
         timeout = min(max(timeout, 1.0), _MAX_TIMEOUT)
         hooks.append(Hook(event=event, command=command, matcher=matcher, timeout=timeout))
@@ -143,15 +161,34 @@ class HookEngine:
     def has(self, event: str) -> bool:
         return any(hook.event == event for hook in self.hooks)
 
-    def fire(self, event: str, payload: dict[str, Any], tool_name: str = "") -> Decision:
-        """跑该事件的所有匹配 hook。任一 block（exit 2）即 block，理由拼接。"""
+    def for_tools(self, workspace: Path) -> "HookEngine | None":
+        """给委托出去的子 agent 用的一份：只带工具类钩子，工作目录换成它的。
+
+        用户挂在工具调用上的护栏不该因为"这一步是子 agent 做的"就不触发；
+        UserPromptSubmit / Stop 说的是用户这一轮的开头和收尾，子 agent 没有
+        这两个时刻，不带下去。没有工具类钩子时返回 None（触发点零开销）。
+        """
+        kept = [hook for hook in self.hooks if hook.event in ("PreToolUse", "PostToolUse")]
+        return HookEngine(kept, workspace, self._notify) if kept else None
+
+    def fire(
+        self, event: str, payload: dict[str, Any], tool_name: str = "", also: str = ""
+    ) -> Decision:
+        """跑该事件的所有匹配 hook。任一 block（exit 2）即 block，理由拼接。
+
+        also 是这次调用的另一个名字：MCP 工具经转发器调用时，tool_name 是转发器、
+        also 是它点名的工具——matcher 写哪个都算匹配，挂在具体 MCP 工具上的钩子
+        不因为调用走了转发器就不触发。
+        """
         reasons: list[str] = []
         body = json.dumps(
             {"event": event, "workspace": str(self.workspace), **payload},
             ensure_ascii=False,
         )
         for hook in self.hooks:
-            if hook.event != event or not hook.matches(tool_name):
+            if hook.event != event or not (
+                hook.matches(tool_name) or (also and hook.matches(also))
+            ):
                 continue
             try:
                 proc = subprocess.run(

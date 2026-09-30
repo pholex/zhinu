@@ -138,6 +138,7 @@ from .session_log import (
     SessionLockedError,
     SessionLog,
     _workspace_slug,
+    last_usage,
     load_messages,
     sessions_dir,
     turn_starts,
@@ -1231,6 +1232,13 @@ def create_app(cfg: ServeConfig):  # noqa: C901 - 路由表天然长，拆开反
             log.event("reopened", version=app.version, model=local.model, messages=len(history))
             #  copy=False：历史就在这个文件里，再抄一遍等于每次重启都把日志翻倍
             session.async_agent.restore(history, copy=False)
+            #  预算是按会话累计卡的，账本却只活在内存里：从日志最后一条 usage
+            #  事件（轮末写的累计快照）接上，否则花超的会话重启一次就又能提交。
+            #  中途被杀的那一轮没来得及记账——少算不到一轮，不会多算
+            recorded = last_usage(log_path)
+            if recorded:
+                session.agent.usage.absorb(recorded.get("by_model"))
+                session.budget_reason = session.check_budget()
             #  游标接着编号：重启前的事件计入 dropped，客户端手里的 from 仍单调。
             #  从预留线接——上个进程发出去的序号都在它之下；优雅停机时它就是实际水位，
             #  中途被杀时它比实际水位高出不到一个块，序号跳过一段但绝不回头

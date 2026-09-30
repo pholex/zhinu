@@ -197,6 +197,125 @@ class ToolboxSearchModeTest(unittest.TestCase):
         self.assertTrue(key.startswith("mcp-online-fake-"))
 
 
+class _FakeMcpView:
+    """不起进程的 MCP 视图：两个现成的远端工具。"""
+
+    def __init__(self, calls: list[str]) -> None:
+        def make(tool: str) -> mcp.RemoteTool:
+            def handler(**kwargs) -> str:
+                calls.append(tool)
+                return f"{tool} ok"
+
+            return mcp.RemoteTool(
+                name=f"mcp__fake__{tool}", description=tool,
+                parameters={"type": "object", "properties": {}},
+                handler=handler, check_fn=lambda: True, server="fake", raw_name=tool,
+            )
+
+        self._tools = [make("list"), make("delete")]
+
+    def ready_tools(self):
+        return self._tools
+
+    def loading(self) -> bool:
+        return False
+
+    def take_media(self):
+        return []
+
+
+class PermissionIdentityAcrossModesTest(unittest.TestCase):
+    """权限认的是被调用的 MCP 工具本身，与它是直接挂进工具表还是经转发器调用无关。"""
+
+    def run_calls(self, search_mode: bool, rules: list[str], tools: list[str], on_ask=None):
+        import contextlib
+        import io
+
+        from xiaoyu.agent import Agent
+        from xiaoyu.permissions import Permissions, parse_rule
+        from xiaoyu.providers import Registry
+
+        from .test_agent_paths import FakeClient, call_fragment, chunk
+
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        root = Path(tmp.name).resolve()
+        config = Config(
+            base_url="x", model="m", summary_model="m", explore_model="m", workspace=root,
+            mode="default", auto_approve=False, mcp_tool_search=search_mode,
+            enable_skills=False, enable_agents=False, enable_hooks=False, enable_plugins=False,
+        )
+        executed: list[str] = []
+        asked: list[str] = []
+        permissions = Permissions(root, [parse_rule(rule) for rule in rules])
+
+        def approver(name, args):
+            asked.append(name)
+            return on_ask(permissions, name, args) if on_ask else False
+
+        def call(index: int, tool: str) -> list:
+            full = f"mcp__fake__{tool}"
+            if search_mode:
+                payload = ("use_tool", {"tool_name": full, "tool_input": {}})
+            else:
+                payload = (full, {})
+            return [chunk(tool_calls=[call_fragment(0, f"c{index}", payload[0], json.dumps(payload[1]))])]
+
+        script = [call(index, tool) for index, tool in enumerate(tools)] + [[chunk(content="完")]]
+        agent = Agent(
+            config, Toolbox(config, mcp_view=_FakeMcpView(executed)),
+            registry=Registry.for_client(FakeClient(script)),
+            approver=approver, permissions=permissions,
+        )
+        with contextlib.redirect_stdout(io.StringIO()):
+            agent.send("干活")
+        return executed, len(asked), [item["output"] for item in agent.trace]
+
+    def both_modes(self, *args, **kwargs):
+        direct = self.run_calls(False, *args, **kwargs)
+        forwarded = self.run_calls(True, *args, **kwargs)
+        self.assertEqual(direct, forwarded)
+        return forwarded
+
+    def test_deny_on_one_tool_holds_in_both_modes(self):
+        executed, asked, outputs = self.both_modes(
+            ["deny mcp__fake__delete", "allow mcp__fake__list"], ["list", "delete"]
+        )
+        self.assertEqual(executed, ["list"])
+        self.assertEqual(asked, 0)
+        self.assertEqual(outputs[-1], "DENIED_BY_RULE")
+
+    def test_session_grant_for_one_tool_does_not_free_the_other(self):
+        """答一次「本会话允许」放行的是那一个工具：另一个照样要问。"""
+
+        def grant_list_only(permissions, name, args):
+            permissions.grant_session_call(name, args)
+            return True
+
+        executed, asked, _ = self.both_modes([], ["list", "list", "delete"], on_ask=grant_list_only)
+        #  第一次 list 问、第二次免问、delete 仍然问
+        self.assertEqual(asked, 2)
+        self.assertEqual(executed, ["list", "list", "delete"])
+
+    def test_hook_matcher_written_for_the_real_tool_fires_through_the_forwarder(self):
+        from xiaoyu.hooks import Hook
+
+        hook = Hook("PreToolUse", "true", matcher="^mcp__fake__delete$")
+        self.assertFalse(hook.matches("use_tool"))
+        self.assertEqual(
+            Agent_hook_alias("use_tool", {"tool_name": "mcp__fake__delete", "tool_input": {}}),
+            {"also": "mcp__fake__delete"},
+        )
+        self.assertEqual(Agent_hook_alias("mcp__fake__delete", {}), {})
+        self.assertEqual(Agent_hook_alias("bash", {"command": "ls"}), {})
+
+
+def Agent_hook_alias(name: str, args: dict) -> dict:
+    from xiaoyu.agent import Agent
+
+    return Agent._hook_alias(name, args)  # noqa: SLF001
+
+
 class SearchToolWithoutMcpTest(unittest.TestCase):
     def test_meta_tools_absent_without_mcp(self):
         with tempfile.TemporaryDirectory() as tmp:

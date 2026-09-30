@@ -14,7 +14,15 @@ from pathlib import Path
 from unittest import mock
 
 from xiaoyu import permissions as perm_mod
-from xiaoyu.permissions import Permissions, Rule, banned_allow_reason, parse_rule
+from xiaoyu.permissions import (
+    Permissions,
+    Rule,
+    banned_allow_reason,
+    call_identity,
+    parse_rule,
+    rule_lint,
+    suggest_allow_rule,
+)
 
 from .test_agent_paths import AgentTestCase
 
@@ -34,6 +42,19 @@ class ParseRuleTest(unittest.TestCase):
     def test_roundtrip_str(self):
         for text in ("allow bash(git *)", "deny write_file"):
             self.assertEqual(str(parse_rule(text)), text)
+
+    def test_keyword_is_case_insensitive_but_tool_is_not(self):
+        self.assertEqual(parse_rule("Deny bash(curl *)"), Rule("deny", "bash", "curl *"))
+        self.assertEqual(parse_rule("ASK write_file"), Rule("ask", "write_file", None))
+        self.assertEqual(parse_rule("deny Bash(curl *)"), Rule("deny", "Bash", "curl *"))
+
+    def test_lint_names_rules_that_will_never_hit(self):
+        self.assertIn("bash", rule_lint(Rule("deny", "Bash", "curl *")))
+        self.assertIn("bash", rule_lint(Rule("deny", "shell", "curl *")))
+        self.assertIn("一行只能写一条", rule_lint(parse_rule("deny bash(a *), bash(b *)")))
+        for rule in ("deny bash(curl *)", "allow write_file", "deny mcp__GitHub__delete_repo",
+                     "deny bash(echo (a), b)"):
+            self.assertEqual(rule_lint(parse_rule(rule)), "", rule)
 
 
 class DecideTest(unittest.TestCase):
@@ -355,14 +376,73 @@ class PersistenceTest(unittest.TestCase):
         ws_file = self.workspace / ".xiaoyu" / "permissions.txt"
         ws_file.parent.mkdir(parents=True)
         ws_file.write_text("deny bash(curl *)\n", encoding="utf-8")
-        perms = Permissions.load(self.workspace)
+        with contextlib.redirect_stderr(io.StringIO()):
+            perms = Permissions.load(self.workspace)
         self.assertEqual(len(perms.rules), 2)
         self.assertEqual(perms.decide("bash", {"command": "git status"}), "allow")
         self.assertEqual(perms.decide("bash", {"command": "curl http://x"}), "deny")
 
     def test_load_without_files(self):
-        perms = Permissions.load(self.workspace)
+        with contextlib.redirect_stderr(io.StringIO()) as err:
+            perms = Permissions.load(self.workspace)
         self.assertEqual(perms.rules, [])
+        self.assertEqual(err.getvalue(), "")  # 没有文件不是问题，不该出声
+
+    def load_user_rules(self, body: str) -> tuple[Permissions, str]:
+        self.user_file.parent.mkdir(parents=True, exist_ok=True)
+        self.user_file.write_text(body, encoding="utf-8")
+        with contextlib.redirect_stderr(io.StringIO()) as err:
+            perms = Permissions.load(self.workspace)
+        return perms, err.getvalue()
+
+    def test_unparseable_lines_are_reported_not_dropped_silently(self):
+        """写坏的 deny 不生效 = 护栏没了，必须让人看见是哪一行。"""
+        perms, err = self.load_user_rules(
+            "deny: bash(curl *)\n"
+            "deny bash (wget *)\n"
+            "deny bash(git push*)\n"
+        )
+        self.assertEqual([str(rule) for rule in perms.rules], ["deny bash(git push*)"])
+        self.assertEqual(err.count("权限规则被忽略"), 2)
+        self.assertIn(f"{self.user_file}:1", err)
+        self.assertIn(f"{self.user_file}:2", err)
+
+    def test_trailing_comment_does_not_void_the_rule(self):
+        perms, err = self.load_user_rules(
+            "deny bash(curl *)   # 临时 (先拦着)\n"
+            "ask write_file # 都问\n"
+            "deny bash(echo # x)\n"
+        )
+        self.assertEqual(
+            [str(rule) for rule in perms.rules],
+            ["deny bash(curl *)", "ask write_file", "deny bash(echo # x)"],
+        )
+        self.assertEqual(err, "")
+        self.assertEqual(perms.decide("bash", {"command": "curl http://x"}), "deny")
+
+    def test_suspicious_rules_load_with_a_warning(self):
+        perms, err = self.load_user_rules("Deny Bash(curl *)\n")
+        self.assertEqual(len(perms.rules), 1)
+        self.assertIn("权限规则可能不会命中", err)
+        self.assertIn("bash", err)
+
+    @unittest.skipIf(os.name == "nt" or os.geteuid() == 0, "靠 POSIX 权限位造不可读文件")
+    def test_unreadable_file_is_reported(self):
+        self.user_file.parent.mkdir(parents=True)
+        self.user_file.write_text("deny bash(curl *)\n", encoding="utf-8")
+        self.user_file.chmod(0)
+        self.addCleanup(self.user_file.chmod, 0o600)
+        with contextlib.redirect_stderr(io.StringIO()) as err:
+            perms = Permissions.load(self.workspace)
+        self.assertEqual(perms.rules, [])
+        self.assertIn("权限规则读不了", err.getvalue())
+
+    def test_tilde_in_path_rule_is_expanded(self):
+        home = Path(os.path.expanduser("~"))
+        perms = Permissions(self.workspace, [Rule("deny", "read_file", "~/.ssh/*")])
+        self.assertEqual(perms.decide("read_file", {"path": str(home / ".ssh" / "id_rsa")}), "deny")
+        self.assertEqual(perms.decide("read_file", {"path": "~/.ssh/id_rsa"}), "deny")
+        self.assertEqual(perms.decide("read_file", {"path": str(home / "notes.txt")}), "ask")
 
     def test_add_persistent_appends_and_takes_effect(self):
         perms = Permissions.load(self.workspace)
@@ -372,6 +452,129 @@ class PersistenceTest(unittest.TestCase):
         self.assertEqual(perms.decide("bash", {"command": "git status"}), "allow")
         #  重新 load 也还在
         self.assertEqual(len(Permissions.load(self.workspace).rules), 1)
+
+
+class ForwardedCallIdentityTest(unittest.TestCase):
+    """MCP 工具经 use_tool 转发调用时，权限认的是被点名的那个工具。"""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.workspace = Path(self.tmp.name).resolve()
+
+    @staticmethod
+    def via(tool: str, **tool_input) -> tuple[str, dict]:
+        return "use_tool", {"tool_name": tool, "tool_input": tool_input}
+
+    def perms(self, *rules: str) -> Permissions:
+        return Permissions(self.workspace, [parse_rule(rule) for rule in rules])
+
+    def test_identity_unwraps_only_well_formed_mcp_calls(self):
+        self.assertEqual(
+            call_identity(*self.via("mcp__gh__delete_repo", name="x")),
+            ("mcp__gh__delete_repo", {"name": "x"}),
+        )
+        #  参数对象被整个序列化成字符串的宽进形态
+        self.assertEqual(
+            call_identity("use_tool", {"tool_name": "mcp__gh__x", "tool_input": '{"a": 1}'}),
+            ("mcp__gh__x", {"a": 1}),
+        )
+        for args in ({}, {"tool_name": "bash", "tool_input": {"command": "ls"}}, {"tool_name": 7}):
+            self.assertEqual(call_identity("use_tool", args), ("use_tool", args))
+        self.assertEqual(call_identity("bash", {"command": "ls"}), ("bash", {"command": "ls"}))
+
+    def test_rules_written_for_the_real_tool_apply(self):
+        perms = self.perms("deny mcp__gh__delete_repo", "ask mcp__gh__create_issue", "allow mcp__gh__list")
+        self.assertEqual(perms.explain(*self.via("mcp__gh__delete_repo"))[0], "deny")
+        decision, rule = perms.explain(*self.via("mcp__gh__create_issue"))
+        self.assertEqual((decision, str(rule)), ("ask", "ask mcp__gh__create_issue"))
+        self.assertEqual(perms.decide(*self.via("mcp__gh__list")), "allow")
+        self.assertEqual(perms.explain(*self.via("mcp__gh__other")), ("ask", None))
+
+    def test_both_mcp_modes_judge_the_same(self):
+        """同一条规则、同一个工具：直接调用与经转发器调用必须同判。"""
+        perms = self.perms("deny mcp__gh__delete_repo", "ask mcp__gh__push", "allow mcp__gh__list")
+        for tool in ("mcp__gh__delete_repo", "mcp__gh__push", "mcp__gh__list", "mcp__gh__other"):
+            with self.subTest(tool=tool):
+                self.assertEqual(perms.explain(tool, {}), perms.explain(*self.via(tool)))
+
+    def test_rules_written_for_the_forwarder_still_cover_everything(self):
+        self.assertEqual(self.perms("deny use_tool").decide(*self.via("mcp__gh__list")), "deny")
+        self.assertEqual(self.perms("allow use_tool").decide(*self.via("mcp__gh__list")), "allow")
+        #  具体工具上的 deny 压过转发器上的 allow
+        perms = self.perms("allow use_tool", "deny mcp__gh__delete_repo")
+        self.assertEqual(perms.decide(*self.via("mcp__gh__delete_repo")), "deny")
+
+    def test_session_grant_covers_one_tool_not_all_of_them(self):
+        perms = self.perms()
+        call = self.via("mcp__gh__list")
+        self.assertEqual(perms.session_grant_label(*call), "mcp__gh__list")
+        self.assertEqual(perms.grant_session_call(*call), "mcp__gh__list")
+        self.assertEqual(perms.session_allowed, {"mcp__gh__list"})
+        self.assertEqual(perms.decide(*call), "allow")
+        self.assertEqual(perms.decide(*self.via("mcp__gh__delete_repo")), "ask")
+        self.assertEqual(perms.decide(*self.via("mcp__other__anything")), "ask")
+
+    def test_always_allow_suggestion_names_the_real_tool(self):
+        rule = suggest_allow_rule(*self.via("mcp__gh__list", q="x"), self.workspace)
+        self.assertEqual(str(rule), "allow mcp__gh__list")
+
+    def test_blanket_allow_on_the_forwarder_is_called_out_at_load(self):
+        user_file = self.workspace / "userconf" / "permissions.txt"
+        user_file.parent.mkdir(parents=True)
+        user_file.write_text("allow use_tool\n", encoding="utf-8")
+        with mock.patch.object(perm_mod, "user_rules_path", return_value=user_file):
+            with contextlib.redirect_stderr(io.StringIO()) as err:
+                perms = Permissions.load(self.workspace)
+        self.assertEqual(len(perms.rules), 1)  # 照旧生效
+        self.assertIn("所有 MCP 工具", err.getvalue())
+
+
+class ExploreInheritsRulesTest(AgentTestCase):
+    """检索子 agent 读文件也要过用户的规则：规则管的是"读什么"，不是"谁来读"。"""
+
+    def run_explore(self, rules: list[str], approve: bool = True):
+        import json
+
+        from .test_agent_paths import call_fragment, chunk
+
+        (self.root / "secret.txt").write_text("TOP-SECRET-TOKEN", encoding="utf-8")
+        asked: list[str] = []
+
+        def approver(name, args):
+            asked.append(name)
+            return approve
+
+        script = [
+            [chunk(tool_calls=[call_fragment(0, "c1", "explore", json.dumps({"question": "密钥是什么"}))])],
+            [chunk(tool_calls=[call_fragment(0, "s1", "read_file", json.dumps({"path": "secret.txt"}))])],
+            [chunk(content="子：查完了")],
+            [chunk(content="主：收到")],
+        ]
+        agent = self.build(
+            script, approver=approver,
+            permissions=Permissions(self.root, [parse_rule(line) for line in rules]),
+        )
+        with contextlib.redirect_stdout(io.StringIO()):
+            agent.send("查一下")
+        #  子 agent 第二次请求里带着它那次 read_file 的结果
+        seen = json.dumps(self.client.completions.calls[2]["messages"], ensure_ascii=False)
+        return seen, asked
+
+    def test_deny_rule_reaches_the_explore_subagent(self):
+        seen, _ = self.run_explore(["deny read_file(secret.txt)"])
+        self.assertNotIn("TOP-SECRET-TOKEN", seen)
+        self.assertIn("deny", seen)
+
+    def test_ask_rule_reaches_the_explore_subagent(self):
+        seen, asked = self.run_explore(["ask read_file(secret.txt)"], approve=False)
+        self.assertEqual(asked, ["read_file"])
+        self.assertNotIn("TOP-SECRET-TOKEN", seen)
+
+    def test_without_rules_explore_reads_freely(self):
+        seen, asked = self.run_explore([])
+        self.assertIn("TOP-SECRET-TOKEN", seen)
+        self.assertEqual(asked, [])
 
 
 class AgentIntegrationTest(AgentTestCase):

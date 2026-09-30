@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import hashlib
+import inspect
 import json
 import platform
 import queue
@@ -44,11 +45,12 @@ from .compaction import (
     age_tool_images,
     is_degenerate_summary,
     microcompact,
+    plan_from_history,
 )
 from .config import EFFORT_LEVELS, Config
 from .errors import Interrupted, classify
 from .providers import Registry, Route, UnknownModel
-from .permissions import Permissions
+from .permissions import Permissions, call_identity
 from .events import (
     Notice,
     PlanUpdated,
@@ -115,7 +117,8 @@ class Allow:
     note 非空时随 tool result 回灌模型（与 (True, 附言) 等价）。
     updated_args 非 None 时以它**整体替换**本次调用的参数再执行——宿主"批准但
     改写"的通道，典型用法是把只读形命令包上 OS 级沙箱后放行。替换发生在权限规则与
-    needs_approval 判定之后：改写出来的参数是宿主自己的责任，不再过一遍规则。
+    needs_approval 判定之后；改写出来的参数只再过一遍 deny 规则（deny 对审批改写
+    同样生效），allow / ask 不重判。
     """
 
     note: str = ""
@@ -129,13 +132,35 @@ class Deny:
     reason: str = ""
 
 
+def verdict_problem(verdict: Any) -> str:
+    """Approver 返回值的形状认不认识：认识返回空串，不认识返回一句说明。
+
+    审批是闸，闸上"看不懂的答复"只能算没批准——按真值判会把没 await 的协程
+    对象、`{"approved": False}` 这类字典、宿主自定义的结果对象统统当成批准。
+    认的形状只有：bool、None、str、Allow / Deny、以及头元素是 bool / None / str
+    的元组。
+    """
+    if verdict is None or isinstance(verdict, (bool, str, Allow, Deny)):
+        return ""
+    if isinstance(verdict, tuple):
+        if not verdict or verdict[0] is None or isinstance(verdict[0], (bool, str)):
+            return ""
+        return f"元组头元素是 {type(verdict[0]).__name__}，不是 bool / str"
+    if inspect.isawaitable(verdict):
+        return "返回的是没有 await 的协程对象——异步审批要经 AsyncApprover 接入"
+    return f"返回了 {type(verdict).__name__}，不是 bool / str / tuple / Allow / Deny"
+
+
 def normalize_verdict(verdict: Any) -> tuple[bool, str, str, dict[str, Any] | None]:
     """把 Approver 的多形态返回值归一成 (批准?, 附言, 拒绝理由, 改写参数)。
 
     简写形态的语义完整保留：True=批准；(True, 附言)=批准并附言；非空 str=
-    拒绝并附理由；其余 falsy=普通拒绝。(False, 理由) 的理由**不再被静默丢弃**
-    ——它就是拒绝理由（此前这条路会把理由吞掉，宿主以为回灌了模型其实没有）。
-    改写参数只能经 Allow(updated_args=…) 表达，简写形态没有这个通道。
+    拒绝并附理由；False / None / 空串=普通拒绝。(False, 理由) 的理由**不再被
+    静默丢弃**——它就是拒绝理由（此前这条路会把理由吞掉，宿主以为回灌了模型
+    其实没有）。改写参数只能经 Allow(updated_args=…) 表达，简写形态没有这个通道。
+
+    **批准只认 True 本身**（或 Allow）：形状不认识的返回值一律拒绝，不按真值
+    猜（见 verdict_problem）。
     """
     if isinstance(verdict, Allow):
         updated = dict(verdict.updated_args) if verdict.updated_args is not None else None
@@ -148,12 +173,17 @@ def normalize_verdict(verdict: Any) -> tuple[bool, str, str, dict[str, Any] | No
         #  头元素本身是字符串时沿用裸 str 的语义：非空=拒绝理由
         if isinstance(flag, str):
             return False, "", flag.strip() or text, None
-        if flag:
+        if flag is True:
             return True, text, "", None
-        return False, "", text, None
+        if flag is False or flag is None:
+            return False, "", text, None
+        return False, "", "", None
     if isinstance(verdict, str):
         return False, "", verdict.strip(), None
-    return bool(verdict), "", "", None
+    if inspect.iscoroutine(verdict):
+        #  不会有人 await 它了：关掉，免得解释器再补一条 never awaited 的告警
+        verdict.close()
+    return verdict is True, "", "", None
 
 
 def normalize_questions(questions: Any) -> list[dict[str, Any]] | str:
@@ -687,6 +717,29 @@ class Usage:
             entry.completion_tokens += completion
             entry.calls += 1
 
+    def absorb(self, by_model: Any) -> None:
+        """把一份已有的分模型用量并进这本账（形状同 to_dict()["by_model"]）。
+
+        给"同一个会话换了进程接着跑"用：账本只活在内存里，不并回来的话累计
+        从零重算，按会话累计设的预算就跟着清零。形状不对的条目跳过。
+        """
+        if not isinstance(by_model, dict):
+            return
+        with self._lock:
+            for model, record in by_model.items():
+                if not isinstance(model, str) or not isinstance(record, dict):
+                    continue
+                try:
+                    calls = int(record.get("calls") or 0)
+                    prompt = int(record.get("prompt_tokens") or 0)
+                    completion = int(record.get("completion_tokens") or 0)
+                except (TypeError, ValueError):
+                    continue
+                entry = self.by_model.setdefault(model, ModelUsage())
+                entry.calls += max(calls, 0)
+                entry.prompt_tokens += max(prompt, 0)
+                entry.completion_tokens += max(completion, 0)
+
     @property
     def prompt_tokens(self) -> int:
         with self._lock:
@@ -833,6 +886,16 @@ class Agent:
     ) -> None:
         self.config = config
         self.toolbox = toolbox or Toolbox(config)
+        if approver is not None and (
+            inspect.iscoroutinefunction(approver)
+            or inspect.iscoroutinefunction(getattr(approver, "__call__", None))
+        ):
+            #  async def 调出来的是协程对象，没人 await 就永远没有答复。运行期
+            #  也会按拒绝处理（verdict_problem），但接线错误该在接线时就炸
+            raise TypeError(
+                "approver 不能是 async 函数：审批在工作线程里同步调用，"
+                "异步审批请用 xiaoyu.AsyncApprover(fn, loop) 包一层"
+            )
         #  默认放行，交互式 CLI 会传入真正的确认函数。
         self.approver: Approver = approver or (lambda name, args: True)
         #  提问通道（ask_user 工具）：None = 前端没有提问界面，工具不进 schemas
@@ -1023,7 +1086,12 @@ class Agent:
         if allow_explore and config.enable_explore and self.toolbox.get("explore") is None:
             from .explore import make_explore_tool
 
-            self.toolbox.register(make_explore_tool(config, self.registry, self.usage, self.sink))
+            self.toolbox.register(
+                make_explore_tool(
+                    config, self.registry, self.usage, self.sink,
+                    approver=self.approver, permissions=self.permissions,
+                )
+            )
         #  web_search：借厂商 Responses 内置搜索的一次性调用（后端见 XIAOYU_SEARCH_PROVIDER，
         #  "为什么不切协议"见 websearch.py 顶部）。选中后端没配直连时 check_fn 让它不进 schemas。
         if config.enable_web_search and self.toolbox.get("web_search") is None:
@@ -1229,7 +1297,13 @@ class Agent:
         #  声明式 subagent（agents/*.toml）：挂成与 explore
         #  同形态的委托工具。allow_explore 兼作"不套娃"闸门——子 agent 不再挂
         if nesting_ok and config.enable_agents:
-            from .agents import RunStore, load_agent_specs, make_subagent_tool, runs_dir_for
+            from .agents import (
+                ParentGuards,
+                RunStore,
+                load_agent_specs,
+                make_subagent_tool,
+                runs_dir_for,
+            )
 
             agent_specs, spec_problems = load_agent_specs(config.workspace)
             for problem in spec_problems:
@@ -1245,6 +1319,9 @@ class Agent:
                 )
             )
             self.subagent_runs = subagent_runs
+            #  委托出去的子 agent 跟本会话同一档、过同一批工具钩子（现取：模式会
+            #  中途换，钩子引擎也可能是构造后才注入的）
+            guards = ParentGuards(mode=self._step_mode, hooks=lambda: self.hook_engine)
             mounted_specs = []
             for spec in agent_specs:
                 if self.toolbox.get(spec.name) is not None:
@@ -1260,6 +1337,7 @@ class Agent:
                         mcp_manager=getattr(self.toolbox, "mcp_manager", None),
                         parent_history=lambda: self.messages,
                         stop_requested=self.interrupt_requested,
+                        guards=guards,
                     )
                 )
                 mounted_specs.append(spec)
@@ -1275,6 +1353,7 @@ class Agent:
                         subagent_runs,
                         mcp_manager=getattr(self.toolbox, "mcp_manager", None),
                         stop_requested=self.interrupt_requested,
+                        guards=guards,
                     )
                 )
             #  斗巧（竞争织造）：与七襄同闸——有可扇出的 spec 才有参赛者
@@ -1288,6 +1367,7 @@ class Agent:
                         subagent_runs,
                         mcp_manager=getattr(self.toolbox, "mcp_manager", None),
                         stop_requested=self.interrupt_requested,
+                        guards=guards,
                     )
                 )
         #  宸枢（编排总控模式）：init 常驻 schema，其余工具在 active 后经
@@ -1298,6 +1378,7 @@ class Agent:
             self.chenshu = ChenshuRuntime(
                 config, self.registry, self.usage, self.sink,
                 self.permissions, notify=self.notify,
+                hooks=lambda: self.hook_engine,
             )
             for tool in make_chenshu_tools(self.chenshu):
                 if self.toolbox.get(tool.name) is None:
@@ -2041,6 +2122,11 @@ class Agent:
             self.messages, _ = age_tool_images(self.messages)
             #  整段历史是装进来的，不是这个会话一条条长出来的：按改写计
             self._history_rewritten()
+            #  挂在历史旁边、只活在内存里的两样状态跟着接回：历史里点过名的召回
+            #  id 作废（它们的落盘内容属于上一个进程），计划从历史里找回
+            self.toolbox.adopt_history(self.messages)
+            if not self.plan:
+                self.plan = plan_from_history(self.messages)
         if self.session_log and source:
             self.session_log.event("resumed_from", source=source)
         if source and (runs := getattr(self, "subagent_runs", None)) is not None:
@@ -2261,7 +2347,7 @@ class Agent:
             #  中途到达的消息补一句收尾提醒（与 steer 的 INTERJECTION_TAIL 同理）：
             #  不让别人的来信把在飞的活儿带偏
             content = f"{wrapped}\n{INBOX_MIDTURN_TAIL}" if midturn else wrapped
-            self._record({"role": "user", "content": content})
+            self._record({"role": "user", "content": content, media.PEER_KEY: True})
             self.sink.emit(Notice(f"[收到来自 {sender} 的消息]", "info"))
             if self.session_log:
                 self.session_log.event("peer_message", sender=sender)
@@ -4499,7 +4585,23 @@ class Agent:
             if guarded is not None:
                 #  为什么这一笔在 auto / --yolo 下也要问，得让人看得见
                 self.sink.emit(Notice(f"  ⚠ 要写的是可执行配置——{guarded}", "warn"))
-            approved, note, reason, updated = normalize_verdict(self.approver(name, args))
+            verdict = self.approver(name, args)
+            malformed = verdict_problem(verdict)
+            approved, note, reason, updated = normalize_verdict(verdict)
+            if malformed:
+                #  闸坏了要让人看见：静默拒绝的话，宿主只会觉得"模型怎么什么都不干"
+                self.trace.append(
+                    {"tool": name, "args": args, "ok": False, "output": "DENIED_BAD_VERDICT"}
+                )
+                self.sink.emit(
+                    Notice(f"  ⚠ 审批回调的返回值无法识别，已按拒绝处理：{malformed}", "warn")
+                )
+                self.sink.emit(ToolDenied(name, by="user"))
+                return self._tool_message(
+                    call,
+                    "ERROR: 这次调用没有执行——宿主的审批回调返回了无法识别的结果，"
+                    "按拒绝处理。这是接入配置问题，重试不会变：请把情况告诉用户。",
+                )
             if not approved:
                 self.trace.append({"tool": name, "args": args, "ok": False, "output": "DENIED"})
                 self.sink.emit(ToolDenied(name, by="user"))
@@ -4535,7 +4637,8 @@ class Agent:
         #  hook 眼前（宿主 seatbelt 包装后的命令才是真正要跑的东西）
         if self.hook_engine is not None and self.hook_engine.has("PreToolUse"):
             decision = self.hook_engine.fire(
-                "PreToolUse", {"tool": name, "args": args}, tool_name=name
+                "PreToolUse", {"tool": name, "args": args}, tool_name=name,
+                **self._hook_alias(name, args),
             )
             if decision.blocked:
                 self.trace.append(
@@ -4638,12 +4741,24 @@ class Agent:
                 "PostToolUse",
                 {"tool": name, "args": args, "ok": ok, "output": clip(output)},
                 tool_name=name,
+                **self._hook_alias(name, args),
             )
             if decision.blocked:
                 output += f"\n\n[PostToolUse hook 反馈，请重视] {decision.reason}"
         self.trace.append({"tool": name, "args": args, "ok": ok, "output": output})
         self.sink.emit(ToolCompleted(name, output=output, ok=ok, seconds=elapsed))
         return self._tool_message(call, self._for_model(name, args, raw_output, output))
+
+    @staticmethod
+    def _hook_alias(name: str, args: dict[str, Any]) -> dict[str, str]:
+        """经转发器调用 MCP 工具时，让钩子的 matcher 也能按被点名的工具匹配。
+
+        payload 不变（tool 仍是转发器、真名在 args.tool_name 里）：已有的钩子脚本
+        照旧读得懂；只是"挂在某个 MCP 工具上"的 matcher 不再因为调用走了转发器
+        而落空。不是转发调用时返回空 dict——不给注入的引擎多传参数。
+        """
+        target, _ = call_identity(name, args)
+        return {"also": target} if target != name else {}
 
     def _untrusted_source(self, name: str, args: dict[str, Any]) -> str | None:
         """外部来源工具的来源标签；内置工具返回 None。use_tool 永远是 MCP。"""

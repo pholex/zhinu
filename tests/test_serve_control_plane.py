@@ -396,6 +396,34 @@ class TestPersistence(ServeCase):
         #  同一会话日志续写（不是新开一份）；被关掉的会话日志作为留痕保留在盘上
         self.assertEqual(len(list((state / "logs").glob(f"*-id-{kept}.jsonl"))), 1)
 
+    def test_spent_budget_stays_spent_after_restart(self):
+        """预算按会话累计：花超了的会话不能靠服务重启一次把账清零。"""
+        state = Path(self.tmp) / "state"
+        self.start(SIMPLE + "---\n" + SIMPLE, state_dir=state)
+        session_id = self.new_session(budget={"tokens": 120})
+        first = self.client.post(
+            f"/session/{session_id}/prompt", json={"text": "干活"}, headers=self.headers()
+        ).json()
+        self.assertEqual((first["detail"], first["spend"]["tokens"]), ("budget_reached", 150))
+
+        self.client.__exit__(None, None, None)
+        self.start(SIMPLE + "---\n" + SIMPLE, state_dir=state)
+        info = self.status(session_id)
+        self.assertEqual(info["spend"]["tokens"], 150)
+        self.assertIn("已达预算", info["budget_reason"])
+        again = self.client.post(
+            f"/session/{session_id}/prompt", json={"text": "再来"}, headers=self.headers()
+        )
+        self.assertEqual(again.status_code, 409, again.text)
+        #  调高预算后照常跑，账接着累计而不是从零起算
+        self.client.post(
+            f"/session/{session_id}/budget", json={"budget": {"tokens": 1000}}, headers=self.headers()
+        )
+        after = self.client.post(
+            f"/session/{session_id}/prompt", json={"text": "再来"}, headers=self.headers()
+        ).json()
+        self.assertEqual((after["detail"], after["spend"]["tokens"]), ("finished", 300))
+
     def test_turn_in_flight_is_on_disk_while_running_and_cleared_after(self):
         import json
 

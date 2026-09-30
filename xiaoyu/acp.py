@@ -450,7 +450,7 @@ def _cmd_perm(agent: Agent, args: str) -> str:
 
 
 def _cmd_rule(kind: str, agent: Agent, args: str) -> str:
-    from .permissions import parse_rule
+    from .permissions import parse_rule, rule_lint
 
     rule = parse_rule(f"{kind} {args}") if args.strip() else None
     if rule is None:
@@ -460,7 +460,8 @@ def _cmd_rule(kind: str, agent: Agent, args: str) -> str:
     except ValueError as exc:
         #  持久 allow 不许覆盖任意代码执行入口（与 REPL 同一道闸）
         return f"已拒绝：{exc}"
-    return f"已写入 {path}：{rule}"
+    hint = rule_lint(rule)
+    return f"已写入 {path}：{rule}" + (f"\n这条规则可能不会命中：{hint}" if hint else "")
 
 
 _ACP_COMMANDS: tuple[AcpCommand, ...] = (

@@ -46,6 +46,10 @@ inherit = "distilled"             # 可省：none（默认）/ distilled（精�
 
 - **权限不因声明放大**：只读子集免确认；写/执行/MCP 复用父会话的审批与
   deny 规则——工作区级 spec 是安全的，clone 一个仓库不会静默多出放行。
+  子 agent 逐工具的确认**跟发起委托的那个会话同一档**（你在确认档，它的
+  写文件、跑命令也逐条问；你在 auto 档，它同样只放行沙箱兜得住的那部分），
+  你挂在工具调用上的钩子（`PreToolUse` / `PostToolUse`）在子 agent 里照样触发。
+  检索子 agent（explore）读文件同样过你的 deny / ask 规则。
 - **worktree 隔离**：`isolation = "worktree"` 时改动落在独立 git worktree，
   跑完没改动自动删、有改动保留并把路径写进结论（`git -C <路径> diff` 查看，
   `git apply` 取回）。

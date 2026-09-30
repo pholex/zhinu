@@ -380,6 +380,8 @@ Windows 为 `%APPDATA%\xiaoyu\serve\<root slug>\`；启动后 `GET /health` 的 
 
 - 会话自动接回（`detail=recovered`），历史来自会话日志（`Agent.restore`，未配对的
   tool_call 会补"结果未知"），配置、agent 引用、预算、`turns` 随清单回来；
+- **已花的用量接着累计**：`usage` / `spend` 从会话日志里最后一次轮末记账接上，到线的
+  会话重启后仍是 `409`。被打断在半途的那一轮没来得及记账，会少算不到一轮；
 - **在途的那一轮会被标出来**：开轮时清单就记下在途标记，收尾时清掉。重启时标记还在，
   说明那一轮随进程一起没了——会话以 `detail=interrupted_by_restart` 接回，`/status` 的
   `lost_turn`（`{"turn": 3, "started_at": …}`）与 `session.recovered` 事件里都带着它。

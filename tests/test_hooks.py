@@ -62,6 +62,31 @@ command = "echo bad-regex"
         self.assertEqual(hooks[0].timeout, 5.0)
         self.assertEqual(len(problems), 3)
 
+    def test_misspelled_table_name_is_reported(self):
+        """[[hooks]] 写成 [[hook]]：一条都不加载，但不能连个声都没有。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "hooks.toml"
+            path.write_text('[[hook]]\nevent = "PreToolUse"\ncommand = "exit 2"\n', encoding="utf-8")
+            hooks, problems = load_hooks(path)
+        self.assertEqual(hooks, [])
+        self.assertEqual(len(problems), 1)
+        self.assertIn("'hook'", problems[0])
+        self.assertIn("[[hooks]]", problems[0])
+
+    def test_unknown_entry_keys_and_bad_timeout_are_reported(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "hooks.toml"
+            path.write_text(
+                '[[hooks]]\nevent = "PreToolUse"\nmatch = "bash"\ncommand = "true"\ntimeout = "soon"\n',
+                encoding="utf-8",
+            )
+            hooks, problems = load_hooks(path)
+        #  照常加载（matcher 空 = 全匹配，比不加载更严），但两处都点了名
+        self.assertEqual(len(hooks), 1)
+        self.assertEqual(hooks[0].matcher, "")
+        self.assertTrue(any("match" in item for item in problems), problems)
+        self.assertTrue(any("timeout" in item for item in problems), problems)
+
     def test_missing_file_is_empty(self):
         hooks, problems = load_hooks(Path("/nonexistent/hooks.toml"))
         self.assertEqual((hooks, problems), ([], []))
@@ -107,6 +132,30 @@ class EngineTest(unittest.TestCase):
         engine = self.engine([Hook("PreToolUse", cmd, matcher="^bash$")])
         self.assertFalse(engine.fire("PreToolUse", {}, tool_name="read_file").blocked)
         self.assertTrue(engine.fire("PreToolUse", {}, tool_name="bash").blocked)
+
+    def test_for_tools_keeps_only_tool_hooks_in_the_new_workspace(self):
+        elsewhere = self.tmp / "worktree"
+        engine = self.engine(
+            [Hook("PreToolUse", "true", matcher="bash"), Hook("PostToolUse", "true"),
+             Hook("Stop", "true"), Hook("UserPromptSubmit", "true")]
+        )
+        scoped = engine.for_tools(elsewhere)
+        self.assertEqual([hook.event for hook in scoped.hooks], ["PreToolUse", "PostToolUse"])
+        self.assertEqual(scoped.workspace, elsewhere)
+        self.assertIsNone(self.engine([Hook("Stop", "true")]).for_tools(elsewhere))
+
+    def test_matcher_also_accepts_the_forwarded_tool_name(self):
+        cmd = _script_cmd(self.tmp, "block.py", BLOCK_BODY)
+        engine = self.engine([Hook("PreToolUse", cmd, matcher="^mcp__gh__delete$")])
+        self.assertFalse(engine.fire("PreToolUse", {}, tool_name="use_tool").blocked)
+        self.assertTrue(
+            engine.fire("PreToolUse", {}, tool_name="use_tool", also="mcp__gh__delete").blocked
+        )
+        #  写给转发器本身的 matcher 照旧匹配
+        engine = self.engine([Hook("PreToolUse", cmd, matcher="^use_tool$")])
+        self.assertTrue(
+            engine.fire("PreToolUse", {}, tool_name="use_tool", also="mcp__gh__list").blocked
+        )
 
     def test_other_exit_codes_fail_open_with_notice(self):
         cmd = _script_cmd(self.tmp, "crash.py", "import sys\nsys.exit(1)\n")

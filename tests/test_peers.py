@@ -257,6 +257,9 @@ class TestAgentInbox(AgentTestCase):
         )
         self.assertEqual(agent.messages[1]["content"], "<msg>先看看 CI</msg>")
         self.assertEqual(agent.messages[2]["content"], "继续")
+        #  来信落笔时带记号：压缩时不会被当成主人的原话备份
+        self.assertTrue(agent.messages[1].get("_peer"))
+        self.assertFalse(agent.messages[2].get("_peer"))
 
     def test_message_arriving_mid_turn_lands_at_the_step_boundary(self) -> None:
         """一批工具跑完就是注入点：与 steer 完全同一处，不新增时机。"""

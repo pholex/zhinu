@@ -157,6 +157,7 @@ def make_qixiang_tool(
     runs: dict[str, SubagentRun],
     mcp_manager: Any = None,
     stop_requested: Callable[[], bool] | None = None,
+    guards: Any = None,
 ) -> Tool:
     """七襄工具：与 make_subagent_tool 同一套依赖（同一本账、同一存档）。"""
     spec_map = {spec.name: spec for spec in specs}
@@ -304,6 +305,7 @@ def make_qixiang_tool(
                     #  这里传了也只对新开项生效
                     model_override=model_name,
                     effort_override=effort_level,
+                    guards=guards,
                 )
 
             return primary
@@ -322,6 +324,7 @@ def make_qixiang_tool(
                     child_sink=state.observer,
                     on_agent=register,
                     effort_override=effort_level,
+                    guards=guards,
                 )
 
             return follow_up
