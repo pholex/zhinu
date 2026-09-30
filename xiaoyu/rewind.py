@@ -29,6 +29,7 @@ from __future__ import annotations
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Literal
 
 from . import fsguard
 
@@ -36,6 +37,22 @@ from . import fsguard
 MAX_POINTS = 64
 #  单文件超过这个字节数不快照（该文件从此轮起不可回滚，点上有标记）
 MAX_FILE_BYTES = 5 * 1024 * 1024
+
+
+@dataclass(frozen=True)
+class RewindResult:
+    """Outcome of a rewind; failed file writes may require manual reconciliation."""
+
+    checkpoint: int
+    status: Literal["completed", "partial", "conflict", "failed", "unavailable", "noop"]
+    conversation_rewound: bool = False
+    files_rewound: bool = False
+    restored_files: tuple[str, ...] = ()
+    removed_files: tuple[str, ...] = ()
+    conflicts: tuple[str, ...] = ()
+    skipped_files: tuple[str, ...] = ()
+    uncertain_files: tuple[str, ...] = ()
+    summary: str = ""
 
 
 @dataclass

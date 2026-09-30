@@ -471,5 +471,24 @@ class AgentWiringTest(unittest.TestCase):
             self.assertEqual(agent.toolbox.tasks.notify, agent.notify)
 
 
+class ShutdownOwnershipTest(unittest.TestCase):
+    def test_log_directory_survives_until_writer_exits(self):
+        manager = bg.TaskManager()
+        writer = mock.Mock(spec=threading.Thread)
+        writer.name = "late-writer"
+        writer.is_alive.return_value = True
+        manager._threads.append(writer)
+        manager._log_dir = Path("unused-fault-injection-directory")
+        with mock.patch.object(bg.tempdirs, "discard") as discard:
+            manager.shutdown()
+            self.assertEqual(manager.shutdown_pending(), ("late-writer",))
+            discard.assert_not_called()
+            writer.is_alive.return_value = False
+            manager.shutdown()
+            self.assertEqual(manager.shutdown_pending(), ())
+            discard.assert_called_once()
+            self.assertIsNone(manager._log_dir)
+
+
 if __name__ == "__main__":
     unittest.main()

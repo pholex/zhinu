@@ -329,6 +329,11 @@ class SessionLog:
         """会话文件是否已经（或将按常规）落盘；延迟落盘还没落时为 False。"""
         return self._pending is None
 
+    @property
+    def locked(self) -> bool:
+        """Whether this instance holds an exclusive writer lock."""
+        return self._lock_finalizer is not None and self._lock_finalizer.alive
+
     def materialize(self) -> None:
         """延迟落盘的会话立即落盘（已落盘、已放锁或已停写时什么都不做）。
 
@@ -634,7 +639,7 @@ class SessionInfo:
 _HEAD_SCAN_LINES = 10
 
 
-def list_sessions(limit: int = 20, workspace: str | None = None) -> list[SessionInfo]:
+def list_sessions(limit: int = 20, workspace: str | None = None, *, directory: Path | None = None) -> list[SessionInfo]:
     """按时间倒序列出历史会话（文件名即时间戳，跨目录按文件名排序仍是时间序）。
 
     会话按工作区分子目录存放；根目录下的平铺文件是分区之前的存量，一并列出。
@@ -642,7 +647,7 @@ def list_sessions(limit: int = 20, workspace: str | None = None) -> list[Session
     原始 workspace 为准（slug 转义可能撞名）。每个文件只读头几行——
     拿 meta + 首条用户消息当标题就够了。
     """
-    directory = sessions_dir()
+    directory = directory if directory is not None else sessions_dir()
     if not directory.is_dir():
         return []
     candidates = list(directory.glob("*.jsonl"))  # 存量平铺文件

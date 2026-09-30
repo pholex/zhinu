@@ -386,7 +386,7 @@ def _kill_with_descendants(proc: subprocess.Popen) -> None:
             os.kill(pid, signal.SIGKILL)
 
 
-def _close_streams(proc: subprocess.Popen) -> None:
+def _close_streams(proc: subprocess.Popen) -> threading.Thread:
     """管道句柄显式关掉（留给 GC 会攒出 ResourceWarning），但不无限等。"""
     def close() -> None:
         for stream in (proc.stdin, proc.stdout):
@@ -397,6 +397,7 @@ def _close_streams(proc: subprocess.Popen) -> None:
     worker = threading.Thread(target=close, name="xiaoyu-mcp-close", daemon=True)
     worker.start()
     worker.join(_CLOSE_WAIT)
+    return worker
 
 
 def _inherited(names: list[str] | None) -> dict[str, str]:
@@ -1294,6 +1295,8 @@ class McpServer:
         #  是否已计入 CONNECTIONS_LIVE（启动成功 +1、收进程 -1，重启不重复计）
         self._counted = False
         self._drain_thread: threading.Thread | None = None
+        self._workers_lock = threading.Lock()
+        self._workers: list[threading.Thread] = []
         #  重连预算（按 outage 计，见模块 docstring）；归 manager 的重连线程读写
         self.reconnect_attempts = 0
         self.connected_at: float | None = None
@@ -1472,6 +1475,36 @@ class McpServer:
         #  主动关闭：先立旗再收进程，EOF 到来时读线程据此不触发重连
         self._closing = True
         self._shutdown_proc()
+        self._join_workers(_CLOSE_WAIT)
+
+    def _start_worker(self, worker: threading.Thread) -> None:
+        with self._workers_lock:
+            self._workers = [thread for thread in self._workers if thread.is_alive()]
+            self._workers.append(worker)
+            worker.start()
+
+    def _join_workers(self, timeout: float) -> None:
+        deadline = time.monotonic() + timeout
+        with self._workers_lock:
+            workers = list(self._workers)
+        if self._drain_thread is not None:
+            workers.append(self._drain_thread)
+        if self._http is not None and self._http._stream_thread is not None:
+            workers.append(self._http._stream_thread)
+        for worker in workers:
+            if worker is not threading.current_thread():
+                worker.join(timeout=max(0, deadline - time.monotonic()))
+
+    def shutdown_pending(self) -> bool:
+        """Local process/readers still owned, even after close was requested."""
+        with self._workers_lock:
+            pending_workers = any(worker.is_alive() for worker in self._workers)
+        return bool(pending_workers or
+            self._proc is not None and self._proc.poll() is None
+            or self._drain_thread is not None and self._drain_thread.is_alive()
+            or self._http is not None and self._http._stream_thread is not None
+            and self._http._stream_thread.is_alive()
+        )
 
     def restart(self, spec: ServerSpec | None = None) -> list[dict[str, Any]]:
         """断线后重启一代：收掉旧进程，重置协议状态，重新 spawn → 握手 → 列工具。
@@ -1491,6 +1524,9 @@ class McpServer:
             thread = self._drain_thread
             if thread is not None:
                 thread.join(timeout=5.0)
+            self._join_workers(5.0)
+            if self.shutdown_pending():
+                raise McpError("上一代资源尚未退出，稍后重试重连")
             if spec is not None:
                 #  旧代按旧声明收干净之后再换：传输类型也可能跟着变了（stdio ↔ HTTP）
                 self.spec = spec
@@ -1567,7 +1603,9 @@ class McpServer:
                     except (OSError, subprocess.TimeoutExpired, ValueError):
                         continue
         finally:
-            _close_streams(proc)
+            worker = _close_streams(proc)
+            with self._workers_lock:
+                self._workers.append(worker)
 
     # ---- 协议 ----
 
@@ -1837,9 +1875,9 @@ class McpServer:
             except Exception:  # noqa: BLE001 - 尽力而为的告知，发不出去不是调用方的事
                 pass
 
-        threading.Thread(
+        self._start_worker(threading.Thread(
             target=send, name=f"xiaoyu-mcp-cancel-{self.spec.name}", daemon=True
-        ).start()
+        ))
 
     def _notify(self, method: str) -> None:
         self._send({"jsonrpc": "2.0", "method": method})
@@ -1984,12 +2022,12 @@ class McpServer:
                 if stop_requested is not None and stop_requested():
                     raise McpError(_CANCELLED_UNSENT, kind="cancelled")
                 deadline = time.monotonic() + timeout
-                threading.Thread(
+                self._start_worker(threading.Thread(
                     target=self._pump_exchange,
                     args=(channel, payload, timeout, exchange),
                     name=f"xiaoyu-mcp-post-{self.spec.name}",
                     daemon=True,
-                ).start()
+                ))
                 try:
                     return self._await_reply(
                         payload["id"], method, timeout, deadline, stop_requested, exchange
@@ -2364,6 +2402,7 @@ class McpManager:
         spec_loader: Callable[[], list[ServerSpec]] | None = None,
         *,
         trust_tool_changes: bool = False,
+        state_dir: Path | None = None,
     ) -> None:
         self._specs = specs
         #  全局"变更工具不隔离"（Config.mcp_trust_changes：--unguarded 预设的落点）。
@@ -2375,6 +2414,7 @@ class McpManager:
         self._spec_loader = spec_loader
         self._lock = threading.Lock()
         self._servers: dict[str, McpServer] = {}
+        self._owned_servers: list[McpServer] = []
         #  name → "loading" | "ready" | "cached" | "failed: …" | "blocked: …" | "closed"
         self._states: dict[str, str] = {spec.name: "loading" for spec in specs}
         #  就绪工具的 append-only 列表：Toolbox 每次组装 schemas 前来同步一次
@@ -2401,12 +2441,13 @@ class McpManager:
         #  close 时置位：重连线程的退避等待立即醒来退场
         self._close_event = threading.Event()
         #  工具指纹基线（防 rug-pull）与 schema 缓存都放用户配置目录
-        self._baseline_path = user_config_dir() / "mcp-approved.json"
-        self._cache_path = user_config_dir() / "cache" / "mcp-schemas.json"
+        self._state_dir = Path(state_dir) if state_dir is not None else user_config_dir()
+        self._baseline_path = self._state_dir / "mcp-approved.json"
+        self._cache_path = self._state_dir / "cache" / "mcp-schemas.json"
         self._baseline = mcp_guard.load_baseline(self._baseline_path)
         #  上次批准/首见时的声明正文（description + inputSchema），/mcp diff 的"上次"。
         #  与基线同步写；没有它裁决照常，只是 diff 退化成"只能看这次的"
-        self._decls_path = user_config_dir() / "mcp-approved-decls.json"
+        self._decls_path = self._state_dir / "mcp-approved-decls.json"
         self._decls = mcp_guard.load_declarations(self._decls_path)
         self._cache = self._load_cache() if _enabled("XIAOYU_MCP_CACHE") else {}
 
@@ -2431,9 +2472,10 @@ class McpManager:
                 and entry.get("fingerprint") == spec_fingerprint(spec)
                 and isinstance(entry.get("tools"), list)
             ):
-                server = McpServer(spec, log_path=self._log_path(spec.name))
+                server = McpServer(spec, log_path=self._log_path(spec.name, self._state_dir))
                 server.server_info = str(entry.get("server_info", ""))
                 with self._lock:
+                    self._owned_servers.append(server)
                     self._servers[spec.name] = server
                     error = declared_violation(entry["tools"]) or self._swap_generation_locked(
                         spec.name, server, entry["tools"]
@@ -2450,7 +2492,9 @@ class McpManager:
             thread.start()
 
     def _bootstrap_one(self, spec: ServerSpec) -> None:
-        server = McpServer(spec, log_path=self._log_path(spec.name))
+        server = McpServer(spec, log_path=self._log_path(spec.name, self._state_dir))
+        with self._lock:
+            self._owned_servers.append(server)
         try:
             declared = server.bootstrap()
         except McpError as exc:
@@ -3016,7 +3060,9 @@ class McpManager:
             self._specs = [spec if item.name == name else item for item in self._specs]
         if server is None:
             #  从未登记过（启动即失败 / 首代被回滚）：没有旧代工具绑在旧对象上，新建即可
-            server = McpServer(spec, log_path=self._log_path(name))
+            server = McpServer(spec, log_path=self._log_path(name, self._state_dir))
+            with self._lock:
+                self._owned_servers.append(server)
         succeeded = False
         try:
             try:
@@ -3123,9 +3169,9 @@ class McpManager:
         )
 
     @staticmethod
-    def _log_path(name: str) -> Path:
+    def _log_path(name: str, directory: Path | None = None) -> Path:
         safe = _NAME_CLEAN.sub("_", name)
-        return user_config_dir() / "logs" / f"mcp-{safe}.log"
+        return (directory if directory is not None else user_config_dir()) / "logs" / f"mcp-{safe}.log"
 
     def ready_tools(self) -> list[RemoteTool]:
         """当前已就绪的全部工具（append-only 快照，顺序稳定）。"""
@@ -3168,10 +3214,6 @@ class McpManager:
     def close(self) -> None:
         with self._lock:
             self._closed = True
-        #  at-exit 兜底名单里除名：常驻进程里每个会话一份 manager，关了还留着
-        #  引用的话名单只增不减
-        with contextlib.suppress(ValueError):
-            _extra_managers.remove(self)
         #  重连线程的退避等待立即醒来，看到 _closed 退场
         self._close_event.set()
         #  join 而不是限时等状态：启动中的 server 由 _bootstrap_one 发现 _closed
@@ -3181,18 +3223,32 @@ class McpManager:
         #  孤儿由看门狗按父进程死亡兜底回收。
         for thread in self._boot_threads:
             thread.join(timeout=15.0)
-        self._boot_threads.clear()
         with self._lock:
-            servers = list(self._servers.values())
-            self._servers.clear()
+            servers = list(dict.fromkeys([*self._owned_servers, *self._servers.values()]))
         for server in servers:
             server.close()
         #  最后收代际服务线程：server 进程已死，卡在 fetch 里的请求立即报错返回
         with self._lock:
             service = list(self._service_threads)
-            self._service_threads.clear()
         for thread in service:
             thread.join(timeout=15.0)
+        with self._lock:
+            self._boot_threads = [thread for thread in self._boot_threads if thread.is_alive()]
+            self._service_threads = [thread for thread in self._service_threads if thread.is_alive()]
+            # Retain server handles until their process and readers really finish.
+            self._owned_servers = [server for server in dict.fromkeys([*self._owned_servers, *servers]) if server.shutdown_pending()]
+            self._servers = {name: server for name, server in self._servers.items() if server in self._owned_servers}
+        if not self.shutdown_pending():
+            with contextlib.suppress(ValueError):
+                _extra_managers.remove(self)
+
+    def shutdown_pending(self) -> tuple[str, ...]:
+        with self._lock:
+            threads = [*self._boot_threads, *self._service_threads]
+            servers = list(self._owned_servers)
+        return tuple(thread.name for thread in threads if thread.is_alive()) + tuple(
+            server.spec.name for server in servers if server.shutdown_pending()
+        )
 
     def server_states(self) -> dict[str, str]:
         """声明过的每个 server 此刻的状态字（ready / cached / loading / failed / …）。
@@ -3202,6 +3258,10 @@ class McpManager:
         """
         with self._lock:
             states = dict(self._states)
+            closed = self._closed
+        if closed:
+            state = "closing" if self.shutdown_pending() else "closed"
+            return {spec.name: state for spec in self._specs if not spec.disabled}
         return {
             spec.name: states.get(spec.name, "loading").split(":", 1)[0].strip()
             for spec in self._specs
@@ -3249,7 +3309,7 @@ class McpManager:
                     f"    ⚠ {len(quarantined[name])} 个工具因描述/schema 变更被隔离"
                     f"（{shown}）—— /mcp diff {name} 看变更，核对后 /mcp approve {name}"
                 )
-            lines.append(f"    日志：{self._log_path(name)}")
+            lines.append(f"    日志：{self._log_path(name, self._state_dir)}")
         return "\n".join(lines)
 
     @staticmethod

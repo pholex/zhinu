@@ -491,6 +491,9 @@ class Config:
     mcp_trust_changes: bool = False
     #  无护栏预设是否打开（横幅与会话前言据此提示；各层的实际开关在上面各字段）
     unguarded: bool = False
+    # Appended fields preserve positional arguments of the existing Config API.
+    load_project_instructions: bool = True
+    skill_directories: tuple[Path, ...] | None = None
 
     @property
     def context_limit(self) -> int:

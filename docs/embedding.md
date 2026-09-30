@@ -1,5 +1,9 @@
 # 嵌入面：把小羽当库用
 
+新增的独立发行包 `xiaoyu-agent-sdk` 提供 `Session` / `AsyncSession`、资源关闭和
+严格结构化结果契约，见 [Python SDK 指南](sdk.md)。本文记录的 `import xiaoyu`
+公开 API 继续兼容；已有宿主不需要立即迁移。
+
 > 面向"把 xiaoyu 当执行引擎嵌进自己进程"的宿主：聊天机器人常驻进程、内部平台、
 > 行业 agent 的壳。三张脸的选型见 [platform.md](platform.md)；本文只讲
 > **Python 进程内嵌入**这一张，以及跨语言时的 `--wire` 协议。

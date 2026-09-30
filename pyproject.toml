@@ -28,6 +28,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+sdk = ["jsonschema==4.26.0"]
 # TUI 前端（输入补全/跨会话历史/底部状态栏/富文本确认框）。
 # 可选：缺包时自动退回明文 REPL。同主依赖一样精确锁版本；
 # rich 不用 15.x——刚发的大版本先观望，14 线是成熟尾版。

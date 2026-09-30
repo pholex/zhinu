@@ -103,7 +103,7 @@ def skill_sources(workspace: Path | None = None) -> list[SkillSource]:
     return sources
 
 
-def sources_fingerprint(workspace: Path | None = None) -> tuple:
+def sources_fingerprint(workspace: Path | None = None, *, directories: tuple[Path, ...] | None = None) -> tuple:
     """扫描来源目录的轻量指纹（路径 + 命名空间 + mtime）。
 
     给轮首的技能差量检测用：技能的**增删**表现为来源目录下子目录的增删，
@@ -113,7 +113,7 @@ def sources_fingerprint(workspace: Path | None = None) -> tuple:
     不受影响。
     """
     rows = []
-    for source in skill_sources(workspace):
+    for source in (skill_sources(workspace) if directories is None else [SkillSource(p) for p in directories]):
         try:
             mtime = source.directory.stat().st_mtime_ns
         except OSError:
@@ -304,13 +304,14 @@ def disabled_skills(workspace: Path | None = None) -> list[str]:
     return sorted(skill.name for skill in _scan(workspace, keep_disabled=True)[1])
 
 
-def scan_skills(workspace: Path | None = None) -> list[Skill]:
+def scan_skills(workspace: Path | None = None, *, directories: tuple[Path, ...] | None = None) -> list[Skill]:
     """扫描所有来源（停用清单点名的不进结果）。"""
-    return _scan(workspace)[0]
+    return _scan(workspace, directories=directories)[0]
 
 
 def _scan(
-    workspace: Path | None = None, keep_disabled: bool = False
+    workspace: Path | None = None, keep_disabled: bool = False,
+    *, directories: tuple[Path, ...] | None = None,
 ) -> tuple[list[Skill], list[Skill]]:
     """扫描所有来源。同名技能第一个来源胜出，被盖掉的打一行 stderr。
 
@@ -320,8 +321,8 @@ def _scan(
     """
     found: dict[str, Skill] = {}
     disabled: list[Skill] = []
-    patterns = disabled_patterns()
-    for source in skill_sources(workspace):
+    patterns = disabled_patterns() if directories is None else []
+    for source in (skill_sources(workspace) if directories is None else [SkillSource(p) for p in directories]):
         if not source.directory.is_dir():
             continue
         for skill_md in plugins.skill_files(source.directory):

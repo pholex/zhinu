@@ -99,6 +99,9 @@ class RunResult:
     #  budget（token 软预算到线，同上）/ truncated（回复撞了输出长度上限，自动续写
     #  用尽或无从续起，最后一条是半截）/ interrupted。宿主据此决定是调预算续跑还是结案
     stopped: str = "done"
+    output_status: str = "not_requested"
+    output_errors: tuple[str, ...] = ()
+    output_retries: int = 0
 
 
 @dataclass(frozen=True)
@@ -135,6 +138,8 @@ def measured_send(
     agent: Agent,
     user_input: str | list[dict[str, Any]],
     output_schema: dict[str, Any] | None = None,
+    *,
+    output_contract: Any = None,
 ) -> RunResult:
     """跑一轮 `Agent.send()` 并结算本轮元数据（同步；异步宿主经 `AsyncAgent`）。
 
@@ -154,6 +159,9 @@ def measured_send(
     start_index = len(agent.messages)
     started = time.monotonic()
     interrupted = False
+    if output_contract is not None:
+        output_schema = output_contract.schema
+        agent.output_contract = output_contract
     if output_schema is not None:
         agent.set_output_schema(output_schema)
     try:
@@ -166,6 +174,7 @@ def measured_send(
         output = agent.structured_output if output_schema is not None else None
         if output_schema is not None:
             agent.set_output_schema(None)
+        agent.output_contract = None
     duration = time.monotonic() - started
 
     by_model: dict[str, dict[str, int]] = {}
@@ -207,6 +216,16 @@ def measured_send(
         context_tokens=agent.context_tokens(),
         output=output,
         stopped="interrupted" if interrupted else agent.last_stop,
+        output_status=(
+            "not_requested" if output_contract is None else
+            "interrupted" if interrupted else
+            "valid" if output_contract.submitted else
+            {"output_missing": "missing", "output_invalid": "invalid",
+             "output_retries_exhausted": "retries_exhausted",
+             "budget": "budget_exhausted", "turn_cap": "budget_exhausted"}.get(agent.last_stop, "missing")
+        ),
+        output_errors=output_contract.errors if output_contract else (),
+        output_retries=output_contract.repairs if output_contract else 0,
     )
 
 

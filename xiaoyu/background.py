@@ -325,6 +325,7 @@ class TaskManager:
         self._counter = 0
         self._log_dir: Path | None = None
         self._atexit_registered = False
+        self._threads: list[threading.Thread] = []
 
     # ---------- 启动 ----------
 
@@ -407,14 +408,18 @@ class TaskManager:
         with self._lock:
             self._tasks[task_id] = task
         TASKS_LIVE.inc()
-        threading.Thread(
+        watcher = threading.Thread(
             target=self._watch, args=(task, timeout), daemon=True, name=f"xiaoyu-{task_id}"
-        ).start()
+        )
+        self._threads.append(watcher)
+        watcher.start()
         if kind == "monitor":
-            threading.Thread(
+            tail = threading.Thread(
                 target=self._tail_monitor, args=(task,), daemon=True,
                 name=f"xiaoyu-{task_id}-tail",
-            ).start()
+            )
+            self._threads.append(tail)
+            tail.start()
         return task
 
     # ---------- 生命周期 ----------
@@ -661,11 +666,20 @@ class TaskManager:
         for task in killed:
             with contextlib.suppress(Exception):
                 task.proc.wait(timeout=max(0.0, deadline - time.monotonic()))
-        if self._log_dir is not None:
+        for thread in self._threads:
+            if thread is not threading.current_thread():
+                thread.join(timeout=max(0.0, deadline - time.monotonic()))
+        self._threads = [thread for thread in self._threads if thread.is_alive()]
+        if self._log_dir is not None and not self.shutdown_pending():
             #  Windows 上刚被杀的进程可能还没松开日志句柄，删不掉由 discard 吞掉，
             #  留给下次启动清扫
             tempdirs.discard(self._log_dir)
             self._log_dir = None
+
+    def shutdown_pending(self) -> tuple[str, ...]:
+        """Resources still owned after a bounded shutdown attempt."""
+        tasks = tuple(task.task_id for task in self.all() if task.proc.poll() is None)
+        return tasks + tuple(thread.name for thread in self._threads if thread.is_alive())
 
 
 def _incomplete_utf8_tail(data: bytes) -> int:

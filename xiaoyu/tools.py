@@ -939,6 +939,8 @@ class Tool:
     #  给"结论类"工具用——子 agent、检索、联网搜索存在的理由就是省上下文，
     #  但把结论的后半截直接切掉，等于白跑了那一半
     output_limit: int | None = None
+    # Strict SDK tools validate their original JSON arguments themselves.
+    coerce_arguments: bool = True
 
     def available(self) -> bool:
         if self.check_fn is None:
@@ -982,7 +984,7 @@ class Tool:
 PLUGIN_GROUP = "xiaoyu.tools"
 
 
-def load_plugin_tools(config: Config) -> list[Tool]:
+def load_plugin_tools(config: Config, *, selected: tuple[tuple[str, str], ...] | None = None) -> list[Tool]:
     """加载 entry_points 插件工具。单个插件坏了只警告，不拦启动。
 
     fail-closed：插件没显式声明 requires_approval 的，按 Tool 的默认值需要确认。
@@ -992,19 +994,38 @@ def load_plugin_tools(config: Config) -> list[Tool]:
 
         candidates = entry_points(group=PLUGIN_GROUP)
     except Exception:  # noqa: BLE001 - 插件发现失败不能影响内置工具
+        if selected is not None:
+            raise
         return []
+
+    if selected is not None:
+        def normalized(name: str) -> str:
+            return re.sub(r"[-_.]+", "-", name).lower()
+
+        chosen = []
+        for distribution, name in selected:
+            matches = [entry for entry in candidates if entry.name == name and
+                       normalized(getattr(getattr(entry, "dist", None), "name", "")) == normalized(distribution)]
+            if len(matches) != 1:
+                raise ValueError(f"Plugin must resolve to one entry point: {distribution}/{name}")
+            chosen.append(matches[0])
+        candidates = chosen
 
     tools: list[Tool] = []
     for entry in candidates:
         try:
             made = entry.load()(config)
         except Exception as exc:  # noqa: BLE001 - 坏插件只警告
+            if selected is not None:
+                raise RuntimeError(f"Selected plugin failed: {entry.name}") from exc
             print(f"[插件 {entry.name} 加载失败：{type(exc).__name__}: {exc}]", file=sys.stderr)
             continue
         for tool in made if isinstance(made, list) else [made]:
             if isinstance(tool, Tool):
                 tools.append(tool)
             else:
+                if selected is not None:
+                    raise TypeError(f"Selected plugin returned an invalid tool: {entry.name}")
                 print(f"[插件 {entry.name} 返回了非 Tool 对象，已忽略]", file=sys.stderr)
     return tools
 
@@ -1598,7 +1619,7 @@ class Toolbox:
         if blocked:
             return blocked
 
-        if isinstance(args, dict):
+        if isinstance(args, dict) and tool.coerce_arguments:
             args = coerce_to_schema(args, {**tool.parameters, "type": "object"})
             if problem := _mistyped_argument(args, tool.parameters):
                 return f"ERROR: 调用 {name} 的参数不对：{problem}"

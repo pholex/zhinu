@@ -18,12 +18,13 @@ jobs:
   test:
     uses: ./.github/workflows/ci.yml
 
-  publish:
-    needs: test
+  sdk-test:
+    uses: ./.github/workflows/sdk.yml
+
+  artifacts:
+    needs: [test, sdk-test]
     runs-on: ubuntu-latest
-    environment: pypi
     permissions:
-      id-token: write  # Trusted Publishing 需要
       contents: read
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -38,7 +39,51 @@ jobs:
             echo "::error::tag v$tag 与 __version__ $version 不一致"
             exit 1
           fi
-      #  只发 wheel 不发 sdist：发 PyPI 只为让用户一行 pip 装上，wheel 不带
-      #  tests/experiments 等杂项；要看源码去 GitHub 项目页。
-      - run: pip install build && python -m build --wheel
-      - uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # v1.14.2（release/v1）
+      - run: pip install build twine
+      - run: python scripts/build_sdk.py
+      - run: python scripts/sdk_release.py verify dist/sdk-release --commit "$GITHUB_SHA" --version "${GITHUB_REF_NAME#v}"
+      - run: twine check dist/sdk-release/kernel/* dist/sdk-release/sdk/*
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: sdk-release-${{ github.sha }}
+          path: dist/sdk-release/
+          if-no-files-found: error
+          retention-days: 90
+
+  publish:
+    needs: artifacts
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      id-token: write
+      contents: read
+      actions: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
+        with:
+          python-version: "3.12"
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: sdk-release-${{ github.sha }}
+          path: dist/sdk-release
+      - run: python scripts/sdk_release.py verify dist/sdk-release --commit "$GITHUB_SHA" --version "${GITHUB_REF_NAME#v}"
+      # Stage only missing files. Existing files must match the saved SHA-256.
+      - id: kernel
+        run: python scripts/sdk_release.py stage dist/sdk-release --package kernel --destination upload/kernel
+      - if: steps.kernel.outputs.pending != '0'
+        uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33
+        with:
+          packages-dir: upload/kernel/
+      - run: python scripts/sdk_release.py wait dist/sdk-release --package kernel
+      - id: sdk
+        run: python scripts/sdk_release.py stage dist/sdk-release --package sdk --destination upload/sdk
+      - if: steps.sdk.outputs.pending != '0'
+        uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33
+        with:
+          packages-dir: upload/sdk/
+      - run: python scripts/sdk_release.py wait dist/sdk-release --package sdk
+      - run: python -m venv /tmp/released-sdk
+      - run: /tmp/released-sdk/bin/python -m pip install "xiaoyu-agent-sdk==${GITHUB_REF_NAME#v}"
+      - run: /tmp/released-sdk/bin/python -m pip check
+      - run: /tmp/released-sdk/bin/python -I tests/sdk_wheel_smoke.py

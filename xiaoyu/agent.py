@@ -54,6 +54,7 @@ from .config import EFFORT_LEVELS, Config
 from .errors import Interrupted, classify
 from .providers import Registry, Route, UnknownModel
 from .permissions import Permissions, call_identity
+from .rewind import RewindResult
 from .events import (
     Notice,
     PlanUpdated,
@@ -1309,6 +1310,7 @@ class Agent:
         #  它即等于收尾；结果存这里，消费方（run_once / serve / embedding）直接取
         self.output_schema: dict[str, Any] | None = None
         self.structured_output: Any = None
+        self.output_contract: Any = None
         if config.enable_plan and self.toolbox.get("update_plan") is None:
             self.toolbox.register(
                 Tool(
@@ -1573,7 +1575,7 @@ class Agent:
             max_tokens=int(self.config.context_limit * self._SKILL_BUDGET_RATIO),
             #  按使用账本排序：预算降级时让常用技能优先存活。system prompt 每会话
             #  构建一次，账本跨会话慢变，会话内静态（不破坏 prefix cache）。
-            rank_by_usage=True,
+            rank_by_usage=self.config.skill_directories is None,
         )
         if skills_block:
             segments.append(("技能索引", skills_block))
@@ -1612,6 +1614,8 @@ class Agent:
         总预算 `_PROJECT_DOC_CAP` 按 **leaf-first** 分配：更深、更具体的文件
         永不被浅层的大文件挤掉——预算先给工作区自己的规范，剩多少才轮到上层。
         """
+        if not self.config.load_project_instructions:
+            return ""
         found = collect_project_docs(
             self.config.workspace, self._PROJECT_DOC_NAMES, self._PROJECT_DOC_CAP
         )
@@ -1705,12 +1709,22 @@ class Agent:
                 parameters=params,
                 handler=self._structured_output,
                 requires_approval=False,
+                coerce_arguments=self.output_contract is None,
             )
         )
 
     def _structured_output(self, **data: Any) -> str:
         schema = self.output_schema or {}
         wrapped = schema.get("type") != "object" or "properties" not in schema
+        if self.output_contract is not None:
+            value = data.get("value") if wrapped else data
+            if wrapped and "value" not in data:
+                self.output_contract.errors = ("/value: required constraint failed",)
+                self.output_contract.failures += 1
+            elif self.output_contract.accept(value):
+                self.structured_output = value
+                return "已记录结构化结果，本轮到此结束。"
+            return "ERROR: " + "; ".join(self.output_contract.errors) + ". 请修正后重新调用。"
         value = coerce_to_schema(data.get("value") if wrapped else data, schema)
         problems = _schema_problems(value, schema)
         if problems:
@@ -1932,9 +1946,13 @@ class Agent:
         return None
 
     def _scan_skills(self) -> list[skills.Skill]:
+        if self.config.skill_directories is not None:
+            return skills.scan_skills(directories=self.config.skill_directories)
         return skills.scan_skills(self._skills_workspace())
 
     def _skill_sources_state(self) -> tuple:
+        if self.config.skill_directories is not None:
+            return skills.sources_fingerprint(directories=self.config.skill_directories)
         return skills.sources_fingerprint(self._skills_workspace())
 
     def _load_skill(self, name: str) -> str:
@@ -1954,7 +1972,8 @@ class Agent:
             return body
         #  只有正文成功送达才记一次使用（加载失败不算）：账本给索引排序用，
         #  让常用技能在预算降级时优先存活。best-effort，绝不影响加载本身。
-        skill_usage.record_load(name)
+        if self.config.skill_directories is None:
+            skill_usage.record_load(name)
         #  基准目录必须随正文给出：技能正文里的相对路径（references/…、
         #  ../共享文档）模型无从知道相对谁——真实会话里模型猜错目录后，
         #  又花二十分钟递归搜盘才找到真实位置。
@@ -2548,7 +2567,11 @@ class Agent:
     # ---------- rewind（/rewind：回滚到某轮开始前） ----------
 
     def rewind_to(self, index: int, conversation: bool = True, files: bool = True) -> str:
-        """回滚到快照点 index（第 index 轮开始前）。返回给用户看的结果文本。
+        return self.rewind_result(index, conversation, files, check_conflicts=False).summary
+
+    def rewind_result(self, index: int, conversation: bool = True, files: bool = True,
+                      *, check_conflicts: bool = True) -> RewindResult:
+        """回滚到快照点 index，返回状态、文件清单与可读说明。
 
         对话截断按**该轮用户输入原文**在当前历史里定位（同文多次出现按点序数
         对应第 n 次）：压缩把消息改写后下标不可靠，原文匹配不上即说明该轮已被
@@ -2561,10 +2584,17 @@ class Agent:
         """
         store = getattr(self.toolbox, "rewind", None)
         if store is None:
-            return "当前工具箱没有挂快照，无法回滚。"
+            return RewindResult(index, "unavailable", summary="当前工具箱没有挂快照，无法回滚。")
         point = store.get(index)
         if point is None:
-            return f"没有编号为 {index} 的快照点（/rewind 重新看列表）。"
+            return RewindResult(index, "unavailable", summary=f"没有编号为 {index} 的快照点（/rewind 重新看列表）。")
+        targets = store.files_from(index) if files else {}
+        skipped = tuple(store.skipped_from(index)) if files else ()
+        conflicts = tuple(store.conflicts(index)) if files and check_conflicts else ()
+        if conflicts:
+            return RewindResult(index, "conflict", conflicts=conflicts, skipped_files=skipped,
+                                summary="文件有外部改动，文件与对话均未回滚。")
+        requested_conversation = conversation
         notes: list[str] = []
         if conversation:
             occurrence = sum(
@@ -2594,7 +2624,8 @@ class Agent:
                 notes.append("文件恢复出错：" + summary)
                 if conversation:
                     notes.append("对话没有回滚（文件回不去时对话也不动；修好后重试即可）")
-                return "；".join(notes)
+                return RewindResult(index, "failed", skipped_files=skipped,
+                                    uncertain_files=tuple(targets), summary="；".join(notes))
         if conversation:
             self.messages = self.messages[:found]
             self._history_rewritten()
@@ -2608,7 +2639,14 @@ class Agent:
             notes.append(f"对话已回滚到第 {index} 轮开始前（截掉其后的全部轮次）")
         if files:
             notes.append("文件：" + summary)
-        return "；".join(notes) if notes else "什么也没做。"
+        return RewindResult(
+            index, "partial" if skipped or requested_conversation and not conversation else
+            "completed" if conversation or files else "noop",
+            conversation_rewound=conversation, files_rewound=files,
+            restored_files=tuple(path for path, before in targets.items() if before is not None),
+            removed_files=tuple(path for path, before in targets.items() if before is None),
+            skipped_files=skipped, summary="；".join(notes) if notes else "什么也没做。",
+        )
 
     def drop_from(self, start: int, reason: str) -> int:
         """把历史从下标 start 起整段拿掉（不含 system），返回拿掉了几条。
@@ -2735,6 +2773,9 @@ class Agent:
         self.last_stop = "done"
         while True:
             if steps >= turn_budget:
+                if self.output_contract is not None:
+                    self.last_stop = "turn_cap"
+                    return
                 granted, wrapped = self._offer_extension(extension_pool)
                 if wrapped:
                     self.last_stop = "turn_cap"
@@ -2747,6 +2788,8 @@ class Agent:
             self._budget_countdown()
             if self._budget_exhausted():
                 self.last_stop = "budget"
+                if self.output_contract is not None:
+                    return
                 break
             steps += 1
             self.maybe_compact()
@@ -2777,6 +2820,12 @@ class Agent:
                 self._continue_after_truncation(truncations)
                 continue
             if not calls:
+                if self.output_contract is not None:
+                    if self.output_contract.retry():
+                        self._record_operator(STRUCTURED_OUTPUT_NUDGE)
+                        continue
+                    self.last_stop = "output_missing"
+                    return
                 if media.text_of(message.get("content")).strip():
                     #  模型已给出收尾正文，但期间用户插了话：不结束本轮，
                     #  把插话入历史再跑一步
@@ -2869,10 +2918,28 @@ class Agent:
                 self._record_operator(EMPTY_REPLY_NUDGE)
                 continue
 
+            output_failures = self.output_contract.failures if self.output_contract else 0
             for call in calls:
                 #  同一批里后面的调用不该在打断之后照跑
                 self._checkpoint()
+                failures_before_call = self.output_contract.failures if self.output_contract else 0
                 self._record(self._execute(call))
+                if (
+                    self.output_contract is not None
+                    and call.get("function", {}).get("name") == STRUCTURED_OUTPUT_TOOL
+                    and not self.output_contract.submitted
+                    and self.output_contract.failures == failures_before_call
+                ):
+                    # Invalid JSON/non-object arguments can fail before the handler.
+                    self.output_contract.failures += 1
+                    self.output_contract.errors = ("Structured output invocation failed",)
+                if self.output_contract is not None and self.output_contract.submitted:
+                    self.close_open_tool_calls("结构化结果已提交，本批其余调用未执行。")
+                    return
+            if self.output_contract is not None and self.output_contract.failures > output_failures:
+                if not self.output_contract.retry():
+                    self.last_stop = "output_invalid" if self.output_contract.max_retries == 0 else "output_retries_exhausted"
+                    return
             if resumable:
                 #  截断前写完整的调用照常执行了，被丢弃的那个还得重来——同样要提醒拆小
                 truncations += 1
@@ -3881,6 +3948,9 @@ class Agent:
                     and not message.get("tool_calls")
                 )
                 self._log_request(route, attempt, "empty" if empty else "ok")
+                if empty and self.output_contract is not None:
+                    # Empty final output consumes the same bounded repair budget.
+                    return message
                 if empty:
                     zero_streak = zero_streak + 1 if self._completion_tokens == 0 else 0
                     if zero_streak >= self._DETERMINISTIC_EMPTY:
@@ -4905,7 +4975,7 @@ class Agent:
             self._turn_mutations += 1
         #  隐式技能使用记账：bash 直读 SKILL.md / 跑技能脚本也算用了该技能
         #  （理由见 skill_usage 模块 docstring）。每轮每技能一次，失败的命令不算。
-        if ok and name == "bash" and self.skills:
+        if ok and name == "bash" and self.skills and self.config.skill_directories is None:
             for skill_name in skill_usage.implicit_loads(
                 str(args.get("command") or ""), self.skills, self.config.workspace
             ):

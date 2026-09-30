@@ -12,7 +12,7 @@
 | 你是谁 | 用哪张脸 | 入口 | 文档 |
 |---|---|---|---|
 | **脚本 / CI / 定时任务**：跑一次、拿结果、退出 | 一次性执行 | `xy "…" --output-format json [--output-schema …]` | [ci.md](ci.md)（凭证分离与注入面）· [README](../README.md#用) |
-| **Python 进程**：agent 跑在你的进程里，自己管生命周期 | 嵌入 SDK | `import xiaoyu` → `AsyncAgent`（`send` / `stream` / `interrupt` / `steer` / `restore`） | [embedding.md](embedding.md)（公开面清单与稳定性承诺） |
+| **Python 进程**：agent 跑在你的进程里 | Python SDK | `xiaoyu_agent_sdk` → `Session` / `AsyncSession`；旧 `import xiaoyu` 继续兼容 | [sdk.md](sdk.md)、[embedding.md](embedding.md) |
 | **别的语言 / 别的进程 / 编排器**（n8n、Dify、LangChain、自研平台） | 服务 | `xiaoyu serve`：REST + `/mcp` | [http-api.md](http-api.md) · [mcp-server.md](mcp-server.md) |
 | **浏览器**（扩展侧栏；agent 反向操作用户的浏览器） | 服务 | `xiaoyu serve`：REST + `/session/{id}/browser` | [browser-bridge.md](browser-bridge.md) |
 | **编辑器 / IDE** | ACP | `xiaoyu --acp`（stdio JSON-RPC） | [acp-registry/](acp-registry/) |
@@ -76,8 +76,7 @@ UI，就是你的产品。
 
 ## 刻意不做的
 
-- **不出别的语言的 SDK**：跨语言走 serve 的 REST / MCP（OpenAPI 由代码生成），
-  一份契约比 N 份 SDK 可靠。
+- **首版支持 Python SDK**：其他语言目前走 serve 的 REST / MCP 或 wire；TypeScript SDK 后续评估。
 - **不另起一套"应用协议"**：REST 给编排器，MCP 给 agent 框架，ACP 给编辑器——三类消费方
   各有事实标准，不发明第四种。
 - **不托管**：小羽跑在你的机器上，serve 默认只绑回环，对外必须带 token。

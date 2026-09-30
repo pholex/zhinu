@@ -176,6 +176,7 @@ class AgentSpec:
     mcp_servers: tuple[str, ...] = ()
     inherit: str = ""  # "" | "distilled"（父会话历史的继承方式）
     source: str = ""  # user | workspace（显示用）
+    require_isolation: bool = False
 
     @property
     def readonly(self) -> bool:
@@ -801,7 +802,7 @@ def execute_delegation(
         if record.worktree is not None and record.worktree.is_dir():
             workdir = record.worktree
             inherited_wt = record.worktree
-        elif was_isolated and set(tools_list) <= set(Toolbox.READONLY):
+        elif was_isolated and set(tools_list) <= set(Toolbox.READONLY) and not require_isolation:
             #  这次只读：在主工作区看一眼无妨，不值得为它建目录
             notes.append("上次的 worktree 已不存在，这次在主工作区只读跑")
         elif was_isolated:
@@ -926,6 +927,8 @@ def execute_delegation(
         enable_explore=False,
         enable_web_search=False,
         enable_skills=False,
+        load_project_instructions=config.load_project_instructions,
+        skill_directories=config.skill_directories,
         enable_plan=False,
         enable_plugins=False,
         enable_mcp=False,
@@ -988,7 +991,7 @@ def execute_delegation(
         if seed
         else "父会话的对话记忆你也没有"
     )
-    if not spec.system_prompt.count("AGENTS.md") and collect_project_docs(
+    if config.load_project_instructions and not spec.system_prompt.count("AGENTS.md") and collect_project_docs(
         workdir, Agent._PROJECT_DOC_NAMES, Agent._PROJECT_DOC_CAP  # noqa: SLF001
     ):
         system_text += (
@@ -1161,7 +1164,8 @@ def make_subagent_tool(
             spec, config, registry, usage, sink, approver, permissions,
             store, mcp_manager,
             task=task, capability_mode=capability_mode,
-            isolation=isolation, resume_from=resume_from,
+            isolation="worktree" if spec.require_isolation else isolation, resume_from=resume_from,
+            require_isolation=spec.require_isolation,
             parent_history=parent_history,
             stop_requested=stop_requested,
             guards=guards,

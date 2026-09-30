@@ -502,10 +502,13 @@ class Registry:
         providers: list[Provider],
         timeout: float = 600.0,
         clients: dict[str, Any] | None = None,
+        *,
+        inherit_environment: bool = True,
     ) -> None:
         if not providers:
             raise MissingConfig(NO_PROVIDER_HINT)
         self.providers = providers
+        self.inherit_environment = inherit_environment
         #  配置给的是一个秒数，出网用的是摊开的四段超时（建连短、读写长）
         self._timeout = request_timeout(timeout)
         #  预置 client（测试注入假 client 用）；其余按需惰性构造并缓存。
@@ -601,7 +604,7 @@ class Registry:
 
         网关上确实挂着视觉模型时，用 XIAOYU_VISION_MODELS 点名放行（见 _vision_override）。
         """
-        if _vision_override(name):
+        if self.inherit_environment and _vision_override(name):
             return True
         #  刻意不走 resolve()：那条路会顺手构造 client（连接池、鉴权），
         #  而这里只是问一句"能不能"，一轮里会被问好几次

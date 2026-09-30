@@ -2616,5 +2616,48 @@ class NamespaceConflictTest(unittest.TestCase):
         self.assertEqual([t.name for t in manager.ready_tools()], ["mcp__a__b__c"])
 
 
+class ShutdownOwnershipTest(unittest.TestCase):
+    def test_close_retains_an_interrupted_http_worker_until_it_finishes(self):
+        server = mcp.McpServer(mcp.ServerSpec(name="late", command="", url="https://unused.invalid/mcp"), Path("unused"))
+        release = threading.Event()
+        worker = threading.Thread(target=release.wait, name="late-http-response", daemon=True)
+        server._start_worker(worker)
+        try:
+            with mock.patch.object(mcp, "_CLOSE_WAIT", 0.01):
+                server.close()
+            self.assertTrue(server.shutdown_pending())
+        finally:
+            release.set()
+            worker.join(2)
+            server.close()
+        self.assertFalse(server.shutdown_pending())
+
+    def test_timeout_retains_readers_processes_and_exit_fallback(self):
+        spec = mcp.ServerSpec(name="stuck", command="unused")
+        manager = mcp.McpManager([spec])
+        server = mock.Mock(spec=mcp.McpServer)
+        server.spec = spec
+        server.shutdown_pending.return_value = True
+        worker = mock.Mock(spec=threading.Thread)
+        worker.name = "stuck-reader"
+        worker.is_alive.return_value = True
+        manager._owned_servers.append(server)
+        manager._servers[spec.name] = server
+        manager._boot_threads.append(worker)
+        mcp._extra_managers.append(manager)
+        self.addCleanup(lambda: mcp._extra_managers.remove(manager) if manager in mcp._extra_managers else None)
+        manager.close()
+        self.assertEqual(set(manager.shutdown_pending()), {"stuck-reader", "stuck"})
+        self.assertIn(manager, mcp._extra_managers)
+        self.assertEqual(manager.server_states(), {"stuck": "closing"})
+        worker.is_alive.return_value = False
+        server.shutdown_pending.return_value = False
+        manager.close()
+        self.assertEqual(manager.shutdown_pending(), ())
+        self.assertEqual(manager.server_states(), {"stuck": "closed"})
+        self.assertNotIn(manager, mcp._extra_managers)
+        self.assertEqual(server.close.call_count, 2)
+
+
 if __name__ == "__main__":
     unittest.main()
