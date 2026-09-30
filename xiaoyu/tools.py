@@ -933,6 +933,11 @@ class Tool:
     #  结果来自外部（MCP server、网页、联网搜索）：回灌模型前由 agent 包进
     #  <untrusted_content>，其中的指令只当数据（见 wrap_untrusted）
     untrusted: bool = False
+    #  这个工具的输出留在上下文里的字符上限；None = 用全局的 max_tool_output。
+    #  超出的部分不丢：完整内容落盘，内联留头尾预览和召回 id（见 _bound_output）。
+    #  给"结论类"工具用——子 agent、检索、联网搜索存在的理由就是省上下文，
+    #  但把结论的后半截直接切掉，等于白跑了那一半
+    output_limit: int | None = None
 
     def available(self) -> bool:
         if self.check_fn is None:
@@ -1582,7 +1587,7 @@ class Toolbox:
                 return f"ERROR: 调用 {name} 的参数不对：{problem}"
 
         try:
-            output = self._bound_output(name, tool.handler(**args))
+            output = self._bound_output(name, tool.handler(**args), tool.output_limit)
         except Interrupted:
             #  打断不是工具的错误：不能折成 ERROR 文本回给模型然后接着跑
             raise
@@ -2963,14 +2968,15 @@ class Toolbox:
         self._spill_seq = max(self._spill_seq, highest)
         self._foreign_recall_ids = self._spill_seq
 
-    def _bound_output(self, name: str, text: str) -> str:
+    def _bound_output(self, name: str, text: str, limit: int | None = None) -> str:
         """超长输出：完整落盘 + 内联留头尾预览和取回定位符（spill）。
 
         纯截断会把中段永久丢掉——测试输出的中部失败、长日志的关键一段，
         模型想再看只能重跑命令。落盘后中段随时可用 read_file/grep 按需取回，
         重跑（可能有副作用、可能很慢）不再是唯一出路。落盘失败退回纯截断。
         """
-        limit = self.config.max_tool_output
+        #  工具自己声明的上限只能比全局的更紧
+        limit = min(limit or self.config.max_tool_output, self.config.max_tool_output)
         if len(text) <= limit:
             return text
         result = self._spill(name, text)
