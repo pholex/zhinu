@@ -244,6 +244,10 @@ def _option_name(token: str) -> str:
 #  持久规则的模式后缀：命令头后面要隔一个空格（`ls *`，否则 `ls*` 连 lsof 一起放行），
 #  子命令后面沿用粘连写法（`git status*`），整条精确的不带通配
 _EXACT, _AFTER_HEAD, _AFTER_SUB = "", " *", "*"
+#  只够会话授权、落不成持久规则的范围：解释器跑脚本文件（python x.py / node x.js）。
+#  规则认的是文件名，跑的却是文件内容——内容随时能改，记住一次就等于永久放行
+#  任意代码。会话授权退出即失效，仍按脚本给范围。
+_SESSION_ONLY = None
 
 
 def _exact_if_options_only(argv: list[str]) -> tuple[str, int, str] | None:
@@ -254,11 +258,12 @@ def _exact_if_options_only(argv: list[str]) -> tuple[str, int, str] | None:
     return None
 
 
-def _stable_prefix(argv: list[str], depth: int = 0) -> tuple[str, int, str] | None:
+def _stable_prefix(argv: list[str], depth: int = 0) -> tuple[str, int, str | None] | None:
     """一条简单命令的"命令类"：(范围键, 原始 argv 里属于前缀的词数, 规则模式后缀)。
 
     范围键是归一后的（全局选项已剥掉），给会话授权做相等比较；词数给持久规则
     拼字面前缀用（规则按命令文本匹配，得保留用户实际写的那些选项）。
+    后缀为 _SESSION_ONLY 表示这个范围只给会话授权用，不落持久规则。
     推不出返回 None。调用方已经拦过危险命令、注入口与 wrapper 头。
     """
     if not argv or depth > _MAX_PREFIX_DEPTH:
@@ -282,7 +287,7 @@ def _stable_prefix(argv: list[str], depth: int = 0) -> tuple[str, int, str] | No
                     return None
                 return _through_runner(argv, index + 1, f"{head} -m", depth)
             if not token.startswith("-"):
-                return f"{head} {token}", index + 1, _AFTER_SUB
+                return f"{head} {token}", index + 1, _SESSION_ONLY
             if token in _INFO_FLAGS:
                 return _exact_if_options_only(argv)
             if token not in harmless:
@@ -328,7 +333,7 @@ def _stable_prefix(argv: list[str], depth: int = 0) -> tuple[str, int, str] | No
 
 
 def _through_runner(argv: list[str], start: int, label: str,
-                    depth: int) -> tuple[str, int, str] | None:
+                    depth: int) -> tuple[str, int, str | None] | None:
     """透传运行器后面那条命令的范围，拼上运行器前缀。"""
     inner = argv[start:]
     if not inner:
@@ -389,11 +394,13 @@ def suggest_allow_rule(name: str, args: dict, workspace: Path) -> Rule | None:
     """从一次待确认的调用推导「总是允许」的持久规则；推不出返回 None。
 
     确认框的第三个选项靠它：能给用户一条"范围恰好覆盖这类调用"的规则才显示。
-    保守三关（推不出就只是少一个选项，不影响允许/拒绝）：
+    保守四关（推不出就只是少一个选项，不影响允许/拒绝）：
     1. bash 只认单条、能被 bash_ast 白名单解析的简单命令——复合命令、
        重定向、命令替换统统不推导；
     2. 危险命令（强制 rm 等）与参数注入口（git -c / find -exec …）不推导；
-    3. 推导结果必须过 banned_allow_reason——python * 这类任意代码执行入口
+    3. 解释器跑脚本文件（python x.py / node x.js，含套在 uv run 等运行器里的）
+       不推导：文件内容随时能改，只能逐次确认或会话授权；
+    4. 推导结果必须过 banned_allow_reason——python * 这类任意代码执行入口
        在这里就被拦下，不会出现"界面提供了选项、落盘时才报错"。
     """
     if name != "bash":
@@ -436,6 +443,8 @@ def suggest_allow_rule(name: str, args: dict, workspace: Path) -> Rule | None:
     if found is None:
         return None
     _, used, suffix = found
+    if suffix is _SESSION_ONLY:
+        return None
     literal = argv[:used]
     if any(not token or _has_glob(token) or any(ch.isspace() for ch in token)
            for token in literal):

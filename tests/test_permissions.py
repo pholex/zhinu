@@ -778,6 +778,22 @@ class SuggestAllowRuleTest(unittest.TestCase):
         #  `nice -n 10 make` 推导出的 `nice *` 会放行 nice 包的任意命令
         self.assertIsNone(self.suggest("bash", {"command": "nice -n 10 make"}))
 
+    def test_interpreter_running_a_script_file_not_derived(self):
+        """规则认文件名、跑的是文件内容：脚本随时能改，记住一次等于永久放行任意代码。
+        会话授权退出即失效，范围照给。"""
+        from xiaoyu.permissions import command_keys
+
+        for command in ("python3 evil.py", "python scripts/x.py --flag", "python3 -u evil.py",
+                        "python3.12 evil.py", "node x.js", "ruby x.rb", "perl x.pl", "php x.php",
+                        "/usr/bin/python3 evil.py", "uv run python evil.py"):
+            self.assertIsNone(self.suggest("bash", {"command": command}), command)
+            self.assertIsNotNone(command_keys(command), command)
+        #  跑模块 / 只问版本不受影响
+        self.assertEqual(self.suggest("bash", {"command": "python -m pytest tests/"}),
+                         Rule("allow", "bash", "python -m pytest *"))
+        self.assertEqual(self.suggest("bash", {"command": "python --version"}),
+                         Rule("allow", "bash", "python --version"))
+
     def test_file_tool_scoped_to_directory(self):
         rule = self.suggest("write_file", {"path": "src/app/x.py"})
         self.assertEqual(rule, Rule("allow", "write_file", "src/app/*"))
