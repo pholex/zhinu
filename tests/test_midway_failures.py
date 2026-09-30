@@ -360,5 +360,132 @@ class ForkSeedTest(AgentTestCase):
         self.assertEqual(agents_mod.fork_seed(history), history[1:])
 
 
+def tool_call(call_id: str, name: str = "read_file") -> dict:
+    return {"id": call_id, "type": "function", "function": {"name": name, "arguments": "{}"}}
+
+
+def shape(messages: list[dict]) -> list[str]:
+    """消息序列的骨架：role，tool 带上它应答的调用 id。"""
+    return [
+        f"tool:{m.get('tool_call_id')}" if m.get("role") == "tool" else str(m.get("role"))
+        for m in messages
+    ]
+
+
+class FillerPlacementTest(AgentTestCase):
+    """补位的工具结果：内存与会话日志里都紧跟它的调用，resume 后序列合法。"""
+
+    def test_dangling_call_is_closed_before_the_next_user_message(self) -> None:
+        from xiaoyu.session_log import SessionLog, load_messages
+
+        log_path = self.root / "log.jsonl"
+        log = SessionLog(log_path)
+        self.addCleanup(log.release)
+
+        def approver(name, args):
+            raise RuntimeError("审批通道断了")
+
+        self.config.auto_approve = False
+        agent = self.build(
+            [
+                [chunk(tool_calls=[call_fragment(0, "c1", "bash", '{"command": "echo hi"}')])],
+                [chunk(content="好的")],
+            ],
+            session_log=log, approver=approver,
+        )
+        with contextlib.redirect_stdout(io.StringIO()):
+            #  宿主的通用异常分支：不做补位，直接等用户的下一条
+            with self.assertRaises(RuntimeError):
+                agent.send("跑一下")
+            agent.send("怎么了")
+        expected = ["user", "assistant", "tool:c1", "user", "assistant"]
+        self.assertEqual(shape(agent.messages[1:]), expected)
+        #  日志里的顺序与内存一致——resume 重放出来的就是合法序列
+        self.assertEqual(shape(load_messages(log_path)), expected)
+
+    def restored(self, messages: list[dict]):
+        agent = self.build([])
+        with contextlib.redirect_stdout(io.StringIO()):
+            agent.restore(messages, copy=False)
+            agent._repair_history()
+        return agent.messages[1:]
+
+    def test_log_written_out_of_order_heals_on_resume(self) -> None:
+        healed = self.restored([
+            {"role": "user", "content": "跑一下"},
+            {"role": "assistant", "content": "", "tool_calls": [tool_call("c1")]},
+            {"role": "user", "content": "怎么了"},
+            {"role": "tool", "tool_call_id": "c1", "content": "[按已放弃处理]"},
+            {"role": "assistant", "content": "好的"},
+        ])
+        self.assertEqual(shape(healed), ["user", "assistant", "tool:c1", "user", "assistant"])
+
+    def test_result_far_from_its_call_is_dropped(self) -> None:
+        healed = self.restored([
+            {"role": "user", "content": "跑一下"},
+            {"role": "assistant", "content": "", "tool_calls": [tool_call("c1")]},
+            {"role": "tool", "tool_call_id": "c1", "content": "真结果"},
+            {"role": "assistant", "content": "好的"},
+            {"role": "user", "content": "再来"},
+            {"role": "tool", "tool_call_id": "c1", "content": "游离的一条"},
+            {"role": "tool", "tool_call_id": "zz", "content": "没有主的一条"},
+        ])
+        self.assertEqual(shape(healed), ["user", "assistant", "tool:c1", "assistant", "user"])
+        self.assertEqual(healed[2]["content"], "真结果")
+
+    def test_duplicate_result_for_one_call_keeps_the_first(self) -> None:
+        healed = self.restored([
+            {"role": "user", "content": "跑一下"},
+            {"role": "assistant", "content": "", "tool_calls": [tool_call("c1")]},
+            {"role": "tool", "tool_call_id": "c1", "content": "第一条"},
+            {"role": "tool", "tool_call_id": "c1", "content": "第二条"},
+        ])
+        self.assertEqual(shape(healed), ["user", "assistant", "tool:c1"])
+        self.assertEqual(healed[2]["content"], "第一条")
+
+    def test_real_result_behind_an_interleaved_note_is_moved_back_not_replaced(self) -> None:
+        #  一批工具跑到一半时插进来的说明（切档的交代）：第二个调用的真结果排在它后面
+        healed = self.restored([
+            {"role": "user", "content": "跑一下"},
+            {"role": "assistant", "content": "", "tool_calls": [tool_call("c1"), tool_call("c2")]},
+            {"role": "tool", "tool_call_id": "c1", "content": "一"},
+            {"role": "user", "content": "[已进入 plan 档]", "_operator": True},
+            {"role": "tool", "tool_call_id": "c2", "content": "二"},
+        ])
+        self.assertEqual(shape(healed), ["user", "assistant", "tool:c1", "tool:c2", "user"])
+        self.assertEqual(healed[3]["content"], "二")
+
+    def test_legitimate_history_is_left_alone(self) -> None:
+        #  每轮都从同一个 id 起编的模型、不给 id 的服务端：位置都对，一条不能少
+        history = [
+            {"role": "user", "content": "跑一下"},
+            {"role": "assistant", "content": "", "tool_calls": [tool_call("c1")]},
+            {"role": "tool", "tool_call_id": "c1", "content": "一"},
+            {"role": "assistant", "content": "", "tool_calls": [tool_call("c1")]},
+            {"role": "tool", "tool_call_id": "c1", "content": "二"},
+            {"role": "assistant", "content": "", "tool_calls": [tool_call(""), tool_call("")]},
+            {"role": "tool", "tool_call_id": "", "content": "三"},
+            {"role": "tool", "tool_call_id": "", "content": "四"},
+            {"role": "assistant", "content": "完"},
+        ]
+        healed = self.restored([dict(m) for m in history])
+        self.assertEqual(healed, history)
+
+    def test_reused_id_in_a_later_turn_is_not_stolen(self) -> None:
+        #  前一轮的调用悬空，后一轮用了同一个 id：后一轮的结果不是前一轮的
+        healed = self.restored([
+            {"role": "user", "content": "跑一下"},
+            {"role": "assistant", "content": "", "tool_calls": [tool_call("c1")]},
+            {"role": "user", "content": "再来"},
+            {"role": "assistant", "content": "", "tool_calls": [tool_call("c1")]},
+            {"role": "tool", "tool_call_id": "c1", "content": "后一轮的结果"},
+        ])
+        self.assertEqual(
+            shape(healed), ["user", "assistant", "tool:c1", "user", "assistant", "tool:c1"]
+        )
+        self.assertNotEqual(healed[2]["content"], "后一轮的结果")
+        self.assertEqual(healed[5]["content"], "后一轮的结果")
+
+
 if __name__ == "__main__":
     unittest.main()
