@@ -52,7 +52,7 @@ from .config import (
     save_user_env,
     user_env_path,
 )
-from .permissions import Permissions, parse_rule
+from .permissions import Permissions, parse_rule, rule_lint
 from .render import REPLAY_TURNS, JsonlSink, NullSink, replay_transcript
 from .tools import Toolbox
 
@@ -3509,6 +3509,8 @@ def handle_slash(agent: Agent, line: str, select: Any = None) -> bool:
                 print(ui.error(f"已拒绝：{exc}"))
             else:
                 print(ui.success(f"已写入 {path}：{rule}"))
+                if hint := rule_lint(rule):
+                    print(ui.warning(f"  这条规则可能不会命中：{hint}"))
     elif command == "/resume":
         slash_resume(agent, rest, select)
     elif command == "/clear":

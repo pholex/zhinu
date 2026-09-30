@@ -14,7 +14,7 @@ from pathlib import Path
 from unittest import mock
 
 from xiaoyu import permissions as perm_mod
-from xiaoyu.permissions import Permissions, Rule, banned_allow_reason, parse_rule
+from xiaoyu.permissions import Permissions, Rule, banned_allow_reason, parse_rule, rule_lint
 
 from .test_agent_paths import AgentTestCase
 
@@ -34,6 +34,19 @@ class ParseRuleTest(unittest.TestCase):
     def test_roundtrip_str(self):
         for text in ("allow bash(git *)", "deny write_file"):
             self.assertEqual(str(parse_rule(text)), text)
+
+    def test_keyword_is_case_insensitive_but_tool_is_not(self):
+        self.assertEqual(parse_rule("Deny bash(curl *)"), Rule("deny", "bash", "curl *"))
+        self.assertEqual(parse_rule("ASK write_file"), Rule("ask", "write_file", None))
+        self.assertEqual(parse_rule("deny Bash(curl *)"), Rule("deny", "Bash", "curl *"))
+
+    def test_lint_names_rules_that_will_never_hit(self):
+        self.assertIn("bash", rule_lint(Rule("deny", "Bash", "curl *")))
+        self.assertIn("bash", rule_lint(Rule("deny", "shell", "curl *")))
+        self.assertIn("一行只能写一条", rule_lint(parse_rule("deny bash(a *), bash(b *)")))
+        for rule in ("deny bash(curl *)", "allow write_file", "deny mcp__GitHub__delete_repo",
+                     "deny bash(echo (a), b)"):
+            self.assertEqual(rule_lint(parse_rule(rule)), "", rule)
 
 
 class DecideTest(unittest.TestCase):
@@ -355,14 +368,73 @@ class PersistenceTest(unittest.TestCase):
         ws_file = self.workspace / ".xiaoyu" / "permissions.txt"
         ws_file.parent.mkdir(parents=True)
         ws_file.write_text("deny bash(curl *)\n", encoding="utf-8")
-        perms = Permissions.load(self.workspace)
+        with contextlib.redirect_stderr(io.StringIO()):
+            perms = Permissions.load(self.workspace)
         self.assertEqual(len(perms.rules), 2)
         self.assertEqual(perms.decide("bash", {"command": "git status"}), "allow")
         self.assertEqual(perms.decide("bash", {"command": "curl http://x"}), "deny")
 
     def test_load_without_files(self):
-        perms = Permissions.load(self.workspace)
+        with contextlib.redirect_stderr(io.StringIO()) as err:
+            perms = Permissions.load(self.workspace)
         self.assertEqual(perms.rules, [])
+        self.assertEqual(err.getvalue(), "")  # 没有文件不是问题，不该出声
+
+    def load_user_rules(self, body: str) -> tuple[Permissions, str]:
+        self.user_file.parent.mkdir(parents=True, exist_ok=True)
+        self.user_file.write_text(body, encoding="utf-8")
+        with contextlib.redirect_stderr(io.StringIO()) as err:
+            perms = Permissions.load(self.workspace)
+        return perms, err.getvalue()
+
+    def test_unparseable_lines_are_reported_not_dropped_silently(self):
+        """写坏的 deny 不生效 = 护栏没了，必须让人看见是哪一行。"""
+        perms, err = self.load_user_rules(
+            "deny: bash(curl *)\n"
+            "deny bash (wget *)\n"
+            "deny bash(git push*)\n"
+        )
+        self.assertEqual([str(rule) for rule in perms.rules], ["deny bash(git push*)"])
+        self.assertEqual(err.count("权限规则被忽略"), 2)
+        self.assertIn(f"{self.user_file}:1", err)
+        self.assertIn(f"{self.user_file}:2", err)
+
+    def test_trailing_comment_does_not_void_the_rule(self):
+        perms, err = self.load_user_rules(
+            "deny bash(curl *)   # 临时 (先拦着)\n"
+            "ask write_file # 都问\n"
+            "deny bash(echo # x)\n"
+        )
+        self.assertEqual(
+            [str(rule) for rule in perms.rules],
+            ["deny bash(curl *)", "ask write_file", "deny bash(echo # x)"],
+        )
+        self.assertEqual(err, "")
+        self.assertEqual(perms.decide("bash", {"command": "curl http://x"}), "deny")
+
+    def test_suspicious_rules_load_with_a_warning(self):
+        perms, err = self.load_user_rules("Deny Bash(curl *)\n")
+        self.assertEqual(len(perms.rules), 1)
+        self.assertIn("权限规则可能不会命中", err)
+        self.assertIn("bash", err)
+
+    @unittest.skipIf(os.name == "nt" or os.geteuid() == 0, "靠 POSIX 权限位造不可读文件")
+    def test_unreadable_file_is_reported(self):
+        self.user_file.parent.mkdir(parents=True)
+        self.user_file.write_text("deny bash(curl *)\n", encoding="utf-8")
+        self.user_file.chmod(0)
+        self.addCleanup(self.user_file.chmod, 0o600)
+        with contextlib.redirect_stderr(io.StringIO()) as err:
+            perms = Permissions.load(self.workspace)
+        self.assertEqual(perms.rules, [])
+        self.assertIn("权限规则读不了", err.getvalue())
+
+    def test_tilde_in_path_rule_is_expanded(self):
+        home = Path(os.path.expanduser("~"))
+        perms = Permissions(self.workspace, [Rule("deny", "read_file", "~/.ssh/*")])
+        self.assertEqual(perms.decide("read_file", {"path": str(home / ".ssh" / "id_rsa")}), "deny")
+        self.assertEqual(perms.decide("read_file", {"path": "~/.ssh/id_rsa"}), "deny")
+        self.assertEqual(perms.decide("read_file", {"path": str(home / "notes.txt")}), "ask")
 
     def test_add_persistent_appends_and_takes_effect(self):
         perms = Permissions.load(self.workspace)

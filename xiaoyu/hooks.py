@@ -44,6 +44,7 @@ from typing import Any
 from .config import user_config_dir
 
 EVENTS = ("PreToolUse", "PostToolUse", "UserPromptSubmit", "Stop")
+_ENTRY_KEYS = frozenset({"event", "matcher", "command", "timeout"})
 
 _DEFAULT_TIMEOUT = 30.0
 _MAX_TIMEOUT = 600.0
@@ -87,11 +88,25 @@ def load_hooks(path: Path | None = None) -> tuple[list[Hook], list[str]]:
         data = tomllib.loads(path.read_text(encoding="utf-8", errors="replace"))
     except (OSError, tomllib.TOMLDecodeError) as exc:
         return [], [f"hooks.toml 解析失败：{exc}"]
+    #  不认识的键要说出来：[[hooks]] 写成 [[hook]]，整份配置一条都不加载，
+    #  用户以为挂上的护栏其实不存在
+    for key in data:
+        if key != "hooks":
+            problems.append(f"顶层键 {key!r} 不认识，已忽略——条目要写在 [[hooks]] 下")
+    entries = data.get("hooks") or []
+    if not isinstance(entries, list):
+        problems.append("hooks 应当是表数组（[[hooks]]），整段已忽略")
+        entries = []
     hooks: list[Hook] = []
-    for index, entry in enumerate(data.get("hooks") or [], start=1):
+    for index, entry in enumerate(entries, start=1):
         if not isinstance(entry, dict):
             problems.append(f"第 {index} 条不是表")
             continue
+        if unknown := sorted(set(entry) - _ENTRY_KEYS):
+            problems.append(
+                f"第 {index} 条有不认识的键 {'、'.join(unknown)}，已忽略"
+                f"（可用：{'、'.join(sorted(_ENTRY_KEYS))}）"
+            )
         event = str(entry.get("event", ""))
         command = str(entry.get("command", "")).strip()
         if event not in EVENTS:
@@ -110,6 +125,9 @@ def load_hooks(path: Path | None = None) -> tuple[list[Hook], list[str]]:
         try:
             timeout = float(entry.get("timeout", _DEFAULT_TIMEOUT))
         except (TypeError, ValueError):
+            problems.append(
+                f"第 {index} 条 timeout={entry.get('timeout')!r} 不是数字，按 {_DEFAULT_TIMEOUT:g}s 算"
+            )
             timeout = _DEFAULT_TIMEOUT
         timeout = min(max(timeout, 1.0), _MAX_TIMEOUT)
         hooks.append(Hook(event=event, command=command, matcher=matcher, timeout=timeout))

@@ -62,6 +62,31 @@ command = "echo bad-regex"
         self.assertEqual(hooks[0].timeout, 5.0)
         self.assertEqual(len(problems), 3)
 
+    def test_misspelled_table_name_is_reported(self):
+        """[[hooks]] 写成 [[hook]]：一条都不加载，但不能连个声都没有。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "hooks.toml"
+            path.write_text('[[hook]]\nevent = "PreToolUse"\ncommand = "exit 2"\n', encoding="utf-8")
+            hooks, problems = load_hooks(path)
+        self.assertEqual(hooks, [])
+        self.assertEqual(len(problems), 1)
+        self.assertIn("'hook'", problems[0])
+        self.assertIn("[[hooks]]", problems[0])
+
+    def test_unknown_entry_keys_and_bad_timeout_are_reported(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "hooks.toml"
+            path.write_text(
+                '[[hooks]]\nevent = "PreToolUse"\nmatch = "bash"\ncommand = "true"\ntimeout = "soon"\n',
+                encoding="utf-8",
+            )
+            hooks, problems = load_hooks(path)
+        #  照常加载（matcher 空 = 全匹配，比不加载更严），但两处都点了名
+        self.assertEqual(len(hooks), 1)
+        self.assertEqual(hooks[0].matcher, "")
+        self.assertTrue(any("match" in item for item in problems), problems)
+        self.assertTrue(any("timeout" in item for item in problems), problems)
+
     def test_missing_file_is_empty(self):
         hooks, problems = load_hooks(Path("/nonexistent/hooks.toml"))
         self.assertEqual((hooks, problems), ([], []))

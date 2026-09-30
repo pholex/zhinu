@@ -531,11 +531,19 @@ class Rule:
         return f"{self.behavior} {target}"
 
 
-_RULE_LINE = re.compile(r"^(allow|deny|ask)\s+([A-Za-z_][\w-]*)(?:\((.*)\))?\s*$")
+#  行首关键字不分大小写（Deny / DENY 是同一个意思，没有第二种读法）；工具名照旧
+#  区分——它要和注册的名字逐字对上
+_RULE_LINE = re.compile(
+    r"^(allow|deny|ask)\s+([A-Za-z_][\w-]*)(?:\((.*)\))?\s*$", re.IGNORECASE
+)
 
 
 def parse_rule(text: str) -> Rule | None:
-    """解析一条规则；解析不了返回 None（fail-closed：坏规则不生效）。"""
+    """解析一条规则；解析不了返回 None。
+
+    坏的 allow 不生效是 fail-closed，坏的 deny / ask 不生效却是护栏没了——所以
+    调用方拿到 None 必须让人看见（规则文件加载时逐行报，见 _parse_rules_file）。
+    """
     match = _RULE_LINE.match(text.strip())
     if not match:
         return None
@@ -545,7 +553,41 @@ def parse_rule(text: str) -> Rule | None:
         if not spec:
             #  空括号 bash() 是笔误而不是"整个工具"：宁可无效也不猜意图
             return None
-    return Rule(behavior, tool, spec)
+    return Rule(behavior.lower(), tool, spec)
+
+
+#  常见的叫错名字：写了规则却永远不命中，比写不进去更糟——用户以为护栏在
+_TOOL_ALIASES = {
+    "shell": "bash",
+    "sh": "bash",
+    "terminal": "bash",
+    "exec": "bash",
+    "read": "read_file",
+    "write": "write_file",
+    "edit": "str_replace",
+}
+_SECOND_RULE = re.compile(r"\)\s*,\s*[A-Za-z_][\w-]*\s*\(")
+
+
+def rule_lint(rule: Rule) -> str:
+    """规则能解析、但多半不会按用户想的生效：返回一句说明，没问题返回空串。
+
+    只报拿得准的几类，规则本身照常加载——插件工具的名字我们管不着，宁可少报。
+    """
+    tool = rule.tool
+    if not tool.startswith("mcp__"):
+        if tool.lower() in _TOOL_ALIASES:
+            return f"没有叫 {tool} 的工具，是不是 {_TOOL_ALIASES[tool.lower()]}？"
+        if tool != tool.lower():
+            return f"工具名区分大小写，内置工具都是小写——是不是 {tool.lower()}？"
+    if rule.spec and _SECOND_RULE.search(rule.spec):
+        return "一行只能写一条规则，逗号后面的部分被当成了模式的一部分"
+    return ""
+
+
+#  行尾注释：`deny bash(curl *)  # 临时`。不剥的话整行解析不了，规则静默失效。
+#  只认"规则主体之后、空白加 #"——模式里的 # 在括号内，不会被误剥
+_TRAILING_COMMENT = re.compile(r"^(\S+\s+[A-Za-z_][\w-]*(?:\(.*?\))?)\s+#.*$")
 
 
 @dataclass(frozen=True)
@@ -578,11 +620,18 @@ def _parse_rules_file(path: Path) -> tuple[list[Rule], list[RuleTest]]:
         #  坏字节不该让整份规则作废：里面的 deny 是用户明令禁止的事，
         #  能认出来的行照常生效
         raw = path.read_text(encoding="utf-8", errors="replace")
-    except OSError:
+    except (FileNotFoundError, NotADirectoryError):
+        return [], []
+    except OSError as exc:
+        #  文件在、却读不了：里面的 deny / ask 是用户明令要拦的事，不能悄悄当没有
+        print(
+            f"[权限规则读不了] {path}: {exc} —— 这份文件里的规则（含 deny / ask）都没生效",
+            file=sys.stderr,
+        )
         return [], []
     rules: list[Rule] = []
     tests: list[RuleTest] = []
-    for line in raw.splitlines():
+    for lineno, line in enumerate(raw.splitlines(), start=1):
         line = line.strip()
         if match := _TEST_LINE.match(line):
             expected, tool, argument = match.groups()
@@ -590,13 +639,22 @@ def _parse_rules_file(path: Path) -> tuple[list[Rule], list[RuleTest]]:
             continue
         if not line or line.startswith("#"):
             continue
+        if match := _TRAILING_COMMENT.match(line):
+            line = match.group(1)
         rule = parse_rule(line)
         if rule is None:
+            print(
+                f"[权限规则被忽略] {path}:{lineno}: {line} —— 解析不了，这一行没生效。"
+                "行格式：allow|deny|ask 工具名(模式)，一行一条",
+                file=sys.stderr,
+            )
             continue
         if reason := banned_allow_reason(rule):
             #  手改文件绕过 add_persistent 的校验也拦得住：坏规则不生效并当场报警
             print(f"[权限规则被忽略] {path}: {rule} —— {reason}", file=sys.stderr)
             continue
+        if hint := rule_lint(rule):
+            print(f"[权限规则可能不会命中] {path}:{lineno}: {rule} —— {hint}", file=sys.stderr)
         rules.append(rule)
     return rules, tests
 
@@ -793,6 +851,10 @@ class Permissions:
     def _match_path(self, spec: str, path: object) -> bool:
         if not isinstance(path, str) or not path:
             return False
+        if spec.startswith("~"):
+            #  规则里写 ~/.ssh/* 是最自然的写法；比较对象是展开后的绝对路径，
+            #  不展开就永远对不上
+            spec = os.path.expanduser(spec)
         candidate = Path(path).expanduser()
         if not candidate.is_absolute():
             candidate = self.workspace / candidate
