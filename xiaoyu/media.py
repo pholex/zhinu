@@ -256,6 +256,18 @@ def is_midturn_message(message: dict[str, Any]) -> bool:
     if message.get(MIDTURN_KEY):
         return True
     return text_of(message.get("content")).startswith(MIDTURN_PREFIX)
+#  别的会话转来的消息（peers.wrap 包的那种）：role=user、照常算一轮，但不是主人
+#  说的话——压缩时不能进"用户原话备份"。旧日志没有这个键，按包装的开头认
+PEER_KEY = "_peer"
+PEER_PREFIX = "<cross-session-message "
+
+
+def is_peer_message(message: dict[str, Any]) -> bool:
+    if message.get(PEER_KEY):
+        return True
+    return text_of(message.get("content")).lstrip().startswith(PEER_PREFIX)
+
+
 #  落笔时盖的章（字面量而不是 import：media 在 responses 的下层）
 _HARNESS_MARKS = ("_operator", INJECTED_KEY)
 

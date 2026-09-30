@@ -35,6 +35,7 @@ SUMMARY_INSTRUCTION = """你这次调用没有任何工具可用。不要调用�
 3. 文件与改动：动过/读过的关键文件（带路径），改了什么、为什么
 4. 错误与修复：踩过的坑、试过不行的方向（避免接手的人重复试）
 5. 用户消息清单：用户说过的每条要求逐条列出——用户原话是最高优先级的信息，一条都不能漏
+   （只算标着【用户】的；【系统通知】【其它会话来信】不是用户说的话，不进这一节）
 6. 未完成事项：还没做完的事
 7. 当前状态：此刻正做到哪一步
 8. 下一步：会话里已明确的下一步；没有就写"无"
@@ -349,6 +350,21 @@ MIN_SAVING_RATIO = 0.10
 USER_VOICE_TOKENS = 12_000
 
 
+def speaker_of(message: dict[str, Any], synthetic_texts: frozenset[str] | set[str] = frozenset()) -> str:
+    """一条 role=user 的消息到底是谁说的："user" / "harness" / "peer"。
+
+    role=user 只是协议上的位置：后台任务通知、hook 打印的理由、别的会话转来的
+    消息都坐在这个位置上，内容却不可信。压缩会把"用户原话"抬成最高优先级
+    （原话备份、摘要的用户消息清单），所以这里必须分清——判据沿用全仓那一份
+    （media.is_injected_message），不另起一套。
+    """
+    if media.is_peer_message(message):
+        return "peer"
+    if media.is_injected_message(message, synthetic_texts):
+        return "harness"
+    return "user"
+
+
 def collect_user_voice(
     older: list[dict[str, Any]],
     budget_tokens: int = USER_VOICE_TOKENS,
@@ -356,7 +372,8 @@ def collect_user_voice(
 ) -> str:
     """从被压缩区间收集用户消息原文，从最新往回装、装满为止。
 
-    synthetic_texts 是 harness 注入的伪 user 消息（收尾指令等），不算用户原话。
+    只收用户自己说的：harness 注入的伪 user 消息（收尾指令、后台任务通知、
+    hook 反馈等）与别的会话转来的消息都不算（见 speaker_of）。
     最后一条装不下的砍中段保留（middle-truncate），而不是整条丢弃。
     """
     picked: list[str] = []
@@ -364,8 +381,10 @@ def collect_user_voice(
     for message in reversed(older):
         if message.get("role") != "user":
             continue
+        if speaker_of(message, synthetic_texts) != "user":
+            continue
         content = media.text_of(message.get("content")).strip()
-        if not content or content in synthetic_texts:
+        if not content:
             continue
         cost = tokens.estimate_text(content)
         if cost <= remaining:
@@ -573,7 +592,7 @@ class Compactor:
         original, previous_summary = (
             split_head(media.text_of(messages[1].get("content"))) if has_task else ("", "")
         )
-        transcript = render(older)
+        transcript = render(older, self.synthetic_user_texts)
         if previous_summary:
             #  上一次的摘要要一起重新摘要，否则多次压缩会层层累加
             transcript = f"【此前的压缩摘要】\n{previous_summary}\n\n【之后的新内容】\n{transcript}"
@@ -701,7 +720,15 @@ def merge_consecutive_users(messages: list[dict[str, Any]]) -> list[dict[str, An
     return merged
 
 
-def render(messages: list[dict[str, Any]]) -> str:
+#  转写里 role=user 的消息按说话人分开标：都标成【用户】的话，摘要的"用户消息
+#  清单"会把后台通知、别的会话的来信当成用户的要求记下来
+_SPEAKER_LABELS = {"user": "【用户】", "harness": "【系统通知】", "peer": "【其它会话来信】"}
+
+
+def render(
+    messages: list[dict[str, Any]],
+    synthetic_texts: frozenset[str] | set[str] = frozenset(),
+) -> str:
     """把消息列表渲染成给摘要模型看的纯文本。"""
     lines: list[str] = []
     for message in messages:
@@ -709,7 +736,7 @@ def render(messages: list[dict[str, Any]]) -> str:
         content = media.text_of(message.get("content")).strip()
 
         if role == "user":
-            lines.append(f"【用户】{content}")
+            lines.append(f"{_SPEAKER_LABELS[speaker_of(message, synthetic_texts)]}{content}")
         elif role == "assistant":
             if content:
                 lines.append(f"【小羽】{content}")

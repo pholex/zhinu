@@ -2300,7 +2300,7 @@ class Agent:
             #  中途到达的消息补一句收尾提醒（与 steer 的 INTERJECTION_TAIL 同理）：
             #  不让别人的来信把在飞的活儿带偏
             content = f"{wrapped}\n{INBOX_MIDTURN_TAIL}" if midturn else wrapped
-            self._record({"role": "user", "content": content})
+            self._record({"role": "user", "content": content, media.PEER_KEY: True})
             self.sink.emit(Notice(f"[收到来自 {sender} 的消息]", "info"))
             if self.session_log:
                 self.session_log.event("peer_message", sender=sender)
