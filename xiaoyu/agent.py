@@ -23,6 +23,7 @@ from dataclasses import dataclass, field
 from typing import Any, Callable, Protocol
 
 from . import (
+    background,
     diagnostics,
     envprobe,
     errors,
@@ -2219,6 +2220,9 @@ class Agent:
         #  正常退出路径都会先补齐），用"结果未知"文案补齐——修复写进新会话
         #  文件（copy=False 时写进续写的原文件），下次 resume 不必再修。
         self.close_open_tool_calls(self.UNKNOWN_TOOL_OUTCOME)
+        #  排在补齐之后：这条说明要落在历史尾部，不能插进调用与它的结果之间
+        if messages:
+            self._reconcile_background_tasks()
         #  读回时的中段坏行（session_log.load_messages 记在返回值上）：被跳过的
         #  可能是带 tool_calls 的 assistant，发请求前的历史修复还会连带删掉对应
         #  tool 结果——历史被改写了，必须让用户知道，不能静默
@@ -2251,6 +2255,52 @@ class Agent:
                         "warn",
                     )
                 )
+
+    #  接回历史后的后台任务对账说明以它开头（也靠它认出"这之前的已经交代过"）
+    TASK_RECONCILE_MARK = "[后台任务对账]"
+
+    def _reconcile_background_tasks(self) -> None:
+        """历史是接回来的：里面点过名的后台任务不在这个进程的任务表里。
+
+        两件事。编号：新任务从历史里出现过的最大号之后起编，不与旧的撞号。
+        交代：历史里还写着"完成时会自动通知你"，而通知永远不会来——留一条说明，
+        免得模型干等或拿旧 id 去查。只在确有提及时说，且只说上一条说明之后
+        新提到的：反复 resume 不重复唠叨，没用过后台任务的会话一个字不加。
+
+        说明走 operator 通道：整句是 harness 自己的话，编号是从文本里认出数字
+        后重新拼的，不夹带历史里的任何原文。
+        """
+        tasks = getattr(self.toolbox, "tasks", None)
+        if tasks is None:
+            return
+        seen: set[int] = set()
+        unexplained: set[int] = set()
+        for message in self.messages[1:]:
+            text = media.text_of(message.get("content"))
+            if message.get(OPERATOR_KEY) and text.startswith(self.TASK_RECONCILE_MARK):
+                unexplained.clear()
+                continue
+            for call in message.get("tool_calls") or []:
+                text += "\n" + str((call.get("function") or {}).get("arguments") or "")
+            numbers = background.mentioned_task_numbers(text)
+            seen |= numbers
+            unexplained |= numbers
+        if seen:
+            tasks.reserve_ids(max(seen))
+        #  同一个进程里接回、任务表里确实还有的不算
+        stale = sorted(n for n in unexplained if tasks.get(f"task-{n}") is None)
+        if not stale:
+            return
+        listed = "、".join(f"task-{n}" for n in stale[:8])
+        if len(stale) > 8:
+            listed += f" 等 {len(stale)} 个"
+        self._record_operator(
+            f"{self.TASK_RECONCILE_MARK} 这段历史是接回来的。其中提到的后台任务 / monitor"
+            f"（{listed}）不在当前的任务表里：原来的进程退出时会终止它们，"
+            "task_output / kill_task 查不到这些 id（not_found），也不会再有完成通知或 "
+            "monitor 事件——不要等。需要它们的结果就重新执行；拿不准命令是否还在跑，"
+            "先用 ps 核实。之后新起的任务编号接在它们后面，不会撞号。"
+        )
 
     def interrupt(self) -> None:
         """请求打断当前正在进行的生成（线程安全，可从任意线程/协程调用）。
@@ -2634,6 +2684,11 @@ class Agent:
         #  turn 开始丢弃上轮残留——前端若想救回来，应在轮间自行 drain_steers。
         self._interrupt_flag.clear()
         self.drain_steers()
+        #  上一轮半路出事（工具执行中途抛错、宿主没做收尾）留下的悬空调用，
+        #  赶在任何新消息入历史之前补齐：此刻补位点就在历史尾部，内存与会话
+        #  日志的顺序一致。拖到发请求前才补的话，占位在内存里插回原位、在
+        #  日志里却排到了本轮输入后面，resume 重放出来的顺序就是乱的
+        self.close_open_tool_calls(self.ABANDONED_TOOL_OUTCOME)
         #  信箱不在丢弃之列：别人趁我发呆投进来的消息，时间上确实排在本轮
         #  输入之前，先入历史即是正确顺序
         self._consume_inbox()
@@ -4915,6 +4970,9 @@ class Agent:
             "content": content,
         }
 
+    #  通用的补位文案：不知道具体原因时用（显式收尾的调用方给得出更准的）
+    ABANDONED_TOOL_OUTCOME = "[此调用未返回结果（可能被中断），按已放弃处理]"
+
     def close_open_tool_calls(self, reason: str) -> None:
         """补齐所有悬空的 tool_calls，否则下一次请求会因缺少 tool 结果而报错。
 
@@ -4924,6 +4982,10 @@ class Agent:
 
         CLI 在 Ctrl-C 时仍显式调用它（能给出比通用兜底更准确的原因文案）；
         _repair_history 在每次发请求前用通用文案再兜一次底。
+
+        会话日志只能追加：补位写在文件末尾，只有补位点就在历史尾部时两边的
+        顺序才一致。所以新消息入历史之前要先调它（见 _turn），别等后面有了
+        别的消息再补。
         """
         index = 0
         while index < len(self.messages):
@@ -4940,6 +5002,15 @@ class Agent:
             for call in message["tool_calls"]:
                 if call.get("id") in answered:
                     continue
+                stray = self._stray_result(tail, call.get("id"))
+                if stray is not None:
+                    #  结果其实在，只是和它的调用之间隔了别的消息（一批工具跑到
+                    #  一半时插进来的说明，或补位晚了、写在日志末尾的占位重放
+                    #  回来）：搬回原位，不另造一条占位把它顶掉
+                    self.messages.insert(tail, self.messages.pop(stray))
+                    self._history_rewritten()
+                    tail += 1
+                    continue
                 filler = self._tool_message(call, reason)
                 self.messages.insert(tail, filler)
                 #  插入点可能在锚点之前，权威值不再对应现状
@@ -4949,26 +5020,51 @@ class Agent:
                 tail += 1
             index = tail
 
+    def _stray_result(self, start: int, call_id: Any) -> int | None:
+        """从 start 往后、到下一条 assistant 之前，找 call_id 的 tool 结果的下标。
+
+        只看到下一条 assistant 为止：一批调用的结果总是先于模型的下一次回复
+        入历史；再往后同名的 id 属于别的调用（有的模型每轮都从同一个 id 起编）。
+        """
+        for index in range(start, len(self.messages)):
+            message = self.messages[index]
+            role = message.get("role")
+            if role == "assistant":
+                return None
+            if role == "tool" and message.get("tool_call_id") == call_id:
+                return index
+        return None
+
     def _repair_history(self) -> None:
         """发请求前修复历史不变量（惰性修复）：
 
         1. 每个 tool_call 都有对应的 tool 结果（缺的补 aborted 占位）；
-        2. 每条 tool 消息都对应得上某个 tool_call（孤儿直接删——压缩切点、
-           手工改历史等任何来路的孤儿都会让请求 400）。
+        2. 每条 tool 消息都紧跟在它所属的那条 assistant 后面（中间只隔同一批的
+           其它结果），且一个调用只有一条结果。对不上调用的、位置不对的、多出来的
+           一律删——压缩切点、手工改历史、顺序写乱了的旧会话日志，任何来路的
+           孤儿都会让请求的消息序列不合法。
+
+        只认 id 不认位置是不够的：结果落在别的消息后面时 id 照样对得上。
 
         好处是中断/异常路径不需要"记得清理"：只要走到发请求，历史一定合法。
         """
-        self.close_open_tool_calls("[此调用未返回结果（可能被中断），按已放弃处理]")
-        known_ids = {
-            call.get("id")
-            for message in self.messages
-            for call in message.get("tool_calls") or []
-        }
-        repaired = [
-            message
-            for message in self.messages
-            if message.get("role") != "tool" or message.get("tool_call_id") in known_ids
-        ]
+        self.close_open_tool_calls(self.ABANDONED_TOOL_OUTCOME)
+        repaired: list[dict[str, Any]] = []
+        #  当前这一段 tool 结果还能应答的调用：id → 还差几条。遇到任何非 tool
+        #  消息即换届。按个数记而不是按集合：不给 id 的服务端，同一批里的几个
+        #  调用 id 全是空串，各自的结果都得留
+        awaiting: dict[Any, int] = {}
+        for message in self.messages:
+            if message.get("role") == "tool":
+                call_id = message.get("tool_call_id")
+                if not awaiting.get(call_id):
+                    continue
+                awaiting[call_id] -= 1
+            else:
+                awaiting = {}
+                for call in message.get("tool_calls") or []:
+                    awaiting[call.get("id")] = awaiting.get(call.get("id"), 0) + 1
+            repaired.append(message)
         if len(repaired) != len(self.messages):
             self.messages = repaired
             self._history_rewritten()

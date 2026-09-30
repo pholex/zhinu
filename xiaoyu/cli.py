@@ -3012,6 +3012,46 @@ def acp_main(args: argparse.Namespace) -> int:
     ).serve()
 
 
+#  退出报告里每条后台命令最多带这么多字符
+_TERMINATED_COMMAND_CAP = 120
+
+
+def terminate_background_commands(agent: Agent) -> list[dict[str, Any]]:
+    """一次性模式收尾：把还在跑的后台任务停掉，返回其中**命令**任务的清单。
+
+    一次性模式这一轮结束进程就退出，后台任务活不过它——模型刚说完"已在后台
+    启动，完成后通知"，任务就没了。停掉是既定行为，这里只负责让它看得见：
+    当场停（而不是留给 atexit）是为了报告属实——报出来的每一条都确实没跑完。
+    monitor 不进清单：它是观察者，随会话结束本就是它的寿命，没有丢掉的工作。
+    """
+    tasks = getattr(getattr(agent, "toolbox", None), "tasks", None)
+    if tasks is None:
+        return []
+    try:
+        running = [task for task in tasks.running() if task.kind == "command"]
+        report = []
+        for task in running:
+            command = " ".join(task.command.split())
+            if len(command) > _TERMINATED_COMMAND_CAP:
+                command = command[:_TERMINATED_COMMAND_CAP] + "…"
+            report.append(
+                {
+                    "task_id": task.task_id,
+                    "command": command,
+                    "elapsed_seconds": round(task.elapsed(), 1),
+                }
+            )
+        tasks.shutdown()
+    except Exception:  # noqa: BLE001 - 收场的报告出错不该盖掉这次运行本身的结果
+        return []
+    #  清点与停掉之间自己跑完的不算被终止
+    return [
+        item
+        for item, task in zip(report, running)
+        if task.killed and task.proc.returncode != 0
+    ]
+
+
 def run_once(
     agent: Agent,
     user_input: str | list[dict[str, Any]],
@@ -3041,12 +3081,28 @@ def run_once(
     if output_schema is not None and agent.structured_output is None and not error:
         error = "模型没有按 --output-schema 给出结构化结果"
 
+    terminated = terminate_background_commands(agent)
+
     if output_format == "text":
         if output_schema is not None:
             if agent.structured_output is not None:
                 print(json.dumps(agent.structured_output, ensure_ascii=False), flush=True)
             else:
                 print(ui.error(f"[{error}]"), file=sys.stderr)
+        if terminated:
+            #  走 stderr：stdout 可能正被管道接去当结果用
+            listed = "\n".join(
+                f"  {item['task_id']}  {item['command']}（已运行 {item['elapsed_seconds']:.0f}s）"
+                for item in terminated
+            )
+            print(
+                ui.warning(
+                    f"[注意] {len(terminated)} 个后台任务在退出时被终止，没有跑完：\n{listed}\n"
+                    "一次性模式在这一轮结束后就退出，不等后台任务；"
+                    "要它跑完，就让命令在前台执行。"
+                ),
+                file=sys.stderr,
+            )
         #  一次性模式也把用量打出来：做了模型路由就得看得见每个模型花了多少
         print(ui.secondary(f"\n{agent.usage}"))
         return 1 if error else 0
@@ -3066,6 +3122,9 @@ def run_once(
             payload["session_log_complete"] = False
     if error:
         payload["error"] = error
+    if terminated:
+        #  只在确有任务被终止时出现：result 里那句"已在后台启动"此时不可信
+        payload["background_tasks_terminated"] = terminated
     if output_format == "stream-json":
         payload = {"kind": "result", **payload}
     print(json.dumps(payload, ensure_ascii=False), flush=True)

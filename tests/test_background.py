@@ -229,7 +229,7 @@ class BoundedLogTest(unittest.TestCase):
         with mock.patch.object(bg, "LOG_CHECK_INTERVAL", 0.1):
             task = self.start("sleep 30", timeout=0.5)
             self.assertTrue(task.done.wait(15))
-        self.assertEqual(task.stopped_for, "")
+        self.assertIn("超时上限", task.stopped_for)
         self.assertNotEqual(task.exit_code, 0)
 
     def test_quiet_task_is_left_alone(self):
