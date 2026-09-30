@@ -5,9 +5,19 @@
 
 from __future__ import annotations
 
+import tempfile
 import unittest
+from pathlib import Path
 
-from xiaoyu.compaction import Compactor, microcompact
+from xiaoyu import compaction, media, tools
+from xiaoyu.compaction import (
+    CONTEXT_PREFIX,
+    Compactor,
+    age_tool_images,
+    microcompact,
+    split_head,
+)
+from xiaoyu.config import Config
 
 from .test_context import assert_valid_sequence
 
@@ -110,6 +120,130 @@ class TestMicrocompactAlignsToBatches(unittest.TestCase):
         self.assertEqual(cleared, 1)
         self.assertIn("已清理", result[3]["content"])
         self.assertEqual(result[4:], messages[4:])
+
+
+def pictured_task() -> dict:
+    return {
+        "role": "user",
+        "content": [
+            media.text_part("照这张设计稿改首页"),
+            media.image_part("xiaoyu-media://mock.png"),
+            media.text_part("按钮颜色以图为准"),
+        ],
+    }
+
+
+def turns(count: int, tag: str) -> list[dict]:
+    messages: list[dict] = []
+    for n in range(count):
+        messages.append({"role": "assistant", "content": f"{tag} 进展 {n}：" + "阿" * 300})
+        messages.append({"role": "user", "content": f"{tag} 要求 {n}"})
+    return messages
+
+
+class TestPicturedTaskSurvivesCompaction(unittest.TestCase):
+    """原始任务带图：压缩后图还在原位，摘要接在后面，下次压缩照常拆得开。"""
+
+    def compact_twice(self) -> tuple[list[dict], list[dict], list[str]]:
+        transcripts: list[str] = []
+
+        def summarizer(transcript: str, _prefix: list) -> str:
+            transcripts.append(transcript)
+            return f"第 {len(transcripts)} 份交接说明"
+
+        compactor = build_compactor(keep_recent=2, summarizer=summarizer, user_voice_tokens=0)
+        messages = [{"role": "system", "content": "s"}, pictured_task(), *turns(8, "甲")]
+        first, note = compactor.compact(messages)
+        self.assertIn("已压缩", note)
+        second, note = compactor.compact([*first, *turns(8, "乙")])
+        self.assertIn("已压缩", note)
+        return first, second, transcripts
+
+    def test_image_part_is_kept_in_place(self) -> None:
+        first, second, _ = self.compact_twice()
+        for compacted in (first, second):
+            head = compacted[1]
+            self.assertEqual(head["content"][:3], pictured_task()["content"])
+            self.assertEqual(len(media.images_of(head["content"])), 1)
+            #  用户贴的图不带工具图标记，老化碰不到它
+            self.assertNotIn(media.TOOL_MEDIA_KEY, head)
+            assert_valid_sequence(self, compacted)
+        self.assertIs(age_tool_images(second, high_water=0, keep=0)[0], second)
+
+    def test_next_compaction_still_splits_task_from_summary(self) -> None:
+        first, second, transcripts = self.compact_twice()
+        original, previous = split_head(media.text_of(first[1]["content"]))
+        self.assertEqual(original, "照这张设计稿改首页[图片]按钮颜色以图为准")
+        self.assertTrue(previous.startswith("第 1 份交接说明"))
+        #  第二次压缩：上一份摘要作为「此前的压缩摘要」重新参与，不层层累加
+        self.assertIn("【此前的压缩摘要】\n第 1 份交接说明", transcripts[1])
+        text = media.text_of(second[1]["content"])
+        self.assertEqual(text.count(CONTEXT_PREFIX), 1)
+        self.assertIn("第 2 份交接说明", text)
+        self.assertNotIn("第 1 份交接说明", text)
+        self.assertEqual(text.count("照这张设计稿改首页"), 1)
+
+    def test_text_only_task_keeps_string_head(self) -> None:
+        """不带图的首条（哪怕是部件列表）仍拼成字符串，与纯文本任务同一形态。"""
+        for task in ("只有文字的任务", [media.text_part("只有文字的任务")]):
+            with self.subTest(task=task):
+                compactor = build_compactor(keep_recent=2, user_voice_tokens=0)
+                messages = [
+                    {"role": "system", "content": "s"},
+                    {"role": "user", "content": task},
+                    *turns(8, "甲"),
+                ]
+                compacted, _ = compactor.compact(messages)
+                self.assertEqual(
+                    compacted[1]["content"],
+                    f"只有文字的任务\n\n{CONTEXT_PREFIX}读过前面几个模块",
+                )
+
+
+class TestClearedSpillKeepsRecallId(unittest.TestCase):
+    """被清理的输出若是落盘预览：占位留住召回 id、指向 recall，而不是让模型重跑。"""
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        config = Config(
+            base_url="x", model="m", workspace=Path(self.tmp.name).resolve(), enable_plugins=False
+        )
+        config.max_tool_output = 1200
+        self.box = tools.Toolbox(config)
+
+    def history(self, output: str) -> list[dict]:
+        return [
+            {"role": "system", "content": "s"},
+            {"role": "user", "content": "跑一下迁移"},
+            *parallel_batch("run", 1, name="bash", output=output),
+            {"role": "assistant", "content": "跑完了"},
+        ]
+
+    def test_placeholder_points_at_recall(self) -> None:
+        #  先落一次别的，让真实 id 不是 1：认错成序号之外的数字会露馅
+        self.box._bound_output("bash", "y" * 5000)  # noqa: SLF001
+        preview = self.box._bound_output(  # noqa: SLF001
+            "bash", "\n".join(f"migrated row {n}" for n in range(2000))
+        )
+        messages = self.history(preview)
+        messages[3]["content"] = preview
+        result, cleared, _ = microcompact(messages, keep_recent=1)
+        self.assertEqual(cleared, 1)
+        stub = result[3]["content"]
+        self.assertIn('recall(id="2")', stub)
+        self.assertNotIn("重新调用", stub)
+        self.assertEqual(compaction.recall_id_of(preview), "2")
+        #  接回历史时工具箱靠这句认出带进来的 id（adopt_history），占位里不能丢
+        self.assertEqual(tools._RECALL_ID_MENTION.search(stub).group(1), "2")  # noqa: SLF001
+
+    def test_plain_output_still_asks_to_rerun(self) -> None:
+        #  正文里碰巧提到召回 id 的普通输出不是预览：照旧让模型重新调用
+        messages = self.history("grep 到一行：完整内容见召回 id 7\n" + BIG)
+        result, cleared, _ = microcompact(messages, keep_recent=1)
+        self.assertEqual(cleared, 1)
+        self.assertIn("请重新调用 bash", result[3]["content"])
+        self.assertNotIn("recall", result[3]["content"])
 
 
 if __name__ == "__main__":

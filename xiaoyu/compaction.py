@@ -136,6 +136,18 @@ CLEAR_MIN_CHARS = 500
 
 _CLEARED_MARKER = "[结果已清理"
 
+#  「超长已落盘」预览的头一行（文案出自 Toolbox._bound_output）。tools 不在本模块的
+#  依赖里，这里自带一份；只认预览头而不是任意一处「召回 id」——读到的文件、搜到的
+#  行里也可能碰巧写着这几个字，认错了会把模型指到另一条命令的输出上。
+#  两边文案由测试拿真实预览锁住一致
+_SPILL_PREVIEW = re.compile(r"\[输出超长：[^\n]*?召回 id[:：]?\s*(\d+)")
+
+
+def recall_id_of(content: str) -> str:
+    """工具输出是落盘预览时返回它的召回 id，否则空串。"""
+    found = _SPILL_PREVIEW.search(content)
+    return found.group(1) if found else ""
+
 
 def _protected_from(messages: list[dict[str, Any]], keep_recent: int) -> int:
     """microcompact 的保护边界：这个下标起的消息不清。
@@ -191,10 +203,19 @@ def microcompact(
         ):
             result.append(message)
             continue
-        stub = (
-            f"{_CLEARED_MARKER}：这条较早的 {name} 输出（原 {len(content)} 字符）"
-            f"已在上下文回收时移除。若还需要这份内容，请重新调用 {name}。]"
-        )
+        recall_id = recall_id_of(content)
+        if recall_id:
+            #  完整内容还在落盘文件里：占位留住 id，取回不必重跑（重跑可能有副作用）
+            stub = (
+                f"{_CLEARED_MARKER}：这条较早的 {name} 输出的预览（{len(content)} 字符）"
+                f"已在上下文回收时移除。完整内容仍存着，召回 id: {recall_id}。"
+                f"若还需要，用 recall(id=\"{recall_id}\") 取回，不要为此重跑 {name}。]"
+            )
+        else:
+            stub = (
+                f"{_CLEARED_MARKER}：这条较早的 {name} 输出（原 {len(content)} 字符）"
+                f"已在上下文回收时移除。若还需要这份内容，请重新调用 {name}。]"
+            )
         result.append({**message, "content": stub})
         cleared += 1
         saved += len(content) - len(stub)
@@ -396,6 +417,29 @@ def split_head(content: str) -> tuple[str, str]:
         original, _, previous = content.partition(CONTEXT_PREFIX)
         return original.rstrip(), previous.strip()
     return content, ""
+
+
+def task_parts(content: Any) -> list[dict[str, Any]]:
+    """首条用户消息里属于原始任务的部件；任务不带图时返回空表。
+
+    原始任务永远原文保留，用户贴的图是原文的一部分——收窄成文本就只剩一句
+    「[图片]」。分界标记之后的部件是上一次的摘要（和并进头部的后续消息），
+    不算原始任务；它们的文本由 split_head 照常拆出去重新参与摘要。
+    不带图就返回空表：调用方走字符串拼接，历史形态不无谓地变复杂。
+    """
+    if not media.is_parts(content):
+        return []
+    parts: list[dict[str, Any]] = []
+    for part in content:
+        if isinstance(part, dict) and part.get("type") == media.TEXT_PART:
+            text = str(part.get("text") or "")
+            if CONTEXT_PREFIX in text:
+                kept = text.partition(CONTEXT_PREFIX)[0].rstrip()
+                if kept:
+                    parts.append(media.text_part(kept))
+                break
+        parts.append(part)
+    return parts if media.images_of(parts) else []
 
 #  喂给摘要模型时，单条工具输出最多保留这么多字符
 _TOOL_OUTPUT_CAP = 600
@@ -726,7 +770,20 @@ class Compactor:
         summary_block = (
             CONTEXT_PREFIX + sanitize_summary(summary.strip()) + anchors + plan + voice
         )
-        if has_task:
+        #  工具回的图不算用户原文（它本来就会老化），带那个标记的首条照旧按文本拼
+        pictured = (
+            task_parts(messages[1].get("content"))
+            if has_task and not messages[1].get(media.TOOL_MEDIA_KEY)
+            else []
+        )
+        if pictured:
+            #  任务带图：按部件拼，图留在原位，摘要块作为文本部件接在后面。
+            #  文本投影与字符串拼法一致，下次压缩 split_head 照常拆得开
+            head = {
+                "role": "user",
+                "content": [*pictured, media.text_part(f"\n\n{summary_block}")],
+            }
+        elif has_task:
             head = {"role": "user", "content": f"{original}\n\n{summary_block}"}
         else:
             head = {"role": "user", "content": summary_block}
