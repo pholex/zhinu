@@ -583,3 +583,92 @@ class QuotaWordedThrottleRecoveryTest(AgentTestCase):
         self.assertGreaterEqual(waited, 35.2)
         self.assertLessEqual(waited, 35.2 * 1.1 + 1e-9)
         self.assertEqual(agent.last_assistant_text(), "好了")
+
+
+# ---------- 辅助模型没有 provider 能接时退回主模型 ----------
+
+
+class AuxiliaryModelFallbackTest(AgentTestCase):
+    """只配了一家、主模型换成这家的型号，摘要与检索模型的默认值还落在别家。"""
+
+    def build_single_provider(self, script: list):
+        from xiaoyu.agent import Agent
+        from xiaoyu.providers import Provider, Registry
+        from xiaoyu.tools import Toolbox
+
+        from .test_agent_paths import FakeClient
+
+        self.client = FakeClient(script)
+        #  非通配：只认 main-model，cheap-model（摘要 / 检索模型）没人接
+        registry = Registry(
+            [Provider("solo", "", "", ("main-model",), "solo")], clients={"solo": self.client}
+        )
+        return Agent(self.config, Toolbox(self.config), registry=registry)
+
+    def test_summary_chain_falls_to_the_main_model(self):
+        agent = self.build_single_provider([])
+        self.assertEqual(
+            [route.qualified for route in agent.summary_models()], ["solo/main-model"]
+        )
+
+    def test_summarize_really_produces_a_summary(self):
+        from .test_agent_paths import GOOD_SUMMARY, text_response
+
+        agent = self.build_single_provider([text_response(GOOD_SUMMARY)])
+        with contextlib.redirect_stdout(io.StringIO()):
+            summary = agent._summarize("一段历史")
+        self.assertEqual(summary, GOOD_SUMMARY)
+        self.assertEqual(self.client.completions.calls[0]["model"], "main-model")
+
+    def test_unresolvable_main_model_still_raises(self):
+        from xiaoyu.providers import UnknownModel
+
+        agent = self.build_single_provider([])
+        agent.config.model = "ghost-model"
+        with self.assertRaises(UnknownModel):
+            agent.summary_models()
+        #  摘要模型与主模型是同一个名字时也一样
+        agent.config.summary_model = "ghost-model"
+        with self.assertRaises(UnknownModel):
+            agent.summary_models()
+
+    def test_request_chain_still_raises_on_its_leading_name(self):
+        """主请求链的语义不变：打头的名字解析不了必须立刻看见。"""
+        from xiaoyu.providers import UnknownModel
+
+        agent = self.build_single_provider([])
+        with self.assertRaises(UnknownModel):
+            agent._routes(["cheap-model", "main-model"])
+        #  排在后面的备用名字解析不了则跳过
+        self.assertEqual(
+            [route.qualified for route in agent._routes(["main-model", "cheap-model"])],
+            ["solo/main-model"],
+        )
+
+    def test_explore_runs_on_the_main_model_and_says_so_once(self):
+        agent = self.build_single_provider(
+            [[chunk(content="子：第一次的结论")], [chunk(content="子：第二次的结论")]]
+        )
+        tool = agent.toolbox.get("explore")
+        shown = io.StringIO()
+        with contextlib.redirect_stdout(shown):
+            first = tool.handler(question="add 定义在哪")
+            second = tool.handler(question="谁调用了 add")
+        self.assertIn("子：第一次的结论", first)
+        self.assertIn("子：第二次的结论", second)
+        self.assertNotIn("ERROR", first)
+        self.assertIn("由 main-model 只读检索", first)
+        self.assertEqual(
+            [call["model"] for call in self.client.completions.calls],
+            ["main-model", "main-model"],
+        )
+        self.assertEqual(shown.getvalue().count("改用主模型 main-model"), 1)
+
+    def test_resolvable_explore_model_is_used_without_any_notice(self):
+        agent = self.build([[chunk(content="子：结论")]])
+        shown = io.StringIO()
+        with contextlib.redirect_stdout(shown):
+            answer = agent.toolbox.get("explore").handler(question="add 定义在哪")
+        self.assertIn("由 cheap-model 只读检索", answer)
+        self.assertEqual(self.client.completions.calls[0]["model"], "cheap-model")
+        self.assertNotIn("改用主模型", shown.getvalue())

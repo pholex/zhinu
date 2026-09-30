@@ -16,7 +16,7 @@ from __future__ import annotations
 from . import ui
 from .config import Config
 from .events import Notice, UISink
-from .providers import Registry
+from .providers import Registry, UnknownModel
 from .render import PlainSink
 from .tools import Tool, Toolbox
 
@@ -68,14 +68,40 @@ def make_explore_tool(
     检索子 agent 就不算数。
     """
     sink = sink or PlainSink()
+    #  "改用主模型"只提示一次：每次检索都刷一遍是噪音
+    fallback_noticed = False
+
+    def effective_model() -> str:
+        """这次检索用哪个模型：explore_model 没有 provider 能接时退回主模型。
+
+        只配了一家的用户，explore_model 的默认值多半落在别家——检索慢一点、贵一点，
+        好过每次调用都报模型不存在。每次调用现判：主模型会被 /model 换掉。
+        主模型也解析不了时不在这里管，照常由子 agent 的请求报出来。
+        """
+        nonlocal fallback_noticed
+        try:
+            registry.resolve(config.explore_model)
+        except UnknownModel:
+            if not fallback_noticed:
+                fallback_noticed = True
+                sink.emit(
+                    Notice(
+                        f"  explore 的模型 {config.explore_model} 没有 provider 能接，"
+                        f"改用主模型 {config.model}（XIAOYU_EXPLORE_MODEL 可另行指定）",
+                        "warn",
+                    )
+                )
+            return config.model
+        return config.explore_model
 
     def explore(question: str) -> str:
         #  延迟导入，避免和 agent 模块循环引用
         from .agent import Agent
 
+        model = effective_model()
         sub_config = Config(
             base_url=config.base_url,
-            model=config.explore_model,
+            model=model,
             #  备用链随主会话（理由见 agents.execute_delegation 的同一处）
             fallback_models=list(config.fallback_models),
             summary_model=config.summary_model,
@@ -105,7 +131,7 @@ def make_explore_tool(
             enable_mcp=False,
         )
 
-        sink.emit(Notice(f"  🔍 explore（{config.explore_model}）：{ui.preview(question, 90)}"))
+        sink.emit(Notice(f"  🔍 explore（{model}）：{ui.preview(question, 90)}"))
 
         #  子 agent 的 sink 从父 sink 派生（duck-typed）：RichSink 场景下必须
         #  共用同一个 Console，rich 的活区 spinner 才能把嵌套的工具行抬到
@@ -143,7 +169,7 @@ def make_explore_tool(
         if len(answer) > MAX_ANSWER_CHARS:
             answer = answer[:MAX_ANSWER_CHARS] + "\n…（结论过长已截断）"
         return (
-            f"[检索结论 · 由 {config.explore_model} 只读检索 {tools_used} 次得出。"
+            f"[检索结论 · 由 {model} 只读检索 {tools_used} 次得出。"
             "结论里的 路径:行号 + 原文行是实际读到的，可直接采信，"
             "不需要为了核对再把这些文件读一遍]\n"
             f"{answer}"

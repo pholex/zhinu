@@ -3307,9 +3307,22 @@ class Agent:
             self.session_log.event("compact_end", ok=True)
 
     def summary_models(self) -> list[Route]:
-        """摘要的尝试顺序：先便宜的（连它的影子兜底），失败再回退主模型。"""
-        names = [self.config.summary_model or self.config.model, self.config.model]
-        return self._routes(names)
+        """摘要的尝试顺序：先便宜的（连它的影子兜底），失败再回退主模型。
+
+        摘要模型没有 provider 能接时（只配了一家、而摘要模型的默认值落在别家）
+        整条链就是主模型：摘要模型是辅助角色，它配不上不该让压缩无路可走。
+        主模型自己解析不了则照常抛。
+        """
+        main = self.config.model
+        summary = self.config.summary_model or main
+        try:
+            return self._routes([summary, main])
+        except UnknownModel:
+            #  _routes 对打头的名字解析不了是直接抛（主请求链要的语义），这里打头的
+            #  却是摘要模型——去掉它再解析一次，轮到主模型打头
+            if summary == main:
+                raise
+            return self._routes([main])
 
     def _routes(self, names: list[str]) -> list[Route]:
         """一串模型名 → 路由链：每个名字展开成「主路由 + 影子兜底」，按 (家, 名) 去重保序。
