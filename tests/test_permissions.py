@@ -446,6 +446,53 @@ class PersistenceTest(unittest.TestCase):
         self.assertEqual(len(Permissions.load(self.workspace).rules), 1)
 
 
+class ExploreInheritsRulesTest(AgentTestCase):
+    """检索子 agent 读文件也要过用户的规则：规则管的是"读什么"，不是"谁来读"。"""
+
+    def run_explore(self, rules: list[str], approve: bool = True):
+        import json
+
+        from .test_agent_paths import call_fragment, chunk
+
+        (self.root / "secret.txt").write_text("TOP-SECRET-TOKEN", encoding="utf-8")
+        asked: list[str] = []
+
+        def approver(name, args):
+            asked.append(name)
+            return approve
+
+        script = [
+            [chunk(tool_calls=[call_fragment(0, "c1", "explore", json.dumps({"question": "密钥是什么"}))])],
+            [chunk(tool_calls=[call_fragment(0, "s1", "read_file", json.dumps({"path": "secret.txt"}))])],
+            [chunk(content="子：查完了")],
+            [chunk(content="主：收到")],
+        ]
+        agent = self.build(
+            script, approver=approver,
+            permissions=Permissions(self.root, [parse_rule(line) for line in rules]),
+        )
+        with contextlib.redirect_stdout(io.StringIO()):
+            agent.send("查一下")
+        #  子 agent 第二次请求里带着它那次 read_file 的结果
+        seen = json.dumps(self.client.completions.calls[2]["messages"], ensure_ascii=False)
+        return seen, asked
+
+    def test_deny_rule_reaches_the_explore_subagent(self):
+        seen, _ = self.run_explore(["deny read_file(secret.txt)"])
+        self.assertNotIn("TOP-SECRET-TOKEN", seen)
+        self.assertIn("deny", seen)
+
+    def test_ask_rule_reaches_the_explore_subagent(self):
+        seen, asked = self.run_explore(["ask read_file(secret.txt)"], approve=False)
+        self.assertEqual(asked, ["read_file"])
+        self.assertNotIn("TOP-SECRET-TOKEN", seen)
+
+    def test_without_rules_explore_reads_freely(self):
+        seen, asked = self.run_explore([])
+        self.assertIn("TOP-SECRET-TOKEN", seen)
+        self.assertEqual(asked, [])
+
+
 class AgentIntegrationTest(AgentTestCase):
     """权限接进 _execute：deny bypass-immune、allow 免确认、ask 走确认。"""
 

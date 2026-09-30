@@ -161,6 +161,16 @@ class HookEngine:
     def has(self, event: str) -> bool:
         return any(hook.event == event for hook in self.hooks)
 
+    def for_tools(self, workspace: Path) -> "HookEngine | None":
+        """给委托出去的子 agent 用的一份：只带工具类钩子，工作目录换成它的。
+
+        用户挂在工具调用上的护栏不该因为"这一步是子 agent 做的"就不触发；
+        UserPromptSubmit / Stop 说的是用户这一轮的开头和收尾，子 agent 没有
+        这两个时刻，不带下去。没有工具类钩子时返回 None（触发点零开销）。
+        """
+        kept = [hook for hook in self.hooks if hook.event in ("PreToolUse", "PostToolUse")]
+        return HookEngine(kept, workspace, self._notify) if kept else None
+
     def fire(self, event: str, payload: dict[str, Any], tool_name: str = "") -> Decision:
         """跑该事件的所有匹配 hook。任一 block（exit 2）即 block，理由拼接。"""
         reasons: list[str] = []

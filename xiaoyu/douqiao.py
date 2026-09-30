@@ -126,6 +126,7 @@ def make_douqiao_tool(
     runs: dict[str, SubagentRun],
     mcp_manager: Any = None,
     stop_requested: Callable[[], bool] | None = None,
+    guards: Any = None,
 ) -> Tool:
     """斗巧工具：与七襄同一套依赖（同一本账、同一存档）。"""
     spec_map = {spec.name: spec for spec in specs}
@@ -238,6 +239,7 @@ def make_douqiao_tool(
                     on_agent=register,
                     require_isolation=iso_value == "worktree",
                     model_override=seat.model_override,
+                    guards=guards,
                 )
 
             return primary
@@ -254,6 +256,7 @@ def make_douqiao_tool(
                     resume_from=run_id,
                     child_sink=seat.observer,
                     on_agent=register,
+                    guards=guards,
                 )
 
             return follow_up
@@ -437,6 +440,7 @@ def make_douqiao_tool(
                 criteria=str(criteria or "").strip(),
                 seats=finished_seats,
                 judge_model=judge,
+                guards=guards,
             )
             #  判官中途失败（哪怕留了半截输出）不冒充权威：不解析胜者
             if not judge_result.failure and judge_result.answer:
@@ -529,6 +533,7 @@ def _run_judge(
     criteria: str,
     seats: list[_Seat],
     judge_model: str | None,
+    guards: Any = None,
 ) -> DelegationResult:
     """判官 = 一次只读委托（免确认），横向比对后裁决。"""
     judge_spec = AgentSpec(
@@ -570,4 +575,5 @@ def _run_judge(
         task="\n\n".join(sections),
         child_sink=_NullSink(),
         model_override=judge_model,
+        guards=guards,
     )

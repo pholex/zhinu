@@ -1086,7 +1086,12 @@ class Agent:
         if allow_explore and config.enable_explore and self.toolbox.get("explore") is None:
             from .explore import make_explore_tool
 
-            self.toolbox.register(make_explore_tool(config, self.registry, self.usage, self.sink))
+            self.toolbox.register(
+                make_explore_tool(
+                    config, self.registry, self.usage, self.sink,
+                    approver=self.approver, permissions=self.permissions,
+                )
+            )
         #  web_search：借厂商 Responses 内置搜索的一次性调用（后端见 XIAOYU_SEARCH_PROVIDER，
         #  "为什么不切协议"见 websearch.py 顶部）。选中后端没配直连时 check_fn 让它不进 schemas。
         if config.enable_web_search and self.toolbox.get("web_search") is None:
@@ -1292,7 +1297,13 @@ class Agent:
         #  声明式 subagent（agents/*.toml）：挂成与 explore
         #  同形态的委托工具。allow_explore 兼作"不套娃"闸门——子 agent 不再挂
         if nesting_ok and config.enable_agents:
-            from .agents import RunStore, load_agent_specs, make_subagent_tool, runs_dir_for
+            from .agents import (
+                ParentGuards,
+                RunStore,
+                load_agent_specs,
+                make_subagent_tool,
+                runs_dir_for,
+            )
 
             agent_specs, spec_problems = load_agent_specs(config.workspace)
             for problem in spec_problems:
@@ -1308,6 +1319,9 @@ class Agent:
                 )
             )
             self.subagent_runs = subagent_runs
+            #  委托出去的子 agent 跟本会话同一档、过同一批工具钩子（现取：模式会
+            #  中途换，钩子引擎也可能是构造后才注入的）
+            guards = ParentGuards(mode=self._step_mode, hooks=lambda: self.hook_engine)
             mounted_specs = []
             for spec in agent_specs:
                 if self.toolbox.get(spec.name) is not None:
@@ -1323,6 +1337,7 @@ class Agent:
                         mcp_manager=getattr(self.toolbox, "mcp_manager", None),
                         parent_history=lambda: self.messages,
                         stop_requested=self.interrupt_requested,
+                        guards=guards,
                     )
                 )
                 mounted_specs.append(spec)
@@ -1338,6 +1353,7 @@ class Agent:
                         subagent_runs,
                         mcp_manager=getattr(self.toolbox, "mcp_manager", None),
                         stop_requested=self.interrupt_requested,
+                        guards=guards,
                     )
                 )
             #  斗巧（竞争织造）：与七襄同闸——有可扇出的 spec 才有参赛者
@@ -1351,6 +1367,7 @@ class Agent:
                         subagent_runs,
                         mcp_manager=getattr(self.toolbox, "mcp_manager", None),
                         stop_requested=self.interrupt_requested,
+                        guards=guards,
                     )
                 )
         #  宸枢（编排总控模式）：init 常驻 schema，其余工具在 active 后经
@@ -1361,6 +1378,7 @@ class Agent:
             self.chenshu = ChenshuRuntime(
                 config, self.registry, self.usage, self.sink,
                 self.permissions, notify=self.notify,
+                hooks=lambda: self.hook_engine,
             )
             for tool in make_chenshu_tools(self.chenshu):
                 if self.toolbox.get(tool.name) is None:

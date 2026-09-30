@@ -133,6 +133,17 @@ class EngineTest(unittest.TestCase):
         self.assertFalse(engine.fire("PreToolUse", {}, tool_name="read_file").blocked)
         self.assertTrue(engine.fire("PreToolUse", {}, tool_name="bash").blocked)
 
+    def test_for_tools_keeps_only_tool_hooks_in_the_new_workspace(self):
+        elsewhere = self.tmp / "worktree"
+        engine = self.engine(
+            [Hook("PreToolUse", "true", matcher="bash"), Hook("PostToolUse", "true"),
+             Hook("Stop", "true"), Hook("UserPromptSubmit", "true")]
+        )
+        scoped = engine.for_tools(elsewhere)
+        self.assertEqual([hook.event for hook in scoped.hooks], ["PreToolUse", "PostToolUse"])
+        self.assertEqual(scoped.workspace, elsewhere)
+        self.assertIsNone(self.engine([Hook("Stop", "true")]).for_tools(elsewhere))
+
     def test_other_exit_codes_fail_open_with_notice(self):
         cmd = _script_cmd(self.tmp, "crash.py", "import sys\nsys.exit(1)\n")
         engine = self.engine([Hook("Stop", cmd)])

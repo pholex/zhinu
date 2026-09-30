@@ -185,6 +185,86 @@ class DelegationTest(AgentTestCase):
         tool_msgs = [m for m in agent.messages if m.get("role") == "tool"]
         self.assertIn("被拦了", tool_msgs[-1]["content"])
 
+    # ---------- 委托不是绕开护栏的路：模式、钩子跟父会话走 ----------
+
+    WRITER_SPEC = (
+        'description = "写文件的子 agent"\nsystem_prompt = "工作区 {workspace}"\n'
+        'tools = ["read_file", "write_file"]\n'
+    )
+
+    def _delegate_a_write(self, mode: str, approve: bool, **agent_kwargs):
+        """真实挂载路径：Agent 自己把护栏接给委托工具。返回 (agent, 被问到的工具名)。"""
+        write_spec(self.root / ".xiaoyu" / "agents", "writer", self.WRITER_SPEC)
+        self.config.enable_agents = True
+        self.config.auto_approve = False
+        #  故意让配置里的起始档与运行时的档不一样：换档不回写 config，
+        #  子 agent 得跟着运行时的那一档走
+        self.config.mode = "auto" if mode == "default" else "default"
+        asked: list[str] = []
+
+        def approver(name, args):
+            asked.append(name)
+            return approve
+
+        script = [
+            _sub_tool_call("writer", "写个文件"),
+            [chunk(tool_calls=[call_fragment(
+                0, "s1", "write_file", json.dumps({"path": "out.txt", "content": "hi"})
+            )])],
+            text_turn("子：做完了"),
+            text_turn("主：收到"),
+        ]
+        with mock.patch.object(agents_mod, "user_config_dir", lambda: self.root / "cfg"):
+            agent = self.build(script, approver=approver, **agent_kwargs)
+        agent.mode = mode
+        with contextlib.redirect_stdout(io.StringIO()):
+            agent.send("去写")
+        return agent, asked
+
+    def test_subagent_asks_like_its_parent_in_confirm_mode(self):
+        agent, asked = self._delegate_a_write("default", approve=False)
+        self.assertEqual(asked, ["write_file"])
+        self.assertFalse((self.root / "out.txt").exists())
+
+    def test_subagent_follows_parent_into_auto_mode(self):
+        agent, asked = self._delegate_a_write("auto", approve=False)
+        self.assertEqual(asked, [])  # 工作区内改文件，auto 档不问
+        self.assertEqual((self.root / "out.txt").read_text(encoding="utf-8"), "hi")
+
+    def test_direct_callers_without_guards_get_confirm_mode(self):
+        """没人交代父级在哪一档时按最保守的来，而不是吃出厂起始档。"""
+        self.assertEqual(agents_mod.ParentGuards().child_mode(), "default")
+        self.assertEqual(agents_mod.ParentGuards(mode=lambda: "plan").child_mode(), "default")
+        self.assertEqual(agents_mod.ParentGuards(mode=lambda: "auto").child_mode(), "auto")
+
+    def test_parent_tool_hooks_fire_inside_the_subagent(self):
+        from xiaoyu.hooks import Decision
+
+        fired: list[tuple[str, str, str]] = []
+
+        class Engine:
+            """替身：只认工具类钩子，write_file 一律拦下。"""
+
+            def __init__(self, workspace=None, scoped=False):
+                self.workspace, self.scoped = workspace, scoped
+
+            def for_tools(self, workspace):
+                return Engine(workspace, scoped=True)
+
+            def has(self, event):
+                return event == "PreToolUse" or not self.scoped
+
+            def fire(self, event, payload, tool_name=""):
+                fired.append((event, tool_name, "子" if self.scoped else "主"))
+                return Decision(blocked=event == "PreToolUse" and tool_name == "write_file",
+                                reason="钩子说不行")
+
+        agent, _ = self._delegate_a_write("auto", approve=True, hook_engine=Engine())
+        self.assertIn(("PreToolUse", "write_file", "子"), fired)
+        self.assertFalse((self.root / "out.txt").exists())
+        #  开头 / 收尾那两类钩子说的是用户这一轮，子 agent 里不触发
+        self.assertFalse([item for item in fired if item[2] == "子" and item[0] != "PreToolUse"])
+
     def test_agent_mounts_specs_from_workspace(self):
         """Agent 构造时自动挂载工作区 spec（enable_agents 门控）。"""
         write_spec(self.root / ".xiaoyu" / "agents", "doc_reader", GOOD_SPEC)

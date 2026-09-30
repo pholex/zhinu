@@ -51,12 +51,21 @@ MAX_ANSWER_CHARS = 4000
 
 
 def make_explore_tool(
-    config: Config, registry: Registry, usage, sink: UISink | None = None
+    config: Config,
+    registry: Registry,
+    usage,
+    sink: UISink | None = None,
+    *,
+    approver=None,
+    permissions=None,
 ) -> Tool:
     """造一个 explore 工具挂到主 agent 上。usage 与 registry 都传父级的：
     成本记同一本账，client 也按 provider 复用（explore_model 可能落在另一家）。
 
     sink 是父 agent 的表现层出口：explore 的进度提示随父级的界面走。
+    approver / permissions 也是父级的：只读工具免确认，但用户写的 deny / ask
+    规则（`deny read_file(.env)` 这类）管的是"读什么"，不因为读的人换成了
+    检索子 agent 就不算数。
     """
     sink = sink or PlainSink()
 
@@ -110,6 +119,8 @@ def make_explore_tool(
             registry=registry,
             quiet=True,
             allow_explore=False,
+            approver=approver,
+            permissions=permissions,
             sink=child_maker() if callable(child_maker) else None,
         )
         sub_agent.system_prompt_override = EXPLORE_PROMPT.format(workspace=config.workspace)

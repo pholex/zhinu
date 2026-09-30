@@ -272,12 +272,15 @@ class ChenshuRuntime:
         sink: UISink,
         permissions: Any,
         notify: Callable[[str, str], None] | None = None,
+        hooks: Callable[[], Any] | None = None,
     ) -> None:
         self.config = config
         self.registry = registry
         self.usage = usage
         self.sink = sink
         self.permissions = permissions
+        #  总枢会话的钩子引擎（取值回调）：成员的工具调用照样过用户挂的工具类钩子
+        self.hooks = hooks
         self.notify = notify or (lambda text, key="": None)
         self.root = config.workspace / ".xiaoyu" / "chenshu"
         self.lock = threading.RLock()
@@ -1106,6 +1109,11 @@ class ChenshuRuntime:
                 approver=guard,
                 permissions=self.permissions,
                 sink=observer,
+                hook_engine=(
+                    engine.for_tools(workdir)
+                    if self.hooks is not None and (engine := self.hooks()) is not None
+                    else None
+                ),
             )
             with self.lock:
                 self._agents[name] = agent

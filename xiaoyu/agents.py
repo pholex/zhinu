@@ -579,6 +579,35 @@ def distill_history(
     return [message for turn in picked for message in turn]
 
 
+@dataclass(frozen=True)
+class ParentGuards:
+    """委托时要从父会话带下去的护栏。两项都是取值回调：父会话运行中会变
+    （Shift+Tab 换档不回写 config），委托发起的那一刻现取。
+
+    不传（None）按最保守的来：确认档、不带钩子。
+    """
+
+    #  父会话此刻的交互模式（"default" / "auto" / "plan"）
+    mode: Callable[[], str] | None = None
+    #  父会话的 hooks.HookEngine（没有钩子时为 None）
+    hooks: Callable[[], Any] | None = None
+
+    def child_mode(self) -> str:
+        """子 agent 该用哪一档：跟父级走，但只在确认档与 auto 之间取。
+
+        plan 档下委托工具本来就被拦，走到这里的只会是前两档；认不出的值
+        一律落到确认档——子 agent 不能比发起委托的那个会话问得更少。
+        """
+        from . import modes
+
+        current = self.mode() if self.mode is not None else modes.DEFAULT
+        return current if current == modes.AUTO else modes.DEFAULT
+
+    def child_hooks(self, workdir: Path) -> Any:
+        engine = self.hooks() if self.hooks is not None else None
+        return engine.for_tools(workdir) if engine is not None else None
+
+
 def execute_delegation(
     spec: AgentSpec,
     config: Config,
@@ -601,8 +630,12 @@ def execute_delegation(
     effort_override: str | None = None,
     parent_history: Callable[[], list[dict[str, Any]]] | None = None,
     stop_requested: Callable[[], bool] | None = None,
+    guards: ParentGuards | None = None,
 ) -> DelegationResult:
     """跑一次委托的执行核心（单发 subagent 工具与 qixiang 批量共用）。
+
+    guards 是父会话的交互模式与工具钩子（见 ParentGuards）：子 agent 逐工具的
+    确认跟父级同一档，父级挂在工具调用上的钩子照样触发——委托不是绕开护栏的路。
 
     model_override / effort_override 是调用方按本次任务给的模型与推理深度
     （七襄给整批、斗巧给每席）：优先级 调用参数 > spec 声明 > 主会话。
@@ -621,6 +654,7 @@ def execute_delegation(
     from .agent import Agent, collect_project_docs
     from .mcp import McpView
 
+    guards = guards or ParentGuards()
     lock = _store_lock(store)
 
     #  -- 能力档位：调用参数 ∧ spec 天花板（spec.tools 已在解析期扣过天花板，
@@ -827,6 +861,9 @@ def execute_delegation(
         sandbox=config.sandbox,
         sandbox_network=config.sandbox_network,
         auto_approve=readonly_run or config.auto_approve,
+        #  跟父会话同一档。不传的话吃的是出厂起始档（auto）：父会话明明在确认档，
+        #  子 agent 却能不问就写文件、跑命令
+        mode=guards.child_mode(),
         mcp_tool_search=config.mcp_tool_search,
         enable_explore=False,
         enable_web_search=False,
@@ -857,6 +894,9 @@ def execute_delegation(
         approver=None if readonly_run else approver,
         permissions=permissions,
         sink=child_sink,
+        #  enable_hooks=False 只是不让子 agent 自己再读一遍 hooks.toml；
+        #  父级的工具类钩子由这里带下去
+        hook_engine=guards.child_hooks(workdir),
         allow_nesting=nest,
         #  父级被打断时跟着停（单发委托跑在父级线程里，父级自己没机会去叫停它）
         upstream_stop=stop_requested,
@@ -1019,6 +1059,7 @@ def make_subagent_tool(
     mcp_manager: Any = None,
     parent_history: Callable[[], list[dict[str, Any]]] | None = None,
     stop_requested: Callable[[], bool] | None = None,
+    guards: ParentGuards | None = None,
 ) -> Tool:
     """spec → 可挂载的工具。结构与 explore.make_explore_tool 同构：
     usage/registry 传父级的（同一本账、client 复用），sink 走 quiet_child 派生。
@@ -1043,6 +1084,7 @@ def make_subagent_tool(
             isolation=isolation, resume_from=resume_from,
             parent_history=parent_history,
             stop_requested=stop_requested,
+            guards=guards,
         )
         if result.error:
             return result.error
