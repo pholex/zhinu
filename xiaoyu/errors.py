@@ -347,6 +347,10 @@ def classify(exc: Exception) -> Verdict:
         or (status is not None and status >= 500)
         #  anthropic 的连接/超时异常是 `raise ... from <httpx 异常>`，认底因即可
         or isinstance(exc.__cause__, httpx.HTTPError)
+        #  流迭代到一半断开时两个 SDK 都不包装：抛出来的就是裸的 httpx 传输层异常
+        #  （对端关连接、分块读到一半、读超时）。证书失败也以 ConnectError 的形态
+        #  出现，它在上面的 _certificate_failure 已经先行判掉，走不到这里
+        or isinstance(exc, httpx.TransportError)
         #  没有状态码可判的流内错误事件，只剩措辞可认（见 _TRANSIENT_MARKERS）
         or any(marker in text for marker in _TRANSIENT_MARKERS)
     ):
