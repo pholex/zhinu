@@ -519,6 +519,58 @@ def _write_like_original(target: Path, text: str, encoding: str, raw: bytes | No
     target.write_bytes(data)
 
 
+def _mixed_newlines(raw: bytes) -> bool:
+    """文件里是不是不止一种换行（\\r\\n、单独的 \\n、单独的 \\r 三种里出现了两种以上）。"""
+    crlf = raw.count(b"\r\n")
+    kinds = (crlf, raw.count(b"\n") - crlf, raw.count(b"\r") - crlf)
+    return sum(1 for count in kinds if count) > 1
+
+
+def _write_edit(target: Path, before: str, updated: str, encoding: str, raw: bytes | None) -> None:
+    """局部替换的写回：换行不纯的文件只动被替换的那一段，其余字节原样留着。
+
+    匹配是在换行归一成 LF 的文本上做的，写回时整体换成"多数派"换行——对换行
+    单一的文件这是还原，对换行不纯的文件却是改写：少数派的行被统一掉，LF 文件
+    里孤立的 \\r（CSV 字段内、测试夹具）变成 \\n，那是内容变化，而模型根本没碰
+    那几行。所以不纯时把改动定位回原文：两头没变的部分按原字节保留，只有中间
+    新写的那段用多数派换行。
+    """
+    if raw is None or not _mixed_newlines(raw):
+        _write_like_original(target, updated, encoding, raw)
+        return
+    try:
+        decoded = raw.decode(encoding).removeprefix("\ufeff")
+    except UnicodeDecodeError:
+        _write_like_original(target, updated, encoding, raw)
+        return
+    #  归一后第 i 个字符在原文里从哪儿开始（\\r\\n 占两个字符）
+    starts: list[int] = []
+    index = 0
+    while index < len(decoded):
+        starts.append(index)
+        index += 2 if decoded.startswith("\r\n", index) else 1
+    starts.append(len(decoded))
+    if len(starts) - 1 != len(before):
+        #  对不上说明手里的 before 不是这份字节归一出来的：不猜，走整体写回
+        _write_like_original(target, updated, encoding, raw)
+        return
+    limit = min(len(before), len(updated))
+    head = 0
+    while head < limit and before[head] == updated[head]:
+        head += 1
+    tail = 0
+    while tail < limit - head and before[-1 - tail] == updated[-1 - tail]:
+        tail += 1
+    middle = updated[head : len(updated) - tail]
+    newline = _newline_of(raw)
+    if newline != "\n":
+        middle = middle.replace("\n", newline)
+    data = (decoded[: starts[head]] + middle + decoded[starts[len(before) - tail] :]).encode(encoding)
+    if raw.startswith(codecs.BOM_UTF8) and codecs.lookup(encoding).name == "utf-8":
+        data = codecs.BOM_UTF8 + data
+    target.write_bytes(data)
+
+
 def _undecodable_error(path: str) -> str:
     return (
         f"ERROR: {path} 按 UTF-8、GBK 都无法无损解码（可能是二进制或其它编码），"
@@ -2190,7 +2242,7 @@ class Toolbox:
             return error
         self.rewind.record(target, raw)
         try:
-            _write_like_original(target, updated, encoding, raw)
+            _write_edit(target, text, updated, encoding, raw)
         except OSError as exc:
             return f"ERROR: 写入失败 {path}: {exc}"
         self._mark_read(target, keep_level=True)
@@ -2266,7 +2318,7 @@ class Toolbox:
             return error
         self.rewind.record(target, raw if raw is not None else text.encode(encoding))
         try:
-            _write_like_original(target, updated, encoding, raw)
+            _write_edit(target, text, updated, encoding, raw)
         except OSError as exc:
             return f"ERROR: 写入失败 {path}: {exc}"
         self._mark_read(target, keep_level=True)
