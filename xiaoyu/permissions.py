@@ -163,22 +163,6 @@ def _runner_reason(runner: str) -> str:
             "请写到具体命令（如 allow bash(uv run pytest*)），或在确认框答 a 做会话级放行。")
 
 
-def _after_options(tokens: list[str], start: int) -> list[int]:
-    """从 start 起跳过选项，给出下一个词（子命令 / 里面那条命令）可能落在的每个下标。
-
-    运行器的选项不查表：选项后面那个词既可能是它的值、也可能就是要找的词，两种都给。
-    """
-    found = []
-    index = start
-    while index < len(tokens):
-        if not tokens[index].startswith("-"):
-            found.append(index)
-            if index == start or not tokens[index - 1].startswith("-"):
-                break
-        index += 1
-    return found
-
-
 def _runner_pattern_reason(tokens: list[str], depth: int) -> str | None:
     """透传运行器开头的模式（`uv run python *`、`npx tsx *`）按结构判，与 wrapper 同理：
 
@@ -194,7 +178,7 @@ def _runner_pattern_reason(tokens: list[str], depth: int) -> str | None:
         if not subs:
             return None
         starts = []
-        for index in _after_options(tokens, 1):
+        for index in command_check.command_starts(tokens, 1):
             if not any(fnmatch.fnmatch(sub, tokens[index]) for sub in subs):
                 continue
             if "*" in tokens[index] or any(_has_glob(token) for token in tokens[1:index]):
@@ -204,7 +188,7 @@ def _runner_pattern_reason(tokens: list[str], depth: int) -> str | None:
         reason = _runner_reason(" ".join(tokens[:start]))
         if depth >= _MAX_PATTERN_DEPTH:
             return reason
-        for index in _after_options(tokens, start):
+        for index in command_check.command_starts(tokens, start):
             if any(_has_glob(token) for token in tokens[start:index]):
                 return reason
             if _inner_pattern_banned(" ".join(tokens[index:]), depth):
@@ -270,11 +254,9 @@ _SCRIPT_RUNNERS = frozenset({("npm", "run"), ("pnpm", "run"), ("yarn", "run"), (
 
 #  透传运行器：后面跟的是另一条命令，范围按里面那条命令算（`uv run pytest` 放行后
 #  `uv run python -c …` 照问）。运行器自己的选项不解析——带选项就推不出范围。
-_PASSTHROUGH_RUNNERS = frozenset({
-    ("uv", "run"), ("poetry", "run"), ("conda", "run"),
-    ("npm", "exec"), ("pnpm", "exec"), ("pnpm", "dlx"), ("yarn", "exec"), ("yarn", "dlx"),
-})
-_PASSTHROUGH_HEADS = frozenset({"npx", "bunx", "uvx"})
+#  名单与 command_check 共用：那边剥运行器找危险命令，这边算授权范围
+_PASSTHROUGH_RUNNERS = command_check.RUNNER_SUBCOMMANDS
+_PASSTHROUGH_HEADS = command_check.RUNNER_HEADS
 _RUNNER_HEADS = _PASSTHROUGH_HEADS | {runner for runner, _ in _PASSTHROUGH_RUNNERS}
 #  运行器 × 探针：`uv run*`、`uv*python *` 这类通配跨词的模式按词拆不开，拿
 #  「运行器 + 任意代码执行入口」的完整命令去试规则本身。运行器带选项的写法探针

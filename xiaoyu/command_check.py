@@ -357,6 +357,13 @@ def _injection_risk_argv(argv: list[str], depth: int) -> str | None:
                 raise _TooComplex
             if reason := _injection_risk_argv(_strip_shell_prefix(inner), depth + 1):
                 return reason
+    #  透传运行器同理：`uv run git -c core.pager=sh log` 不能靠 `uv run git *` 放行
+    elif (inners := _peel_runner(name, argv)) is not None:
+        for inner in inners:
+            if depth + 1 > _MAX_WRAPPER_DEPTH:
+                raise _TooComplex
+            if reason := _injection_risk_argv(_strip_shell_prefix(inner), depth + 1):
+                return reason
     return None
 
 
@@ -592,6 +599,51 @@ _WRAPPERS: dict[str, tuple[_WrapperSpec, ...]] = {
 
 #  所有 wrapper 名：permissions 的会话授权与 allow 探针都从这里取，加一个 wrapper 三处同时受益
 WRAPPER_NAMES = frozenset(_WRAPPERS)
+
+#  透传运行器：后面跟的是另一条命令（`uv run rm -rf x` 跑的就是 rm）。与 wrapper 的
+#  区别是选项不查表——各家选项多且常变，按表外选项的办法处理：选项后面那个词按
+#  「是它的值」「就是命令」两种解释都扫。permissions 的授权范围与 allow 规则判定同用这两张表
+RUNNER_SUBCOMMANDS = frozenset({
+    ("uv", "run"), ("poetry", "run"), ("conda", "run"),
+    ("npm", "exec"), ("pnpm", "exec"), ("pnpm", "dlx"), ("yarn", "exec"), ("yarn", "dlx"),
+})
+RUNNER_HEADS = frozenset({"npx", "bunx", "uvx"})
+
+
+def command_starts(argv: list[str], start: int) -> list[int]:
+    """从 start 起跳过不查表的选项，给出下一个非选项词可能落在的每个下标。
+
+    选项后面那个词既可能是它的值、也可能就是要找的词，两种都给；`--` 之后
+    紧跟的那个词一定是。`uv run --with x rm` 给出 x 与 rm 两个位置。
+    """
+    found: list[int] = []
+    index = start
+    while index < len(argv):
+        token = argv[index]
+        if token == "--":
+            if index + 1 < len(argv):
+                found.append(index + 1)
+            break
+        if not token.startswith("-"):
+            found.append(index)
+            if index == start or not argv[index - 1].startswith("-"):
+                break
+        index += 1
+    return found
+
+
+def _peel_runner(name: str, argv: list[str]) -> list[list[str]] | None:
+    """透传运行器剥掉外层，返回里面可能被执行的命令 argv 候选；不是运行器形态返回 None。"""
+    if name in RUNNER_HEADS:
+        starts = [1]
+    else:
+        subs = {sub for runner, sub in RUNNER_SUBCOMMANDS if runner == name}
+        if not subs:
+            return None
+        starts = [index + 1 for index in command_starts(argv, 1) if argv[index] in subs]
+        if not starts:
+            return None
+    return [argv[index:] for start in starts for index in command_starts(argv, start)]
 
 _NICE_NUMERIC = re.compile(r"-[+-]?\d+")
 
@@ -1388,6 +1440,11 @@ def _scan_segment(argv: list[str], depth: int, hit, budget: _Budget) -> str | No
                 return reason
         for script in scripts:
             if reason := _scan_script(script, budget.descend(depth), hit, budget):
+                return reason
+        return None
+    if (inners := _peel_runner(name, argv)) is not None:
+        for inner in inners:
+            if reason := _scan_segment(inner, budget.descend(depth), hit, budget):
                 return reason
         return None
     if name == "find":
