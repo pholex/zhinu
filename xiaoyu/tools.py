@@ -1389,7 +1389,23 @@ class Toolbox:
             return f"ERROR: MCP 工具 {name} 当前不可用（server 未就绪或已退出）。"
         #  目的参数是给审批框看的，别漏进远端参数
         tool_input.pop(PURPOSE_PARAM, None)
-        return remote.handler(**tool_input)
+        return self._interruptible(remote.handler)(**tool_input)
+
+    def _interruptible(self, handler: Callable[..., str]) -> Callable[..., str]:
+        """给 MCP 工具的 handler 包一层：调用期间把本工具箱的"有没有人叫停"挂到
+        当前线程上（mcp.stop_scope），在飞的远端调用据此停得下来。
+
+        handler 是 manager 级的闭包，父子 agent 的工具箱共用同一个；stop_requested
+        却是每个 Agent 各自注入的，而且注入晚于工具箱构造——所以在调用的那一刻
+        现取。原 handler 记在 remote 属性上，_absorb_mcp 靠它认"还是不是同一代"。
+        """
+
+        def call(**kwargs: Any) -> str:
+            with mcp.stop_scope(self.stop_requested):
+                return handler(**kwargs)
+
+        call.remote = handler  # type: ignore[attr-defined]
+        return call
 
     def mcp_content_trusted(self, tool_name: str) -> bool:
         """use_tool 触达的 MCP 工具，其 server 是否声明了 trustContent（结果不套
@@ -1449,14 +1465,14 @@ class Toolbox:
             #  handler 同一 = 还是同一代的同一个声明；不同 = 代际 swap 换过
             #  （/mcp approve 后的新 schema）→ 原位覆盖（dict 赋值保序，
             #  schemas 顺序与 prompt cache 前缀不动）
-            if existing is not None and existing.handler is remote.handler:
+            if existing is not None and getattr(existing.handler, "remote", None) is remote.handler:
                 continue
             self.register(
                 Tool(
                     name=remote.name,
                     description=remote.description,
                     parameters=remote.parameters,
-                    handler=remote.handler,
+                    handler=self._interruptible(remote.handler),
                     requires_approval=True,
                     #  server 进程退出后工具自动从 schemas 消失、拒绝执行
                     check_fn=remote.check_fn,
