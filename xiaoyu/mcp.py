@@ -46,6 +46,10 @@
   立即返回并明确告诉模型"不要立刻重试"——同步主循环里每次干等满超时，
   几个回合就能烧光一轮预算。server 明确答复的错误（JSON-RPC error、HTTP 4xx）
   不计：那是这一次请求的问题，不是 server 的。
+- **调用停得下来**：tools/call 的超时是整个往返的 wall-clock 总时限；宿主打断
+  （Agent.interrupt）时在飞的调用本地放手。超时与打断都给 server 发
+  notifications/cancelled——但本地放手不等于远端停了，给模型的说明里明说
+  "远端可能仍在执行、结果未知"。
 - **schema 归一**：server 返回的 inputSchema 做最小消毒（可空 type 数组折叠、
   required 剪掉不存在的属性、裸字符串 schema 替换、缺 type 补 object）——
   严格校验的端点（Gemini/Kimi/OpenAI strict）会因一个畸形 schema 把整个
@@ -88,6 +92,7 @@ from typing import Any, Callable, Iterator
 
 from . import diagnostics, fsguard, mcp_guard, mcp_watchdog, media, netproxy
 from .config import Config, user_config_dir
+from .errors import Interrupted, attach_partial
 
 #  活着的 MCP 连接数（stdio 子进程 + HTTP 会话），/diagnostics 与 doctor 可见
 CONNECTIONS_LIVE = diagnostics.Gauge("mcp.connections.live")
@@ -139,6 +144,7 @@ WORKSPACE_FILE = ".mcp.json"
 #    too_large        应答体超过上限（见 _HTTP_BODY_CAP 一组常量）    → 只报错；结果不确定
 #    http             其余 4xx（server 明确拒收，请求没执行）         → 只报错
 #    rpc              JSON-RPC error 应答（参数非法、方法不存在…）     → 只报错；两种传输都有
+#    cancelled        宿主叫停了在等的调用（本地放手，不是 server 出错）→ 只报错；不计熔断；两种传输都有
 _RECONNECT_KINDS = frozenset({"connect", "session_expired", "dropped"})
 #  "结果不确定"：请求已送达 server 却没拿到可信应答——tools/call 的副作用可能
 #  已经发生，自动重试可能把一次写操作做成两次
@@ -146,6 +152,37 @@ _OUTCOME_UNKNOWN_KINDS = frozenset({"dropped", "timeout", "server", "malformed",
 #  "server 给了明确答复"：它在正常收发，错在这一次请求本身（多半是模型把参数
 #  写错了）。不算进熔断的连败，反而证明 server 是健康的
 _ANSWERED_KINDS = frozenset({"rpc", "http"})
+
+#  等应答时隔多久看一眼"有没有人叫停"（秒）
+_STOP_POLL = 0.1
+#  notifications/cancelled 走 HTTP 时的超时：尽力而为的告知，不为它久等
+_CANCEL_NOTIFY_TIMEOUT = 5.0
+#  宿主叫停时给模型的说明。在飞的那种必须把话说全：本地不等了不等于远端停了
+_CANCELLED_IN_FLIGHT = (
+    "宿主请求打断，本地已取消等待——请求已送达 server，远端可能仍在执行，结果未知；"
+    "要用到这个结果时先核实，不要直接重试"
+)
+_CANCELLED_UNSENT = "宿主请求打断，本地已取消——请求还没有发出，server 没有执行"
+
+#  当前线程上的"有没有人叫停"（见 stop_scope）
+_call_scope = threading.local()
+
+
+@contextlib.contextmanager
+def stop_scope(stop_requested: Callable[[], bool] | None) -> "Iterator[None]":
+    """在当前线程上挂一个"有没有人叫停"，期间发起的 MCP 工具调用会轮询它。
+
+    工具的 handler 是 manager 级的闭包，一个 manager 被父子 agent 的多个工具箱
+    共用；打断标志却是每个 Agent 自己的。所以标志不进 handler 的签名（那里是
+    远端工具的参数），由调用方在调用期间挂到自己的线程上——handler 同步跑在
+    调用方线程里，谁调的就看谁的标志。
+    """
+    previous = getattr(_call_scope, "stop", None)
+    _call_scope.stop = stop_requested
+    try:
+        yield
+    finally:
+        _call_scope.stop = previous
 
 
 class McpError(RuntimeError):
@@ -898,7 +935,7 @@ class _HttpChannel:
         awaited = payload.get("id") if "method" in payload else None
         with response:
             try:
-                for message in self._read_messages(response):
+                for message in self._read_messages(response, exchange):
                     deliver(message)
                     if (
                         awaited is not None
@@ -918,7 +955,9 @@ class _HttpChannel:
                 if exchange is not None:
                     exchange.detach()
 
-    def _read_messages(self, response: Any) -> "Iterator[dict[str, Any]]":
+    def _read_messages(
+        self, response: Any, exchange: "_Exchange | None" = None
+    ) -> "Iterator[dict[str, Any]]":
         #  会话 id 只在 initialize 的响应里出现，但每次都读一遍无害
         if new_id := response.headers.get("Mcp-Session-Id"):
             self.session_id = new_id
@@ -926,7 +965,9 @@ class _HttpChannel:
         if response.status == 202:
             return  # 通知被接收，无响应体
         if kind == "text/event-stream":
-            yield from _read_sse(response)
+            yield from _read_sse(
+                response, None if exchange is None else lambda: exchange.abandoned
+            )
             return
         raw = _read_capped(response).decode("utf-8", "replace").strip()
         if not raw:
@@ -1057,19 +1098,13 @@ def _hang_up(response: Any) -> None:
     """从别的线程掐断一条正在被读的应答。
 
     不能直接 close：读线程阻塞在读里时握着缓冲区的锁，close 要等它读完才拿得到
-    ——等于陪它一起卡住。对底层 socket 做 shutdown 不用等谁：阻塞的读立刻以
-    "对端已关闭"返回，读线程自己收场、自己关。摸不到 socket 时退而求其次，
-    把 close 放到旁路线程里去等。
+    ——等于陪它一起卡住。对底层 socket 做 shutdown 不用等谁：阻塞的读随即以
+    "连接已关闭"返回，读线程自己收场、自己关。尽力而为：没掐成（响应已关、
+    平台叫不醒阻塞的读）也有后手——读线程每读到一行都会看等待方是否已放手
+    （见 _read_sse），最迟到 socket 空闲超时。
     """
-    try:
+    with contextlib.suppress(Exception):
         response.fp.raw._sock.shutdown(socket.SHUT_RDWR)
-    except Exception:  # noqa: BLE001 - 响应已关 / 内部结构对不上：交给旁路线程兜底
-
-        def close() -> None:
-            with contextlib.suppress(Exception):
-                response.close()
-
-        threading.Thread(target=close, name="xiaoyu-mcp-hangup", daemon=True).start()
 
 
 class _Exchange:
@@ -1134,7 +1169,9 @@ def _read_capped(response: Any) -> bytes:
         chunks.append(chunk)
 
 
-def _read_sse(response: Any) -> "Iterator[dict[str, Any]]":
+def _read_sse(
+    response: Any, abandoned: Callable[[], bool] | None = None
+) -> "Iterator[dict[str, Any]]":
     """SSE 流 → JSON-RPC 消息，**边读边吐**（生成器）。
 
     生成器不是风格选择：GET 长流要的就是"事件到一条派发一条"，先收集再返回
@@ -1148,11 +1185,16 @@ def _read_sse(response: Any) -> "Iterator[dict[str, Any]]":
     一个事件（上一个空行之后读到的全部字节）超过 _SSE_EVENT_CAP 即拒收。
     还没攒到 data 时（心跳、event:/id: 行）计数随行清零，长流挂一整天也不误伤。
     不用 `for line in response`：那是不限长的 readline，一行不换行就读到内存爆。
+
+    abandoned 给了的话每读到一行问一次，等待方已经放手就不再读下去——只发
+    心跳的流永远吐不出消息，调用方在消息之间看不到这个机会。
     """
     buffer: list[str] = []
     pending = bytearray()  # 当前行已读到、还没见到换行的部分
     size = 0  # 当前事件已读字节
     while True:
+        if abandoned is not None and abandoned():
+            return
         cap = _SSE_EVENT_CAP
         chunk = response.readline(min(_READ_CHUNK, cap + 1 - size))
         if chunk:
@@ -1212,6 +1254,9 @@ class McpServer:
         self._http: _HttpChannel | None = _HttpChannel(spec) if spec.is_http else None
         self._cond = threading.Condition()
         self._responses: dict[int, dict[str, Any]] = {}
+        #  正有人在等应答的请求 id。响应槽只为它们留：超时 / 取消之后才到的应答
+        #  没有人会来取，收下就是只增不减
+        self._awaited: set[int] = set()
         self._next_id = 0
         self._write_lock = threading.Lock()
         self._dead = False
@@ -1452,6 +1497,9 @@ class McpServer:
             with self._cond:
                 self._dead = False
                 self._responses.clear()
+                #  换一张新表而不是清空：上一代还没退场的等待方各自从旧表里除名，
+                #  id 从头编之后撞不到新一代的登记
+                self._awaited = set()
                 self._next_id = 0
             #  熔断是"进程活着但请求连败"的防线，新一代从零开始
             self._failures = 0
@@ -1547,8 +1595,16 @@ class McpServer:
             seen.add(cursor)
         return tools
 
-    def call_tool(self, tool: str, args: dict[str, Any]) -> str:
+    def call_tool(
+        self,
+        tool: str,
+        args: dict[str, Any],
+        stop_requested: Callable[[], bool] | None = None,
+    ) -> str:
         """tools/call，把 content 各部件拼成回给模型的文本。协议错误也返回文本。
+
+        stop_requested（"有没有人叫停"）给了的话，等应答期间会轮询它：叫停即
+        放手返回，文本里说明远端可能仍在执行。
 
         图片部件不在返回值里（返回值是"给模型的文本"，形状不能变——它同时是
         工具结果、trace 记录、审批预览的输入），改挂在 `last_media` 上由调用方
@@ -1594,8 +1650,12 @@ class McpServer:
                 "tools/call",
                 {"name": tool, "arguments": args},
                 timeout=self.spec.timeout,
+                stop_requested=stop_requested,
             )
         except McpError as exc:
+            if exc.kind == "cancelled":
+                #  本地叫停说明不了 server 的好坏：连败计数不加也不清
+                return f"ERROR: MCP 调用已取消（{self.spec.name}/{tool}）：{exc}"
             if exc.kind in _ANSWERED_KINDS:
                 self._failures = 0
             else:
@@ -1658,20 +1718,41 @@ class McpServer:
                 raise
             return call(common[0])
 
-    def _request(self, method: str, params: dict[str, Any], timeout: float) -> dict[str, Any]:
+    def _request(
+        self,
+        method: str,
+        params: dict[str, Any],
+        timeout: float,
+        stop_requested: Callable[[], bool] | None = None,
+    ) -> dict[str, Any]:
         """发一个请求并等它的应答。timeout 是整个往返的 wall-clock 总时限，
-        两种传输同一个意思。"""
+        两种传输同一个意思。stop_requested 给了就切片等、每片问一次，叫停时抛
+        kind="cancelled"。"""
         with self._cond:
             if self._dead:
                 raise McpError(self._exit_reason())
             self._next_id += 1
             request_id = self._next_id
+            awaited = self._awaited
+            awaited.add(request_id)
         payload = {"jsonrpc": "2.0", "id": request_id, "method": method, "params": params}
-        if self._http is not None:
-            reply = self._roundtrip(payload, timeout)
-        else:
-            self._send(payload)
-            reply = self._await_reply(request_id, method, timeout, time.monotonic() + timeout)
+        try:
+            if self._http is not None:
+                reply = self._roundtrip(payload, timeout, stop_requested)
+            else:
+                if stop_requested is not None and stop_requested():
+                    raise McpError(_CANCELLED_UNSENT, kind="cancelled")
+                self._send(payload)
+                reply = self._await_reply(
+                    request_id, method, timeout, time.monotonic() + timeout, stop_requested
+                )
+        finally:
+            with self._cond:
+                awaited.discard(request_id)
+                #  不等了就把槽也清掉（应答恰好在放手那一刻落进来的）。换代之后
+                #  槽属于新一代，不碰
+                if self._awaited is awaited:
+                    self._responses.pop(request_id, None)
         if "error" in reply:
             error = reply["error"] if isinstance(reply["error"], dict) else {}
             raise McpError(
@@ -1688,28 +1769,77 @@ class McpServer:
         method: str,
         timeout: float,
         deadline: float,
+        stop_requested: Callable[[], bool] | None = None,
         exchange: _Exchange | None = None,
     ) -> dict[str, Any]:
         """等 request_id 的应答落进响应槽，到 deadline 为止。
 
         走到这里请求已经发出：此后的退出/超时都是"结果不确定"。exchange 是
         HTTP 往返的读线程状态——它收场了而应答没来，就不必再等。
+        不等了（超时 / 宿主叫停 / Ctrl-C）要告诉 server 一声，见 _notify_cancelled。
         """
-        with self._cond:
-            while request_id not in self._responses:
-                if exchange is not None and exchange.finished:
-                    #  规范：应答只会出现在这次 POST 自己的响应体里。流正常结束
-                    #  却没有它，等到总时限也不会有
-                    raise exchange.error or McpError(
-                        f"server 结束了应答却没有给出 {method} 的结果", kind="malformed"
+        try:
+            while True:
+                #  叫停优先于同一时刻到达的应答：调用方已经不要这个结果了，
+                #  "拿到了"和"取消了"只能说一个
+                if stop_requested is not None and stop_requested():
+                    raise McpError(_CANCELLED_IN_FLIGHT, kind="cancelled")
+                with self._cond:
+                    if request_id in self._responses:
+                        return self._responses.pop(request_id)
+                    if exchange is not None and exchange.finished:
+                        #  规范：应答只会出现在这次 POST 自己的响应体里。流正常结束
+                        #  却没有它，等到总时限也不会有
+                        raise exchange.error or McpError(
+                            f"server 结束了应答却没有给出 {method} 的结果", kind="malformed"
+                        )
+                    if self._dead:
+                        raise McpError(self._exit_reason(), kind="dropped")
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise McpError(f"{method} 超时（{timeout:g}s）", kind="timeout")
+                    #  宿主的打断只是置一个标志，叫不醒条件变量：切成小片轮流看
+                    self._cond.wait(
+                        remaining if stop_requested is None else min(_STOP_POLL, remaining)
                     )
-                if self._dead:
-                    raise McpError(self._exit_reason(), kind="dropped")
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
-                    raise McpError(f"{method} 超时（{timeout:g}s）", kind="timeout")
-                self._cond.wait(remaining)
-            return self._responses.pop(request_id)
+        except McpError as exc:
+            if exc.kind == "timeout":
+                self._notify_cancelled(request_id, method, "等待应答超时")
+            elif exc.kind == "cancelled":
+                self._notify_cancelled(request_id, method, "调用方已取消")
+            raise
+        except KeyboardInterrupt:
+            self._notify_cancelled(request_id, method, "调用方已取消")
+            raise
+
+    def _notify_cancelled(self, request_id: int, method: str, reason: str) -> None:
+        """已发出的请求不等了：告诉 server 别再算（notifications/cancelled）。
+
+        尽力而为，且绝不拖住调用方：放到独立线程里发——stdin 管道写满、远端
+        不应答时发送本身会阻塞，而调用方此刻正要脱身。失败静默：server 没收到
+        只是白算一场。initialize 按规范不可取消。
+        """
+        if method == "initialize":
+            return
+        payload = {
+            "jsonrpc": "2.0",
+            "method": "notifications/cancelled",
+            "params": {"requestId": request_id, "reason": reason},
+        }
+        channel = self._http
+
+        def send() -> None:
+            try:
+                if channel is not None:
+                    channel.post(payload, _CANCEL_NOTIFY_TIMEOUT)
+                else:
+                    self._send(payload)
+            except Exception:  # noqa: BLE001 - 尽力而为的告知，发不出去不是调用方的事
+                pass
+
+        threading.Thread(
+            target=send, name=f"xiaoyu-mcp-cancel-{self.spec.name}", daemon=True
+        ).start()
 
     def _notify(self, method: str) -> None:
         self._send({"jsonrpc": "2.0", "method": method})
@@ -1802,8 +1932,10 @@ class McpServer:
             if not isinstance(response_id, (int, str)) or isinstance(response_id, bool):
                 return
             with self._cond:
-                self._responses[response_id] = message
-                self._cond.notify_all()
+                #  只收正在等的 id：迟到的、对不上任何请求的当场丢
+                if response_id in self._awaited:
+                    self._responses[response_id] = message
+                    self._cond.notify_all()
 
     def _post(self, payload: dict[str, Any]) -> None:
         """HTTP 传输发一条不等应答的消息（通知、对 server 反向请求的答复）。
@@ -1821,14 +1953,20 @@ class McpServer:
             self._http_failed(channel, payload.get("method"), exc)
             raise
 
-    def _roundtrip(self, payload: dict[str, Any], timeout: float) -> dict[str, Any]:
+    def _roundtrip(
+        self,
+        payload: dict[str, Any],
+        timeout: float,
+        stop_requested: Callable[[], bool] | None = None,
+    ) -> dict[str, Any]:
         """HTTP 传输的一次请求往返：POST 出去，等到这个 id 的应答为止。
 
         写锁包住整个往返：同一个 server 的请求串行（见 _HttpChannel）。往返本身
         有 timeout 这个总时限，所以排在后面的请求等得再久也有界。
         读应答放在独立线程里（_pump_exchange），本线程只看响应槽和时钟——
         应答一到就走，不等流结束；总时限一到也走，不管 server 还在不在发心跳。
-        无论怎么离开都把连接掐掉，读线程不会留在那条流上。
+        无论怎么离开都把连接掐掉，读线程不会留在那条流上。宿主叫停也是同一条
+        路：本线程放手、连接掐断；还在排队等写锁时叫停的，请求根本不发。
         """
         channel = self._http
         if channel is None:
@@ -1836,7 +1974,15 @@ class McpServer:
         method = str(payload.get("method"))
         exchange = _Exchange()
         try:
-            with self._write_lock:
+            #  排队也要看打断：占着写锁的可能是别的会话的一次慢调用
+            while not self._write_lock.acquire(
+                timeout=-1 if stop_requested is None else _STOP_POLL
+            ):
+                if stop_requested is not None and stop_requested():
+                    raise McpError(_CANCELLED_UNSENT, kind="cancelled")
+            try:
+                if stop_requested is not None and stop_requested():
+                    raise McpError(_CANCELLED_UNSENT, kind="cancelled")
                 deadline = time.monotonic() + timeout
                 threading.Thread(
                     target=self._pump_exchange,
@@ -1845,9 +1991,13 @@ class McpServer:
                     daemon=True,
                 ).start()
                 try:
-                    return self._await_reply(payload["id"], method, timeout, deadline, exchange)
+                    return self._await_reply(
+                        payload["id"], method, timeout, deadline, stop_requested, exchange
+                    )
                 finally:
                     exchange.abandon()
+            finally:
+                self._write_lock.release()
         except McpError as exc:
             self._http_failed(channel, method, exc)
             raise
@@ -2163,7 +2313,15 @@ def _make_remote_tool(
                 f"ERROR: MCP server {server.spec.name} 的当前版本不再提供 {tool_name}"
                 "（schema 缓存已过期并刷新，该工具随后会从列表消失）。换其它工具。"
             )
-        text = server.call_tool(tool_name, kwargs)
+        stop = getattr(_call_scope, "stop", None)
+        text = server.call_tool(tool_name, kwargs, stop_requested=stop)
+        if stop is not None and stop():
+            #  宿主叫停了：打断照常往上走，不折成一条普通结果让主循环接着跑。
+            #  这次调用的文本挂在异常上、由主循环写进历史——取消的说明，或恰好
+            #  赶在叫停前拿到的结果，模型下一轮都看得到
+            interrupted = Interrupted("宿主请求打断")
+            attach_partial(interrupted, lambda: text)
+            raise interrupted
         #  图片紧接着取走交给 manager 暂存：工具 handler 的返回值形状是"文本"，
         #  这条约定不为多模态破例（trace / 审批预览 / 权限规则全靠它）
         manager.stash_media(server.last_media)

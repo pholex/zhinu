@@ -7,6 +7,7 @@ stdio 部分用 sys.executable 起一个 stdlib 写的假 server（FAKE_SERVER�
 
 from __future__ import annotations
 
+import contextlib
 import io
 import json
 import sys
@@ -19,7 +20,14 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from unittest import mock
 
-from xiaoyu import mcp
+from xiaoyu import errors, mcp
+from xiaoyu.agent import Agent
+from xiaoyu.config import Config
+from xiaoyu.errors import Interrupted
+from xiaoyu.providers import Registry
+from xiaoyu.tools import Toolbox
+
+from .test_agent_paths import FakeClient, call_fragment, chunk
 
 #  假 stdio server。收到的每条消息追加写进 argv[1]（用例据此看 server 收到了什么）。
 #  工具：echo 回显 / strict 缺 text 就答 -32602 / never 永不应答 /
@@ -558,6 +566,263 @@ class HttpRoundtripTest(_HttpCase):
         server = self.make_server(timeout=5.0)
         self.assertEqual(server.call_tool("echo", {}), "应答")
         self.wait_until(lambda: not self.readers(), 3.0, "读线程没有随往返结束")
+
+
+def _later(seconds: float, action) -> threading.Timer:
+    timer = threading.Timer(seconds, action)
+    timer.daemon = True
+    timer.start()
+    return timer
+
+
+def _cancelled(messages: list[dict]) -> list[dict]:
+    return [m for m in messages if m.get("method") == "notifications/cancelled"]
+
+
+def _call_id(messages: list[dict], tool: str) -> int:
+    (request,) = [
+        m for m in messages
+        if m.get("method") == "tools/call" and m["params"]["name"] == tool
+    ]
+    return request["id"]
+
+
+class StdioInterruptTest(_StdioCase):
+    """宿主的打断只是置一个标志：在飞的调用得自己去看，看到了就放手，
+    并且告诉 server 一声。"""
+
+    def test_interrupt_stops_a_call_in_flight(self):
+        server = self.make_server(timeout=30.0)
+        stop = threading.Event()
+        _later(0.3, stop.set)
+        started = time.monotonic()
+        out = server.call_tool("never", {}, stop_requested=stop.is_set)
+        self.assertLess(time.monotonic() - started, 3.0, "调用没有被打断，是自己跑完的")
+        self.assertTrue(out.startswith("ERROR:"), out)
+        for phrase in ("本地已取消", "远端可能仍在执行", "结果未知"):
+            self.assertIn(phrase, out)
+        #  server 收到了针对这个请求的取消通知
+        self.wait_until(lambda: _cancelled(self.received()), message="server 没收到取消通知")
+        (notice,) = _cancelled(self.received())
+        self.assertEqual(notice["params"]["requestId"], _call_id(self.received(), "never"))
+        self.assertNotIn("id", notice)
+        #  连接还好好的：下一个调用照常
+        self.assertEqual(server.call_tool("echo", {"text": "还能用"}), "echo: 还能用")
+
+    def test_timeout_tells_the_server_to_stop(self):
+        server = self.make_server(timeout=0.5)
+        self.assertIn("超时", server.call_tool("never", {}))
+        self.wait_until(lambda: _cancelled(self.received()), message="超时后 server 没收到取消通知")
+        (notice,) = _cancelled(self.received())
+        self.assertEqual(notice["params"]["requestId"], _call_id(self.received(), "never"))
+
+    def test_late_answer_is_dropped_not_kept(self):
+        server = self.make_server(timeout=0.4)
+        self.assertIn("超时", server.call_tool("late", {"after": 0.9}))
+        time.sleep(1.0)
+        #  server 按顺序写 stdout：echo 的应答读到时，迟到的那条已经先过了读线程
+        self.assertEqual(server.call_tool("echo", {"text": "后面的"}), "echo: 后面的")
+        self.assertEqual(server._responses, {}, "没人等的应答留在了响应槽里")
+        self.assertEqual(server._awaited, set())
+
+    def test_stop_requested_before_sending_sends_nothing(self):
+        server = self.make_server()
+        for _ in range(mcp.McpServer._BREAKER_THRESHOLD):
+            out = server.call_tool("echo", {"text": "不该发出"}, stop_requested=lambda: True)
+            self.assertIn("本地已取消", out)
+            self.assertIn("还没有发出", out)
+        #  取消说明不了 server 的好坏：不计入熔断
+        self.assertEqual(server.call_tool("echo", {"text": "发了"}), "echo: 发了")
+        calls = [m for m in self.received() if m.get("method") == "tools/call"]
+        self.assertEqual([m["params"]["arguments"] for m in calls], [{"text": "发了"}])
+        self.assertEqual(_cancelled(self.received()), [])
+
+    def test_cancellation_wins_over_an_answer_that_arrived_at_the_same_moment(self):
+        server = _stub_server(self)
+        state = {"sent": False}
+
+        def send(payload):
+            if "id" in payload:
+                #  请求一发出应答就到：等待方看到叫停时，响应槽里已经有东西了
+                state["sent"] = True
+                server._dispatch({"jsonrpc": "2.0", "id": payload["id"], "result": {"ok": True}})
+
+        with mock.patch.object(server, "_send", side_effect=send):
+            with self.assertRaises(mcp.McpError) as caught:
+                server._request("tools/call", {}, timeout=5.0, stop_requested=lambda: state["sent"])
+        self.assertEqual(caught.exception.kind, "cancelled")
+        self.assertEqual(server._responses, {})
+
+    def test_without_a_stop_signal_calls_run_as_before(self):
+        server = self.make_server()
+        self.assertEqual(
+            server.call_tool("echo", {"text": "照常"}, stop_requested=lambda: False), "echo: 照常"
+        )
+
+
+class ToolboxInterruptTest(_StdioCase):
+    """打断标志是每个 Agent 注入到自己工具箱上的；MCP manager 却是共享的。
+    两种挂载方式（经 use_tool 转发 / 直接注册成工具）都要把标志递到在飞的调用上。"""
+
+    def toolbox(self, search: bool) -> Toolbox:
+        manager = mcp.McpManager([self.spec(timeout=30.0)])
+        manager.start()
+        self.addCleanup(manager.close)
+        manager.wait_ready(15.0)
+        #  同一个用例里第二次起 manager 会命中 schema 缓存（进程按首次调用启动）
+        self.assertIn(manager._states["fake"], ("ready", "cached"))
+        config = Config(
+            base_url="x", model="x", workspace=self.root, enable_plugins=False,
+            mcp_tool_search=search,
+        )
+        return Toolbox(config, mcp_view=mcp.McpView(manager))
+
+    def assert_interrupted(self, box: Toolbox, name: str, args: dict) -> None:
+        stop = threading.Event()
+        box.stop_requested = stop.is_set
+        _later(0.3, stop.set)
+        started = time.monotonic()
+        with self.assertRaises(Interrupted) as caught:
+            box.run(name, args)
+        self.assertLess(time.monotonic() - started, 3.0)
+        #  打断照常往上走，给模型的说明挂在异常上（主循环把它写进历史）
+        note = getattr(caught.exception, errors.PARTIAL_OUTPUT, "")
+        self.assertIn("本地已取消", note)
+        self.assertIn("远端可能仍在执行", note)
+        self.wait_until(lambda: _cancelled(self.received()), message="server 没收到取消通知")
+
+    def test_forwarded_call_is_interruptible(self):
+        box = self.toolbox(search=True)
+        self.assert_interrupted(
+            box, "use_tool", {"tool_name": "mcp__fake__never", "tool_input": {}}
+        )
+
+    def test_registered_tool_is_interruptible(self):
+        box = self.toolbox(search=False)
+        self.assertIn("mcp__fake__never", box.names())
+        self.assert_interrupted(box, "mcp__fake__never", {})
+
+    def test_calls_run_normally_with_and_without_a_stop_signal(self):
+        for search in (True, False):
+            with self.subTest(search=search):
+                box = self.toolbox(search=search)
+                name, args = (
+                    ("use_tool", {"tool_name": "mcp__fake__echo", "tool_input": {"text": "好"}})
+                    if search
+                    else ("mcp__fake__echo", {"text": "好"})
+                )
+                self.assertEqual(box.run(name, args), "echo: 好")
+                box.stop_requested = lambda: False
+                self.assertEqual(box.run(name, args), "echo: 好")
+
+    def test_registered_tool_is_not_re_registered_every_time(self):
+        """同一代的工具只注册一次：每次组装都换一个新对象，等于每轮都在重排工具表。"""
+        box = self.toolbox(search=False)
+        first = box.get("mcp__fake__echo")
+        box.schemas()
+        self.assertIs(box.get("mcp__fake__echo"), first)
+
+    def test_agent_interrupt_stops_the_call_and_history_says_what_happened(self):
+        manager = mcp.McpManager([self.spec(timeout=30.0)])
+        manager.start()
+        self.addCleanup(manager.close)
+        manager.wait_ready(15.0)
+        config = Config(
+            base_url="http://unused", model="main-model", summary_model="cheap-model",
+            explore_model="cheap-model", workspace=self.root, auto_approve=True,
+            enable_skills=False, enable_agents=False, enable_hooks=False, enable_plugins=False,
+        )
+        arguments = json.dumps({"tool_name": "mcp__fake__never", "tool_input": {}})
+        script = [[chunk(tool_calls=[call_fragment(0, "u1", "use_tool", arguments)])]]
+        agent = Agent(
+            config,
+            Toolbox(config, mcp_view=mcp.McpView(manager)),
+            registry=Registry.for_client(FakeClient(script)),
+        )
+        _later(0.5, agent.interrupt)
+        started = time.monotonic()
+        with contextlib.redirect_stdout(io.StringIO()), self.assertRaises(Interrupted):
+            agent.send("调一下那个工具")
+        self.assertLess(time.monotonic() - started, 8.0)
+        results = [m for m in agent.messages if m.get("role") == "tool"]
+        self.assertEqual(len(results), 1)
+        self.assertIn("本地已取消", results[0]["content"])
+        self.assertIn("远端可能仍在执行", results[0]["content"])
+
+
+class HttpInterruptTest(_HttpCase):
+    def test_interrupt_while_the_server_is_still_thinking(self):
+        """server 压着响应头不发（算完才一次性回 JSON 的那种）：打断不能等它。"""
+        server = self.make_server(timeout=30.0)
+        _Handler.script = ["slow"]
+        stop = threading.Event()
+        _later(0.3, stop.set)
+        started = time.monotonic()
+        out = server.call_tool("echo", {}, stop_requested=stop.is_set)
+        self.assertLess(time.monotonic() - started, 3.0)
+        self.assertIn("本地已取消", out)
+        self.assertIn("远端可能仍在执行", out)
+        self.wait_until(lambda: _cancelled(_Handler.seen), message="server 没收到取消通知")
+        (notice,) = _cancelled(_Handler.seen)
+        (request,) = [m for m in _Handler.seen if m.get("method") == "tools/call"]
+        self.assertEqual(notice["params"]["requestId"], request["id"])
+        #  写锁放开了：下一个调用不用等那个还压着的请求
+        started = time.monotonic()
+        self.assertEqual(server.call_tool("echo", {}), "应答")
+        self.assertLess(time.monotonic() - started, 2.0)
+
+    def test_interrupt_mid_stream_drops_the_connection(self):
+        server = self.make_server(timeout=30.0)
+        _Handler.script = ["silent"]
+        stop = threading.Event()
+        _later(0.3, stop.set)
+        started = time.monotonic()
+        out = server.call_tool("echo", {}, stop_requested=stop.is_set)
+        self.assertLess(time.monotonic() - started, 3.0)
+        self.assertIn("本地已取消", out)
+        self.wait_until(lambda: not self.readers(), 3.0, "读线程还挂在被放弃的流上")
+        self.assertTrue(server.alive())
+
+    def test_reader_leaves_an_abandoned_stream_even_if_the_hangup_cannot_wake_it(self):
+        """掐连接是尽力而为的（平台不一定叫得醒阻塞的读）：读线程自己每读到
+        一行也要看一眼等待方还在不在。"""
+        server = self.make_server(timeout=30.0)
+        _Handler.script = ["silent"]
+        stop = threading.Event()
+        _later(0.3, stop.set)
+        with mock.patch.object(mcp, "_hang_up", lambda response: None):
+            out = server.call_tool("echo", {}, stop_requested=stop.is_set)
+            self.assertIn("本地已取消", out)
+            self.wait_until(lambda: not self.readers(), 3.0, "读线程跟着心跳一直读下去了")
+
+    def test_timeout_tells_the_server_to_stop(self):
+        server = self.make_server(timeout=0.8)
+        _Handler.script = ["silent"]
+        self.assertIn("超时", server.call_tool("echo", {}))
+        self.wait_until(lambda: _cancelled(_Handler.seen), message="超时后 server 没收到取消通知")
+
+    def test_interrupt_while_queued_behind_another_call_sends_nothing(self):
+        server = self.make_server(timeout=30.0)
+        _Handler.script = ["slow"]
+        first: list[str] = []
+        holder = threading.Thread(
+            target=lambda: first.append(server.call_tool("echo", {})), daemon=True
+        )
+        holder.start()
+        self.wait_until(
+            lambda: any(m.get("method") == "tools/call" for m in _Handler.seen),
+            message="占位的那次调用没发出去",
+        )
+        stop = threading.Event()
+        _later(0.3, stop.set)
+        started = time.monotonic()
+        out = server.call_tool("echo", {}, stop_requested=stop.is_set)
+        self.assertLess(time.monotonic() - started, 3.0, "排队等写锁时停不下来")
+        self.assertIn("还没有发出", out)
+        self.assertEqual(len([m for m in _Handler.seen if m.get("method") == "tools/call"]), 1)
+        _Handler.release.set()
+        holder.join(10.0)
+        self.assertEqual(first, ["迟到的应答"])
 
 
 if __name__ == "__main__":
