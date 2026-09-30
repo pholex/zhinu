@@ -18,8 +18,8 @@ from pathlib import Path
 from typing import Any
 
 from . import (
-    __version__, command_check, envprobe, keys, media, modes, peers, providers, skills,
-    terminal, ui,
+    __version__, command_check, envprobe, errors, keys, media, modes, peers, providers,
+    skills, terminal, ui,
 )
 from .agent import Agent
 from .banner import build_banner
@@ -3070,6 +3070,17 @@ def run_once(
             print(ui.warning("\n[已中断]"))
             return 130
         error = "interrupted"
+    except errors.ContentFiltered as exc:
+        #  服务端拒答不是故障，更不是小羽自己的 bug：text 模式也不该甩 traceback。
+        #  说清被拒了、照常收场（后台任务、用量），退出码 1
+        if agent.session_log:
+            agent.session_log.event("error", error=f"ContentFiltered: {exc}")
+        #  text 给人看，带上"重发也没用"那句；JSON 沿用「类型名: 文案」的形状
+        error = (
+            errors.classify(exc).hint
+            if output_format == "text"
+            else f"ContentFiltered: {exc}"
+        )
     except Exception as exc:  # noqa: BLE001 - JSON 消费方要结构化错误，不是 traceback
         if agent.session_log:
             agent.session_log.event("error", error=f"{type(exc).__name__}: {exc}")
@@ -3084,11 +3095,11 @@ def run_once(
     terminated = terminate_background_commands(agent)
 
     if output_format == "text":
-        if output_schema is not None:
-            if agent.structured_output is not None:
-                print(json.dumps(agent.structured_output, ensure_ascii=False), flush=True)
-            else:
-                print(ui.error(f"[{error}]"), file=sys.stderr)
+        if output_schema is not None and agent.structured_output is not None:
+            print(json.dumps(agent.structured_output, ensure_ascii=False), flush=True)
+        if error:
+            #  走 stderr：stdout 可能正被管道接去当结果用
+            print(ui.error(f"[{error}]"), file=sys.stderr)
         if terminated:
             #  走 stderr：stdout 可能正被管道接去当结果用
             listed = "\n".join(

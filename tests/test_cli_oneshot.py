@@ -32,6 +32,7 @@ from xiaoyu.cli import (
     run_once,
     split_resume_positionals,
 )
+from xiaoyu.errors import ContentFiltered
 from xiaoyu.events import ToolCompleted
 from xiaoyu.permissions import Permissions
 from xiaoyu.render import JsonlSink, NullSink
@@ -272,6 +273,38 @@ class RunOnceTest(unittest.TestCase):
     def test_text_error_still_raises(self) -> None:
         with self.assertRaises(RuntimeError):
             run_once(StubAgent(exc=RuntimeError("x")), "干活", "text")
+
+    def test_text_refusal_reports_cleanly_instead_of_traceback(self) -> None:
+        """服务端拒答不是故障：text 模式说清原因、退出码 1，不往外抛。"""
+        logged: list[str] = []
+        agent = StubAgent(exc=ContentFiltered("服务端拒绝了这次请求"))
+        agent.session_log.event = lambda kind, **kw: logged.append(kw.get("error", ""))
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            code = run_once(agent, "干活", "text")
+        self.assertEqual(code, 1)
+        self.assertIn("服务端拒绝了这次请求", err.getvalue())
+        self.assertIn("请调整请求内容", err.getvalue())
+        #  原因只进 stderr：stdout 可能正被管道接去当结果用
+        self.assertNotIn("服务端拒绝了这次请求", out.getvalue())
+        #  收场照常：用量仍打出来，会话日志留痕
+        self.assertIn("次模型调用", out.getvalue())
+        self.assertEqual(logged, ["ContentFiltered: 服务端拒绝了这次请求"])
+
+    def test_json_refusal_keeps_type_prefix(self) -> None:
+        code, out = self.run_capture(StubAgent(exc=ContentFiltered("被拦了")), "json")
+        self.assertEqual(code, 1)
+        self.assertEqual(json.loads(out)["error"], "ContentFiltered: 被拦了")
+
+    def test_text_schema_missing_still_reported_on_stderr(self) -> None:
+        agent = StubAgent()
+        agent.set_output_schema = lambda schema: None
+        agent.structured_output = None
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            code = run_once(agent, "干活", "text", {"type": "object"})
+        self.assertEqual(code, 1)
+        self.assertIn("没有按 --output-schema", err.getvalue())
 
 
 class HeadlessDenyTest(unittest.TestCase):
