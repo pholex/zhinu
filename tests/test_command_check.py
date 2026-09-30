@@ -125,6 +125,29 @@ class DangerousCommandTest(unittest.TestCase):
         ):
             self.assertIsNotNone(dangerous_command(command), command)
 
+    def test_runners_are_stripped(self):
+        """透传运行器跑的就是后面那条命令。选项不查表：选项后面那个词按值 / 命令两种都扫。"""
+        for command in (
+            "uv run rm -rf /tmp/x",
+            "npx rm -rf /tmp/x",
+            "poetry run rm -rf /tmp/x",
+            "pnpm dlx rm -rf /tmp/x",
+            "uv run --with x rm -rf /tmp/x",
+            "uv -q run rm -rf /tmp/x",
+            "uv --directory /tmp run rm -rf /tmp/x",
+            "npx -y rm -rf /tmp/x",
+            "npm exec -- rm -rf /tmp/x",
+            "uv run sudo rm -rf /tmp/x",
+            "timeout 5 uv run rm -rf /tmp/x",
+            "uv run bash -c 'rm -rf /tmp/x'",
+            "uv run uv run rm -rf /tmp/x",
+        ):
+            self.assertIsNotNone(dangerous_command(command), command)
+        self.assertIsNotNone(privileged_command("uv run sudo ls"))
+        for command in ("uv run pytest", "uv run rm /tmp/x", "uv pip install rm",
+                        "uv run -- pytest", "npx eslint ."):
+            self.assertIsNone(dangerous_command(command), command)
+
     def test_compound_segments_are_scanned(self):
         self.assertIsNotNone(dangerous_command("echo hi && rm -rf /tmp/x"))
         self.assertIsNotNone(dangerous_command("printf x | xargs rm -rf"))
@@ -204,6 +227,13 @@ class WrapperPeelingTest(unittest.TestCase):
         self.assertIsNotNone(injection_risk("su -c 'git status'"))
         self.assertIsNone(injection_risk("timeout 60 git status"))
         self.assertIsNone(injection_risk("nice -n 10 make"))
+
+    def test_runner_does_not_hide_injection(self):
+        self.assertIsNotNone(injection_risk("uv run git -c core.pager=sh log"))
+        self.assertIsNotNone(injection_risk("uv run --with x git -c core.pager=sh log"))
+        self.assertIsNotNone(injection_risk("npx xargs rm"))
+        self.assertIsNone(injection_risk("uv run git status"))
+        self.assertIsNone(injection_risk("npx eslint ."))
 
 
 class WrapperTableTest(unittest.TestCase):
