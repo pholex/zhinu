@@ -93,6 +93,46 @@ class SpillRecallTest(unittest.TestCase):
         out = self.box.run("recall", {"id": "1"})
         self.assertIn("已不可读", out)
 
+    # ---------- 历史是接进来的：里面点过名的 id 不属于这个工具箱 ----------
+
+    def _foreign_history(self) -> list[dict]:
+        return [
+            {"role": "user", "content": "跑测试"},
+            {"role": "tool", "tool_call_id": "c1",
+             "content": "[输出超长：原始 9 字符，完整内容已存，召回 id: 1。以下保留开头和结尾]\n旧输出"},
+            {"role": "tool", "tool_call_id": "c2", "content": "… [中间省略 5 字符，完整内容见召回 id 3] …"},
+        ]
+
+    def test_adopted_ids_never_resolve_to_new_content(self):
+        """接回的历史说"召回 id: 1"——这边新落的盘不能再编出个 1 来冒名顶替。"""
+        self.box.adopt_history(self._foreign_history())
+        preview = self._spill_big()
+        self.assertIn("召回 id: 4", preview)  # 从历史里的最大号之后起编
+        for stale in ("1", "3"):
+            out = self.box.run("recall", {"id": stale})
+            self.assertIn("带进来的历史", out)
+            self.assertNotIn("NEEDLE", out)
+        self.assertIn("NEEDLE", self.box.run("recall", {"id": "4"}))
+
+    def test_adopting_drops_this_boxs_earlier_spills(self):
+        """同一进程里先聊过一段、再接回别的会话：先前编的 1 也不能留着。"""
+        self._spill_big()
+        self.box.adopt_history(self._foreign_history())
+        out = self.box.run("recall", {"id": "1"})
+        self.assertIn("带进来的历史", out)
+        self.assertNotIn("NEEDLE", out)
+
+    def test_recall_stays_visible_after_adopting_history_with_ids(self):
+        self.box.adopt_history(self._foreign_history())
+        names = {schema["function"]["name"] for schema in self.box.schemas()}
+        self.assertIn("recall", names)
+
+    def test_adopting_history_without_ids_changes_nothing(self):
+        self.box.adopt_history([{"role": "user", "content": "hi"}])
+        names = {schema["function"]["name"] for schema in self.box.schemas()}
+        self.assertNotIn("recall", names)
+        self.assertIn("召回 id: 1", self._spill_big())
+
 
 if __name__ == "__main__":
     unittest.main()

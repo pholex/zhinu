@@ -45,6 +45,7 @@ from .compaction import (
     age_tool_images,
     is_degenerate_summary,
     microcompact,
+    plan_from_history,
 )
 from .config import EFFORT_LEVELS, Config
 from .errors import Interrupted, classify
@@ -2080,6 +2081,11 @@ class Agent:
             self.messages, _ = age_tool_images(self.messages)
             #  整段历史是装进来的，不是这个会话一条条长出来的：按改写计
             self._history_rewritten()
+            #  挂在历史旁边、只活在内存里的两样状态跟着接回：历史里点过名的召回
+            #  id 作废（它们的落盘内容属于上一个进程），计划从历史里找回
+            self.toolbox.adopt_history(self.messages)
+            if not self.plan:
+                self.plan = plan_from_history(self.messages)
         if self.session_log and source:
             self.session_log.event("resumed_from", source=source)
         if source and (runs := getattr(self, "subagent_runs", None)) is not None:

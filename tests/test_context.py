@@ -13,6 +13,8 @@ from xiaoyu.compaction import (
     Compactor,
     anchor_index,
     collect_user_voice,
+    plan_from_history,
+    plan_snapshot,
     is_degenerate_summary,
     render,
     sanitize_summary,
@@ -895,6 +897,65 @@ class TestAgentPlanSurvivesCompaction(AgentTestCase):
         head = agent.messages[1]["content"]
         self.assertIn("[in_progress] 补上 div 的除零", head)
         self.assertIn("[pending] 跑一遍测试", head)
+
+
+class TestPlanFromHistory(unittest.TestCase):
+    """计划只活在内存里：接回历史后要能从历史本身找回来。"""
+
+    PLAN = TestPlanSnapshot.PLAN
+
+    def call(self, call_id: str, plan: list, ok: bool = True) -> list[dict]:
+        import json
+
+        return [
+            {"role": "assistant", "content": "", "tool_calls": [
+                {"id": call_id, "type": "function",
+                 "function": {"name": "update_plan", "arguments": json.dumps({"plan": plan})}}]},
+            {"role": "tool", "tool_call_id": call_id,
+             "content": "已更新计划" if ok else "ERROR: 第 1 项的 status 是 'done'"},
+        ]
+
+    def test_latest_successful_call_wins(self) -> None:
+        first = [{"step": "读代码", "status": "in_progress"}]
+        history = [
+            {"role": "user", "content": "任务"},
+            *self.call("p1", first),
+            *self.call("p2", self.PLAN),
+            *self.call("p3", [{"step": "写坏的", "status": "done"}], ok=False),
+        ]
+        self.assertEqual(plan_from_history(history), self.PLAN)
+
+    def test_snapshot_in_compaction_head_is_read_back(self) -> None:
+        head = "原始任务\n\n" + CONTEXT_PREFIX + "摘要正文" + plan_snapshot(self.PLAN) + "\n\n[别的附注]"
+        history = [{"role": "user", "content": head}, {"role": "assistant", "content": "继续"}]
+        self.assertEqual(plan_from_history(history), self.PLAN)
+
+    def test_call_after_the_snapshot_beats_it(self) -> None:
+        newer = [{"step": "跑一遍测试", "status": "in_progress"}]
+        head = CONTEXT_PREFIX + "摘要" + plan_snapshot(self.PLAN)
+        history = [{"role": "user", "content": head}, *self.call("p9", newer)]
+        self.assertEqual(plan_from_history(history), newer)
+
+    def test_nothing_to_find(self) -> None:
+        self.assertEqual(plan_from_history([{"role": "user", "content": "hi"}]), [])
+
+
+class TestAgentRestoreRecoversSidecars(AgentTestCase):
+    def test_plan_and_recall_ids_follow_the_restored_history(self) -> None:
+        history = [
+            {"role": "user", "content": "任务"},
+            *TestPlanFromHistory().call("p1", TestPlanSnapshot.PLAN),
+            {"role": "assistant", "content": "", "tool_calls": [
+                {"id": "b1", "type": "function", "function": {"name": "bash", "arguments": "{}"}}]},
+            {"role": "tool", "tool_call_id": "b1", "content": "[输出超长，完整内容已存，召回 id: 2。]"},
+            {"role": "assistant", "content": "好"},
+        ]
+        agent = self.build([])
+        with contextlib.redirect_stdout(io.StringIO()):
+            agent.restore(history)
+        self.assertEqual(agent.plan, TestPlanSnapshot.PLAN)
+        out = agent.toolbox.run("recall", {"id": "2"})
+        self.assertIn("带进来的历史", out)
 
 
 if __name__ == "__main__":

@@ -572,6 +572,8 @@ def _shell_argv(command: str) -> list[str]:
 
 
 _URL_PATTERN = re.compile(r"https?://\S+")
+#  工具输出里点到召回 id 的几种写法（见 _bound_output / _recall 的文案）
+_RECALL_ID_MENTION = re.compile(r"召回 id[:：]?\s*(\d+)")
 _AUTH_KEYWORDS = (
     "浏览器",
     "扫码",
@@ -1125,6 +1127,10 @@ class Toolbox:
         #  短 id，中段随时用 recall(id, ...) 按需取回——id 只有一两个字符，压缩
         #  丢了 60 字符的临时路径也不影响召回（addressable recall）
         self._spills: dict[str, dict[str, Any]] = {}
+        #  接进来的历史（resume / fork / 精简副本）里提到过的最大召回 id：那些 id
+        #  是别的进程或别的工具箱落的盘，这里取不回。本工具箱的新 id 从它之后
+        #  起编，≤ 它又不在 _spills 里的一律明说取不回（见 adopt_history）
+        self._foreign_recall_ids = 0
         #  连续 read_file 次数，用于引导改用 explore
         self._read_streak = 0
         #  非 MCP 工具产出的图片（浏览器桥的截图等）：与 MCP 那份一起由 take_media 取走
@@ -1730,7 +1736,9 @@ class Toolbox:
                 },
                 handler=self._recall,
                 requires_approval=False,
-                check_fn=lambda: bool(self._spills),
+                #  接回的历史里点过名的 id 也要有个去处：工具不在表里的话，模型
+                #  照着旧预览调 recall 只会得到一句"没有这个工具"
+                check_fn=lambda: bool(self._spills) or self._foreign_recall_ids > 0,
             )
         )
         self.register(
@@ -2865,6 +2873,25 @@ class Toolbox:
         except OSError:
             return None
 
+    def adopt_history(self, messages: list[dict[str, Any]]) -> None:
+        """历史是接进来的（resume / fork / 精简副本）时调用：把里面的召回 id 作废。
+
+        召回 id 是每个工具箱从 1 起编的序号，落盘内容随进程清理。接回的历史里
+        那句"召回 id: 1"指的是上一个进程的文件——不处理的话，这边新落一次盘
+        又编出个 1，模型照旧预览去召回，拿到的是另一条命令的输出，而且没有
+        任何迹象。所以：已有的登记清掉（它们属于被换掉的那段对话），新 id 从
+        历史里出现过的最大号之后起编。
+        """
+        highest = 0
+        for message in messages:
+            if message.get("role") != "tool":
+                continue
+            for found in _RECALL_ID_MENTION.finditer(media.text_of(message.get("content"))):
+                highest = max(highest, int(found.group(1)))
+        self._spills.clear()
+        self._spill_seq = max(self._spill_seq, highest)
+        self._foreign_recall_ids = self._spill_seq
+
     def _bound_output(self, name: str, text: str) -> str:
         """超长输出：完整落盘 + 内联留头尾预览和取回定位符（spill）。
 
@@ -2917,6 +2944,13 @@ class Toolbox:
         meta = self._spills.get(str(id).strip())
         if meta is None:
             avail = "、".join(self._spills) or "（无）"
+            wanted = str(id).strip()
+            if wanted.isdigit() and 0 < int(wanted) <= self._foreign_recall_ids:
+                return (
+                    f"ERROR: 召回 id {id} 是带进来的历史里留下的，它的内容落盘在"
+                    "别的进程或别的会话里，这里取不回。还需要这份输出的话只能重跑"
+                    f"原命令。当前可用 id：{avail}"
+                )
             return f"ERROR: 没有召回 id {id}。可用 id：{avail}"
         try:
             text = Path(meta["path"]).read_text(encoding="utf-8", errors="replace")

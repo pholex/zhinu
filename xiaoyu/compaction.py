@@ -12,6 +12,7 @@
 
 from __future__ import annotations
 
+import json
 import re
 import time
 from dataclasses import dataclass
@@ -304,9 +305,65 @@ def plan_snapshot(plan: list[dict[str, str]] | None) -> str:
         return ""
     lines = [f"- [{item.get('status')}] {item['step']}" for item in items]
     return (
-        "\n\n【当前计划】以下是压缩时刻计划的原文（机械附加，未经改写）。"
+        f"\n\n{_PLAN_SNAPSHOT_HEAD}（机械附加，未经改写）。"
         "继续时沿用它推进、用 update_plan 更新状态，不要重列：\n" + "\n".join(lines)
     )
+
+
+_PLAN_SNAPSHOT_HEAD = "【当前计划】以下是压缩时刻计划的原文"
+_PLAN_SNAPSHOT_LINE = re.compile(r"^- \[(pending|in_progress|completed)\] (.+)$")
+_PLAN_STATUSES = ("pending", "in_progress", "completed")
+
+
+def plan_from_history(messages: list[dict[str, Any]]) -> list[dict[str, str]]:
+    """从一段历史里找回当前计划；找不到返回空表。
+
+    计划只活在内存里，接回历史（resume）的新进程里是空的——下一次压缩就不再
+    附计划快照，模型只剩摘要里的转述。历史里有两处逐字记录，从后往前谁先
+    出现谁就是最新的：成功的 update_plan 调用参数，或压缩头里的计划快照。
+    """
+    succeeded = {
+        message.get("tool_call_id")
+        for message in messages
+        if message.get("role") == "tool"
+        and media.text_of(message.get("content")).startswith("已更新计划")
+    }
+    for message in reversed(messages):
+        role = message.get("role")
+        if role == "assistant":
+            for call in reversed(message.get("tool_calls") or []):
+                function = call.get("function") or {}
+                if function.get("name") != "update_plan" or call.get("id") not in succeeded:
+                    continue
+                try:
+                    items = json.loads(function.get("arguments") or "{}").get("plan")
+                except (ValueError, AttributeError):
+                    continue
+                plan = [
+                    {"step": item["step"].strip(), "status": item["status"]}
+                    for item in items or []
+                    if isinstance(item, dict)
+                    and isinstance(item.get("step"), str)
+                    and item["step"].strip()
+                    and item.get("status") in _PLAN_STATUSES
+                ]
+                if plan:
+                    return plan
+        elif role == "user":
+            text = media.text_of(message.get("content"))
+            if _PLAN_SNAPSHOT_HEAD not in text:
+                continue
+            plan = []
+            for line in text.split(_PLAN_SNAPSHOT_HEAD, 1)[1].splitlines()[1:]:
+                found = _PLAN_SNAPSHOT_LINE.match(line)
+                if not found:
+                    if plan:
+                        break
+                    continue
+                plan.append({"step": found.group(2).strip(), "status": found.group(1)})
+            if plan:
+                return plan
+    return []
 
 
 def split_head(content: str) -> tuple[str, str]:

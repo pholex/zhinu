@@ -927,6 +927,10 @@ def execute_delegation(
         sub_agent.messages[0]["content"] = system_text
         #  精简副本直接作为起始历史：进存档随 resume 续用，无需额外登记
         sub_agent.messages.extend(seed)
+    if record is not None or seed:
+        #  带进来的历史里点过名的召回 id 是别的工具箱落的盘，这边取不回；
+        #  不作废的话会和子 agent 自己新编的 id 撞号
+        sub_agent.toolbox.adopt_history(sub_agent.messages)
     #  继承来的历史（fork / 精简副本 / resume 存档）末尾可能已有别人的答复：
     #  本次一个字没产出时，不能把它当成本次的结论（或失败前的部分结论）交回去
     inherited_answer = sub_agent.last_assistant_text()
