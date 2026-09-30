@@ -7,10 +7,12 @@ stdio 部分用 sys.executable 起一个 stdlib 写的假 server（FAKE_SERVER�
 
 from __future__ import annotations
 
+import io
 import json
 import sys
 import tempfile
 import textwrap
+import threading
 import time
 import unittest
 from pathlib import Path
@@ -20,7 +22,8 @@ from xiaoyu import mcp
 
 #  假 stdio server。收到的每条消息追加写进 argv[1]（用例据此看 server 收到了什么）。
 #  工具：echo 回显 / strict 缺 text 就答 -32602 / never 永不应答 /
-#  late 过 after 秒才应答 / nest 先吐一帧深嵌套 JSON 再正常应答
+#  late 过 after 秒才应答 / nest 先吐一帧深嵌套 JSON 再正常应答。
+#  argv[2] == "deep" 时 tools/list 里多一个 schema 嵌套 300 层的工具
 FAKE_SERVER = textwrap.dedent(
     r"""
     import json, sys, threading
@@ -46,6 +49,12 @@ FAKE_SERVER = textwrap.dedent(
          "inputSchema": {"type": "object", "properties": {}}}
         for name in ("echo", "strict", "never", "late", "nest")
     ]
+    if sys.argv[2:] == ["deep"]:
+        schema = {"type": "string"}
+        for _ in range(300):
+            schema = {"type": "array", "items": schema}
+        TOOLS.append({"name": "deep", "description": "deep",
+                      "inputSchema": {"type": "object", "properties": {"x": schema}}})
 
     for line in sys.stdin:
         line = line.strip()
@@ -99,11 +108,11 @@ class _StdioCase(unittest.TestCase):
         patcher.start()
         self.addCleanup(patcher.stop)
 
-    def spec(self, timeout: float = 10.0, name: str = "fake") -> mcp.ServerSpec:
+    def spec(self, timeout: float = 10.0, mode: str = "") -> mcp.ServerSpec:
         return mcp.ServerSpec(
-            name=name,
+            name="fake",
             command=sys.executable,
-            args=[str(self.script), str(self.log)],
+            args=[str(self.script), str(self.log), *([mode] if mode else [])],
             timeout=timeout,
         )
 
@@ -186,6 +195,148 @@ class BreakerCountsOnlyServerTroubleTest(_StdioCase):
                 server.call_tool("t", {})
         with mock.patch.object(server, "_request", return_value={"content": []}):
             self.assertNotIn("熔断", server.call_tool("t", {}))
+
+
+DEEP_FRAME = "[" * 200000 + "]" * 200000
+
+
+class ReaderSurvivesBadFramesTest(_StdioCase):
+    """读线程是这条连接唯一的耳朵：一帧解析不了只丢这一帧；真读不下去了
+    就按断线收场，不能留下"进程活着、没人读、也没判死"的状态。"""
+
+    def test_deeply_nested_frame_costs_one_frame_not_the_server(self):
+        server = self.make_server(timeout=5.0)
+        started = time.monotonic()
+        self.assertEqual(server.call_tool("nest", {}), "坏帧之后的应答")
+        self.assertLess(time.monotonic() - started, 4.0, "调用是等满超时才回来的")
+        #  读线程还在：之后的调用照常有人接
+        self.assertEqual(server.call_tool("echo", {"text": "还在"}), "echo: 还在")
+
+    def test_reader_that_cannot_go_on_is_treated_as_a_disconnect(self):
+        server = self.make_server(timeout=8.0)
+        disconnected = threading.Event()
+        server.on_disconnect = disconnected.set
+        real_loads = json.loads
+
+        def loads(text, *args, **kwargs):
+            if isinstance(text, str) and "poison" in text:
+                raise RuntimeError("解析器内部出错")
+            return real_loads(text, *args, **kwargs)
+
+        started = time.monotonic()
+        with mock.patch.object(mcp.json, "loads", side_effect=loads):
+            out = server.call_tool("echo", {"text": "poison"})
+        self.assertLess(time.monotonic() - started, 6.0, "在等的请求没被唤醒，干等到了超时")
+        self.assertIn("进程已退出", out)
+        self.assertTrue(disconnected.wait(5.0), "没有报断线：没人会去重连")
+        self.wait_until(lambda: not server.alive(), message="没人读的进程还留着")
+
+    def test_unparseable_sse_event_is_skipped(self):
+        reply = {"jsonrpc": "2.0", "id": 1, "result": {}}
+        body = f"data: {DEEP_FRAME}\n\ndata: {json.dumps(reply)}\n\n".encode()
+        self.assertEqual(list(mcp._read_sse(io.BytesIO(body))), [reply])
+
+
+def _deep_tool(depth: int) -> dict:
+    schema: dict = {"type": "string"}
+    for _ in range(depth):
+        schema = {"type": "array", "items": schema}
+    return {"name": "deep", "description": "d",
+            "inputSchema": {"type": "object", "properties": {"x": schema}}}
+
+
+class DeclarationDepthTest(unittest.TestCase):
+    PLAIN = {"name": "plain", "description": "d",
+             "inputSchema": {"type": "object", "properties": {}}}
+
+    def test_realistic_nesting_is_accepted(self):
+        self.assertIsNone(mcp.declared_violation([self.PLAIN, _deep_tool(20)]))
+
+    def test_excessive_nesting_rejects_the_whole_list(self):
+        #  5000 层：量深度的函数自己要是递归的，这里先栈溢出
+        reason = mcp.declared_violation([self.PLAIN, _deep_tool(5000)])
+        self.assertIsNotNone(reason)
+        self.assertIn("嵌套", reason)
+        self.assertIn("deep", reason)
+
+
+class BootThreadFailureTest(_StdioCase):
+    """启动线程出任何事都要落到一个终态：状态 failed 带原因、子进程收掉、
+    不留"基线写了、工具没注册"的半截。"""
+
+    def boot(self, mode: str = "", wait: float = 8.0) -> tuple[mcp.McpManager, list[mcp.McpServer]]:
+        created: list[mcp.McpServer] = []
+
+        class Recording(mcp.McpServer):
+            def __init__(self, *args, **kwargs):
+                super().__init__(*args, **kwargs)
+                created.append(self)
+
+        manager = mcp.McpManager([self.spec(mode=mode)])
+        self.addCleanup(manager.close)
+        with mock.patch.object(mcp, "McpServer", Recording):
+            manager.start()
+            manager.wait_ready(wait)
+        return manager, created
+
+    def baseline_file(self) -> Path:
+        return self.root / "userconf" / "mcp-approved.json"
+
+    def assert_reaped(self, servers: list[mcp.McpServer]) -> None:
+        self.assertEqual(len(servers), 1)
+        proc = servers[0]._proc
+        self.assertIsNotNone(proc)
+        self.wait_until(lambda: proc.poll() is not None, message="启动失败的 server 进程没被收掉")
+
+    def test_over_deep_schema_fails_the_server_with_a_reason(self):
+        manager, servers = self.boot(mode="deep")
+        state = manager._states["fake"]
+        self.assertTrue(state.startswith("failed"), state)
+        self.assertIn("嵌套", state)
+        #  整代拒绝：不是丢掉那一个工具后带着其余的继续
+        self.assertEqual(manager.ready_tools(), [])
+        self.assertFalse(self.baseline_file().exists(), "非法的一代不该落进基线")
+        self.assert_reaped(servers)
+
+    def test_unexpected_error_while_registering_lands_in_failed_state(self):
+        with mock.patch.object(mcp, "_make_remote_tool", side_effect=RuntimeError("建工具时出错")):
+            manager, servers = self.boot(wait=6.0)
+        self.assertFalse(manager.loading(), "状态停在 loading：wait_ready 每次都要等满超时")
+        state = manager._states["fake"]
+        self.assertTrue(state.startswith("failed"), state)
+        self.assertIn("建工具时出错", state)
+        self.assertEqual(manager.ready_tools(), [])
+        self.assertEqual(manager._baseline, {})
+        self.assertFalse(self.baseline_file().exists(), "工具没建成，基线却已经落盘")
+        self.assert_reaped(servers)
+
+    def test_failed_build_leaves_the_previous_generation_and_baseline_untouched(self):
+        manager, _ = self.boot()
+        self.assertEqual(manager._states["fake"], "ready")
+        server = manager._servers["fake"]
+        names = [tool.name for tool in manager.ready_tools()]
+        on_disk = self.baseline_file().read_text(encoding="utf-8")
+        in_memory = json.loads(json.dumps(manager._baseline))
+        grown = [*server.live_declared,
+                 {"name": "brand_new", "description": "新工具",
+                  "inputSchema": {"type": "object", "properties": {}}}]
+        with mock.patch.object(mcp, "_make_remote_tool", side_effect=RuntimeError("建工具时出错")):
+            with manager._lock, self.assertRaises(RuntimeError):
+                manager._swap_generation_locked("fake", server, grown)
+        self.assertEqual(manager._baseline, in_memory)
+        self.assertEqual(self.baseline_file().read_text(encoding="utf-8"), on_disk)
+        self.assertEqual(manager._declared["fake"], server.live_declared)
+        self.assertEqual([tool.name for tool in manager.ready_tools()], names)
+        self.assertEqual(manager.ready_tools()[0].handler(text="上一代还在"), "echo: 上一代还在")
+
+    def test_a_good_generation_still_writes_the_baseline(self):
+        """落笔挪到建工具之后，成功路径照样要把首见的指纹记下来。"""
+        manager, _ = self.boot()
+        recorded = json.loads(self.baseline_file().read_text(encoding="utf-8"))
+        self.assertEqual(
+            sorted(recorded["fake"]), ["echo", "late", "nest", "never", "strict"]
+        )
+        self.assertEqual(len(manager.ready_tools()), 5)
 
 
 if __name__ == "__main__":

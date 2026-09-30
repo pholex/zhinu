@@ -747,17 +747,51 @@ def public_tool_name(server: str, tool: str) -> str:
     return normalized[: _NAME_CAP - _NAME_HASH_LEN - 1] + "_" + digest
 
 
+#  一个工具声明（连同它的 inputSchema）的容器嵌套上限。真实 schema 十几层到头；
+#  成百上千层的只会出自坏掉或恶意的 server——指纹、归一、落盘缓存都要递归走
+#  一遍这棵树，放进来就是在启动线程里栈溢出
+_DECLARATION_DEPTH_CAP = 64
+
+
+def _nested_beyond(node: Any, cap: int) -> bool:
+    """node（JSON 值）的对象/数组嵌套是否超过 cap 层。
+
+    显式栈遍历：量深度的函数自己不能靠递归。
+    """
+    stack = [(node, 1)]
+    while stack:
+        current, depth = stack.pop()
+        if isinstance(current, dict):
+            children: Any = current.values()
+        elif isinstance(current, list):
+            children = current
+        else:
+            continue
+        if depth > cap:
+            return True
+        stack.extend((child, depth + 1) for child in children)
+    return False
+
+
 def declared_violation(declared: list[dict[str, Any]]) -> str | None:
-    """一代工具声明的合法性：同 server 重名 → 整个列表非法。
+    """一代工具声明的合法性：同 server 重名、声明嵌套过深 → 整个列表非法。
 
     重名不是"挑一个注册"能修的：两个声明争一个确定性名字，任选其一都是
-    静默影蔽。返回原因文本；合法返回 None。
+    静默影蔽。嵌套过深同样整代拒绝而不是只丢那一个工具：会发这种声明的
+    server 已经不可信，悄悄少一个工具继续用，用户连出过事都不知道。
+    返回原因文本；合法返回 None。
     """
     names = [str(item.get("name", "")) for item in declared]
     duplicates = {name for name in names if names.count(name) > 1}
     if duplicates:
         shown = ", ".join(sorted(duplicates)[:3])
         return f"server 在 tools/list 里重复列出同名工具（{shown}），整个工具列表判非法"
+    for item in declared:
+        if _nested_beyond(item, _DECLARATION_DEPTH_CAP):
+            return (
+                f"工具 {str(item.get('name', ''))[:40]!r} 的声明嵌套超过 "
+                f"{_DECLARATION_DEPTH_CAP} 层，整个工具列表判非法"
+            )
     return None
 
 
@@ -1014,7 +1048,8 @@ def _read_sse(response: Any) -> "Iterator[dict[str, Any]]":
     等于要等流结束——而那条流本来就不会结束。POST 那边 list() 一下即可。
 
     多行 data 按规范用 \n 拼接。解析不出 JSON 的块跳过——server 拿注释行做
-    心跳是常见做法，不该把心跳当协议错误。
+    心跳是常见做法，不该把心跳当协议错误。嵌套深到解析器放弃的一块
+    （RecursionError）同样只丢这一块，不连累整条流。
 
     内存有界：readline 带上限按块读，没有换行的超长行也只会一块一块进来；
     一个事件（上一个空行之后读到的全部字节）超过 _SSE_EVENT_CAP 即拒收。
@@ -1047,7 +1082,7 @@ def _read_sse(response: Any) -> "Iterator[dict[str, Any]]":
             if buffer:
                 try:
                     message = json.loads("\n".join(buffer))
-                except json.JSONDecodeError:
+                except (ValueError, RecursionError):
                     message = None
                 if isinstance(message, dict):
                     yield message
@@ -1062,7 +1097,7 @@ def _read_sse(response: Any) -> "Iterator[dict[str, Any]]":
     if buffer:
         try:
             message = json.loads("\n".join(buffer))
-        except json.JSONDecodeError:
+        except (ValueError, RecursionError):
             message = None
         if isinstance(message, dict):
             yield message
@@ -1582,25 +1617,36 @@ class McpServer:
         一切写共享状态/发回调的动作都带 `self._proc is proc` 代际守卫：restart
         换代后，旧读线程迟到的 EOF 不能把新一代标死，迟到的响应也不能污染
         新一代的 id 空间（restart 会把 id 归零）。
+
+        不变量：读线程不管怎么离开读循环，都走到下面同一段收尾（判死、唤醒
+        等待方、报断线）。"进程活着、没人读、也没判死"是最坏的状态——在等的
+        请求各自干等到超时，此后每次调用都一样，也没有人去重连。
         """
         proc = self._proc
         assert proc is not None and proc.stdout is not None
-        for line in proc.stdout:
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                message = json.loads(line)
-            except json.JSONDecodeError:
-                #  server 把日志错打到 stdout 是常见毛病，跳过非 JSON 行
-                continue
-            if not isinstance(message, dict):
-                continue
-            try:
-                self._dispatch(message, generation=proc)
-            except Exception:  # noqa: BLE001 - 一帧畸形降级的是这一帧，不是整条连接
-                #  读线程死了的话 server 不会被标死，在等的请求只能干等到超时
-                continue
+        try:
+            for line in proc.stdout:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    message = json.loads(line)
+                except (ValueError, RecursionError):
+                    #  server 把日志错打到 stdout 是常见毛病，跳过非 JSON 行。
+                    #  嵌套深到解析器放弃的一帧（RecursionError）同样只丢这一帧
+                    continue
+                if not isinstance(message, dict):
+                    continue
+                try:
+                    self._dispatch(message, generation=proc)
+                except Exception:  # noqa: BLE001 - 一帧畸形降级的是这一帧，不是整条连接
+                    continue
+        except Exception:  # noqa: BLE001 - 读不下去了按断线收场，不能让线程带着异常无声退出
+            #  不是 EOF：进程多半还活着，但它的 stdout 已经没人读。收掉它，让
+            #  "进程已退出"成为事实——之后的判死、重连与进程自己崩掉走同一条路
+            if proc.poll() is None:
+                with contextlib.suppress(Exception):
+                    _kill_with_descendants(proc)
         with self._cond:
             if self._proc is not proc:
                 return
@@ -2082,31 +2128,39 @@ class McpManager:
             with self._lock:
                 self._states[spec.name] = f"failed: {type(exc).__name__}: {exc}"
             return
-        error = declared_violation(declared)
-        with self._lock:
-            #  manager 已被关闭（退出/测试清理）：不注册，把刚拉起的子进程收掉。
-            #  没有这一步，关闭时还在启动中的 server 会变成孤儿进程。
-            if self._closed:
-                self._states[spec.name] = "closed"
-            else:
-                error = error or self._swap_generation_locked(spec.name, server, declared)
-                if error:
-                    self._states[spec.name] = f"failed: {error}"
+        try:
+            error = declared_violation(declared)
+            with self._lock:
+                #  manager 已被关闭（退出/测试清理）：不注册，把刚拉起的子进程收掉。
+                #  没有这一步，关闭时还在启动中的 server 会变成孤儿进程。
+                if self._closed:
+                    self._states[spec.name] = "closed"
                 else:
-                    self._servers[spec.name] = server
-                    #  live 启动的不需要再对账
-                    self._reconciled.add(spec.name)
-                    self._states[spec.name] = "ready"
-                    self._write_cache_locked(spec, server)
-                    self._supervise_locked(server)
-                    return
+                    error = error or self._swap_generation_locked(spec.name, server, declared)
+                    if error:
+                        self._states[spec.name] = f"failed: {error}"
+                    else:
+                        self._servers[spec.name] = server
+                        #  live 启动的不需要再对账
+                        self._reconciled.add(spec.name)
+                        self._states[spec.name] = "ready"
+                        self._write_cache_locked(spec, server)
+                        self._supervise_locked(server)
+                        return
+        except Exception as exc:  # noqa: BLE001 - 启动线程带着异常退场，状态就永远停在 loading
+            #  注册到一半出的错：这一代不留任何东西（工具、登记、进程），状态
+            #  亮出原因——wait_ready 不必等满超时，close 之后也不会剩下孤儿进程
+            with self._lock:
+                self._drop_generation_locked(spec.name)
+                self._servers.pop(spec.name, None)
+                self._states[spec.name] = f"failed: {type(exc).__name__}: {exc}"
         server.close()
 
     def _swap_generation_locked(
         self, name: str, server: McpServer, declared: list[dict[str, Any]]
     ) -> str | None:
-        """整代 swap 的落笔阶段：基线裁决 → 冲突预检 →
-        与现役代对齐（原位替换 / 删除 / 追加）。持锁调用；幂等。
+        """整代 swap 的落笔阶段：基线裁决 → 冲突预检 → 建好新一代 →
+        落笔（基线、声明存档、与现役代对齐：原位替换 / 删除 / 追加）。持锁调用；幂等。
 
         fetch 与 declared_violation 校验由调用方在锁外完成——这里
         只做落笔。注册表就在本进程锁内，所以冲突可以**先检查后落笔**，
@@ -2155,6 +2209,27 @@ class McpManager:
                 f"命名空间冲突：{', '.join(conflicts[:3])} 已被其它 server 注册，"
                 "本代整体回滚（保留上一代），不注册部分集合"
             )
+        #  对齐现役代：其它 server 的工具原样保留；本 server 的按新一代裁决——
+        #  声明消失/被隔离的删除，指纹没变的保留原对象，变了的原位换新。
+        #  新一代的工具对象在任何落笔之前建好：建到一半出错时，基线、声明存档、
+        #  注册表都还是上一代的样子，没有"基线已写、工具没注册"的半截状态
+        next_tools: list[RemoteTool] = []
+        seen: set[str] = set()
+        for tool in self._tools:
+            if tool.server != name:
+                next_tools.append(tool)
+                continue
+            item = new_decls.get(tool.raw_name)
+            if item is None:
+                continue
+            seen.add(tool.raw_name)
+            if tool.fingerprint == mcp_guard.tool_fingerprint(item):
+                next_tools.append(tool)
+            else:
+                next_tools.append(_make_remote_tool(self, server, item))
+        for raw, item in new_decls.items():
+            if raw not in seen:
+                next_tools.append(_make_remote_tool(self, server, item))
         self._declared[name] = declared
         if updates:
             #  TOFU / 信任接受：并入基线立即落盘，声明正文同步存档
@@ -2177,25 +2252,6 @@ class McpManager:
                 + f"\n  全部差异 /mcp diff {name}；核对无误 /mcp approve {name}",
                 file=sys.stderr,
             )
-        #  对齐现役代：其它 server 的工具原样保留；本 server 的按新一代裁决——
-        #  声明消失/被隔离的删除，指纹没变的保留原对象，变了的原位换新
-        next_tools: list[RemoteTool] = []
-        seen: set[str] = set()
-        for tool in self._tools:
-            if tool.server != name:
-                next_tools.append(tool)
-                continue
-            item = new_decls.get(tool.raw_name)
-            if item is None:
-                continue
-            seen.add(tool.raw_name)
-            if tool.fingerprint == mcp_guard.tool_fingerprint(item):
-                next_tools.append(tool)
-            else:
-                next_tools.append(_make_remote_tool(self, server, item))
-        for raw, item in new_decls.items():
-            if raw not in seen:
-                next_tools.append(_make_remote_tool(self, server, item))
         self._tools = next_tools
         self._registered[name] = set(new_decls)
         return None
