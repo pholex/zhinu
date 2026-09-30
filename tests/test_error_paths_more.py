@@ -43,9 +43,11 @@ def _read_request(conn: socket.socket) -> None:
         body += piece
 
 
-def serve_cut_stream(test: unittest.TestCase, events: list[bytes]) -> str:
-    """起一个只接一次请求的本机服务器：回 200 + 分块 SSE，发完给定事件就断开
-    （没有结束分块）。返回 base URL。"""
+def serve_once(
+    test: unittest.TestCase, content_type: bytes, pieces: list[bytes], *, cut: bool
+) -> str:
+    """起一个只接一次请求的本机服务器：回 200 + 分块响应体。cut=True 时发完给定
+    内容就断开（没有结束分块），否则正常收尾。返回 base URL。"""
     server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     server.bind(("127.0.0.1", 0))
     server.listen(1)
@@ -61,11 +63,13 @@ def serve_cut_stream(test: unittest.TestCase, events: list[bytes]) -> str:
             try:
                 _read_request(conn)
                 conn.sendall(
-                    b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\n"
+                    b"HTTP/1.1 200 OK\r\ncontent-type: " + content_type + b"\r\n"
                     b"transfer-encoding: chunked\r\n\r\n"
                 )
-                for event in events:
-                    conn.sendall(hex(len(event))[2:].encode() + b"\r\n" + event + b"\r\n")
+                for piece in pieces:
+                    conn.sendall(hex(len(piece))[2:].encode() + b"\r\n" + piece + b"\r\n")
+                if not cut:
+                    conn.sendall(b"0\r\n\r\n")
                 conn.shutdown(socket.SHUT_RDWR)
             except OSError:
                 pass
@@ -75,6 +79,11 @@ def serve_cut_stream(test: unittest.TestCase, events: list[bytes]) -> str:
     test.addCleanup(thread.join, 10)
     test.addCleanup(server.close)
     return f"http://127.0.0.1:{server.getsockname()[1]}"
+
+
+def serve_cut_stream(test: unittest.TestCase, events: list[bytes]) -> str:
+    """SSE 流开了头就断。"""
+    return serve_once(test, b"text/event-stream", events, cut=True)
 
 
 # ---------- 流中途的网络断开 ----------
@@ -175,3 +184,212 @@ class MidStreamDisconnectRecoveryTest(AgentTestCase):
         fake_sleep.assert_called_once()
         self.assertEqual(agent.last_assistant_text(), "完整回答")
         self.assertEqual(len(self.client.completions.calls), 2)
+
+
+# ---------- Bedrock 的流内异常帧、4xx 里的瞬时状态码 ----------
+
+
+def _event_stream_frame(headers: dict[str, str], payload: bytes) -> bytes:
+    """按 AWS event stream 的二进制帧格式编一帧（头值一律字符串类型）。"""
+    import binascii
+    import struct
+
+    head = b""
+    for name, value in headers.items():
+        raw_name, raw_value = name.encode(), value.encode()
+        head += bytes([len(raw_name)]) + raw_name + b"\x07"
+        head += struct.pack("!H", len(raw_value)) + raw_value
+    prelude = struct.pack("!II", 16 + len(head) + len(payload), len(head))
+    prelude += struct.pack("!I", binascii.crc32(prelude) & 0xFFFFFFFF)
+    frame = prelude + head + payload
+    return frame + struct.pack("!I", binascii.crc32(frame) & 0xFFFFFFFF)
+
+
+def _bedrock_exception_frame(kind: str, message: str) -> bytes:
+    import json
+
+    return _event_stream_frame(
+        {":message-type": "exception", ":exception-type": kind, ":content-type": "application/json"},
+        json.dumps({"message": message}).encode(),
+    )
+
+
+def _bedrock_chunk_frame(event: dict) -> bytes:
+    import base64
+    import json
+
+    inner = base64.b64encode(json.dumps(event).encode()).decode()
+    return _event_stream_frame(
+        {":message-type": "event", ":event-type": "chunk", ":content-type": "application/json"},
+        json.dumps({"bytes": inner}).encode(),
+    )
+
+
+def _frame_error(kind: str, message: str = "boom") -> ValueError:
+    """SDK 的 Bedrock 解码器对异常帧抛的那种 ValueError（文本照它的格式拼）。"""
+    frame = {
+        "status_code": 400,
+        "headers": {
+            ":message-type": "exception",
+            ":exception-type": kind,
+            ":content-type": "application/json",
+        },
+        "body": ('{"message": "%s"}' % message).encode(),
+    }
+    return ValueError(f"Bad response code, expected 200: {frame}")
+
+
+def _raising(exc: Exception):
+    """先给一个正常事件、再在取下一个事件时抛错的事件流。"""
+    import types
+
+    yield types.SimpleNamespace(
+        type="content_block_delta",
+        index=0,
+        delta=types.SimpleNamespace(type="text_delta", text="半截"),
+    )
+    raise exc
+
+
+class BedrockStreamExceptionTest(unittest.TestCase):
+    """Bedrock 事件流里的异常帧：SDK 抛的是没有状态码的裸 ValueError。"""
+
+    def consume(self, exc: Exception) -> tuple[list[str], Exception]:
+        from xiaoyu import messages
+
+        texts: list[str] = []
+        with self.assertRaises(Exception) as caught:
+            for piece in messages.stream_chunks(_raising(exc)):
+                texts.extend(choice.delta.content or "" for choice in piece.choices)
+        return texts, caught.exception
+
+    def test_server_side_exceptions_become_retryable(self):
+        from xiaoyu.errors import StreamFailed
+
+        for kind in (
+            "modelStreamErrorException",
+            "internalServerException",
+            "modelTimeoutException",
+            "serviceUnavailableException",
+        ):
+            texts, raised = self.consume(_frame_error(kind))
+            #  异常帧之前已经到的内容照常翻译出来
+            self.assertEqual(texts, ["半截"], kind)
+            self.assertIsInstance(raised, StreamFailed, kind)
+            #  上游原文照带：排查时只有这一句话可看
+            self.assertIn(kind, str(raised))
+            verdict = classify(raised)
+            self.assertEqual(verdict.kind, "transient", kind)
+            self.assertTrue(verdict.retryable, kind)
+
+    def test_wording_still_wins_over_the_fallback(self):
+        _, throttled = self.consume(_frame_error("throttlingException", "Too many requests"))
+        self.assertEqual(classify(throttled).kind, "rate_limit")
+        _, too_long = self.consume(
+            _frame_error("modelStreamErrorException", "Input is too long for requested model.")
+        )
+        verdict = classify(too_long)
+        self.assertEqual(verdict.kind, "context_overflow")
+        self.assertTrue(verdict.should_compact)
+
+    def test_validation_exception_is_not_retried(self):
+        """请求本身不合法：原样重发结果相同，不该被兜底成瞬时错误。"""
+        _, raised = self.consume(_frame_error("validationException", "Malformed input request"))
+        self.assertIsInstance(raised, ValueError)
+        self.assertEqual(classify(raised).kind, "fatal")
+        #  超窗也是以 validationException 报的，措辞判定照常生效
+        _, too_long = self.consume(
+            _frame_error("validationException", "Input is too long for requested model.")
+        )
+        self.assertEqual(classify(too_long).kind, "context_overflow")
+
+    def test_unrelated_value_errors_pass_through(self):
+        _, raised = self.consume(ValueError("something odd"))
+        self.assertIs(type(raised), ValueError)
+        self.assertEqual(classify(raised).kind, "fatal")
+
+    def test_real_decoder_through_the_sdk(self):
+        """整条真实链路：本机服务器回一帧正常事件 + 一帧异常，经 SDK 的解码器进翻译层。"""
+        import importlib.util
+
+        if importlib.util.find_spec("botocore") is None:
+            self.skipTest("事件流解码依赖 botocore（bedrock extra）")
+        import anthropic
+
+        from xiaoyu import messages
+        from xiaoyu.errors import StreamFailed
+
+        start = {
+            "type": "message_start",
+            "message": {
+                "id": "m", "type": "message", "role": "assistant", "model": "x", "content": [],
+                "stop_reason": None, "stop_sequence": None,
+                "usage": {"input_tokens": 7, "output_tokens": 0},
+            },
+        }
+        block = {
+            "type": "content_block_start", "index": 0,
+            "content_block": {"type": "text", "text": ""},
+        }
+        delta = {
+            "type": "content_block_delta", "index": 0,
+            "delta": {"type": "text_delta", "text": "半截"},
+        }
+        base = serve_once(
+            self,
+            b"application/vnd.amazon.eventstream",
+            [
+                _bedrock_chunk_frame(start),
+                _bedrock_chunk_frame(block),
+                _bedrock_chunk_frame(delta),
+                _bedrock_exception_frame("modelStreamErrorException", "model stream broke"),
+            ],
+            cut=False,
+        )
+        client = anthropic.AnthropicBedrock(
+            api_key="k", aws_region="us-east-1", base_url=base, max_retries=0, timeout=10,
+            http_client=httpx.Client(trust_env=False),
+        )
+        self.addCleanup(client.close)
+        stream = client.messages.create(
+            model="some.model-v1", max_tokens=8,
+            messages=[{"role": "user", "content": "x"}], stream=True,
+        )
+        texts: list[str] = []
+        with self.assertRaises(StreamFailed) as caught:
+            for piece in messages.stream_chunks(stream):
+                texts.extend(choice.delta.content or "" for choice in piece.choices)
+        self.assertEqual(texts, ["半截"])
+        self.assertIn("modelStreamErrorException", str(caught.exception))
+        self.assertEqual(classify(caught.exception).kind, "transient")
+
+
+class _StatusError(Exception):
+    """SDK 状态码异常的最小鸭子型：classify 只取 status_code。"""
+
+    def __init__(self, message: str, status_code: int) -> None:
+        super().__init__(message)
+        self.status_code = status_code
+
+
+class TransientStatusTest(unittest.TestCase):
+    def test_request_timeout_conflict_and_model_error_are_transient(self):
+        for status in (408, 409, 424):
+            verdict = classify(_StatusError("error", status))
+            self.assertEqual(verdict.kind, "transient", status)
+            self.assertTrue(verdict.retryable, status)
+
+    def test_real_sdk_status_errors(self):
+        response = httpx.Response(409, request=httpx.Request("POST", "http://unused"))
+        self.assertEqual(
+            classify(openai.ConflictError("lock timeout", response=response, body=None)).kind,
+            "transient",
+        )
+
+    def test_other_client_errors_stay_fatal(self):
+        for status in (400, 404, 413, 422):
+            self.assertEqual(classify(_StatusError("error", status)).kind, "fatal", status)
+
+    def test_wording_still_wins_over_the_status(self):
+        verdict = classify(_StatusError("prompt is too long: 9 tokens > 8 maximum", 424))
+        self.assertEqual(verdict.kind, "context_overflow")

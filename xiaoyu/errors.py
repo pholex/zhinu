@@ -189,6 +189,12 @@ _TRANSIENT_MARKERS = (
     "try again in",
 )
 
+#  4xx 里"原样再发一次可能就好"的几个状态码。408（请求超时）与 409（锁冲突）是
+#  两个 SDK 自带重试策略都认的码——重试收归主循环、SDK 的 max_retries 设成 0 之后，
+#  这里不认就没人接了。424 是 Bedrock 报"模型侧处理出错"用的码：依据只有 AWS 文档
+#  的说法，没有对着真实响应核对过；按瞬时处理，判错的代价是有界的几次重发。
+_TRANSIENT_STATUSES = (408, 409, 424)
+
 #  gRPC 系（Gemini / Vertex）的限流码。Google 对"每分钟配额用尽"也报这个，
 #  按限流处理正合适——退避等一等就过去了，和 _QUOTA_MARKERS 那种充值才能解的不同
 _EXHAUSTED_MARKERS = ("resource exhausted", "resource_exhausted")
@@ -345,6 +351,7 @@ def classify(exc: Exception) -> Verdict:
         _is_openai(exc, "APITimeoutError", "APIConnectionError", "InternalServerError")
         #  >=500 覆盖非 openai SDK 的服务端错误（含 anthropic 529 overloaded）
         or (status is not None and status >= 500)
+        or status in _TRANSIENT_STATUSES
         #  anthropic 的连接/超时异常是 `raise ... from <httpx 异常>`，认底因即可
         or isinstance(exc.__cause__, httpx.HTTPError)
         #  流迭代到一半断开时两个 SDK 都不包装：抛出来的就是裸的 httpx 传输层异常

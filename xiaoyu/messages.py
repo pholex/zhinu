@@ -44,7 +44,7 @@ from typing import Any, Iterator
 #  httpx 是 anthropic SDK 的硬传递依赖，顶层 import 安全（同 errors.py）
 import httpx
 
-from .errors import ContentFiltered
+from .errors import ContentFiltered, StreamFailed
 from .responses import (
     OPERATOR_KEY,
     REASONING_KEY,
@@ -508,6 +508,39 @@ def _refusal_detail(event: Any) -> str:
     return "安全分类器拒绝（无详情）"
 
 
+#  Bedrock 事件流解码器对异常帧的报法：一条裸 ValueError，文本以此开头，后面跟着
+#  整帧的 repr（`:exception-type` 头 + body 里的 message）
+_BEDROCK_FRAME_ERROR = "Bad response code, expected 200"
+
+
+def _events(events: Iterator[Any]) -> Iterator[Any]:
+    """逐个取事件，把 Bedrock 事件流里的异常帧翻成 StreamFailed。
+
+    Bedrock 的流内异常（modelStreamErrorException / internalServerException /
+    modelTimeoutException / serviceUnavailableException / throttlingException）不走
+    SDK 的类型化异常：解码器抛的是没有状态码的裸 ValueError，分类器只能判 fatal。
+    这几种都是服务端侧的问题，包成 StreamFailed——原文照带，限流、超窗等措辞判定
+    仍先生效，全没命中才兜底成瞬时错误。
+
+    validationException 不包：那是请求本身不合法，原样重发结果相同。它照旧按文本
+    判（"Input is too long" 仍是超窗），其余落 fatal。
+
+    只接取事件这一步抛的 ValueError：循环体里翻译逻辑自己的错不该被改写成流失败。
+    """
+    iterator = iter(events)
+    while True:
+        try:
+            event = next(iterator)
+        except StopIteration:
+            return
+        except ValueError as exc:
+            text = str(exc)
+            if _BEDROCK_FRAME_ERROR not in text or "validationexception" in text.lower():
+                raise
+            raise StreamFailed(f"Bedrock 流内异常：{text}") from exc
+        yield event
+
+
 def stream_chunks(events: Iterator[Any]) -> Iterator[Chunk]:
     """Messages 事件流 → chat completions chunk 流。
 
@@ -527,7 +560,7 @@ def stream_chunks(events: Iterator[Any]) -> Iterator[Chunk]:
     #  index → 攒块状态（thinking/redacted 攒内容，tool 记有没有见过参数分片）
     open_blocks: dict[int, dict[str, Any]] = {}
 
-    for event in events:
+    for event in _events(events):
         kind = getattr(event, "type", "")
         if kind == "message_start":
             usage = getattr(getattr(event, "message", None), "usage", None)
@@ -626,6 +659,7 @@ def stream_chunks(events: Iterator[Any]) -> Iterator[Chunk]:
             #  与 OpenAI chat 流最后那个纯 usage chunk 形状一致
             yield Chunk(usage=Usage(prompt_tokens=input_tokens, completion_tokens=output_tokens))
         #  ping / 未知事件一律忽略；流层错误由 anthropic SDK 自己抛类型化异常
+        #  （Bedrock 的异常帧除外，见 _events）
 
 
 def to_completion(response: Any) -> Completion:
