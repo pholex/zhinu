@@ -78,12 +78,70 @@ def _group_of(proc: subprocess.Popen) -> int | None:
     return getattr(proc, _GROUP_ATTR, None)
 
 
-def kill_tree(proc: subprocess.Popen) -> None:
+#  先礼后兵的宽限：SIGTERM 之后最多等这么久再 SIGKILL。够一个 trap 删掉锁文件、
+#  够测试框架跑完 teardown；再长，"停下"就不像是停下了
+TERM_GRACE_SECONDS = 1.0
+#  宽限期内查看"退干净了没有 / 有没有人再催"的间隔
+_TERM_POLL_SECONDS = 0.02
+
+
+def _group_gone(pgid: int) -> bool:
+    """进程组里是不是一个成员都不剩了；拿不准（无权探测等）按还在算。"""
+    try:
+        os.killpg(pgid, 0)
+    except ProcessLookupError:
+        return True
+    except OSError:
+        return False
+    return False
+
+
+def _terminate_gracefully(
+    proc: subprocess.Popen,
+    pgid: int | None,
+    grace: float,
+    stop_requested: Callable[[], bool] | None,
+) -> bool:
+    """发 SIGTERM 并有界等待；返回"已经退干净、不必再 SIGKILL"。
+
+    pgid 为 None = 只能管直接子进程（见 kill_tree 里同组的那条注释）。
+    """
+    import signal
+
+    if pgid is not None:
+        os.killpg(pgid, signal.SIGTERM)
+    else:
+        proc.terminate()
+    deadline = time.monotonic() + grace
+    while True:
+        #  顺手收掉已退出的组长：僵尸仍算组员，不收的话整组永远"还在"
+        exited = proc.poll() is not None
+        if exited and (pgid is None or _group_gone(pgid)):
+            return True
+        if time.monotonic() >= deadline:
+            return False
+        if stop_requested is not None and stop_requested():
+            return False
+        time.sleep(_TERM_POLL_SECONDS)
+
+
+def kill_tree(
+    proc: subprocess.Popen,
+    grace: float = 0.0,
+    stop_requested: Callable[[], bool] | None = None,
+) -> None:
     """整树终止（从 tools.py 移入，那边 import 这里的）。
 
     只杀 shell 会留下孙进程握着管道不放；Windows 用 taskkill /T 按树杀，
     POSIX 靠 start_new_session 建立的进程组整组杀。组长先退、孙进程还在的
     形态靠 mark_group_leader 的登记覆盖。
+
+    grace > 0（仅 POSIX）：先整组 SIGTERM，最多等 grace 秒——整组退干净就立刻
+    返回——再 SIGKILL 收尾。直接 SIGKILL 的话，被杀的命令 trap 里的清理不会跑：
+    锁文件、临时目录、起到一半的容器都留在原地。宽限由调用方按场合给：有人在
+    等的打断 / 超时给；进程退出时的兜底、批量收场不给（那些路径有自己的总时长
+    约定）。宽限期内 stop_requested() 为真、或等待被 Ctrl-C 打断，都立刻转入
+    SIGKILL——催第二次的人不该再等。
     """
     if os.name == "nt":
         with contextlib.suppress(Exception):
@@ -92,17 +150,32 @@ def kill_tree(proc: subprocess.Popen) -> None:
                 capture_output=True,
                 timeout=10,
             )
-    else:
-        import signal
+        with contextlib.suppress(Exception):
+            proc.kill()
+        return
 
-        with contextlib.suppress(ProcessLookupError, PermissionError, OSError):
-            pgid = _group_of(proc)
-            #  子进程与我们同组（调用方没开 start_new_session）时绝不能 killpg——
-            #  那会把自己整组带走。这种情况下退化为只杀直接子进程。
-            if pgid is not None and pgid != os.getpgid(0):
-                os.killpg(pgid, signal.SIGKILL)
-    with contextlib.suppress(Exception):
-        proc.kill()
+    import signal
+
+    pgid: int | None = None
+    with contextlib.suppress(ProcessLookupError, PermissionError, OSError):
+        group = _group_of(proc)
+        #  子进程与我们同组（调用方没开 start_new_session）时绝不能 killpg——
+        #  那会把自己整组带走。这种情况下退化为只杀直接子进程。
+        if group is not None and group != os.getpgid(0):
+            pgid = group
+    done = False
+    try:
+        if grace > 0:
+            with contextlib.suppress(ProcessLookupError, PermissionError, OSError):
+                done = _terminate_gracefully(proc, pgid, grace, stop_requested)
+    finally:
+        #  放在 finally：宽限等待被第二次 Ctrl-C 打断时，也得先杀干净再上抛
+        if not done:
+            if pgid is not None:
+                with contextlib.suppress(ProcessLookupError, PermissionError, OSError):
+                    os.killpg(pgid, signal.SIGKILL)
+            with contextlib.suppress(Exception):
+                proc.kill()
 
 
 #  任务 id 的形态（TaskManager.start 里生成），以及历史里点名它的那些文案都带的
@@ -386,7 +459,8 @@ class TaskManager:
 
     @staticmethod
     def _stop(task: BackgroundTask) -> None:
-        kill_tree(task.proc)
+        #  watcher 线程里等，不挡任何人：给足宽限
+        kill_tree(task.proc, grace=TERM_GRACE_SECONDS)
         with contextlib.suppress(Exception):
             task.proc.wait(timeout=10)
 
@@ -524,7 +598,8 @@ class TaskManager:
         if task.done.is_set():
             return f"{task_id} 早已结束（exit {task.exit_code}），无需终止。"
         task.killed = True
-        kill_tree(task.proc)
+        #  点名终止的多半是开发服务器、watch 这类会认 SIGTERM 的长驻进程
+        kill_tree(task.proc, grace=TERM_GRACE_SECONDS)
         return f"已终止 {task_id}（{task.description}）。"
 
     def output_of(self, task: BackgroundTask) -> str:
@@ -574,6 +649,7 @@ class TaskManager:
         for task in self.all():
             if not task.done.is_set():
                 task.killed = True
+                #  不给宽限：每个任务各等一秒的话，下面"合计有界"的约定就破了
                 kill_tree(task.proc)
                 killed.append(task)
         #  杀只是发信号，还得等它们真的退出：不等的话进程以僵尸形态挂着，日志

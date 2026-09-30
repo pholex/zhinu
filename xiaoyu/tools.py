@@ -35,6 +35,7 @@ from typing import Any, Callable
 from . import browser, fsguard, mcp, media, sandbox, tempdirs
 from .background import (
     MONITOR_DEFAULT_TIMEOUT,
+    TERM_GRACE_SECONDS as _TERM_GRACE_SECONDS,
     TaskManager,
     kill_tree as _kill_tree,
     mark_group_leader as _mark_group_leader,
@@ -267,8 +268,8 @@ def _trim_partial_utf8(data: bytes) -> bytes:
 _STOP_POLL_SECONDS = 0.2
 
 
-#  杀掉之后等它退出的上限（秒）。整组 SIGKILL 之后进程是毫秒级退出的，
-#  这个数只防意外：等不到就放手，打断不能因此卡住
+#  杀掉之后等它退出的上限（秒）。kill_tree 返回时整组已收到 SIGKILL（或已自行
+#  退干净），进程是毫秒级退出的，这个数只防意外：等不到就放手，打断不能因此卡住
 _REAP_SECONDS = 2.0
 
 
@@ -2617,11 +2618,13 @@ class Toolbox:
             #  Ctrl-C 的 SIGINT 只到前台进程组（我们自己）；子进程在独立会话里
             #  收不到，不杀就成遗孤继续跑、还握着管道。中断语义必须是
             #  "真的停掉这条命令"，杀完再上抛给前端打中断提示。
-            _kill_tree(proc)
+            #  先 SIGTERM 给命令一个清理的机会；宽限期内再按一次 Ctrl-C 即刻强杀
+            _kill_tree(proc, grace=_TERM_GRACE_SECONDS)
             _reap(proc)
             raise
         except subprocess.TimeoutExpired:
-            _kill_tree(proc)
+            #  宽限期内宿主叫停就不再等：直接强杀
+            _kill_tree(proc, grace=_TERM_GRACE_SECONDS, stop_requested=self.stop_requested)
             #  整树已杀、管道随之关闭，这里只回收已缓冲的输出；再收不到就放弃，
             #  绝不能为了一点残余输出重新陷入无限期等待。
             _wait_bounded(proc, pipes, time.monotonic() + 10)
@@ -2637,10 +2640,17 @@ class Toolbox:
                 f"exit_status: 124 (timeout)\n{partial or '(无输出)'}"
             )
             return output + _interactive_auth_hint(partial)
+        except Interrupted:
+            #  宿主的 interrupt()：与 Ctrl-C 同一个待遇。打断标志此刻已经立着，
+            #  再催一次也看不出区别，所以这条路的宽限不可再打断——有界一秒
+            _kill_tree(proc, grace=_TERM_GRACE_SECONDS)
+            _reap(proc)
+            raise
         except BaseException:
             #  其余一切非正常退出：SIGTERM 被 session_log 转成的 SystemExit、
             #  等待期间的任何异常。命令在独立会话里收不到我们的信号，不收割就
             #  整树成孤儿一直活着——与 Ctrl-C 同理，杀完照常上抛。
+            #  不给宽限：本进程自己正在被要求退出
             _kill_tree(proc)
             _reap(proc)
             raise

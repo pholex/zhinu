@@ -10,12 +10,15 @@ from __future__ import annotations
 import contextlib
 import io
 import json
+import os
 import shutil
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import unittest
+from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
@@ -25,6 +28,9 @@ from xiaoyu import worktree as worktree_mod
 from xiaoyu.agent import Usage
 from xiaoyu.agents import AgentSpec, RunStore, make_subagent_tool
 from xiaoyu.cli import run_once
+from xiaoyu.config import Config
+from xiaoyu.errors import Interrupted
+from xiaoyu.tools import Toolbox
 
 from .test_agent_paths import AgentTestCase, call_fragment, chunk
 
@@ -567,6 +573,109 @@ class ResumedBackgroundTasksTest(AgentTestCase):
         ])
         self.assertEqual(shape(agent.messages[-3:]), ["assistant", "tool:c2", "user"])
         self.assertEqual(len(self.notes(agent)), 1)
+
+
+#  收到 SIGTERM 时做清理的命令：删锁、留下"清理过"的记号。sleep 放后台再 wait，
+#  信号一到 sh 立刻跑 trap；最坏情况下 30 秒自己结束，不出任何输出
+TRAP_SCRIPT = (
+    "trap 'rm -f lock; touch cleaned; exit 0' TERM; "
+    "touch lock; sleep 30 & wait $!"
+)
+#  对 SIGTERM 装聋的命令（忽略的信号会被子进程继承）
+DEAF_SCRIPT = "trap '' TERM; touch lock; sleep 30"
+
+
+@unittest.skipIf(os.name == "nt", "信号与进程组语义是 POSIX 的")
+class GracefulStopTest(unittest.TestCase):
+    """叫停一条命令：先 SIGTERM 给它清理的机会，有界等待后再 SIGKILL。"""
+
+    def setUp(self) -> None:
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.root = Path(tmp.name).resolve()
+        self.toolbox = Toolbox(
+            Config(
+                base_url="x", model="x", workspace=self.root,
+                enable_plugins=False, enable_mcp=False, sandbox=False,
+            )
+        )
+        self.addCleanup(self.toolbox.tasks.shutdown)
+
+    def spawn(self, script: str) -> subprocess.Popen:
+        proc = subprocess.Popen(
+            ["/bin/sh", "-c", script], cwd=self.root, start_new_session=True,
+            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+        bg.mark_group_leader(proc)
+        self.addCleanup(proc.wait, 5)
+        self.addCleanup(bg.kill_tree, proc)
+        self.assertTrue(wait_until((self.root / "lock").exists), "命令没起来")
+        return proc
+
+    def assert_cleaned(self) -> None:
+        self.assertTrue((self.root / "cleaned").exists(), "trap 里的清理没有跑")
+        self.assertFalse((self.root / "lock").exists(), "锁文件残留")
+
+    def test_timed_out_command_gets_to_clean_up(self) -> None:
+        output = self.toolbox.run("bash", {"command": TRAP_SCRIPT, "timeout": 1})
+        self.assertIn("命令超时", output)
+        self.assert_cleaned()
+
+    def test_interrupted_command_gets_to_clean_up(self) -> None:
+        self.toolbox.stop_requested = (self.root / "lock").exists
+        with self.assertRaises(Interrupted):
+            self.toolbox.run("bash", {"command": TRAP_SCRIPT, "timeout": 20})
+        self.assert_cleaned()
+
+    def test_killed_background_task_gets_to_clean_up(self) -> None:
+        self.toolbox.run("bash", {"command": TRAP_SCRIPT, "run_in_background": True})
+        self.assertTrue(wait_until((self.root / "lock").exists))
+        self.assertIn("已终止", self.toolbox.run("kill_task", {"task_id": "task-1"}))
+        self.assertTrue(self.toolbox.tasks.get("task-1").done.wait(10))
+        self.assert_cleaned()
+
+    def test_grace_ends_as_soon_as_the_group_is_gone(self) -> None:
+        proc = self.spawn(TRAP_SCRIPT)
+        started = time.monotonic()
+        bg.kill_tree(proc, grace=10)
+        self.assertLess(time.monotonic() - started, 3)
+        self.assertIsNotNone(proc.returncode)
+        self.assert_cleaned()
+
+    def test_command_deaf_to_sigterm_is_killed_when_the_grace_runs_out(self) -> None:
+        proc = self.spawn(DEAF_SCRIPT)
+        started = time.monotonic()
+        bg.kill_tree(proc, grace=0.3)
+        elapsed = time.monotonic() - started
+        self.assertGreaterEqual(elapsed, 0.3)
+        self.assertLess(elapsed, 3)
+        self.assertEqual(proc.wait(5), -9)
+
+    def test_second_stop_request_cuts_the_grace_short(self) -> None:
+        proc = self.spawn(DEAF_SCRIPT)
+        started = time.monotonic()
+        bg.kill_tree(proc, grace=10, stop_requested=lambda: True)
+        self.assertLess(time.monotonic() - started, 2)
+        self.assertEqual(proc.wait(5), -9)
+
+    def test_second_ctrl_c_during_the_grace_still_kills_before_propagating(self) -> None:
+        proc = self.spawn(DEAF_SCRIPT)
+
+        def second_ctrl_c() -> bool:
+            raise KeyboardInterrupt
+
+        started = time.monotonic()
+        with self.assertRaises(KeyboardInterrupt):
+            bg.kill_tree(proc, grace=10, stop_requested=second_ctrl_c)
+        self.assertLess(time.monotonic() - started, 2)
+        self.assertEqual(proc.wait(5), -9)
+
+    def test_without_grace_the_kill_is_immediate(self) -> None:
+        #  进程退出兜底、批量收场走的就是这条：不等，也就不给清理机会
+        proc = self.spawn(TRAP_SCRIPT)
+        bg.kill_tree(proc)
+        self.assertEqual(proc.wait(5), -9)
+        self.assertFalse((self.root / "cleaned").exists())
 
 
 if __name__ == "__main__":
