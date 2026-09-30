@@ -14,7 +14,7 @@ from pathlib import Path
 from unittest import mock
 
 from xiaoyu import permissions as perm_mod
-from xiaoyu.permissions import Permissions, Rule, parse_rule
+from xiaoyu.permissions import Permissions, Rule, banned_allow_reason, parse_rule
 
 from .test_agent_paths import AgentTestCase
 
@@ -524,6 +524,46 @@ class BannedAllowTest(unittest.TestCase):
         for line in ("allow bash(git *)", "allow bash(python -m pytest*)", "allow bash(ls*)"):
             perms.add_persistent(parse_rule(line))
         self.assertEqual(len(perms.rules), 3)
+
+    def test_runner_rules_judged_by_the_inner_command(self):
+        """透传运行器后面跟的是另一条命令：`uv run python *` 放行的是
+        `uv run python -c …`。剥开运行器（连它自己的选项）再判里面的模式。"""
+        for spec in (
+            "uv run python *", "npx tsx *", "npx node *", "poetry run python *",
+            "pnpm exec node *", "uv run sudo *", "uv run env python *",
+            #  运行器自己带选项：选项后面那个词是值还是命令都得兜住
+            "uv run --with x python *", "uv -q run python *", "conda run -n env python *",
+            "uv --directory x run bash -c *", "npx -y *", "npm exec -- node *",
+            #  通配贴在运行器上 / 落在被跳过的选项里 / 跨词
+            "uv run*", "uv run *", "uv *", "poetry *", "uvx *", "pnpm dlx *",
+            "uv run -* pytest", "uv r?n python *", "u? run python *", "uv*python *",
+            "*npx tsx *",
+            #  层层套
+            "timeout 60 uv run python *", "npx npx node *", "uv run uv run python *",
+            "/usr/local/bin/uv run python *",
+        ):
+            rule = parse_rule(f"allow bash({spec})")
+            self.assertIsNotNone(banned_allow_reason(rule), spec)
+        perms = Permissions(self.workspace, [parse_rule("allow bash(uv run python *)"),
+                                             parse_rule("allow bash(npx tsx *)")])
+        for command in ("uv run python -c 'x'", "uv run python x.py", "npx tsx -e 'x'"):
+            self.assertEqual(perms.decide("bash", {"command": command}), "ask", command)
+
+    def test_narrow_runner_rules_still_allowed(self):
+        for spec in (
+            "uv run pytest*", "uv run pytest *", "uv run python -m pytest*",
+            "uv run --with x pytest*", "conda run -n env pytest*", "uv run ruff check*",
+            "npx eslint *", "npx tsc --noEmit*", "npx prettier --check *",
+            "poetry run ruff *", "pnpm exec vitest*", "timeout 60 uv run pytest*",
+            #  写到具体脚本的窄规则是用户自己的决定
+            "npx tsx src/build.ts*", "uv run python scripts/x.py*",
+            #  运行器的其它子命令不受牵连
+            "uv pip list*", "uv sync*", "poetry install*", "conda env list*", "uv run",
+        ):
+            rule = parse_rule(f"allow bash({spec})")
+            self.assertIsNone(banned_allow_reason(rule), spec)
+        perms = Permissions(self.workspace, [parse_rule("allow bash(uv run pytest*)")])
+        self.assertEqual(perms.decide("bash", {"command": "uv run pytest -q"}), "allow")
 
     def test_wrapper_rules_rejected_in_any_option_spelling(self):
         """wrapper 包任意命令的模式：不管选项值怎么写都拒绝落盘。"""
