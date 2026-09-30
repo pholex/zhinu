@@ -14,7 +14,15 @@ from pathlib import Path
 from unittest import mock
 
 from xiaoyu import permissions as perm_mod
-from xiaoyu.permissions import Permissions, Rule, banned_allow_reason, parse_rule, rule_lint
+from xiaoyu.permissions import (
+    Permissions,
+    Rule,
+    banned_allow_reason,
+    call_identity,
+    parse_rule,
+    rule_lint,
+    suggest_allow_rule,
+)
 
 from .test_agent_paths import AgentTestCase
 
@@ -444,6 +452,82 @@ class PersistenceTest(unittest.TestCase):
         self.assertEqual(perms.decide("bash", {"command": "git status"}), "allow")
         #  重新 load 也还在
         self.assertEqual(len(Permissions.load(self.workspace).rules), 1)
+
+
+class ForwardedCallIdentityTest(unittest.TestCase):
+    """MCP 工具经 use_tool 转发调用时，权限认的是被点名的那个工具。"""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.workspace = Path(self.tmp.name).resolve()
+
+    @staticmethod
+    def via(tool: str, **tool_input) -> tuple[str, dict]:
+        return "use_tool", {"tool_name": tool, "tool_input": tool_input}
+
+    def perms(self, *rules: str) -> Permissions:
+        return Permissions(self.workspace, [parse_rule(rule) for rule in rules])
+
+    def test_identity_unwraps_only_well_formed_mcp_calls(self):
+        self.assertEqual(
+            call_identity(*self.via("mcp__gh__delete_repo", name="x")),
+            ("mcp__gh__delete_repo", {"name": "x"}),
+        )
+        #  参数对象被整个序列化成字符串的宽进形态
+        self.assertEqual(
+            call_identity("use_tool", {"tool_name": "mcp__gh__x", "tool_input": '{"a": 1}'}),
+            ("mcp__gh__x", {"a": 1}),
+        )
+        for args in ({}, {"tool_name": "bash", "tool_input": {"command": "ls"}}, {"tool_name": 7}):
+            self.assertEqual(call_identity("use_tool", args), ("use_tool", args))
+        self.assertEqual(call_identity("bash", {"command": "ls"}), ("bash", {"command": "ls"}))
+
+    def test_rules_written_for_the_real_tool_apply(self):
+        perms = self.perms("deny mcp__gh__delete_repo", "ask mcp__gh__create_issue", "allow mcp__gh__list")
+        self.assertEqual(perms.explain(*self.via("mcp__gh__delete_repo"))[0], "deny")
+        decision, rule = perms.explain(*self.via("mcp__gh__create_issue"))
+        self.assertEqual((decision, str(rule)), ("ask", "ask mcp__gh__create_issue"))
+        self.assertEqual(perms.decide(*self.via("mcp__gh__list")), "allow")
+        self.assertEqual(perms.explain(*self.via("mcp__gh__other")), ("ask", None))
+
+    def test_both_mcp_modes_judge_the_same(self):
+        """同一条规则、同一个工具：直接调用与经转发器调用必须同判。"""
+        perms = self.perms("deny mcp__gh__delete_repo", "ask mcp__gh__push", "allow mcp__gh__list")
+        for tool in ("mcp__gh__delete_repo", "mcp__gh__push", "mcp__gh__list", "mcp__gh__other"):
+            with self.subTest(tool=tool):
+                self.assertEqual(perms.explain(tool, {}), perms.explain(*self.via(tool)))
+
+    def test_rules_written_for_the_forwarder_still_cover_everything(self):
+        self.assertEqual(self.perms("deny use_tool").decide(*self.via("mcp__gh__list")), "deny")
+        self.assertEqual(self.perms("allow use_tool").decide(*self.via("mcp__gh__list")), "allow")
+        #  具体工具上的 deny 压过转发器上的 allow
+        perms = self.perms("allow use_tool", "deny mcp__gh__delete_repo")
+        self.assertEqual(perms.decide(*self.via("mcp__gh__delete_repo")), "deny")
+
+    def test_session_grant_covers_one_tool_not_all_of_them(self):
+        perms = self.perms()
+        call = self.via("mcp__gh__list")
+        self.assertEqual(perms.session_grant_label(*call), "mcp__gh__list")
+        self.assertEqual(perms.grant_session_call(*call), "mcp__gh__list")
+        self.assertEqual(perms.session_allowed, {"mcp__gh__list"})
+        self.assertEqual(perms.decide(*call), "allow")
+        self.assertEqual(perms.decide(*self.via("mcp__gh__delete_repo")), "ask")
+        self.assertEqual(perms.decide(*self.via("mcp__other__anything")), "ask")
+
+    def test_always_allow_suggestion_names_the_real_tool(self):
+        rule = suggest_allow_rule(*self.via("mcp__gh__list", q="x"), self.workspace)
+        self.assertEqual(str(rule), "allow mcp__gh__list")
+
+    def test_blanket_allow_on_the_forwarder_is_called_out_at_load(self):
+        user_file = self.workspace / "userconf" / "permissions.txt"
+        user_file.parent.mkdir(parents=True)
+        user_file.write_text("allow use_tool\n", encoding="utf-8")
+        with mock.patch.object(perm_mod, "user_rules_path", return_value=user_file):
+            with contextlib.redirect_stderr(io.StringIO()) as err:
+                perms = Permissions.load(self.workspace)
+        self.assertEqual(len(perms.rules), 1)  # 照旧生效
+        self.assertIn("所有 MCP 工具", err.getvalue())
 
 
 class ExploreInheritsRulesTest(AgentTestCase):

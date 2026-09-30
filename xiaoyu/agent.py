@@ -50,7 +50,7 @@ from .compaction import (
 from .config import EFFORT_LEVELS, Config
 from .errors import Interrupted, classify
 from .providers import Registry, Route, UnknownModel
-from .permissions import Permissions
+from .permissions import Permissions, call_identity
 from .events import (
     Notice,
     PlanUpdated,
@@ -4637,7 +4637,8 @@ class Agent:
         #  hook 眼前（宿主 seatbelt 包装后的命令才是真正要跑的东西）
         if self.hook_engine is not None and self.hook_engine.has("PreToolUse"):
             decision = self.hook_engine.fire(
-                "PreToolUse", {"tool": name, "args": args}, tool_name=name
+                "PreToolUse", {"tool": name, "args": args}, tool_name=name,
+                **self._hook_alias(name, args),
             )
             if decision.blocked:
                 self.trace.append(
@@ -4740,12 +4741,24 @@ class Agent:
                 "PostToolUse",
                 {"tool": name, "args": args, "ok": ok, "output": clip(output)},
                 tool_name=name,
+                **self._hook_alias(name, args),
             )
             if decision.blocked:
                 output += f"\n\n[PostToolUse hook 反馈，请重视] {decision.reason}"
         self.trace.append({"tool": name, "args": args, "ok": ok, "output": output})
         self.sink.emit(ToolCompleted(name, output=output, ok=ok, seconds=elapsed))
         return self._tool_message(call, self._for_model(name, args, raw_output, output))
+
+    @staticmethod
+    def _hook_alias(name: str, args: dict[str, Any]) -> dict[str, str]:
+        """经转发器调用 MCP 工具时，让钩子的 matcher 也能按被点名的工具匹配。
+
+        payload 不变（tool 仍是转发器、真名在 args.tool_name 里）：已有的钩子脚本
+        照旧读得懂；只是"挂在某个 MCP 工具上"的 matcher 不再因为调用走了转发器
+        而落空。不是转发调用时返回空 dict——不给注入的引擎多传参数。
+        """
+        target, _ = call_identity(name, args)
+        return {"also": target} if target != name else {}
 
     def _untrusted_source(self, name: str, args: dict[str, Any]) -> str | None:
         """外部来源工具的来源标签；内置工具返回 None。use_tool 永远是 MCP。"""

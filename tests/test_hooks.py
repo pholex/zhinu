@@ -144,6 +144,19 @@ class EngineTest(unittest.TestCase):
         self.assertEqual(scoped.workspace, elsewhere)
         self.assertIsNone(self.engine([Hook("Stop", "true")]).for_tools(elsewhere))
 
+    def test_matcher_also_accepts_the_forwarded_tool_name(self):
+        cmd = _script_cmd(self.tmp, "block.py", BLOCK_BODY)
+        engine = self.engine([Hook("PreToolUse", cmd, matcher="^mcp__gh__delete$")])
+        self.assertFalse(engine.fire("PreToolUse", {}, tool_name="use_tool").blocked)
+        self.assertTrue(
+            engine.fire("PreToolUse", {}, tool_name="use_tool", also="mcp__gh__delete").blocked
+        )
+        #  写给转发器本身的 matcher 照旧匹配
+        engine = self.engine([Hook("PreToolUse", cmd, matcher="^use_tool$")])
+        self.assertTrue(
+            engine.fire("PreToolUse", {}, tool_name="use_tool", also="mcp__gh__list").blocked
+        )
+
     def test_other_exit_codes_fail_open_with_notice(self):
         cmd = _script_cmd(self.tmp, "crash.py", "import sys\nsys.exit(1)\n")
         engine = self.engine([Hook("Stop", cmd)])

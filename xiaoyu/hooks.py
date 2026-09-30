@@ -171,15 +171,24 @@ class HookEngine:
         kept = [hook for hook in self.hooks if hook.event in ("PreToolUse", "PostToolUse")]
         return HookEngine(kept, workspace, self._notify) if kept else None
 
-    def fire(self, event: str, payload: dict[str, Any], tool_name: str = "") -> Decision:
-        """跑该事件的所有匹配 hook。任一 block（exit 2）即 block，理由拼接。"""
+    def fire(
+        self, event: str, payload: dict[str, Any], tool_name: str = "", also: str = ""
+    ) -> Decision:
+        """跑该事件的所有匹配 hook。任一 block（exit 2）即 block，理由拼接。
+
+        also 是这次调用的另一个名字：MCP 工具经转发器调用时，tool_name 是转发器、
+        also 是它点名的工具——matcher 写哪个都算匹配，挂在具体 MCP 工具上的钩子
+        不因为调用走了转发器就不触发。
+        """
         reasons: list[str] = []
         body = json.dumps(
             {"event": event, "workspace": str(self.workspace), **payload},
             ensure_ascii=False,
         )
         for hook in self.hooks:
-            if hook.event != event or not hook.matches(tool_name):
+            if hook.event != event or not (
+                hook.matches(tool_name) or (also and hook.matches(also))
+            ):
                 continue
             try:
                 proc = subprocess.run(

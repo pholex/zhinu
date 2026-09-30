@@ -98,7 +98,7 @@ def run(path: str) -> str:
 
 - `command`/`args`/`env` 的值里可写 `${env:VAR}`（兼容 `${VAR}`）引用环境变量。
 - 远端 server 直连：`"type": "http", "url": "https://…"`，可带 `"headers": {...}`；明文 http 只允许回环地址。老式 SSE 传输不支持。
-- 工具挂进来的名字是 `mcp__<server>__<tool>`；权限规则（`/allow`）按这个名字写。
+- 工具挂进来的名字是 `mcp__<server>__<tool>`；权限规则（`/allow`、`/deny`）按这个名字写，工具是经 `use_tool` 转发调用的也一样——判权限、记「本会话允许」、钩子的 matcher 认的都是这个名字。写 `deny use_tool` 则是所有 MCP 工具。
 - server 的 stderr 在配置目录 `logs/mcp-<name>.log`，排障看那里；`/mcp` 查看状态。
 
 ## hooks
