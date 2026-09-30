@@ -124,7 +124,7 @@ class BackgroundTask:
     exit_code: int | None = None
     #  kill_task 明确终止的任务不再发完成通知（kill 的返回值已经告知模型）
     killed: bool = False
-    #  被我们自己叫停的原因（日志超限）；空串 = 自然结束或超时
+    #  被我们自己叫停的原因（超时 / 日志超限）；空串 = 自然结束
     stopped_for: str = ""
 
     @property
@@ -328,6 +328,14 @@ class TaskManager:
                 except subprocess.TimeoutExpired:
                     pass
                 if deadline is not None and time.monotonic() >= deadline:
+                    #  被杀的进程退出码是 -9，不写明原因的话完成通知读起来像
+                    #  "它自己跑完了、只是失败了"。刚好踩着点自己退出的不算
+                    if task.proc.poll() is None:
+                        task.stopped_for = (
+                            f"已到最长观察时间 {timeout:g}s"
+                            if task.kind == "monitor"
+                            else f"运行超过启动时设定的 {timeout:g}s 超时上限，没有跑完"
+                        )
                     self._stop(task)
                     break
                 if _size_of(task.log_path) > MAX_LOG_BYTES:
