@@ -393,3 +393,60 @@ class TransientStatusTest(unittest.TestCase):
     def test_wording_still_wins_over_the_status(self):
         verdict = classify(_StatusError("prompt is too long: 9 tokens > 8 maximum", 424))
         self.assertEqual(verdict.kind, "context_overflow")
+
+
+# ---------- 超出上下文窗口的另几种措辞 ----------
+
+
+class MoreOverflowWordingTest(unittest.TestCase):
+    """漏判成 fatal 是整轮直接死、不压缩。"""
+
+    WORDINGS = (
+        #  Bedrock 上的 Claude
+        "Input is too large: too many total text bytes: 9437184 > 9000000",
+        "too many total text bytes",
+        #  Bedrock Mantle，经网关转出
+        "prompt tokens exceed model maximum of 200000",
+        "requested tokens exceed customer model maximum",
+        #  vLLM
+        "The prompt (9000 tokens) exceeds the max_model_len of 8192",
+        "The decoder prompt (length 9000) is longer than the maximum model length of 8192. "
+        "Make sure that `max_model_len` is no smaller than the number of text tokens.",
+    )
+
+    def test_every_wording_compacts_whatever_carries_it(self):
+        from xiaoyu.errors import StreamFailed
+
+        for wording in self.WORDINGS:
+            for exc in (
+                RuntimeError(wording),
+                StreamFailed(wording),
+                _StatusError(wording, 400),
+                openai.BadRequestError(
+                    wording,
+                    response=httpx.Response(400, request=httpx.Request("POST", "http://unused")),
+                    body=None,
+                ),
+            ):
+                with self.subTest(wording=wording, carrier=type(exc).__name__):
+                    verdict = classify(exc)
+                    self.assertEqual(verdict.kind, "context_overflow")
+                    self.assertTrue(verdict.should_compact)
+                    self.assertTrue(verdict.retryable)
+
+    def test_token_worded_throttle_is_still_rate_limit(self):
+        verdict = classify(RuntimeError("Too many tokens, please wait before trying again."))
+        self.assertEqual(verdict.kind, "rate_limit")
+        self.assertFalse(verdict.should_compact)
+
+    def test_lookalike_request_errors_do_not_compact(self):
+        """长得像、但说的不是输入超窗：误判会白做一次强制压缩。"""
+        for wording in (
+            "max_tokens: 100000 > 64000, which is the maximum allowed number of output tokens",
+            "model maximum output tokens is 8192",
+            "Unknown parameter: max_model_len",
+            "too many images in request",
+        ):
+            verdict = classify(_StatusError(wording, 400))
+            self.assertEqual(verdict.kind, "fatal", wording)
+            self.assertFalse(verdict.should_compact, wording)

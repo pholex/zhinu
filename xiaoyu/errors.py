@@ -108,6 +108,16 @@ _CONTEXT_MARKERS = (
     "maximum number of tokens allowed",  # "input token count … exceeds the maximum …"
     "range of input length should be",
     "token length exceed",  # "total message token length exceed model limit"
+    #  Bedrock 上的 Claude 按字节数报超限，整句里没有 token / context 字样
+    "too many total text bytes",
+    #  Bedrock Mantle（经网关转出来的样本）。两条互不包含，各收一条；
+    #  不缩成裸 "model maximum"——输出上限类的请求错误也会这么说
+    "exceed model maximum",
+    "exceed customer model maximum",
+    #  vLLM 的两种写法。后一条出自对其源码文案的记忆（"… is longer than the
+    #  maximum model length of N"），没有对着真实服务核对过
+    "exceeds the max_model_len",
+    "maximum model length",
 )
 
 #  结构化错误码里的超限：码比措辞稳（文案会改、会被网关转写，码不会）
