@@ -20,6 +20,7 @@
 from __future__ import annotations
 
 import fnmatch
+import functools
 import os
 import re
 import shlex
@@ -79,12 +80,21 @@ def banned_allow_reason(rule: "Rule") -> str | None:
     if rule.spec is None:
         return ("allow bash（不带模式）等于永久放行任意命令。"
                 "临时放开请在确认框答 a（本会话）或用 --yolo。")
+    return _bash_pattern_reason(rule.spec)
+
+
+@functools.lru_cache(maxsize=1024)
+def _bash_pattern_reason(spec: str) -> str | None:
+    """一条 bash 模式的判定。每次权限判定都会把全部 allow 规则过一遍，结果按模式缓存。"""
     for probe in _BANNED_ALLOW_PROBES:
-        if fnmatch.fnmatch(probe, rule.spec):
+        if fnmatch.fnmatch(probe, spec):
             return (f"该模式会放行「{probe.split(' evil')[0].strip()}」这类任意代码执行入口，"
                     "等于永久绕过整套权限系统。请写更窄的规则"
                     "（如 allow bash(python -m pytest*)），或在确认框答 a 做会话级放行。")
-    return _wrapped_pattern_reason(rule.spec, 0)
+    for runner, probe in _RUNNER_PROBES:
+        if fnmatch.fnmatch(probe, spec):
+            return _runner_reason(runner)
+    return _wrapped_pattern_reason(spec, 0)
 
 
 def _has_glob(token: str) -> bool:
@@ -106,7 +116,7 @@ def _wrapped_pattern_reason(spec: str, depth: int) -> str | None:
     if _has_glob(head):
         #  wrapper 名本身带通配（`*nice -n 5 *`、`n?ce …`、`[s]udo …`）：unwrap 认不出名字，
         #  不拦就原样放行。逐个代入它能匹配上的 wrapper 名再判，任一代入被拒即拒
-        for name in sorted(command_check.WRAPPER_NAMES):
+        for name in sorted(command_check.WRAPPER_NAMES | _RUNNER_HEADS):
             if fnmatch.fnmatch(name, head) and _wrapped_pattern_reason(
                 " ".join([name, *tokens[1:]]), depth + 1
             ):
@@ -119,7 +129,7 @@ def _wrapped_pattern_reason(spec: str, depth: int) -> str | None:
     except ValueError:
         inners = [["*"]]  # 选项分叉多到剥不完：按最宽的情况处理
     if inners is None:
-        return None
+        return _runner_pattern_reason(tokens, depth)
     reason = (f"该模式会借「{tokens[0]}」放行里面的任意命令，等于永久绕过整套权限系统。"
               "请写到具体命令（如 allow bash(timeout 60 pytest*)），或在确认框答 a 做会话级放行。")
     if depth >= _MAX_PATTERN_DEPTH:
@@ -134,14 +144,71 @@ def _wrapped_pattern_reason(spec: str, depth: int) -> str | None:
         if any(_has_glob(token) for token in consumed):
             return reason
         text = " ".join(inner)
-        if not text:
-            continue
-        if fnmatch.fnmatch("evil", text) or any(
-            fnmatch.fnmatch(probe, text) for probe in _BANNED_ALLOW_PROBES
-        ):
+        if text and _inner_pattern_banned(text, depth):
             return reason
-        if _wrapped_pattern_reason(text, depth + 1):
+    return None
+
+
+def _inner_pattern_banned(text: str, depth: int) -> bool:
+    """剥出来的那条命令模式：能匹配任意命令、命中探针、或本身又是一层包装且里面不干净。"""
+    if fnmatch.fnmatch("evil", text) or any(
+        fnmatch.fnmatch(probe, text) for probe in _BANNED_ALLOW_PROBES
+    ):
+        return True
+    return _wrapped_pattern_reason(text, depth + 1) is not None
+
+
+def _runner_reason(runner: str) -> str:
+    return (f"该模式会借「{runner}」放行里面的任意代码执行入口，等于永久绕过整套权限系统。"
+            "请写到具体命令（如 allow bash(uv run pytest*)），或在确认框答 a 做会话级放行。")
+
+
+def _after_options(tokens: list[str], start: int) -> list[int]:
+    """从 start 起跳过选项，给出下一个词（子命令 / 里面那条命令）可能落在的每个下标。
+
+    运行器的选项不查表：选项后面那个词既可能是它的值、也可能就是要找的词，两种都给。
+    """
+    found = []
+    index = start
+    while index < len(tokens):
+        if not tokens[index].startswith("-"):
+            found.append(index)
+            if index == start or not tokens[index - 1].startswith("-"):
+                break
+        index += 1
+    return found
+
+
+def _runner_pattern_reason(tokens: list[str], depth: int) -> str | None:
+    """透传运行器开头的模式（`uv run python *`、`npx tsx *`）按结构判，与 wrapper 同理：
+
+    运行器后面跟的是另一条命令，`uv run python *` 放行的是 `uv run python -c …`。
+    跳过运行器自己的选项，看里面放行的是什么；通配符落在被跳过的部分、或者贴在
+    运行器子命令上（`uv run*`）→ 它能连里面的命令一起吞掉。
+    """
+    head = tokens[0].rsplit("/", 1)[-1] if tokens else ""
+    if head in _PASSTHROUGH_HEADS:
+        starts = [1]
+    else:
+        subs = [sub for runner, sub in _PASSTHROUGH_RUNNERS if runner == head]
+        if not subs:
+            return None
+        starts = []
+        for index in _after_options(tokens, 1):
+            if not any(fnmatch.fnmatch(sub, tokens[index]) for sub in subs):
+                continue
+            if "*" in tokens[index] or any(_has_glob(token) for token in tokens[1:index]):
+                return _runner_reason(" ".join([head, *subs[:1]]))
+            starts.append(index + 1)
+    for start in starts:
+        reason = _runner_reason(" ".join(tokens[:start]))
+        if depth >= _MAX_PATTERN_DEPTH:
             return reason
+        for index in _after_options(tokens, start):
+            if any(_has_glob(token) for token in tokens[start:index]):
+                return reason
+            if _inner_pattern_banned(" ".join(tokens[index:]), depth):
+                return reason
     return None
 
 
@@ -208,6 +275,15 @@ _PASSTHROUGH_RUNNERS = frozenset({
     ("npm", "exec"), ("pnpm", "exec"), ("pnpm", "dlx"), ("yarn", "exec"), ("yarn", "dlx"),
 })
 _PASSTHROUGH_HEADS = frozenset({"npx", "bunx", "uvx"})
+_RUNNER_HEADS = _PASSTHROUGH_HEADS | {runner for runner, _ in _PASSTHROUGH_RUNNERS}
+#  运行器 × 探针：`uv run*`、`uv*python *` 这类通配跨词的模式按词拆不开，拿
+#  「运行器 + 任意代码执行入口」的完整命令去试规则本身。运行器带选项的写法探针
+#  枚举不完，另由 _runner_pattern_reason 按结构判。
+_RUNNER_PROBES = tuple(
+    (runner, f"{runner} {probe}")
+    for runner in sorted([*_PASSTHROUGH_HEADS, *(" ".join(pair) for pair in _PASSTHROUGH_RUNNERS)])
+    for probe in ("evil", *_BANNED_ALLOW_PROBES)
+)
 
 #  名词-动词式子命令：第二个词只是对象类别，第三个词才是操作——`gh repo view` 与
 #  `gh repo delete`、`git stash list` 与 `git stash drop` 不是一类
