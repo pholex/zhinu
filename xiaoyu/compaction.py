@@ -462,6 +462,114 @@ def clamp(text: str, cap: int = MAX_TRANSCRIPT_CHARS) -> str:
     return text[:head] + _ELLIPSIS + text[-tail:]
 
 
+# ---------- 最后手段：服务端报超窗、摘要压缩又缩不动时 ----------
+
+#  单条工具结果的上限阶梯（字符）。keep_recent 与工具输出上限都是固定值，不随
+#  窗口缩放：小窗口模型上，保留段里几条三万字符的结果自己就能撑爆窗口，而摘要
+#  压缩动不了保留段。逐档下探、够了就停——工具结果能重新取，但能少砍就少砍
+TIGHTEN_CAPS = (8_000, 2_000, 500)
+
+#  原始任务占窗口的份额上限：超过才砍、砍到这个份额。原文保留是承诺，只有它
+#  自己就占掉一大块窗口、不砍就一步也走不了时才动
+TASK_WINDOW_SHARE = 0.25
+
+
+class ContextOverflow(RuntimeError):
+    """服务端报上下文超限，而历史已经缩不动了：原样重发只会再被拒一次。
+
+    文案固定、不带数字和上游原话：它会被错误分类器按措辞再判一遍，混进
+    token 数或上游的超限措辞就可能被认成限流 / 超限而重试。上游的报错在
+    __cause__ 里。
+    """
+
+    def __init__(self) -> None:
+        super().__init__(
+            "上下文已超出模型窗口，压缩也无法再缩小。可以 /rewind 回退到较早的一轮、"
+            "/clear 清空对话，或 /model 换一个窗口更大的模型后重发"
+        )
+
+
+def _squeeze(text: str, cap: int, marker: str) -> str:
+    """砍中段保头尾，省略处留 marker；结果不超过 cap 字符。"""
+    head = int(cap * 0.4)
+    tail = max(cap - head - len(marker), 0)
+    return text[:head] + marker + (text[-tail:] if tail else "")
+
+
+def tighten_tool_results(
+    messages: list[dict[str, Any]], cap: int
+) -> tuple[list[dict[str, Any]], int]:
+    """把超过 cap 字符的工具结果砍到 cap 以内。返回 (新消息列表, 动了几条)。
+
+    只换内容、不删消息，tool_calls 配对不受影响。省略处留标记：模型得知道
+    这里被截过、缺的那段该怎么拿——落盘预览指向 recall，其余让它缩小范围重取
+    （原样重取只会把窗口再撑爆一次）。一条没动时原样返回同一个列表。
+    """
+    result: list[dict[str, Any]] = []
+    touched = 0
+    for message in messages:
+        content = message.get("content")
+        if message.get("role") != "tool" or not isinstance(content, str) or len(content) <= cap:
+            result.append(message)
+            continue
+        recall_id = recall_id_of(content)
+        how = (
+            f"用 recall(id=\"{recall_id}\") 按行或按正则取回"
+            if recall_id
+            else "缩小范围重新调用工具，只取用得上的那一段"
+        )
+        marker = (
+            f"\n\n… [上下文超出模型窗口，这条工具结果只保留了头尾"
+            f"（原 {len(content)} 字符，中段已省略）。需要被省略的部分请{how}] …\n\n"
+        )
+        result.append({**message, "content": _squeeze(content, cap, marker)})
+        touched += 1
+    return (result, touched) if touched else (messages, 0)
+
+
+def tighten_task(
+    messages: list[dict[str, Any]], context_limit: int
+) -> tuple[list[dict[str, Any]], bool]:
+    """首条 user 里的原始任务超过窗口份额时砍中段保头尾。返回 (新消息列表, 动没动)。
+
+    只动分界标记之前的原始任务，摘要块原样；图片部件不动。
+    """
+    if len(messages) < 2 or messages[1].get("role") != "user":
+        return messages, False
+    allowed = int(context_limit * TASK_WINDOW_SHARE)
+
+    def squeezed(text: str) -> str:
+        original, marker, rest = text.partition(CONTEXT_PREFIX)
+        cost = tokens.estimate_text(original)
+        if cost <= allowed:
+            return text
+        note = (
+            f"\n\n… [原始任务超出模型窗口，只保留了头尾（原 {len(original)} 字符，"
+            "中段已省略）。被省略的部分如仍需要，从它的出处重新读取，或请用户重新提供] …\n\n"
+        )
+        #  份额是 token，砍的是字符：按这段文本自己的密度折算
+        return _squeeze(original, int(len(original) * allowed / cost), note) + marker + rest
+
+    content = messages[1].get("content")
+    if isinstance(content, str):
+        replaced: Any = squeezed(content)
+    elif media.is_parts(content):
+        replaced = list(content)
+        for offset, part in enumerate(content):
+            if not (isinstance(part, dict) and part.get("type") == media.TEXT_PART):
+                continue
+            text = str(part.get("text") or "")
+            if (shorter := squeezed(text)) != text:
+                replaced[offset] = media.text_part(shorter)
+            if CONTEXT_PREFIX in text:
+                break
+    else:
+        return messages, False
+    if replaced == content:
+        return messages, False
+    return [messages[0], {**messages[1], "content": replaced}, *messages[2:]], True
+
+
 #  单次压缩至少要省出这个比例才算"有效"
 MIN_SAVING_RATIO = 0.10
 
@@ -816,6 +924,48 @@ class Compactor:
         else:
             self.state.ineffective = 0
         return compacted, note
+
+    # ---------- 最后手段 ----------
+
+    def tighten(
+        self, messages: list[dict[str, Any]], overhead: int = 0
+    ) -> tuple[list[dict[str, Any]], str]:
+        """摘要压缩缩不动时收紧保留下来的内容。返回 (新消息列表, 说明)。
+
+        只给「不收紧这一轮就要以上下文超限失败」的路用，compact 不调它。
+        由轻到重逐个试，取第一个「确实变小、且估算回到预算内」的方案：
+        工具结果按 TIGHTEN_CAPS 逐档收紧；都不够、且原始任务占窗口过大时，
+        先砍原始任务的中段、再叠加同一组档位。没有一个够得着预算就取最重的
+        那个——估算未必准，小一些总比原样再被拒一次强。
+        一点都缩不了时原样返回同一个列表、说明为空串：调用方据此判断没有进展。
+
+        overhead 是消息之外随请求走的固定开销（工具 schema）的 token 估算。
+        """
+        before = tokens.estimate_messages(messages)
+        budget = self.budget()
+        bases = [(messages, False)]
+        tasked, task_cut = tighten_task(messages, self.context_limit)
+        if task_cut:
+            bases.append((tasked, True))
+        best: tuple[list[dict[str, Any]], str] | None = None
+        for base, with_task in bases:
+            steps = [(base, 0, 0)] if with_task else []
+            steps += [(*tighten_tool_results(base, cap), cap) for cap in TIGHTEN_CAPS]
+            for candidate, touched, cap in steps:
+                after = tokens.estimate_messages(candidate)
+                if after >= before:
+                    continue
+                done = []
+                if touched:
+                    done.append(f"把 {touched} 条工具结果收紧到 {cap} 字符以内")
+                if with_task:
+                    done.append("把过长的原始任务砍去中段")
+                best = candidate, (
+                    f"已{'、'.join(done)}（省略处有标记），估算 {before} → {after} tok"
+                )
+                if after + overhead < budget:
+                    return best
+        return best or (messages, "")
 
 
 def _joined(first: Any, second: Any) -> Any:

@@ -5,11 +5,14 @@
 
 from __future__ import annotations
 
+import contextlib
+import io
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
-from xiaoyu import compaction, media, tools
+from xiaoyu import compaction, errors, media, session_log, tokens, tools
 from xiaoyu.compaction import (
     CONTEXT_PREFIX,
     Compactor,
@@ -19,6 +22,7 @@ from xiaoyu.compaction import (
 )
 from xiaoyu.config import Config
 
+from .test_agent_paths import AgentTestCase, chunk
 from .test_context import assert_valid_sequence
 
 BIG = "x" * 2000
@@ -244,6 +248,230 @@ class TestClearedSpillKeepsRecallId(unittest.TestCase):
         self.assertEqual(cleared, 1)
         self.assertIn("请重新调用 bash", result[3]["content"])
         self.assertNotIn("recall", result[3]["content"])
+
+
+def log_lines(count: int, tag: str = "row") -> str:
+    """一段头、中、尾各不相同的长输出：验证砍的是中段。"""
+    return "\n".join(f"{tag} {n:05d} ok" for n in range(count))
+
+
+class TestTightenLastResort(unittest.TestCase):
+    """摘要压缩缩不动时的最后手段：逐档收紧工具结果，必要时砍原始任务的中段。"""
+
+    def history(self, outputs: int = 4, size: int = 3000) -> list[dict]:
+        return [
+            {"role": "system", "content": "s"},
+            {"role": "user", "content": "跑一遍全量检查"},
+            *parallel_batch("chk", outputs, name="bash", output=log_lines(size)),
+        ]
+
+    def test_picks_the_lightest_rung_that_fits(self) -> None:
+        messages = self.history()
+        for limit, cap in ((40_000, 8_000), (9_000, 2_000), (1_000, 500)):
+            with self.subTest(limit=limit):
+                compactor = build_compactor()
+                compactor.context_limit = limit
+                tightened, note = compactor.tighten(messages)
+                self.assertIn(f"{cap} 字符以内", note)
+                assert_valid_sequence(self, tightened)
+                for before, after in zip(messages[3:], tightened[3:]):
+                    self.assertLessEqual(len(after["content"]), cap)
+                    #  保头保尾，省略处留下标记并说明怎么拿回来
+                    self.assertTrue(after["content"].startswith(before["content"][:100]))
+                    self.assertTrue(after["content"].endswith(before["content"][-100:]))
+                    self.assertIn("中段已省略", after["content"])
+                    self.assertIn("缩小范围重新调用工具", after["content"])
+                self.assertLess(
+                    tokens.estimate_messages(tightened), tokens.estimate_messages(messages)
+                )
+
+    def test_nothing_to_tighten_returns_the_same_list(self) -> None:
+        messages = [
+            {"role": "system", "content": "s"},
+            {"role": "user", "content": "任务"},
+            {"role": "assistant", "content": "阿" * 5000},
+        ]
+        compactor = build_compactor()
+        compactor.context_limit = 1_000
+        tightened, note = compactor.tighten(messages)
+        self.assertIs(tightened, messages)
+        self.assertEqual(note, "")
+
+    def test_spilled_preview_points_at_recall(self) -> None:
+        preview = (
+            "[输出超长：原始 90000 字符 / 约 3000 行，完整内容已存，召回 id: 4。以下保留开头和结尾]\n"
+            + log_lines(3000)
+        )
+        messages = self.history(outputs=1)
+        messages[3]["content"] = preview
+        tightened, _ = build_compactor().tighten(messages)
+        self.assertIn('recall(id="4")', tightened[3]["content"])
+        self.assertNotIn("重新调用工具", tightened[3]["content"])
+
+    def test_oversized_task_loses_only_its_middle(self) -> None:
+        task = log_lines(6000, tag="需求")
+        summary = f"{CONTEXT_PREFIX}上一份交接说明"
+        for content in (
+            f"{task}\n\n{summary}",
+            [
+                media.image_part("xiaoyu-media://mock.png"),
+                media.text_part(task),
+                media.text_part(f"\n\n{summary}"),
+            ],
+        ):
+            with self.subTest(parts=media.is_parts(content)):
+                messages = [
+                    {"role": "system", "content": "s"},
+                    {"role": "user", "content": content},
+                    {"role": "assistant", "content": "好"},
+                ]
+                compactor = build_compactor()
+                compactor.context_limit = 20_000
+                tightened, note = compactor.tighten(messages)
+                self.assertIn("原始任务", note)
+                original, previous = split_head(media.text_of(tightened[1]["content"]))
+                self.assertEqual(previous, "上一份交接说明")
+                self.assertIn("原始任务超出模型窗口", original)
+                self.assertIn("需求 00000 ok", original)
+                self.assertIn("需求 05999 ok", original)
+                self.assertNotIn("需求 03000 ok", original)
+                self.assertLessEqual(
+                    tokens.estimate_text(original), 20_000 * compaction.TASK_WINDOW_SHARE * 1.1
+                )
+                self.assertEqual(
+                    media.images_of(tightened[1]["content"]), media.images_of(content)
+                )
+
+    def test_task_within_its_share_is_left_alone(self) -> None:
+        messages = self.history()
+        compactor = build_compactor()
+        compactor.context_limit = 1_000
+        tightened, note = compactor.tighten(messages)
+        self.assertEqual(tightened[1], messages[1])
+        self.assertNotIn("原始任务", note)
+
+
+OVERFLOW_TEXT = "This model's maximum context length is 32000 tokens"
+
+
+class TestOverflowRecovery(AgentTestCase):
+    """服务端报上下文超限之后：缩得动才重发，缩不动立刻给出可操作的报错。"""
+
+    def send(self, agent, text: str = "继续") -> tuple[list, str]:
+        """跑一轮，返回 (退避等待的秒数列表, 屏幕输出)。"""
+        buffer = io.StringIO()
+        with mock.patch("xiaoyu.agent.Agent._sleep") as sleep, contextlib.redirect_stdout(buffer):
+            try:
+                agent.send(text)
+            finally:
+                self.waits = [call.args[0] for call in sleep.call_args_list]
+        return self.waits, buffer.getvalue()
+
+    def main_requests(self) -> int:
+        """对话请求的次数（流式的那些；摘要调用不是流式）。"""
+        return sum(1 for call in self.client.completions.calls if call.get("stream"))
+
+    def assert_actionable(self, exc: BaseException) -> None:
+        self.assertIsInstance(exc, compaction.ContextOverflow)
+        for way_out in ("/rewind", "/clear", "/model"):
+            self.assertIn(way_out, str(exc))
+        self.assertIn(OVERFLOW_TEXT, str(exc.__cause__))
+        #  宿主按分类决定重不重试：这一条重试无用，也不该再触发压缩
+        verdict = errors.classify(exc)
+        self.assertFalse(verdict.retryable)
+        self.assertFalse(verdict.should_compact)
+
+    def test_history_too_short_to_compact_fails_at_once(self) -> None:
+        agent = self.build([RuntimeError(OVERFLOW_TEXT)])
+        with self.assertRaises(compaction.ContextOverflow) as caught:
+            self.send(agent, "你好")
+        self.assert_actionable(caught.exception)
+        self.assertEqual(self.main_requests(), 1)
+        self.assertEqual(self.waits, [])
+
+    def test_failing_summary_keeps_history_and_fails_at_once(self) -> None:
+        #  主请求一次 + 摘要的降级阶梯（两档 × 便宜腿、主模型重放腿、主模型转写腿）
+        agent = self.build(
+            [RuntimeError(OVERFLOW_TEXT), *[ValueError("摘要后端坏了") for _ in range(6)]]
+        )
+        agent.messages.append({"role": "user", "content": "长任务"})
+        for n in range(12):
+            agent.messages.append({"role": "assistant", "content": f"进展 {n}：" + "阿" * 1500})
+            agent.messages.append({"role": "user", "content": f"要求 {n}"})
+        agent.messages.append({"role": "assistant", "content": "等下一步"})
+        #  自动压缩此前已因连续失败暂停：发请求前不会先压
+        agent.compactor.state.failures = 2
+        before = list(agent.messages)
+        with self.assertRaises(compaction.ContextOverflow) as caught:
+            self.send(agent)
+        self.assert_actionable(caught.exception)
+        self.assertEqual(agent.messages[: len(before)], before)
+        self.assertEqual(self.main_requests(), 1)
+        self.assertEqual(len(self.client.completions.calls), 7)
+        self.assertEqual(self.waits, [])
+
+    def oversized_tail(self, agent) -> None:
+        agent.messages.append({"role": "user", "content": "跑一遍全量检查"})
+        agent.messages += parallel_batch("chk", 3, name="bash", output=log_lines(2200))
+        agent.config.context_limit = 16_000
+
+    def test_oversized_tail_is_tightened_then_resent(self) -> None:
+        log = session_log.SessionLog(self.root / "log.jsonl")
+        self.addCleanup(log.release)
+        agent = self.build([RuntimeError(OVERFLOW_TEXT), [chunk(content="检查都过了")]], session_log=log)
+        self.oversized_tail(agent)
+        for message in agent.messages[1:]:
+            log.append(message)
+        untouched = [m["content"] for m in agent.messages if m.get("role") == "tool"]
+
+        _, shown = self.send(agent)
+
+        self.assertEqual(agent.last_assistant_text(), "检查都过了")
+        self.assertEqual(self.main_requests(), 2)
+        self.assertIn("收紧", shown)
+        results = [m["content"] for m in agent.messages if m.get("role") == "tool"]
+        for before, after in zip(untouched, results):
+            self.assertLess(len(after), len(before))
+            self.assertIn("中段已省略", after)
+        assert_valid_sequence(self, agent.messages)
+        #  第二次发出去的就是收紧后的历史
+        resent = self.client.completions.calls[-1]["messages"]
+        self.assertIn("中段已省略", str(resent))
+        #  收紧记成一次带 replacement 的压缩：resume 重放出来的与内存里的一致
+        self.assertEqual(session_log.load_messages(log.path), agent.messages[1:])
+        self.assertFalse(session_log.has_orphan_compact(log.path))
+
+    def test_second_overflow_with_nothing_left_to_shrink_stops(self) -> None:
+        """收紧到底仍被拒：不再发第三次。"""
+        agent = self.build([RuntimeError(OVERFLOW_TEXT) for _ in range(5)])
+        self.oversized_tail(agent)
+        with self.assertRaises(compaction.ContextOverflow):
+            self.send(agent)
+        #  每次重发之前历史都确实更小；缩到底之后不再发
+        sizes = [
+            tokens.estimate_messages(call["messages"])
+            for call in self.client.completions.calls
+        ]
+        self.assertEqual(sizes, sorted(sizes, reverse=True))
+        self.assertEqual(len(set(sizes)), len(sizes))
+        self.assertLess(self.main_requests(), 5)
+
+    def test_normal_compaction_never_tightens(self) -> None:
+        """没有超限报错时，保留段里的大结果原样不动。"""
+        from .test_agent_paths import GOOD_SUMMARY, text_response
+
+        agent = self.build([text_response(GOOD_SUMMARY)])
+        agent.messages.append({"role": "user", "content": "长任务"})
+        for n in range(12):
+            agent.messages.append({"role": "assistant", "content": f"进展 {n}：" + "阿" * 1500})
+            agent.messages.append({"role": "user", "content": f"要求 {n}"})
+        agent.messages += parallel_batch("chk", 3, name="bash", output=log_lines(2200))
+        kept = [m for m in agent.messages if m.get("role") == "tool"]
+        agent.config.context_limit = 16_000
+        with contextlib.redirect_stdout(io.StringIO()):
+            note = agent.maybe_compact()
+        self.assertIn("已压缩", note)
+        self.assertEqual([m for m in agent.messages if m.get("role") == "tool"], kept)
 
 
 if __name__ == "__main__":
