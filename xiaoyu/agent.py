@@ -10,6 +10,7 @@ from __future__ import annotations
 import hashlib
 import inspect
 import json
+import os
 import platform
 import queue
 import random
@@ -643,6 +644,60 @@ def collect_project_docs(
         kept.append((label, text))
     kept.reverse()
     return kept
+
+
+#  往下找子目录约定文件时不进去的目录：依赖、构建产物、版本库内部
+_NESTED_DOC_SKIP = frozenset(
+    {"node_modules", "vendor", "venv", "dist", "build", "target", "__pycache__", "site-packages"}
+)
+#  只往下看两层、最多扫这么多个目录、最多列这么多条：这是启动路径上的一次
+#  目录遍历，工作区可能是个很大的 monorepo（甚至是家目录）
+_NESTED_DOC_DEPTH = 2
+_NESTED_DOC_SCAN_CAP = 400
+_NESTED_DOC_LIST_CAP = 12
+#  路径的每一段只认这些字符：目录名来自仓库，进 system prompt 之前不能让它
+#  带着空白和标点夹一句话进来
+_NESTED_DOC_PART = re.compile(r"^[\w.@+-]{1,64}$")
+
+
+def nested_project_docs(workspace: Path, names: tuple[str, ...]) -> list[str]:
+    """工作区**下层**目录里的项目指令文件，返回相对路径（posix 形态，已排序）。
+
+    collect_project_docs 只收"git 根 → 工作区"这条上行链。在 monorepo 根启动时，
+    子包自己的约定文件不在这条链上，模型不知道它们存在，改到那个子包时就按
+    根目录的约定去猜。这里只找出它们在哪，正文不读：由调用方在 system prompt
+    里留一行指针，模型动到那个目录时自己去读。
+    """
+    found: list[str] = []
+    scanned = 0
+    pending: list[tuple[Path, int]] = [(workspace, 0)]
+    while pending and scanned < _NESTED_DOC_SCAN_CAP:
+        directory, depth = pending.pop(0)
+        try:
+            entries = sorted(os.scandir(directory), key=lambda entry: entry.name)
+        except OSError:
+            continue
+        for entry in entries:
+            try:
+                is_dir = entry.is_dir(follow_symlinks=False)
+            except OSError:
+                continue
+            name = entry.name
+            if not is_dir or name.startswith(".") or name in _NESTED_DOC_SKIP:
+                continue
+            if not _NESTED_DOC_PART.match(name):
+                continue
+            scanned += 1
+            if scanned > _NESTED_DOC_SCAN_CAP:
+                break
+            child = Path(entry.path)
+            for doc in names:
+                if (child / doc).is_file():
+                    found.append((child / doc).relative_to(workspace).as_posix())
+                    break
+            if depth + 1 < _NESTED_DOC_DEPTH:
+                pending.append((child, depth + 1))
+    return sorted(found)[:_NESTED_DOC_LIST_CAP]
 
 
 class _DeterministicEmpty(Exception):
@@ -1558,15 +1613,26 @@ class Agent:
         found = collect_project_docs(
             self.config.workspace, self._PROJECT_DOC_NAMES, self._PROJECT_DOC_CAP
         )
+        #  下层目录的约定文件只留指针、不载正文：正文按需读，system prompt 在
+        #  会话内保持静态（它是 prompt cache 的最长前缀）
+        nested = nested_project_docs(self.config.workspace, self._PROJECT_DOC_NAMES)
+        pointer = (
+            "\n\n子目录里还有各自的约定文件（正文没有载入；要改动某个子目录里的东西，"
+            "先读它那份）：\n" + "\n".join(f"- {path}" for path in nested)
+            if nested
+            else ""
+        )
         if not found:
-            return ""
+            return pointer
         if len(found) == 1:
             label, text = found[0]
-            return f"\n\n项目指令（来自 {label}，由项目维护者提供，遵照执行）：\n{text}"
+            return (
+                f"\n\n项目指令（来自 {label}，由项目维护者提供，遵照执行）：\n{text}" + pointer
+            )
         blocks = "\n\n".join(f"【{label}】\n{text}" for label, text in found)
         return (
             "\n\n项目指令（由项目维护者提供，遵照执行；自项目根到工作区逐层收集，"
-            f"越靠后越具体、冲突时以靠后者为准）：\n{blocks}"
+            f"越靠后越具体、冲突时以靠后者为准）：\n{blocks}" + pointer
         )
 
     #  计划状态的合法值（显示符号在 render.py，这里只管校验）
