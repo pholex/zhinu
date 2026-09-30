@@ -137,6 +137,25 @@ CLEAR_MIN_CHARS = 500
 _CLEARED_MARKER = "[结果已清理"
 
 
+def _protected_from(messages: list[dict[str, Any]], keep_recent: int) -> int:
+    """microcompact 的保护边界：这个下标起的消息不清。
+
+    一个工具结果一条消息，模型一次并行调十几个工具时，按条数数出来的边界会
+    落在这一批的中间——同一批里靠前的几个结果被换成占位。所以边界按
+    「assistant(tool_calls) + 它的全部结果」整批对齐：
+    - 落在 tool 消息上就退到这一批所属的那条 assistant；
+    - 最后一条 assistant 之后的工具结果模型还没读过（它没来得及回应），
+      不管 keep_recent 多小都整批不清——清掉等于让模型为没见过的内容重跑工具。
+    """
+    boundary = max(0, len(messages) - keep_recent)
+    while 0 < boundary < len(messages) and messages[boundary].get("role") == "tool":
+        boundary -= 1
+    for index in range(len(messages) - 1, -1, -1):
+        if messages[index].get("role") == "assistant":
+            return min(boundary, index)
+    return boundary
+
+
 def microcompact(
     messages: list[dict[str, Any]],
     keep_recent: int,
@@ -149,6 +168,7 @@ def microcompact(
     （摘要看到的是占位符，占位符本身也说明了内容去了哪）。
 
     最近 keep_recent 条消息受保护：近期的读取/测试输出往往正在被使用。
+    保护边界按批对齐（见 _protected_from）：一批并行结果要么整批受保护、要么整批可清。
     """
     #  tool_call_id → 工具名，从 assistant 的 tool_calls 里反查
     call_names: dict[str, str] = {}
@@ -156,7 +176,7 @@ def microcompact(
         for call in message.get("tool_calls") or []:
             call_names[call.get("id", "")] = call.get("function", {}).get("name", "")
 
-    boundary = max(0, len(messages) - keep_recent)
+    boundary = _protected_from(messages, keep_recent)
     result: list[dict[str, Any]] = []
     cleared = saved = 0
     for index, message in enumerate(messages):
@@ -573,6 +593,10 @@ class Compactor:
         单个 turn 内烧掉的（一路读文件、跑命令），整段可能只有一条 user 消息，
         那个规则会让压缩永远不触发。
 
+        从 target 到末尾全是 tool 消息（末批并行结果不少于 keep_recent 条）时，
+        往后找不到切点，就退到这一批所属的那条 assistant 上——整批跟着它保留，
+        它之前的历史照常可压。
+
         min_index 之前的消息受保护（system prompt 和原始任务描述）。
         """
         target = max(min_index, len(messages) - self.keep_recent)
@@ -580,6 +604,9 @@ class Compactor:
             if messages[index].get("role") != "tool":
                 #  切点等于 min_index 意味着一条都没压到，没意义
                 return index if index > min_index else -1
+        for index in range(min(target, len(messages)) - 1, min_index, -1):
+            if messages[index].get("role") != "tool":
+                return index
         return -1
 
     # ---------- 执行 ----------
