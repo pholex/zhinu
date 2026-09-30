@@ -448,7 +448,13 @@ class TestOverflowRecovery(AgentTestCase):
         """收紧到底仍被拒：不再发第三次。"""
         agent = self.build([RuntimeError(OVERFLOW_TEXT) for _ in range(5)])
         self.oversized_tail(agent)
-        with self.assertRaises(compaction.ContextOverflow):
+        #  收紧分几档走完，取决于工具 schema 的开销离预算多远；这个开销随环境变
+        #  （装没装浏览器依赖差一个工具，system prompt 也略有出入）。钉住它，让
+        #  两档见底这个场景在哪台机器上都成立，而不是恰好压在预算线上
+        with (
+            mock.patch.object(tokens, "estimate_tools", return_value=6_000),
+            self.assertRaises(compaction.ContextOverflow),
+        ):
             self.send(agent)
         #  每次重发之前历史都确实更小；缩到底之后不再发
         sizes = [
