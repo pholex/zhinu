@@ -212,12 +212,16 @@ class CommandKeyGrantTest(unittest.TestCase):
         self.assertEqual(command_keys("python -m pip list"), ("python -m pip list",))
         self.assertEqual(command_keys("python scripts/x.py --flag"), ("python scripts/x.py",))
         self.assertEqual(command_keys("node scripts/build.js"), ("node scripts/build.js",))
+        self.assertEqual(command_keys("tsx src/build.ts"), ("tsx src/build.ts",))
+        self.assertEqual(command_keys("tsx watch src/build.ts"), ("tsx src/build.ts",))
+        self.assertEqual(command_keys("ts-node src/build.ts"), ("ts-node src/build.ts",))
         self.assertEqual(command_keys("python --version"), ("python --version",))
         #  把参数当代码跑的形态、从标准输入读代码的裸解释器：永远逐次确认。
         #  perl -E 是执行代码（python 的 -E 才是忽略环境变量），不能共用一张无害表
         for command in ("python -c 'print(1)'", "node -e 'x'", "perl -E 'x'", "perl -e 'x'",
                         "ruby -e 'x'", "php -r 'x'", "python", "node", "python -",
-                        "node --require ./x.js app.js"):
+                        "node --require ./x.js app.js",
+                        "tsx -e 'x'", "ts-node -e 'x'", "ts-node -p 'x'", "tsx watch"):
             self.assertIsNone(command_keys(command), command)
         perms = self.perms()
         perms.grant_session_call("bash", {"command": "python -m pytest tests/"})
@@ -508,6 +512,8 @@ class BannedAllowTest(unittest.TestCase):
             "allow bash(sudo *)",
             "allow bash(env *)",
             "allow bash(npm *)",  # 会覆盖 npm run（跑 package.json 里的任意脚本）
+            "allow bash(tsx *)",  # 会覆盖 tsx -e
+            "allow bash(ts-node *)",
             "allow bash(rm *)",
         ):
             with self.assertRaises(ValueError, msg=line):
@@ -785,7 +791,8 @@ class SuggestAllowRuleTest(unittest.TestCase):
 
         for command in ("python3 evil.py", "python scripts/x.py --flag", "python3 -u evil.py",
                         "python3.12 evil.py", "node x.js", "ruby x.rb", "perl x.pl", "php x.php",
-                        "/usr/bin/python3 evil.py", "uv run python evil.py"):
+                        "/usr/bin/python3 evil.py", "uv run python evil.py",
+                        "tsx x.ts", "tsx watch x.ts", "ts-node x.ts", "npx tsx x.ts"):
             self.assertIsNone(self.suggest("bash", {"command": command}), command)
             self.assertIsNotNone(command_keys(command), command)
         #  跑模块 / 只问版本不受影响

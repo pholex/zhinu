@@ -52,7 +52,7 @@ _BANNED_ALLOW_PROBES = (
     "ksh -c evil", "fish -c evil", "cmd /c evil", "powershell -Command evil",
     "pwsh -Command evil",
     "python -c evil", "python3 -c evil", "py -c evil", "pypy -c evil",
-    "node -e evil", "deno eval evil", "bun -e evil",
+    "node -e evil", "deno eval evil", "bun -e evil", "tsx -e evil", "ts-node -e evil",
     "perl -e evil", "ruby -e evil", "php -r evil", "lua -e evil",
     "julia -e evil", "Rscript -e evil", "osascript -e evil",
     "eval evil",
@@ -230,7 +230,7 @@ _NESTED_SUBCOMMANDS = frozenset({
 #  无害选项表里，自然推不出范围。各家同一个字母含义不同（python -E 是忽略环境变量，
 #  perl -E 是执行代码），所以无害选项按解释器分别列，不共用。
 _INTERPRETER = re.compile(
-    r"(?:python|pypy)(?:\d+(?:\.\d+)?)?$|(?:py|node|ruby|perl|php|lua|Rscript|julia)$"
+    r"(?:python|pypy)(?:\d+(?:\.\d+)?)?$|(?:py|node|tsx|ts-node|ruby|perl|php|lua|Rscript|julia)$"
 )
 _PYTHON_FLAGS = frozenset({"-u", "-B", "-q", "-O", "-OO", "-s", "-S", "-E", "-I", "-b", "-d", "-P"})
 _INFO_FLAGS = frozenset({"--version", "--help", "-h", "-V"})
@@ -286,6 +286,10 @@ def _stable_prefix(argv: list[str], depth: int = 0) -> tuple[str, int, str | Non
                 if index + 1 >= len(argv):
                     return None
                 return _through_runner(argv, index + 1, f"{head} -m", depth)
+            if head == "tsx" and index == 1 and token == "watch":
+                #  tsx watch x.ts：watch 只是运行方式，跑的仍是后面那个脚本
+                index += 1
+                continue
             if not token.startswith("-"):
                 return f"{head} {token}", index + 1, _SESSION_ONLY
             if token in _INFO_FLAGS:
