@@ -380,6 +380,9 @@ class TestOverflowRecovery(AgentTestCase):
         verdict = errors.classify(exc)
         self.assertFalse(verdict.retryable)
         self.assertFalse(verdict.should_compact)
+        #  类别照旧报上下文超限：宿主要能区分"上下文满了"和别的致命错误
+        self.assertEqual(verdict.kind, "context_overflow")
+        self.assertIs(compaction.ContextOverflow, errors.ContextOverflow)
 
     def test_history_too_short_to_compact_fails_at_once(self) -> None:
         agent = self.build([RuntimeError(OVERFLOW_TEXT)])

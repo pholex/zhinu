@@ -19,6 +19,8 @@ from dataclasses import dataclass
 from typing import Any, Callable
 
 from . import media, tokens
+#  定义在 errors（分类器要认它），这里再导出：压缩这一侧的调用方照旧从本模块取
+from .errors import ContextOverflow  # noqa: F401
 
 #  开头的"无工具"声明：实测不加这段时部分模型会把唯一一轮输出浪费在
 #  调工具上——摘要走的是便宜模型，更容易犯这个错。固定分节结构
@@ -472,21 +474,6 @@ TIGHTEN_CAPS = (8_000, 2_000, 500)
 #  原始任务占窗口的份额上限：超过才砍、砍到这个份额。原文保留是承诺，只有它
 #  自己就占掉一大块窗口、不砍就一步也走不了时才动
 TASK_WINDOW_SHARE = 0.25
-
-
-class ContextOverflow(RuntimeError):
-    """服务端报上下文超限，而历史已经缩不动了：原样重发只会再被拒一次。
-
-    文案固定、不带数字和上游原话：它会被错误分类器按措辞再判一遍，混进
-    token 数或上游的超限措辞就可能被认成限流 / 超限而重试。上游的报错在
-    __cause__ 里。
-    """
-
-    def __init__(self) -> None:
-        super().__init__(
-            "上下文已超出模型窗口，压缩也无法再缩小。可以 /rewind 回退到较早的一轮、"
-            "/clear 清空对话，或 /model 换一个窗口更大的模型后重发"
-        )
 
 
 def _squeeze(text: str, cap: int, marker: str) -> str:

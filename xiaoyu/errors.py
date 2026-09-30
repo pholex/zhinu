@@ -51,6 +51,21 @@ class Interrupted(Exception):
     """
 
 
+class ContextOverflow(RuntimeError):
+    """服务端报上下文超限，而历史已经缩不动了：原样重发只会再被拒一次。
+
+    分类器按类型认它（见 classify）：类别仍是 context_overflow——宿主据此知道
+    是上下文的问题——但不可重试、也不再触发压缩。文案固定、不带数字和上游原话；
+    上游的报错在 __cause__ 里。
+    """
+
+    def __init__(self) -> None:
+        super().__init__(
+            "上下文已超出模型窗口，压缩也无法再缩小。可以 /rewind 回退到较早的一轮、"
+            "/clear 清空对话，或 /model 换一个窗口更大的模型后重发"
+        )
+
+
 class ContentFiltered(RuntimeError):
     """服务端内容过滤/安全分类器拒答（HTTP 200、没有可用内容）。
 
@@ -350,6 +365,9 @@ def classify(exc: Exception) -> Verdict:
             "fatal", False, False,
             f"{exc}（重发或换模型多半同样被拦，请调整请求内容）",
         )
+    if isinstance(exc, ContextOverflow):
+        #  先于文本判定：按措辞认的话它又是"超限、压缩后重试"，正好绕回它要打断的那个圈
+        return Verdict("context_overflow", False, False, str(exc))
     if isinstance(exc, StreamTruncated):
         #  先于文本判定：断流描述里的措辞不该撞上任何 marker
         return Verdict("transient", True, False, "流在工具参数写到一半时断开")
