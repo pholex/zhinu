@@ -42,6 +42,7 @@ from .compaction import (
     TOOL_IMAGE_HIGH_WATER,
     TOOL_IMAGE_KEEP,
     Compactor,
+    ContextOverflow,
     TruncatedSummary,
     age_tool_images,
     is_degenerate_summary,
@@ -3298,6 +3299,45 @@ class Agent:
             self.session_log.event("compact_end", ok=changed)
         return note
 
+    def _shrink_after_overflow(self) -> bool:
+        """服务端报上下文超限后的回收。返回历史有没有真的变小。
+
+        先强制压缩。压不动（历史太短被跳过、摘要调用失败、保留段自己就超窗），
+        或压完估算仍在预算之上，再走最后手段收紧保留下来的内容。
+        判据是消息的 token 估算而不是改写计数：改写了却没变小同样不值得重发。
+        """
+        before = tokens.estimate_messages(self.messages)
+        self.maybe_compact(force=True)
+        if (
+            tokens.estimate_messages(self.messages) >= before
+            or self.context_tokens() >= self.compactor.budget()
+        ):
+            self._tighten_history()
+        return tokens.estimate_messages(self.messages) < before
+
+    def _tighten_history(self) -> bool:
+        """最后手段：收紧保留下来的工具结果（必要时连同过长的原始任务）。
+
+        只有超窗恢复这条路会调——不收紧，这一轮就要以上下文超限失败。
+        算一次历史改写，日志走压缩的协议（compact_start / compact(replacement) /
+        compact_end）：resume 只认最后一个带 replacement 的事件，重放出来的就是
+        收紧后的历史，不会把刚砍掉的内容原样接回来再超一次窗。
+        """
+        tightened, note = self.compactor.tighten(
+            self.messages, overhead=tokens.estimate_tools(self.toolbox.schemas())
+        )
+        if tightened is self.messages:
+            return False
+        if self.session_log:
+            self.session_log.event("compact_start", trigger="overflow")
+        self.messages = tightened
+        self._history_rewritten()
+        self.sink.emit(Notice(f"[上下文仍超出模型窗口，{note}]", "warn"))
+        if self.session_log:
+            self.session_log.event("compact", note=note, replacement=self.messages[1:])
+            self.session_log.event("compact_end", ok=True)
+        return True
+
     # ---------- 上下文窗口工具（模型自管余量） ----------
 
     _NEW_CONTEXT_NOTES_CAP = 4000
@@ -3873,8 +3913,12 @@ class Agent:
                     attempt -= 1
                     continue
                 if verdict.should_compact:
-                    #  上下文超限：本地估算低估了才会走到这，立刻强制压缩
-                    self.maybe_compact(force=True)
+                    #  上下文超限：本地估算低估了才会走到这，立刻强制压缩。历史一点
+                    #  没变小就不再重发——同一个请求只会再被拒一次，退避也是白等，
+                    #  无头模式下每轮都这样重演，会话等于卡死
+                    if not self._shrink_after_overflow():
+                        self._log_request(route, attempt, "error", exc=exc, verdict=verdict)
+                        raise ContextOverflow() from exc
                 if not retrying:
                     self._log_request(route, attempt, "error", exc=exc, verdict=verdict)
                     raise

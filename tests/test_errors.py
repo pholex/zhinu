@@ -387,8 +387,18 @@ class RecoveryLoopTest(AgentTestCase):
         )
         script = [overflow, [chunk(content="ok"), usage_chunk(100, 5)]]
         agent = self.build(script)
+        agent.messages += [
+            {"role": "user", "content": "早先的任务"},
+            {"role": "assistant", "content": "阿" * 4000},
+        ]
+
+        def compacting(force: bool = False) -> None:
+            #  重发的前提是历史真的变小了：这里替压缩把那条长回答换掉
+            if force:
+                agent.messages[2] = {"role": "assistant", "content": "（已压缩）"}
+
         with mock.patch("xiaoyu.agent.Agent._sleep"), mock.patch.object(
-            agent, "maybe_compact"
+            agent, "maybe_compact", side_effect=compacting
         ) as fake_compact:
             agent.send("hi")
         fake_compact.assert_any_call(force=True)

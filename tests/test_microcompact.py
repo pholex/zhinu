@@ -97,6 +97,8 @@ class MicrocompactTest(unittest.TestCase):
         messages = [
             {"role": "system", "content": "s"},
             *tool_exchange("c1", "bash", self.big),
+            #  模型回应过这条结果之后它才可清
+            {"role": "assistant", "content": "跑完了"},
             {"role": "user", "content": "继续"},
         ]
         once, cleared_first, _ = microcompact(messages, keep_recent=1)
@@ -110,9 +112,11 @@ class MicrocompactTest(unittest.TestCase):
         messages = [
             {"role": "system", "content": "s"},
             *tool_exchange("c1", "grep", self.big),
+            {"role": "assistant", "content": "找到了"},
             {"role": "user", "content": "继续"},
         ]
-        microcompact(messages, keep_recent=1)
+        _, cleared, _ = microcompact(messages, keep_recent=1)
+        self.assertEqual(cleared, 1)
         self.assertEqual(messages[2]["content"], self.big)
 
 
