@@ -717,6 +717,29 @@ class Usage:
             entry.completion_tokens += completion
             entry.calls += 1
 
+    def absorb(self, by_model: Any) -> None:
+        """把一份已有的分模型用量并进这本账（形状同 to_dict()["by_model"]）。
+
+        给"同一个会话换了进程接着跑"用：账本只活在内存里，不并回来的话累计
+        从零重算，按会话累计设的预算就跟着清零。形状不对的条目跳过。
+        """
+        if not isinstance(by_model, dict):
+            return
+        with self._lock:
+            for model, record in by_model.items():
+                if not isinstance(model, str) or not isinstance(record, dict):
+                    continue
+                try:
+                    calls = int(record.get("calls") or 0)
+                    prompt = int(record.get("prompt_tokens") or 0)
+                    completion = int(record.get("completion_tokens") or 0)
+                except (TypeError, ValueError):
+                    continue
+                entry = self.by_model.setdefault(model, ModelUsage())
+                entry.calls += max(calls, 0)
+                entry.prompt_tokens += max(prompt, 0)
+                entry.completion_tokens += max(completion, 0)
+
     @property
     def prompt_tokens(self) -> int:
         with self._lock:

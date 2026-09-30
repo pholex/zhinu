@@ -776,6 +776,11 @@ def _tail_usage(path: Path) -> tuple[dict[str, Any] | None, dict[str, Any] | Non
     return meta, usage, corrupt
 
 
+def last_usage(path: Path) -> dict[str, Any] | None:
+    """会话文件里最后一条 usage 事件（累计用量快照）；没有返回 None。"""
+    return _tail_usage(path)[1]
+
+
 def usage_digest(workspace: str | None = None) -> UsageDigest:
     """扫全部会话文件，按工作区聚合 token 用量（"配额花在哪了"）。
 
