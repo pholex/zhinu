@@ -574,6 +574,19 @@ def config_wizard() -> int:
     #  厂商清单直接遍历 PRESETS：补一家 preset，向导自动多问一家，两处不会脱节。
     has_direct = False
     for preset in providers.PRESETS.values():
+        if preset.region_env:
+            #  无 key 型（Bedrock）：问的是区域不是密钥，凭据走 AWS 自己的链
+            current = providers.bedrock_region()
+            tip = (
+                f"{preset.name}：AWS 区域（凭据走 AWS 默认凭证链，不需要 key；"
+                f"模型 {'、'.join(preset.models)}；"
+                + (f"当前 {current}，回车 = 沿用" if current else "留空 = 不用 Bedrock")
+                + "）"
+            )
+            if region := ask(preset.region_env, tip):
+                values[preset.region_env] = region
+            has_direct = has_direct or bool(region or current)
+            continue
         existing = bool(find_api_key(preset.key_envs))
         if existing:
             source = (

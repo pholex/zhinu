@@ -40,6 +40,13 @@ tui = [
 browser = [
     "playwright==1.62.0",
 ]
+# 可选：AWS Bedrock 直连（XIAOYU_BEDROCK_REGION）。anthropic SDK 的 SigV4 签名
+# 要 botocore；凭据走 AWS 默认凭证链，所以不引入别的东西。缺包时首个请求前报
+# 一句怎么装（见 messages.bedrock_client）。
+bedrock = [
+    "boto3==1.43.105",
+    "botocore==1.43.105",
+]
 # 可选：`xiaoyu serve` 的 HTTP API（给 n8n / Dify 这类编排器用）。
 # 只影响这一条命令，缺包时 serve 报一句怎么装就退出。选 fastapi 是为了让
 # OpenAPI schema 由代码生成（Dify 自定义工具吃它），手写的会随代码漂移。

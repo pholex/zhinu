@@ -317,11 +317,17 @@ def check_disk(
 def check_providers() -> Check:
     """只报"哪些 provider 有凭据"，值永不出现在任何输出里。"""
     from .config import GATEWAY_KEY_ENVS, find_api_key
-    from .providers import GATEWAY, PRESETS
+    from .providers import GATEWAY, PRESETS, bedrock_region
 
     present: list[str] = []
     absent: list[str] = []
     for name, preset in PRESETS.items():
+        if preset.region_env:
+            #  无 key 型：只看激活变量。AWS 凭证本身有没有、对不对，这里不探
+            #  （探一次要出网），首个请求会如实报
+            region = bedrock_region()
+            (present if region else absent).append(f"{name}（{region}）" if region else name)
+            continue
         (present if find_api_key(preset.key_envs) else absent).append(name)
     gateway_url = os.environ.get("XIAOYU_BASE_URL", "").strip()
     gateway_key = bool(find_api_key(GATEWAY_KEY_ENVS))

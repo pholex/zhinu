@@ -635,6 +635,111 @@ class TestCrossProviderFallback(ProviderTestCase):
         self.assertEqual(list(agent.usage.by_model), [f"{GATEWAY}/deepseek-flash"])
 
 
+class TestBedrock(ProviderTestCase):
+    """Bedrock 直连：没有 key，激活信号是区域变量；client 走 AWS 凭证链。不出网。"""
+
+    MODEL = "global.anthropic.claude-fable-5-1"
+
+    def test_not_registered_without_region(self) -> None:
+        with isolated_env({"XIAOYU_API_KEY": "k"}):
+            registry = providers.build(config())
+        self.assertNotIn("bedrock", [p.name for p in registry.providers])
+
+    def test_region_activates_without_any_key(self) -> None:
+        """只有 XIAOYU_BEDROCK_REGION、没有任何 key 也能建起 Registry。"""
+        with isolated_env({"XIAOYU_BEDROCK_REGION": "us-west-2"}):
+            registry = providers.build(config(base_url=""))
+        bedrock = registry.get("bedrock")
+        assert bedrock is not None
+        self.assertEqual(bedrock.aws_region, "us-west-2")
+        self.assertEqual(bedrock.base_url, "https://bedrock-runtime.us-west-2.amazonaws.com")
+        self.assertIn("us-west-2", bedrock.display)
+        self.assertEqual(bedrock.models, (self.MODEL,))
+        route = registry.resolve(self.MODEL)
+        self.assertEqual((route.provider, route.model), ("bedrock", self.MODEL))
+        self.assertTrue(registry.sees_images(self.MODEL))
+        self.assertEqual(route.client.protocol_for(self.MODEL), providers.ANTHROPIC)
+
+    def test_shorthand_means_default_region(self) -> None:
+        for raw in ("1", "true", "Default"):
+            with isolated_env({"XIAOYU_BEDROCK_REGION": raw}):
+                self.assertEqual(providers.bedrock_region(), "us-east-1", raw)
+        with isolated_env({"XIAOYU_BEDROCK_REGION": "  "}):
+            self.assertEqual(providers.bedrock_region(), "")
+
+    def test_explicit_addressing_reaches_other_profiles(self) -> None:
+        """未内置的推理 profile / ARN 用 bedrock/ 前缀点名即可，不必进清单。"""
+        with isolated_env({"XIAOYU_BEDROCK_REGION": "us-east-1"}):
+            registry = providers.build(config(base_url=""))
+        for name in (
+            "us.anthropic.claude-opus-5-5",
+            "arn:aws:bedrock:us-east-1:1:inference-profile/global.anthropic.claude-opus-5-5",
+        ):
+            route = registry.resolve(f"bedrock/{name}")
+            self.assertEqual((route.provider, route.model), ("bedrock", name))
+        #  裸名仍归 anthropic 直连/网关，Bedrock 不抢
+        with self.assertRaises(UnknownModel):
+            registry.resolve("claude-opus-5-5")
+
+    def test_factory_builds_sigv4_client_not_api_key_client(self) -> None:
+        with isolated_env({"XIAOYU_BEDROCK_REGION": "ap-northeast-1"}):
+            registry = providers.build(config(base_url=""))
+        made: list[dict] = []
+
+        class FakeBedrock:
+            def __init__(self, **kw) -> None:
+                made.append(kw)
+
+        import anthropic
+
+        with mock.patch.object(anthropic, "AnthropicBedrock", FakeBedrock):
+            with mock.patch("importlib.util.find_spec", return_value=object()):
+                client = registry.resolve(self.MODEL).client.anthropic_client()
+        self.assertIsInstance(client, FakeBedrock)
+        self.assertEqual(made[0]["aws_region"], "ap-northeast-1")
+        self.assertEqual(made[0]["max_retries"], 0)
+        self.assertNotIn("api_key", made[0], "凭据走 AWS 链，绝不把占位 key 交给 SDK")
+
+    def test_missing_botocore_is_a_readable_error(self) -> None:
+        from xiaoyu import messages
+
+        with mock.patch("importlib.util.find_spec", return_value=None):
+            with self.assertRaises(MissingConfig) as caught:
+                messages.bedrock_client("us-east-1", 30.0)
+        self.assertIn("xiaoyu-agent[bedrock]", str(caught.exception))
+
+    def test_effort_is_clamped_to_measured_levels(self) -> None:
+        order = ("none", "minimal", "low", "medium", "high", "xhigh", "max")
+        self.assertEqual(providers.effort_for("bedrock", self.MODEL, "none", order), "low")
+        self.assertEqual(providers.effort_for("bedrock", self.MODEL, "max", order), "max")
+
+    def test_context_window_sees_through_bedrock_prefixes(self) -> None:
+        from xiaoyu.config import FALLBACK_CONTEXT_LIMIT, context_window
+
+        for name in (
+            self.MODEL,
+            "us.anthropic.claude-opus-5-5",
+            "anthropic.claude-sonnet-5-5",
+            "bedrock/global.anthropic.claude-fable-5-1",
+            "arn:aws:bedrock:us-east-1:1:inference-profile/global.anthropic.claude-opus-5-5",
+        ):
+            self.assertEqual(context_window(name), 1_000_000, name)
+        self.assertEqual(context_window("global.anthropic.claude-haiku-4-5-20251001-v1:0"), 200_000)
+        #  别家在 Bedrock 上的 id 不受影响（表里本就没有它们，仍是兜底）；带 anthropic
+        #  字样的非 Bedrock 名字也不误剥
+        self.assertEqual(context_window("deepseek.v3.2"), FALLBACK_CONTEXT_LIMIT)
+        self.assertEqual(context_window("my.custom.anthropic.thing"), FALLBACK_CONTEXT_LIMIT)
+
+    def test_aws_credentials_are_not_stripped_from_subprocess_env(self) -> None:
+        """无 key 型 preset 不往子进程密钥剥除名单里加任何名字：容器里 agent 跑
+        aws CLI 就靠这些变量。"""
+        from xiaoyu.tools import non_inheritable_env_names
+
+        names = non_inheritable_env_names()
+        for name in ("AWS_PROFILE", "AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "XIAOYU_BEDROCK_REGION"):
+            self.assertNotIn(name, names)
+
+
 class TestEffortPerModel(ProviderTestCase):
     """档位跟着会话走，但各型号认的档位不一样。"""
 

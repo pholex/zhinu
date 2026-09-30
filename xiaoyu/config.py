@@ -64,9 +64,25 @@ CONTEXT_WINDOWS: tuple[tuple[str, int], ...] = (
 FALLBACK_CONTEXT_LIMIT = 180_000
 
 
-def context_window(model: str) -> int:
-    """模型名 → 上下文上限。全限定名（provider/model）先剥掉 provider 前缀。"""
+#  Bedrock 写法的模型 id：`[geo.]anthropic.claude-…`（geo = global / us / eu / apac…）。
+#  查窗口表前剥掉这一段，让 global.anthropic.claude-fable-5-1 落进 claude- 的 1M
+#  而不是 180K 兜底。只认 anthropic. 这一个厂商段：别家在 Bedrock 上的 id
+#  （deepseek.v3.2 / moonshotai.kimi-k3）与表里的前缀本就对不上，剥了也没用
+_BEDROCK_VENDOR_SEGMENT = "anthropic."
+
+
+def _bare_model_name(model: str) -> str:
     bare = model.rsplit("/", 1)[-1]
+    head, sep, rest = bare.partition(_BEDROCK_VENDOR_SEGMENT)
+    if sep and (not head or (head.endswith(".") and head.count(".") == 1)):
+        return rest
+    return bare
+
+
+def context_window(model: str) -> int:
+    """模型名 → 上下文上限。全限定名（provider/model）先剥掉 provider 前缀，
+    Bedrock 的 `[geo.]anthropic.` 段同样剥掉。"""
+    bare = _bare_model_name(model)
     for prefix, limit in CONTEXT_WINDOWS:
         if bare.startswith(prefix):
             return limit

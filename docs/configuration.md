@@ -21,7 +21,7 @@ XIAOYU_MODEL=kimi-k3 xiaoyu
 
 ## 直连厂商
 
-内置直连：deepseek / moonshot / qwen / zhipu / anthropic / gemini / openai / xai。**键名一律用厂商原生名**（别家工具已配过的直接复用）：
+内置直连：deepseek / moonshot / qwen / zhipu / anthropic / gemini / openai / xai，以及 AWS Bedrock（只凭 AWS 凭证，见下方）。**键名一律用厂商原生名**（别家工具已配过的直接复用）：
 
 ```ini
 DEEPSEEK_API_KEY=<key>
@@ -32,6 +32,28 @@ GEMINI_API_KEY=<key>
 ```
 
 每家走哪种 wire 协议（chat completions / Responses / Anthropic Messages）、哪些型号能看图，都是按型号内置好的，不用管。
+
+### AWS Bedrock：只凭 AWS 凭证，不要 key
+
+在 AWS 容器（AgentCore Runtime / ECS / EC2）里跑时，最自然的凭证是执行角色而不是一把 key。Bedrock 直连走 bedrock-runtime 的原生 Messages 协议，凭据用 AWS 默认凭证链（环境变量 / profile / SSO / 容器与实例角色），**不需要 Anthropic key，也不需要网关**：
+
+```ini
+XIAOYU_BEDROCK_REGION=us-east-1        # 激活信号 = 区域；写 1 / default 等价于 us-east-1
+XIAOYU_MODEL=global.anthropic.claude-fable-5-1
+```
+
+```sh
+pip install 'xiaoyu-agent[bedrock]'     # SigV4 签名要 botocore；缺包时首个请求前会提示
+```
+
+要点：
+
+- **必须显式设置**，不自动嗅探 AWS 凭证——机器上有 AWS profile 不等于想让模型请求走 Bedrock。
+- 内置型号只有 `global.anthropic.claude-fable-5-1`（anthropic 直连已有的 opus-5-5 / sonnet-5-5 不重复收）。其它推理 profile 或 ARN 用显式寻址：`/model bedrock/us.anthropic.claude-opus-5-5`。
+- 模型 id 要用**推理 profile**（`global.` / `us.` / `eu.` 前缀）——裸 id `anthropic.claude-fable-5-1` 在 Bedrock 上不能按需调用，会 400。
+- 没有凭证、模型未开通、区域不支持时如实报错（NoCredentials / 403 / 400），不会悄悄换到别的模型；换路由仍只按 `XIAOYU_FALLBACK_MODELS` 的显式降级链走。
+- 本机验证：`AWS_PROFILE=<profile> XIAOYU_BEDROCK_REGION=us-east-1 xiaoyu -m global.anthropic.claude-fable-5-1`。
+- 也认 `AWS_BEARER_TOKEN_BEDROCK`（Bedrock API key）——anthropic SDK 会优先用它代替 SigV4。
 
 ## 网关
 
@@ -56,6 +78,7 @@ XIAOYU_API_KEY=<key>
 | `XIAOYU_EXPLORE_MODEL` | `deepseek-flash` | `explore` 子 agent 用的模型 |
 | `XIAOYU_BASE_URL` | — | OpenAI 兼容网关端点 |
 | `XIAOYU_API_KEY` | — | 网关 key（也认 `LITELLM_API_KEY`） |
+| `XIAOYU_BEDROCK_REGION` | —（不注册） | 激活 AWS Bedrock 直连并指定区域（`1` / `default` = `us-east-1`）；凭据走 AWS 默认凭证链，见上方"AWS Bedrock" |
 | `XIAOYU_FALLBACK_MODELS` | —（不降级） | 备用模型链，逗号分隔，主模型重试耗尽后依次切。委托出去的子 agent（含 explore、七襄、斗巧、宸枢成员）沿用同一条链，即使那次委托另外点名了模型 |
 | `XIAOYU_PROVIDERS` | 直连 → 网关 | 覆盖 provider 优先级（如 `gateway,deepseek` = 临时全走网关） |
 | `XIAOYU_VISION_MODELS` | — | 网关后面挂的视觉模型点名（`*` = 一律放行） |
@@ -243,7 +266,7 @@ XIAOYU_PROVIDER_MINIMAX_SIGNATURES=*                         # 工具调用重�
 
 `_MODELS=auto`：启动时探一次端点 `/v1/models`，把它当前 serve 的 model id 自动注册进来——本机端点换了 model 不用改配置，重启 xiaoyu 即自动跟上（新 id 会出现在 `config --show` 与 `/model` 补全里）。**只对本机 `localhost` 端点生效**（远端仍守「启动不探测」，请显式列模型名）；探测失败或返回空则该 provider 本次不注册（**不会**退化成通配去劫持网关路由）。默认路径依然从不探测 `/v1/models`。
 
-`_PROTOCOL=anthropic` 也适用于 Bedrock Mantle 一类只挂 Claude 原生协议的端点。视觉是 fail-closed 的：**未声明即不发图**，模型会收到一行"有 N 张图但看不了"的说明而不是被静默丢弃。
+`_PROTOCOL=anthropic` 也适用于只挂 Claude 原生协议、用 key 鉴权的自建端点（AWS Bedrock 本身已内置，见上方，不必走这里）。视觉是 fail-closed 的：**未声明即不发图**，模型会收到一行"有 N 张图但看不了"的说明而不是被静默丢弃。
 
 `_TOOLS=text` 是给**不支持 function calling** 的端点（本地 vLLM / Ollama 上的小模型、带 `tools` 就 400 或静默忽略的老服务）准备的逃生舱：工具说明改为写进 system prompt，模型用 ```` ```tool_call ```` 代码块（也认 `<tool_call>` 标签）发起调用，结果以 `<tool_result>` 文本回灌。翻译只发生在出网那一刻，会话历史仍是标准形态，随时 `/model` 切回原生工具调用的模型。它与 `_PROTOCOL` 正交，可同时设置。原生 function calling 能用就别开它——文本解析天生更脆。
 

@@ -684,3 +684,38 @@ def client(base_url: str, api_key: str, timeout: float | httpx.Timeout) -> Any:
         max_retries=0,
         http_client=netproxy.http_client("anthropic"),
     )
+
+
+#  Bedrock 的 SigV4 签名住在 botocore 里（anthropic SDK 的 bedrock extra 只是声明
+#  依赖）。缺包时 SDK 要到**第一个请求出网前**才 ImportError，报的是 botocore 的
+#  内部路径——这里提前一步、用一句能照着做的话报出来
+BEDROCK_EXTRA_HINT = (
+    "Bedrock 直连需要 boto3/botocore（SigV4 签名）：pip install 'xiaoyu-agent[bedrock]'"
+)
+
+
+def bedrock_client(region: str, timeout: float | httpx.Timeout) -> Any:
+    """构造走 AWS 凭证链的 Bedrock client（同 SDK 的 AnthropicBedrock）。
+
+    凭据不经小羽：SDK 每个请求用 botocore 的默认链（环境变量 / profile / SSO /
+    容器与实例角色）取凭证并做 SigV4。region 决定端点 bedrock-runtime.{region}；
+    模型 id 由调用方按 Bedrock 的写法给（推理 profile 或 ARN），这里不改名。
+    没有凭证时 SDK 如实抛错（botocore NoCredentialsError），classify 判 fatal——
+    不会被当成瞬时错误重试、也不会换到别家。
+    """
+    import importlib.util
+
+    if importlib.util.find_spec("botocore") is None:
+        from .config import MissingConfig
+
+        raise MissingConfig(BEDROCK_EXTRA_HINT)
+    import anthropic
+
+    from . import netproxy
+
+    return anthropic.AnthropicBedrock(
+        aws_region=region,
+        timeout=timeout,
+        max_retries=0,
+        http_client=netproxy.http_client("anthropic"),
+    )
