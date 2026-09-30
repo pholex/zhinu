@@ -672,3 +672,166 @@ class AuxiliaryModelFallbackTest(AgentTestCase):
         self.assertIn("由 cheap-model 只读检索", answer)
         self.assertEqual(self.client.completions.calls[0]["model"], "cheap-model")
         self.assertNotIn("改用主模型", shown.getvalue())
+
+
+# ---------- 本地补的调用 id、出网前的工具名与调用 id 规整 ----------
+
+
+class LocalCallIdTest(AgentTestCase):
+    """流里一路都没给 id 的工具调用由本地补 id：跨轮不能重复。"""
+
+    def test_ids_do_not_repeat_across_turns(self):
+        import json
+
+        from .test_agent_paths import call_fragment
+
+        def idless_call():
+            arguments = json.dumps({"path": "calc.py"})
+            return [chunk(tool_calls=[call_fragment(0, None, "read_file", arguments)]),
+                    usage_chunk(10, 5)]
+
+        agent = self.build(
+            [idless_call(), idless_call(), [chunk(content="读完了"), usage_chunk(10, 2)]]
+        )
+        with contextlib.redirect_stdout(io.StringIO()):
+            agent.send("读两遍")
+        issued = [
+            call["id"]
+            for message in agent.messages
+            if message["role"] == "assistant"
+            for call in message.get("tool_calls") or []
+        ]
+        answered = [m["tool_call_id"] for m in agent.messages if m["role"] == "tool"]
+        self.assertEqual(len(issued), 2)
+        self.assertEqual(len(set(issued)), 2, issued)
+        self.assertTrue(all(call_id.startswith("call_local_") for call_id in issued), issued)
+        #  每个结果仍挂在自己那次调用上
+        self.assertEqual(answered, issued)
+
+
+_VALID_NAME = r"[a-zA-Z0-9_-]{1,64}"
+
+
+def _history_with_odd_names() -> list[dict]:
+    names = ["multi_tool_use.parallel", "bash run", "x" * 65, "read_file"]
+    calls = [
+        {"id": f"c{index}", "type": "function", "function": {"name": name, "arguments": "{}"}}
+        for index, name in enumerate(names)
+    ]
+    results = [
+        {"role": "tool", "tool_call_id": call["id"], "content": "ERROR: 未知工具"}
+        for call in calls
+    ]
+    return [
+        {"role": "user", "content": "hi"},
+        {"role": "assistant", "content": None, "tool_calls": calls},
+        *results,
+        {"role": "user", "content": "继续"},
+    ]
+
+
+class ToolNameOnTheWireTest(unittest.TestCase):
+    """模型写出的不合规工具名留在历史里，三条协议出网时都换成占位，历史不动。"""
+
+    def check(self, sent: list[str]) -> None:
+        from xiaoyu import responses
+
+        for name in sent:
+            self.assertRegex(name, f"^{_VALID_NAME}$")
+        self.assertEqual(sent[:3], [responses.MALFORMED_TOOL] * 3)
+        #  合规的名字一个字节不动
+        self.assertEqual(sent[3], "read_file")
+
+    def test_chat(self):
+        from xiaoyu.responses import Transport
+
+        from .test_responses import FakeClient, FakeResponses
+
+        history = _history_with_odd_names()
+        inner = FakeClient(FakeResponses())
+        Transport(inner).chat.completions.create(model="m", messages=history)
+        sent = inner.chat.completions.calls[0]["messages"]
+        self.check([call["function"]["name"] for call in sent[1]["tool_calls"]])
+        self.assertEqual(history, _history_with_odd_names())
+
+    def test_responses(self):
+        from .test_responses import FakeResponses, responses_transport
+
+        history = _history_with_odd_names()
+        api = FakeResponses()
+        responses_transport(api).chat.completions.create(model="m", messages=history)
+        items = api.calls[0]["input"]
+        self.check([item["name"] for item in items if item.get("type") == "function_call"])
+        self.assertEqual(history, _history_with_odd_names())
+
+    def test_messages(self):
+        from .test_messages import FakeMessagesAPI, anthropic_transport
+
+        history = _history_with_odd_names()
+        api = FakeMessagesAPI()
+        transport, _ = anthropic_transport(api)
+        transport.chat.completions.create(model="m", messages=history)
+        blocks = api.calls[0]["messages"][1]["content"]
+        self.check([block["name"] for block in blocks if block["type"] == "tool_use"])
+        self.assertEqual(history, _history_with_odd_names())
+
+    def test_a_name_in_this_requests_tool_table_is_left_alone(self):
+        """宿主注册的工具名即使带点号，调用与工具表也得对得上。"""
+        from xiaoyu import responses
+
+        history = _history_with_odd_names()
+        tools = [
+            {"type": "function",
+             "function": {"name": "multi_tool_use.parallel", "parameters": {"type": "object"}}}
+        ]
+        repaired = responses.repair_tool_arguments(history, tools)
+        names = [call["function"]["name"] for call in repaired[1]["tool_calls"]]
+        self.assertEqual(
+            names,
+            ["multi_tool_use.parallel", responses.MALFORMED_TOOL, responses.MALFORMED_TOOL,
+             "read_file"],
+        )
+
+
+class MessagesCallIdTest(unittest.TestCase):
+    """Messages 一路：别家产的调用 id 带 `.`、`:` 时做确定性规整，调用与结果两头同值。"""
+
+    IDS = ("functions.read_file:0", "a.b", "a:b", "toolu_01AbC-xyz")
+
+    def history(self) -> list[dict]:
+        calls = [
+            {"id": call_id, "type": "function",
+             "function": {"name": "read_file", "arguments": "{}"}}
+            for call_id in self.IDS
+        ]
+        return [
+            {"role": "user", "content": "hi"},
+            {"role": "assistant", "content": None, "tool_calls": calls},
+            *[{"role": "tool", "tool_call_id": call_id, "content": "ok"} for call_id in self.IDS],
+        ]
+
+    def convert(self) -> tuple[list[str], list[str]]:
+        from xiaoyu import messages
+
+        history = self.history()
+        request = messages.to_request("m", history, None, False, {})
+        self.assertEqual(history, self.history())
+        _, assistant, results = request["messages"]
+        used = [block["id"] for block in assistant["content"] if block["type"] == "tool_use"]
+        answered = [
+            block["tool_use_id"] for block in results["content"] if block["type"] == "tool_result"
+        ]
+        return used, answered
+
+    def test_both_ends_get_the_same_compliant_id(self):
+        used, answered = self.convert()
+        self.assertEqual(used, answered)
+        for call_id in used:
+            self.assertRegex(call_id, r"^[a-zA-Z0-9_-]+$")
+        #  只差在被替换字符上的两个 id 不会撞成一个
+        self.assertEqual(len(set(used)), len(self.IDS))
+        #  合规的 id 一个字节不动
+        self.assertEqual(used[3], "toolu_01AbC-xyz")
+
+    def test_replacement_is_stable_across_requests(self):
+        self.assertEqual(self.convert(), self.convert())

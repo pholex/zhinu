@@ -38,7 +38,9 @@ signature 绑的不止型号，还有**产出它时的那段会话前缀**（顶
 
 from __future__ import annotations
 
+import hashlib
 import json
+import re
 from typing import Any, Iterator
 
 #  httpx 是 anthropic SDK 的硬传递依赖，顶层 import 安全（同 errors.py）
@@ -203,6 +205,26 @@ def _to_blocks(content: Any) -> list[dict[str, Any]]:
     return blocks
 
 
+#  tool_use.id 的合规写法。这条字符要求出自对官方文档的记忆，上游是否真的拒收
+#  没有实测过；规整是确定性的，合规的 id 一个字节不动，即使上游其实宽容也无害
+_WIRE_ID = re.compile(r"[a-zA-Z0-9_-]+")
+
+
+def _wire_id(raw: Any) -> str:
+    """调用 id 的出网形态：不合规的字符换成下划线，再缀上原 id 的短摘要。
+
+    历史里的 id 可能是别家产的（会话中途切模型、降级链落过来），有的带 `.`、`:`。
+    tool_use 与它的 tool_result 各自调用这个函数，同一个原 id 两头得到同一个值；
+    缀摘要是为了让只差在被替换字符上的两个 id（`a.b` 与 `a:b`）不至于撞成一个。
+    只改发送副本，历史里的 id 不动。空 id 原样返回——没有可以规整的东西。
+    """
+    text = raw if isinstance(raw, str) else ("" if raw is None else str(raw))
+    if not text or _WIRE_ID.fullmatch(text):
+        return text
+    digest = hashlib.sha1(text.encode("utf-8")).hexdigest()[:8]
+    return re.sub(r"[^a-zA-Z0-9_-]", "_", text) + "_" + digest
+
+
 #  绑定会话前缀的块类型。**为什么要单独认它们**：Claude 的 thinking block
 #  signature 除了绑型号，还绑「产出它时的那段会话前缀」——顶层 system、tools 清单、
 #  以及它之前的每一条消息。回传时服务端重新校验这段前缀没变过，变了就 400
@@ -284,7 +306,7 @@ def _assistant_blocks(
         blocks.append(
             {
                 "type": "tool_use",
-                "id": call.get("id", ""),
+                "id": _wire_id(call.get("id")),
                 "name": function.get("name", ""),
                 "input": _load_arguments(function.get("arguments")),
             }
@@ -350,7 +372,7 @@ def _to_messages(
         if role == "tool":
             block = {
                 "type": "tool_result",
-                "tool_use_id": message.get("tool_call_id", ""),
+                "tool_use_id": _wire_id(message.get("tool_call_id")),
                 #  内核的工具结果一定是纯字符串（图片走随后的独立 user 消息）
                 "content": message.get("content") or "",
             }

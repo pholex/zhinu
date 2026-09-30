@@ -4113,10 +4113,11 @@ class Agent:
             calls = [pending[index] for index in sorted(pending)]
             #  id 一路都没给的调用（无 index 流的病理形状）补本地 id：重放和
             #  tool result 都靠 tool_call_id 配对，空 id 两头全断（签名也会因
-            #  没有键可挂而丢）。id 只在本会话内闭环消费，本地合成即自洽
-            for position, call in enumerate(calls):
+            #  没有键可挂而丢）。id 只在本会话内闭环消费，本地合成即自洽——但必须
+            #  整个会话内不重复：按位置编号每轮都从 0 起，跨轮撞号，调用与结果配错对
+            for call in calls:
                 if not call["id"]:
-                    call["id"] = f"call_local_{position}"
+                    call["id"] = f"call_local_{uuid.uuid4().hex[:12]}"
             #  分片上攒的 extra_content（Gemini thought_signature）挪进私有键：
             #  留在 tool_call 里会漏进 wire（strip_private 只摘消息级键）。
             #  纪律同 _reasoning——签名是模型私有状态，记下产出路由，

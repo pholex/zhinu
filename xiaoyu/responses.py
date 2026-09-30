@@ -31,6 +31,7 @@
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import dataclass, field
 from typing import Any, Iterator
 
@@ -101,6 +102,39 @@ def strip_private(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
 #  回放时顶替空工具名的占位：只出现在发送副本里，不对应任何真实工具
 NAMELESS_TOOL = "unnamed_tool"
+#  顶替不合规工具名的占位，同样只出现在发送副本里
+MALFORMED_TOOL = "malformed_tool_name"
+
+#  函数名的合规写法，取各家文档里最严的那一条。模型偶尔会写出
+#  `multi_tool_use.parallel`、`bash run` 这类名字；上游是否一律拒收没有逐家实测过，
+#  按最严的规整：合规的名字一个字节不动，规整只落在本来就没有对应工具的调用上
+_TOOL_NAME = re.compile(r"[a-zA-Z0-9_-]{1,64}")
+
+
+def _declared_names(tools: list[dict[str, Any]] | None) -> frozenset[str]:
+    """这次请求的工具表里出现的名字（chat 的嵌套形态与平铺形态都认）。"""
+    names: set[str] = set()
+    for tool in tools or []:
+        if not isinstance(tool, dict):
+            continue
+        function = tool.get("function")
+        name = function.get("name") if isinstance(function, dict) else tool.get("name")
+        if isinstance(name, str):
+            names.add(name)
+    return frozenset(names)
+
+
+def _name_placeholder(name: Any, declared: frozenset[str]) -> str | None:
+    """一个 tool_call 的工具名出网前要换成的占位；原样可发返回 None。
+
+    工具表里真有的名字不动：宿主注册的工具名即使不合这条最严的写法，调用与
+    工具表也得对得上——上游认不认这个名字，由工具表那一头决定。
+    """
+    if not (isinstance(name, str) and name.strip()):
+        return NAMELESS_TOOL
+    if _TOOL_NAME.fullmatch(name) or name in declared:
+        return None
+    return MALFORMED_TOOL
 
 
 def _repaired_arguments(raw: Any) -> str | None:
@@ -125,17 +159,23 @@ def _repaired_arguments(raw: Any) -> str | None:
     return json.dumps(loaded, ensure_ascii=False) if isinstance(loaded, dict) else "{}"
 
 
-def repair_tool_arguments(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """历史里 assistant tool_calls 的坏 arguments 修成合法 JSON 对象串（出网前调用）。
+def repair_tool_arguments(
+    messages: list[dict[str, Any]], tools: list[dict[str, Any]] | None = None
+) -> list[dict[str, Any]]:
+    """历史里 assistant tool_calls 的坏 arguments 修成合法 JSON 对象串、空的或
+    不合规的工具名换成占位（出网前调用）。
 
     模型吐过一次非法 JSON 参数后，那次调用已经回了 ERROR 结果，但原串还留在
     历史里：chat 原样回放、Responses 的 function_call 也原样带上，严格解析
     tool_calls 的端点（Ollama / vLLM 等）每次回放都 400，会话就此卡死。
     tool 结果里的 ERROR 保留不动——模型仍知道那次调用失败了。
 
+    工具名同理（见 _name_placeholder）；tools 是这次请求的工具表，表里有的名字不动。
+
     只改发送副本：历史是共享数据结构、会话日志要保留模型原话，改动都发生在
     拷贝上；没有坏参数的消息原样复用，不做无谓的拷贝。
     """
+    declared = _declared_names(tools)
     out: list[dict[str, Any]] = []
     for message in messages:
         calls = message.get("tool_calls")
@@ -148,17 +188,16 @@ def repair_tool_arguments(messages: list[dict[str, Any]]) -> list[dict[str, Any]
                 continue
             function = call.get("function") or {}
             fixed = _repaired_arguments(function.get("arguments"))
-            name = function.get("name")
-            nameless = not (isinstance(name, str) and name.strip())
-            if fixed is None and not nameless:
+            placeholder = _name_placeholder(function.get("name"), declared)
+            if fixed is None and placeholder is None:
                 continue
             patched = dict(function)
             if fixed is not None:
                 patched["arguments"] = fixed
-            if nameless:
-                #  没写工具名的调用同理：那次已经回了"未知工具"，但空名字留在历史里，
-                #  校验函数名的端点每次回放都拒
-                patched["name"] = NAMELESS_TOOL
+            if placeholder is not None:
+                #  没写工具名、或名字不合规的调用同理：那次已经回了"未知工具"，但原名
+                #  留在历史里，校验函数名的端点每次回放都拒
+                patched["name"] = placeholder
             if new_calls is None:
                 new_calls = list(calls)
             new_calls[position] = {**call, "function": patched}
@@ -609,8 +648,9 @@ class _Completions:
         messages = media.inline(messages)
         #  历史里的坏工具参数同理在这个唯一出网口修：chat / Responses 原样回放
         #  坏串会让严格端点每轮 400（Messages 一路 _load_arguments 本就兜成 {}，
-        #  先修也无害）。只改发送副本，历史与会话日志保留模型原话
-        messages = repair_tool_arguments(messages)
+        #  先修也无害）。空的、不合规的工具名也在这里换成占位，三条协议同一份结果。
+        #  只改发送副本，历史与会话日志保留模型原话
+        messages = repair_tool_arguments(messages, tools)
         #  文本工具协议（textcalls.py）包在协议分派**外面**：它改的是消息内容与
         #  tools 的有无，不挑 wire protocol——哪条协议都能跑。出网前把历史改写成
         #  纯文本、tools 拿掉；回来时把正文里的调用块翻回 tool_calls 分片
