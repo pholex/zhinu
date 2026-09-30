@@ -138,13 +138,32 @@ def strip_controls(text: str) -> str:
     return _TERMINAL_CONTROLS.sub("", text)
 
 
+#  完整的转义序列：OSC（ESC ] … 以 BEL 或 ESC \\ 结束）、CSI（ESC [ 或 8-bit 的
+#  0x9b 起头，参数、中间字节、一个结尾字节）、其余两字符序列
+_TERMINAL_SEQUENCES = re.compile(
+    r"\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)"
+    r"|(?:\x1b\[|\x9b)[0-?]*[ -/]*[@-~]"
+    r"|\x1b[@-Z\\^_]"
+)
+
+
+def strip_sequences(text: str) -> str:
+    """strip_controls 的整串版：先把完整的转义序列连参数一起摘掉，再删零散的控制字符。
+
+    只给**完整的字符串**用（工具输出预览、参数、提示文案）：带颜色的命令输出里，
+    只删 ESC 会留下一地 "[31m" "[0m"。流式正文的分片不能用——序列可能被切在
+    两片之间，那条路继续逐字符删。
+    """
+    return strip_controls(_TERMINAL_SEQUENCES.sub("", text))
+
+
 def preview(value: object, limit: int = 100) -> str:
     """把工具参数压成一行短预览，**含省略号在内**不超过 limit 个字符。
 
     省略号必须算进预算里：limit 现在就是终端宽度，多吐一个字符这行就折行了，
     "压成一行"的意义随之落空。
     """
-    text = strip_controls(str(value).replace("\n", "⏎"))
+    text = strip_sequences(str(value).replace("\n", "⏎"))
     if len(text) <= limit:
         return text
     return text[: max(limit - 1, 0)] + "…"

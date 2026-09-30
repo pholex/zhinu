@@ -147,6 +147,26 @@ def user_config_dir() -> Path:
     return Path(tempfile.gettempdir()) / "xiaoyu"
 
 
+def _dotenv_line(key: str, value: str) -> str:
+    """一个键值写成 .env 的一行：读回来必须还是这个值（见 _dotenv_value）。
+
+    值里带"空白 + #"、以引号开头、或首尾有空白时要包引号，否则读的时候会被
+    当成行尾注释剥掉一截、或被当成引号包裹去掉一层。
+    """
+    plain = (
+        value == value.strip()
+        and value[:1] not in ("\"", "'")
+        and " #" not in value
+        and "\t#" not in value
+    )
+    if plain:
+        return f"{key}={value}"
+    for quote in ("\"", "'"):
+        if quote not in value:
+            return f"{key}={quote}{value}{quote}"
+    return f"{key}={value}"
+
+
 def user_env_path() -> Path:
     """用户级 .env 的固定路径（`xiaoyu config` 的写入目标）。"""
     return user_config_dir() / ".env"
@@ -158,7 +178,7 @@ def save_user_env(values: dict[str, str]) -> Path:
     path.parent.mkdir(parents=True, exist_ok=True)
     merged = _parse_dotenv(path) if path.is_file() else {}
     merged.update(values)
-    body = "\n".join(f"{key}={value}" for key, value in merged.items())
+    body = "\n".join(_dotenv_line(key, value) for key, value in merged.items())
     #  里面可能有 key：创建时就是仅本人可读，而不是写完再收紧
     from . import fsguard
 
@@ -267,7 +287,7 @@ def _inside(path: Path, directory: Path) -> bool:
 
 
 def _parse_dotenv(path: Path) -> dict[str, str]:
-    """极简 .env 解析：KEY=VALUE，支持 # 注释、export 前缀、引号包裹。"""
+    """极简 .env 解析：KEY=VALUE，支持 # 注释（整行与行尾）、export 前缀、引号包裹。"""
     result: dict[str, str] = {}
     try:
         raw = path.read_text(encoding="utf-8", errors="replace")
@@ -281,12 +301,28 @@ def _parse_dotenv(path: Path) -> dict[str, str]:
             line = line[len("export ") :]
         key, _, value = line.partition("=")
         key = key.strip()
-        value = value.strip()
-        if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
-            value = value[1:-1]
         if key:
-            result[key] = value
+            result[key] = _dotenv_value(value)
     return result
+
+
+def _dotenv_value(raw: str) -> str:
+    """`=` 右边 → 值：去引号，剥掉行尾注释。
+
+    `KEY=abc  # 说明` 是很自然的写法，不剥的话注释整串进了值——密钥带着一截
+    注释发出去，换来一个看不出原因的 401。只认"空白 + #"：值里紧挨着的 #
+    （URL 片段、密钥本身带的）不动；引号里的 # 是内容。
+    """
+    value = raw.strip()
+    if value[:1] in ("\"", "'"):
+        closing = value.find(value[0], 1)
+        if closing != -1:
+            return value[1:closing]
+        return value
+    for index, char in enumerate(value):
+        if char == "#" and index > 0 and value[index - 1] in " \t":
+            return value[:index].rstrip()
+    return value
 
 
 @dataclass

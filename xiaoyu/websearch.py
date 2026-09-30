@@ -110,12 +110,12 @@ def make_web_search_tool(
         #  deepseek 实测常为空，来源多写在正文里）——有就附上
         if sources := _citations(response):
             answer += "\n来源：\n" + "\n".join(f"- {item}" for item in sources)
-        if len(answer) > MAX_ANSWER_CHARS:
-            answer = answer[:MAX_ANSWER_CHARS] + "\n…（结论过长已截断）"
         return f"[联网搜索结论 · 由 {backend.model} 服务端搜索得出，时效信息以此为准]\n{answer}"
 
     return Tool(
         name="web_search",
+        #  超出的部分落盘可召回，不直接切掉（来源列表排在结论最后）
+        output_limit=MAX_ANSWER_CHARS + 500,
         description=(
             "联网搜索并返回带来源的结论。适合：查时效性信息（版本号、新闻、价格、"
             "文档更新）、核实你不确定的事实、找报错信息的解法。"

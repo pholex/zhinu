@@ -226,6 +226,14 @@ def parse_frontmatter(text: str) -> dict[str, str]:
     result: dict[str, str] = {}
     pending: str | None = None  # 正在收集多行值（>- / | 等块标量）的键
     collected: list[str] = []
+    #  上一个顶层键写了行内值、还可能被缩进行续写（YAML 的多行普通标量）
+    open_key: str | None = None
+
+    def unquote(value: str) -> str:
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
+            return value[1:-1]
+        return value
+
     for line in lines[1:]:
         if line.strip() == "---":
             if pending:
@@ -239,17 +247,22 @@ def parse_frontmatter(text: str) -> dict[str, str]:
                 continue
             result[pending] = " ".join(collected).strip()
             pending, collected = None, []
+        if open_key is not None and line.startswith((" ", "\t")) and line.strip():
+            #  值写了一行没写完、下一行缩进接着写：折成一行。description 常这么
+            #  排版，只取首行的话续行里的触发词就丢了，技能永远选不中
+            result[open_key] = unquote(f"{result[open_key]} {line.strip()}")
+            continue
         key, sep, value = line.partition(":")
         #  嵌套结构（如 metadata:）的子行有缩进，跳过——索引只需要顶层键
         if sep and key == key.lstrip() and key.strip():
             value = value.strip()
             if value in (">", ">-", ">+", "|", "|-", "|+"):
                 #  YAML 块标量：收集后续缩进行，折叠成一行（索引只要一句话）
-                pending, collected = key.strip(), []
+                pending, collected, open_key = key.strip(), [], None
                 continue
-            if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
-                value = value[1:-1]
-            result[key.strip()] = value
+            result[key.strip()] = unquote(value)
+            #  空值后面的缩进行是嵌套结构的子行，不是续写
+            open_key = key.strip() if value else None
     return {}  # 没有闭合的 --- 不算 frontmatter
 
 

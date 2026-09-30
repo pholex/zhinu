@@ -81,6 +81,28 @@ SLASH_COMMANDS: dict[str, str] = {
     "/quit": "退出",
 }
 
+def effort_mismatch(agent: Agent, level: str) -> str:
+    """当前模型登记过认哪几档推理深度、而这一档不在其中时，返回一句提醒；否则空串。
+
+    只提醒不拦：用户给自己点名的模型配的档位是原样发的（不认就让上游报错，
+    不替他改）。但登记表就在手边，当场说一声好过等第一次请求才收到一句 400。
+    没登记过的模型不知道它认什么，不猜。
+    """
+    if not level:
+        return ""
+    try:
+        route = agent.registry.resolve(agent.config.model)
+    except providers.UnknownModel:
+        return ""
+    accepted = providers.accepted_efforts(route.provider, route.model)
+    if not accepted or level in accepted:
+        return ""
+    return (
+        f"  {route.qualified} 登记的档位是 {' / '.join(accepted)}，{level} 多半会被上游拒绝"
+        "——仍按你的设置发送，被拒就换一档"
+    )
+
+
 SLASH_HELP = "可用命令：\n" + "\n".join(
     f"  {command:<10} {description}" for command, description in SLASH_COMMANDS.items()
 ) + "\n"
@@ -3438,6 +3460,8 @@ def handle_slash(agent: Agent, line: str, select: Any = None) -> bool:
             else:
                 agent.config.effort = level
                 print(ui.secondary(f"推理深度：{level or '上游默认'}"))
+                if warning := effort_mismatch(agent, level):
+                    print(ui.warning(warning))
         else:
             print(ui.secondary(f"推理深度：{agent.config.effort or '上游默认'}"))
     elif command == "/usage":

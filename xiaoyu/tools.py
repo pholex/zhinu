@@ -519,6 +519,58 @@ def _write_like_original(target: Path, text: str, encoding: str, raw: bytes | No
     target.write_bytes(data)
 
 
+def _mixed_newlines(raw: bytes) -> bool:
+    """文件里是不是不止一种换行（\\r\\n、单独的 \\n、单独的 \\r 三种里出现了两种以上）。"""
+    crlf = raw.count(b"\r\n")
+    kinds = (crlf, raw.count(b"\n") - crlf, raw.count(b"\r") - crlf)
+    return sum(1 for count in kinds if count) > 1
+
+
+def _write_edit(target: Path, before: str, updated: str, encoding: str, raw: bytes | None) -> None:
+    """局部替换的写回：换行不纯的文件只动被替换的那一段，其余字节原样留着。
+
+    匹配是在换行归一成 LF 的文本上做的，写回时整体换成"多数派"换行——对换行
+    单一的文件这是还原，对换行不纯的文件却是改写：少数派的行被统一掉，LF 文件
+    里孤立的 \\r（CSV 字段内、测试夹具）变成 \\n，那是内容变化，而模型根本没碰
+    那几行。所以不纯时把改动定位回原文：两头没变的部分按原字节保留，只有中间
+    新写的那段用多数派换行。
+    """
+    if raw is None or not _mixed_newlines(raw):
+        _write_like_original(target, updated, encoding, raw)
+        return
+    try:
+        decoded = raw.decode(encoding).removeprefix("\ufeff")
+    except UnicodeDecodeError:
+        _write_like_original(target, updated, encoding, raw)
+        return
+    #  归一后第 i 个字符在原文里从哪儿开始（\\r\\n 占两个字符）
+    starts: list[int] = []
+    index = 0
+    while index < len(decoded):
+        starts.append(index)
+        index += 2 if decoded.startswith("\r\n", index) else 1
+    starts.append(len(decoded))
+    if len(starts) - 1 != len(before):
+        #  对不上说明手里的 before 不是这份字节归一出来的：不猜，走整体写回
+        _write_like_original(target, updated, encoding, raw)
+        return
+    limit = min(len(before), len(updated))
+    head = 0
+    while head < limit and before[head] == updated[head]:
+        head += 1
+    tail = 0
+    while tail < limit - head and before[-1 - tail] == updated[-1 - tail]:
+        tail += 1
+    middle = updated[head : len(updated) - tail]
+    newline = _newline_of(raw)
+    if newline != "\n":
+        middle = middle.replace("\n", newline)
+    data = (decoded[: starts[head]] + middle + decoded[starts[len(before) - tail] :]).encode(encoding)
+    if raw.startswith(codecs.BOM_UTF8) and codecs.lookup(encoding).name == "utf-8":
+        data = codecs.BOM_UTF8 + data
+    target.write_bytes(data)
+
+
 def _undecodable_error(path: str) -> str:
     return (
         f"ERROR: {path} 按 UTF-8、GBK 都无法无损解码（可能是二进制或其它编码），"
@@ -881,6 +933,11 @@ class Tool:
     #  结果来自外部（MCP server、网页、联网搜索）：回灌模型前由 agent 包进
     #  <untrusted_content>，其中的指令只当数据（见 wrap_untrusted）
     untrusted: bool = False
+    #  这个工具的输出留在上下文里的字符上限；None = 用全局的 max_tool_output。
+    #  超出的部分不丢：完整内容落盘，内联留头尾预览和召回 id（见 _bound_output）。
+    #  给"结论类"工具用——子 agent、检索、联网搜索存在的理由就是省上下文，
+    #  但把结论的后半截直接切掉，等于白跑了那一半
+    output_limit: int | None = None
 
     def available(self) -> bool:
         if self.check_fn is None:
@@ -1530,7 +1587,7 @@ class Toolbox:
                 return f"ERROR: 调用 {name} 的参数不对：{problem}"
 
         try:
-            output = self._bound_output(name, tool.handler(**args))
+            output = self._bound_output(name, tool.handler(**args), tool.output_limit)
         except Interrupted:
             #  打断不是工具的错误：不能折成 ERROR 文本回给模型然后接着跑
             raise
@@ -2190,7 +2247,7 @@ class Toolbox:
             return error
         self.rewind.record(target, raw)
         try:
-            _write_like_original(target, updated, encoding, raw)
+            _write_edit(target, text, updated, encoding, raw)
         except OSError as exc:
             return f"ERROR: 写入失败 {path}: {exc}"
         self._mark_read(target, keep_level=True)
@@ -2266,7 +2323,7 @@ class Toolbox:
             return error
         self.rewind.record(target, raw if raw is not None else text.encode(encoding))
         try:
-            _write_like_original(target, updated, encoding, raw)
+            _write_edit(target, text, updated, encoding, raw)
         except OSError as exc:
             return f"ERROR: 写入失败 {path}: {exc}"
         self._mark_read(target, keep_level=True)
@@ -2681,6 +2738,25 @@ class Toolbox:
                 )
         return output
 
+    def _wait_task(self, task: Any, deadline: float) -> None:
+        """等一个后台任务结束，不超过 deadline；宿主叫停就抛 Interrupted。
+
+        宿主的 interrupt() 只是置个标志，打不断一个阻塞着的 Event.wait——不切片
+        问的话，serve 的 abort、ACP 的 cancel 都要等这里最长十分钟的等待自己到点。
+        任务本身不动：等的人走了，它照常在后台跑、完成时照常通知。
+        """
+        while not task.done.is_set():
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return
+            if self.stop_requested is None:
+                task.done.wait(remaining)
+                return
+            if task.done.wait(min(_STOP_POLL_SECONDS, remaining)):
+                return
+            if self.stop_requested():
+                raise Interrupted("宿主请求打断")
+
     def _task_output(self, task_ids: Any, timeout: int | None = None) -> str:
         """后台任务快照 / 有界等待。宽进：单个 id 裸字符串也收（模型常这么写）。"""
         if isinstance(task_ids, str):
@@ -2702,7 +2778,7 @@ class Toolbox:
                 sections.append(f"{task_id}：not_found。已知任务：{known}")
                 continue
             if wait:
-                task.done.wait(max(0.0, deadline - time.monotonic()))
+                self._wait_task(task, deadline)
             status = task.status
             head = f"{task_id}：{status}"
             if task.done.is_set():
@@ -2892,14 +2968,15 @@ class Toolbox:
         self._spill_seq = max(self._spill_seq, highest)
         self._foreign_recall_ids = self._spill_seq
 
-    def _bound_output(self, name: str, text: str) -> str:
+    def _bound_output(self, name: str, text: str, limit: int | None = None) -> str:
         """超长输出：完整落盘 + 内联留头尾预览和取回定位符（spill）。
 
         纯截断会把中段永久丢掉——测试输出的中部失败、长日志的关键一段，
         模型想再看只能重跑命令。落盘后中段随时可用 read_file/grep 按需取回，
         重跑（可能有副作用、可能很慢）不再是唯一出路。落盘失败退回纯截断。
         """
-        limit = self.config.max_tool_output
+        #  工具自己声明的上限只能比全局的更紧
+        limit = min(limit or self.config.max_tool_output, self.config.max_tool_output)
         if len(text) <= limit:
             return text
         result = self._spill(name, text)

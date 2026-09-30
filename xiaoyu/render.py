@@ -250,14 +250,18 @@ class PlainSink:
         print(ui.styled(self._NOTICE_TOKENS[event.level], event.text))
 
 
-def clean_value(value: Any) -> Any:
-    """递归去掉字符串（含 dict / list 里嵌套的）中的终端控制字符，见 ui.strip_controls。"""
+def clean_value(value: Any, whole: bool = False) -> Any:
+    """递归去掉字符串（含 dict / list 里嵌套的）中的终端控制字符，见 ui.strip_controls。
+
+    whole=True 表示这些都是完整的字符串：转义序列连参数一起摘（ui.strip_sequences），
+    不留 "[31m" 这样的残渣。
+    """
     if isinstance(value, str):
-        return ui.strip_controls(value)
+        return ui.strip_sequences(value) if whole else ui.strip_controls(value)
     if isinstance(value, dict):
-        return {key: clean_value(item) for key, item in value.items()}
+        return {key: clean_value(item, whole) for key, item in value.items()}
     if isinstance(value, list):
-        return [clean_value(item) for item in value]
+        return [clean_value(item, whole) for item in value]
     return value
 
 
@@ -268,9 +272,11 @@ def sanitize_event(event: UIEvent) -> UIEvent:
     绝大多数事件不含控制字符，这时原样返回、不复制——TextDelta 是逐 token 的热路径。
     """
     changes = {}
+    #  流式正文是分片到的，序列可能跨片：只有它逐字符删，其余事件的字段都是整串
+    whole = not isinstance(event, TextDelta)
     for spec in dataclasses.fields(event):
         current = getattr(event, spec.name)
-        cleaned = clean_value(current)
+        cleaned = clean_value(current, whole)
         if cleaned != current:
             changes[spec.name] = cleaned
     return dataclasses.replace(event, **changes) if changes else event

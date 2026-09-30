@@ -140,8 +140,6 @@ def make_explore_tool(
 
         if not answer:
             return "检索子 agent 没有给出结论（可能是轮次用尽）。请自己用 grep / read_file 继续查。"
-        if len(answer) > MAX_ANSWER_CHARS:
-            answer = answer[:MAX_ANSWER_CHARS] + "\n…（结论过长已截断）"
         return (
             f"[检索结论 · 由 {config.explore_model} 只读检索 {tools_used} 次得出。"
             "结论里的 路径:行号 + 原文行是实际读到的，可直接采信，"
@@ -151,6 +149,8 @@ def make_explore_tool(
 
     return Tool(
         name="explore",
+        #  超出的部分落盘可召回，不直接切掉（证据行常在结论的后半截）
+        output_limit=MAX_ANSWER_CHARS + 500,
         description=(
             "把一个检索问题交给便宜模型的只读子 agent，返回带证据位置的结论。"
             "适合：摸清项目结构、找某个符号定义在哪、找所有调用点、"

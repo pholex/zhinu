@@ -146,10 +146,12 @@ class TestWebSearchTool(unittest.TestCase):
         self.assertIn("没有返回内容", out)
         self.assertEqual(usage.by_model, {})
 
-    def test_long_answer_truncated(self):
-        out = _tool(_registry(_response(text="长" * (MAX_ANSWER_CHARS + 100)))).handler(query="q")
-        self.assertIn("已截断", out)
-        self.assertLess(len(out), MAX_ANSWER_CHARS + 200)
+    def test_long_answer_is_left_whole_for_the_toolbox_to_bound(self):
+        """结论不在工具里硬切：交给工具箱落盘并留头尾预览（见 test_answer_overflow）。"""
+        tool = _tool(_registry(_response(text="长" * (MAX_ANSWER_CHARS + 100) + "结尾的来源")))
+        out = tool.handler(query="q")
+        self.assertIn("结尾的来源", out)
+        self.assertEqual(tool.output_limit, MAX_ANSWER_CHARS + 500)
 
     def test_no_approval_required(self):
         self.assertFalse(_tool(_registry(_response())).requires_approval)

@@ -103,7 +103,11 @@ CAPABILITY_TOOLS: dict[str, frozenset[str]] = {
 
 _NAME_RE = re.compile(r"^[a-z][a-z0-9_]{1,31}$")
 _DEFAULT_ITERATIONS = 20
+#  子 agent 的结论留在父上下文里的量（字符）：省上下文是委托存在的理由。
+#  超出的部分落盘可召回，不丢——结论的后半截往往是"所以该怎么改"
 MAX_ANSWER_CHARS = 4000
+#  整条工具结果的内联上限：结论之外还有头一行说明和尾部的续跑句柄、worktree 路径
+ANSWER_INLINE_LIMIT = MAX_ANSWER_CHARS + 1500
 #  失败诊断（异常原文）交给模型前的上限：异常里可能夹整段响应体或 traceback
 MAX_FAILURE_CHARS = 1000
 #  resume 记录的滚动上限与"transcript 不得超过窗口多少"的闸（80%）
@@ -1102,9 +1106,9 @@ def make_subagent_tool(
             )
         footer_lines.extend(result.notes)
         footer = "\n".join(footer_lines)
+        #  结论不在这里切：过长时由工具箱落盘、内联留头尾预览（见下面的
+        #  output_limit），尾部的 resume 句柄与 worktree 路径也因此一定留得住
         answer = result.answer
-        if len(answer) > MAX_ANSWER_CHARS:
-            answer = answer[:MAX_ANSWER_CHARS] + "\n…（结论过长已截断）"
         if result.failure:
             #  失败前已经查明的东西照样交回：父级据此决定续跑还是换路，不必从零再查
             partial = f"[失败前的部分结论，未必完整]\n{answer}\n" if answer else ""
@@ -1131,6 +1135,7 @@ def make_subagent_tool(
     extras = "；".join(part for part in (isolation_hint, mcp_hint) if part)
     return Tool(
         name=spec.name,
+        output_limit=ANSWER_INLINE_LIMIT,
         description=(
             f"{spec.description}（子 agent，工具：{', '.join(spec.tools)}"
             + (f"；{extras}" if extras else "")
