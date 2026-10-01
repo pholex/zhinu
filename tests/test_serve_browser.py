@@ -116,6 +116,32 @@ class TestHandshake(BrowserCase):
         kinds = [e["kind"] for e in self.events(session_id)]
         self.assertIn("browser.disconnected", kinds)
 
+    def test_v2_tools_register_after_v1_with_approval_defaults(self):
+        from xiaoyu.serve_browser import BROWSER_TOOLS
+
+        names = list(BROWSER_TOOLS)
+        v1 = ["browser_tabs", "browser_open", "browser_navigate", "browser_read_page", "browser_click", "browser_type", "browser_screenshot"]
+        #  v1 的顺序不能动（prompt cache 前缀）；v2 只能追加在后
+        self.assertEqual(names[:7], v1)
+        self.assertEqual(
+            names[7:],
+            ["browser_scroll", "browser_hover", "browser_key", "browser_find", "browser_back", "browser_close", "browser_wait"],
+        )
+        gated = {name for name, spec in BROWSER_TOOLS.items() if spec["requires_approval"]}
+        self.assertEqual(
+            gated,
+            {"browser_open", "browser_navigate", "browser_click", "browser_type", "browser_key", "browser_back", "browser_close"},
+        )
+        self.assertEqual(BROWSER_TOOLS["browser_close"]["parameters"]["required"], ["tab_id"])
+
+        self.start("text: 无所谓\n")
+        session_id = self.new_session()
+        ws = self.connect(session_id, supports=["browser_wait", "browser_scroll", "browser_tabs"])
+        ok = ws.receive_json()
+        self.assertEqual(ok["registered"], ["browser_tabs", "browser_scroll", "browser_wait"])
+        self.assertEqual(ok["ignored"], [])
+        ws.__exit__(None, None, None)
+
     def test_newer_connection_replaces_older(self):
         self.start("text: 无所谓\n")
         session_id = self.new_session()

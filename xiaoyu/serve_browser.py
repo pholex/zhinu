@@ -34,13 +34,21 @@ CLOSE_REPLACED = 4409
 CLOSE_SESSION_CLOSED = 4410
 
 _TAB = {"type": "integer", "description": "标签页 id（browser_tabs 里的），缺省 = 侧栏当前所在的标签页"}
-_REF = {"type": "string", "description": "元素 ref（browser_read_page 的 interactive 模式里的 [eNN]）"}
+_REF = {
+    "type": "string",
+    "description": "元素 ref：browser_read_page interactive 模式 / browser_find 给出的 [e12]；iframe 里的带框架前缀 [f37.e4]，原样传回",
+}
 
-#  v1 工具清单：名字、描述、schema、审批默认全由服务端定义；扩展只声明"我做得了哪些"。
+#  工具清单（v1 七个 + v2 七个）：名字、描述、schema、审批默认全由服务端定义；扩展只声明"我做得了哪些"。
 #  顺序 = 注册顺序 = 请求里的工具顺序，会话内稳定，不要重排。
 BROWSER_TOOLS: dict[str, dict[str, Any]] = {
     "browser_tabs": {
-        "description": "列出浏览器里打开的标签页：每行 tab_id · 标题 · URL，当前标签页标 *。",
+        "description": (
+            "列出浏览器里打开的标签页：每行 tab_id · 标题 · URL，当前标签页标 *。"
+            "browser_* 这组工具操作的是用户正在用的那个浏览器（带登录态，范围由用户在扩展里圈定）；"
+            "涉及用户的网页时优先用它们，不要改用别的浏览器自动化工具（CDP / devtools MCP 之类看到的是另一个视角，"
+            "也不受用户圈定的范围约束）。"
+        ),
         "parameters": {"type": "object", "properties": {}, "required": []},
         "requires_approval": False,
     },
@@ -103,6 +111,93 @@ BROWSER_TOOLS: dict[str, dict[str, Any]] = {
     "browser_screenshot": {
         "description": "截取标签页当前可见区域，图片作为下一条消息附上。",
         "parameters": {"type": "object", "properties": {"tab_id": _TAB}, "required": []},
+        "requires_approval": False,
+    },
+    #  ---- v2：追加在后，不动 v1 的顺序 ----
+    "browser_scroll": {
+        "description": (
+            "滚动页面，返回滚动位置与是否到底。direction=up/down/top/bottom，amount=滚几屏（默认 1）。"
+            "给 ref + direction = 滚该元素所在的可滚容器；只给 ref = 把它滚到视口中间。"
+            "长页面 / 无限滚动要先滚再 browser_read_page，新露出的元素才有 ref。"
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "direction": {"type": "string", "enum": ["up", "down", "top", "bottom"]},
+                "amount": {"type": "number", "description": "滚几屏，默认 1"},
+                "ref": _REF,
+                "tab_id": _TAB,
+            },
+            "required": [],
+        },
+        "requires_approval": False,
+    },
+    "browser_hover": {
+        "description": "把鼠标悬停到元素（ref）上，用来展开悬停菜单 / 提示；之后用 browser_read_page 看新出现的元素。",
+        "parameters": {"type": "object", "properties": {"ref": _REF, "tab_id": _TAB}, "required": ["ref"]},
+        "requires_approval": False,
+    },
+    "browser_key": {
+        "description": (
+            "发送一个按键，如 Enter / Escape / Tab / ArrowDown / Control+a。缺 ref = 发给当前焦点元素。"
+            "关弹窗、在下拉里上下选、提交表单时用；输入文字请用 browser_type。"
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "key": {"type": "string", "description": "按键名，可带修饰键：Enter、Escape、ArrowDown、Shift+Tab、Control+a"},
+                "ref": _REF,
+                "tab_id": _TAB,
+            },
+            "required": ["key"],
+        },
+        "requires_approval": True,
+    },
+    "browser_find": {
+        "description": (
+            "在页面里按文本找元素（可交互元素的标签 + 可见正文，含 iframe），命中的每个都给 ref，"
+            "可直接用于 click / hover / scroll。页面元素很多、不想整页 read_page 时用。"
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {"query": {"type": "string", "description": "要找的文本（不区分大小写）"}, "tab_id": _TAB},
+            "required": ["query"],
+        },
+        "requires_approval": False,
+    },
+    "browser_back": {
+        "description": "标签页历史后退（direction=back，默认）或前进（forward），等加载完成后返回标题与 URL。",
+        "parameters": {
+            "type": "object",
+            "properties": {"direction": {"type": "string", "enum": ["back", "forward"]}, "tab_id": _TAB},
+            "required": [],
+        },
+        "requires_approval": True,
+    },
+    "browser_close": {
+        "description": "关闭一个标签页。tab_id 必填（不可撤销，不接受缺省）；只关自己用 browser_open 开的，别关用户的。",
+        "parameters": {
+            "type": "object",
+            "properties": {"tab_id": {"type": "integer", "description": "要关闭的标签页 id（browser_tabs 里的）"}},
+            "required": ["tab_id"],
+        },
+        "requires_approval": True,
+    },
+    "browser_wait": {
+        "description": (
+            "等页面上出现某段文本（gone=true 则等它消失），最多 seconds 秒（默认 5，上限 30）；"
+            "不给 text = 单纯等这么久。点击后内容是异步加载的时候用。超时按错误返回。"
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "text": {"type": "string", "description": "等它出现 / 消失的文本"},
+                "gone": {"type": "boolean", "description": "true = 等文本消失，默认 false"},
+                "seconds": {"type": "number", "description": "最多等几秒，默认 5，上限 30"},
+                "tab_id": _TAB,
+            },
+            "required": [],
+        },
         "requires_approval": False,
     },
 }
