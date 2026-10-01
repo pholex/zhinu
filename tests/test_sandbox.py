@@ -184,6 +184,51 @@ class HostProgramLookupTest(unittest.TestCase):
         self.assertFalse(self.marker.exists(), "工作区里的假 git 被宿主执行了")
 
 
+class WorkspaceTrustCacheTest(unittest.TestCase):
+    def setUp(self):
+        self.root = Path(os.path.abspath("/sdk-trust-cache-test"))
+        for name, value in (("_workspaces", {}), ("_untrusted_cache", None)):
+            patcher = mock.patch.object(sandbox, name, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        patcher = mock.patch.dict(os.environ, {"XIAOYU_SANDBOX_WRITABLE": ""})
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def test_many_sessions_do_not_resolve_all_historical_workspaces_again(self):
+        with mock.patch.object(sandbox, "default_writable_roots", side_effect=lambda w: [w, self.root]) as roots:
+            for i in range(200):
+                sandbox.note_workspace(self.root / str(i))
+            self.assertEqual(roots.call_count, 200)
+            self.assertEqual(len(sandbox._workspaces), 200)
+            self.assertLessEqual(len(sandbox._untrusted_roots()), 2)
+        self.assertFalse(sandbox.trusted_program_dir(str(self.root / "0" / "bin")))
+        self.assertFalse(sandbox.trusted_program_dir(str(self.root / "199" / "bin")))
+        self.assertTrue(sandbox.trusted_program_dir(str(self.root.with_name(self.root.name + "-other"))))
+
+    def test_environment_change_rebuilds_without_trusting_old_workspaces(self):
+        with mock.patch.object(sandbox, "default_writable_roots", side_effect=lambda w: [w]) as roots:
+            sandbox.note_workspace(self.root / "one")
+            sandbox.note_workspace(self.root / "two")
+            self.assertEqual(roots.call_count, 2)
+            with mock.patch.dict(os.environ, {"TMPDIR": str(self.root / "new-temp")}):
+                sandbox._untrusted_roots()
+                self.assertEqual(roots.call_count, 4)
+                self.assertFalse(sandbox.trusted_program_dir(str(self.root / "one" / "bin")))
+                self.assertFalse(sandbox.trusted_program_dir(str(self.root / "two" / "bin")))
+
+    def test_parent_root_preserves_descendant_denial_and_path_boundaries(self):
+        with mock.patch.object(sandbox, "default_writable_roots", side_effect=lambda w: [w]):
+            child = self.root / "nested"
+            sandbox.note_workspace(child)
+            sandbox.note_workspace(self.root)
+            roots = sandbox._untrusted_roots()
+            self.assertNotIn(str(child.resolve()), roots)
+            self.assertIn(str(self.root.resolve()), roots)
+            self.assertFalse(sandbox.trusted_program_dir(str(child / "bin")))
+            self.assertTrue(sandbox.trusted_program_dir(str(self.root.with_name(self.root.name + "-other"))))
+
+
 class SecretPathsTest(unittest.TestCase):
     def test_lists_user_env_and_user_mcp_config(self):
         from xiaoyu import config as config_mod

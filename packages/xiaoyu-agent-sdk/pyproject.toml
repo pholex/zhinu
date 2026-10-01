@@ -11,6 +11,9 @@ readme = "README.md"
 license = "MIT"
 license-files = ["LICENSE"]
 
+[project.optional-dependencies]
+telemetry = ["opentelemetry-api==1.45.0"]
+
 [project.urls]
 Repository = "https://github.com/pholex/zhinu"
 

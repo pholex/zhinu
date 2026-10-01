@@ -403,6 +403,23 @@ def note_workspace(workspace: Path) -> None:
 _untrusted_cache: tuple[tuple, tuple[str, ...]] | None = None
 
 
+def _merge_untrusted_roots(previous: tuple[str, ...], added: list[str]) -> tuple[str, ...]:
+    """Keep the same denied path union without redundant descendant roots."""
+    def covers(parent: str, child: str) -> bool:
+        try:
+            return os.path.commonpath([child, parent]) == parent
+        except ValueError:
+            return False
+
+    roots = list(previous)
+    for root in added:
+        if any(covers(parent, root) for parent in roots):
+            continue
+        roots = [child for child in roots if not covers(root, child)]
+        roots.append(root)
+    return tuple(roots)
+
+
 def _untrusted_roots() -> tuple[str, ...]:
     """模型跑的命令写得进去的地方：工作区、临时目录、构建缓存、追加的可写根。
 
@@ -422,13 +439,20 @@ def _untrusted_roots() -> tuple[str, ...]:
     cached = _untrusted_cache
     if cached is not None and cached[0] == key:
         return cached[1]
+    # Workspace registration is append-only. Preserve every previously denied
+    # root, but resolve only new workspaces while the environment is unchanged.
+    # Re-resolving the entire catalogue on every Session made N workspaces cost
+    # O(N²) filesystem lookups. Environment changes still rebuild the catalogue.
+    extend = (cached is not None and bool(cached[0][0]) and cached[0][1:] == key[1:]
+              and workspaces[:len(cached[0][0])] == cached[0][0])
+    pending = workspaces[len(cached[0][0]):] if extend and cached is not None else workspaces
     try:
         roots: list[Path] = []
-        for workspace in workspaces or (os.getcwd(),):
+        for workspace in pending or (() if extend else (os.getcwd(),)):
             roots += default_writable_roots(Path(workspace))
         roots += extra_writable_roots()
         roots.append(Path(tempfile.gettempdir()))
-        resolved = tuple(_normalize(roots))
+        resolved = _merge_untrusted_roots(cached[1] if extend and cached is not None else (), _normalize(roots))
     except (OSError, NotImplementedError):
         return cached[1] if cached is not None else ()
     _untrusted_cache = (key, resolved)

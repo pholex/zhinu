@@ -38,4 +38,44 @@ with tempfile.TemporaryDirectory() as directory:
     assert session.closed
     assert sdk.Subagent("worker", "worker", "work", (), isolation="worktree").isolation == "worktree"
     assert sdk.Plugin("entry", "package").distribution == "package"
+    store = sdk.SQLiteSessionStore(Path(directory) / "sessions.sqlite")
+    options = sdk.SessionOptions(model=sdk.ModelOptions("offline", client=Client()),
+                                workspace=Path(directory), builtin_tools=(), session_store=store)
+    with sdk.Session(options) as session:
+        session.run("Persist 42", output=sdk.OutputSpec({"type": "integer"}))
+        key = session.session_id
+    with sdk.Session(options, resume_id=key) as restored:
+        assert restored.session_id == key
+        assert restored.run("Return 42 again", output=sdk.OutputSpec({"type": "integer"})).output_status == "valid"
+    assert len(store.list_sessions()) == 1
+    class PlainClient:
+        def __init__(self):
+            self.chat = SimpleNamespace(completions=self)
+
+        def create(self, **kwargs):
+            return iter([SimpleNamespace(choices=[SimpleNamespace(
+                delta=SimpleNamespace(content="42", tool_calls=None), finish_reason="stop")],
+                usage=SimpleNamespace(prompt_tokens=10, completion_tokens=1))])
+
+    traces = []
+    platform_options = sdk.SessionOptions(
+        model=sdk.ModelOptions("offline", client=PlainClient()), workspace=Path(directory), builtin_tools=(),
+        session_store=store, subagents=(sdk.Subagent("worker", "worker", "work", ()),),
+        budget=sdk.BudgetOptions(max_requests=3), telemetry=sdk.TelemetryOptions(traces.append),
+    )
+    with sdk.McpPool() as pool:
+        from dataclasses import replace
+        with sdk.Session(replace(platform_options, mcp_pool=pool)) as session:
+            handles = session.tasks.submit((sdk.TaskSpec("a", "worker", "Return 42"),
+                sdk.TaskSpec("b", "worker", "Confirm the answer", depends_on=("a",))))
+            assert all(h.wait(10).state == "succeeded" for h in handles)
+            assert session.cost.requests == 2
+            key = session.session_id
+        assert pool.server_states() == {}
+    with sdk.Session(platform_options, resume_id=key) as session:
+        assert len(session.tasks.list()) == 2
+        assert all(t.state == "succeeded" for t in session.tasks.list())
+        assert session.cost.requests == 2
+    assert len(traces) == 2
+    assert sdk.MemoryTokenStore().load() is None
 print("Installed SDK smoke passed", sdk.__version__)

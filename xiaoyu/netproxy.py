@@ -444,9 +444,16 @@ class _ProxyHandler(urllib.request.ProxyHandler):
         return super().proxy_open(req, proxy, type)
 
 
-def urlopen(request: urllib.request.Request | str, timeout: float | None = None) -> Any:
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req: Any, fp: Any, code: int, msg: str, headers: Any, newurl: str) -> None:
+        return None
+
+
+def urlopen(request: urllib.request.Request | str, timeout: float | None = None, *, allow_redirects: bool = True) -> Any:
     """替代 urllib.request.urlopen：同样的返回值与异常，代理判定走 ProxyPlan。"""
-    return current().opener.open(request, timeout=timeout)
+    plan = current()
+    opener = plan.opener if allow_redirects else urllib.request.build_opener(_ProxyHandler(plan), _NoRedirect())
+    return opener.open(request, timeout=timeout)
 
 
 # ---------- doctor ----------

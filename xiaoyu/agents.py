@@ -684,6 +684,7 @@ def execute_delegation(
     resume_from: str | None = None,
     child_sink: Any = None,
     on_agent: Callable[[Any], None] | None = None,
+    on_settled: Callable[[Any], None] | None = None,
     require_isolation: bool = False,
     model_override: str | None = None,
     effort_override: str | None = None,
@@ -735,7 +736,7 @@ def execute_delegation(
         if mode is None
         else tuple(tool for tool in spec.tools if tool in CAPABILITY_TOOLS[mode])
     )
-    if not tools_list:
+    if not tools_list and spec.tools:
         return DelegationResult(
             error=(
                 f"ERROR: capability_mode={mode} 收紧后 {spec.name} 没有可用工具了，"
@@ -1081,7 +1082,12 @@ def execute_delegation(
 
     failure = ""
     failure_kind = ""
+    lifecycle = guards.hooks() if guards.hooks is not None else None
     try:
+        if lifecycle is not None and lifecycle.has("SubagentStart"):
+            decision = lifecycle.fire("SubagentStart", {"agent": spec.name})
+            if decision.blocked:
+                raise RuntimeError("SubagentStart hook blocked execution")
         sub_agent.send(relocation + task)
     except Exception as exc:  # noqa: BLE001 - 委托失败不该打断主流程
         failure = f"{type(exc).__name__}: {exc}"
@@ -1105,6 +1111,12 @@ def execute_delegation(
     finally:
         if reaped := reap_background(sub_agent):
             notes.append(f"子 agent 留下的 {reaped} 个后台任务已终止")
+        if on_settled is not None:
+            on_settled(sub_agent)
+        if lifecycle is not None and lifecycle.has("SubagentEnd"):
+            decision = lifecycle.fire("SubagentEnd", {"agent": spec.name, "failed": bool(failure)})
+            if decision.blocked:
+                notes.append("SubagentEnd hook failed or blocked")
     answer = fresh_answer()
     #  降级是粘性的：点名的模型持续失败后，余下的活都是备用模型干的。结论头里
     #  报实际干活的那个；存档仍记点名的（续跑时先回去试它，与主会话回探同一个道理）
@@ -1143,6 +1155,7 @@ def make_subagent_tool(
     parent_history: Callable[[], list[dict[str, Any]]] | None = None,
     stop_requested: Callable[[], bool] | None = None,
     guards: ParentGuards | None = None,
+    on_settled: Callable[[Any], None] | None = None,
 ) -> Tool:
     """spec → 可挂载的工具。结构与 explore.make_explore_tool 同构：
     usage/registry 传父级的（同一本账、client 复用），sink 走 quiet_child 派生。
@@ -1169,6 +1182,7 @@ def make_subagent_tool(
             parent_history=parent_history,
             stop_requested=stop_requested,
             guards=guards,
+            on_settled=on_settled,
         )
         if result.error:
             return result.error

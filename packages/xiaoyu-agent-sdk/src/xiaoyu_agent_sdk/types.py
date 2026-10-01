@@ -3,7 +3,14 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Awaitable, Callable, Literal
+from typing import Any, Awaitable, Callable, Literal, TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from .storage import SessionStore
+    from .mcp import McpPool
+    from .oauth import OAuthClient
+    from .budget import BudgetOptions
+    from .telemetry import TelemetryOptions
 
 from xiaoyu.agent import Allow, Deny
 from xiaoyu.hooks import Decision as HookDecision
@@ -48,7 +55,8 @@ class ToolResult:
 
 @dataclass(frozen=True)
 class Hook:
-    event: Literal["PreToolUse", "PostToolUse", "UserPromptSubmit", "Stop"]
+    event: Literal["PreToolUse", "PostToolUse", "UserPromptSubmit", "Stop", "SessionStart", "SessionEnd",
+                   "SubagentStart", "SubagentEnd", "ToolFailed", "BeforeCompact", "AfterCompact"]
     callback: HookHandler = field(repr=False)
     tool_name: str = ""
 
@@ -62,6 +70,7 @@ class McpServer:
     url: str = ""
     headers: dict[str, str] = field(default_factory=dict, repr=False)
     timeout: float = 60.0
+    oauth: OAuthClient | None = field(default=None, repr=False, compare=False)
 
 
 @dataclass(frozen=True)
@@ -73,6 +82,7 @@ class Subagent:
     model: str = ""
     max_iterations: int = 12
     isolation: Literal["none", "worktree"] = "none"
+    mcp_servers: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -112,6 +122,11 @@ class SessionOptions:
     deny_rules: tuple[str, ...] = ()
     event_buffer_size: int = 128
     plugins: tuple[Plugin, ...] = ()
+    session_store: SessionStore | None = field(default=None, repr=False, compare=False)
+    mcp_pool: McpPool | None = field(default=None, repr=False, compare=False)
+    max_parallel_tasks: int = 4
+    budget: BudgetOptions | None = None
+    telemetry: TelemetryOptions | None = None
 
 
 class SDKError(Exception):
@@ -139,4 +154,12 @@ class ExecutionError(SDKError):
 
 
 class SessionStorageError(SDKError):
+    pass
+
+
+class McpManagementError(SDKError):
+    pass
+
+
+class OAuthError(SDKError):
     pass

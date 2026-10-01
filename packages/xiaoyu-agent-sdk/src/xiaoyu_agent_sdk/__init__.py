@@ -1,5 +1,13 @@
 """Stable host API for Xiaoyu's in-process workspace execution engine."""
 from ._version import __version__ as __version__
+from .telemetry import TelemetryOptions as TelemetryOptions, TraceRecord as TraceRecord, SpanRecord as SpanRecord, OpenTelemetryExporter as OpenTelemetryExporter
+from .budget import BudgetOptions as BudgetOptions, ModelPrice as ModelPrice, CostSnapshot as CostSnapshot, RequestCost as RequestCost, BudgetExceededError as BudgetExceededError
+from .mcp import McpPool as McpPool
+from .oauth import OAuthClient as OAuthClient, OAuthTokens as OAuthTokens, OAuthTokenStore as OAuthTokenStore, MemoryTokenStore as MemoryTokenStore
+from .tasks import TaskSpec as TaskSpec, TaskSnapshot as TaskSnapshot, TaskHandle as TaskHandle, TaskManager as TaskManager
+from .types import McpManagementError as McpManagementError, OAuthError as OAuthError
+from .storage import SessionStore as SessionStore, SessionWriter as SessionWriter
+from .storage import SQLiteSessionStore as SQLiteSessionStore, StoredSessionInfo as StoredSessionInfo
 from .session import AsyncSession as AsyncSession, Session as Session, run as run, run_async as run_async
 from .session import list_sessions as list_sessions
 from .types import Plugin as Plugin, McpServerStatus as McpServerStatus
@@ -26,6 +34,11 @@ from xiaoyu.session_log import SessionLockedError as SessionLockedError
 from xiaoyu.session_log import SessionInfo as SessionInfo
 
 __all__ = [
+    "TelemetryOptions", "TraceRecord", "SpanRecord", "OpenTelemetryExporter",
+    "BudgetOptions", "ModelPrice", "CostSnapshot", "RequestCost", "BudgetExceededError",
+    "McpPool", "OAuthClient", "OAuthTokens", "OAuthTokenStore", "MemoryTokenStore", "OAuthError", "McpManagementError",
+    "TaskSpec", "TaskSnapshot", "TaskHandle", "TaskManager",
+    "SessionStore", "SessionWriter", "SQLiteSessionStore", "StoredSessionInfo",
     "Plugin", "McpServerStatus", "RewindResult",
     "__version__", "Session", "AsyncSession", "run", "run_async", "ModelOptions",
     "SessionOptions", "OutputSpec", "Tool", "ToolResult", "ToolHandler", "Hook",

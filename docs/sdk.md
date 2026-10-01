@@ -241,3 +241,6 @@ SDK。两次上传不是原子事务；SDK 失败时保留制品与日志，核�
 首版支持 Python；跨语言继续使用 REST/MCP/wire，TypeScript SDK 后续评估。
 
 公开方法和选项速查见 [API 参考](sdk-api.md)。
+
+工作区中的未发布 P4 存储扩展见 [外置 SessionStore](sdk-storage.md)。
+动态 MCP/OAuth、依赖任务、成本预算和 OpenTelemetry 见 [平台能力](sdk-platform.md)。

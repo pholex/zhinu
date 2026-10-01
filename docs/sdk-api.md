@@ -2,6 +2,13 @@
 
 所有以下类型均从 `xiaoyu_agent_sdk` 导入。使用说明与失效语义见 [SDK 指南](sdk.md)。
 
+本页列出已发布首版接口。工作区中新增的未发布 P4 `SessionStore`、
+`SessionWriter`、`SQLiteSessionStore`、`StoredSessionInfo`、`session_id` 与
+`resume_id` 见 [存储扩展](sdk-storage.md)。
+动态 MCP/OAuth、`TaskSpec` / `TaskHandle` / `TaskSnapshot` / `TaskManager`、
+`BudgetOptions` / `ModelPrice` / `CostSnapshot`、扩展 Hook 和 OpenTelemetry 的
+未发布接口见 [平台能力](sdk-platform.md)。
+
 ## 会话方法
 
 | 同步入口 | 返回值；异步对应 |

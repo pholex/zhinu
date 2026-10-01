@@ -33,7 +33,7 @@ import weakref
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterable
 
 from . import __version__, media
 from .config import user_config_dir
@@ -242,6 +242,28 @@ def _holder_pid(lock: Path) -> int | None:
     except OSError:
         return None
     return int(raw) if raw.isdigit() else None
+
+
+class SessionWriteLock:
+    """Fail-closed local single-writer ownership, released on process death."""
+
+    def __init__(self, path: Path) -> None:
+        lock = lock_path(path)
+        _ensure_private_dir(lock.parent)
+        fd = _open_private(lock, os.O_RDWR)
+        try:
+            if not _try_lock(fd):
+                raise SessionLockedError(path, _holder_pid(lock))
+        except BaseException:
+            os.close(fd)
+            raise
+        with contextlib.suppress(OSError):
+            _write_pid(fd, os.getpid())
+        self._finalizer = weakref.finalize(self, _release_lock_fd, fd)
+        self._finalizer.atexit = False
+
+    def close(self) -> None:
+        self._finalizer()
 
 
 class SessionLog:
@@ -1062,50 +1084,59 @@ def load_messages(path: Path) -> LoadedMessages:
       所以记进返回值的 corrupt_lines，由 Agent.restore 提示出来。
     compact / clear 会整体重建历史，之前的坏行不影响接回内容，随之清零。
     """
+    with path.open(encoding="utf-8", errors="replace") as handle:
+        return _replay_lines(handle)
+
+
+def replay_records(records: Iterable[dict[str, Any]]) -> LoadedMessages:
+    """Replay storage records with the same semantics as local JSONL logs."""
+    return _replay_lines(json.dumps(record, ensure_ascii=False, allow_nan=False) for record in records)
+
+
+def _replay_lines(lines: Iterable[str]) -> LoadedMessages:
     messages: list[dict[str, Any]] = []
     corrupt: list[int] = []
     #  最近一条还没定性的坏行：看下一条有效记录（或文件结束）才知道它是不是尾巴
     pending_bad = 0
-    with path.open(encoding="utf-8", errors="replace") as handle:
-        for number, raw in enumerate(handle, start=1):
-            line = raw.strip()
-            if not line:
-                continue
-            try:
-                record = json.loads(line)
-            except json.JSONDecodeError:
-                record = None
-            if not isinstance(record, dict):
-                if pending_bad:
-                    corrupt.append(pending_bad)
-                pending_bad = number
-                continue
+    for number, raw in enumerate(lines, start=1):
+        line = raw.strip()
+        if not line:
+            continue
+        try:
+            record = json.loads(line)
+        except json.JSONDecodeError:
+            record = None
+        if not isinstance(record, dict):
             if pending_bad:
-                if record.get("event") != "torn_tail":
-                    corrupt.append(pending_bad)
-                pending_bad = 0
-            if "event" in record:
-                kind = record["event"]
-                if kind == "meta":
-                    fmt = record.get("format", 1)
-                    if isinstance(fmt, int) and fmt > SESSION_FORMAT:
-                        raise ValueError(
-                            f"会话文件格式版本 {fmt} 比当前支持的 {SESSION_FORMAT} 新，"
-                            "请升级 xiaoyu 后再 resume。"
-                        )
-                elif kind in ("compact", "rewind") and isinstance(
-                    record.get("replacement"), list
-                ):
-                    #  rewind 与 compact 共用 replacement 机制：重放不需要理解
-                    #  任何回滚语义，撞到即整体替换（旧版本会跳过 rewind 事件，
-                    #  resume 出来的历史会多出被回滚的轮次——只影响旧版读新文件）
-                    messages = list(record["replacement"])
-                    corrupt = []
-                elif kind == "clear":
-                    messages = []
-                    corrupt = []
-                continue
-            if "role" in record:
-                messages.append({key: value for key, value in record.items() if key != "ts"})
+                corrupt.append(pending_bad)
+            pending_bad = number
+            continue
+        if pending_bad:
+            if record.get("event") != "torn_tail":
+                corrupt.append(pending_bad)
+            pending_bad = 0
+        if "event" in record:
+            kind = record["event"]
+            if kind == "meta":
+                fmt = record.get("format", 1)
+                if isinstance(fmt, int) and fmt > SESSION_FORMAT:
+                    raise ValueError(
+                        f"会话文件格式版本 {fmt} 比当前支持的 {SESSION_FORMAT} 新，"
+                        "请升级 xiaoyu 后再 resume。"
+                    )
+            elif kind in ("compact", "rewind") and isinstance(
+                record.get("replacement"), list
+            ):
+                #  rewind 与 compact 共用 replacement 机制：重放不需要理解
+                #  任何回滚语义，撞到即整体替换（旧版本会跳过 rewind 事件，
+                #  resume 出来的历史会多出被回滚的轮次——只影响旧版读新文件）
+                messages = list(record["replacement"])
+                corrupt = []
+            elif kind == "clear":
+                messages = []
+                corrupt = []
+            continue
+        if "role" in record:
+            messages.append({key: value for key, value in record.items() if key != "ts"})
     #  循环结束还挂着的 pending_bad 就是最后一行：尾部半行，静默
     return LoadedMessages(messages, corrupt)

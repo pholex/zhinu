@@ -565,16 +565,22 @@ class TestStreamTranslation(unittest.TestCase):
         self.assertEqual((usage.prompt_tokens, usage.completion_tokens), (3, 4))
 
     def test_max_tokens_surfaces_as_length(self) -> None:
-        chunks = list(msgs.stream_chunks(iter([message_delta(stop_reason="max_tokens", output_tokens=4)])))
+        chunks = list(msgs.stream_chunks(iter([message_delta(stop_reason="max_tokens", output_tokens=4), message_stop()])))
         self.assertEqual([c.choices[0].finish_reason for c in chunks if c.choices], ["length"])
 
     def test_context_window_exhausted_mid_generation_surfaces_as_length(self) -> None:
         """生成把窗口填满时请求是成功的，只是停止原因不同。不翻译的话内核会把
         半截回复当成完整回复。"""
         chunks = list(msgs.stream_chunks(iter([
-            message_delta(stop_reason="model_context_window_exceeded", output_tokens=4)
+            message_delta(stop_reason="model_context_window_exceeded", output_tokens=4), message_stop()
         ])))
         self.assertEqual([c.choices[0].finish_reason for c in chunks if c.choices], ["length"])
+
+    def test_missing_message_stop_rejects_empty_unknown_and_partial_streams(self) -> None:
+        from xiaoyu.errors import StreamFailed
+        for events in ([], [event("ping")], [block_start(0, "text"), text_delta("partial")]):
+            with self.subTest(events=events), self.assertRaises(StreamFailed):
+                list(msgs.stream_chunks(iter(events)))
 
     def test_ping_and_unknown_events_are_ignored(self) -> None:
         text, pending, _ = self.collect(

@@ -29,15 +29,27 @@ from typing import Any, ClassVar, Literal, Protocol
 NoticeLevel = Literal["info", "warn", "error"]
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, kw_only=True)
 class UIEvent:
     """事件基类。kind 是判别字段（ClassVar，不进 asdict，由 to_dict 补上）。"""
 
     kind: ClassVar[str] = ""
+    session_id: str = ""
+    run_id: str = ""
+    request_id: str = ""
+    tool_call_id: str = ""
+    task_id: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         """序列化为可 JSON 化的字典（跨进程时的线上形态）。"""
-        return {"kind": self.kind, **asdict(self)}
+        fields = asdict(self)
+        for key in ("session_id", "run_id", "request_id", "tool_call_id", "task_id"):
+            # SDK events opt into correlation with a session identity. Keep
+            # the existing CLI JSONL shape, even when the kernel supplies a
+            # native tool-call ID for in-process SDK consumers.
+            if not self.session_id or not fields[key]:
+                del fields[key]
+        return {"kind": self.kind, **fields}
 
 
 @dataclass(frozen=True)

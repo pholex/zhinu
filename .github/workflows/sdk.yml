@@ -24,10 +24,14 @@ jobs:
       - run: python -m pip install -e ".[sdk]"
       - run: python -m pip install -e packages/xiaoyu-agent-sdk
       - run: python -m pip install mypy==2.3.1
+      - run: python -m pip install opentelemetry-sdk==1.45.0
       - run: python -m mypy --follow-imports=silent packages/xiaoyu-agent-sdk/src examples/sdk
-      - run: python -m unittest tests.test_sdk tests.test_sdk_release tests.test_public_api tests.test_embedding_smoke -v
+      - run: python -m unittest tests.test_sdk tests.test_sdk_storage tests.test_sdk_tasks tests.test_sdk_mcp_management tests.test_sdk_accounting tests.test_sdk_transport_reliability tests.test_sdk_fault_windows tests.test_sdk_reliability tests.test_sandbox.WorkspaceTrustCacheTest tests.test_sdk_release tests.test_public_api tests.test_embedding_smoke -v
       - run: python examples/sdk/sync.py --demo
       - run: python examples/sdk/async_service.py --demo
+      - run: python examples/sdk/storage.py --demo
+      - run: python examples/sdk/orchestration.py --demo
+      - run: python examples/sdk/mcp_management.py --demo
 
   artifacts:
     runs-on: ubuntu-latest

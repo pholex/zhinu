@@ -57,6 +57,7 @@ from .responses import (
     Function,
     Message,
     NonStreamChoice,
+    PromptTokenDetails,
     Usage,
     _text_chunk,
     _tool_chunk,
@@ -579,6 +580,9 @@ def stream_chunks(events: Iterator[Any]) -> Iterator[Chunk]:
     """
     input_tokens = 0
     output_tokens = 0
+    saw_stop = False
+    input_known = output_known = False
+    cached_tokens = cache_creation_tokens = 0
     #  index → 攒块状态（thinking/redacted 攒内容，tool 记有没有见过参数分片）
     open_blocks: dict[int, dict[str, Any]] = {}
 
@@ -586,6 +590,9 @@ def stream_chunks(events: Iterator[Any]) -> Iterator[Chunk]:
         kind = getattr(event, "type", "")
         if kind == "message_start":
             usage = getattr(getattr(event, "message", None), "usage", None)
+            input_known = type(getattr(usage, "input_tokens", None)) is int
+            cached_tokens = getattr(usage, "cache_read_input_tokens", 0) or 0
+            cache_creation_tokens = getattr(usage, "cache_creation_input_tokens", 0) or 0
             input_tokens = (
                 (getattr(usage, "input_tokens", 0) or 0)
                 + (getattr(usage, "cache_read_input_tokens", 0) or 0)
@@ -667,6 +674,7 @@ def stream_chunks(events: Iterator[Any]) -> Iterator[Chunk]:
                 yield _tool_chunk(event.index, function=Function(arguments="{}"))
         elif kind == "message_delta":
             if usage := getattr(event, "usage", None):
+                output_known = type(getattr(usage, "output_tokens", None)) is int
                 output_tokens = getattr(usage, "output_tokens", 0) or 0
             stop_reason = getattr(getattr(event, "delta", None), "stop_reason", None)
             if stop_reason in _TRUNCATED_STOP_REASONS:
@@ -677,11 +685,19 @@ def stream_chunks(events: Iterator[Any]) -> Iterator[Chunk]:
                 #  errors.classify → fatal（不换模型不重试），详情报给用户
                 raise ContentFiltered(f"Anthropic 拒绝了这次请求：{_refusal_detail(event)}")
         elif kind == "message_stop":
+            saw_stop = True
             #  usage 收尾 chunk：choices 留空——内核见空 choices 就跳过，
             #  与 OpenAI chat 流最后那个纯 usage chunk 形状一致
-            yield Chunk(usage=Usage(prompt_tokens=input_tokens, completion_tokens=output_tokens))
+            yield Chunk(usage=Usage(prompt_tokens=input_tokens, completion_tokens=output_tokens,
+                prompt_tokens_details=PromptTokenDetails(cached_tokens, cache_creation_tokens),
+                reported=input_known and output_known))
         #  ping / 未知事件一律忽略；流层错误由 anthropic SDK 自己抛类型化异常
         #  （Bedrock 的异常帧除外，见 _events）
+    if not saw_stop:
+        # A clean HTTP EOF is not an application-level completion. In
+        # particular, ignored/unknown frames must not become a successful
+        # empty response, and partial text must not silently look complete.
+        raise StreamFailed("Anthropic stream ended before message_stop")
 
 
 def to_completion(response: Any) -> Completion:
@@ -713,6 +729,9 @@ def _usage(raw: Any) -> Usage | None:
             + (getattr(raw, "cache_creation_input_tokens", 0) or 0)
         ),
         completion_tokens=getattr(raw, "output_tokens", 0) or 0,
+        prompt_tokens_details=PromptTokenDetails(
+            getattr(raw, "cache_read_input_tokens", 0) or 0, getattr(raw, "cache_creation_input_tokens", 0) or 0),
+        reported=all(type(getattr(raw, key, None)) is int for key in ("input_tokens", "output_tokens")),
     )
 
 

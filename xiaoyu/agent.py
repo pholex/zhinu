@@ -1490,7 +1490,8 @@ class Agent:
             from .session_log import SYSTEM_PROMPT_EVENT, load_system_prompt
 
             #  续写同名会话（--session-id）每次启动都经这里：文件里已是这份就不重复记
-            if load_system_prompt(self.session_log.path) != custom:
+            path = getattr(self.session_log, "path", None)
+            if path is None or load_system_prompt(path) != custom:
                 self.session_log.preamble(SYSTEM_PROMPT_EVENT, text=custom)
 
     def _log_guardrails(self) -> None:
@@ -3373,6 +3374,10 @@ class Agent:
             #  服务端压缩在岗：本地只在它没接住（估算继续涨过兜底线）时才出手
             return None
 
+        if self.hook_engine is not None and self.hook_engine.has("BeforeCompact"):
+            decision = self.hook_engine.fire("BeforeCompact", {"context_tokens": estimated, "forced": force})
+            if decision.blocked:
+                raise RuntimeError("BeforeCompact hook blocked compaction")
         self.messages, cleared, saved_chars = microcompact(
             self.messages, self.config.keep_recent
         )
@@ -3389,6 +3394,8 @@ class Agent:
                     "microcompact", cleared=cleared, saved_chars=saved_chars
                 )
             if not force and not self.compactor.should_compact(after_micro):
+                if self.hook_engine is not None and self.hook_engine.has("AfterCompact"):
+                    self.hook_engine.fire("AfterCompact", {"changed": True, "method": "microcompact"})
                 #  清完就降到阈值以下：这轮不必花钱做摘要了
                 return f"microcompact：清理 {cleared} 条旧工具输出，估算 {estimated} → {after_micro} tok"
             estimated = after_micro
@@ -3419,6 +3426,8 @@ class Agent:
             else:
                 self.session_log.event("compact", note=note)
             self.session_log.event("compact_end", ok=changed)
+        if self.hook_engine is not None and self.hook_engine.has("AfterCompact"):
+            self.hook_engine.fire("AfterCompact", {"changed": changed, "method": "summary"})
         return note
 
     def _shrink_after_overflow(self) -> bool:
@@ -4750,7 +4759,7 @@ class Agent:
                 "或者停下来向用户说明卡在哪里。",
             )
 
-        self.sink.emit(ToolPending(name, args))
+        self.sink.emit(ToolPending(name, args, tool_call_id=call.get("id", "")))
 
         #  权限判定的有序管线：
         #  deny 规则 → 会话授权/allow 规则 → 常规确认。
@@ -4760,7 +4769,7 @@ class Agent:
             self.trace.append(
                 {"tool": name, "args": args, "ok": False, "output": "DENIED_BY_RULE"}
             )
-            self.sink.emit(ToolDenied(name, by="rule"))
+            self.sink.emit(ToolDenied(name, by="rule", tool_call_id=call.get("id", "")))
             return self._tool_message(
                 call,
                 f"ERROR: 这次调用命中了用户配置的 deny 权限规则「{deny_rule}」，已拦截"
@@ -4775,7 +4784,7 @@ class Agent:
             self.trace.append(
                 {"tool": name, "args": args, "ok": False, "output": "DENIED_PLAN_MODE"}
             )
-            self.sink.emit(ToolDenied(name, by="rule"))
+            self.sink.emit(ToolDenied(name, by="rule", tool_call_id=call.get("id", "")))
             return self._tool_message(
                 call,
                 f"ERROR: 当前处于 plan mode（只读规划态），{name} 被拦截。"
@@ -4856,7 +4865,7 @@ class Agent:
                 self.sink.emit(
                     Notice(f"  ⚠ 审批回调的返回值无法识别，已按拒绝处理：{malformed}", "warn")
                 )
-                self.sink.emit(ToolDenied(name, by="user"))
+                self.sink.emit(ToolDenied(name, by="user", tool_call_id=call.get("id", "")))
                 return self._tool_message(
                     call,
                     "ERROR: 这次调用没有执行——宿主的审批回调返回了无法识别的结果，"
@@ -4864,7 +4873,7 @@ class Agent:
                 )
             if not approved:
                 self.trace.append({"tool": name, "args": args, "ok": False, "output": "DENIED"})
-                self.sink.emit(ToolDenied(name, by="user"))
+                self.sink.emit(ToolDenied(name, by="user", tool_call_id=call.get("id", "")))
                 if reason:
                     return self._tool_message(
                         call,
@@ -4886,7 +4895,7 @@ class Agent:
                     self.trace.append(
                         {"tool": name, "args": args, "ok": False, "output": "DENIED_BY_RULE"}
                     )
-                    self.sink.emit(ToolDenied(name, by="rule"))
+                    self.sink.emit(ToolDenied(name, by="rule", tool_call_id=call.get("id", "")))
                     return self._tool_message(
                         call,
                         f"ERROR: 审批方改写后的参数命中了 deny 权限规则「{deny_rule}」，"
@@ -4904,7 +4913,7 @@ class Agent:
                 self.trace.append(
                     {"tool": name, "args": args, "ok": False, "output": "DENIED_BY_HOOK"}
                 )
-                self.sink.emit(ToolDenied(name, by="rule"))
+                self.sink.emit(ToolDenied(name, by="rule", tool_call_id=call.get("id", "")))
                 return self._tool_message(
                     call,
                     f"ERROR: 这次调用被用户配置的 PreToolUse hook 拦截：{decision.reason}。"
@@ -4913,12 +4922,12 @@ class Agent:
 
         if moved := self.toolbox.target_moved(args, reviewed_target):
             self.trace.append({"tool": name, "args": args, "ok": False, "output": "TARGET_MOVED"})
-            self.sink.emit(ToolDenied(name, by="rule"))
+            self.sink.emit(ToolDenied(name, by="rule", tool_call_id=call.get("id", "")))
             return self._tool_message(call, moved)
 
         #  过了全部关卡才算 running（状态机：pending → running →
         #  completed|denied，每个 pending 恰好一个终态——将来活区 spinner 靠它不悬空）
-        self.sink.emit(ToolRunning(name, args))
+        self.sink.emit(ToolRunning(name, args, tool_call_id=call.get("id", "")))
         started = time.monotonic()
         try:
             output = self.toolbox.run(name, args)
@@ -4938,6 +4947,7 @@ class Agent:
                     output=partial or f"[执行被中断/异常：{type(exc).__name__}]",
                     ok=False,
                     seconds=time.monotonic() - started,
+                    tool_call_id=call.get("id", ""),
                 )
             )
             if partial:
@@ -5005,8 +5015,10 @@ class Agent:
             )
             if decision.blocked:
                 output += f"\n\n[PostToolUse hook 反馈，请重视] {decision.reason}"
+        if not ok and self.hook_engine is not None and self.hook_engine.has("ToolFailed"):
+            self.hook_engine.fire("ToolFailed", {"tool": name, "ok": False}, tool_name=name, **self._hook_alias(name, args))
         self.trace.append({"tool": name, "args": args, "ok": ok, "output": output})
-        self.sink.emit(ToolCompleted(name, output=output, ok=ok, seconds=elapsed))
+        self.sink.emit(ToolCompleted(name, output=output, ok=ok, seconds=elapsed, tool_call_id=call.get("id", "")))
         return self._tool_message(call, self._for_model(name, args, raw_output, output))
 
     @staticmethod

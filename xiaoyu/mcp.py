@@ -86,6 +86,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+import weakref
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Iterator
@@ -169,7 +170,7 @@ _call_scope = threading.local()
 
 
 @contextlib.contextmanager
-def stop_scope(stop_requested: Callable[[], bool] | None) -> "Iterator[None]":
+def stop_scope(stop_requested: Callable[[], bool] | None, *, media_owner: Any = None) -> "Iterator[None]":
     """在当前线程上挂一个"有没有人叫停"，期间发起的 MCP 工具调用会轮询它。
 
     工具的 handler 是 manager 级的闭包，一个 manager 被父子 agent 的多个工具箱
@@ -180,9 +181,20 @@ def stop_scope(stop_requested: Callable[[], bool] | None) -> "Iterator[None]":
     previous = getattr(_call_scope, "stop", None)
     _call_scope.stop = stop_requested
     try:
-        yield
+        with media_scope(media_owner):
+            yield
     finally:
         _call_scope.stop = previous
+
+
+@contextlib.contextmanager
+def media_scope(owner: Any) -> "Iterator[None]":
+    previous = getattr(_call_scope, "media_owner", None)
+    _call_scope.media_owner = owner
+    try:
+        yield
+    finally:
+        _call_scope.media_owner = previous
 
 
 class McpError(RuntimeError):
@@ -259,6 +271,9 @@ class ServerSpec:
     #  与 trustToolChanges 是两条轴：那个信的是工具声明的变更，这个信的是工具
     #  返回的内容。网页与联网搜索没有对应开关：它们的来源不是用户能背书的。
     trust_content: bool = False
+    # SDK-owned OAuth provider. Credentials are evaluated for each request and
+    # never written to the declaration/cache or included in dataclass repr.
+    authorization: Callable[[], str] | None = field(default=None, repr=False, compare=False)
 
     @property
     def is_http(self) -> bool:
@@ -888,6 +903,11 @@ class _HttpChannel:
             headers["MCP-Protocol-Version"] = self.protocol_version
         #  自定义头最后合并：用户点名的优先（他可能就是要覆盖 UA/Accept）
         headers.update(self.spec.headers)
+        if self.spec.authorization is not None:
+            try:
+                headers["Authorization"] = self.spec.authorization()
+            except Exception as exc:
+                raise McpError("MCP authorization unavailable", kind="auth") from exc
         return headers
 
     def post(
@@ -918,7 +938,8 @@ class _HttpChannel:
         #  建连、写请求）的 OSError 包成 URLError；等响应头与读响应体阶段的异常
         #  原样抛出——这条边界就是"送没送到"的判据。
         try:
-            response = netproxy.urlopen(request, timeout=timeout)
+            response = netproxy.urlopen(request, timeout=timeout,
+                **({"allow_redirects": False} if self.spec.authorization is not None else {}))
         except urllib.error.HTTPError as exc:
             raise self._http_error(exc) from exc
         except urllib.error.URLError as exc:
@@ -1024,7 +1045,8 @@ class _HttpChannel:
             self.spec.url, headers=self._headers("text/event-stream"), method="GET"
         )
         try:
-            stream = netproxy.urlopen(request, timeout=self._STREAM_TIMEOUT)
+            stream = netproxy.urlopen(request, timeout=self._STREAM_TIMEOUT,
+                **({"allow_redirects": False} if self.spec.authorization is not None else {}))
         except urllib.error.HTTPError as exc:
             #  HTTPError 本身就是一个开着的响应：不关就是把连接留给垃圾回收。
             #  405 是常态（多数 server 不提供这条流），漏的是每连一个 server 一条
@@ -1082,11 +1104,12 @@ class _HttpChannel:
         if not self.session_id:
             return
         #  规范：客户端应当显式 DELETE 掉会话，让 server 释放资源。尽力而为。
-        request = urllib.request.Request(
-            self.spec.url, headers=self._headers("application/json"), method="DELETE"
-        )
         try:
-            netproxy.urlopen(request, timeout=5.0).close()
+            request = urllib.request.Request(
+                self.spec.url, headers=self._headers("application/json"), method="DELETE"
+            )
+            netproxy.urlopen(request, timeout=5.0,
+                **({"allow_redirects": False} if self.spec.authorization is not None else {})).close()
         except urllib.error.HTTPError as exc:
             #  不支持 DELETE 的 server 回 405：同样是个开着的响应，要关
             with contextlib.suppress(Exception):
@@ -1270,7 +1293,7 @@ class McpServer:
         #  本代 initialize 协商出的协议版本（空串 = 未握手）；restart 清零重协商
         self.protocol_version = ""
         #  最近一次 call_tool 的图片部件（见 call_tool）：调用方紧接着取走
-        self.last_media: list[dict[str, Any]] = []
+        self._call_media = threading.local()
         #  惰性启动状态：schema 缓存命中的 server 直到第一次真实调用才 spawn
         self._start_lock = threading.Lock()
         self.started = False
@@ -1632,6 +1655,14 @@ class McpServer:
                 )
             seen.add(cursor)
         return tools
+
+    @property
+    def last_media(self) -> list[dict[str, Any]]:
+        return getattr(self._call_media, "parts", [])
+
+    @last_media.setter
+    def last_media(self, parts: list[dict[str, Any]]) -> None:
+        self._call_media.parts = parts
 
     def call_tool(
         self,
@@ -2403,11 +2434,14 @@ class McpManager:
         *,
         trust_tool_changes: bool = False,
         state_dir: Path | None = None,
+        inherit_environment: bool = True,
+        use_cache: bool = True,
     ) -> None:
         self._specs = specs
         #  全局"变更工具不隔离"（Config.mcp_trust_changes：--unguarded 预设的落点）。
         #  与环境变量 XIAOYU_MCP_TRUST_CHANGES 同义，二者任一即开
         self._trust_tool_changes = trust_tool_changes
+        self._inherit_environment = inherit_environment
         #  重读配置的函数（/mcp reconnect 用）：必须是启动时同一条加载路径
         #  （folder trust 门 + 加载期准入 + ${env:VAR} 展开），由 launch 接线。
         #  None = 清单是宿主直接给的，热恢复沿用现有声明
@@ -2421,6 +2455,7 @@ class McpManager:
         self._tools: list[RemoteTool] = []
         #  最近一次工具调用产出的图片部件，等 Toolbox 取走（见 take_media）
         self._media: list[dict[str, Any]] = []
+        self._caller_media = threading.local()
         self._closed = False
         #  每个 server 最近一次拿到的完整声明（缓存或 live）与已注册工具原名，
         #  /mcp approve 与对账去重靠它们
@@ -2449,7 +2484,7 @@ class McpManager:
         #  与基线同步写；没有它裁决照常，只是 diff 退化成"只能看这次的"
         self._decls_path = self._state_dir / "mcp-approved-decls.json"
         self._decls = mcp_guard.load_declarations(self._decls_path)
-        self._cache = self._load_cache() if _enabled("XIAOYU_MCP_CACHE") else {}
+        self._cache = self._load_cache() if use_cache and _enabled("XIAOYU_MCP_CACHE") else {}
 
     def _load_cache(self) -> dict[str, Any]:
         try:
@@ -2556,7 +2591,7 @@ class McpManager:
             "trustToolChanges"
             if server.spec.trust_tool_changes
             else "XIAOYU_MCP_TRUST_CHANGES"
-            if self._trust_tool_changes or _opted_in("XIAOYU_MCP_TRUST_CHANGES")
+            if self._trust_tool_changes or (self._inherit_environment and _opted_in("XIAOYU_MCP_TRUST_CHANGES"))
             else ""
         )
         if quarantined and trusted_by:
@@ -3185,8 +3220,15 @@ class McpManager:
 
     def stash_media(self, parts: list[dict[str, Any]]) -> None:
         if parts:
-            with self._lock:
-                self._media.extend(parts)
+            owner = getattr(_call_scope, "media_owner", None)
+            if owner is None:
+                current = getattr(self._caller_media, "parts", [])
+                self._caller_media.parts = [*current, *parts]
+            else:
+                if not hasattr(self._caller_media, "owners"):
+                    self._caller_media.owners = weakref.WeakKeyDictionary()
+                owners = self._caller_media.owners
+                owners.setdefault(owner, []).extend(parts)
 
     def take_media(self) -> list[dict[str, Any]]:
         """取走暂存的图片部件（取完即清）。
@@ -3194,8 +3236,12 @@ class McpManager:
         一次工具调用可能返回多张图，一批 tool_calls 也可能有好几个都返回图，
         所以是累加 + 一次取走，由 agent 在这批工具跑完后统一附给模型。
         """
-        with self._lock:
-            parts, self._media = self._media, []
+        owner = getattr(_call_scope, "media_owner", None)
+        if owner is not None:
+            owners = getattr(self._caller_media, "owners", {})
+            return owners.pop(owner, [])
+        parts = getattr(self._caller_media, "parts", [])
+        self._caller_media.parts = []
         return parts
 
     def wait_ready(self, timeout: float) -> None:
@@ -3334,9 +3380,8 @@ class McpView:
     子集对齐（ready_tools / loading / take_media）。粒度是 server 而不是
     tool：精确名匹配、引用不存在的名字不报错（过滤后少一个而已）。
 
-    已知边界：media 暂存是 manager 级共享的，子 agent 取图时理论上可能把
-    父级同批工具刚暂存的图一并取走。同步架构下父级在子 agent 返回后才收
-    自己那批，实际窗口极窄，不为此加标记链路。
+    media 暂存按调用线程及 Toolbox 所有者隔离；并发子 agent 和复用 worker
+    的后续任务不会接收其他工具箱尚未消费的结果。
     """
 
     def __init__(self, manager: McpManager, mode: str = "all", names: tuple[str, ...] = ()) -> None:

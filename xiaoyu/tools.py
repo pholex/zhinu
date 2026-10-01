@@ -1422,7 +1422,7 @@ class Toolbox:
         """
 
         def call(**kwargs: Any) -> str:
-            with mcp.stop_scope(self.stop_requested):
+            with mcp.stop_scope(self.stop_requested, media_owner=self):
                 return handler(**kwargs)
 
         call.remote = handler  # type: ignore[attr-defined]
@@ -1645,7 +1645,8 @@ class Toolbox:
         """
         with self._media_lock:
             own, self._media = self._media, []
-        remote = self._mcp.take_media() if self._mcp is not None else []
+        with mcp.media_scope(self):
+            remote = self._mcp.take_media() if self._mcp is not None else []
         return own + remote
 
     def push_media(self, part: dict[str, Any]) -> None:

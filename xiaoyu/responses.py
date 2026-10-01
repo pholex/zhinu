@@ -430,9 +430,17 @@ class Choice:
 
 
 @dataclass
+class PromptTokenDetails:
+    cached_tokens: int = 0
+    cache_creation_tokens: int = 0
+
+
+@dataclass
 class Usage:
     prompt_tokens: int = 0
     completion_tokens: int = 0
+    prompt_tokens_details: PromptTokenDetails | None = None
+    reported: bool = True
 
 
 @dataclass
@@ -496,6 +504,9 @@ def _usage(raw: Any) -> Usage | None:
     return Usage(
         prompt_tokens=getattr(raw, "input_tokens", 0) or 0,
         completion_tokens=getattr(raw, "output_tokens", 0) or 0,
+        prompt_tokens_details=PromptTokenDetails(
+            cached_tokens=getattr(getattr(raw, "input_tokens_details", None), "cached_tokens", 0) or 0),
+        reported=all(type(getattr(raw, key, None)) is int for key in ("input_tokens", "output_tokens")),
     )
 
 
