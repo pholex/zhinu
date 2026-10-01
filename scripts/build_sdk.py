@@ -6,8 +6,10 @@ import email
 import hashlib
 import json
 import re
+import shutil
 import subprocess
 import sys
+import tempfile
 import zipfile
 from pathlib import Path
 
@@ -29,12 +31,16 @@ def main() -> None:
         ("sdk", root / "packages/xiaoyu-agent-sdk", "xiaoyu_agent_sdk"),
     ):
         destination = out / name
-        command = [sys.executable, "-m", "build", "--outdir", str(destination)]
-        if args.no_isolation:
-            command.append("--no-isolation")
-        subprocess.run([*command, str(source)], check=True)
         distribution = "xiaoyu_agent" if name == "kernel" else "xiaoyu_agent_sdk"
         wheel = destination / f"{distribution}-{version}-py3-none-any.whl"
+        # Validate rebuilding from sdist, but retain only wheels for publication.
+        with tempfile.TemporaryDirectory(prefix="xiaoyu-build-") as temporary:
+            command = [sys.executable, "-m", "build", "--outdir", temporary]
+            if args.no_isolation:
+                command.append("--no-isolation")
+            subprocess.run([*command, str(source)], check=True)
+            destination.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(Path(temporary) / wheel.name, wheel)
         with zipfile.ZipFile(wheel) as archive:
             paths = archive.namelist()
             metadata = email.message_from_bytes(archive.read(next(p for p in paths if p.endswith("/METADATA"))))
@@ -49,7 +55,7 @@ def main() -> None:
         "files": {
             path.relative_to(out).as_posix(): hashlib.sha256(path.read_bytes()).hexdigest()
             for folder in ("kernel", "sdk") for path in sorted((out / folder).iterdir())
-            if path.suffix in (".whl", ".gz")
+            if path.suffix == ".whl"
         },
     }
     (out / "release-manifest.json").write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")

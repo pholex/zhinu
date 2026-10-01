@@ -24,11 +24,15 @@ def verify(root: Path, *, commit: str | None = None, version: str | None = None)
     if version and manifest["version"] != version:
         raise ValueError("Release version differs from the tag")
     expected = {
-        f"{group}/{project.replace('-', '_')}-{manifest['version']}{suffix}"
-        for group, project in PROJECTS.items() for suffix in ("-py3-none-any.whl", ".tar.gz")
+        f"{group}/{project.replace('-', '_')}-{manifest['version']}-py3-none-any.whl"
+        for group, project in PROJECTS.items()
     }
     if set(manifest["files"]) != expected:
-        raise ValueError("Manifest must describe exactly both wheels and sdists")
+        raise ValueError("Manifest must describe exactly both wheels")
+    actual = {path.relative_to(root).as_posix()
+              for group in PROJECTS for path in (root / group).rglob("*") if path.is_file()}
+    if actual != expected:
+        raise ValueError("Release directories must contain only the two wheels")
     for name, digest in manifest["files"].items():
         if hashlib.sha256((root / name).read_bytes()).hexdigest() != digest:
             raise ValueError(f"Artifact digest mismatch: {name}")

@@ -14,8 +14,9 @@ python scripts/sdk_release.py verify /tmp/xiaoyu-release-candidate
 python -m twine check /tmp/xiaoyu-release-candidate/kernel/* /tmp/xiaoyu-release-candidate/sdk/*
 ```
 
-输出目录必须为空。构建同时产生两个 wheel、两个 sdist 和 release-manifest.json，
-记录版本、提交、工作区是否有未提交修改及每个制品的 SHA-256。wheel 从 sdist 重建。
+输出目录必须为空。发布目录只包含两个 wheel 和 release-manifest.json，
+记录版本、提交、工作区是否有未提交修改及每个制品的 SHA-256。构建在临时目录中
+生成 sdist 并从中重建 wheel；sdist 随后清理，不保存到 Actions 制品，也不上传 PyPI。
 清单验证用于完整性和来源追溯；不承诺重新构建产生逐字节相同的压缩包。
 正式发布要求清单来自准确的、无未提交修改的标签提交。
 
@@ -32,8 +33,7 @@ python -m twine check /tmp/xiaoyu-release-candidate/kernel/* /tmp/xiaoyu-release
 
 开始前分别为两个 PyPI 项目配置 Trusted Publishing，workflow 名为 `release.yml`，
 environment 为 `pypi`，并确认名称与发布权限。既有内核发布权限不会自动授权 SDK。
-这次工作只修改流程定义，没有推送标签、注册项目或上传制品。
-内核发布原先只上传 wheel；成对发布起会同时上传已验证的 sdist。
+发布检查会拒绝包含源码包或其他额外文件的发布目录，只允许上传 wheel。
 
 ## 部分发布与重试
 
