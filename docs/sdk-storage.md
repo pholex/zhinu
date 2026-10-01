@@ -61,16 +61,15 @@ SQLite 锁；连接的同步设置也在协调范围内。
 支持本机本地文件系统，不保证网络盘/多机部署的锁语义或所有存储设备的断电持久性。
 跨机器后端必须实现自己的租约、续期和 fencing，不能复用 SQLite 的本机锁保证。
 
-## 参考核实与验收
+## 适配器契约验收
 
-Claude 的存储预检明确区分外置 transcript 与本地文件 checkpoint；LangGraph
-提供读写故障与 pending writes 的恢复断言。小羽据此复用日志重放，并独立检查
-工具副作用与存储幂等，不将对话恢复称为执行状态恢复。
+存储恢复使用日志重放；工具副作用与存储幂等分别验证，对话恢复不代表执行状态恢复。
 
-适配器作者可在隔离后端运行：
+契约助手位于源码仓库的 `tests/sdk_store_contracts.py`，不随 PyPI 包分发。
+适配器作者可在仓库开发检出中对隔离后端运行：
 
 ```python
-from xiaoyu_agent_sdk.testing import check_session_store
+from tests.sdk_store_contracts import check_session_store
 check_session_store(store, Path.cwd())
 ```
 

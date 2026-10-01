@@ -76,6 +76,7 @@ xiaoyu-eval = "xiaoyu.evals.runner:main"
 
 [tool.setuptools]
 packages = ["xiaoyu", "xiaoyu.evals"]
+include-package-data = false
 
 [tool.setuptools.dynamic]
 version = {attr = "xiaoyu.__version__"}
@@ -86,4 +87,4 @@ version = {attr = "xiaoyu.__version__"}
 "xiaoyu.evals" = ["models.example.json"]
 # 扩展指南随包分发（"文档即能力"）：system prompt 里只放它的绝对路径，
 # 模型要给小羽写技能/插件时现读——扩展格式不该靠训练记忆
-xiaoyu = ["docs/*.md"]
+xiaoyu = ["py.typed", "docs/extending.md"]

@@ -14,6 +14,11 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
+if __package__:
+    from .build_sdk import verify_wheel
+else:
+    from build_sdk import verify_wheel
+
 PROJECTS = {"kernel": "xiaoyu-agent", "sdk": "xiaoyu-agent-sdk"}
 
 
@@ -36,6 +41,7 @@ def verify(root: Path, *, commit: str | None = None, version: str | None = None)
     for name, digest in manifest["files"].items():
         if hashlib.sha256((root / name).read_bytes()).hexdigest() != digest:
             raise ValueError(f"Artifact digest mismatch: {name}")
+        verify_wheel(root / name, package=name.split("/", 1)[0], version=manifest["version"])
     return manifest
 
 

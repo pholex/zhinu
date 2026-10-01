@@ -5,8 +5,8 @@ import uuid
 from pathlib import Path
 
 from xiaoyu.session_log import SessionLockedError
-from .storage import SessionStore, session_metadata
-from .types import SessionStorageError
+from xiaoyu_agent_sdk.storage import SessionStore, session_metadata
+from xiaoyu_agent_sdk.types import SessionStorageError
 
 
 def check_session_store(store: SessionStore, workspace: Path) -> None:

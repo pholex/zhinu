@@ -11,7 +11,64 @@ import subprocess
 import sys
 import tempfile
 import zipfile
-from pathlib import Path
+from pathlib import Path, PurePosixPath
+
+
+RUNTIME_ASSETS = {
+    "kernel": {"xiaoyu/py.typed", "xiaoyu/docs/extending.md", "xiaoyu/evals/models.example.json"},
+    "sdk": {"xiaoyu_agent_sdk/py.typed"},
+}
+
+
+def verify_wheel(wheel: Path, *, package: str, version: str) -> None:
+    """Reject development files while retaining executable modules and assets."""
+    namespace, distribution = {
+        "kernel": ("xiaoyu", "xiaoyu_agent"),
+        "sdk": ("xiaoyu_agent_sdk", "xiaoyu_agent_sdk"),
+    }[package]
+    info = f"{distribution}-{version}.dist-info/"
+    metadata_files = {info + name for name in (
+        "METADATA", "WHEEL", "RECORD", "entry_points.txt", "top_level.txt", "licenses/LICENSE",
+    )}
+    module_packages = {(namespace,)}
+    if package == "kernel":
+        module_packages.add((namespace, "evals"))
+
+    def allowed(name: str) -> bool:
+        path = PurePosixPath(name)
+        if name != path.as_posix():
+            return False
+        module = (path.suffix == ".py" and path.parts[:-1] in module_packages
+                  and path.name not in {"testing.py", "tests.py", "conftest.py"}
+                  and not path.name.startswith("test_") and not path.name.endswith("_test.py"))
+        return module or name in RUNTIME_ASSETS[package] or name in metadata_files
+
+    with zipfile.ZipFile(wheel) as archive:
+        paths = archive.namelist()
+        if len(paths) != len(set(paths)):
+            raise ValueError("Wheel contains duplicate members")
+        unexpected = [name for name in paths if not allowed(name)]
+        if unexpected:
+            raise ValueError("Wheel contains non-runtime files: " + ", ".join(unexpected))
+        required = RUNTIME_ASSETS[package] | {
+            f"{namespace}/__init__.py", info + "METADATA", info + "WHEEL", info + "RECORD",
+            info + "licenses/LICENSE",
+        }
+        if package == "kernel":
+            required |= {"xiaoyu/cli.py", "xiaoyu/evals/runner.py", info + "entry_points.txt"}
+        missing = required - set(paths)
+        if missing:
+            raise ValueError("Wheel lacks required runtime files: " + ", ".join(sorted(missing)))
+        metadata = email.message_from_bytes(archive.read(info + "METADATA"))
+        if metadata["Version"] != version:
+            raise ValueError("Wheel version differs from release version")
+        if re.sub(r"[-_.]+", "-", metadata.get("Name", "")).lower() != distribution.replace("_", "-"):
+            raise ValueError("Wheel project differs from release package")
+        if package == "sdk" and not any(
+            re.fullmatch(r"xiaoyu-agent\[sdk\]\s*==\s*" + re.escape(version), dependency)
+            for dependency in metadata.get_all("Requires-Dist", [])
+        ):
+            raise ValueError("SDK must depend on the paired kernel version")
 
 
 def main() -> None:
@@ -26,9 +83,9 @@ def main() -> None:
     commit = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=root, text=True).strip()
     dirty = bool(subprocess.check_output(["git", "status", "--porcelain"], cwd=root, text=True).strip())
     version = re.search(r'^__version__ = "([^"]+)"', (root / "xiaoyu/__init__.py").read_text(encoding="utf-8"), re.M).group(1)
-    for name, source, namespace in (
-        ("kernel", root, "xiaoyu"),
-        ("sdk", root / "packages/xiaoyu-agent-sdk", "xiaoyu_agent_sdk"),
+    for name, source in (
+        ("kernel", root),
+        ("sdk", root / "packages/xiaoyu-agent-sdk"),
     ):
         destination = out / name
         distribution = "xiaoyu_agent" if name == "kernel" else "xiaoyu_agent_sdk"
@@ -41,14 +98,7 @@ def main() -> None:
             subprocess.run([*command, str(source)], check=True)
             destination.mkdir(parents=True, exist_ok=True)
             shutil.copy2(Path(temporary) / wheel.name, wheel)
-        with zipfile.ZipFile(wheel) as archive:
-            paths = archive.namelist()
-            metadata = email.message_from_bytes(archive.read(next(p for p in paths if p.endswith("/METADATA"))))
-            assert metadata["Version"] == version
-            assert all(p.startswith(namespace + "/") or ".dist-info/" in p for p in paths)
-            assert namespace + "/py.typed" in paths
-            if name == "sdk":
-                assert f"xiaoyu-agent[sdk]=={version}" in metadata.get_all("Requires-Dist", [])
+        verify_wheel(wheel, package=name, version=version)
         print(f"Verified {wheel}")
     manifest = {
         "version": version, "commit": commit, "dirty": dirty,

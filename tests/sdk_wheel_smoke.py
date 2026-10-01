@@ -8,6 +8,16 @@ from types import SimpleNamespace
 import xiaoyu
 import xiaoyu_agent_sdk as sdk
 
+for package, namespace in (("xiaoyu-agent", "xiaoyu"), ("xiaoyu-agent-sdk", "xiaoyu_agent_sdk")):
+    for member in importlib.metadata.files(package):
+        parts = member.parts
+        if not parts or parts[0] != namespace:
+            continue
+        assert not {"tests", "examples"}.intersection(parts), f"Development file installed: {member}"
+        assert member.name not in {"testing.py", "tests.py", "conftest.py"}, f"Test helper installed: {member}"
+        assert not member.name.startswith("test_") and not member.name.endswith("_test.py"), f"Test file installed: {member}"
+assert importlib.util.find_spec("xiaoyu_agent_sdk.testing") is None, "Storage test helper installed"
+
 assert sdk.__version__ == xiaoyu.__version__
 assert importlib.metadata.version("xiaoyu-agent-sdk") == sdk.__version__
 for package in ("fastapi", "playwright", "prompt_toolkit", "rich"):

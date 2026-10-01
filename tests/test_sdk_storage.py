@@ -22,7 +22,7 @@ from xiaoyu_agent_sdk import (
     SessionLockedError, SessionOptions, SessionStorageError, SQLiteSessionStore,
     Tool,
 )
-from xiaoyu_agent_sdk.testing import check_session_store
+from tests.sdk_store_contracts import check_session_store
 from tests.test_agent_paths import FakeClient, chunk
 from tests.test_sdk import call
 
