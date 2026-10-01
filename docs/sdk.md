@@ -2,7 +2,7 @@
 
 `xiaoyu-agent-sdk` 是与 `xiaoyu-agent` 同仓库、同版本的独立发行包，导入名为
 `xiaoyu_agent_sdk`。SDK 在宿主进程里调用现有执行内核，不启动 CLI 子进程。
-旧 `import xiaoyu` 和 CLI 保持兼容。当前代码版本为 0.58.0，尚未发布到 PyPI。
+旧 `import xiaoyu` 和 CLI 保持兼容。本页适用于 0.59.0，平台扩展不包含在 0.58.0 中。
 
 ## 安装与首次调用
 

@@ -20,7 +20,7 @@ python examples/sdk/business.py --demo --workspace /same/workspace --resume /pri
 ```
 
 `storage.py` 使用临时 SQLite 数据库演示会话 ID 与重新打开后恢复，示例结束时清理
-临时数据。此接口为工作区中未发布的 P4 扩展，见 [存储契约](../../docs/sdk-storage.md)。
+临时数据。此接口为 0.59.0 的平台扩展，见 [存储契约](../../docs/sdk-storage.md)。
 
 `orchestration.py` 演示并发依赖任务、结果恢复、请求预算和遥测。
 `mcp_management.py` 启动测试专用 stdio 服务，演示动态添加、调用、启停和删除。

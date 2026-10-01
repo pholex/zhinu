@@ -1,13 +1,13 @@
-# SDK 0.58.0 API 参考
+# SDK 0.59.0 API 参考
 
 所有以下类型均从 `xiaoyu_agent_sdk` 导入。使用说明与失效语义见 [SDK 指南](sdk.md)。
 
-本页列出已发布首版接口。工作区中新增的未发布 P4 `SessionStore`、
+本页列出首版接口及 0.59.0 新增能力。`SessionStore`、
 `SessionWriter`、`SQLiteSessionStore`、`StoredSessionInfo`、`session_id` 与
 `resume_id` 见 [存储扩展](sdk-storage.md)。
 动态 MCP/OAuth、`TaskSpec` / `TaskHandle` / `TaskSnapshot` / `TaskManager`、
 `BudgetOptions` / `ModelPrice` / `CostSnapshot`、扩展 Hook 和 OpenTelemetry 的
-未发布接口见 [平台能力](sdk-platform.md)。
+接口见 [平台能力](sdk-platform.md)。
 
 ## 会话方法
 
@@ -76,8 +76,8 @@ context_tokens 是当前上下文估算。仅 output_status 为 valid 时消费 
 
 | SDK | 内核依赖 | Python | 当前验证 |
 |---|---|---|---|
-| 0.58.0（未发布） | `xiaoyu-agent[sdk]==0.58.0` | >=3.11 | 本机 macOS arm64 / 3.14.3 |
+| 0.59.0 | `xiaoyu-agent[sdk]==0.59.0` | >=3.11 | 六组跨平台 CI 与 wheel 安装检查 |
 
-Linux/macOS/Windows × 3.11/3.14 已配置 CI，远端执行尚待完成。
+CI 覆盖 Linux/macOS/Windows × Python 3.11/3.14，发布流程以全部通过为前提。
 不承诺低版本 Python、其他内核版本或未验证平台的操作系统沙箱能力。
 0.x 破坏性变更升级 minor；移除既有接口前至少保留一个 minor 的弃用窗口。
