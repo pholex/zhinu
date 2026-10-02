@@ -1,0 +1,6 @@
+# 跑分产物与本地构建，不入库
+runs/
+.build/
+.env
+__pycache__/
+*.pyc
