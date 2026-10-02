@@ -275,6 +275,35 @@ class TestTuiFrontend(AgentTestCase):
         self.assertIn("/context", self.completions(tui, "/c"))
         self.assertEqual(self.completions(tui, "正文不补全"), [])
 
+    def test_skill_names_complete_after_builtins_and_shadowed_get_prefix(self) -> None:
+        """技能名进补全菜单；与内建命令撞名的以 /skill: 形态出现，内建不被遮。"""
+        from xiaoyu.skills import Skill
+
+        agent = self.build([])
+        agent.skills = [
+            Skill(name="deploy", description="部署流程" * 30, path=self.root / "deploy" / "SKILL.md"),
+            Skill(name="help", description="同名技能", path=self.root / "help" / "SKILL.md"),
+        ]
+        tui = self.make_tui(agent)
+        items = self.completions(tui, "/dep")
+        self.assertIn("/deploy", items)
+        #  /help 补的是内建；撞名技能走 /skill:help
+        self.assertEqual(self.completions(tui, "/help"), ["/help", "/skill:help"])
+        self.assertIn("/skill:help", self.completions(tui, "/skill:h"))
+        #  内建在前、技能在后；`/<技能名>` 占位行不进菜单
+        everything = self.completions(tui, "/")
+        self.assertLess(everything.index("/model"), everything.index("/deploy"))
+        self.assertFalse(any("<" in item for item in everything))
+        from prompt_toolkit.document import Document
+
+        from xiaoyu.tui import SlashCompleter
+
+        document = Document("/deploy", cursor_position=7)
+        (item,) = list(SlashCompleter(tui).get_completions(document, None))
+        meta = str(item.display_meta_text)
+        self.assertTrue(meta.startswith("技能："))
+        self.assertLess(len(meta), 80)
+
     def test_model_name_completion_uses_chain(self) -> None:
         self.config.fallback_models = ["backup-model"]
         agent = self.build([])

@@ -1048,7 +1048,7 @@ class Agent:
             self.plan_file = config.workspace / ".xiaoyu" / "plan.md"
         self._plan_enter_note = PLAN_MODE_ENTER_NOTE.format(plan_file=self.plan_file)
         #  生命周期钩子（用户级 hooks.toml；测试可直接注入 engine）。
-        #  没有任何 hook 时保持 None——四个触发点零开销。
+        #  没有任何 hook 时保持 None——各触发点零开销。
         self.hook_engine = hook_engine
         if hook_engine is None and config.enable_hooks:
             from . import hooks as hooks_mod
@@ -1062,6 +1062,11 @@ class Agent:
                     config.workspace,
                     notify=lambda text: self.sink.emit(Notice(text, "warn")),
                 )
+        #  SessionStart / SessionEnd 由宿主显式调 begin_session / end_session 触发
+        #  （CLI 的几个入口各调一次），不藏在 send 里：SDK 的 Session 有自己的
+        #  同名生命周期，藏进 send 会让嵌入宿主的钩子被叫两遍
+        self._session_started = False
+        self._session_ended = False
         #  SKILL.md 技能：启动时扫描一次，索引要写进 system prompt，必须先于它构建
         self.skills = self._scan_skills() if config.enable_skills else []
         #  来源目录指纹：轮首差量检测（_refresh_skills）靠它把"无变化"的轮次
@@ -1453,10 +1458,17 @@ class Agent:
                     description=(
                         "加载一个技能的完整说明（SKILL.md 正文）。可用技能列表见系统提示；"
                         "会话中途新落盘的技能也能按名加载（未命中会重扫磁盘），加载后按说明执行。"
+                        "技能正文里的 $ARGUMENTS / $1 / $名字 占位由 arguments 参数填充。"
                     ),
                     parameters={
                         "type": "object",
-                        "properties": {"name": {"type": "string", "description": "技能名"}},
+                        "properties": {
+                            "name": {"type": "string", "description": "技能名"},
+                            "arguments": {
+                                "type": "string",
+                                "description": "传给技能的参数原文（按空白切分对应 $1、$2…；可省）",
+                            },
+                        },
                         "required": ["name"],
                     },
                     handler=self._load_skill,
@@ -1956,7 +1968,7 @@ class Agent:
             return skills.sources_fingerprint(directories=self.config.skill_directories)
         return skills.sources_fingerprint(self._skills_workspace())
 
-    def _load_skill(self, name: str) -> str:
+    def _load_skill(self, name: str, arguments: str = "") -> str:
         found = next((item for item in self.skills if item.name == name), None)
         if found is None and self.config.enable_skills:
             #  未命中先重扫磁盘再判死刑：技能可能是**本轮**刚落盘的（模型自己
@@ -1975,13 +1987,26 @@ class Agent:
         #  让常用技能在预算降级时优先存活。best-effort，绝不影响加载本身。
         if self.config.skill_directories is None:
             skill_usage.record_load(name)
+        #  参数占位：$ARGUMENTS / $1 / $名字 → 调用方给的参数。缺的占位原样留着
+        #  并在头部点名——静默留一个 `$1` 在正文里，模型会把它当成技能本来的写法
+        body, missing = skills.expand_arguments(body, arguments, skills.skill_arguments(found))
         #  基准目录必须随正文给出：技能正文里的相对路径（references/…、
         #  ../共享文档）模型无从知道相对谁——真实会话里模型猜错目录后，
         #  又花二十分钟递归搜盘才找到真实位置。
         header = (
             f"[技能目录：{found.path.parent}。"
-            "正文中的相对路径都以此目录为基准。]\n\n"
+            "正文中的相对路径都以此目录为基准。]\n"
         )
+        #  支持文件清单（相对 → 绝对）：技能目录里的脚本 / 参考文档模型要按绝对
+        #  路径引用才不会在工作区里瞎找；受条数上限，超了让它自己 list_files
+        if listing := skills.supporting_files_note(found):
+            header += listing + "\n"
+        if missing:
+            header += (
+                f"[提示] 技能正文用到参数占位 {'、'.join(missing)}，本次调用未提供，"
+                "占位原样保留；按上下文推断，推不出就问用户。]\n"
+            )
+        header += "\n"
         if name in self._loaded_skills:
             header = (
                 "[提示] 本会话已加载过该技能，若内容还在上下文里无需重复加载。"
@@ -2667,6 +2692,42 @@ class Agent:
                 "rewind", target=-1, reason=reason, replacement=self.messages[1:]
             )
         return dropped
+
+    # ---------- 会话生命周期（hooks.toml 的 SessionStart / SessionEnd） ----------
+
+    def _session_payload(self) -> dict[str, Any]:
+        log_path = getattr(self.session_log, "path", None) if self.session_log is not None else None
+        return {"model": self.config.model, "session": str(log_path) if log_path else ""}
+
+    def begin_session(self) -> Any:
+        """会话首轮之前触发一次 SessionStart；返回 None 表示没有这类钩子。
+
+        block → 返回的 Decision.blocked 为真，由宿主决定怎么拒绝启动（CLI 直接
+        退出）——与 SDK 的 Session 语义一致。放行时钩子 stdout 的首个非空行注入
+        历史：走 _record_injected 而不是 operator 通道，钩子打印的东西可能来自
+        仓库文件（git 输出、日志），不能让它以权威身份进上下文。重复调用不再触发。
+        """
+        if self._session_started:
+            return None
+        if self.hook_engine is None or not self.hook_engine.has("SessionStart"):
+            self._session_started = True
+            return None
+        decision = self.hook_engine.fire("SessionStart", self._session_payload())
+        if decision.blocked:
+            self.sink.emit(Notice(f"[SessionStart hook 拒绝启动：{decision.reason}]", "warn"))
+            return decision
+        self._session_started = True
+        if output := getattr(decision, "output", ""):
+            self._record_injected(f"[SessionStart hook] {output}")
+        return decision
+
+    def end_session(self) -> None:
+        """会话收尾触发一次 SessionEnd（只在 SessionStart 真跑过之后）。结果不影响退出。"""
+        if self._session_ended or not self._session_started or self.hook_engine is None:
+            return
+        self._session_ended = True
+        if self.hook_engine.has("SessionEnd"):
+            self.hook_engine.fire("SessionEnd", self._session_payload())
 
     # ---------- 主循环 ----------
 
@@ -4906,7 +4967,10 @@ class Agent:
         #  hook 眼前（宿主 seatbelt 包装后的命令才是真正要跑的东西）
         if self.hook_engine is not None and self.hook_engine.has("PreToolUse"):
             decision = self.hook_engine.fire(
-                "PreToolUse", {"tool": name, "args": args}, tool_name=name,
+                #  call_id 在 Pre / Post / ToolFailed 三处同值：外部钩子靠它把
+                #  "要跑什么"和"跑出了什么"对上（并行工具调用下光靠工具名对不上）
+                "PreToolUse", {"tool": name, "args": args, "call_id": call.get("id", "")},
+                tool_name=name,
                 **self._hook_alias(name, args),
             )
             if decision.blocked:
@@ -5004,19 +5068,29 @@ class Agent:
                 self.session_log.event("tool_stall", tool=name, count=self._stall_count)
         if ok and (reread_note := self._reread_note(name, args, raw_output)):
             output += reread_note
+        call_id = call.get("id", "")
         if self.hook_engine is not None and self.hook_engine.has("PostToolUse"):
             from .hooks import clip
 
             decision = self.hook_engine.fire(
                 "PostToolUse",
-                {"tool": name, "args": args, "ok": ok, "output": clip(output)},
+                {"tool": name, "args": args, "ok": ok, "output": clip(output), "call_id": call_id},
                 tool_name=name,
                 **self._hook_alias(name, args),
             )
             if decision.blocked:
                 output += f"\n\n[PostToolUse hook 反馈，请重视] {decision.reason}"
         if not ok and self.hook_engine is not None and self.hook_engine.has("ToolFailed"):
-            self.hook_engine.fire("ToolFailed", {"tool": name, "ok": False}, tool_name=name, **self._hook_alias(name, args))
+            from .hooks import clip
+
+            #  失败通知带上参数与错误文本：只给工具名的话钩子什么也做不了
+            #  （发告警至少得说清哪条命令、错在哪）；通知在动作之后，结果不看
+            self.hook_engine.fire(
+                "ToolFailed",
+                {"tool": name, "args": args, "ok": False, "output": clip(output), "call_id": call_id},
+                tool_name=name,
+                **self._hook_alias(name, args),
+            )
         self.trace.append({"tool": name, "args": args, "ok": ok, "output": output})
         self.sink.emit(ToolCompleted(name, output=output, ok=ok, seconds=elapsed, tool_call_id=call.get("id", "")))
         return self._tool_message(call, self._for_model(name, args, raw_output, output))

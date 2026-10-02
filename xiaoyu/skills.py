@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import fnmatch
 import os
+import re
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -390,6 +391,178 @@ def load_skill_body(skill: Skill) -> str:
         return strip_frontmatter(skill.path.read_text(encoding="utf-8", errors="replace"))
     except OSError as exc:
         return f"ERROR: 读取技能失败：{exc}"
+
+
+# ---------- 参数占位（$ARGUMENTS / $ARGUMENTS[i] / $i / $名字） ----------
+
+#  frontmatter 里声明具名参数的两种写法（都按位置对应 $1、$2…）：
+#      arguments: [env, version]        # 顶层行内列表
+#      arguments:                       # 顶层块列表
+#        - env
+#        - version
+#      metadata:
+#        arguments: [env, version]      # 规范里私有键都挂 metadata 下，也认
+_ARG_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
+
+def _split_inline_list(value: str) -> list[str]:
+    """`[a, b]` / `a, b` → 名字列表；不合法的名字丢掉（占位符只能是标识符形态）。"""
+    value = value.strip()
+    if value.startswith("[") and value.endswith("]"):
+        value = value[1:-1]
+    names = []
+    for part in value.split(","):
+        part = part.strip().strip("\"'")
+        if part and _ARG_NAME.match(part):
+            names.append(part)
+    return names
+
+
+def declared_arguments(text: str) -> list[str]:
+    """SKILL.md 文本里声明的具名参数（按位置对应）；没声明返回空列表。
+
+    零依赖手解析，只认上面注释里的几种形态——技能作者要的是"给参数起个名"，
+    不是整套 YAML。
+    """
+    lines = text.splitlines()
+    if not lines or lines[0].strip() != "---":
+        return []
+    names: list[str] = []
+    collecting = False  # 正在收 `arguments:` 下面的 `- 项` 块列表
+    in_metadata = False
+    for line in lines[1:]:
+        if line.strip() == "---":
+            break
+        stripped = line.strip()
+        indented = line[:1] in (" ", "\t")
+        if collecting:
+            if indented and stripped.startswith("- "):
+                item = stripped[2:].strip().strip("\"'")
+                if _ARG_NAME.match(item):
+                    names.append(item)
+                continue
+            if indented and not stripped:
+                continue
+            collecting = False
+            if names:
+                return names
+        if not indented:
+            in_metadata = stripped.startswith("metadata:")
+        key, sep, value = stripped.partition(":")
+        if not sep or key.strip() != "arguments":
+            continue
+        if indented and not in_metadata:
+            continue  # 别的嵌套块里的 arguments 不是给我们的
+        if value.strip():
+            found = _split_inline_list(value)
+            if found:
+                return found
+            continue
+        collecting = True
+    return names
+
+
+def skill_arguments(skill: Skill) -> list[str]:
+    """读 SKILL.md 取声明的具名参数；读失败按没声明。"""
+    try:
+        return declared_arguments(skill.path.read_text(encoding="utf-8", errors="replace"))
+    except OSError:
+        return []
+
+
+#  占位符形态。`ARGUMENTS\[` 要排在裸名字之前，否则 `$ARGUMENTS[2]` 会被当成
+#  `$ARGUMENTS` 后面跟了个 `[2]`。花括号形态（${1}、${env}）顺手也认——紧跟
+#  字母数字的位置（`$1abc`）没有花括号就写不出来。
+_PLACEHOLDER = re.compile(
+    r"\$(?:\{(?P<braced>ARGUMENTS|\d+|[A-Za-z_][A-Za-z0-9_]*)\}"
+    r"|ARGUMENTS\[(?P<index>\d+)\]"
+    r"|(?P<bare>ARGUMENTS(?![A-Za-z0-9_])|\d+|[A-Za-z_][A-Za-z0-9_]*))"
+)
+
+
+def expand_arguments(body: str, arguments: str, names: list[str] | None = None) -> tuple[str, list[str]]:
+    """把正文里的参数占位换成实际参数；返回 (正文, 缺参的占位列表)。
+
+    - `$ARGUMENTS` = 全部参数原文；`$ARGUMENTS[i]` / `$i` = 按空白切的第 i 个（从 1 起）；
+    - `$名字` 只认 frontmatter 声明过的名字（按位置对应）：别的 `$xxx`（shell 片段
+      里的 `$PATH`、`$HOME`）不是占位，原样不动；
+    - 没给到的占位**原样保留**并回报，由调用方提示。裸 `$i` 缺参不回报：
+      技能正文里的 `awk '{print $1}'` 太常见，报出来全是误伤；`$ARGUMENTS`
+      与声明过的 `$名字` 不会出现在别的语境里，缺了就是真缺。
+    """
+    names = names or []
+    arguments = arguments.strip()
+    parts = arguments.split()
+    missing: list[str] = []
+
+    def value_at(index: int) -> str | None:
+        return parts[index - 1] if 1 <= index <= len(parts) else None
+
+    def replace(match: re.Match) -> str:
+        token = match.group("braced") or match.group("bare")
+        index_text = match.group("index")
+        if index_text is not None:
+            value = value_at(int(index_text))
+            if value is None and match.group(0) not in missing:
+                missing.append(match.group(0))
+            return match.group(0) if value is None else value
+        if token == "ARGUMENTS":
+            if not arguments:
+                if match.group(0) not in missing:
+                    missing.append(match.group(0))
+                return match.group(0)
+            return arguments
+        if token.isdigit():
+            value = value_at(int(token))
+            return match.group(0) if value is None else value
+        if token in names:
+            value = value_at(names.index(token) + 1)
+            if value is None and match.group(0) not in missing:
+                missing.append(match.group(0))
+            return match.group(0) if value is None else value
+        return match.group(0)
+
+    return _PLACEHOLDER.sub(replace, body), missing
+
+
+# ---------- 支持文件清单 ----------
+
+#  清单条数上限：技能目录里带整个 node_modules 的也有，全列等于把目录树塞进上下文
+SUPPORTING_FILES_CAP = 40
+
+
+def supporting_files(skill_dir: Path, cap: int = SUPPORTING_FILES_CAP) -> tuple[list[tuple[str, Path]], int]:
+    """技能目录下除 SKILL.md 外的文件：[(相对路径, 绝对路径)…]（最多 cap 条）与总数。
+
+    隐藏文件 / 目录（.git、.DS_Store）与 __pycache__ 不算；不跟符号链接进目录
+    （技能库里指向工作区外的链接不该被顺着列出来）。按路径排序，输出稳定。
+    """
+    rows: list[tuple[str, Path]] = []
+    try:
+        for dirpath, dirnames, filenames in os.walk(skill_dir, followlinks=False):
+            dirnames[:] = sorted(d for d in dirnames if not d.startswith(".") and d != "__pycache__")
+            for filename in sorted(filenames):
+                if filename.startswith("."):
+                    continue
+                full = Path(dirpath) / filename
+                if full == skill_dir / "SKILL.md":
+                    continue
+                rows.append((full.relative_to(skill_dir).as_posix(), full))
+    except OSError:
+        return [], 0
+    return rows[:cap], len(rows)
+
+
+def supporting_files_note(skill: Skill, cap: int = SUPPORTING_FILES_CAP) -> str:
+    """给 skill 工具头部用的一段清单文本；目录里没别的文件时返回空串。"""
+    rows, total = supporting_files(skill.path.parent, cap)
+    if not rows:
+        return ""
+    lines = [f"[支持文件（引用时用右侧的绝对路径）："]
+    lines += [f"  {relative} → {absolute}" for relative, absolute in rows]
+    if total > len(rows):
+        lines.append(f"  …另有 {total - len(rows)} 个未列出，需要时 list_files 看技能目录")
+    return "\n".join(lines) + "]"
 
 
 def clip_body(skill: Skill, body: str, budget: int) -> str:

@@ -64,6 +64,7 @@ SLASH_COMMANDS: dict[str, str] = {
     "/tasks": "后台任务列表（run_in_background 的命令 / monitor）",
     "/mcp": "MCP server 状态；/mcp diff [名] 看变更工具的差异；/mcp approve [名] 批准（无参 = 全部）；/mcp reconnect [名] 修好后重读配置热恢复（无参 = 全部失败的）",
     "/skills": "列出可用技能；/skills reload 重扫磁盘并刷新索引",
+    "/<技能名>": "把技能展开成本轮提示（/<技能名> 参数…，正文里的 $ARGUMENTS / $1 / $名字 用参数填）；与内建命令撞名时写 /skill:<技能名>",
     "/model": "查看或切换模型（/model 名字）",
     "/usage": "本次会话的 token 统计",
     "/effort": "查看或设置推理深度（/effort low|medium|high|xhigh|max）",
@@ -848,11 +849,37 @@ def build_toolbox(config: Config, peer: "peers.Registration | None") -> Toolbox:
     return toolbox
 
 
+def session_start_refused(agent: Agent) -> bool:
+    """SessionStart 钩子（hooks.toml）在首轮之前跑一次；拦截 = 拒绝启动。
+
+    放在 run_once / run_repl 的开头而不是各个 main 里：新会话与 resume 两条装配
+    链最后都汇到这两个入口，钩子只该有一处触发点。接回的历史此时已经 restore
+    完，钩子注入的那行环境说明排在本次会话的输入前面。
+    """
+    #  getattr：这两个入口的测试用极简替身充当 agent，钩子不是替身关心的事
+    begin = getattr(agent, "begin_session", None)
+    decision = begin() if begin is not None else None
+    if decision is None or not decision.blocked:
+        return False
+    print(ui.error(f"SessionStart hook 拒绝启动：{decision.reason}"), file=sys.stderr)
+    return True
+
+
+def end_session(agent: Agent) -> None:
+    """SessionEnd 钩子（hooks.toml）：会话收尾时一次，与 session_start_refused 成对。"""
+    end = getattr(agent, "end_session", None)
+    if end is not None:
+        end()
+
+
 def run_repl(repl_fn: Any, agent: Agent) -> int:
     """跑 REPL，退出时抹掉会话登记（抹不掉也无妨：心跳一停别人自会清理）。"""
+    if session_start_refused(agent):
+        return 2
     try:
         return repl_fn(agent)
     finally:
+        end_session(agent)
         if agent.peer is not None:
             agent.peer.close()
 
@@ -2975,7 +3002,12 @@ def wire_main(args: argparse.Namespace, workspace_trusted: bool = True) -> int:
     install_exit_logging(agent.session_log)
     #  wire 侧不打招呼——stdout 只有协议；接回的条数由 initialize 的 messages 字段说
     agent.restore(restored, copy=False)
-    return server.serve()
+    if session_start_refused(agent):
+        return 2
+    try:
+        return server.serve()
+    finally:
+        end_session(agent)
 
 
 def acp_main(args: argparse.Namespace) -> int:
@@ -3053,6 +3085,21 @@ def terminate_background_commands(agent: Agent) -> list[dict[str, Any]]:
 
 
 def run_once(
+    agent: Agent,
+    user_input: str | list[dict[str, Any]],
+    output_format: str = "text",
+    output_schema: dict[str, Any] | None = None,
+) -> int:
+    """一次性模式的外壳：SessionStart / SessionEnd 钩子包在这一轮外面。"""
+    if session_start_refused(agent):
+        return 2
+    try:
+        return _run_once(agent, user_input, output_format, output_schema)
+    finally:
+        end_session(agent)
+
+
+def _run_once(
     agent: Agent,
     user_input: str | list[dict[str, Any]],
     output_format: str = "text",
@@ -3293,9 +3340,15 @@ def repl(agent: Agent) -> int:
             print(ui.secondary(f"  {action.hint}"))
             continue
         if action.kind == "slash":
-            if handle_slash(agent, action.args):
-                return 0
-            continue
+            #  /<技能名> 参数… 展开成本轮提示；不是技能的才交给内建命令表
+            expanded = skill_prompt(agent, action.args)
+            if expanded is None:
+                if handle_slash(agent, action.args):
+                    return 0
+                continue
+            if not expanded:
+                continue
+            action = keys.InputAction("send", expanded)
         if action.kind == "shell":
             _repl_shell(agent, action.args)
             continue
@@ -3379,6 +3432,45 @@ def _rewind_flow(agent: Agent, rest: list[str]) -> None:
         print(ui.secondary("  （屏幕上方的旧输出只是显示残留，模型已不记得被截掉的轮次）"))
 
 
+#  技能的显式入口前缀：/skill:<名字>。与内建命令撞名的技能只能从这里进
+SKILL_SLASH_PREFIX = "/skill:"
+#  内建命令名（含表外别名）：斜杠名字空间里内建永远优先，技能撞名不许遮住它
+_BUILTIN_SLASH = frozenset(name for name in SLASH_COMMANDS if "<" not in name) | {"/undo"}
+
+
+def skill_shadowed(name: str) -> bool:
+    """这个技能名直接写成 /<名字> 会不会撞上内建命令。"""
+    return f"/{name}" in _BUILTIN_SLASH
+
+
+def skill_prompt(agent: Agent, line: str) -> str | None:
+    """`/<技能名> 参数…` → 展开成本轮提示文本。
+
+    返回 None = 这行不是技能调用（内建命令或没这个技能），交给 handle_slash；
+    返回空串 = 是技能调用但展开失败（已打印原因），本轮不发。
+    名字空间规则：内建命令 > 技能——`/help` 永远是帮助，同名技能要写
+    `/skill:help`。`/skill:` 前缀下找不到也报错而不是回落到内建，用户既然
+    写了前缀就是明确要技能。
+    """
+    head, _, rest = line.strip().partition(" ")
+    explicit = head.startswith(SKILL_SLASH_PREFIX)
+    name = head[len(SKILL_SLASH_PREFIX):] if explicit else head[1:]
+    if not name or (not explicit and (head in _BUILTIN_SLASH or not agent.skills)):
+        return None
+    if not explicit and not any(skill.name == name for skill in agent.skills):
+        #  不是已知技能：当作敲错的内建命令报"未知命令"，别为每个错字重扫磁盘
+        return None
+    arguments = rest.strip()
+    result = agent._load_skill(name, arguments)  # noqa: SLF001 - 同包的前端入口
+    if result.startswith("ERROR:"):
+        print(ui.error(f"  {result}"))
+        return ""
+    print(ui.secondary(f"  已展开技能 {name}" + (f"（参数：{arguments}）" if arguments else "")))
+    #  模型看到的就是 skill 工具加载的那份（目录头 + 支持文件 + 正文），外加
+    #  一句"这是用户点名要执行的"：和模型自己按索引挑技能加载是两种语气
+    return f"按下面这个技能的说明执行（用户以 /{name} 直接调用）：\n\n{result}"
+
+
 def handle_slash(agent: Agent, line: str, select: Any = None) -> bool:
     """处理斜杠命令。返回 True 表示应该退出。
 
@@ -3458,7 +3550,12 @@ def handle_slash(agent: Agent, line: str, select: Any = None) -> bool:
                 origin = ui.secondary(f"  [插件 {skill.plugin}]") if skill.plugin else ""
                 if skill.project:
                     origin = ui.secondary("  [工作区]")
+                if skill_shadowed(skill.name):
+                    #  与内建命令撞名的技能不是不能用，只是 /<名字> 归内建；说清入口
+                    origin += ui.warning(f"  [与内建命令撞名，用 /skill:{skill.name} 调用]")
                 print(f"  {skill.name}  {ui.secondary(skill.description or str(skill.path))}{origin}")
+            if agent.skills:
+                print(ui.secondary("  /<技能名> 参数… 可把技能直接展开成本轮提示"))
             from . import skills as skills_mod
 
             if hidden := skills_mod.disabled_skills(agent.config.workspace):
@@ -3610,6 +3707,9 @@ def handle_slash(agent: Agent, line: str, select: Any = None) -> bool:
     elif command == "/clear":
         agent.reset()
         print(ui.secondary("对话已清空"))
+    elif command.startswith(SKILL_SLASH_PREFIX):
+        #  正常路径上 skill_prompt 已先一步接走；走到这里说明前端没接技能展开
+        print(ui.warning(f"技能调用（{command}）只在交互前端里可用，/skills 看技能列表"))
     else:
         print(ui.warning(f"未知命令 {command}，/help 看可用命令"))
     return False

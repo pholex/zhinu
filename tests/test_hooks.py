@@ -289,5 +289,201 @@ class AgentIntegrationTest(AgentTestCase):
         self.assertIn("省略", decision.reason)
 
 
+class OnFailureAndNewEventsTest(unittest.TestCase):
+    """on_failure 开关、三个新事件、放行钩子的 stdout 首行。"""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.tmp = Path(self._tmp.name)
+        self.notices: list[str] = []
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def engine(self, hooks: list[Hook]) -> HookEngine:
+        return HookEngine(hooks, self.tmp, notify=self.notices.append)
+
+    def test_load_on_failure_and_new_events(self):
+        path = self.tmp / "hooks.toml"
+        path.write_text(
+            '[[hooks]]\nevent = "PreToolUse"\ncommand = "true"\non_failure = "block"\n'
+            '[[hooks]]\nevent = "SessionStart"\ncommand = "true"\n'
+            '[[hooks]]\nevent = "SessionEnd"\ncommand = "true"\n'
+            '[[hooks]]\nevent = "ToolFailed"\ncommand = "true"\n'
+            #  非 PreToolUse 上的 block：照常加载但归零并点名
+            '[[hooks]]\nevent = "Stop"\ncommand = "true"\non_failure = "block"\n'
+            #  不认识的取值：按 allow 并点名
+            '[[hooks]]\nevent = "PreToolUse"\ncommand = "true"\non_failure = "maybe"\n',
+            encoding="utf-8",
+        )
+        hooks, problems = load_hooks(path)
+        self.assertEqual(
+            [(h.event, h.on_failure) for h in hooks],
+            [("PreToolUse", "block"), ("SessionStart", "allow"), ("SessionEnd", "allow"),
+             ("ToolFailed", "allow"), ("Stop", "allow"), ("PreToolUse", "allow")],
+        )
+        self.assertEqual(len(problems), 2, problems)
+        self.assertTrue(any("只对 PreToolUse 生效" in p for p in problems), problems)
+        self.assertTrue(any("maybe" in p for p in problems), problems)
+
+    def test_on_failure_block_turns_crash_and_timeout_into_denial(self):
+        crash = _script_cmd(self.tmp, "crash.py", "import sys\nsys.exit(1)\n")
+        engine = self.engine([Hook("PreToolUse", crash, on_failure="block")])
+        decision = engine.fire("PreToolUse", {"tool": "bash"}, tool_name="bash")
+        self.assertTrue(decision.blocked)
+        self.assertIn("钩子失败", decision.reason)
+        self.assertIn("退出码 1", decision.reason)
+        self.assertTrue(any("拦截" in note for note in self.notices), self.notices)
+
+        slow = _script_cmd(self.tmp, "slow.py", "import time\ntime.sleep(10)\n")
+        engine = self.engine([Hook("PreToolUse", slow, timeout=1.0, on_failure="block")])
+        decision = engine.fire("PreToolUse", {"tool": "bash"}, tool_name="bash")
+        self.assertTrue(decision.blocked)
+        self.assertIn("超时", decision.reason)
+
+    def test_on_failure_allow_keeps_fail_open_with_visible_warning(self):
+        crash = _script_cmd(self.tmp, "crash.py", "import sys\nsys.exit(1)\n")
+        engine = self.engine([Hook("PreToolUse", crash)])
+        self.assertFalse(engine.fire("PreToolUse", {"tool": "bash"}, tool_name="bash").blocked)
+        self.assertTrue(any("放行" in note and "退出码 1" in note for note in self.notices), self.notices)
+
+    def test_allowed_hook_stdout_first_line_is_reported(self):
+        say = _script_cmd(
+            self.tmp, "say.py",
+            "import sys\nsys.stdout.write('\\n  branch: main  \\nsecond line\\n')\nsys.exit(0)\n",
+        )
+        quiet = _script_cmd(self.tmp, "quiet.py", ALLOW_BODY)
+        engine = self.engine([Hook("SessionStart", say), Hook("SessionStart", quiet)])
+        decision = engine.fire("SessionStart", {"model": "m"})
+        self.assertEqual(decision, Decision(blocked=False, reason="", output="branch: main"))
+
+    def test_first_line_is_capped(self):
+        from xiaoyu.hooks import OUTPUT_LINE_CAP, first_line
+
+        self.assertEqual(first_line(""), "")
+        self.assertEqual(first_line("\n\n"), "")
+        clipped = first_line("x" * (OUTPUT_LINE_CAP + 50))
+        self.assertLess(len(clipped), OUTPUT_LINE_CAP + 20)
+        self.assertTrue(clipped.endswith("（已截断）"))
+
+    def test_for_tools_also_carries_toolfailed(self):
+        engine = self.engine(
+            [Hook("ToolFailed", "true"), Hook("SessionStart", "true"), Hook("SessionEnd", "true")]
+        )
+        scoped = engine.for_tools(self.tmp / "w")
+        self.assertEqual([hook.event for hook in scoped.hooks], ["ToolFailed"])
+
+
+class LifecycleIntegrationTest(AgentTestCase):
+    """call_id 贯穿 Pre / Post / ToolFailed；SessionStart / SessionEnd 从 Agent 入口触发。"""
+
+    def _engine(self, hooks: list[Hook]) -> HookEngine:
+        return HookEngine(hooks, self.root, notify=lambda text: None)
+
+    def _dump_cmd(self, name: str) -> str:
+        out = self.root / f"{name}.json"
+        return _script_cmd(
+            self.root, f"{name}.py",
+            f"import sys, pathlib\npathlib.Path({str(out)!r}).write_text(sys.stdin.read(), encoding='utf-8')\n",
+        )
+
+    def _payload(self, name: str) -> dict:
+        return json.loads((self.root / f"{name}.json").read_text(encoding="utf-8"))
+
+    def test_pre_and_post_share_call_id(self):
+        engine = self._engine(
+            [Hook("PreToolUse", self._dump_cmd("pre")), Hook("PostToolUse", self._dump_cmd("post"))]
+        )
+        agent = self.build([tool_turn("read_file", {"path": "calc.py"}), text_turn("好")], hook_engine=engine)
+        agent.send("看代码")
+        pre, post = self._payload("pre"), self._payload("post")
+        self.assertEqual(pre["call_id"], "call_read_file")
+        self.assertEqual(post["call_id"], pre["call_id"])
+        self.assertEqual(post["tool"], "read_file")
+        self.assertTrue(post["ok"])
+
+    def test_toolfailed_fires_with_call_id_and_output(self):
+        engine = self._engine([Hook("ToolFailed", self._dump_cmd("failed"))])
+        agent = self.build([tool_turn("read_file", {"path": "missing.txt"}), text_turn("好")], hook_engine=engine)
+        agent.send("看代码")
+        failed = self._payload("failed")
+        self.assertEqual(failed["event"], "ToolFailed")
+        self.assertEqual(failed["call_id"], "call_read_file")
+        self.assertFalse(failed["ok"])
+        self.assertEqual(failed["args"], {"path": "missing.txt"})
+        self.assertTrue(failed["output"].startswith("ERROR:"))
+
+    def test_session_start_injects_first_line_once(self):
+        from xiaoyu import media
+
+        say = _script_cmd(
+            self.root, "say.py", "import sys\nsys.stdout.write('当前分支 main，别碰 prod\\n细节\\n')\n"
+        )
+        engine = self._engine([Hook("SessionStart", say)])
+        agent = self.build([], hook_engine=engine)
+        before = len(agent.messages)
+        decision = agent.begin_session()
+        self.assertFalse(decision.blocked)
+        injected = [m for m in agent.messages[before:] if m.get(media.INJECTED_KEY)]
+        self.assertEqual(len(injected), 1)
+        self.assertEqual(injected[0]["content"], "[SessionStart hook] 当前分支 main，别碰 prod")
+        #  再调不再触发、不再注入
+        self.assertIsNone(agent.begin_session())
+        self.assertEqual(len(agent.messages), before + 1)
+
+    def test_session_start_payload_and_block(self):
+        engine = self._engine([Hook("SessionStart", self._dump_cmd("start"))])
+        agent = self.build([], hook_engine=engine)
+        agent.begin_session()
+        start = self._payload("start")
+        self.assertEqual(start["event"], "SessionStart")
+        self.assertEqual(start["model"], agent.config.model)
+        self.assertIn("session", start)
+
+        engine = self._engine([Hook("SessionStart", _script_cmd(self.root, "b.py", BLOCK_BODY))])
+        agent = self.build([], hook_engine=engine)
+        before = len(agent.messages)
+        decision = agent.begin_session()
+        self.assertTrue(decision.blocked)
+        self.assertEqual(decision.reason, "不许这么干")
+        self.assertEqual(len(agent.messages), before)
+        #  没启动成功就不算开始：收尾钩子不跑，再次 begin 还会重试
+        self.assertFalse(agent._session_started)
+
+    def test_session_end_fires_once_after_start(self):
+        engine = self._engine([Hook("SessionEnd", self._dump_cmd("end"))])
+        agent = self.build([], hook_engine=engine)
+        agent.end_session()  # 没 begin 过：不触发
+        self.assertFalse((self.root / "end.json").exists())
+        agent.begin_session()
+        agent.end_session()
+        self.assertEqual(self._payload("end")["event"], "SessionEnd")
+        (self.root / "end.json").unlink()
+        agent.end_session()  # 幂等
+        self.assertFalse((self.root / "end.json").exists())
+
+    def test_no_engine_still_marks_session_started(self):
+        agent = self.build([])
+        self.assertIsNone(agent.begin_session())
+        self.assertTrue(agent._session_started)
+        agent.end_session()  # 不炸
+
+    def test_run_once_refuses_when_session_start_blocks(self):
+        from types import SimpleNamespace
+
+        from xiaoyu.cli import run_once
+
+        sent: list[str] = []
+        agent = SimpleNamespace(
+            begin_session=lambda: Decision(blocked=True, reason="环境没就绪"),
+            end_session=lambda: sent.append("end"),
+            send=lambda text: sent.append(text),
+        )
+        with mock.patch("sys.stderr", new_callable=lambda: __import__("io").StringIO()) as err:
+            self.assertEqual(run_once(agent, "干活"), 2)
+        self.assertIn("环境没就绪", err.getvalue())
+        self.assertEqual(sent, [])
+
+
 if __name__ == "__main__":
     unittest.main()

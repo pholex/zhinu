@@ -138,6 +138,8 @@ lookup_tool = Tool(
 callback 收到带 `event` 的 payload，返回 `HookDecision(blocked, reason)`。
 Pre/User 的 block 阻止执行，Post 的 block 反馈给模型但不撤销副作用，Stop 最多顶回
 一次。hook 故障按 block 处理。`tool_name` 可选精确匹配，不使用 shell hooks。
+工具类事件的 payload 带 `tool`、`args` 与 `call_id`（同一次调用的 Pre / Post / ToolFailed
+同值，宿主靠它把前后对上）；Post 与 ToolFailed 另带 `ok`、`output`。
 
 `McpServer` 显式提供 stdio command/args/env 或 HTTP url/headers；会话启动 manager，
 工具异步发现，走同一权限和审批路径。`session.mcp_status()` 返回

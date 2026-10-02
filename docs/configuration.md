@@ -254,6 +254,74 @@ server 的**结果**默认包进 `<untrusted_content>` 回灌（里面的指令�
 > 管的**插件工具**（entry point 组 `xiaoyu.tools`，第三方 Python 包往进程里注册函数）
 > 是两条互不相干的通道，只是恰好都叫 plugin。
 
+## 技能（SKILL.md）：参数、斜杠调用、支持文件
+
+技能是 `<目录>/SKILL.md`（frontmatter `name` / `description` + markdown 正文），扫描位置见上表
+`XIAOYU_ENABLE_SKILLS` 一行。索引（名字 + 一句话描述）进 system prompt，正文由模型用 `skill`
+工具按需加载。加载时除正文外还带三样东西：
+
+- **技能目录**：正文里的相对路径以它为基准；
+- **支持文件清单**：技能目录下除 `SKILL.md` 外的文件，按「相对路径 → 绝对路径」列出（隐藏文件、
+  `__pycache__` 不算，不跟符号链接；最多 40 条，超了提示用 `list_files` 看）。模型引用脚本 /
+  参考文档时用绝对路径，不会在工作区里瞎找；
+- **参数占位**：正文里的 `$ARGUMENTS`（全部参数原文）、`$ARGUMENTS[i]` / `$i`（按空白切的第 i 个，
+  从 1 起）、`$名字`（frontmatter 声明的具名参数，按位置对应）由调用时给的参数填充。声明写法：
+
+  ```yaml
+  ---
+  name: deploy
+  description: 部署到指定环境
+  arguments: [env, version]      # 顶层行内列表；块列表（- env）或 metadata.arguments 也认
+  ---
+  把 $version 部署到 $env（完整参数：$ARGUMENTS）
+  ```
+
+  没给到的 `$ARGUMENTS` / 声明过的 `$名字` **原样保留**，并在头部点名缺了哪些（模型按上下文推断，
+  推不出就问你）。裸 `$1` 缺参不报：技能正文里 `awk '{print $1}'` 这类 shell 片段太常见。别的
+  `$xxx`（`$PATH`、`$HOME`）不是占位，原样不动。
+
+交互前端里 **`/<技能名> 参数…`** 直接把技能展开成本轮提示（模型看到的就是 `skill` 工具加载的那份，
+外加一句"用户点名要执行"）。斜杠名字空间里**内建命令优先**：技能叫 `help` 也遮不住 `/help`，
+要写 `/skill:help`；`/skills` 列表会标出撞名的技能，TUI 补全里技能也列在内建命令之后
+（撞名的以 `/skill:` 形态出现）。`/skill:` 前缀下找不到技能报错，不回落到内建命令。
+
+## 生命周期钩子（hooks.toml）
+
+用户级 `<配置目录>/hooks.toml`（刻意不读工作区级：hook 是任意代码执行，clone 一个仓库不该把命令
+种进你的 shell）。`XIAOYU_ENABLE_HOOKS=0` 一键关。
+
+```toml
+[[hooks]]
+event = "PreToolUse"        # 见下表
+matcher = "bash"            # 正则匹配工具名，只对工具类事件有意义；MCP 工具按真名匹配
+command = "python ~/bin/check.py"
+timeout = 10                # 秒，缺省 30，上限 600
+on_failure = "allow"        # allow | block，只对 PreToolUse 生效
+```
+
+钩子从 stdin 收一个 JSON 对象（`event`、`workspace` 必有，其余按事件），**退出码 2 = 拦截**
+（stderr 作为理由），0 = 放行；超时、起不来、其它退出码默认 **fail-open 放行并告警**——
+hook 是辅助护栏，deny 规则才是硬闸。`on_failure = "block"` 反过来：钩子坏了也按拦截处理，
+理由里标明「钩子失败」，给"这道闸必须跑过才能动手"的场景；只对 PreToolUse 生效，写在别的
+事件上会提示并忽略。同一事件多个钩子顺序执行，任一拦截即拦截。
+
+| 事件 | 时机与拦截语义 | payload 额外字段 |
+|---|---|---|
+| `PreToolUse` | 审批之后、执行之前；拦截 → 不执行，理由回灌模型 | `tool`、`args`、`call_id` |
+| `PostToolUse` | 工具已执行；拦截 → 理由作为附注拼进结果（不撤销副作用） | `tool`、`args`、`ok`、`output`、`call_id` |
+| `ToolFailed` | 工具结果判成失败（`ERROR:`）之后的通知，拦截无意义 | `tool`、`args`、`ok=false`、`output`、`call_id` |
+| `UserPromptSubmit` | 用户输入入历史之前；拦截 → 本轮不发 | `prompt` |
+| `Stop` | 模型想收尾时；拦截 → 理由作为消息顶回去续跑一步（每轮一次） | `last_text` |
+| `SessionStart` | 会话首轮之前一次（接回历史之后；子 agent 不触发）；拦截 → 拒绝启动 | `model`、`session` |
+| `SessionEnd` | 会话正常收尾一次，结果不影响退出 | `model`、`session` |
+
+同一次工具调用的 `PreToolUse` / `PostToolUse` / `ToolFailed` 带**同一个 `call_id`**，外部钩子
+靠它把"要跑什么"和"跑出了什么"对上（并行工具调用下光靠工具名对不上）。`SessionStart` 放行时，
+钩子 stdout 的**首个非空行**（上限 2000 字符）作为一次性消息注入历史——给宿主注入环境说明用
+（当前分支、值班提示……）；它走的是"harness 放进来、内容不可信"的通道，不是权威指令。
+挂在工具事件上的钩子在子 agent 里照样触发（工作目录换成它的）；会话类事件不带下去。
+事件名与 payload 形状和 SDK 进程内 hook（见 [sdk-platform](sdk-platform.md)）一致。
+
 ## 接入未内置的厂商
 
 `<NAME>` 自取，大写：
