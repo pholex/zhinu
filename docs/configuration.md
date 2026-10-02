@@ -129,7 +129,7 @@ XIAOYU_API_KEY=<key>
 | `XIAOYU_HARDLINE` | bash 硬红线（`rm -rf /`、`mkfs`、`dd of=/dev/…`，默认开、任何模式都拦）；`0` = 关，给隔离环境里的镜像烧录 / 格式化用（见[安全](security.md)） |
 | `XIAOYU_UNATTENDED` | **默认关**，`1` = 开：`--yolo` 下仍必问的三项（`exit_plan_mode`、沙箱升权、写可执行配置）也不再问；等价命令行 `--unattended` |
 | `XIAOYU_UNGUARDED` | `--unguarded` 无护栏预设的**环境同意**：只认真实环境变量、不读 `.env`，由容器 / VM 编排脚本注入；没有它 `--unguarded` 报错退出（见[安全](security.md)） |
-| `XIAOYU_ENABLE_HOOKS` | 用户级 `hooks.toml` 生命周期钩子 |
+| `XIAOYU_ENABLE_HOOKS` | 用户级 `hooks.toml` 生命周期钩子（PreToolUse / PostToolUse / UserPromptSubmit / Stop；退出码 2 = 拦截，其它失败 fail-open 放行）。样本：[examples/hooks/adversary](../examples/hooks/adversary/)——bash 命令交给另一次 `xiaoyu -p` 做二审 |
 | `XIAOYU_ENABLE_AGENTS` | 声明式 subagent（`agents/*.toml`）与七襄并行织造模式（见[多 agent 协同](multi-agent.md)） |
 | `XIAOYU_ENABLE_CHENSHU` | 宸枢统筹织造模式（见[多 agent 协同](multi-agent.md)） |
 | `XIAOYU_SUBAGENT_MAX_DEPTH` | 子 agent 嵌套深度上限（默认 `1` = 不套娃）；设 2/3 显式放开有界嵌套 |

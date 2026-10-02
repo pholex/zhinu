@@ -12,6 +12,8 @@ wheel 和能装依赖的网络，由 CI build job 在 `python -m build` 之后�
     python tests/wheel_smoke.py [dist 目录或 .whl 路径，缺省 dist/]
 
 检查项（任何一项不过都以非零退出，报错写明哪一步、期望什么、实际什么）：
+0. wheel 体积不超上限（WHEEL_SIZE_CAP），运行期核心依赖恰为 RUNTIME_DEPENDENCY_COUNT 个
+   （Requires-Dist 里不带 extra 标记的那些）——两个都是"误打包 / 依赖面悄悄变了"的报警线；
 1. 全新 venv 装 wheel（连同锁定依赖）；
 2. 切到仓库外的临时目录，`xiaoyu.__file__` 必须落在该 venv 的 site-packages
    下——落回源码树等于什么都没测；
@@ -38,6 +40,18 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parent.parent
 DIST_NAME = "xiaoyu_agent"
 _TIMEOUT = 120  # 单个子进程的硬上限（秒），pip 安装另给
+
+#  wheel 体积上限（字节）。2026-10-02 量得 0.60.0 的 wheel 为 893 928 字节，上限留
+#  约 30% 余量。不是性能指标，是"有东西被误打进包"的报警线：测试夹具、录制的
+#  snapshot、本机数据一旦被 package-data 或 packages 清单带进来，体积会一跳就过线。
+#  正常功能增长撞线时把这个数连同新量得的体积一起改，别悄悄放宽
+WHEEL_SIZE_CAP = 1_200_000
+
+#  运行期核心依赖恰好这么多个（pyproject `dependencies`，不含 extras）：
+#  openai / anthropic / tree-sitter / tree-sitter-bash。写死而不是从 pyproject 读，
+#  是因为要守的正是"有人改了 pyproject 却没意识到依赖面变了"——从源头读等于
+#  永远相等。有意增减依赖时同步改这里，并在 commit 里说明为什么
+RUNTIME_DEPENDENCY_COUNT = 4
 
 #  运行期按包路径读取的数据文件（相对 site-packages），及读取方——
 #  新增"按 __file__ 定位的数据文件"时同步加一行，并确认 pyproject 的
@@ -127,6 +141,13 @@ def main(argv: list[str]) -> int:
     wheel_version = wheel.name.split("-")[1]
     print(f"wheel：{wheel}（版本 {wheel_version}）")
 
+    step("0. wheel 体积与运行期依赖面")
+    size = wheel.stat().st_size
+    check(size <= WHEEL_SIZE_CAP,
+          f"wheel 体积 {size} 字节超过上限 {WHEEL_SIZE_CAP}：先查是不是测试夹具 / 本机数据被"
+          "打进了包（pyproject 的 packages / package-data / MANIFEST.in）；确是正常增长再改上限")
+    ok(f"体积 {size} 字节（上限 {WHEEL_SIZE_CAP}）")
+
     with tempfile.TemporaryDirectory(prefix="xiaoyu-wheel-smoke-", ignore_cleanup_errors=True) as raw:
         tmp = Path(os.path.realpath(raw))
         check(REPO not in tmp.parents, f"临时目录 {tmp} 落在仓库内，隔离失效")
@@ -158,6 +179,7 @@ print(json.dumps({
     "prefix": sys.prefix,
     "eval_data_path": str(models.data_path()),
     "eval_candidates": len(models.CANDIDATES),
+    "requires": importlib.metadata.requires("xiaoyu-agent") or [],
 }))
 """
         proc = run([str(py), "-c", probe], cwd=outside, env=clean_env())
@@ -176,6 +198,12 @@ print(json.dumps({
         check(info["dist_version"] == wheel_version,
               f"安装元数据版本 {info['dist_version']} 与 wheel 文件名版本 {wheel_version} 不一致")
         ok(f"__version__ 与元数据版本均为 {wheel_version}")
+        #  Requires-Dist 里带 `extra ==` 的是可选依赖，其余才是用户裸装就会拿到的
+        runtime_deps = sorted(r for r in info["requires"] if "extra ==" not in r)
+        check(len(runtime_deps) == RUNTIME_DEPENDENCY_COUNT,
+              f"运行期核心依赖应恰为 {RUNTIME_DEPENDENCY_COUNT} 个，装出来的元数据里是 "
+              f"{len(runtime_deps)} 个：{runtime_deps}。有意增减依赖请同步改 RUNTIME_DEPENDENCY_COUNT")
+        ok(f"运行期核心依赖 {len(runtime_deps)} 个：{', '.join(runtime_deps)}")
 
         tracked = tracked_package_files()
         if tracked is None:

@@ -127,6 +127,12 @@ auto 档**放行的依据是沙箱，不是信任**——沙箱不可用时自�
 - **可编排**：`xiaoyu serve` 起 HTTP API，n8n / Dify / 自研调度直接驱动（异步提交 + 状态轮询 + 事件游标，需要放行的工具调用挂起等 HTTP 回决定）。OpenAPI schema 由代码生成，贴给 Dify 自定义工具即用——见 [docs/http-api.md](docs/http-api.md)。同一服务还在 `/mcp` 挂着 **agent 级 MCP server**（`xiaoyu` / `xiaoyu_reply` / `xiaoyu_close` 三工具，streamable HTTP），LangChain / LangGraph 经官方 `langchain-mcp-adapters` 即插即用，其它 MCP client 同理——见 [docs/mcp-server.md](docs/mcp-server.md)。**浏览器桥**：浏览器扩展连上同一服务，agent 就能在用户登录态的浏览器里读页 / 点击 / 截图，写类动作走审批——见 [docs/browser-bridge.md](docs/browser-bridge.md)
 - **浏览器**：推荐挂 chrome-devtools MCP；内置 `[browser]` 是纯 pip 的兜底，`playwright install chromium` 后即用
 
+## 安全与贡献
+
+- 报告漏洞、支持的版本、给使用者的风险告诫：[SECURITY.md](SECURITY.md)；审批 / 沙箱 / 硬红线的设计：[docs/security.md](docs/security.md)
+- 在本仓库里干活的 agent（和人）先读 [AGENTS.md](AGENTS.md)：测试命令、提交纪律、公开 API 冻结面
+- 想给 bash 命令加一道模型二审：[examples/hooks/adversary](examples/hooks/adversary/)（PreToolUse 钩子样本，补充层、fail-open）
+
 ---
 
 <p align="center"><sub>天羽织造 · 凤凰出品<br>woven by Xiaoyu · a Pholex (凤凰) production</sub></p>
