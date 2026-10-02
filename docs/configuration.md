@@ -93,6 +93,7 @@ XIAOYU_API_KEY=<key>
 | `XIAOYU_SIGNATURE_MODELS` | — | 网关后面挂的签名型号点名（Gemini 系，工具重放需带回 thought_signature；`*` = 一律） |
 | `XIAOYU_VISION_FALLBACK` | —（不代读） | 代读模型：当前模型看不了图时，把图先交给它换成一段文字（见下方"图片代读"） |
 | `XIAOYU_ENV_FILE` | — | 指定 `.env` 路径，等价 `--env-file` |
+| `XIAOYU_TERM_SESSION` | — | 终端集成的会话 id，由 `eval "$(xiaoyu term init <shell>)"` 导出（随机 `term-<8 位>`，或 `--name` 指定的 `term-<名字>`）；`@x` / `xiaoyu term run` 按它续写会话、`xiaoyu term log|info` 按它找 pending 文件。配套的 `XIAOYU_TERM_PENDING` 是钩子追加命令的文件路径，同样由脚本导出，不必手设。见[终端集成](terminal-integration.md) |
 
 ### 上下文与压缩
 

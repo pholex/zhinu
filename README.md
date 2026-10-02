@@ -82,6 +82,9 @@ xiaoyu send zhinu-1 "顺便把 lint 跑一下"  # 给另一个终端里的小羽
 xiaoyu mcp add chrome-devtools --scope user npx -y chrome-devtools-mcp@latest
 xiaoyu mcp list                         # 写的就是 .mcp.json / mcp.json
 xiaoyu mcp probe chrome-devtools        # 不经模型直接握手、列工具；--script 按脚本调用并逐步输出 JSON
+
+eval "$(xiaoyu term init zsh)"          # 放进 ~/.zshrc（bash/fish/powershell 同理）：之后在自己的 shell 里
+@x 刚才那个报错怎么回事                   # 随时提问，带着刚跑过的命令，续写同一会话；见 docs/terminal-integration.md
 ```
 
 REPL 里：`/help` `/tools` `/skills` `/model` `/effort` `/mode` `/usage` `/context` `/compact` `/clear` `/exit` `/tasks` `/plan` `/goal` `/perm` `/allow` `/deny` `/resume` `/rewind` `/mcp` `/quit`
