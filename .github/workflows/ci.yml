@@ -54,7 +54,7 @@ jobs:
           sudo apt-get install -yq bubblewrap
           sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
       - name: 安装（含锁定依赖 + tui 可选依赖，让 TUI 测试三平台都真跑而非跳过）
-        run: pip install -e '.[tui,sdk]' -e packages/xiaoyu-agent-sdk
+        run: pip install -e '.[tui,sdk,otel]' -e packages/xiaoyu-agent-sdk
       - name: 单元测试
         #  ⚠️ `-v` + 无缓冲 + 步骤级超时，三样都是为了「红了要能查」，别删：
         #  2026-08-12 本机出现过三次 `errors=12`（跑了 24 分钟，干净跑只要 35 秒），

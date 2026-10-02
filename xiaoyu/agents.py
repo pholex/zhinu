@@ -963,6 +963,7 @@ def execute_delegation(
         #  父级被打断时跟着停（单发委托跑在父级线程里，父级自己没机会去叫停它）
         upstream_stop=stop_requested,
     )
+    sub_agent.agent_name = spec.name
     if on_agent is not None:
         on_agent(sub_agent)
     system_text = spec.system_prompt.format(workspace=workdir)
