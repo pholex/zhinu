@@ -31,6 +31,7 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 from dataclasses import dataclass, field
 from typing import Any, Iterator
@@ -98,6 +99,101 @@ def strip_private(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
             message = {k: v for k, v in message.items() if not k.startswith("_")}
         cleaned.append(message)
     return cleaned
+
+
+#  网关位的 provider 名（与 providers.GATEWAY 同值；这里不能 import providers——
+#  它反过来 import 本模块。有测试钉两者相等）
+GATEWAY_PROVIDER = "gateway"
+#  网关下 Claude 后端的缓存断点。Anthropic 的 prompt cache 不是自动的：没有
+#  cache_control 的请求一个 token 都不缓存——2026-10-02 对自建 LiteLLM 网关实测
+#  （claude-sonnet-5.5，15k 前缀）：不带断点连发两次 cached_tokens 全为 0；
+#  带断点第二次 cache_read 15360。直连 Anthropic 一路在 messages.py 里打断点，
+#  但经网关走的是 chat 载荷，那一层碰不到。LiteLLM 把 chat 消息里的 cache_control
+#  原样翻给上游：system 的 text block、user 的 text block、tool 消息的消息级字段、
+#  tools 条目顶层字段四处都实测透传并命中（流式也一样）。
+#  只按型号名猜后端（含 claude / anthropic）：网关的模型表不告诉我们后端是谁；
+#  不是 LiteLLM 的网关可能拒收这个字段，XIAOYU_GATEWAY_CACHE_CONTROL=0 关掉
+CHAT_CACHE_CONTROL: dict[str, str] = {"type": "ephemeral"}
+CHAT_CACHE_ENV = "XIAOYU_GATEWAY_CACHE_CONTROL"
+#  次锚点与尾锚点之间至少隔这么多条消息：上游只往每个断点之前回看约 20 个
+#  block 找命中，一轮里塞进 20 条以上工具往返时尾断点就够不着上一轮的前缀；
+#  次锚点钉在更早处兜住这段。Anthropic 的断点上限是 4：tools、system、次锚、尾锚
+CHAT_CACHE_ANCHOR_GAP = 20
+_CHAT_CACHE_MARKERS = ("claude", "anthropic")
+
+
+def chat_cache_eligible(provider: str, model: str) -> bool:
+    """这条 chat 请求要不要打缓存断点：网关位 + 型号名像 Claude + 开关没关。"""
+    if provider != GATEWAY_PROVIDER:
+        return False
+    lowered = model.lower()
+    if not any(marker in lowered for marker in _CHAT_CACHE_MARKERS):
+        return False
+    return os.environ.get(CHAT_CACHE_ENV, "").strip().lower() not in ("0", "false", "no", "off")
+
+
+def _with_text_cache(message: dict[str, Any]) -> dict[str, Any] | None:
+    """给 user / system 消息的最后一个 text block 打断点；打不上返回 None。只改副本。"""
+    content = message.get("content")
+    if isinstance(content, str):
+        if not content:
+            return None
+        return {**message, "content": [{"type": "text", "text": content, "cache_control": dict(CHAT_CACHE_CONTROL)}]}
+    if not isinstance(content, list) or not content:
+        return None
+    blocks = list(content)
+    for index in range(len(blocks) - 1, -1, -1):
+        block = blocks[index]
+        if isinstance(block, dict) and block.get("type") == "text":
+            blocks[index] = {**block, "cache_control": dict(CHAT_CACHE_CONTROL)}
+            return {**message, "content": blocks}
+    return None
+
+
+def _with_message_cache(message: dict[str, Any]) -> dict[str, Any] | None:
+    """消息级断点：tool 结果用消息级字段（LiteLLM 认，content 保持原样）；
+    user 消息则落到 text block 上。assistant 不打——tool_calls 消息的翻译
+    形态不受我们控制，断点落在它后面那条 tool 上效果相同。"""
+    role = message.get("role")
+    if role == "tool":
+        if not message.get("content"):
+            return None
+        return {**message, "cache_control": dict(CHAT_CACHE_CONTROL)}
+    if role == "user":
+        return _with_text_cache(message)
+    return None
+
+
+def apply_chat_cache_control(
+    messages: list[dict[str, Any]], tools: list[dict[str, Any]] | None
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]] | None]:
+    """chat 载荷打缓存断点：tools 末尾、system、尾部可缓存消息、次锚点。只改发送副本。
+
+    尾锚随轮次后移（多轮增量缓存）；次锚点钉在尾锚之前 ≥ CHAT_CACHE_ANCHOR_GAP
+    条消息处的最近一条 user/tool 上。打不上断点的位置（空内容、全是图片）跳过，
+    不补位——断点少一个只是少命中一段，补错位置可能把 4 个的上限撑爆。
+    """
+    sent = list(messages)
+    if tools:
+        tools = [*tools[:-1], {**tools[-1], "cache_control": dict(CHAT_CACHE_CONTROL)}]
+    if sent and sent[0].get("role") == "system":
+        if (patched := _with_text_cache(sent[0])) is not None:
+            sent[0] = patched
+    cacheable = [
+        index for index, message in enumerate(sent)
+        if index > 0 and message.get("role") in ("user", "tool")
+    ]
+    if not cacheable:
+        return sent, tools
+    tail = cacheable[-1]
+    anchors = [tail]
+    earlier = [index for index in cacheable if index <= tail - CHAT_CACHE_ANCHOR_GAP]
+    if earlier:
+        anchors.append(earlier[-1])
+    for index in anchors:
+        if (patched := _with_message_cache(sent[index])) is not None:
+            sent[index] = patched
+    return sent, tools
 
 
 #  回放时顶替空工具名的占位：只出现在发送副本里，不对应任何真实工具
@@ -730,6 +826,10 @@ class _Completions:
     ) -> Any:
         """原路直发。可选参数为空就**不传**，而不是传 None——
         真 SDK 把显式 None 当"发个 null 上去"，有的端点会因此 400。"""
+        if chat_cache_eligible(self._provider, model):
+            #  网关下的 Claude 后端：chat 载荷不打断点就一个 token 都不缓存
+            #  （见 apply_chat_cache_control）。只改发送副本，历史原样
+            messages, tools = apply_chat_cache_control(messages, tools)
         request: dict[str, Any] = {"model": model, "messages": messages, **extra}
         if stream:
             request["stream"] = True
