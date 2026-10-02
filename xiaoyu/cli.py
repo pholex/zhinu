@@ -71,6 +71,7 @@ SLASH_COMMANDS: dict[str, str] = {
     "/compact": "立刻压缩历史（不等阈值）",
     "/mode": "切换模式（/mode default|auto|plan），TUI 里 Shift-Tab 同效",
     "/plan": "只读规划态开关（/plan on|off）：/mode plan 的别名",
+    "/goal": "本会话的验收目标（/goal <一句话> 设定、/goal 看当前、/goal clear 清除）：模型收尾前会被要求核对是否达成",
     "/perm": "查看权限规则与会话授权",
     "/allow": "持久允许，如 /allow bash(git *)、/allow write_file",
     "/deny": "持久拒绝（任何模式下都拦，包括 --yolo）",
@@ -187,6 +188,11 @@ def build_parser() -> argparse.ArgumentParser:
         dest="budget_tokens",
         type=int,
         help="本会话 token 软预算（prompt+completion 累计）：模型会收到倒计时并在到线前收尾",
+    )
+    parser.add_argument(
+        "--goal",
+        metavar="TEXT",
+        help="验收目标（一句话）：模型收尾前会被要求核对它是否完全达成，未达成继续做；会话里同 /goal",
     )
     parser.add_argument(
         "--env-file",
@@ -2873,6 +2879,9 @@ def main(argv: list[str] | None = None) -> int:
         print(ui.error(str(exc)), file=sys.stderr)
         return 2
     install_exit_logging(agent.session_log)
+    if args.goal:
+        #  --goal 与会话里的 /goal 同义：一次性模式没有机会敲斜杠命令
+        agent.set_goal(args.goal)
     if config.unguarded and prompt:
         #  一次性模式不进 repl/TUI，开场警告走 stderr（stdout 是这条命令的产物）
         from . import guardrails
@@ -3596,6 +3605,15 @@ def handle_slash(agent: Agent, line: str, select: Any = None) -> bool:
         else:
             state = "开启（只读规划态）" if agent.plan_mode else "关闭"
             print(ui.secondary(f"  plan mode 当前{state}；/plan on|off 切换"))
+    elif command == "/goal":
+        if rest and rest == ["clear"]:
+            print(ui.secondary(f"  {agent.set_goal('')}"))
+        elif rest:
+            print(ui.secondary(f"  {agent.set_goal(' '.join(rest))}"))
+        elif agent.goal:
+            print(ui.secondary(f"  当前验收目标：{agent.goal}（/goal clear 清除）"))
+        else:
+            print(ui.secondary("  未设验收目标；/goal <一句话> 设定后，模型收尾前会先核对是否达成"))
     elif command == "/perm":
         print(ui.secondary(f"当前模式：{modes.describe(agent.mode, sandbox_ready=agent.sandbox_ready())}"))
         print(ui.secondary(agent.permissions.describe()))
