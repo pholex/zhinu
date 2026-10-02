@@ -1,0 +1,9 @@
+# 拷到 <用户配置目录>/hooks.toml（追加到已有条目后面）。
+# 路径改成你放本目录的位置；python 用装了 xiaoyu 的那个解释器。
+[[hooks]]
+event = "PreToolUse"
+matcher = "^bash$"
+command = "python /path/to/examples/hooks/adversary/adversary_hook.py"
+#  要大于脚本里的 XIAOYU_ADVERSARY_TIMEOUT（默认 45 秒）：先被 harness 判超时就等于
+#  白审。超时按放行处理（fail-open）
+timeout = 60

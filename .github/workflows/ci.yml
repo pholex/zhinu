@@ -5,8 +5,23 @@ name: ci
 on:
   push:
     branches: [main]
+    #  只改文档不跑三平台矩阵。路径过滤只对 push / pull_request 两个触发器生效——
+    #  release.yml 经 workflow_call 调起时不看路径，发版照常全跑。
+    #  用 paths + 取反而不是 paths-ignore：xiaoyu/docs/ 下的 .md 随包分发、路径写进
+    #  system prompt（wheel_smoke 核对它在不在），删了或挪了必须跑 CI 才拦得住；
+    #  paths-ignore 不支持 ! 取反，表达不出"除了这一处"
+    paths:
+      - "**"
+      - "!docs/**"
+      - "!**/*.md"
+      - "xiaoyu/docs/**"
   pull_request:
     branches: [main]
+    paths:
+      - "**"
+      - "!docs/**"
+      - "!**/*.md"
+      - "xiaoyu/docs/**"
   workflow_dispatch:
   #  release.yml 把本 workflow 当一个 job 调起来，publish 再 needs 它——
   #  跨 workflow 没法用 needs，只有 workflow_call 这一条正路。
@@ -74,6 +89,16 @@ jobs:
         env:
           PYTHONUNBUFFERED: "1"
         run: python tests/wheel_smoke.py dist
+      - name: 依赖漏洞审计（pip-audit，对装好的 wheel 环境跑）
+        #  审计的是用户 `pip install xiaoyu-agent` 真正拿到的依赖闭包（锁定版本），
+        #  不是源码树里的 pip 清单。continue-on-error：主依赖全是精确锁版本，上游刚
+        #  披露的 CVE 不该把与它无关的 PR 全部拦红——但 job 上会挂黄标、日志里可见，
+        #  处理方式是 dependabot 升那一行。审计失败也要可见，所以不 `|| true`
+        continue-on-error: true
+        run: |
+          python -m venv /tmp/audit-env
+          /tmp/audit-env/bin/pip install --disable-pip-version-check -q dist/*.whl pip-audit
+          /tmp/audit-env/bin/pip-audit --strict --desc on
       - name: 敏感信息扫描（发布物里不允许出现密钥特征）
         #  只扫通用密钥特征。内部专有词表不能写进公开 workflow——那本身就是泄漏，
         #  域名/路径类扫描在本地发布流程里做。

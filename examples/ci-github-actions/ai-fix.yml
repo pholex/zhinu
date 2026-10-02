@@ -60,6 +60,19 @@ jobs:
                 --budget-tokens 400000 > "$RUNNER_TEMP/result.json"
           echo "fixed=$(jq -r '.output.fixed' "$RUNNER_TEMP/result.json")" >> "$GITHUB_OUTPUT"
 
+      #  模型那一步没有仓库写凭证，但工作区里的 .github/ 它改得动——改动一旦随 PR 合入，
+      #  下一次 workflow 跑的就是模型写的 workflow（给自己加 secrets、放宽 permissions、
+      #  换掉验证步骤）。这类改动一律不要，在这里拦死，不交给 review 肉眼找
+      - name: 拒绝 .github/ 改动
+        if: steps.agent.outputs.fixed == 'true'
+        run: |
+          touched=$(git status --porcelain --untracked-files=all -- .github | awk '{print $NF}')
+          if [ -n "$touched" ]; then
+            echo "::error::小羽改动了 .github/ 下的文件，拒绝继续（workflow / 权限配置只能由人改）："
+            printf '    %s\n' $touched
+            exit 1
+          fi
+
       #  fixed 是模型自报。开 PR 之前由 workflow 自己跑一遍测试，不拿自报当验收
       - name: 独立验证
         id: verify
