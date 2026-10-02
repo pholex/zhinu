@@ -70,7 +70,12 @@ class ServeTlsTest(unittest.TestCase):
         except Exception:  # noqa: BLE001 - 没装 [serve] 时 import 本身会炸
             self.skipTest("需要可选额外 [serve]")
         err = io.StringIO()
-        with mock.patch.object(serve_module, "serve", fake_serve), redirect_stdout(
+        #  serve_command 会 load_dotenv：XIAOYU_ENV_FILE 指向不存在的文件关掉自动发现
+        #  （editable 安装下 PROJECT_ROOT/.env 就是开发者的真 .env），patch.dict 还把
+        #  setdefault 进 os.environ 的键在用例结束时整体还原，不泄给后面的用例
+        with mock.patch.dict(
+            os.environ, {"XIAOYU_ENV_FILE": str(self.root / "不存在.env")}
+        ), mock.patch.object(serve_module, "serve", fake_serve), redirect_stdout(
             io.StringIO()
         ), redirect_stderr(err):
             code = cli.serve_command(["--workspace", str(self.root), *argv])

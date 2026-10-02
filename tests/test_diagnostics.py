@@ -426,7 +426,13 @@ class BundleTest(unittest.TestCase):
             encoding="utf-8",
         )
         checks = [diagnostics.Check("python", "ok", "fine")]
-        env = {"XIAOYU_API_KEY": FAKE_KEY, "XIAOYU_MODEL": "m"}
+        #  effective_config 会 load_dotenv：指向不存在的文件关掉自动发现，否则 editable
+        #  安装下读到的是开发者的真 .env，键会 setdefault 进 os.environ 泄给后面的用例
+        env = {
+            "XIAOYU_API_KEY": FAKE_KEY,
+            "XIAOYU_MODEL": "m",
+            "XIAOYU_ENV_FILE": str(self.root / "不存在.env"),
+        }
         out = self.root / "bundle.json"
         with mock.patch.dict(os.environ, env), mock.patch(
             "xiaoyu.crash_guard._resolve_path", return_value=self.root / "crash.log"
@@ -444,7 +450,10 @@ class BundleTest(unittest.TestCase):
             self.assertEqual(out.stat().st_mode & 0o777, 0o600)
             link = self.root / "link.json"
             link.symlink_to(out)
-            with self.assertRaises(ValueError):
+            #  这一次调用同样会 load_dotenv，必须在同一份环境隔离里
+            with mock.patch.dict(os.environ, env), mock.patch(
+                "xiaoyu.crash_guard._resolve_path", return_value=self.root / "crash.log"
+            ), self.assertRaises(ValueError):
                 diagnostics.build_bundle(checks, self.root, session, link)
 
 
