@@ -149,6 +149,7 @@ def make_explore_tool(
             permissions=permissions,
             sink=child_maker() if callable(child_maker) else None,
         )
+        sub_agent.agent_name = "explore"
         sub_agent.system_prompt_override = EXPLORE_PROMPT.format(workspace=config.workspace)
         sub_agent.messages[0]["content"] = sub_agent.system_prompt_override
 

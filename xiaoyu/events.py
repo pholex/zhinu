@@ -66,6 +66,9 @@ class RequestStarted(UIEvent):
 
     kind: ClassVar[str] = "request.started"
     model: str
+    #  这条路由的 provider 名（直连厂商名或网关名）。前端按模型名就够画等待指示，
+    #  但 OpenTelemetry 导出要按约定写 gen_ai.provider.name，事件里得带着
+    provider: str = ""
 
 
 @dataclass(frozen=True)
@@ -87,6 +90,16 @@ class RequestEnded(UIEvent):
     duration_ms: int = 0
     ttft_ms: int | None = None
     usage: dict[str, Any] = field(default_factory=dict)
+    #  响应侧的事实（OpenTelemetry 导出按约定逐项写进 span；前端可以无视）：
+    #  - model：上游在响应里报的模型名，可能与请求的不同（网关改写、别名解析）；
+    #  - response_id：上游响应编号，对账 / 向厂商报障用；
+    #  - finish_reason：最后一个 chunk 报的收尾原因（stop / length / tool_calls …）；
+    #  - error：这次调用没正常结束时的分类——errors.classify 的 kind
+    #    （rate_limit / transient / …）或 interrupted；正常结束为空串。
+    model: str = ""
+    response_id: str = ""
+    finish_reason: str = ""
+    error: str = ""
 
 
 @dataclass(frozen=True)

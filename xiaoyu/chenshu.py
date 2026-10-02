@@ -1121,6 +1121,7 @@ class ChenshuRuntime:
                     else None
                 ),
             )
+            agent.agent_name = name
             with self.lock:
                 self._agents[name] = agent
                 self._observers[name] = observer

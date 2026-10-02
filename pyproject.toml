@@ -54,6 +54,13 @@ bedrock = [
 #  ⚠️ 锁版本要查 PyPI 现状再填，别凭印象——0.31.5 首发时锁的 fastapi==0.121.2
 #  是 2025-11 的版本，落后九个月约 20 个 minor。锁版本的目的是"有意识地选一个
 #  审查过的版本"，钉一个旧的等于把目的反过来做。
+# 可选：OpenTelemetry 导出（docs/observability.md）。只在用户设了标准 OTEL_* 变量时
+# 才 import；没设时一个字节不发、包都不加载。下限钉在实现时核对过的现版，不锁死：
+# OTel SDK 与用户自己的 collector / 其它 instrumentation 共存，锁死会跟别人的钉版本打架
+otel = [
+    "opentelemetry-sdk>=1.45.0",
+    "opentelemetry-exporter-otlp-proto-http>=1.45.0",
+]
 serve = [
     "fastapi==0.141.1",
     "uvicorn==0.52.3",

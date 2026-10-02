@@ -153,6 +153,13 @@ XIAOYU_API_KEY=<key>
 | `XIAOYU_BROWSER_CDP` | — | 接管以 `--remote-debugging-port` 起的本机 Chrome（要登录态时用） |
 | `XIAOYU_BROWSER_HEADED` | 无头 | 有头模式启动浏览器 |
 
+### 可观测性（OpenTelemetry，标准 `OTEL_*` 变量）
+
+设了 `OTEL_EXPORTER_OTLP_ENDPOINT`（或 `OTEL_TRACES_EXPORTER=console`）就把每轮 / 每次模型调用 /
+每次工具调用按 GenAI 语义约定打成 span 推到你自己的 collector；没设就一个字节不发、包都不加载。
+需要可选 extra `pip install "xiaoyu-agent[otel]"`。变量表、span 树与属性清单、内容采集开关见
+[可观测性](observability.md)。
+
 ## 自定义 system prompt
 
 小羽出厂是编码 agent。要让它换一种工作身份（写作助手、客服话术、某类专项工作的人设），把提示词写进文件、启动时指过去：
