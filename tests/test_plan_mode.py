@@ -60,6 +60,18 @@ class GateTest(AgentTestCase):
         self.assertEqual(len(executed), 1)
         self.assertTrue(executed[0]["ok"])
 
+    def test_structured_output_allowed_in_plan_mode(self):
+        """-p --mode plan --output-schema：提交结构化结果只写内存不碰现场，
+        plan mode 拦它的话无人值守就永远交不了结果。"""
+        agent = self.build(
+            [tool_call_turn("structured_output", {"answer": 42}), text_turn("交了")]
+        )
+        agent.set_output_schema({"type": "object", "properties": {"answer": {"type": "integer"}}})
+        agent.enter_plan_mode()
+        agent.send("只规划，并以结构化结果收尾")
+        self.assertEqual(agent.structured_output, {"answer": 42})
+        self.assertFalse([t for t in agent.trace if t["output"] == "DENIED_PLAN_MODE"])
+
     def test_whitelist_matches_registered_readonly_tools(self):
         #  白名单不该出现"根本不存在的工具名"这种漂移（exit_plan_mode/skill/
         #  explore/web_search 是条件注册，不在此列强求）

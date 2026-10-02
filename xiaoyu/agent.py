@@ -491,11 +491,13 @@ VISION_CAPTION_HEADER = (
 #  允许的工具白名单。deny-by-default：不在名单里的（bash/write_file/str_replace/
 #  browser/MCP/插件工具）一律拦——MCP 工具即使"看起来只读"也可能有副作用，宁可误拦。
 #  list_sessions 在列（真只读，规划期查一下无害）；send_message 刻意不在——
-#  它把文本塞进别人的上下文，是有外部副作用的动作，只读承诺不能对它破例
+#  它把文本塞进别人的上下文，是有外部副作用的动作，只读承诺不能对它破例。
+#  structured_output 在列：它只把结果存进内存、不碰现场；不在列的话
+#  `-p --mode plan --output-schema` 永远交不了结果（无人值守又退不出 plan mode）
 PLAN_MODE_TOOLS = frozenset(
     {"read_file", "grep", "list_files", "explore", "skill", "web_search",
      "update_plan", "exit_plan_mode", "ask_user", "list_sessions", "task_output",
-     "search_tool", "get_context_remaining"}
+     "search_tool", "get_context_remaining", "structured_output"}
 )
 
 #  进入/退出 plan mode 时注入历史的说明（user 角色）：模型从历史里得知规则，
