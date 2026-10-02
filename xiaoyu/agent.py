@@ -30,6 +30,7 @@ from . import (
     errors,
     media,
     modes,
+    otel,
     providers,
     sandbox,
     skill_usage,
@@ -998,6 +999,13 @@ class Agent:
     _request_clock: float | None = None
     _first_chunk_at: float | None = None
     _response_id = ""
+    #  响应里报的模型名 / 最后一个 chunk 的收尾原因 / 抛出前记下的死因（request.ended 用）
+    _response_model = ""
+    _finish_reason = ""
+    _request_failure: BaseException | None = None
+    #  OpenTelemetry 旁观者与 agent 名的类级缺省：emit / 轮边界在 __init__ 完成前也可能被叫到
+    _otel: Any = None
+    agent_name = "xiaoyu"
     #  `--stats`：轮末在用量行后追加耗时/首 token/吐字速率（CLI 置位，内核只记数）
     show_stats: bool = False
 
@@ -1139,12 +1147,12 @@ class Agent:
 
             loaded, problems = hooks_mod.load_hooks()
             for problem in problems:
-                self.sink.emit(Notice(f"[hooks.toml：{problem}]", "warn"))
+                self.emit(Notice(f"[hooks.toml：{problem}]", "warn"))
             if loaded:
                 self.hook_engine = hooks_mod.HookEngine(
                     loaded,
                     config.workspace,
-                    notify=lambda text: self.sink.emit(Notice(text, "warn")),
+                    notify=lambda text: self.emit(Notice(text, "warn")),
                 )
         #  SessionStart / SessionEnd 由宿主显式调 begin_session / end_session 触发
         #  （CLI 的几个入口各调一次），不藏在 send 里：SDK 的 Session 有自己的
@@ -1219,6 +1227,11 @@ class Agent:
         self._effort_notified: set[tuple[str, str]] = set()
         #  没有会话日志（子 agent / eval / 嵌入）时的缓存路由键：本实例内稳定即可
         self._cache_key_fallback = uuid.uuid4().hex
+        #  对外的 agent 名（OpenTelemetry 的 gen_ai.agent.name）：主 agent 就叫 xiaoyu，
+        #  子 agent 由构造它的一方改成 explore / 委托名 / 宸枢成员名
+        self.agent_name = "xiaoyu"
+        #  OpenTelemetry 导出（otel.py）：没配标准变量时是 None，emit 多一次 None 判断而已
+        self._otel = otel.attach(self)
         self.compactor = Compactor(
             context_limit=config.context_limit,
             compact_at=config.compact_at,
@@ -1465,7 +1478,7 @@ class Agent:
 
             agent_specs, spec_problems = load_agent_specs(config.workspace)
             for problem in spec_problems:
-                self.sink.emit(Notice(f"[agents/：{problem}]", "warn"))
+                self.emit(Notice(f"[agents/：{problem}]", "warn"))
             #  resume 存档跨 spec 共享一本：句柄全局唯一，spec 归属在记录里查。
             #  RunStore 自带锁——七襄的批量委托在工作线程里并发存档
             #  有会话日志就落盘到它旁边：重启 / resume 之后历史里的句柄还接得上
@@ -1483,7 +1496,7 @@ class Agent:
             mounted_specs = []
             for spec in agent_specs:
                 if self.toolbox.get(spec.name) is not None:
-                    self.sink.emit(
+                    self.emit(
                         Notice(f"[agents/{spec.name}：与已有工具同名，跳过]", "warn")
                     )
                     continue
@@ -1779,7 +1792,7 @@ class Agent:
             cleaned.append({"step": step.strip(), "status": status})
         previous = {item["step"]: item["status"] for item in self.plan}
         self.plan = cleaned
-        self.sink.emit(PlanUpdated(plan=cleaned, explanation=explanation))
+        self.emit(PlanUpdated(plan=cleaned, explanation=explanation))
         note = self._unverified_completion_note(previous, cleaned)
         self._exec_evidence = 0
         return "已更新计划" + note
@@ -1921,7 +1934,7 @@ class Agent:
                 self.plan_file.parent.mkdir(parents=True, exist_ok=True)
                 self.plan_file.write_bytes(b"")
         except OSError as exc:
-            self.sink.emit(Notice(f"[plan 文件创建失败：{exc}，编辑时会再报错]", "warn"))
+            self.emit(Notice(f"[plan 文件创建失败：{exc}，编辑时会再报错]", "warn"))
             return
         mark = getattr(self.toolbox, "_mark_read", None)
         if callable(mark):
@@ -2159,7 +2172,7 @@ class Agent:
         #  同一轮"推过了"不算"被压掉"，不该落 skip 事件
         self._crystallize_skip_logged = True
         self._record_operator(CRYSTALLIZE_NUDGE)
-        self.sink.emit(
+        self.emit(
             Notice("[检测到反复改写并执行的解题过程，已请模型评估是否值得沉淀]", "info")
         )
         return True
@@ -2210,7 +2223,7 @@ class Agent:
         #  压缩与 turn_starts 都不能把这条当用户原话（[系统提示] 前缀是离线侧
         #  的兜底判据，这里再进会话内集合，双保险与 plan mode 注入同一纪律）
         self.compactor.synthetic_user_texts |= {note}
-        self.sink.emit(
+        self.emit(
             Notice(f"[技能目录已更新：+{len(added)} / -{len(removed)}，模型本轮可见]", "info")
         )
 
@@ -2371,7 +2384,7 @@ class Agent:
         if corrupt:
             shown = "、".join(str(number) for number in corrupt[:5])
             more = f" 等 {len(corrupt)} 处" if len(corrupt) > 5 else ""
-            self.sink.emit(
+            self.emit(
                 Notice(
                     f"[会话文件有 {len(corrupt)} 行记录损坏、读不出来（第 {shown} 行{more}），"
                     "已跳过——接回的历史可能缺了消息，模型可能不记得那部分内容]",
@@ -2389,7 +2402,7 @@ class Agent:
             except OSError:
                 orphan = False
             if orphan:
-                self.sink.emit(
+                self.emit(
                     Notice(
                         "[上次会话在上下文压缩进行中异常终止（历史无损）。"
                         "若上下文仍然偏满，可 /compact 手动补一次压缩]",
@@ -2466,7 +2479,7 @@ class Agent:
 
     def _mcp_progress(self, name: str, info: dict[str, Any]) -> None:
         """MCP 工具的一次进度上报 → tool.progress 事件（见 Toolbox.mcp_progress_hook）。"""
-        self.sink.emit(
+        self.emit(
             ToolProgress(
                 name=name,
                 message=str(info.get("message") or ""),
@@ -2479,7 +2492,7 @@ class Agent:
         """MCP server 的日志告警（warning 及以上）→ Notice。error 一族按 error 档，
         其余按 warn；文案带上 server 名，几个 server 同时在跑时才分得清是谁在喊。"""
         severity = "error" if level in ("error", "critical", "alert", "emergency") else "warn"
-        self.sink.emit(Notice(f"[MCP {server}·{level}] {text}", severity))
+        self.emit(Notice(f"[MCP {server}·{level}] {text}", severity))
 
     def _checkpoint(self) -> None:
         """打断检查点：有待处理的打断就清掉自己的标志并抛 Interrupted。
@@ -2624,7 +2637,7 @@ class Agent:
             #  不让别人的来信把在飞的活儿带偏
             content = f"{wrapped}\n{INBOX_MIDTURN_TAIL}" if midturn else wrapped
             self._record({"role": "user", "content": content, media.PEER_KEY: True})
-            self.sink.emit(Notice(f"[收到来自 {sender} 的消息]", "info"))
+            self.emit(Notice(f"[收到来自 {sender} 的消息]", "info"))
             if self.session_log:
                 self.session_log.event("peer_message", sender=sender)
         return bool(items)
@@ -2642,7 +2655,7 @@ class Agent:
             self._record(
                 {"role": "user", "content": wrap_interjection(text), media.MIDTURN_KEY: True}
             )
-            self.sink.emit(SteerAccepted(text))
+            self.emit(SteerAccepted(text))
             if self.session_log:
                 self.session_log.event("steer")
             consumed = True
@@ -2665,7 +2678,7 @@ class Agent:
                 #  只说一次：会话照常进行，但用户得知道之后的内容 resume 不回来
                 self._log_loss_warned = True
                 why = getattr(self.session_log, "broken_reason", "") or "写入失败"
-                self.sink.emit(
+                self.emit(
                     Notice(
                         f"[会话日志已停写（{why}）：从这里往后的对话不会落盘，"
                         "resume 只能恢复到此前的内容]",
@@ -2704,7 +2717,7 @@ class Agent:
     def _continue_after_truncation(self, attempt: int) -> None:
         if self.session_log:
             self.session_log.event("truncated_continue", attempt=attempt)
-        self.sink.emit(
+        self.emit(
             Notice(
                 f"[已请模型从断点接着写（{attempt}/{MAX_TRUNCATION_CONTINUES}）]", "warn"
             )
@@ -2823,6 +2836,22 @@ class Agent:
             )
         return dropped
 
+    # ---------- 事件出口 ----------
+
+    def emit(self, event: UIEvent) -> None:
+        """所有事件的唯一出口：先给 OpenTelemetry 旁观者，再交前端 sink。
+
+        不包在 sink 外面而是放这一层，是因为 sink 会被换：serve 的 AsyncAgent.stream()
+        临时换成事件桥、宿主构造后回填——包在 sink 外面要么被换掉、要么把派生
+        子 sink（quiet_child）的鸭子类型挡住。旁观者出错不能连累前端。
+        """
+        if self._otel is not None:
+            try:
+                self._otel.observe(event)
+            except Exception:  # noqa: BLE001
+                self._otel = None
+        self.sink.emit(event)
+
     # ---------- 会话生命周期（hooks.toml 的 SessionStart / SessionEnd） ----------
 
     def _session_payload(self) -> dict[str, Any]:
@@ -2844,7 +2873,7 @@ class Agent:
             return None
         decision = self.hook_engine.fire("SessionStart", self._session_payload())
         if decision.blocked:
-            self.sink.emit(Notice(f"[SessionStart hook 拒绝启动：{decision.reason}]", "warn"))
+            self.emit(Notice(f"[SessionStart hook 拒绝启动：{decision.reason}]", "warn"))
             return decision
         self._session_started = True
         if output := getattr(decision, "output", ""):
@@ -2853,6 +2882,12 @@ class Agent:
 
     def end_session(self) -> None:
         """会话收尾触发一次 SessionEnd（只在 SessionStart 真跑过之后）。结果不影响退出。"""
+        if self._otel is not None:
+            #  OpenTelemetry 的收尾与钩子无关：把队列里的 span 推出去（封顶等待）
+            try:
+                self._otel.close()
+            except Exception:  # noqa: BLE001
+                pass
         if self._session_ended or not self._session_started or self.hook_engine is None:
             return
         self._session_ended = True
@@ -2875,10 +2910,25 @@ class Agent:
         store = getattr(self.toolbox, "rewind", None)
         if store is not None:
             store.begin(media.text_of(user_input))
+        if self._otel is not None:
+            #  轮的 span（invoke_agent）：事件流里没有"轮开始"的事件，只能在这里显式开
+            try:
+                self._otel.begin_turn(media.text_of(user_input))
+            except Exception:  # noqa: BLE001
+                self._otel = None
+        failure: BaseException | None = None
         try:
             with _TURNS_ACTIVE.track():
                 self._turn(user_input)
+        except BaseException as exc:
+            failure = exc
+            raise
         finally:
+            if self._otel is not None:
+                try:
+                    self._otel.end_turn(failure)
+                except Exception:  # noqa: BLE001
+                    self._otel = None
             if store is not None:
                 store.finish()
             self._log_usage()
@@ -2944,7 +2994,7 @@ class Agent:
                 "UserPromptSubmit", {"prompt": clip(media.text_of(user_input))}
             )
             if decision.blocked:
-                self.sink.emit(Notice(f"[hook 拦截了本轮输入：{decision.reason}]", "warn"))
+                self.emit(Notice(f"[hook 拦截了本轮输入：{decision.reason}]", "warn"))
                 return
         self._record({"role": "user", "content": user_input})
 
@@ -3000,7 +3050,7 @@ class Agent:
             resumable = truncated and self._truncation_had_output
             if resumable and truncations >= MAX_TRUNCATION_CONTINUES:
                 resumable = False
-                self.sink.emit(
+                self.emit(
                     Notice(
                         f"[连续 {MAX_TRUNCATION_CONTINUES} 次撞到输出长度上限，不再自动续写。"
                         "发「继续」可接着写]",
@@ -3048,7 +3098,7 @@ class Agent:
                             nudged_phantom = True
                             if self.session_log:
                                 self.session_log.event("phantom_edit_claim", paths=claims)
-                            self.sink.emit(
+                            self.emit(
                                 Notice(
                                     "[回复宣称已创建/修改 "
                                     + "、".join(claims[:5])
@@ -3067,7 +3117,7 @@ class Agent:
                         nudged_promise = True
                         if self.session_log:
                             self.session_log.event("promise_without_action")
-                        self.sink.emit(
+                        self.emit(
                             Notice(
                                 "[模型只说了要做什么却没有调用工具，已请它立即开始或如实收尾]",
                                 "warn",
@@ -3084,7 +3134,7 @@ class Agent:
                         self.compactor.synthetic_user_texts |= {note}
                         if self.session_log:
                             self.session_log.event("goal_check", goal=self.goal)
-                        self.sink.emit(Notice("[收尾前已请模型核对验收目标是否达成]", "warn"))
+                        self.emit(Notice("[收尾前已请模型核对验收目标是否达成]", "warn"))
                         self._record_operator(note)
                         continue
                     #  Stop hook：block 则把理由作为 user 消息顶回去续跑一步
@@ -3100,7 +3150,7 @@ class Agent:
                             "Stop", {"last_text": clip(media.text_of(message.get("content")))}
                         )
                         if decision.blocked:
-                            self.sink.emit(
+                            self.emit(
                                 Notice(f"[Stop hook 要求继续：{decision.reason}]", "warn")
                             )
                             self._record_injected(f"[hook 反馈] {decision.reason}")
@@ -3116,7 +3166,7 @@ class Agent:
                 if self.session_log:
                     self.session_log.event("empty_reply", nudged=not nudged_empty)
                 if nudged_empty:
-                    self.sink.emit(
+                    self.emit(
                         Notice(
                             "[模型连续返回空回复，本轮到此结束。会话仍在，可直接追问]",
                             "error",
@@ -3124,7 +3174,7 @@ class Agent:
                     )
                     return
                 nudged_empty = True
-                self.sink.emit(Notice("[模型返回了空回复，已自动请它补上结论]", "warn"))
+                self.emit(Notice("[模型返回了空回复，已自动请它补上结论]", "warn"))
                 self._record_operator(EMPTY_REPLY_NUDGE)
                 continue
 
@@ -3168,7 +3218,7 @@ class Agent:
         #  干了几十轮的活，至少让模型交代做到哪了、下一步怎么办
         if self.last_stop == "budget":
             spent = self.usage.prompt_tokens + self.usage.completion_tokens
-            self.sink.emit(
+            self.emit(
                 Notice(
                     f"\n[token 预算即将用尽：已用 {spent} / {self.config.budget_tokens}，请模型收尾]",
                     "warn",
@@ -3178,7 +3228,7 @@ class Agent:
                 self.session_log.event("budget_wrapup", spent=spent, budget=self.config.budget_tokens)
             self._record_operator(BUDGET_WRAPUP_INSTRUCTION)
         else:
-            self.sink.emit(
+            self.emit(
                 Notice(f"\n[已达到单轮工具调用上限 {turn_budget}，请模型收尾]", "warn")
             )
             self._record_operator(WRAPUP_INSTRUCTION)
@@ -3229,7 +3279,7 @@ class Agent:
                 )
                 self._record_operator(note)
                 self.compactor.synthetic_user_texts |= {note}
-                self.sink.emit(Notice(f"[预算 {int(ratio * 100)}%：已用 {spent} / {budget} tok]", "warn"))
+                self.emit(Notice(f"[预算 {int(ratio * 100)}%：已用 {spent} / {budget} tok]", "warn"))
                 if self.session_log:
                     self.session_log.event("budget_notice", ratio=step, spent=spent)
 
@@ -3302,7 +3352,7 @@ class Agent:
         note = "[余量] " + " ".join(lines) + " 请据此安排节奏。"
         self._record_operator(note)
         self.compactor.synthetic_user_texts |= {note}
-        self.sink.emit(Notice("[余量] " + " ".join(lines), "warn"))
+        self.emit(Notice("[余量] " + " ".join(lines), "warn"))
         if self.session_log:
             self.session_log.event("headroom_notice", lines=lines)
 
@@ -3334,7 +3384,7 @@ class Agent:
         """
         if pool <= 0:
             return 0, False
-        self.sink.emit(Notice(f"\n[已达到工具调用轮数预算，可追加 ≤{pool} 轮，询问模型]", "warn"))
+        self.emit(Notice(f"\n[已达到工具调用轮数预算，可追加 ≤{pool} 轮，询问模型]", "warn"))
         self._record_operator(TURN_EXTENSION_OFFER)
         self._begin_step(schemas=(EXTEND_TURNS_SCHEMA,))
         message = self._stream_with_recovery()
@@ -3357,7 +3407,7 @@ class Agent:
                 asked = 1
             reason = str(args.get("reason") or "").strip() or "（未说明）"
             granted = min(asked, pool)
-            self.sink.emit(Notice(f"[模型申请追加 {asked} 轮：{reason}；批准 {granted} 轮]", "warn"))
+            self.emit(Notice(f"[模型申请追加 {asked} 轮：{reason}；批准 {granted} 轮]", "warn"))
             if self.session_log:
                 self.session_log.event("turn_extension", asked=asked, granted=granted, reason=reason)
             self._record(
@@ -3424,7 +3474,7 @@ class Agent:
         route = self.registry.vision_reader(name)
         if route is None and not self._vision_warned:
             self._vision_warned = True
-            self.sink.emit(
+            self.emit(
                 Notice(
                     f"  代读模型 {name} 用不了（模型名没有 provider 接、或它自己未声明视觉能力），"
                     "本次代读不生效。网关上的视觉模型用 XIAOYU_VISION_MODELS 点名放行",
@@ -3467,7 +3517,7 @@ class Agent:
             choices = getattr(response, "choices", None) or []
             text = (choices[0].message.content or "").strip() if choices else ""
         except Exception as exc:  # noqa: BLE001 - 代读失败只降级，不打断本轮
-            self.sink.emit(
+            self.emit(
                 Notice(
                     f"  图片代读失败（{route.qualified}：{type(exc).__name__}），退回文字说明",
                     "warn",
@@ -3538,7 +3588,7 @@ class Agent:
             block, notice = self.caption_images(parts, guide=self.last_user_text())
             if block:
                 self._record({"role": "user", "content": block})
-                self.sink.emit(Notice(f"[上一步的工具返回了 {count} 张图片]{notice}", "warn"))
+                self.emit(Notice(f"[上一步的工具返回了 {count} 张图片]{notice}", "warn"))
                 return
             self._record(
                 {
@@ -3551,7 +3601,7 @@ class Agent:
                     ),
                 }
             )
-            self.sink.emit(
+            self.emit(
                 Notice(
                     f"[工具返回了 {count} 张图片，当前模型 {self.config.model} 看不了，已降级为文字说明"
                     "（/model 换视觉模型；或 XIAOYU_VISION_FALLBACK 配一个代读模型；"
@@ -3576,7 +3626,7 @@ class Agent:
         self.messages, aged = age_tool_images(self.messages)
         if aged:
             self._history_rewritten()
-            self.sink.emit(
+            self.emit(
                 Notice(
                     f"[工具截图超过 {TOOL_IMAGE_HIGH_WATER} 张，较早的 {aged} 张已换成文字占位"
                     f"（保留最新 {TOOL_IMAGE_KEEP} 张）]"
@@ -3676,7 +3726,7 @@ class Agent:
             self._history_rewritten()
             self._mark_compaction()
             after_micro = self.context_tokens()
-            self.sink.emit(
+            self.emit(
                 Notice(f"[已清理 {cleared} 条旧工具输出，估算 {estimated} → {after_micro} tok]")
             )
             if self.session_log:
@@ -3690,7 +3740,7 @@ class Agent:
                 return f"microcompact：清理 {cleared} 条旧工具输出，估算 {estimated} → {after_micro} tok"
             estimated = after_micro
 
-        self.sink.emit(
+        self.emit(
             Notice(f"[上下文 {estimated} / {self.config.context_limit} tok，压缩历史…]", "warn")
         )
         before_compact = self.messages
@@ -3701,7 +3751,7 @@ class Agent:
         if self.session_log:
             self.session_log.event("compact_start", trigger="manual" if force else "auto")
         self.messages, note = self.compactor.compact(self.messages)
-        self.sink.emit(Notice(f"  {note}"))
+        self.emit(Notice(f"  {note}"))
         changed = self.messages is not before_compact
         if changed:
             self._history_rewritten()
@@ -3753,7 +3803,7 @@ class Agent:
             self.session_log.event("compact_start", trigger="overflow")
         self.messages = tightened
         self._history_rewritten()
-        self.sink.emit(Notice(f"[上下文仍超出模型窗口，{note}]", "warn"))
+        self.emit(Notice(f"[上下文仍超出模型窗口，{note}]", "warn"))
         if self.session_log:
             self.session_log.event("compact", note=note, replacement=self.messages[1:])
             self.session_log.event("compact_end", ok=True)
@@ -3812,7 +3862,7 @@ class Agent:
         self._new_context_notes = None
         self._context_window += 1
         before = self.context_tokens()
-        self.sink.emit(
+        self.emit(
             Notice(f"[开启第 {self._context_window} 个上下文窗口（估算 {before} tok 的历史不再可见）]", "warn")
         )
         if self.session_log:
@@ -3968,20 +4018,20 @@ class Agent:
                 content = self._summary_call(route, transcript, prefix or [])
             except TruncatedSummary as exc:
                 last_error = exc
-                self.sink.emit(
+                self.emit(
                     Notice(f"  摘要模型 {route.qualified} 输出被截断（半截摘要不落盘），回退下一个")
                 )
                 continue
             except Exception as exc:  # noqa: BLE001 - 换下一个模型再试
                 last_error = exc
-                self.sink.emit(
+                self.emit(
                     Notice(f"  摘要模型 {route.qualified} 失败（{type(exc).__name__}），回退下一个")
                 )
                 continue
 
             if not is_degenerate_summary(content):
                 if route.model != self.config.model:
-                    self.sink.emit(Notice(f"  摘要由 {route.qualified} 生成"))
+                    self.emit(Notice(f"  摘要由 {route.qualified} 生成"))
                 return content
             #  退化摘要与空摘要同罪：
             #  几十个字的应付式输出不可能承载它要替换的历史，当瞬时失败换下一个
@@ -4120,7 +4170,7 @@ class Agent:
         budget = _RetryBudget(self._RECOVERY_BUDGET)
         for index, route in enumerate(chain):
             if index:
-                self.sink.emit(
+                self.emit(
                     Notice(
                         f"[{chain[index - 1].qualified} 重试已耗尽，切换到 {route.qualified}"
                         "（对话原样继续；/model 可切回）]",
@@ -4159,7 +4209,7 @@ class Agent:
         assert last_error is not None  # chain 至少有主模型，必然进过循环
         if len(chain) > 1:
             names = ", ".join(route.qualified for route in chain)
-            self.sink.emit(
+            self.emit(
                 Notice(
                     f"[全部路由（{names}）都失败。会话已保留，"
                     "稍后重发即可继续，或 /model 换其它模型]",
@@ -4196,7 +4246,7 @@ class Agent:
                 self._PREFERRED_PROBE_MAX,
             )
             self._preferred_retry_at = time.monotonic() + self._preferred_backoff
-            self.sink.emit(
+            self.emit(
                 Notice(
                     f"[首选模型 {route.qualified} 仍不可用（{failure}），"
                     f"{self._preferred_backoff / 60:.0f} 分钟后再试；本次继续用 {self.config.model}]",
@@ -4204,7 +4254,7 @@ class Agent:
                 )
             )
             return None
-        self.sink.emit(Notice(f"[首选模型 {route.qualified} 已恢复，切回]", "info"))
+        self.emit(Notice(f"[首选模型 {route.qualified} 已恢复，切回]", "info"))
         self.switch_model(preferred)
         return message
 
@@ -4253,7 +4303,7 @@ class Agent:
                 if empty:
                     zero_streak = zero_streak + 1 if self._completion_tokens == 0 else 0
                     if zero_streak >= self._DETERMINISTIC_EMPTY:
-                        self.sink.emit(
+                        self.emit(
                             Notice(
                                 f"[{route.qualified} 连续 {zero_streak} 次返回空补全且未产出任何 token"
                                 "（completion_tokens=0），不再原样重发]",
@@ -4263,7 +4313,7 @@ class Agent:
                         raise _DeterministicEmpty(message)
                     if attempt < self._RECOVERY_ATTEMPTS and (budget is None or budget.take()):
                         after_empty = True
-                        self.sink.emit(
+                        self.emit(
                             Notice(
                                 f"[模型返回空补全（疑似流中断），已重发"
                                 f"（{attempt}/{self._RECOVERY_ATTEMPTS - 1}）]",
@@ -4289,7 +4339,7 @@ class Agent:
                             self.session_log.event(
                                 "thinking_rejected", route=route.qualified, dropped=dropped
                             )
-                        self.sink.emit(
+                        self.emit(
                             Notice(
                                 f"[{route.qualified} 拒收了历史里的推理内容，"
                                 f"已丢弃 {dropped} 段后重发（回答不受影响，只少了一段推理连续性）]",
@@ -4308,7 +4358,7 @@ class Agent:
                 if retrying and asked is not None and asked > self._RECOVERY_MAX_DELAY:
                     if has_alternative or asked > self._RECOVERY_LONG_WAIT:
                         retrying = False
-                        self.sink.emit(
+                        self.emit(
                             Notice(
                                 f"[{verdict.hint}：{route.qualified} 要求等 {asked:.0f}s，"
                                 + ("不原地等，换下一条路由]" if has_alternative
@@ -4326,7 +4376,7 @@ class Agent:
                     #  端点不认未知字段）这次重发会 400/422：本会话对这家停带，不计次原样重发。
                     #  加进 _cache_bypass_refused 后条件不再成立，同一家至多走这里一次
                     self._cache_bypass_refused.add(route.provider)
-                    self.sink.emit(
+                    self.emit(
                         Notice(
                             f"[{route.provider} 不接受跳过响应缓存的请求字段，本会话重发不再携带"
                             "（可设 XIAOYU_GATEWAY_CACHE_BYPASS=0 关掉）]",
@@ -4350,7 +4400,7 @@ class Agent:
                         #  不会没完没了：每次重发都以估算确实变小为前提，摘要压过一次后
                         #  可压区间就空了，收紧也只有有限的几档
                         self._log_request(route, attempt, "error", exc=exc, verdict=verdict)
-                        self.sink.emit(Notice("[上下文超限，历史已缩小，重发]", "warn"))
+                        self.emit(Notice("[上下文超限，历史已缩小，重发]", "warn"))
                         attempt -= 1
                         continue
                 if not retrying:
@@ -4370,7 +4420,7 @@ class Agent:
                 else:
                     wait = min(delay, self._RECOVERY_MAX_DELAY) * random.uniform(0.75, 1.25)
                 self._log_request(route, attempt, "error", exc=exc, verdict=verdict, wait=wait)
-                self.sink.emit(
+                self.emit(
                     Notice(
                         f"[{verdict.hint}，{wait:.1f}s 后重试"
                         f"（{attempt}/{self._RECOVERY_ATTEMPTS - 1}）]",
@@ -4412,7 +4462,7 @@ class Agent:
         effort = providers.effort_for(route.provider, route.model, wanted, EFFORT_LEVELS)
         if effort != wanted and (route.qualified, wanted) not in self._effort_notified:
             self._effort_notified.add((route.qualified, wanted))
-            self.sink.emit(
+            self.emit(
                 Notice(
                     f"[{route.qualified} 不认推理深度 {wanted}，这条路由上改用 {effort}]", "info"
                 )
@@ -4435,7 +4485,26 @@ class Agent:
                 "cached_tokens": self._cached_tokens_seen,
             }
         self.turn_stats.record(duration_ms, ttft_ms, int(usage.get("completion_tokens", 0)))
-        return RequestEnded(duration_ms=duration_ms, ttft_ms=ttft_ms, usage=usage)
+        #  _request_failure 是 _stream_once 在抛出前记下的死因：分类写进事件，
+        #  OpenTelemetry 的 chat span 据此标 error.type。分类本身不能再抛
+        error = ""
+        exc = getattr(self, "_request_failure", None)
+        if isinstance(exc, (KeyboardInterrupt, Interrupted)):
+            error = "interrupted"
+        elif isinstance(exc, Exception):
+            try:
+                error = errors.classify(exc).kind
+            except Exception:  # noqa: BLE001
+                error = type(exc).__name__
+        return RequestEnded(
+            duration_ms=duration_ms,
+            ttft_ms=ttft_ms,
+            usage=usage,
+            model=getattr(self, "_response_model", ""),
+            response_id=getattr(self, "_response_id", ""),
+            finish_reason=getattr(self, "_finish_reason", ""),
+            error=error,
+        )
 
     def _log_request(
         self,
@@ -4584,7 +4653,7 @@ class Agent:
         #  这整段以前没有任何事件，屏幕停在用户刚敲的那行不动。started/ended
         #  包住它，前端才有东西可画。ended 走 finally：异常和 Ctrl-C 路径上
         #  活区也必须收掉，否则 spinner 会一直转下去。
-        self.sink.emit(RequestStarted(route.model))
+        self.emit(RequestStarted(route.model, provider=route.provider))
         self._content_filtered = False
         self._length_truncated = False
         self._truncation_had_output = False
@@ -4595,12 +4664,17 @@ class Agent:
         self._request_clock = time.monotonic()
         self._first_chunk_at: float | None = None
         self._response_id = ""
+        self._response_model = ""
+        self._finish_reason = ""
+        self._request_failure = None
         self._prompt_tokens_seen: int | None = None
         self._cached_tokens_seen = 0
         try:
             stream = route.client.chat.completions.create(**request)
             self._consume_stream(route, stream, content_parts, pending, reasoning)
-        except (KeyboardInterrupt, Interrupted):
+        except (KeyboardInterrupt, Interrupted) as exc:
+            #  死因先记下：finally 里组 request.ended 要据此写失败分类
+            self._request_failure = exc
             #  Ctrl-C 打在流式中途，或宿主调了 interrupt()：已经说出的半截话也要
             #  入历史，否则整轮凭空消失，用户看到过的内容模型自己却"不记得"。
             #  拼了一半的 tool_calls 直接丢弃（arguments 多半是残缺 JSON，留着
@@ -4614,14 +4688,17 @@ class Agent:
                     }
                 )
             raise
+        except BaseException as exc:
+            self._request_failure = exc
+            raise
         finally:
             #  正文段在请求内部闭合，且**任何路径**上都要闭合：
             #  started → delta… → text.end → ended。中断/异常时缺发 TextEnd，
             #  明文 sink 少收尾换行、OSC 133 锚点悬空、ACP 的正文段没有边界——
             #  事件消费者不该为失败路径写补偿逻辑。
             if content_parts:
-                self.sink.emit(TextEnd())
-            self.sink.emit(self._request_ended())
+                self.emit(TextEnd())
+            self.emit(self._request_ended())
 
         if not self._stream_finished:
             #  流结束了却没有任何收尾信号（finish_reason / usage 都没见到），而某个
@@ -4643,7 +4720,7 @@ class Agent:
                 raise errors.ContentFiltered(
                     f"{route.qualified} 的服务端内容过滤拦下了这次回答"
                 )
-            self.sink.emit(Notice("[回答被服务端内容过滤截断，内容可能不完整]", "warn"))
+            self.emit(Notice("[回答被服务端内容过滤截断，内容可能不完整]", "warn"))
 
         text = "".join(content_parts)
         if self._length_truncated:
@@ -4669,7 +4746,7 @@ class Agent:
             self._truncation_had_output = bool(text.strip() or dropped or pending)
             text = f"{text}\n{marker}" if text else marker
             #  接下来怎么办（自动续写 / 到此为止）由轮循环说，这里只报事实
-            self.sink.emit(Notice(marker, "warn"))
+            self.emit(Notice(marker, "warn"))
 
         if text or pending:
             #  空补全不算出了回复：它会被原地重发，交代留给真出内容的那次
@@ -4715,7 +4792,7 @@ class Agent:
                 #  静默换占位等于悄悄丢掉模型的思维连续性，必须有第一现场
                 signs = getattr(route.client, "signs_tools", None)
                 if signs is not None and signs(route.model):
-                    self.sink.emit(
+                    self.emit(
                         Notice(
                             f"[{route.qualified} 的工具调用没带回 thought_signature——"
                             "重放将以占位签名顶替（能跑，但模型丢失思维连续性）。"
@@ -4731,7 +4808,7 @@ class Agent:
             summary_chars = sum(
                 len(item.get("content") or "") for item in reasoning if item.get("type") == "compaction"
             )
-            self.sink.emit(
+            self.emit(
                 Notice(f"[服务端已压缩上下文：块之前的历史由 {summary_chars} 字摘要替代]", "warn")
             )
             if self.session_log:
@@ -4793,6 +4870,8 @@ class Agent:
                 self._first_chunk_at = time.monotonic()
             if not self._response_id and isinstance(getattr(chunk, "id", None), str):
                 self._response_id = chunk.id
+            if not self._response_model and isinstance(getattr(chunk, "model", None), str):
+                self._response_model = chunk.model
             if getattr(chunk, "usage", None):
                 #  收到 usage 即视为正常收尾：有些端点不发 finish_reason，只在
                 #  最后给一个纯 usage chunk（断流判定见 _stream_once）
@@ -4819,7 +4898,7 @@ class Agent:
                     #  用户知道；上下文本身由锚点记账在下一步触发自动压缩自愈，
                     #  这里只告警不改流程。
                     if prompt_tokens > self.config.context_limit:
-                        self.sink.emit(
+                        self.emit(
                             Notice(
                                 f"[警告] 服务端报告输入 {prompt_tokens} tok，已超过 "
                                 f"{route.model} 的上下文窗口（{self.config.context_limit}）——"
@@ -4840,6 +4919,7 @@ class Agent:
             finish = getattr(chunk.choices[0], "finish_reason", None)
             if finish:
                 self._stream_finished = True
+                self._finish_reason = str(finish)
             if finish == "content_filter":
                 self._content_filtered = True
             elif finish == "length":
@@ -4849,7 +4929,7 @@ class Agent:
                 continue
 
             if delta.content:
-                self.sink.emit(TextDelta(delta.content))
+                self.emit(TextDelta(delta.content))
                 content_parts.append(delta.content)
 
             for fragment in delta.tool_calls or []:
@@ -5216,7 +5296,7 @@ class Agent:
                 "或者停下来向用户说明卡在哪里。",
             )
 
-        self.sink.emit(ToolPending(name, args, tool_call_id=call.get("id", "")))
+        self.emit(ToolPending(name, args, tool_call_id=call.get("id", "")))
 
         #  权限判定的有序管线：
         #  deny 规则 → 会话授权/allow 规则 → 常规确认。
@@ -5226,7 +5306,7 @@ class Agent:
             self.trace.append(
                 {"tool": name, "args": args, "ok": False, "output": "DENIED_BY_RULE"}
             )
-            self.sink.emit(ToolDenied(name, by="rule", tool_call_id=call.get("id", "")))
+            self.emit(ToolDenied(name, by="rule", tool_call_id=call.get("id", "")))
             return self._tool_message(
                 call,
                 f"ERROR: 这次调用命中了用户配置的 deny 权限规则「{deny_rule}」，已拦截"
@@ -5241,7 +5321,7 @@ class Agent:
             self.trace.append(
                 {"tool": name, "args": args, "ok": False, "output": "DENIED_PLAN_MODE"}
             )
-            self.sink.emit(ToolDenied(name, by="rule", tool_call_id=call.get("id", "")))
+            self.emit(ToolDenied(name, by="rule", tool_call_id=call.get("id", "")))
             return self._tool_message(
                 call,
                 f"ERROR: 当前处于 plan mode（只读规划态），{name} 被拦截。"
@@ -5305,12 +5385,12 @@ class Agent:
         ):
             #  模型自述的调用目的：确认框上方展示，"这条命令要干嘛"不用人肉猜
             if purpose:
-                self.sink.emit(ToolPurpose(name, purpose))
+                self.emit(ToolPurpose(name, purpose))
             if asked_by_rule:
-                self.sink.emit(Notice(f"  ⚠ 命中了你配置的规则「{deny_rule}」，这一步要你点头", "warn"))
+                self.emit(Notice(f"  ⚠ 命中了你配置的规则「{deny_rule}」，这一步要你点头", "warn"))
             if guarded is not None:
                 #  为什么这一笔在 auto / --yolo 下也要问，得让人看得见
-                self.sink.emit(Notice(f"  ⚠ 要写的是可执行配置——{guarded}", "warn"))
+                self.emit(Notice(f"  ⚠ 要写的是可执行配置——{guarded}", "warn"))
             verdict = self.approver(name, args)
             malformed = verdict_problem(verdict)
             approved, note, reason, updated = normalize_verdict(verdict)
@@ -5319,10 +5399,10 @@ class Agent:
                 self.trace.append(
                     {"tool": name, "args": args, "ok": False, "output": "DENIED_BAD_VERDICT"}
                 )
-                self.sink.emit(
+                self.emit(
                     Notice(f"  ⚠ 审批回调的返回值无法识别，已按拒绝处理：{malformed}", "warn")
                 )
-                self.sink.emit(ToolDenied(name, by="user", tool_call_id=call.get("id", "")))
+                self.emit(ToolDenied(name, by="user", tool_call_id=call.get("id", "")))
                 return self._tool_message(
                     call,
                     "ERROR: 这次调用没有执行——宿主的审批回调返回了无法识别的结果，"
@@ -5330,7 +5410,7 @@ class Agent:
                 )
             if not approved:
                 self.trace.append({"tool": name, "args": args, "ok": False, "output": "DENIED"})
-                self.sink.emit(ToolDenied(name, by="user", tool_call_id=call.get("id", "")))
+                self.emit(ToolDenied(name, by="user", tool_call_id=call.get("id", "")))
                 if reason:
                     return self._tool_message(
                         call,
@@ -5352,7 +5432,7 @@ class Agent:
                     self.trace.append(
                         {"tool": name, "args": args, "ok": False, "output": "DENIED_BY_RULE"}
                     )
-                    self.sink.emit(ToolDenied(name, by="rule", tool_call_id=call.get("id", "")))
+                    self.emit(ToolDenied(name, by="rule", tool_call_id=call.get("id", "")))
                     return self._tool_message(
                         call,
                         f"ERROR: 审批方改写后的参数命中了 deny 权限规则「{deny_rule}」，"
@@ -5373,7 +5453,7 @@ class Agent:
                 self.trace.append(
                     {"tool": name, "args": args, "ok": False, "output": "DENIED_BY_HOOK"}
                 )
-                self.sink.emit(ToolDenied(name, by="rule", tool_call_id=call.get("id", "")))
+                self.emit(ToolDenied(name, by="rule", tool_call_id=call.get("id", "")))
                 return self._tool_message(
                     call,
                     f"ERROR: 这次调用被用户配置的 PreToolUse hook 拦截：{decision.reason}。"
@@ -5382,12 +5462,12 @@ class Agent:
 
         if moved := self.toolbox.target_moved(args, reviewed_target):
             self.trace.append({"tool": name, "args": args, "ok": False, "output": "TARGET_MOVED"})
-            self.sink.emit(ToolDenied(name, by="rule", tool_call_id=call.get("id", "")))
+            self.emit(ToolDenied(name, by="rule", tool_call_id=call.get("id", "")))
             return self._tool_message(call, moved)
 
         #  过了全部关卡才算 running（状态机：pending → running →
         #  completed|denied，每个 pending 恰好一个终态——将来活区 spinner 靠它不悬空）
-        self.sink.emit(ToolRunning(name, args, tool_call_id=call.get("id", "")))
+        self.emit(ToolRunning(name, args, tool_call_id=call.get("id", "")))
         started = time.monotonic()
         try:
             output = self.toolbox.run(name, args)
@@ -5401,7 +5481,7 @@ class Agent:
             #  存档里有，下一轮模型看到的是一句通用的"已中断"
             partial = getattr(exc, errors.PARTIAL_OUTPUT, None)
             partial = partial if isinstance(partial, str) and partial.strip() else ""
-            self.sink.emit(
+            self.emit(
                 ToolCompleted(
                     name,
                     output=partial or f"[执行被中断/异常：{type(exc).__name__}]",
@@ -5492,7 +5572,7 @@ class Agent:
                 **self._hook_alias(name, args),
             )
         self.trace.append({"tool": name, "args": args, "ok": ok, "output": output})
-        self.sink.emit(ToolCompleted(name, output=output, ok=ok, seconds=elapsed, tool_call_id=call.get("id", "")))
+        self.emit(ToolCompleted(name, output=output, ok=ok, seconds=elapsed, tool_call_id=call.get("id", "")))
         return self._tool_message(call, self._for_model(name, args, raw_output, output))
 
     @staticmethod

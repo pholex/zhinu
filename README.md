@@ -28,6 +28,7 @@
 ```bash
 pip install "xiaoyu-agent[tui]"        # [tui]：补全 / 历史 / 粘贴折叠 / 贴图 / diff 高亮
 pip install "xiaoyu-agent[tui,serve]"  # 还要 HTTP API（n8n / Dify 编排）就带上 [serve]
+pip install "xiaoyu-agent[otel]"       # OpenTelemetry 导出：设 OTEL_EXPORTER_OTLP_ENDPOINT 即把每轮/每次模型与工具调用打成 span 推到你的 collector（docs/observability.md）
 xiaoyu doctor                          # 体检：版本与安装方式 / 凭据有无 / 沙箱 / 磁盘 / MCP 配置（--json 给脚本，任一 FAIL 退出码 1）
 xiaoyu doctor --probe                  # 再对默认模型真发一条最小请求，报耗时与分类后的错误（默认不出网）
 xiaoyu doctor --bundle                 # 打诊断包（体检 + 脱敏配置 + 最近会话尾部 + 崩溃日志）给报 issue 用；含路径与命令历史，分享前自查
@@ -81,6 +82,9 @@ xiaoyu send zhinu-1 "顺便把 lint 跑一下"  # 给另一个终端里的小羽
 xiaoyu mcp add chrome-devtools --scope user npx -y chrome-devtools-mcp@latest
 xiaoyu mcp list                         # 写的就是 .mcp.json / mcp.json
 xiaoyu mcp probe chrome-devtools        # 不经模型直接握手、列工具；--script 按脚本调用并逐步输出 JSON
+
+eval "$(xiaoyu term init zsh)"          # 放进 ~/.zshrc（bash/fish/powershell 同理）：之后在自己的 shell 里
+@x 刚才那个报错怎么回事                   # 随时提问，带着刚跑过的命令，续写同一会话；见 docs/terminal-integration.md
 ```
 
 REPL 里：`/help` `/tools` `/skills` `/model` `/effort` `/mode` `/usage` `/context` `/compact` `/clear` `/exit` `/tasks` `/plan` `/goal` `/perm` `/allow` `/deny` `/resume` `/rewind` `/mcp` `/quit`

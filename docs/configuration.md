@@ -93,6 +93,7 @@ XIAOYU_API_KEY=<key>
 | `XIAOYU_SIGNATURE_MODELS` | — | 网关后面挂的签名型号点名（Gemini 系，工具重放需带回 thought_signature；`*` = 一律） |
 | `XIAOYU_VISION_FALLBACK` | —（不代读） | 代读模型：当前模型看不了图时，把图先交给它换成一段文字（见下方"图片代读"） |
 | `XIAOYU_ENV_FILE` | — | 指定 `.env` 路径，等价 `--env-file` |
+| `XIAOYU_TERM_SESSION` | — | 终端集成的会话 id，由 `eval "$(xiaoyu term init <shell>)"` 导出（随机 `term-<8 位>`，或 `--name` 指定的 `term-<名字>`）；`@x` / `xiaoyu term run` 按它续写会话、`xiaoyu term log|info` 按它找 pending 文件。配套的 `XIAOYU_TERM_PENDING` 是钩子追加命令的文件路径，同样由脚本导出，不必手设。见[终端集成](terminal-integration.md) |
 
 ### 上下文与压缩
 
@@ -152,6 +153,13 @@ XIAOYU_API_KEY=<key>
 | `XIAOYU_STATUS_HOOK` | — | 状态变成"等人"时后台跑的命令，状态串作最后一个参数（`waiting_input` / `waiting_approval`），也放进环境变量 `XIAOYU_STATUS`。给系统通知用，如 macOS：`osascript -e 'display notification "小羽在等你"'`；超时（10s）与失败静默。只在 TUI / 明文 REPL 生效 |
 | `XIAOYU_BROWSER_CDP` | — | 接管以 `--remote-debugging-port` 起的本机 Chrome（要登录态时用） |
 | `XIAOYU_BROWSER_HEADED` | 无头 | 有头模式启动浏览器 |
+
+### 可观测性（OpenTelemetry，标准 `OTEL_*` 变量）
+
+设了 `OTEL_EXPORTER_OTLP_ENDPOINT`（或 `OTEL_TRACES_EXPORTER=console`）就把每轮 / 每次模型调用 /
+每次工具调用按 GenAI 语义约定打成 span 推到你自己的 collector；没设就一个字节不发、包都不加载。
+需要可选 extra `pip install "xiaoyu-agent[otel]"`。变量表、span 树与属性清单、内容采集开关见
+[可观测性](observability.md)。
 
 ## 自定义 system prompt
 

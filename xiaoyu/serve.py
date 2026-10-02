@@ -386,6 +386,9 @@ class _Session:
         #  钉住的 agent（{id, name, version}）与那一版配置的快照。快照进会话而不是
         #  每次回 store 查：agent 之后再改版/归档都不该影响这个会话。
         self.agent_ref = agent_ref
+        if agent_ref and agent_ref.get("name"):
+            #  钉住了 agent 对象的会话：OpenTelemetry 里按对象名区分（gen_ai.agent.name）
+            agent.agent_name = str(agent_ref["name"])
         self.agent_config = agent_config or {}
         self.pricing = pricing or {}
         self.budget = budget
