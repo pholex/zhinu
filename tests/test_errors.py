@@ -8,7 +8,7 @@ import types
 import unittest
 from unittest import mock
 
-import httpx
+import httpx2
 import openai
 
 from xiaoyu.errors import (
@@ -24,9 +24,9 @@ from xiaoyu.errors import (
 from .test_agent_paths import AgentTestCase, call_fragment, chunk, usage_chunk
 
 
-def _response(status: int, headers: dict[str, str] | None = None) -> httpx.Response:
-    return httpx.Response(
-        status, request=httpx.Request("POST", "http://unused"), headers=headers
+def _response(status: int, headers: dict[str, str] | None = None) -> httpx2.Response:
+    return httpx2.Response(
+        status, request=httpx2.Request("POST", "http://unused"), headers=headers
     )
 
 
@@ -51,8 +51,8 @@ class ClassifyTest(unittest.TestCase):
 
     def test_timeout_and_connection_are_transient(self):
         for exc in (
-            openai.APITimeoutError(request=httpx.Request("POST", "http://unused")),
-            openai.APIConnectionError(request=httpx.Request("POST", "http://unused")),
+            openai.APITimeoutError(request=httpx2.Request("POST", "http://unused")),
+            openai.APIConnectionError(request=httpx2.Request("POST", "http://unused")),
         ):
             verdict = classify(exc)
             self.assertEqual(verdict.kind, "transient", exc)
@@ -121,7 +121,7 @@ class ClassifyTest(unittest.TestCase):
 
     def test_balance_and_spend_limit_are_quota(self):
         """余额/消费上限耗尽：以前掉进 fatal，降级链不放行、不切网关兜底。"""
-        request = httpx.Request("POST", "http://unused")
+        request = httpx2.Request("POST", "http://unused")
         samples = [
             #  DeepSeek 余额不足：HTTP 402
             openai.APIStatusError("Insufficient Balance", response=_response(402), body=None),
@@ -203,9 +203,9 @@ class AnthropicShapedTest(unittest.TestCase):
         self.assertTrue(verdict.should_compact)
 
     def test_httpx_cause_is_transient(self):
-        """anthropic 的连接/超时异常是 `raise ... from <httpx 异常>`，认底因。"""
+        """anthropic 的连接/超时异常是 `raise ... from <httpx2 异常>`，认底因。"""
         exc = RuntimeError("Connection error.")
-        exc.__cause__ = httpx.ConnectError("boom")
+        exc.__cause__ = httpx2.ConnectError("boom")
         self.assertEqual(classify(exc).kind, "transient")
 
     def test_retry_after_header_is_read_from_duck_response(self):
@@ -285,7 +285,7 @@ class AllKindsTest(unittest.TestCase):
     def sample_errors(self) -> dict[str, Exception]:
         return {
             "rate_limit": rate_limit_error(),
-            "transient": openai.APITimeoutError(request=httpx.Request("POST", "http://unused")),
+            "transient": openai.APITimeoutError(request=httpx2.Request("POST", "http://unused")),
             "context_overflow": openai.BadRequestError(
                 "prompt is too long", response=_response(400), body=None
             ),
@@ -503,8 +503,8 @@ class RequestLogTest(AgentTestCase):
             self.assertIn("total_ms", record)
 
     def test_request_id_and_code_are_kept_when_the_upstream_gives_them(self):
-        response = httpx.Response(
-            429, request=httpx.Request("POST", "http://unused"),
+        response = httpx2.Response(
+            429, request=httpx2.Request("POST", "http://unused"),
             headers={"x-request-id": "req-abc"},
         )
         exc = openai.RateLimitError("慢一点", response=response, body={"error": {"code": "1302"}})
@@ -944,7 +944,7 @@ class StreamTruncationTest(AgentTestCase):
 
 def _stream_error(message: str, body=None) -> openai.APIError:
     """流内错误事件的样子：没有状态码的裸 APIError。"""
-    return openai.APIError(message, request=httpx.Request("POST", "http://unused"), body=body)
+    return openai.APIError(message, request=httpx2.Request("POST", "http://unused"), body=body)
 
 
 class ContextOverflowWordingTest(unittest.TestCase):
@@ -1015,7 +1015,7 @@ class BareStreamErrorTest(unittest.TestCase):
     def test_request_errors_with_a_status_stay_fatal(self):
         exc = openai.BadRequestError(
             "invalid tool schema",
-            response=httpx.Response(400, request=httpx.Request("POST", "http://unused")),
+            response=httpx2.Response(400, request=httpx2.Request("POST", "http://unused")),
             body=None,
         )
         self.assertEqual(classify(exc).kind, "fatal")
@@ -1038,11 +1038,11 @@ class CertificateFailureTest(unittest.TestCase):
                 )
             except ssl.SSLCertVerificationError as inner:
                 try:
-                    raise httpx.ConnectError("tls failed") from inner
-                except httpx.ConnectError as middle:
+                    raise httpx2.ConnectError("tls failed") from inner
+                except httpx2.ConnectError as middle:
                     raise openai.APIConnectionError(
                         message="Connection error.",
-                        request=httpx.Request("POST", "http://unused"),
+                        request=httpx2.Request("POST", "http://unused"),
                     ) from middle
         except openai.APIConnectionError as exc:
             return exc
@@ -1059,7 +1059,7 @@ class CertificateFailureTest(unittest.TestCase):
         self.assertIn("证书", classify(exc).hint)
 
     def test_ordinary_connection_errors_stay_transient(self):
-        exc = openai.APIConnectionError(request=httpx.Request("POST", "http://unused"))
+        exc = openai.APIConnectionError(request=httpx2.Request("POST", "http://unused"))
         self.assertEqual(classify(exc).kind, "transient")
 
 
@@ -1096,7 +1096,7 @@ class TransientMarkerTest(unittest.TestCase):
 
     def test_bare_api_error_without_status(self):
         exc = openai.APIError(
-            "Overloaded", request=httpx.Request("POST", "http://unused"), body=None
+            "Overloaded", request=httpx2.Request("POST", "http://unused"), body=None
         )
         self.assertIsNone(getattr(exc, "status_code", None))
         self.assertEqual(classify(exc).kind, "transient")

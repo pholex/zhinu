@@ -1,15 +1,15 @@
 """出网代理：小羽**自身** HTTP 客户端的代理策略，全仓只此一处。
 
-为什么不交给 httpx / urllib 各自读环境变量（它们默认就读）：
+为什么不交给 httpx2 / urllib 各自读环境变量（它们默认就读）：
 1. **回环地址会被绕进代理**。两家都只认 NO_PROXY，用户开着 HTTPS_PROXY 又没配
    NO_PROXY 时，连 localhost:8000 的本机模型端点也发给代理——代理多半不转发回环，
    表现是本机端点"时通时不通"，最难查。小羽连回环一律直连，不看 NO_PROXY。
-2. **不支持 / 缺依赖的 scheme 直接炸 traceback**。httpx 在构造 client 时就解析代理：
+2. **不支持 / 缺依赖的 scheme 直接炸 traceback**。httpx2 在构造 client 时就解析代理：
    socks5 没装 socksio 抛 ImportError、socks4 抛 ValueError——第一次调模型就崩，
    而 curl、git 这些工具明明认这个变量。这里把它降级成一条人话诊断（只打一次），
    该变量对小羽自身客户端视同未设置，其余照常。
 3. **urllib 的默认 opener 在首次 urlopen 时就把代理配置冻住**，之后改环境不生效；
-   且它不认 ALL_PROXY、不认 SOCKS。统一从这里取 opener，与 httpx 一路同一份判定。
+   且它不认 ALL_PROXY、不认 SOCKS。统一从这里取 opener，与 httpx2 一路同一份判定。
 
 边界（刻意不做的）：
 - **不改写 os.environ**。bash 工具、MCP stdio server 等子进程继承用户原值——
@@ -18,7 +18,7 @@
   （有 REQUEST_METHOD）忽略大写 HTTP_PROXY（httpoxy）。Windows 的环境变量本就
   大小写不敏感，同一套逻辑两边都对。
 - 环境里一个代理变量都没有时，退回标准库的系统代理设置（macOS 网络偏好 /
-  Windows 注册表）——这是 httpx / urllib 原本的行为，不能因为收口而丢掉。
+  Windows 注册表）——这是 httpx2 / urllib 原本的行为，不能因为收口而丢掉。
 """
 
 from __future__ import annotations
@@ -33,9 +33,9 @@ from dataclasses import dataclass
 from typing import Any, Mapping
 from urllib.parse import urlsplit
 
-import httpx
+import httpx2
 
-#  httpx 认的代理 scheme；socks5 系还要 socksio
+#  httpx2 认的代理 scheme；socks5 系还要 socksio
 _HTTP_SCHEMES = ("http", "https")
 _SOCKS5_SCHEMES = ("socks5", "socks5h")
 #  只关心这几种：别的 *_PROXY（ftp_proxy、TRAVIS_APT_PROXY…）与小羽的出网无关
@@ -45,7 +45,7 @@ def socks_remedy() -> str:
     """装 SOCKS 依赖的命令（按小羽所在的环境给，见 envprobe.install_hint）。"""
     from .envprobe import install_hint
 
-    return install_hint("httpx[socks]")
+    return install_hint("httpx2[socks]")
 
 
 @dataclass(frozen=True)
@@ -174,7 +174,7 @@ def socks_available() -> bool:
 def _check(kind: str, var: str, raw: str, socks_ok: bool) -> Entry | Rejected:
     url = raw.strip()
     if "://" not in url:
-        url = "http://" + url  # 与 curl / httpx / urllib 同一约定：裸 host:port 当 http
+        url = "http://" + url  # 与 curl / httpx2 / urllib 同一约定：裸 host:port 当 http
     shown = redact(url)
     try:
         parts = urlsplit(url)
@@ -189,7 +189,7 @@ def _check(kind: str, var: str, raw: str, socks_ok: bool) -> Entry | Rejected:
         return Rejected(var, shown, "SOCKS5 代理需要 socksio 依赖，当前环境没装", socks_remedy())
     if scheme in ("socks4", "socks4a"):
         return Rejected(
-            var, shown, "小羽的 HTTP 客户端（httpx）不支持 SOCKS4",
+            var, shown, "小羽的 HTTP 客户端（httpx2）不支持 SOCKS4",
             "改用 socks5:// 或 http:// 代理地址（多数本地代理软件同端口都支持）",
         )
     if scheme not in _HTTP_SCHEMES + _SOCKS5_SCHEMES:
@@ -198,9 +198,9 @@ def _check(kind: str, var: str, raw: str, socks_ok: bool) -> Entry | Rejected:
             "改用 http://、https:// 或 socks5:// 代理地址",
         )
     try:
-        httpx.Proxy(url)  # 让 httpx 自己再验一遍，构造 client 时就不会再有意外
+        httpx2.Proxy(url)  # 让 httpx2 自己再验一遍，构造 client 时就不会再有意外
     except Exception as exc:  # noqa: BLE001 - 任何解析异常都降级成诊断
-        return Rejected(var, shown, f"httpx 拒绝这个地址（{exc}）", f"检查 {var} 的写法")
+        return Rejected(var, shown, f"httpx2 拒绝这个地址（{exc}）", f"检查 {var} 的写法")
     return Entry(kind, var, url)
 
 
@@ -341,14 +341,14 @@ def _no_proxy_matches(patterns: tuple[str, ...], host: str, port: int | None) ->
     return False
 
 
-# ---------- httpx（openai / anthropic SDK） ----------
+# ---------- SDK 传输（共享 httpx2 代理策略） ----------
 
 
-class _RoutingTransport(httpx.BaseTransport):
+class _RoutingTransport(httpx2.BaseTransport):
     """按请求逐条判定直连还是走哪条代理。
 
-    为什么不用 httpx 的 mounts：URLPattern 表达不了 127.0.0.0/8、CIDR 形式的
-    NO_PROXY，两套判定写两遍迟早分叉；而且只要 client 不传 transport，httpx
+    为什么不用 httpx2 的 mounts：URLPattern 表达不了 127.0.0.0/8、CIDR 形式的
+    NO_PROXY，两套判定写两遍迟早分叉；而且只要 client 不传 transport，httpx2
     （以及 anthropic SDK 的默认 client）就会先按环境变量把代理 transport 建出来——
     正是那一步对 socks4 / 缺 socksio 抛异常。显式传 transport 让它们完全不碰
     环境里的代理变量；trust_env 仍保持默认开（SSL_CERT_FILE / SSL_CERT_DIR 照认）。
@@ -360,22 +360,22 @@ class _RoutingTransport(httpx.BaseTransport):
     def __init__(self, plan: ProxyPlan, **transport_kwargs: Any) -> None:
         self._plan = plan
         self._kwargs = transport_kwargs
-        self._direct = httpx.HTTPTransport(**transport_kwargs)
-        self._proxied: dict[str, httpx.HTTPTransport] = {}
+        self._direct = httpx2.HTTPTransport(**transport_kwargs)
+        self._proxied: dict[str, httpx2.HTTPTransport] = {}
         self._lock = threading.Lock()
 
-    def _transport_for(self, url: httpx.URL) -> httpx.BaseTransport:
+    def _transport_for(self, url: httpx2.URL) -> httpx2.BaseTransport:
         entry = self._plan.entry_for(url.scheme, url.host, url.port)
         if entry is None:
             return self._direct
         with self._lock:
             if entry.url not in self._proxied:
-                self._proxied[entry.url] = httpx.HTTPTransport(
-                    proxy=httpx.Proxy(entry.url), **self._kwargs
+                self._proxied[entry.url] = httpx2.HTTPTransport(
+                    proxy=httpx2.Proxy(entry.url), **self._kwargs
                 )
             return self._proxied[entry.url]
 
-    def handle_request(self, request: httpx.Request) -> httpx.Response:
+    def handle_request(self, request: httpx2.Request) -> httpx2.Response:
         return self._transport_for(request.url).handle_request(request)
 
     def close(self) -> None:
@@ -403,8 +403,8 @@ def _keepalive_socket_options() -> list[tuple[int, int, int | bool]]:
     return options
 
 
-def http_client(sdk: str = "openai") -> httpx.Client:
-    """给 openai / anthropic SDK 传 `http_client=` 用的 httpx client。
+def http_client(sdk: str = "openai") -> httpx2.Client:
+    """给 SDK 传 `http_client=`，请求与传输必须来自同一套 HTTP 实现。
 
     基类用 SDK 自己导出的 DefaultHttpxClient：超时、连接数上限、跟随重定向
     与 SDK 自建时一致。base_url / timeout / max_retries 仍由 SDK 构造参数决定

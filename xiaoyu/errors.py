@@ -14,8 +14,8 @@ from email.utils import parsedate_to_datetime
 from dataclasses import dataclass
 from typing import Any, Callable
 
-#  httpx 是 openai / anthropic 两个 SDK 共同的硬传递依赖，顶层 import 安全
-import httpx
+#  httpx2 是两套已锁定 SDK 的共同传递依赖。
+import httpx2
 
 
 #  打断时挂在异常上的属性名：批量工具把已收束各项的报告放在这里再上抛，主循环
@@ -459,12 +459,10 @@ def classify(exc: Exception) -> Verdict:
         #  >=500 覆盖非 openai SDK 的服务端错误（含 anthropic 529 overloaded）
         or (status is not None and status >= 500)
         or status in _TRANSIENT_STATUSES
-        #  anthropic 的连接/超时异常是 `raise ... from <httpx 异常>`，认底因即可
-        or isinstance(exc.__cause__, httpx.HTTPError)
-        #  流迭代到一半断开时两个 SDK 都不包装：抛出来的就是裸的 httpx 传输层异常
-        #  （对端关连接、分块读到一半、读超时）。证书失败也以 ConnectError 的形态
-        #  出现，它在上面的 _certificate_failure 已经先行判掉，走不到这里
-        or isinstance(exc, httpx.TransportError)
+        #  SDK 包装的网络异常认底因；流中途也可能抛裸的传输异常。
+        #  证书失败在上面的 _certificate_failure 先行判掉，不进重试。
+        or isinstance(exc.__cause__, httpx2.HTTPError)
+        or isinstance(exc, httpx2.TransportError)
         #  没有状态码可判的流内错误事件，只剩措辞可认（见 _TRANSIENT_MARKERS）
         or any(marker in text for marker in _TRANSIENT_MARKERS)
     ):

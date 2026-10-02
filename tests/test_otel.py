@@ -218,10 +218,10 @@ class SpanTreeTest(_SpanTestCase):
         self.assertLessEqual(tool.end_time, chats[1].start_time)
 
     def test_failed_request_is_error_with_kind(self) -> None:
-        import httpx
+        import httpx2
         import openai
 
-        response = httpx.Response(429, request=httpx.Request("POST", "http://unused"))
+        response = httpx2.Response(429, request=httpx2.Request("POST", "http://unused"))
         limited = openai.RateLimitError("slow down", response=response, body=None)
         agent = self.build([limited, [chunk(content="恢复"), usage_chunk(10, 2)]])
         with mock.patch("xiaoyu.agent.Agent._sleep"):

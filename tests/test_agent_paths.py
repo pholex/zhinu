@@ -15,7 +15,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-import httpx
+import httpx2
 import openai
 
 from xiaoyu.agent import Agent
@@ -1331,7 +1331,7 @@ class EmptyCompletionRecoveryTest(AgentTestCase):
         """网关位默认猜它认绕过字段；猜错（严格兼容端点 400）时本会话停带、不计次原样重发。"""
         rejected = openai.BadRequestError(
             "Unrecognized request argument supplied: cache",
-            response=httpx.Response(400, request=httpx.Request("POST", "https://gw.example/v1")),
+            response=httpx2.Response(400, request=httpx2.Request("POST", "https://gw.example/v1")),
             body=None,
         )
         empty = [chunk(content=None)]

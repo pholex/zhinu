@@ -365,12 +365,12 @@ class ProbeTest(unittest.TestCase):
     def test_failure_is_classified_not_raised(self) -> None:
         import types
 
-        import httpx
+        import httpx2
         import openai
 
         def boom(**kw):
-            request = httpx.Request("POST", "http://unused")
-            response = httpx.Response(401, request=request)
+            request = httpx2.Request("POST", "http://unused")
+            response = httpx2.Response(401, request=request)
             raise openai.AuthenticationError("bad key " + FAKE_KEY, response=response, body=None)
 
         client = types.SimpleNamespace(

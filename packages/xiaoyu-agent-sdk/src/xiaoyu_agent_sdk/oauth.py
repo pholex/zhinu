@@ -84,9 +84,9 @@ class OAuthClient:
         self._invalid = False
 
     def _post(self, url: str, data: dict[str, str]) -> dict[str, Any]:
-        import httpx
+        import httpx2
         try:
-            with httpx.Client(timeout=self.timeout, trust_env=False, follow_redirects=False) as client:
+            with httpx2.Client(timeout=self.timeout, trust_env=False, follow_redirects=False) as client:
                 response = client.post(url, data=data)
                 if response.status_code != 200:
                     raise OAuthError("OAuth endpoint rejected request")

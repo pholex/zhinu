@@ -25,7 +25,7 @@ from dataclasses import dataclass, field
 from typing import Any
 from urllib.parse import urlsplit
 
-import httpx
+import httpx2
 
 from . import netproxy
 from .config import GATEWAY_KEY_ENVS, Config, MissingConfig, find_api_key
@@ -87,9 +87,9 @@ DISCOVER_SENTINEL = "auto"
 _DISCOVER_TIMEOUT = 5.0
 
 #  建连超时（秒）。**为什么要和 request_timeout 分开**：把 600.0 这样一个标量交给
-#  SDK，httpx 会把 connect/read/write/pool 全设成它——端点写错、网关挂了、DNS 不通
+#  SDK，httpx2 会把 connect/read/write/pool 全设成它——端点写错、网关挂了、DNS 不通
 #  这类"连都连不上"的故障要干等 10 分钟才报错，用户只看到假死。建连是秒级的事，
-#  跨境链路留足余量也就十几秒；read 仍用 request_timeout（httpx 的 read 超时是**逐次
+#  跨境链路留足余量也就十几秒；read 仍用 request_timeout（httpx2 的 read 超时是**逐次
 #  读**计的，对流式请求天然等价于"两个 chunk 之间最多等多久"，生成慢不会误伤）。
 _CONNECT_TIMEOUT = 15.0
 
@@ -116,9 +116,9 @@ def __getattr__(name: str) -> Any:
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
-def request_timeout(seconds: float) -> httpx.Timeout:
-    """把配置里的单个超时秒数摊成 httpx 的四段超时（建连短、读写长）。"""
-    return httpx.Timeout(seconds, connect=min(_CONNECT_TIMEOUT, seconds))
+def request_timeout(seconds: float) -> httpx2.Timeout:
+    """把配置里的单个超时秒数摊成 httpx2 的四段超时（建连短、读写长）。"""
+    return httpx2.Timeout(seconds, connect=min(_CONNECT_TIMEOUT, seconds))
 
 
 def _discover_models(base_url: str, api_key: str, label: str) -> tuple[str, ...]:
@@ -134,7 +134,7 @@ def _discover_models(base_url: str, api_key: str, label: str) -> tuple[str, ...]
         #  清单在关连接之前取完：翻页是迭代时才发的请求
         models = tuple(sorted({m.id for m in page if getattr(m, "id", "").strip()}))
     except Exception as exc:
-        reason = str(exc).splitlines()[0][:160] or type(exc).__name__
+        reason = (str(exc).strip() or type(exc).__name__).splitlines()[0][:160]
         print(f"[{label}：/v1/models 探测失败，该 provider 本次未注册：{reason}]", file=sys.stderr)
         return ()
     finally:
@@ -692,7 +692,7 @@ class Registry:
         factory = None
         if provider.anthropic_models:
 
-            def factory(p: Provider = provider, t: httpx.Timeout = self._timeout) -> Any:
+            def factory(p: Provider = provider, t: httpx2.Timeout = self._timeout) -> Any:
                 from . import messages
 
                 if p.aws_region:

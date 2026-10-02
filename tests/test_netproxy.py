@@ -136,6 +136,37 @@ class LoopbackBypassTest(unittest.TestCase):
             self.assertIsNone(mcp_guard.osv_malware_check("npx", ["-y", "some-pkg"]))
         self.assertEqual(self.proxy_hits, ["POST http://osv.example.invalid/v1/query"])
 
+    def test_both_sdk_transports_honor_no_proxy_for_remote_hosts(self) -> None:
+        #  远端域名只在测试中解析到本机，验证 NO_PROXY 实际选路而非仅测策略表。
+        import socket
+
+        resolve = socket.getaddrinfo
+
+        def local_address(host, *args, **kwargs):
+            if host in ("models.example.invalid", b"models.example.invalid"):
+                host = "127.0.0.1"
+            return resolve(host, *args, **kwargs)
+
+        endpoint = self.endpoint.replace("127.0.0.1", "models.example.invalid")
+        with mock.patch.dict(os.environ, {"NO_PROXY": "models.example.invalid", "no_proxy": "models.example.invalid"}), \
+             mock.patch("socket.getaddrinfo", side_effect=local_address):
+            for sdk in ("openai", "anthropic"):
+                with self.subTest(sdk=sdk), netproxy.http_client(sdk) as client:
+                    response = client.get(endpoint + "/v1/models")
+                    self.assertEqual(response.json()["data"][0]["id"], "m1")
+        self.assertEqual(self.proxy_hits, [])
+        self.assertEqual(len(self.endpoint_hits), 2)
+
+    def test_openai_timeout_keeps_short_connect_and_long_read(self) -> None:
+        registry = providers.Registry(
+            [providers.Provider("local", self.endpoint + "/v1", "k", ("m1",), "l")],
+            timeout=120,
+        )
+        client = registry.client("local")
+        self.addCleanup(client.close)
+        self.assertEqual(client.timeout.connect, 15)
+        self.assertEqual(client.timeout.read, 120)
+
 
 class UnsupportedSchemeTest(unittest.TestCase):
     """不支持 / 缺依赖的代理 scheme：不抛 traceback，诊断一次，该变量对自身客户端不生效。"""
@@ -164,7 +195,7 @@ class UnsupportedSchemeTest(unittest.TestCase):
             messages.client("https://api.example.invalid/v1", "k", 5.0)
         text = err.getvalue()
         self.assertEqual(text.count("ALL_PROXY"), 1, text)
-        self.assertIn('pip install "httpx[socks]"', text)  # 普通环境：点名解释器的 pip
+        self.assertIn('pip install "httpx2[socks]"', text)  # 普通环境：点名解释器的 pip
         self.assertIn(sys.executable, text)
 
     def test_socks4_is_rejected_without_value_error(self) -> None:

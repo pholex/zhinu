@@ -9,7 +9,9 @@ MCP、子 agent 委托、错误边界。每一项的判定都是机械的（文�
 
 ```bash
 ws=$(mktemp -d) && cd "$ws"
+test_config=$(mktemp -d)
 schema='{"type":"object","properties":{"total":{"type":"integer"},"passed":{"type":"integer"},"skipped":{"type":"integer"},"rate":{"type":"number"},"items":{"type":"array","items":{"type":"object","properties":{"id":{"type":"string"},"status":{"type":"string","enum":["pass","fail","skip"]},"evidence":{"type":"string"}},"required":["id","status","evidence"]}}},"required":["total","passed","skipped","rate","items"]}'
+XDG_CONFIG_HOME="$test_config" APPDATA="$test_config" \
 xiaoyu -p "$(cat /path/to/zhinu/tests_ai/self_test.md)" --yolo \
     --output-format json --output-schema "$schema" > self_test.json
 jq '.output | {total, passed, skipped, rate}' self_test.json
@@ -18,6 +20,8 @@ jq -e '.output.rate >= 0.8' self_test.json       # 阈值：通过率 ≥ 80%（
 
 `--yolo` 是必须的：清单里有写文件和跑命令，无人值守下没人按确认。沙箱保持默认开
 （phase 6 要靠它）。换模型加 `--model`。
+用户配置隔离是为了让已有 deny 规则不抢先拦截硬红线测试；测试不修改原权限文件。
+若模型密钥来自用户级 `.env`，用 `XIAOYU_ENV_FILE` 显式指向原配置文件。
 
 ---
 
@@ -53,13 +57,15 @@ jq -e '.output.rate >= 0.8' self_test.json       # 阈值：通过率 ≥ 80%（
 - **P3-1 超长输出被截断并给召回 id**：`bash` 跑 `seq 1 300000`（远超 30 000 字符的
   内联上限）。判定：工具结果不是全量输出，而是头尾预览 + 一个「召回 id」。
 - **P3-2 recall 按正则取中段**：用 `recall` 工具，给上一步的 id 和 pattern
-  `^123456$`。判定：返回恰好一行匹配，内容为 `123456`（带行号 123456）。
+  `^123456$`。判定：返回恰好一行匹配，内容为 `123456`，并带完整工具输出中的
+  行号（bash 结果的状态头也计入行号，不要求行号等于数字内容）。
 - **P3-3 recall 列表**：不带 id 调 `recall`。判定：列表里包含上一步那个 id。
 
 ### Phase 4：技能加载
 
 - **P4-1 工作区技能落盘后可加载**：用 `write_file` 写
-  `.xiaoyu/skills/selftest/SKILL.md`，内容如下（frontmatter 必须完整）：
+  `.agents/skills/selftest/SKILL.md`，内容如下（frontmatter 必须完整；使用普通项目
+  技能目录，避免受保护的 `.xiaoyu/` 配置写入需要交互确认）：
 
   ```
   ---

@@ -17,10 +17,10 @@ requires-python = ">=3.11"
 # 精确锁版本（供应链纪律）：范围声明会让 PyPI 上被投毒的
 # 新版本无需审查自动进入用户机器。升级 = 有意改这一行并重跑测试。
 dependencies = [
-    "openai==2.52.0",
-    #  Anthropic Messages 协议直连（xiaoyu/messages.py）。与 openai 同为
-    #  Stainless 生成、共享 httpx 传输，锁版本纪律相同
-    "anthropic==0.121.0",
+    "openai==3.23.0",
+    #  Anthropic Messages 协议直连（xiaoyu/messages.py），锁版本纪律同上；
+    #  两套 SDK 均使用 httpx2 传输
+    "anthropic==1.9.0",
     #  bash 语法白名单解析（权限判定用）：解析失败/缺包时代码自动回退字符串黑名单，
     #  所以两个包即使某平台没有 wheel 也不致命
     "tree-sitter>=0.22",
@@ -31,15 +31,15 @@ dependencies = [
 sdk = ["jsonschema==4.26.0"]
 # TUI 前端（输入补全/跨会话历史/底部状态栏/富文本确认框）。
 # 可选：缺包时自动退回明文 REPL。同主依赖一样精确锁版本；
-# rich 不用 15.x——刚发的大版本先观望，14 线是成熟尾版。
+# rich 15 移除 Python 3.8 支持，项目最低 Python 3.11 不受影响。
 tui = [
     "prompt_toolkit==3.0.53",
-    "rich==14.3.4",
+    "rich==15.0.0",
 ]
 # 可选：browser 工具的引擎。装完还需跑一次 `playwright install chromium`
 # 下载浏览器内核；没装 playwright 时 browser 工具经 check_fn 自动隐藏。
 browser = [
-    "playwright==1.62.0",
+    "playwright==1.63.0",
 ]
 # 可选：AWS Bedrock 直连（XIAOYU_BEDROCK_REGION）。anthropic SDK 的 SigV4 签名
 # 要 botocore；凭据走 AWS 默认凭证链，所以不引入别的东西。缺包时首个请求前报
@@ -63,7 +63,7 @@ otel = [
 ]
 serve = [
     "fastapi==0.141.1",
-    "uvicorn==0.52.3",
+    "uvicorn==0.54.0",
     # 浏览器桥的 WebSocket（uvicorn 不带 ws 实现，缺它 /session/{id}/browser 握手直接 500）
     "websockets==17.1",
 ]

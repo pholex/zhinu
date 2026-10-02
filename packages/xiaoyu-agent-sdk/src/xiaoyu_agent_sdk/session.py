@@ -213,20 +213,20 @@ class Session:
         if client is None:
             if not model.api_key:
                 raise ConfigurationError("api_key must be explicitly supplied")
-            import httpx
+            import httpx2
             from openai import OpenAI
             from xiaoyu.responses import wrap
 
             base = OpenAI(api_key=model.api_key, base_url=model.base_url,
                           timeout=model.request_timeout, max_retries=0,
-                          http_client=httpx.Client(trust_env=False))
+                          http_client=httpx2.Client(trust_env=False))
             self._owned_clients.append(base)
 
             def anthropic_factory():
                 from anthropic import Anthropic
                 other = Anthropic(api_key=model.api_key, base_url=model.base_url,
                                   timeout=model.request_timeout, max_retries=0,
-                                  http_client=httpx.Client(trust_env=False))
+                                  http_client=httpx2.Client(trust_env=False))
                 self._owned_clients.append(other)
                 return other
 

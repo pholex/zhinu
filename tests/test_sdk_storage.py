@@ -42,13 +42,17 @@ class StorageTests(unittest.TestCase):
         check_session_store(self.store, self.workspace)
 
     def test_concurrent_session_writers_keep_every_committed_record(self):
+        # Check committed data, not runner disk latency: FULL synchronous writes
+        # can queue for more than the default five seconds on shared Windows CI.
+        # The timeout tests below exercise bounded admission separately.
+        store = SQLiteSessionStore(self.store.path, timeout=30)
         ready = threading.Barrier(8)
 
         def write(index):
             key = str(index)
-            writer = self.store.open(key, metadata={"event": "meta", "session_id": key})
+            writer = store.open(key, metadata={"event": "meta", "session_id": key})
             try:
-                ready.wait(timeout=10)
+                ready.wait(timeout=30)
                 for number in range(20):
                     writer.append(str(number), {"session": key, "number": number})
             finally:
@@ -58,7 +62,7 @@ class StorageTests(unittest.TestCase):
         with ThreadPoolExecutor(max_workers=8) as pool:
             keys = list(pool.map(write, range(8)))
         for key in keys:
-            writer = self.store.open(key, metadata={}, resume=True)
+            writer = store.open(key, metadata={}, resume=True)
             try:
                 self.assertEqual(writer.read()[1:], [{"session": key, "number": n} for n in range(20)])
             finally:
