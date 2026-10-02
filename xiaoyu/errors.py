@@ -133,7 +133,23 @@ _CONTEXT_MARKERS = (
     #  maximum model length of N"），没有对着真实服务核对过
     "exceeds the max_model_len",
     "maximum model length",
+    #  llama.cpp server 的文案（结构化形态见 _structured_overflow）
+    "exceeds the available context size",
+    #  网关/反代按请求体大小拒绝（HTTP 413 一类的正文措辞）：对我们来说和超限
+    #  是同一件事——同一份历史不压缩再发还是这么大
+    "request body too large",
+    "payload too large",
+    "request entity too large",
 )
+
+#  措辞里带数字的超限形态，单靠子串认不出："content length 1234567 bytes
+#  exceeds …" 这类。要求数字 + bytes 同时出现，免得撞上普通的 Content-Length
+#  头部报错
+_CONTEXT_PATTERNS = (re.compile(r"content[ _-]?length\b[^.\n]{0,60}?\d+\s*bytes"),)
+
+#  llama.cpp 超限错误的结构化字段：type 固定、附带两个计数（提示 token 数 >
+#  上下文大小）。按字段判比按文案稳——文案随版本改过
+_LLAMA_OVERFLOW_TYPE = "exceed_context_size_error"
 
 #  结构化错误码里的超限：码比措辞稳（文案会改、会被网关转写，码不会）
 _CONTEXT_CODES = (
@@ -299,6 +315,23 @@ def _vendor_kind(exc: Exception) -> str:
     return _VENDOR_CODES.get(code, "")
 
 
+def _structured_overflow(exc: Exception) -> bool:
+    """错误体里按结构认超限：llama.cpp 的 `exceed_context_size_error`，或
+    `n_prompt_tokens` > `n_ctx` 两个计数（哪怕 type 字段没带）。"""
+    body = getattr(exc, "body", None)
+    if not isinstance(body, dict):
+        return False
+    inner = body.get("error") if isinstance(body.get("error"), dict) else body
+    if inner.get("type") == _LLAMA_OVERFLOW_TYPE:
+        return True
+    prompt, ctx = inner.get("n_prompt_tokens"), inner.get("n_ctx")
+    return (
+        isinstance(prompt, int) and isinstance(ctx, int)
+        and not isinstance(prompt, bool) and not isinstance(ctx, bool)
+        and prompt > ctx
+    )
+
+
 def _certificate_failure(exc: BaseException) -> bool:
     """底因链上有没有证书校验失败。SDK 把它包成连接错误再抛，得顺着链找。"""
     seen: set[int] = set()
@@ -398,8 +431,13 @@ def classify(exc: Exception) -> Verdict:
     vendor = _vendor_kind(exc)
     if (
         vendor == "context_overflow"
+        #  413 Payload Too Large：网关/反代在请求体大小上拒绝，与模型报超限同治——
+        #  历史不压缩，重试多少次都是这么大
+        or status == 413
         or _error_code(exc) in _CONTEXT_CODES
+        or _structured_overflow(exc)
         or any(marker in text for marker in _CONTEXT_MARKERS)
+        or any(pattern.search(text) for pattern in _CONTEXT_PATTERNS)
     ):
         #  上下文超限：压缩后值得立刻重试
         return Verdict("context_overflow", True, True, "上下文超限，压缩后重试")

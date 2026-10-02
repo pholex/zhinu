@@ -79,7 +79,15 @@ from .messages import (
     supports_task_budget,
 )
 from .responses import CACHE_KEY, OPERATOR_KEY, REASONING_KEY, TOOL_EXTRAS_KEY
-from .tools import PURPOSE_PARAM, Tool, Toolbox, coerce_to_schema, wrap_untrusted
+from .invisible import strip_invisible
+from .tools import (
+    PURPOSE_PARAM,
+    Tool,
+    Toolbox,
+    canonical_tool_name,
+    coerce_to_schema,
+    wrap_untrusted,
+)
 
 #  approver(tool_name, args) -> True=允许；(True, 附言)=允许且附言随 tool result
 #  回灌模型；False / "" / (False, 理由)=拒绝；非空 str（或 Deny.reason）=拒绝并附理由。
@@ -622,6 +630,9 @@ def collect_project_docs(
                 text = path.read_text(encoding="utf-8", errors="replace").strip()
             except OSError:
                 continue
+            #  指令文件进的是 system prompt，"由项目维护者提供，遵照执行"——
+            #  clone 下来的仓库里一段看不见的 Tag 字符就是一段看不见的指令
+            text = strip_invisible(text, f"项目指令文件 {path}").strip()
             if not text:
                 continue
             if level == workspace:
@@ -2535,6 +2546,23 @@ class Agent:
                     )
                 )
 
+    def _record_reply(self, message: dict[str, Any]) -> None:
+        """模型回复入历史——**空回复不入**：没正文、没工具调用的 assistant 消息
+        留在历史里，之后每一次请求都带着一条空壳；有的端点直接 400（空 content
+        不合法），其余的也只是多付 token。只记会话日志事件做诊断。
+
+        不是空的都入：半截的流式回答（中断/截断，带标记）、只有工具调用的回复
+        都有内容。空回复之后的 nudge / 原地重发由调用方决定，这里不管。
+        """
+        if (
+            not media.text_of(message.get("content")).strip()
+            and not message.get("tool_calls")
+        ):
+            if self.session_log:
+                self.session_log.event("empty_reply_dropped")
+            return
+        self._record(message)
+
     def _record_operator(self, text: str) -> None:
         """以 operator 身份入历史：harness/宿主说的话，不是用户原话。
 
@@ -2796,7 +2824,7 @@ class Agent:
             self.maybe_compact()
             self._begin_step()
             message = self._stream_with_recovery()
-            self._record(message)
+            self._record_reply(message)
             truncated = self._length_truncated
             #  什么都没吐出来就撞了上限（输出额度被推理吃光）：没有断点可接，
             #  续写只会原样再来一次
@@ -2974,7 +3002,7 @@ class Agent:
             )
             self._record_operator(WRAPUP_INSTRUCTION)
         self._begin_step(with_tools=False)
-        self._record(self._stream_with_recovery(with_tools=False))
+        self._record_reply(self._stream_with_recovery(with_tools=False))
 
     # ---------- 预算：token 软预算 + 轮数延期 ----------
 
@@ -3048,7 +3076,7 @@ class Agent:
         self._record_operator(TURN_EXTENSION_OFFER)
         self._begin_step(schemas=(EXTEND_TURNS_SCHEMA,))
         message = self._stream_with_recovery()
-        self._record(message)
+        self._record_reply(message)
         granted = 0
         calls = message.get("tool_calls") or []
         for call in calls:
@@ -4349,8 +4377,13 @@ class Agent:
                 except json.JSONDecodeError:
                     del pending[index]
                     dropped += 1
+            #  丢掉的调用要连"下一步怎么办"一起说：没有这句，模型最常见的反应是
+            #  把同一个超大的 write_file 原样再发一次、在同一处再截一次
             marker = "[输出达到模型长度上限，在此截断" + (
-                f"；{dropped} 个没写完的工具调用已丢弃]" if dropped else "]"
+                f"；{dropped} 个没写完的工具调用已丢弃——不要原样重发，"
+                "把那一步拆小：分多次写入、减少单次参数量]"
+                if dropped
+                else "]"
             )
             self._truncation_had_output = bool(text.strip() or dropped or pending)
             text = f"{text}\n{marker}" if text else marker
@@ -4369,10 +4402,15 @@ class Agent:
             #  id 一路都没给的调用（无 index 流的病理形状）补本地 id：重放和
             #  tool result 都靠 tool_call_id 配对，空 id 两头全断（签名也会因
             #  没有键可挂而丢）。id 只在本会话内闭环消费，本地合成即自洽——但必须
-            #  整个会话内不重复：按位置编号每轮都从 0 起，跨轮撞号，调用与结果配错对
+            #  整个会话内不重复：按位置编号每轮都从 0 起，跨轮撞号，调用与结果配错对。
+            #  同一响应里两个调用撞了同一个 id（模型/网关复用）同理：后来的换新 id
+            #  而不是丢掉——两条调用都是模型要做的事，丢一条等于悄悄少干活；而
+            #  两条 tool result 挂同一个 id，下一次请求整个被服务端 400
+            issued: set[str] = set()
             for call in calls:
-                if not call["id"]:
+                if not call["id"] or call["id"] in issued:
                     call["id"] = f"call_local_{uuid.uuid4().hex[:12]}"
+                issued.add(call["id"])
             #  分片上攒的 extra_content（Gemini thought_signature）挪进私有键：
             #  留在 tool_call 里会漏进 wire（strip_private 只摘消息级键）。
             #  纪律同 _reasoning——签名是模型私有状态，记下产出路由，
@@ -4714,6 +4752,15 @@ class Agent:
         try:
             args = json.loads(raw_args)
         except json.JSONDecodeError as exc:
+            if self._length_truncated:
+                #  这次回复撞了长度上限：参数不是写坏了，是没写完。"请给出合法
+                #  JSON"会让模型原样再来一次、在同一处再截一次
+                return self._tool_message(
+                    call,
+                    "ERROR: 这个调用的参数在输出长度上限处被截断，没有执行。"
+                    "不要原样重发——把这一步拆小：分多次写入、每次少量参数，"
+                    "或缩小单次写入的内容。",
+                )
             return self._tool_message(
                 call, f"ERROR: 参数不是合法 JSON：{exc}。请重新调用并给出合法 JSON。"
             )
@@ -4722,10 +4769,25 @@ class Agent:
         #  只认本步广告过的工具：步中途注册的新工具下一步才可见，模型此刻
         #  不可能正当地知道它（知道也是从别处猜的）；本步广告过、此后被撤的
         #  工具照常走下面的 toolbox 查找，撤了自然报错。
-        if self._step is not None and name not in self._step.tool_names:
-            return self._tool_message(
-                call, f"ERROR: 工具 {name} 不在本步可见集合，下一步再试。"
-            )
+        #  名字写歪了（functions.bash、server.tool）先精确归一再查——归一必须在
+        #  权限判定、hook、打转计数之前：恢复出的真名走全部策略，deny 规则点名的
+        #  工具不能靠换个拼法绕过
+        visible = self._step.tool_names if self._step is not None else frozenset(self.toolbox.names())
+        if name not in visible:
+            canonical = canonical_tool_name(name, visible)
+            if canonical is not None:
+                if self.session_log:
+                    self.session_log.event("tool_name_normalized", given=name, canonical=canonical)
+                name = canonical
+            elif self._step is not None:
+                #  没有步上下文（直接调用）时交给 toolbox 报"未知工具"
+                shown = sorted(visible)
+                listed = ", ".join(shown[:40]) + ("…" if len(shown) > 40 else "")
+                return self._tool_message(
+                    call,
+                    f"ERROR: 工具 {name} 不在本步可见集合（名字也对不上任何已知工具），"
+                    f"换一个或下一步再试。可用：{listed}",
+                )
 
         #  目的参数只给人看，不进 handler（handler 收到未知 kwarg 会 TypeError）。
         #  无条件剥离：模型可能给免确认的工具也编一个。

@@ -23,6 +23,7 @@ from pathlib import Path
 
 from . import fsguard, plugins, tokens
 from .config import home_dir, user_config_dir
+from .invisible import strip_invisible
 
 #  插件命名空间与技能名之间的分隔符（`<插件>:<技能>`，业界通行形态）
 NAMESPACE_SEP = ":"
@@ -329,7 +330,12 @@ def _scan(
             try:
                 #  glob 不看文件类型：仓库里 SKILL.md 可以是指向设备的链接
                 fsguard.require_regular(skill_md)
-                meta = parse_frontmatter(skill_md.read_text(encoding="utf-8", errors="replace"))
+                #  frontmatter 里的 description 进 system prompt 的技能索引：同样剥隐形字符
+                meta = parse_frontmatter(
+                    strip_invisible(
+                        skill_md.read_text(encoding="utf-8", errors="replace"), f"技能文件 {skill_md}"
+                    )
+                )
             except OSError:
                 continue
             name = (meta.get("name") or skill_md.parent.name).strip()
@@ -387,9 +393,11 @@ def load_skill_body(skill: Skill) -> str:
     """技能正文（去 frontmatter）。读失败返回错误文本交给模型。"""
     try:
         fsguard.require_regular(skill.path)  # 扫描之后可能被换成特殊文件
-        return strip_frontmatter(skill.path.read_text(encoding="utf-8", errors="replace"))
+        raw = skill.path.read_text(encoding="utf-8", errors="replace")
     except OSError as exc:
         return f"ERROR: 读取技能失败：{exc}"
+    #  技能正文是"照着做"的操作手册，来源可能是装来的第三方包：隐形字符剥掉
+    return strip_frontmatter(strip_invisible(raw, f"技能 {skill.name} 的正文"))
 
 
 def clip_body(skill: Skill, body: str, budget: int) -> str:
