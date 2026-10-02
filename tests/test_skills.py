@@ -737,5 +737,170 @@ class CheckFnTest(unittest.TestCase):
         self.assertFalse(tool.available())
 
 
+class ArgumentPlaceholderTest(unittest.TestCase):
+    """$ARGUMENTS / $ARGUMENTS[i] / $i / $名字 的展开与缺参回报。"""
+
+    def test_declared_arguments_in_three_shapes(self):
+        inline = "---\nname: d\narguments: [env, version]\n---\n正文"
+        block = "---\nname: d\narguments:\n  - env\n  - version\ndescription: x\n---\n正文"
+        nested = "---\nname: d\nmetadata:\n  author: me\n  arguments: [env, version]\n---\n正文"
+        for text in (inline, block, nested):
+            with self.subTest(text=text):
+                self.assertEqual(skills.declared_arguments(text), ["env", "version"])
+        #  别的嵌套块里的 arguments 不算；没 frontmatter 返回空
+        self.assertEqual(skills.declared_arguments("---\nname: d\nother:\n  arguments: [x]\n---\n"), [])
+        self.assertEqual(skills.declared_arguments("正文而已"), [])
+        #  非标识符形态的名字丢掉（占位符写不出来）
+        self.assertEqual(skills.declared_arguments("---\narguments: [ok, 'two words', 1st]\n---\n"), ["ok"])
+
+    def test_expand_all_forms(self):
+        body = (
+            "全部：$ARGUMENTS；第二个：$ARGUMENTS[2]；裸：$1/$2；具名：$env→${version}；"
+            "shell 的 $PATH 与 awk '{print $3}' 不动；$ARGUMENTSX 不是占位"
+        )
+        text, missing = skills.expand_arguments(body, "prod 1.2.3", ["env", "version"])
+        self.assertEqual(
+            text,
+            "全部：prod 1.2.3；第二个：1.2.3；裸：prod/1.2.3；具名：prod→1.2.3；"
+            "shell 的 $PATH 与 awk '{print $3}' 不动；$ARGUMENTSX 不是占位",
+        )
+        self.assertEqual(missing, [])
+
+    def test_missing_placeholders_are_kept_and_reported(self):
+        body = "把 $version 部署到 $env；全部：$ARGUMENTS；第二个：$ARGUMENTS[2]；awk '{print $1}'"
+        text, missing = skills.expand_arguments(body, "", ["env", "version"])
+        self.assertEqual(text, body)
+        #  裸 $1 不回报（shell 片段太常见），其余按出现顺序、去重
+        self.assertEqual(missing, ["$version", "$env", "$ARGUMENTS", "$ARGUMENTS[2]"])
+        #  只给了一个参数：第二个具名的缺
+        text, missing = skills.expand_arguments(body, "prod", ["env", "version"])
+        self.assertIn("部署到 prod", text)
+        self.assertEqual(missing, ["$version", "$ARGUMENTS[2]"])
+
+
+class SupportingFilesTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+
+    def test_lists_relative_to_absolute_skipping_hidden(self):
+        path = write_skill(self.root, "deploy", "name: deploy\ndescription: 部署")
+        skill_dir = path.parent
+        (skill_dir / "references").mkdir()
+        (skill_dir / "references" / "runbook.md").write_text("x", encoding="utf-8")
+        (skill_dir / "scripts").mkdir()
+        (skill_dir / "scripts" / "run.sh").write_text("x", encoding="utf-8")
+        (skill_dir / ".DS_Store").write_text("x", encoding="utf-8")
+        (skill_dir / ".git").mkdir()
+        (skill_dir / ".git" / "HEAD").write_text("x", encoding="utf-8")
+        (skill_dir / "__pycache__").mkdir()
+        (skill_dir / "__pycache__" / "a.pyc").write_text("x", encoding="utf-8")
+        rows, total = skills.supporting_files(skill_dir)
+        self.assertEqual(
+            rows,
+            [("references/runbook.md", skill_dir / "references" / "runbook.md"),
+             ("scripts/run.sh", skill_dir / "scripts" / "run.sh")],
+        )
+        self.assertEqual(total, 2)
+        note = skills.supporting_files_note(skills.Skill(name="deploy", description="", path=path))
+        self.assertIn(f"references/runbook.md → {skill_dir / 'references' / 'runbook.md'}", note)
+        self.assertNotIn("SKILL.md", note)
+        self.assertNotIn("另有", note)
+
+    def test_capped_with_remainder_hint(self):
+        path = write_skill(self.root, "big", "name: big\ndescription: 大")
+        for index in range(45):
+            (path.parent / f"f{index:02d}.txt").write_text("x", encoding="utf-8")
+        rows, total = skills.supporting_files(path.parent)
+        self.assertEqual((len(rows), total), (40, 45))
+        note = skills.supporting_files_note(skills.Skill(name="big", description="", path=path))
+        self.assertIn("另有 5 个未列出", note)
+        self.assertEqual(skills.supporting_files_note(
+            skills.Skill(name="none", description="", path=write_skill(self.root, "none", "name: none\ndescription: 空"))
+        ), "")
+
+
+class SkillArgumentsAndSlashTest(unittest.TestCase):
+    """挂上 Agent：skill 工具的 arguments、头部的支持文件清单与缺参提示、/<技能名> 展开。"""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name) / "skills"
+        self.deploy = write_skill(
+            self.root, "deploy", "name: deploy\ndescription: 部署\narguments: [env, version]",
+            body="把 $version 部署到 $env（$ARGUMENTS）。脚本见 scripts/run.sh",
+        )
+        (self.deploy.parent / "scripts").mkdir()
+        (self.deploy.parent / "scripts" / "run.sh").write_text("echo", encoding="utf-8")
+        write_skill(self.root, "help", "name: help\ndescription: 与内建撞名", body="撞名正文")
+        patcher = mock.patch.object(skills, "skill_sources", return_value=[skills.SkillSource(self.root)])
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def build_agent(self):
+        from xiaoyu.agent import Agent
+        from xiaoyu.config import Config
+        from xiaoyu.providers import Registry
+        from xiaoyu.tools import Toolbox
+
+        config = Config(
+            base_url="http://unused", model="m", workspace=Path(self.tmp.name), enable_explore=False,
+        )
+        return Agent(config, Toolbox(config), registry=Registry.for_client(object()))
+
+    def test_tool_takes_arguments_and_lists_support_files(self):
+        agent = self.build_agent()
+        schema = next(s for s in agent.toolbox.schemas() if s["function"]["name"] == "skill")
+        self.assertIn("arguments", schema["function"]["parameters"]["properties"])
+        result = agent.toolbox.run("skill", {"name": "deploy", "arguments": "prod 1.2.3"})
+        self.assertIn("把 1.2.3 部署到 prod（prod 1.2.3）", result)
+        self.assertIn(f"scripts/run.sh → {self.deploy.parent / 'scripts' / 'run.sh'}", result)
+        self.assertNotIn("未提供", result)
+
+    def test_missing_arguments_are_flagged_in_header(self):
+        agent = self.build_agent()
+        result = agent.toolbox.run("skill", {"name": "deploy"})
+        self.assertIn("把 $version 部署到 $env（$ARGUMENTS）", result)
+        self.assertIn("$version、$env、$ARGUMENTS", result)
+        self.assertIn("未提供", result)
+
+    def test_slash_expands_skill_and_builtins_win(self):
+        from xiaoyu.cli import skill_prompt, skill_shadowed
+
+        agent = self.build_agent()
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            prompt = skill_prompt(agent, "/deploy prod 1.2.3")
+        self.assertIn("用户以 /deploy 直接调用", prompt)
+        self.assertIn("把 1.2.3 部署到 prod", prompt)
+        self.assertIn("已展开技能 deploy", out.getvalue())
+        #  内建优先：/help 不是技能调用；撞名的从 /skill: 进
+        self.assertTrue(skill_shadowed("help"))
+        self.assertFalse(skill_shadowed("deploy"))
+        self.assertIsNone(skill_prompt(agent, "/help"))
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertIn("撞名正文", skill_prompt(agent, "/skill:help"))
+        #  不是技能的斜杠行交给内建命令表（返回 None），不报技能错误
+        self.assertIsNone(skill_prompt(agent, "/halp"))
+        #  显式前缀下找不到：报错、本轮不发（空串）
+        with contextlib.redirect_stdout(io.StringIO()) as out, contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(skill_prompt(agent, "/skill:nope"), "")
+        self.assertIn("没有名为 'nope' 的技能", out.getvalue())
+
+    def test_skills_listing_marks_shadowed_names(self):
+        from xiaoyu.cli import handle_slash
+
+        agent = self.build_agent()
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            self.assertFalse(handle_slash(agent, "/skills"))
+        text = out.getvalue()
+        self.assertIn("/skill:help", text)
+        self.assertIn("/<技能名> 参数…", text)
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            handle_slash(agent, "/skill:deploy")
+        self.assertIn("只在交互前端里可用", out.getvalue())
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -4,16 +4,23 @@
 
     #  <用户配置目录>/hooks.toml
     [[hooks]]
-    event = "PreToolUse"        # PreToolUse | PostToolUse | UserPromptSubmit | Stop
-    matcher = "bash"            # 正则匹配工具名（只对 *ToolUse 有意义，可省）
+    event = "PreToolUse"        # PreToolUse | PostToolUse | ToolFailed | UserPromptSubmit
+                                # | Stop | SessionStart | SessionEnd
+    matcher = "bash"            # 正则匹配工具名（只对工具类事件有意义，可省）
     command = "python ~/bin/check.py"
     timeout = 10                # 秒，缺省 30，上限 600
+    on_failure = "allow"        # allow | block：钩子自己坏了怎么办（只对 PreToolUse 生效）
 
 约定（沿用业界通行的习惯，用户不用学新规矩）：
-- stdin 收一个 JSON 对象（event / tool / args / output / prompt 视事件而定）；
+- stdin 收一个 JSON 对象（event / workspace 必有；tool / args / call_id / output /
+  prompt / model / session 视事件而定）。PreToolUse 与 PostToolUse（以及 ToolFailed）
+  对同一次调用带**同一个 call_id**，外部钩子靠它把"前"与"后"对上；
 - **退出码 2 = block**，stderr 作为理由回灌模型或提示用户；
-- 退出码 0 = 放行；其它退出码、超时、起不来 = **fail-open 放行**并打 warn——
-  hook 是辅助护栏，不能因为自己坏了把 agent 卡死（deny 规则才是硬闸）；
+- 退出码 0 = 放行；其它退出码、超时、起不来 = 默认 **fail-open 放行**并打 warn——
+  hook 是辅助护栏，不能因为自己坏了把 agent 卡死（deny 规则才是硬闸）。
+  `on_failure = "block"` 反过来：钩子坏了就按拦截处理，理由里标明"钩子失败"——
+  给"这道闸必须跑过才能动手"的场景（合规审计、生产环境）。只对 PreToolUse
+  生效：其它事件的 block 本就只是反馈或顶回，拿"钩子坏了"去顶回模型没有意义；
 - 同一事件多个 hook 顺序执行（个人工具挂不了几个，不为并行引入线程池），
   任一 block 即 block，理由拼接。
 
@@ -22,12 +29,18 @@
 得先有指纹/审批机制（同 MCP rug-pull 那套），最小版不背这个包袱。
 `XIAOYU_ENABLE_HOOKS=0` 一键关闭。
 
-四个事件的语义：
-- PreToolUse   block → 该次工具调用不执行，理由回灌模型（在审批之前，省一次弹窗）
+事件的语义（与 SDK 进程内 hook 同名同义、payload 同形）：
+- PreToolUse   block → 该次工具调用不执行，理由回灌模型（在审批之后、执行之前）
 - PostToolUse  block → 工具已执行，理由作为附注拼进 tool result（模型看得到）
+- ToolFailed   通知：工具结果判成失败（ERROR:）之后触发，带 call_id / args / output；
+               发生在动作之后，block 没有意义，退出码只决定要不要打 warn
 - UserPromptSubmit block → 本轮不发给模型，理由打给用户
 - Stop         block → 模型想收尾时被顶回去，理由作为 user 消息续跑一步
                （每轮只顶一次，防 hook 永远不放行造成死循环）
+- SessionStart 会话首轮之前触发一次（子 agent 不触发）：block → 拒绝启动，理由打给
+               用户；放行时 stdout 的**首个非空行**作为一次性消息注入历史（给宿主
+               注入环境说明用：当前分支、值班提示……），受长度上限
+- SessionEnd   会话正常收尾时触发一次，结果不影响退出
 """
 
 from __future__ import annotations
@@ -43,13 +56,22 @@ from typing import Any
 
 from .config import user_config_dir
 
-EVENTS = ("PreToolUse", "PostToolUse", "UserPromptSubmit", "Stop")
-_ENTRY_KEYS = frozenset({"event", "matcher", "command", "timeout"})
+EVENTS = (
+    "PreToolUse", "PostToolUse", "ToolFailed", "UserPromptSubmit", "Stop",
+    "SessionStart", "SessionEnd",
+)
+#  带工具名、matcher 对其有意义的事件；也是子 agent 会带下去的那几个
+TOOL_EVENTS = ("PreToolUse", "PostToolUse", "ToolFailed")
+_ENTRY_KEYS = frozenset({"event", "matcher", "command", "timeout", "on_failure"})
+ON_FAILURE_CHOICES = ("allow", "block")
 
 _DEFAULT_TIMEOUT = 30.0
 _MAX_TIMEOUT = 600.0
 #  喂给 hook 的 output/prompt 字段上限：hook 不需要全文，超长纯属拖慢
 _PAYLOAD_TEXT_CAP = 8_000
+#  放行钩子 stdout 首行的上限：它会原样进历史（SessionStart 的环境说明），
+#  一行就够说清"当前分支 / 值班提示"，更长的说明该写进 AGENTS.md
+OUTPUT_LINE_CAP = 2_000
 
 
 @dataclass(frozen=True)
@@ -58,6 +80,9 @@ class Hook:
     command: str
     matcher: str = ""  # 正则（re.search 语义），空 = 全匹配
     timeout: float = _DEFAULT_TIMEOUT
+    #  钩子自己坏了（超时 / 起不来 / 退出码既非 0 也非 2）时：allow = 放行并告警，
+    #  block = 按拦截处理。只在 PreToolUse 上有意义，load_hooks 对别的事件会归零
+    on_failure: str = "allow"
 
     def matches(self, tool_name: str) -> bool:
         if not self.matcher:
@@ -72,6 +97,9 @@ class Hook:
 class Decision:
     blocked: bool
     reason: str = ""
+    #  放行钩子（退出码 0）stdout 的首个非空行，多个钩子按换行拼接。只有
+    #  SessionStart 消费它（注入历史）；别的事件的 stdout 没有去处，照旧忽略
+    output: str = ""
 
 
 def hooks_path() -> Path:
@@ -130,7 +158,22 @@ def load_hooks(path: Path | None = None) -> tuple[list[Hook], list[str]]:
             )
             timeout = _DEFAULT_TIMEOUT
         timeout = min(max(timeout, 1.0), _MAX_TIMEOUT)
-        hooks.append(Hook(event=event, command=command, matcher=matcher, timeout=timeout))
+        on_failure = str(entry.get("on_failure", "allow") or "allow").strip().lower()
+        if on_failure not in ON_FAILURE_CHOICES:
+            problems.append(
+                f"第 {index} 条 on_failure={entry.get('on_failure')!r} 不认识"
+                f"（可用：{' | '.join(ON_FAILURE_CHOICES)}），按 allow 算"
+            )
+            on_failure = "allow"
+        elif on_failure == "block" and event != "PreToolUse":
+            #  不静默吃掉：用户以为"钩子坏了会拦"，而这个事件上根本没有拦这回事
+            problems.append(
+                f'第 {index} 条 on_failure = "block" 只对 PreToolUse 生效，{event} 上已忽略'
+            )
+            on_failure = "allow"
+        hooks.append(
+            Hook(event=event, command=command, matcher=matcher, timeout=timeout, on_failure=on_failure)
+        )
     return hooks, problems
 
 
@@ -165,10 +208,11 @@ class HookEngine:
         """给委托出去的子 agent 用的一份：只带工具类钩子，工作目录换成它的。
 
         用户挂在工具调用上的护栏不该因为"这一步是子 agent 做的"就不触发；
-        UserPromptSubmit / Stop 说的是用户这一轮的开头和收尾，子 agent 没有
-        这两个时刻，不带下去。没有工具类钩子时返回 None（触发点零开销）。
+        UserPromptSubmit / Stop / SessionStart / SessionEnd 说的是用户这个会话的
+        开头和收尾，子 agent 没有这些时刻，不带下去。没有工具类钩子时返回 None
+        （触发点零开销）。
         """
-        kept = [hook for hook in self.hooks if hook.event in ("PreToolUse", "PostToolUse")]
+        kept = [hook for hook in self.hooks if hook.event in TOOL_EVENTS]
         return HookEngine(kept, workspace, self._notify) if kept else None
 
     def fire(
@@ -181,6 +225,7 @@ class HookEngine:
         不因为调用走了转发器就不触发。
         """
         reasons: list[str] = []
+        outputs: list[str] = []
         body = json.dumps(
             {"event": event, "workspace": str(self.workspace), **payload},
             ensure_ascii=False,
@@ -206,20 +251,31 @@ class HookEngine:
                     env=_hook_env(),
                 )
             except subprocess.TimeoutExpired:
-                self._notify(f"[hook 超时（>{hook.timeout:.0f}s），放行：{hook.command}]")
+                self._failed(hook, f"超时（>{hook.timeout:.0f}s）", reasons)
                 continue
             except OSError as exc:
-                self._notify(f"[hook 启动失败（{exc}），放行：{hook.command}]")
+                self._failed(hook, f"启动失败（{exc}）", reasons)
                 continue
             if proc.returncode == 2:
                 reason = proc.stderr.strip() or proc.stdout.strip() or "（hook 未给出理由）"
                 reasons.append(clip_reason(reason))
             elif proc.returncode != 0:
-                self._notify(
-                    f"[hook 退出码 {proc.returncode}（既非 0 放行也非 2 拦截），"
-                    f"按放行处理：{hook.command}]"
-                )
-        return Decision(blocked=bool(reasons), reason="；".join(reasons))
+                self._failed(hook, f"退出码 {proc.returncode}（既非 0 放行也非 2 拦截）", reasons)
+            elif line := first_line(proc.stdout):
+                outputs.append(line)
+        return Decision(blocked=bool(reasons), reason="；".join(reasons), output="\n".join(outputs))
+
+    def _failed(self, hook: Hook, what: str, reasons: list[str]) -> None:
+        """钩子自己坏了：默认放行并告警；on_failure = block 的改记一条拦截理由。
+
+        两种情况都要让用户看见——放行是静默失效（以为有闸其实没有），拦截则
+        要知道是钩子坏了而不是真的违规，否则会对着模型的参数找半天问题。
+        """
+        if hook.on_failure == "block":
+            reasons.append(f"钩子失败（{what}，on_failure = block）：{hook.command}")
+            self._notify(f"[hook {what}，按 on_failure = block 拦截：{hook.command}]")
+            return
+        self._notify(f"[hook {what}，放行：{hook.command}]")
 
 
 #  一条 hook 理由进上下文的字符上限。理由是给模型的反馈，不是日志：测试闸把
@@ -245,3 +301,12 @@ def clip(text: str) -> str:
     if len(text) <= _PAYLOAD_TEXT_CAP:
         return text
     return text[:_PAYLOAD_TEXT_CAP] + "…（已截断）"
+
+
+def first_line(text: str) -> str:
+    """stdout 的首个非空行（截到 OUTPUT_LINE_CAP）；全空返回空串。"""
+    for line in text.splitlines():
+        if line.strip():
+            line = line.strip()
+            return line if len(line) <= OUTPUT_LINE_CAP else line[:OUTPUT_LINE_CAP] + "…（已截断）"
+    return ""

@@ -1118,12 +1118,27 @@ class SlashCompleter(Completer):
                 if model.startswith(word):
                     yield Completion(model, start_position=-len(word))
 
-    def _command_completions(self, word: str) -> Iterable[Completion]:
-        from .cli import SLASH_COMMANDS
+    #  技能补全的 meta 长度：描述是给索引写的、动辄几百字，菜单里一行放不下
+    _SKILL_META_CAP = 60
 
-        #  前缀命中排前面，子串命中（/ctx 打错也能找到 /context）殿后
+    def _command_completions(self, word: str) -> Iterable[Completion]:
+        from .cli import SLASH_COMMANDS, SKILL_SLASH_PREFIX, skill_shadowed
+
+        #  内建命令在前（名字空间里内建优先，菜单顺序也这么说），技能在后；
+        #  各自内部前缀命中排前面，子串命中（/ctx 打错也能找到 /context）殿后
+        candidates: list[tuple[str, str]] = [
+            #  `/<技能名>` 这种占位行只给 /help 看，补全菜单里列的是真名字
+            (command, description) for command, description in SLASH_COMMANDS.items() if "<" not in command
+        ]
+        if self.tui.agent is not None:
+            for skill in getattr(self.tui.agent, "skills", []):
+                command = f"{SKILL_SLASH_PREFIX}{skill.name}" if skill_shadowed(skill.name) else f"/{skill.name}"
+                meta = skill.description or "技能"
+                if len(meta) > self._SKILL_META_CAP:
+                    meta = meta[: self._SKILL_META_CAP] + "…"
+                candidates.append((command, f"技能：{meta}"))
         substring_hits: list[tuple[str, str]] = []
-        for command, description in SLASH_COMMANDS.items():
+        for command, description in candidates:
             if command.startswith(word):
                 yield Completion(command, start_position=-len(word), display_meta=description)
             elif len(word) > 1 and word[1:] in command:
@@ -2044,7 +2059,7 @@ class Tui:
         """交互循环。与明文 repl 的差异：Ctrl-C 需在 2 秒内按两次才退出
         （单次防误触），Ctrl-D 仍即刻退出；多出 @ 文件补全与 Ctrl-O 等按键
         （! / # 前缀两个前端已对齐，路由同走 keys.classify_input）。"""
-        from .cli import handle_slash
+        from .cli import handle_slash, skill_prompt
 
         self.agent = agent
         self.sink.bash_timeout = agent.config.bash_timeout
@@ -2107,11 +2122,19 @@ class Tui:
             if action.kind == "usage":
                 self.console.print(Text(f"  {action.hint}", style="text.secondary"))
                 continue
+            recall = action.args
             if action.kind == "slash":
-                #  /resume 这类需要列表选择的命令用行内菜单（纯单选，无附言）
-                if handle_slash(agent, action.args, select=lambda t, o: inline_select(t, o, amend=False)):
-                    return 0
-                continue
+                #  /<技能名> 参数… 展开成本轮提示（与明文 REPL 同一个入口）；
+                #  不是技能的才交给内建命令表
+                expanded = skill_prompt(agent, action.args)
+                if expanded is None:
+                    #  /resume 这类需要列表选择的命令用行内菜单（纯单选，无附言）
+                    if handle_slash(agent, action.args, select=lambda t, o: inline_select(t, o, amend=False)):
+                        return 0
+                    continue
+                if not expanded:
+                    continue
+                action = keys.InputAction("send", expanded)
             if action.kind == "shell":
                 self._run_shell(action.args)
                 continue
@@ -2120,7 +2143,8 @@ class Tui:
                 continue
 
             line = action.args
-            self._last_input = line
+            #  Esc-Esc 取回的是用户敲的那行（/deploy prod），不是展开后的几千字
+            self._last_input = recall
             self.sink.begin_turn()
             #  运行期插话（steer）：整行回车即在 step 边界进入本轮。
             #  poller 起不来（Windows/非 tty）时自动退回旧的"收尾预填"体验
