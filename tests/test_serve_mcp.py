@@ -359,6 +359,20 @@ class TestMcpToken(McpCase):
         self.assertEqual(self.rpc({"jsonrpc": "2.0", "id": 1, "method": "ping"}).status_code, 200)
 
 
+class TestProgressMessage(unittest.TestCase):
+    """事件 → progress 通知文案；不需要 fastapi。"""
+
+    def test_tool_progress_carries_the_downstream_detail(self):
+        from xiaoyu.serve_mcp import _progress_message
+
+        self.assertEqual(_progress_message({"kind": "tool.running", "name": "bash"}), "tool.running bash")
+        self.assertEqual(
+            _progress_message({"kind": "tool.progress", "name": "mcp__s__slow", "progress": 1, "total": 3, "message": "step 1"}),
+            "tool.progress mcp__s__slow · 1/3（33%） · step 1",
+        )
+        self.assertEqual(_progress_message({"kind": "tool.progress", "name": "x"}), "tool.progress x")
+
+
 class TestMcpDisabled(McpCase):
     mcp = False
 

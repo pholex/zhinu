@@ -128,7 +128,10 @@ Chat、Responses 和 Anthropic 的归一化保留缓存读取细分，Anthropic 
 原有四类事件继续可用。事件带会话身份，运行中带 run/task 身份。SessionStart 在
 首次执行前触发；阻止/异常拒绝启动。BeforeCompact 可阻止压缩。结束及失败通知
 发生在动作之后，不能撤销已发生动作；通知异常可由 `session.hook_errors` 检查。
-SessionEnd 在关闭时触发一次，结束 hook 不阻止资源继续收尾。
+SessionEnd 在关闭时触发一次，结束 hook 不阻止资源继续收尾。ToolFailed 的 payload
+与 PostToolUse 同形（`tool`、`args`、`ok=False`、`output`、`call_id`），`call_id` 与同一次
+调用的 PreToolUse / PostToolUse 同值。CLI 的 `hooks.toml` 命令钩子认同一组事件名、
+同一套 payload 形状（见 [configuration](configuration.md) 的生命周期钩子一节）。
 
 `TelemetryOptions(exporter, queue_size=32, max_spans=512)` 提供有界完成轨迹导出。
 默认只记录操作种类、时间、状态、模型/工具名和关联 ID，不记录提示词、工具参数、

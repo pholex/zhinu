@@ -334,11 +334,11 @@ class ToolFlowTest(AcpCase):
         self.assertEqual(params["toolCall"]["kind"], "execute")
         self.assertEqual(
             [o["optionId"] for o in params["options"]],
-            ["allow-once", "allow-session", "allow-always", "reject-once"],
+            ["allow-once", "allow-session", "allow-always", "reject-once", "reject-always"],
         )
         self.assertEqual(
             [o["kind"] for o in params["options"]],
-            ["allow_once", "allow_always", "allow_always", "reject_once"],
+            ["allow_once", "allow_always", "allow_always", "reject_once", "reject_always"],
         )
         #  审批前已有 pending 的 tool_call 声明
         pending = [u for u in self.updates(before) if u.get("sessionUpdate") == "tool_call"]
@@ -454,6 +454,25 @@ class ApprovalScopeTest(AcpCase):
             if u.get("sessionUpdate") == "agent_thought_chunk"
         )
         self.assertIn("不再逐次确认", thoughts)
+
+    def test_reject_always_writes_deny_rule_effective_immediately(self):
+        """「以后都拒绝」：deny 规则落盘，第二条同类调用不再问、直接被规则拦。"""
+        response, skipped = self.run_with_choice("reject-always")
+        self.assertEqual(response["result"]["stopReason"], "end_turn")
+        prompts, done = self.counts(skipped)
+        self.assertEqual(prompts, 0)
+        self.assertEqual(done, 0)
+        failed = sum(
+            1 for u in self.updates(skipped)
+            if u.get("sessionUpdate") == "tool_call_update" and u.get("status") == "failed"
+        )
+        self.assertEqual(failed, 2)
+        thoughts = " ".join(
+            u["content"]["text"] for u in self.updates(skipped)
+            if u.get("sessionUpdate") == "agent_thought_chunk"
+        )
+        self.assertIn("已写入", thoughts)
+        self.assertIn("deny bash(echo *)", thoughts)
 
     def test_allow_always_writes_rule_effective_immediately(self):
         response, skipped = self.run_with_choice("allow-always")
@@ -1988,6 +2007,76 @@ class StdoutGuardTest(unittest.TestCase):
             json.loads(line)
         #  serve 退出后 sys.stdout 原样恢复
         self.assertIs(sys.stdout, before)
+
+
+
+class UsageUpdateTest(AcpCase):
+    def test_usage_update_after_each_model_call(self):
+        """规范 v1 的 usage_update 只有 used / size：used 取上游 usage 的 prompt+completion。"""
+        acp = self.start_acp('text: ok\nusage: {"prompt_tokens": 100, "completion_tokens": 5}\n')
+        session_id = self.new_session(acp)
+        self.prompt(acp, session_id, "你好")
+        _, skipped = acp.read_until(self.is_response("p1"))
+        usage = [u for u in self.updates(skipped) if u.get("sessionUpdate") == "usage_update"]
+        self.assertEqual(len(usage), 1)
+        self.assertEqual(usage[0]["used"], 105)
+        self.assertGreater(usage[0]["size"], 105)
+        #  只发规范字段（加上判别字段），不夹带方言键
+        self.assertEqual(set(usage[0]), {"sessionUpdate", "used", "size"})
+
+
+class CloseSessionTest(AcpCase):
+    def test_capability_declared(self):
+        acp = self.start_acp("text: ok\n")
+        acp.send(
+            {"jsonrpc": "2.0", "id": "1", "method": "initialize",
+             "params": {"protocolVersion": 1}}
+        )
+        response, _ = acp.read_until(self.is_response("1"))
+        self.assertEqual(
+            response["result"]["agentCapabilities"]["sessionCapabilities"], {"close": {}}
+        )
+
+    def test_close_idle_session_then_prompt_is_unknown(self):
+        acp = self.start_acp("text: ok\n---\ntext: 不会被看到\n")
+        session_id = self.new_session(acp)
+        self.prompt(acp, session_id, "你好")
+        acp.read_until(self.is_response("p1"))
+        acp.send(
+            {"jsonrpc": "2.0", "id": "close", "method": "session/close",
+             "params": {"sessionId": session_id}}
+        )
+        response, _ = acp.read_until(self.is_response("close"))
+        self.assertEqual(response["result"], {})
+        #  关掉之后它就不在册了：再 prompt 按未知 sessionId 拒绝
+        self.prompt(acp, session_id, "还在吗", req_id="p2")
+        response, _ = acp.read_until(self.is_response("p2"))
+        self.assertEqual(response["error"]["code"], -32602)
+
+    def test_close_running_session_cancels_turn_first(self):
+        """规范：close 先当 cancel 处理——挂起审批解决、prompt 以 cancelled 收尾，再回 {}。"""
+        acp = self.start_acp(_TOOL_SCRIPT + "---\ntext: 不会被看到\n")
+        session_id = self.new_session(acp)
+        self.prompt(acp, session_id, "干活")
+        acp.read_until(self.is_permission)
+        acp.send(
+            {"jsonrpc": "2.0", "id": "close", "method": "session/close",
+             "params": {"sessionId": session_id}}
+        )
+        prompt_response, _ = acp.read_until(self.is_response("p1"))
+        self.assertEqual(prompt_response["result"]["stopReason"], "cancelled")
+        close_response, _ = acp.read_until(self.is_response("close"))
+        self.assertEqual(close_response["result"], {})
+
+    def test_close_unknown_session_is_invalid_params(self):
+        acp = self.start_acp("text: ok\n")
+        self.new_session(acp)
+        acp.send(
+            {"jsonrpc": "2.0", "id": "close", "method": "session/close",
+             "params": {"sessionId": "sess-nope"}}
+        )
+        response, _ = acp.read_until(self.is_response("close"))
+        self.assertEqual(response["error"]["code"], -32602)
 
 
 if __name__ == "__main__":

@@ -1,0 +1,6 @@
+{
+  "_note": "按模型名匹配的单价（USD / token，in=prompt、out=completion）。小羽自己不维护价格表，这份只给横评估算费用用：先全名、再去掉 provider 前缀、再按裸名匹配；没命中的模型 cost 记空并在 metadata.unpriced_models 点名。本机 xiaoyu/evals/models.local.json（从网关 /model/info 同步）会覆盖这里，--prices 再覆盖它。缓存命中不分列，prompt 一律按 in 价算，是费用上界。",
+  "models": [
+    {"name": "deepseek-flash", "in": 1.47e-7, "out": 2.94e-7, "note": "网关 2026-08-11 同步的 flash 档单价；以网关当前报价为准"}
+  ]
+}

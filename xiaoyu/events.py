@@ -23,7 +23,7 @@ from __future__ import annotations
 import threading
 import time
 
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from typing import Any, ClassVar, Literal, Protocol
 
 NoticeLevel = Literal["info", "warn", "error"]
@@ -73,9 +73,20 @@ class RequestEnded(UIEvent):
     """这次模型调用的响应流已消费完（或因异常/中断终止）。
 
     只是兜底的终态：正文或工具调用一出现，前端就该收掉等待指示了，不必等到这里。
+
+    顺带捎上这一次调用的计时与用量——"慢"到底慢在排队（首 token 迟迟不来）
+    还是慢在吐字（tok/s 低），只看一轮总耗时分不出来；按请求记才有分辨率。
+    三个字段都有默认值：老消费方 `RequestEnded()` 照常构造，线上形态只是多几个键。
+    - duration_ms：从发出请求到流消费完；
+    - ttft_ms：首个 chunk 到达的延迟，一个 chunk 都没等到（异常/中断）为 None；
+    - usage：这次调用的 prompt_tokens / completion_tokens / cached_tokens，
+      上游没回 usage 时为空 dict（不编数）。
     """
 
     kind: ClassVar[str] = "request.ended"
+    duration_ms: int = 0
+    ttft_ms: int | None = None
+    usage: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -118,6 +129,22 @@ class ToolRunning(UIEvent):
     kind: ClassVar[str] = "tool.running"
     name: str
     args: dict[str, Any]
+
+
+@dataclass(frozen=True)
+class ToolProgress(UIEvent):
+    """运行中的工具报了一次进度（目前只有 MCP server 的 notifications/progress 会发）。
+
+    不改变四态机：它只出现在 running 与终态之间，可以有零到多次，前端拿它刷新
+    活区文案（"第 3/10 步 · 正在下载"），不打新行——进度是可覆盖的状态，不是
+    事件流里值得各占一行的里程碑。progress/total 按规范都是数字，total 可能没有。
+    """
+
+    kind: ClassVar[str] = "tool.progress"
+    name: str
+    message: str = ""
+    progress: float | None = None
+    total: float | None = None
 
 
 @dataclass(frozen=True)

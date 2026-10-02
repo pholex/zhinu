@@ -57,6 +57,13 @@ sink，不经协议层，所以不需要任何自定义扩展方法；可选能�
     session/cancel              notification：打断当前轮 + 挂起审批按拒绝解决；
                                 prompt 必须以 stopReason=cancelled 收尾（规范
                                 要求，不能回 error——client 取消不是错误）。
+    session/close               能力声明 sessionCapabilities.close={}。按规范先当
+                                session/cancel 处理（打断在跑的轮、挂起审批按
+                                取消解决），再释放会话资源：后台任务停掉、MCP
+                                连接关掉、会话日志记 exit(closed) 并让出写锁、
+                                从在册表摘掉。回包 {}；未知 sessionId 回
+                                INVALID_PARAMS。收尾跑在后台线程——等轮线程退出
+                                可能要几秒，stdin 主循环不能为此停摆。
     session/load                重开旧会话（Zed 重启后续聊的通道）。ACP sessionId
                                 直接当命名会话名落盘（session/new 即建名为
                                 sess-<hex> 的命名会话；延迟落盘，首条记录到来
@@ -100,7 +107,8 @@ sink，不经协议层，所以不需要任何自定义扩展方法；可选能�
                                 （与模型选择同一纪律，last_mode 留痕）。
     session/request_permission  审批桥，选项与 TUI 确认框同一套语义：允许一次 /
                                 本会话内该工具都允许 / 总是允许（能推导出安全
-                                规则才出现，选中即写入持久规则）/ 拒绝。协议
+                                规则才出现，选中即写入持久规则）/ 拒绝 / 以后都
+                                拒绝（reject_always：写入 deny 规则）。协议
                                 没有"会话作用域"的选项 kind——会话档借最接近
                                 的 allow_always 渲染，真实语义由 optionId 承载、
                                 回程按 id 还原。持久规则的安全禁令（不许覆盖
@@ -128,7 +136,11 @@ sink，不经协议层，所以不需要任何自定义扩展方法；可选能�
     tool.completed  → tool_call_update（status=completed|failed + 输出文本）
     tool.denied     → tool_call_update（status=failed；ACP 没有 denied 态）
     plan.updated    → plan（小羽计划状态词汇与 ACP 逐字相同，零转换）
-    request.*/text.end/steer.accepted → 无对应，丢弃
+    request.ended   → usage_update（规范字段只有 used=此刻在上下文里的 token 数
+                      与 size=上下文窗口；used 优先取上游 usage 的 prompt+completion
+                      ——这是服务端的权威值，没回 usage 的模型退回本地估算。
+                      cost 不发：没有价目表就不编数）
+    request.started/text.end/steer.accepted → 无对应，丢弃
 
 工具调用没有跨事件的 id（小羽同步串行执行，事件按序配对即可）：pending 入队
 发 id，purpose/running/completed/denied 按"最老的同名未终态调用"回配。
@@ -146,6 +158,7 @@ sink，不经协议层，所以不需要任何自定义扩展方法；可选能�
 from __future__ import annotations
 
 import base64
+import contextlib
 import inspect
 import json
 import sys
@@ -158,7 +171,7 @@ from typing import Any, Callable, Iterator, TextIO
 
 from . import __version__, errors, folder_trust, fsguard, mcp, mcp_guard, media, modes, ui
 from .config import EFFORT_LEVELS, Config, MissingConfig, load_dotenv, user_env_path
-from .permissions import Permissions, suggest_allow_rule
+from .permissions import Permissions, suggest_allow_rule, suggest_deny_rule
 from .session_log import (
     SessionLockedError,
     SessionLog,
@@ -175,6 +188,7 @@ from .agent import SYNTHETIC_USER_TEXTS, Agent, Allow, Deny, Interrupted
 from .events import (
     Notice,
     PlanUpdated,
+    RequestEnded,
     TextDelta,
     ToolCompleted,
     ToolDenied,
@@ -706,6 +720,34 @@ class AcpSink:
                 ]
         return extras
 
+    # ---------- 上下文水位 ----------
+
+    def _usage_update(self, event: RequestEnded) -> None:
+        """每次模型调用后发 usage_update（规范 v1：used / size 两个必填字段）。
+
+        used 取上游 usage 的 prompt + completion：发请求时整段上下文就是
+        prompt_tokens，回答本身此刻也进了历史。没回 usage 的模型（网关缓存回放、
+        个别端点）退回内核的本地估算；size 是当前模型的上下文窗口。agent 没登记
+        （track_mode 之前）或窗口未知就不发——发个 0 比不发更误导。
+        """
+        agent = self._agent
+        if agent is None:
+            return
+        size = int(getattr(agent.config, "context_limit", 0) or 0)
+        if size <= 0:
+            return
+        used = 0
+        if event.usage:
+            used = int(event.usage.get("prompt_tokens") or 0) + int(
+                event.usage.get("completion_tokens") or 0
+            )
+        if used <= 0:
+            try:
+                used = int(agent.context_tokens())
+            except Exception:  # noqa: BLE001 - 估算失败不该让一条通知炸掉工作线程
+                return
+        self._update({"sessionUpdate": "usage_update", "used": max(used, 0), "size": size})
+
     # ---------- 事件入口 ----------
 
     def emit(self, event: UIEvent) -> None:
@@ -786,6 +828,8 @@ class AcpSink:
                         "content": [_text_content(reason)],
                     }
                 )
+        elif isinstance(event, RequestEnded):
+            self._usage_update(event)
         elif isinstance(event, PlanUpdated):
             self._update(
                 {
@@ -1365,6 +1409,9 @@ class AcpServer:
                     "protocolVersion": version,
                     "agentCapabilities": {
                         "loadSession": True,
+                        #  规范：声明 {} 即支持 session/close（list/delete/resume 不接：
+                        #  会话清单与删除是本机文件操作，编辑器语境里由 resume 命令承担）
+                        "sessionCapabilities": {"close": {}},
                         "promptCapabilities": {
                             "image": True,
                             "audio": False,
@@ -1396,6 +1443,8 @@ class AcpServer:
             self._handle_set_config_option(req_id, params)
         elif method == "session/set_mode":
             self._handle_set_mode(req_id, params)
+        elif method == "session/close":
+            self._handle_close_session(req_id, params)
         elif method == "session/cancel":
             #  notification：无论成败都不回包
             self._handle_cancel(params)
@@ -1769,6 +1818,55 @@ class AcpServer:
         else:
             self._respond(req_id, {"stopReason": stop_reason})
 
+    def _handle_close_session(self, req_id: Any, params: dict[str, Any]) -> None:
+        """session/close：先按 cancel 处理，再释放资源，最后回 {}。
+
+        先从在册表摘掉：摘掉之后到来的 prompt/set_mode 一律"未知 sessionId"，
+        不会撞上正在收尾的 agent。收尾本身在后台线程跑——等轮线程退出最多
+        10s，主循环期间照常收别的会话的消息。
+        """
+        session_id = str(params.get("sessionId", ""))
+        session = self._sessions.pop(session_id, None)
+        if session is None:
+            self._fail(req_id, INVALID_PARAMS, "未知 sessionId（已关闭或从未建立）")
+            return
+        if session.turn_active():
+            session.cancelled = True
+        self._deny_pending("会话已被 client 关闭", session_id=session_id)
+        session.agent.interrupt()
+        threading.Thread(
+            target=self._finish_close,
+            args=(req_id, session),
+            daemon=True,
+            name=f"acp-close-{session_id}",
+        ).start()
+
+    def _finish_close(self, req_id: Any, session: _Session) -> None:
+        turn = session.turn
+        if turn is not None and turn.is_alive():
+            turn.join(timeout=10.0)
+        self._release_session(session)
+        self._respond(req_id, {})
+
+    @staticmethod
+    def _release_session(session: _Session) -> None:
+        """释放一个会话占着的东西。每一步独立兜底：后台任务停不掉不该连累日志收尾。"""
+        agent = session.agent
+        toolbox = getattr(agent, "toolbox", None)
+        tasks = getattr(toolbox, "tasks", None)
+        if tasks is not None:
+            with contextlib.suppress(Exception):
+                tasks.shutdown()
+        manager = getattr(toolbox, "mcp_manager", None)
+        if manager is not None and callable(getattr(manager, "close", None)):
+            with contextlib.suppress(Exception):
+                manager.close()
+        log = agent.session_log
+        if log is not None:
+            #  closed 是明确的收尾原因：事后读日志能把"client 主动关"与"连接断了"分开
+            with contextlib.suppress(Exception):
+                log.close("closed")
+
     def _handle_cancel(self, params: dict[str, Any]) -> None:
         session = self._sessions.get(str(params.get("sessionId", "")))
         #  取消未知/空闲 session 是静默 no-op。挂起审批必须解决（否则该会话的
@@ -1921,6 +2019,21 @@ class AcpServer:
                 }
             )
         options.append({"optionId": "reject-once", "name": "拒绝", "kind": "reject_once"})
+        #  与「总是允许」对称的持久拒绝（协议原生就有 reject_always 这一档）；
+        #  编辑器客户端没有"写入前可编辑"的交互，规则按推导结果原样落盘
+        deny_rule = (
+            suggest_deny_rule(name, args, session.agent.permissions.workspace)
+            if session is not None
+            else None
+        )
+        if deny_rule is not None:
+            options.append(
+                {
+                    "optionId": "reject-always",
+                    "name": f"以后都拒绝（写入规则 {deny_rule}）",
+                    "kind": "reject_always",
+                }
+            )
         req_id, event, slot = self._register_pending(session_id)
         tool_call: dict[str, Any] = {
             "title": _tool_title(name, args),
@@ -1945,7 +2058,7 @@ class AcpServer:
         while not event.wait(0.2):
             if self._closed:
                 return Deny("acp 连接已关闭，无人审批")
-        return self._resolve_verdict(session, name, args, rule, slot.get("result"))
+        return self._resolve_verdict(session, name, args, rule, slot.get("result"), deny_rule)
 
     def _resolve_verdict(
         self,
@@ -1954,6 +2067,7 @@ class AcpServer:
         args: dict[str, Any],
         rule: Any,
         payload: Any,
+        deny_rule: Any = None,
     ) -> Allow | Deny:
         """审批回包 → Allow/Deny，含会话授权与持久规则的落地。
         看不懂的一律 fail closed 按拒绝。"""
@@ -1987,6 +2101,18 @@ class AcpServer:
                 return Allow()
             session.sink.emit(Notice(f"[已写入 {path}：{rule}]", "info"))
             return Allow()
+        if option == "reject-always" and session is not None and deny_rule is not None:
+            #  deny 不受持久 allow 那条禁令的限制（永远只会更严），写盘不会被拒；
+            #  真写不进去（磁盘/权限）也得说出来，本次照样拒绝
+            try:
+                path = session.agent.permissions.add_persistent(deny_rule)
+            except (ValueError, OSError) as exc:
+                session.sink.emit(Notice(f"[规则未写入：{exc}；已仅拒绝本次]", "warn"))
+                return Deny("用户拒绝了本次调用")
+            session.sink.emit(Notice(f"[已写入 {path}：{deny_rule}]", "info"))
+            return Deny(
+                f"用户已拒绝，并写入持久规则「{deny_rule}」——以后同类调用都会被拦，换别的办法"
+            )
         return Deny("用户拒绝了本次调用")
 
     def _resolve_pending(self, message: dict[str, Any]) -> None:

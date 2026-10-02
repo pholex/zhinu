@@ -387,7 +387,8 @@ class TransientStatusTest(unittest.TestCase):
         )
 
     def test_other_client_errors_stay_fatal(self):
-        for status in (400, 404, 413, 422):
+        #  413 不在这里：请求体过大按超限处理（见 test_errors 的 PayloadTooLargeTest）
+        for status in (400, 404, 422):
             self.assertEqual(classify(_StatusError("error", status)).kind, "fatal", status)
 
     def test_wording_still_wins_over_the_status(self):

@@ -334,6 +334,8 @@ class _McpHttpHandler(BaseHTTPRequestHandler):
     init_version = "2025-06-18"
     #  非空 = 只认这个 Authorization 头，其余请求（含 initialize）一律 401（凭据轮换）
     require_auth = ""
+    #  非空 = 对 /mcp 的任何请求回 307 跳到这个地址；落到别的路径的请求记进 record["elsewhere"]
+    redirect_to = ""
     #  超大应答类动作的数据量（用例把客户端上限临时调小到它之下）
     big = 100 * 1024
 
@@ -417,6 +419,18 @@ class _McpHttpHandler(BaseHTTPRequestHandler):
         cls.record.setdefault("headers", []).append(
             {key.lower(): value for key, value in self.headers.items()}
         )
+        if self.path != "/mcp":
+            cls.record.setdefault("elsewhere", []).append(
+                {key.lower(): value for key, value in self.headers.items()}
+            )
+            self._send_status(200, b"{}")
+            return
+        if cls.redirect_to:
+            self.send_response(307)
+            self.send_header("Location", cls.redirect_to)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
         if cls.require_auth and self.headers.get("Authorization") != cls.require_auth:
             self._send_status(401, b"invalid token")
             return
@@ -512,6 +526,7 @@ class _HttpServerCase(unittest.TestCase):
         _McpHttpHandler.init_status = 200
         _McpHttpHandler.init_version = "2025-06-18"
         _McpHttpHandler.require_auth = ""
+        _McpHttpHandler.redirect_to = ""
         self.serve()
         self.url = f"http://127.0.0.1:{self.httpd.server_address[1]}/mcp"
         self.tmp = tempfile.TemporaryDirectory()
@@ -601,6 +616,19 @@ class HttpTransportTest(_HttpServerCase):
         self.assertEqual(
             _McpHttpHandler.record["headers"][0].get("authorization"), "Bearer t0k"
         )
+
+    def test_redirect_is_never_followed_so_static_credentials_stay_home(self):
+        """server 回 30x：urllib 跟过去时会把 Authorization 等全部头原样带到新地址，
+        配置里写死的凭据就泄给了第三方。无论有没有 authorization 回调都不跟。"""
+        _McpHttpHandler.redirect_to = f"http://127.0.0.1:{self.httpd.server_address[1]}/elsewhere"
+        server = self.make_server(headers={"Authorization": "Bearer t0k"})
+        with self.assertRaises(mcp.McpError) as caught:
+            server.bootstrap()
+        self.assertEqual(caught.exception.status, 307)
+        self.assertIn("重定向", str(caught.exception))
+        self.assertIn("/elsewhere", str(caught.exception))
+        #  凭据没有跟着去新地址
+        self.assertNotIn("elsewhere", _McpHttpHandler.record)
 
     def test_close_deletes_remote_session(self):
         server = self.make_server()

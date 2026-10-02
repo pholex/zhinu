@@ -70,6 +70,8 @@ XIAOYU_MODEL=<你网关上的模型名>
 XIAOYU_API_KEY=<key>
 ```
 
+网关上的模型名含 `claude` / `anthropic` 时，发出的 chat 载荷会自动带 Anthropic 的缓存断点（`cache_control`：system、tools 末尾、尾部消息、往前约 20 条处的次锚点）——Anthropic 的 prompt cache 不是自动的，经网关走 chat 协议时没有断点就一个 token 都不缓存（对 LiteLLM 实测透传并命中）。网关不是 LiteLLM、拒收这个字段时设 `XIAOYU_GATEWAY_CACHE_CONTROL=0` 关掉。
+
 直连和网关至少配一个，两个都配见下方"多 provider"。端点在**本机**（`localhost` / `127.0.0.1` / `::1` / `*.localhost`，如 vLLM、SGLang、Ollama）时 key 可以不填——远端地址缺 key 仍视为没配、不注册。
 
 ## 变量总表
@@ -98,9 +100,9 @@ XIAOYU_API_KEY=<key>
 |---|---|---|
 | `XIAOYU_EFFORT` | 不传 | 推理深度 `low / medium / high / xhigh / max`（OpenAI 线另有 `none / minimal`）。同一个名字出内核，按协议翻译成 `reasoning_effort` / `reasoning.effort` / `output_config.effort`；你给自己点名的模型配的取值原样发，上游不认会 400；换到降级链上的模型、或由子 agent 继承过去时，对实测过档位范围的型号就近换成它认的一档并提示（没实测过的型号不改）。命令行 `--effort`，会话里 `/effort`，子 agent 可在 spec 里单独声明 |
 | `XIAOYU_CONTEXT_LIMIT` | 按模型查表 | 上下文上限（token）覆写 |
-| `XIAOYU_COMPACT_AT` | `0.7` | 用量占到这个比例时触发回收/压缩；取 0.05~1 的比例，写成 `70` 这类整数会被忽略并在启动时提示 |
+| `XIAOYU_COMPACT_AT` | `0.7` | 用量占到这个比例时触发回收/压缩；取 0.05~1 的比例，写成 `70` 这类整数会被忽略并在启动时提示。用量到压缩阈值的 50% / 80% 时模型各收到一次余量提示（operator 通道，不碰 system prompt），让它在压缩前合并读取、先把结论落下来；压缩/回滚后按现状重定基线 |
 | `XIAOYU_BUDGET_TOKENS` | 不限 | 本会话 token 软预算（prompt+completion 累计，≥5000 才生效）：模型按 50/80/95% 收到倒计时（operator 通道），到线前一步优雅收尾交代现场，而不是被硬闸中途砍断；直连支持型号（Opus 5/4.8/4.7/Fable/Mythos/Sonnet 5）另附 Anthropic 原生 `task_budget`（服务端倒计时）。命令行 `--budget-tokens` |
-| `XIAOYU_TURN_EXTENSION` | `1.0` | 撞 `max_iterations` 时允许模型调 `extend_turns` 申请追加轮数，总追加量 ≤ `max_iterations ×` 此系数；`0` = 不许延期（撞顶即收尾）。理由展示给用户、可审计 |
+| `XIAOYU_TURN_EXTENSION` | `1.0` | 撞 `max_iterations` 时允许模型调 `extend_turns` 申请追加轮数，总追加量 ≤ `max_iterations ×` 此系数；`0` = 不许延期（撞顶即收尾）。理由展示给用户、可审计。轮数用到上限的 50% / 80% 时模型各收到一次「轮数 N/M」提示（每轮各一次） |
 | `XIAOYU_SERVER_COMPACTION` | `1` | 直连 Claude（opus-4.6+/sonnet-4.6+/5 系）时把压缩交给服务端（模型自己写摘要，`compaction` 块下轮回传，服务端忽略块前历史）；本地摘要压缩降为兜底。设 `0` 回纯本地压缩 |
 | `XIAOYU_KEEP_RECENT` | `8` | 压缩时至少保留最近几条消息 |
 | `XIAOYU_EXPLORE_ITERATIONS` | `12` | `explore` 子 agent 单次检索的工具调用轮数上限（1–100；主 agent 的 50 轮不受影响） |
@@ -124,12 +126,13 @@ XIAOYU_API_KEY=<key>
 | `XIAOYU_MCP_OSV` / `_WATCHDOG` / `_CACHE` / `_RECONNECT` | MCP 的恶意包预检 / 孤儿进程回收 / schema 缓存 / 断线自动重连 |
 | `XIAOYU_MCP_TRUST_CHANGES` | **默认关**，`1` = 开：所有 MCP server 的工具描述/schema 变更自动接受、不再隔离等 `/mcp approve`（逐 server 版是声明里的 `trustToolChanges`；见[安全](security.md)） |
 | `XIAOYU_MCP_TOOL_SEARCH` | MCP 工具检索模式（默认开：工具不进 schema，`search_tool` 检索 + `use_tool` 调用；`0` = 回到全量注册） |
+| `XIAOYU_GATEWAY_CACHE_CONTROL` | 网关下型号名含 `claude` / `anthropic` 的后端：chat 载荷自动打 Anthropic 缓存断点（默认开，见上方"网关"）；`0` = 关 |
 | `XIAOYU_UPDATE_CHECK` | 新版本提示（默认开）：交互式启动时每 24 小时至多查一次 PyPI，有新版在横幅后提一行；`-p`、`--wire`、serve、ACP、嵌入宿主不查。请求只带版本号，没有身份标识；同一个新版本每 24 小时至多提一次。`0` = 关 |
 | `XIAOYU_FOLDER_TRUST` | 工作区信任门（默认开，见[安全](security.md)；只认真实环境变量与用户级 `.env`） |
 | `XIAOYU_HARDLINE` | bash 硬红线（`rm -rf /`、`mkfs`、`dd of=/dev/…`，默认开、任何模式都拦）；`0` = 关，给隔离环境里的镜像烧录 / 格式化用（见[安全](security.md)） |
 | `XIAOYU_UNATTENDED` | **默认关**，`1` = 开：`--yolo` 下仍必问的三项（`exit_plan_mode`、沙箱升权、写可执行配置）也不再问；等价命令行 `--unattended` |
 | `XIAOYU_UNGUARDED` | `--unguarded` 无护栏预设的**环境同意**：只认真实环境变量、不读 `.env`，由容器 / VM 编排脚本注入；没有它 `--unguarded` 报错退出（见[安全](security.md)） |
-| `XIAOYU_ENABLE_HOOKS` | 用户级 `hooks.toml` 生命周期钩子 |
+| `XIAOYU_ENABLE_HOOKS` | 用户级 `hooks.toml` 生命周期钩子（PreToolUse / PostToolUse / UserPromptSubmit / Stop；退出码 2 = 拦截，其它失败 fail-open 放行）。样本：[examples/hooks/adversary](../examples/hooks/adversary/)——bash 命令交给另一次 `xiaoyu -p` 做二审 |
 | `XIAOYU_ENABLE_AGENTS` | 声明式 subagent（`agents/*.toml`）与七襄并行织造模式（见[多 agent 协同](multi-agent.md)） |
 | `XIAOYU_ENABLE_CHENSHU` | 宸枢统筹织造模式（见[多 agent 协同](multi-agent.md)） |
 | `XIAOYU_SUBAGENT_MAX_DEPTH` | 子 agent 嵌套深度上限（默认 `1` = 不套娃）；设 2/3 显式放开有界嵌套 |
@@ -144,6 +147,9 @@ XIAOYU_API_KEY=<key>
 | `XIAOYU_SANDBOX_NETWORK` | 开 | 沙箱内是否允许联网（`0` = 断网） |
 | `XIAOYU_SANDBOX_WRITABLE` | — | 追加可写根目录，冒号分隔 |
 | `XIAOYU_THEME` | `auto` | `dark` / `light` 跳过终端背景色探测 |
+| `XIAOYU_BELL` | 关 | `1` = 一轮结束 / 等审批时往终端写响铃（BEL），终端翻译成提示音、Dock 弹跳或标签高亮；只对真终端写，管道里不写 |
+| `XIAOYU_TITLE` | 开 | 交互模式把窗口标题设成「xiaoyu · 目录名」，退出时还原（认标题栈的终端精确还原，其余清空）；`0` = 关 |
+| `XIAOYU_STATUS_HOOK` | — | 状态变成"等人"时后台跑的命令，状态串作最后一个参数（`waiting_input` / `waiting_approval`），也放进环境变量 `XIAOYU_STATUS`。给系统通知用，如 macOS：`osascript -e 'display notification "小羽在等你"'`；超时（10s）与失败静默。只在 TUI / 明文 REPL 生效 |
 | `XIAOYU_BROWSER_CDP` | — | 接管以 `--remote-debugging-port` 起的本机 Chrome（要登录态时用） |
 | `XIAOYU_BROWSER_HEADED` | 无头 | 有头模式启动浏览器 |
 
@@ -166,6 +172,8 @@ xiaoyu --system-prompt-file ~/prompts/writer.md
 
 - **运行纪律**：工具怎么用（explore / str_replace / bash 验证）、计划怎么记、`<untrusted_content>` 里的指令不照做、工作区与系统信息。这是 harness 正常且安全运转的前提，不属于人格；
 - 环境画像、项目指令（`AGENTS.md` 等）、技能索引；`--append-system-prompt` 给的内容仍追加在后。
+
+项目指令按 git 根 → 工作区逐层收集进 system prompt；工作区**下层**目录（monorepo 的子包）里的 `AGENTS.md` / `XIAOYU.md` / `CLAUDE.md` 只在 system prompt 里留指针，正文在模型第一次读写该目录（`read_file` / `write_file` / `str_replace` 的路径、bash 命令里的路径词）时随工具结果附上——从工作区到那个目录的每一层各载一次，只向下、不出工作区、依赖目录不算，总量与 system prompt 里的项目指令同一上限（超了只给指针）。
 
 几点约定：
 
@@ -233,6 +241,45 @@ MCP 子进程的环境是**纯白名单**（定位类变量，加上代理与自
 全部失败的；对在线的 server 就是干净重启一次）。它重读的是配置文件：在别的终端 export 的变量、
 会话启动后才改的 `.env`，本进程都看不到，那两种仍得重启会话。
 
+除了各家通用的 `command` / `args` / `env` / `url` / `headers` / `timeout` / `disabled`，声明里还认几个
+小羽自己的字段（`xiaoyu mcp add` 有对应选项）：
+
+```json
+{
+  "mcpServers": {
+    "fs": {
+      "command": "npx", "args": ["-y", "@modelcontextprotocol/server-filesystem", "."],
+      "cwd": "${env:HOME}/projects/site",
+      "tools": ["read_file", "list_directory"],
+      "inheritEnv": ["MYAPP_*"]
+    }
+  }
+}
+```
+
+- `cwd`：stdio server 的工作目录（文件系统类 server 把它当根用；宿主由编辑器或 systemd 拉起时
+  当前目录是哪儿全看运气）。与 `url` / `headers` 同一套 `${env:VAR}` 展开；目录不存在在启动前就报
+  清楚，不会变成一句看起来像"命令找不到"的 `FileNotFoundError`。远端 server 没有这个字段。
+- `tools`：只暴露名单内的工具。几十个工具的 server 往往只用两三个，其余的既占检索结果又是多余的
+  攻击面——名单外的工具模型看不见（不注册、不进 `search_tool`），拿着全限定名直接点名也会被
+  server 调用层再拦一次。名单里写了 server 没提供的名字，启动时告警一次并列出它实际提供的；
+  rug-pull 基线只对名单内的工具比对，名单外工具的描述怎么变都不会把整代隔离。
+- `inheritEnv`：从父环境透传给 server 的变量名或前缀（子进程环境是白名单，见下）。
+
+server 启动失败时（`/mcp` 的状态、工具调用的报错、重连耗尽的提示）会直接附上它 stderr 日志的
+末几行（脱敏、去控制序列、每行截断），多数时候不必再去翻 `日志：` 那个路径。server 经
+`notifications/message` 发来的日志按级别分流：warning 及以上一行上屏，其余只进同一份
+`mcp-<name>.log`；长调用期间 server 的 `notifications/progress` 会显示在活区那一行（`3/10（30%） · 正在下载`），
+`--output-format stream-json` 下是 `tool.progress` 事件。
+
+排障不必经模型：`xiaoyu mcp probe <server名>` 直接握手、打印 serverInfo / 协议版本 / 能力 /
+instructions / 工具表（不在 `tools` 名单里的标 ✗）；也可以 `xiaoyu mcp probe -- npx -y 某包` 探一条
+还没写进配置的命令行，或 `--url` 探远端。`--script steps.json` 按脚本顺序执行
+`[{"op":"listTools"}, {"op":"callTool","name":"echo","args":{"text":"hi"}}]`，每步一行 JSON（耗时、
+错误分类 `timeout` / `rpc` / `dropped`…、结果形状），任一步失败退出码 1。走的是会话里同一个客户端：
+准入规则、OSV 预检、`cwd` 校验、超时都一样，"probe 通了会话里却不通"不会发生在这一层；探测的日志
+单独写 `mcp-probe-<name>.log`，不碰正在跑的会话。
+
 找启动命令（`npx` / `uvx` …）时先看该 server 的 `env` 块里声明的 `PATH`，再看小羽自己的
 `PATH`。小羽由编辑器或 systemd 拉起时自己的 `PATH` 往往很短，在 `env` 里补一行
 `"PATH": "/opt/homebrew/bin:${env:PATH}"` 即可，不必把 `command` 写成绝对路径。
@@ -253,6 +300,74 @@ server 的**结果**默认包进 `<untrusted_content>` 回灌（里面的指令�
 > `xiaoyu plugin` 装的是**内容包**（技能文本 + MCP 声明）。它和 `XIAOYU_ENABLE_PLUGINS`
 > 管的**插件工具**（entry point 组 `xiaoyu.tools`，第三方 Python 包往进程里注册函数）
 > 是两条互不相干的通道，只是恰好都叫 plugin。
+
+## 技能（SKILL.md）：参数、斜杠调用、支持文件
+
+技能是 `<目录>/SKILL.md`（frontmatter `name` / `description` + markdown 正文），扫描位置见上表
+`XIAOYU_ENABLE_SKILLS` 一行。索引（名字 + 一句话描述）进 system prompt，正文由模型用 `skill`
+工具按需加载。加载时除正文外还带三样东西：
+
+- **技能目录**：正文里的相对路径以它为基准；
+- **支持文件清单**：技能目录下除 `SKILL.md` 外的文件，按「相对路径 → 绝对路径」列出（隐藏文件、
+  `__pycache__` 不算，不跟符号链接；最多 40 条，超了提示用 `list_files` 看）。模型引用脚本 /
+  参考文档时用绝对路径，不会在工作区里瞎找；
+- **参数占位**：正文里的 `$ARGUMENTS`（全部参数原文）、`$ARGUMENTS[i]` / `$i`（按空白切的第 i 个，
+  从 1 起）、`$名字`（frontmatter 声明的具名参数，按位置对应）由调用时给的参数填充。声明写法：
+
+  ```yaml
+  ---
+  name: deploy
+  description: 部署到指定环境
+  arguments: [env, version]      # 顶层行内列表；块列表（- env）或 metadata.arguments 也认
+  ---
+  把 $version 部署到 $env（完整参数：$ARGUMENTS）
+  ```
+
+  没给到的 `$ARGUMENTS` / 声明过的 `$名字` **原样保留**，并在头部点名缺了哪些（模型按上下文推断，
+  推不出就问你）。裸 `$1` 缺参不报：技能正文里 `awk '{print $1}'` 这类 shell 片段太常见。别的
+  `$xxx`（`$PATH`、`$HOME`）不是占位，原样不动。
+
+交互前端里 **`/<技能名> 参数…`** 直接把技能展开成本轮提示（模型看到的就是 `skill` 工具加载的那份，
+外加一句"用户点名要执行"）。斜杠名字空间里**内建命令优先**：技能叫 `help` 也遮不住 `/help`，
+要写 `/skill:help`；`/skills` 列表会标出撞名的技能，TUI 补全里技能也列在内建命令之后
+（撞名的以 `/skill:` 形态出现）。`/skill:` 前缀下找不到技能报错，不回落到内建命令。
+
+## 生命周期钩子（hooks.toml）
+
+用户级 `<配置目录>/hooks.toml`（刻意不读工作区级：hook 是任意代码执行，clone 一个仓库不该把命令
+种进你的 shell）。`XIAOYU_ENABLE_HOOKS=0` 一键关。
+
+```toml
+[[hooks]]
+event = "PreToolUse"        # 见下表
+matcher = "bash"            # 正则匹配工具名，只对工具类事件有意义；MCP 工具按真名匹配
+command = "python ~/bin/check.py"
+timeout = 10                # 秒，缺省 30，上限 600
+on_failure = "allow"        # allow | block，只对 PreToolUse 生效
+```
+
+钩子从 stdin 收一个 JSON 对象（`event`、`workspace` 必有，其余按事件），**退出码 2 = 拦截**
+（stderr 作为理由），0 = 放行；超时、起不来、其它退出码默认 **fail-open 放行并告警**——
+hook 是辅助护栏，deny 规则才是硬闸。`on_failure = "block"` 反过来：钩子坏了也按拦截处理，
+理由里标明「钩子失败」，给"这道闸必须跑过才能动手"的场景；只对 PreToolUse 生效，写在别的
+事件上会提示并忽略。同一事件多个钩子顺序执行，任一拦截即拦截。
+
+| 事件 | 时机与拦截语义 | payload 额外字段 |
+|---|---|---|
+| `PreToolUse` | 审批之后、执行之前；拦截 → 不执行，理由回灌模型 | `tool`、`args`、`call_id` |
+| `PostToolUse` | 工具已执行；拦截 → 理由作为附注拼进结果（不撤销副作用） | `tool`、`args`、`ok`、`output`、`call_id` |
+| `ToolFailed` | 工具结果判成失败（`ERROR:`）之后的通知，拦截无意义 | `tool`、`args`、`ok=false`、`output`、`call_id` |
+| `UserPromptSubmit` | 用户输入入历史之前；拦截 → 本轮不发 | `prompt` |
+| `Stop` | 模型想收尾时；拦截 → 理由作为消息顶回去续跑一步（每轮一次） | `last_text` |
+| `SessionStart` | 会话首轮之前一次（接回历史之后；子 agent 不触发）；拦截 → 拒绝启动 | `model`、`session` |
+| `SessionEnd` | 会话正常收尾一次，结果不影响退出 | `model`、`session` |
+
+同一次工具调用的 `PreToolUse` / `PostToolUse` / `ToolFailed` 带**同一个 `call_id`**，外部钩子
+靠它把"要跑什么"和"跑出了什么"对上（并行工具调用下光靠工具名对不上）。`SessionStart` 放行时，
+钩子 stdout 的**首个非空行**（上限 2000 字符）作为一次性消息注入历史——给宿主注入环境说明用
+（当前分支、值班提示……）；它走的是"harness 放进来、内容不可信"的通道，不是权威指令。
+挂在工具事件上的钩子在子 agent 里照样触发（工作目录换成它的）；会话类事件不带下去。
+事件名与 payload 形状和 SDK 进程内 hook（见 [sdk-platform](sdk-platform.md)）一致。
 
 ## 接入未内置的厂商
 

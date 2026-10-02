@@ -56,7 +56,8 @@ jobs:
     environment: pypi
     permissions:
       id-token: write
-      contents: read
+      #  write：末尾用 gh 建 GitHub Release（之前只读）。只在 publish 这一个 job 放开
+      contents: write
       actions: read
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
@@ -87,3 +88,22 @@ jobs:
       - run: /tmp/released-sdk/bin/python -m pip install "xiaoyu-agent-sdk==${GITHUB_REF_NAME#v}"
       - run: /tmp/released-sdk/bin/python -m pip check
       - run: /tmp/released-sdk/bin/python -I tests/sdk_wheel_smoke.py
+      - name: GitHub Release（docs/releases/<版本>.md 存在就用它，否则自动生成说明）
+        #  放在 PyPI 发布与装回冒烟之后：包没发出去就不该有 Release。
+        #  发版说明由 scripts/release_notes.py 在打 tag 前生成并提交（见 DEVELOPMENT.md）；
+        #  忘了生成就退回 GitHub 的 --generate-notes，不拦发版。已存在（rerun）则跳过
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag="$GITHUB_REF_NAME"
+          notes="docs/releases/${tag#v}.md"
+          if gh release view "$tag" --repo "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
+            echo "Release $tag 已存在，跳过"
+            exit 0
+          fi
+          if [ -f "$notes" ]; then
+            gh release create "$tag" --repo "$GITHUB_REPOSITORY" --title "$tag" --notes-file "$notes"
+          else
+            echo "::warning::没有 $notes，改用自动生成的说明（发版前跑 scripts/release_notes.py 可避免）"
+            gh release create "$tag" --repo "$GITHUB_REPOSITORY" --title "$tag" --generate-notes
+          fi

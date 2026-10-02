@@ -90,7 +90,7 @@ from rich.syntax import Syntax
 from rich.text import Text
 from rich.theme import Theme as RichTheme
 
-from . import command_check, keys, media, modes, theme, ui
+from . import attention, command_check, keys, media, modes, theme, ui
 from .agent import Agent
 from .config import user_config_dir
 from .events import (
@@ -105,11 +105,12 @@ from .events import (
     ToolCompleted,
     ToolDenied,
     ToolPending,
+    ToolProgress,
     ToolPurpose,
     ToolRunning,
     UIEvent,
 )
-from .permissions import Permissions, parse_rule, suggest_allow_rule
+from .permissions import Permissions, parse_rule, suggest_allow_rule, suggest_deny_rule
 from .session_log import _ensure_private_dir, _open_private
 from . import render
 from .render import args_preview
@@ -263,11 +264,15 @@ class _RunningLine:
         #  见 _TIP_START：跨运行把整张提示表轮完，而不是每次都从头四条开始
         self._tip_start = next(_TIP_START)
         self.started = time.monotonic()
+        #  工具自报的进度（tool.progress 事件写入，刷新线程读）：有它就顶掉轮播
+        #  提示——"第 3/10 步 · 正在下载"比上手提示更回答"还要等多久"
+        self.progress = ""
 
     def __rich__(self) -> Text:
         elapsed = time.monotonic() - self.started
+        suffix = self.progress or self._suffix(elapsed)
         return Text(
-            f"{self.name} {self.verb} · {elapsed:.0f}s · {self._suffix(elapsed)}",
+            f"{self.name} {self.verb} · {elapsed:.0f}s · {suffix}",
             style="text.secondary",
         )
 
@@ -839,6 +844,8 @@ class RichSink:
         self.bash_timeout: int | None = None
         self.request_timeout: int | None = None
         self._status: Any | None = None
+        #  活区正在画的那一行（tool.progress 往上面写进度；spinner 收掉即清）
+        self._running_line: _RunningLine | None = None
         self._ro_counts: dict[str, int] = {}
         #  当前正文块是否已打开 OSC 133 锚点（TextEnd 负责收束配对），
         #  语义与 PlainSink 对齐，见 render.OSC133_TEXT_START 的注释
@@ -851,6 +858,7 @@ class RichSink:
             ToolPending: self._tool_pending,
             ToolPurpose: self._tool_purpose,
             ToolRunning: self._tool_running,
+            ToolProgress: self._tool_progress,
             ToolCompleted: self._tool_completed,
             ToolDenied: self._tool_denied,
             PlanUpdated: self._plan,
@@ -888,6 +896,7 @@ class RichSink:
             with contextlib.suppress(Exception):
                 self._status.stop()
             self._status = None
+        self._running_line = None
 
     def _flush_ro_group(self) -> None:
         """只读折叠组落盘：遇到任何非只读事件（或一轮结束）时汇成一行。
@@ -977,9 +986,18 @@ class RichSink:
             return
         self._stop_status()
         line = _RunningLine(event.name, self._timeout_for(event))
+        self._running_line = line
         self._status = self.console.status(line, spinner="dots")
         with contextlib.suppress(Exception):
             self._status.start()
+
+    def _tool_progress(self, event: ToolProgress) -> None:
+        """工具自报的进度写进活区那一行（没有活区就丢：进度是可覆盖的状态，
+        不值得在 scrollback 里各占一行）。读线程上来的调用，只改一个字符串。"""
+        line = self._running_line
+        if line is None:
+            return
+        line.progress = render.progress_text(event.progress, event.total, event.message)
 
     def _timeout_for(self, event: ToolRunning) -> int | None:
         """这次调用的超时上限（只有 bash 有）：显式传的优先，否则用配置默认值。
@@ -1118,12 +1136,27 @@ class SlashCompleter(Completer):
                 if model.startswith(word):
                     yield Completion(model, start_position=-len(word))
 
-    def _command_completions(self, word: str) -> Iterable[Completion]:
-        from .cli import SLASH_COMMANDS
+    #  技能补全的 meta 长度：描述是给索引写的、动辄几百字，菜单里一行放不下
+    _SKILL_META_CAP = 60
 
-        #  前缀命中排前面，子串命中（/ctx 打错也能找到 /context）殿后
+    def _command_completions(self, word: str) -> Iterable[Completion]:
+        from .cli import SLASH_COMMANDS, SKILL_SLASH_PREFIX, skill_shadowed
+
+        #  内建命令在前（名字空间里内建优先，菜单顺序也这么说），技能在后；
+        #  各自内部前缀命中排前面，子串命中（/ctx 打错也能找到 /context）殿后
+        candidates: list[tuple[str, str]] = [
+            #  `/<技能名>` 这种占位行只给 /help 看，补全菜单里列的是真名字
+            (command, description) for command, description in SLASH_COMMANDS.items() if "<" not in command
+        ]
+        if self.tui.agent is not None:
+            for skill in getattr(self.tui.agent, "skills", []):
+                command = f"{SKILL_SLASH_PREFIX}{skill.name}" if skill_shadowed(skill.name) else f"/{skill.name}"
+                meta = skill.description or "技能"
+                if len(meta) > self._SKILL_META_CAP:
+                    meta = meta[: self._SKILL_META_CAP] + "…"
+                candidates.append((command, f"技能：{meta}"))
         substring_hits: list[tuple[str, str]] = []
-        for command, description in SLASH_COMMANDS.items():
+        for command, description in candidates:
             if command.startswith(word):
                 yield Completion(command, start_position=-len(word), display_meta=description)
             elif len(word) > 1 and word[1:] in command:
@@ -1716,10 +1749,11 @@ class Tui:
     # ---------- 确认框 ----------
 
     def confirm(self, name: str, args: dict[str, Any]) -> bool | str | tuple[bool, str]:
-        """交互确认（Agent 的 approver）：三选项菜单。
+        """交互确认（Agent 的 approver）：行内单选菜单。
 
         允许一次 / 本会话不再问 / 总是允许（规则写入前可编辑）/
-        拒绝并告诉小羽下一步怎么做。Tab = 批准并附言：附言随 tool result
+        拒绝并告诉小羽下一步怎么做 / 以后都拒绝（写 deny 规则，同样可编辑）。
+        Tab = 批准并附言：附言随 tool result
         回灌模型（拒绝理由走同一条通道，拒绝只是附言的特例）。
         返回值：(True, 附言) 也是批准——附言由 Agent 拼进 tool result。
         """
@@ -1727,6 +1761,8 @@ class Tui:
         #  poller 不停手会把用户的选择按键当成插话吃掉
         if self._poller is not None:
             self._poller.pause()
+        #  审批挂起 = 轮次卡在等人：铃（opt-in）与状态钩子把切走的人叫回来
+        attention.waiting(attention.WAITING_APPROVAL)
         try:
             return self._confirm_inner(name, args)
         finally:
@@ -1743,6 +1779,7 @@ class Tui:
         if self._poller is not None:
             self._poller.pause()
         self.sink._stop_status()  # noqa: SLF001 - 同模块前端搭档
+        attention.waiting(attention.WAITING_INPUT)
         try:
             return ask_questions(questions, self.console)
         finally:
@@ -1776,6 +1813,10 @@ class Tui:
         if rule is not None:
             options.append(("always", f"总是允许（规则写入前可编辑：{rule}）", "!"))
         options.append(("deny", "拒绝，并告诉小羽下一步怎么做", "n"))
+        #  与「总是允许」对称的持久拒绝：写的是 deny 规则，任何模式（含 --yolo）都拦
+        deny_rule = suggest_deny_rule(name, args, self.permissions.workspace)
+        if deny_rule is not None:
+            options.append(("never", f"以后都拒绝（规则写入前可编辑：{deny_rule}）", "x"))
 
         try:
             choice = self._inline_select(self._confirm_title(name, shown), options, expand)
@@ -1816,6 +1857,33 @@ class Tui:
             reason = self._ask_reason()
             self._echo_verdict("⨯ 已拒绝" + (f"：{reason}" if reason else ""))
             return reason or False
+        if choice == "never":
+            assert deny_rule is not None  # 只有推导出规则才有这个选项
+            edited = self._ask_rule(str(deny_rule), empty_means="仅本次拒绝")
+            #  取消或置空都退化成普通拒绝：这一次总归是不执行的
+            parsed = parse_rule(edited.strip()) if edited and edited.strip() else None
+            if edited is not None and edited.strip() and parsed is None:
+                self.console.print(
+                    Text(f"  规则格式无法解析：{edited.strip()}（应为 deny bash(curl *) 这类）", style="status.error")
+                )
+            elif parsed is not None and parsed.behavior != "deny":
+                #  这个入口只写 deny：改成 allow 等于把"拒绝"按成了"放行"，不收
+                self.console.print(
+                    Text(f"  这里只写 deny 规则，{parsed} 未写入", style="status.error")
+                )
+                parsed = None
+            if parsed is None:
+                self._echo_verdict("⨯ 已拒绝")
+                return False
+            try:
+                path = self.permissions.add_persistent(parsed)
+            except ValueError as exc:
+                self.console.print(Text(f"  规则被拒绝：{exc}", style="status.error"))
+                self._echo_verdict("⨯ 已拒绝")
+                return False
+            self._echo_verdict(f"⨯ 已拒绝，并写入 {path}：{parsed}")
+            #  拒绝理由回灌模型：说明这是持久规则，同类调用不必再试
+            return f"用户已拒绝，并写入持久规则「{parsed}」——以后同类调用都会被拦，换别的办法"
         #  Esc / Ctrl-C：普通拒绝
         self._echo_verdict("⨯ 已拒绝")
         return False
@@ -1842,14 +1910,14 @@ class Tui:
             return f"要{verb} {base} 吗？"
         return f"允许执行 {name} 吗？"
 
-    def _ask_rule(self, rule: str) -> str | None:
-        """「总是允许」的规则写入前可编辑（选项预填可改的命令前缀）。
-        回车接受原文；置空 = 不写规则、仅本次允许；Esc/Ctrl-C = 取消。"""
+    def _ask_rule(self, rule: str, empty_means: str = "仅本次允许") -> str | None:
+        """「总是允许」/「以后都拒绝」的规则写入前可编辑（选项预填推导出的规则）。
+        回车接受原文；置空 = 不写规则、只按本次的判定走；Esc/Ctrl-C = 取消。"""
         if self._confirm_session is None:
             self._confirm_session = PromptSession()
         try:
             return self._confirm_session.prompt(
-                [(theme.ptk("menu.title"), "  规则（可编辑，置空 = 仅本次允许）：")], default=rule
+                [(theme.ptk("menu.title"), f"  规则（可编辑，置空 = {empty_means}）：")], default=rule
             )
         except (EOFError, KeyboardInterrupt):
             print()
@@ -2044,7 +2112,15 @@ class Tui:
         """交互循环。与明文 repl 的差异：Ctrl-C 需在 2 秒内按两次才退出
         （单次防误触），Ctrl-D 仍即刻退出；多出 @ 文件补全与 Ctrl-O 等按键
         （! / # 前缀两个前端已对齐，路由同走 keys.classify_input）。"""
-        from .cli import handle_slash
+        #  窗口标题随会话走，退出时还原——任何退出路径（Ctrl-D、/exit、异常）都要还
+        attention.set_title(agent.config.workspace)
+        try:
+            return self._run_loop(agent)
+        finally:
+            attention.clear_title()
+
+    def _run_loop(self, agent: Agent) -> int:
+        from .cli import handle_slash, skill_prompt
 
         self.agent = agent
         self.sink.bash_timeout = agent.config.bash_timeout
@@ -2107,11 +2183,19 @@ class Tui:
             if action.kind == "usage":
                 self.console.print(Text(f"  {action.hint}", style="text.secondary"))
                 continue
+            recall = action.args
             if action.kind == "slash":
-                #  /resume 这类需要列表选择的命令用行内菜单（纯单选，无附言）
-                if handle_slash(agent, action.args, select=lambda t, o: inline_select(t, o, amend=False)):
-                    return 0
-                continue
+                #  /<技能名> 参数… 展开成本轮提示（与明文 REPL 同一个入口）；
+                #  不是技能的才交给内建命令表
+                expanded = skill_prompt(agent, action.args)
+                if expanded is None:
+                    #  /resume 这类需要列表选择的命令用行内菜单（纯单选，无附言）
+                    if handle_slash(agent, action.args, select=lambda t, o: inline_select(t, o, amend=False)):
+                        return 0
+                    continue
+                if not expanded:
+                    continue
+                action = keys.InputAction("send", expanded)
             if action.kind == "shell":
                 self._run_shell(action.args)
                 continue
@@ -2120,7 +2204,8 @@ class Tui:
                 continue
 
             line = action.args
-            self._last_input = line
+            #  Esc-Esc 取回的是用户敲的那行（/deploy prod），不是展开后的几千字
+            self._last_input = recall
             self.sink.begin_turn()
             #  运行期插话（steer）：整行回车即在 step 边界进入本轮。
             #  poller 起不来（Windows/非 tty）时自动退回旧的"收尾预填"体验
@@ -2151,7 +2236,13 @@ class Tui:
 
             if note := background_status(agent):
                 self.console.print(Text(note, style="text.secondary"))
+            from .cli import turn_stats_line
+
+            if stats := turn_stats_line(agent):
+                self.console.print(Text(f"  {stats}", style="text.secondary"))
             self._print_expand_hint()
+            #  一轮收尾 = 回到"等人"：铃（opt-in）+ 状态钩子，把切去别处的人叫回来
+            attention.waiting(attention.WAITING_INPUT)
             #  没赶上本轮的插话（模型收尾后才按的回车）+ 等待期敲的其余内容：
             #  都转成下一轮输入行的预填——用户的话绝不凭空消失，也绝不自动提交
             leftover = agent.drain_steers()

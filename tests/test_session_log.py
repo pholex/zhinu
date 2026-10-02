@@ -984,5 +984,94 @@ class OrphanCompactTest(unittest.TestCase):
         self.assertFalse(has_orphan_compact(self.path))
 
 
+
+class TitleExportTest(SessionDirTestCase):
+    """显示名、末条摘要、按引用找会话、导出（不含 system）。"""
+
+    def _session(self, name: str = "") -> SessionLog:
+        log = SessionLog.create("m", "/ws/a", session_id=name)
+        log.append({"role": "system", "content": "内部提示 不该导出"})
+        log.append({"role": "user", "content": "修登录页"})
+        log.append(
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {"id": "c1", "type": "function",
+                     "function": {"name": "bash", "arguments": '{"command": "pytest -q"}'}}
+                ],
+            }
+        )
+        log.append({"role": "tool", "tool_call_id": "c1", "content": "3 passed\n更多输出"})
+        log.append({"role": "assistant", "content": "修好了，" + "测试通过。" * 40})
+        log.release()
+        return log
+
+    def test_last_preview_is_tail_message_capped(self):
+        from xiaoyu.session_log import LAST_PREVIEW, last_preview
+
+        log = self._session()
+        last = last_preview(log.path)
+        self.assertTrue(last.startswith("修好了，测试通过。"))
+        self.assertEqual(len(last), LAST_PREVIEW)
+        info = list_sessions()[0]
+        self.assertEqual(info.last, last)
+        self.assertEqual(info.title, "")
+        self.assertEqual(info.label, info.preview)
+
+    def test_rename_sets_meta_title_and_list_shows_it(self):
+        from xiaoyu.session_log import rename_session
+
+        log = self._session("named")
+        self.assertEqual(rename_session(log.path, "  登录页\x1b[31m 修复  "), "登录页 修复")
+        head = json.loads(log.path.read_text(encoding="utf-8").splitlines()[0])
+        self.assertEqual(head["event"], "meta")
+        self.assertEqual(head["title"], "登录页 修复")
+        info = list_sessions()[0]
+        self.assertEqual(info.title, "登录页 修复")
+        self.assertEqual(info.label, "登录页 修复")
+        #  其余记录原样：改名不丢历史
+        self.assertEqual(len(load_messages(log.path)), 5)
+
+    def test_rename_refuses_locked_or_empty(self):
+        from xiaoyu.session_log import rename_session
+
+        log = self._session()
+        with self.assertRaises(ValueError):
+            rename_session(log.path, "   ")
+        with self.assertRaises(ValueError):
+            rename_session(log.path, "x" * 81)
+        holder = SessionLog(log.path)  # 别的句柄正续写
+        self.addCleanup(holder.release)
+        with self.assertRaises(SessionLockedError):
+            rename_session(log.path, "改不了")
+
+    def test_find_session_by_index_name_and_filename(self):
+        from xiaoyu.session_log import find_session
+
+        log = self._session("job-7")
+        self.assertEqual(find_session("1", "/ws/a").path, log.path)
+        self.assertEqual(find_session("job-7", "/ws/a").path, log.path)
+        self.assertEqual(find_session(log.path.stem, None).path, log.path)
+        self.assertEqual(find_session(log.path.name, "/ws/other").path, log.path)  # 放眼全部
+        self.assertIsNone(find_session("9", "/ws/a"))
+        self.assertIsNone(find_session("nope", None))
+
+    def test_export_skips_system_and_summarizes_tools(self):
+        from xiaoyu.session_log import export_markdown, export_messages
+
+        log = self._session()
+        entries = export_messages(log.path)
+        self.assertEqual([e["role"] for e in entries], ["user", "assistant", "tool", "assistant"])
+        self.assertEqual(entries[1]["tool_calls"][0]["name"], "bash")
+        self.assertIn("pytest -q", entries[1]["tool_calls"][0]["summary"])
+        self.assertEqual(entries[2]["text"], "3 passed 更多输出")
+        text = export_markdown(list_sessions()[0])
+        self.assertNotIn("内部提示", text)
+        self.assertIn("## 用户\n\n修登录页", text)
+        self.assertIn("- 调用 `bash`：", text)
+        self.assertIn("> 工具结果：3 passed", text)
+
+
 if __name__ == "__main__":
     unittest.main()

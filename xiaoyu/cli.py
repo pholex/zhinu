@@ -18,8 +18,8 @@ from pathlib import Path
 from typing import Any
 
 from . import (
-    __version__, command_check, envprobe, errors, keys, media, modes, peers, providers,
-    skills, terminal, ui,
+    __version__, attention, command_check, envprobe, errors, keys, media, modes, peers,
+    providers, skills, terminal, ui,
 )
 from .agent import Agent
 from .banner import build_banner
@@ -29,11 +29,15 @@ from .session_log import (
     SessionLockedError,
     SessionLog,
     check_session_id,
+    export_markdown,
+    export_messages,
+    find_session,
     install_exit_logging,
     list_sessions,
     load_messages,
     load_system_prompt,
     open_named,
+    rename_session,
     turn_starts,
     usage_digest,
 )
@@ -64,6 +68,7 @@ SLASH_COMMANDS: dict[str, str] = {
     "/tasks": "后台任务列表（run_in_background 的命令 / monitor）",
     "/mcp": "MCP server 状态；/mcp diff [名] 看变更工具的差异；/mcp approve [名] 批准（无参 = 全部）；/mcp reconnect [名] 修好后重读配置热恢复（无参 = 全部失败的）",
     "/skills": "列出可用技能；/skills reload 重扫磁盘并刷新索引",
+    "/<技能名>": "把技能展开成本轮提示（/<技能名> 参数…，正文里的 $ARGUMENTS / $1 / $名字 用参数填）；与内建命令撞名时写 /skill:<技能名>",
     "/model": "查看或切换模型（/model 名字）",
     "/usage": "本次会话的 token 统计",
     "/effort": "查看或设置推理深度（/effort low|medium|high|xhigh|max）",
@@ -71,6 +76,7 @@ SLASH_COMMANDS: dict[str, str] = {
     "/compact": "立刻压缩历史（不等阈值）",
     "/mode": "切换模式（/mode default|auto|plan），TUI 里 Shift-Tab 同效",
     "/plan": "只读规划态开关（/plan on|off）：/mode plan 的别名",
+    "/goal": "本会话的验收目标（/goal <一句话> 设定、/goal 看当前、/goal clear 清除）：模型收尾前会被要求核对是否达成",
     "/perm": "查看权限规则与会话授权",
     "/allow": "持久允许，如 /allow bash(git *)、/allow write_file",
     "/deny": "持久拒绝（任何模式下都拦，包括 --yolo）",
@@ -114,16 +120,18 @@ SLASH_HELP = "可用命令：\n" + "\n".join(
 SUBCOMMANDS: tuple[tuple[tuple[str, ...], str, str, str], ...] = (
     (("config",), "config_command", "config", "初始化/查看配置"),
     (("resume",), "resume_command", "resume", "恢复历史会话"),
-    (("sessions",), "sessions_command", "sessions",
-     "列出本机在跑的会话（sessions digest 汇总 token 用量）"),
+    (("sessions",), "sessions_command", "sessions [digest|export|rename]",
+     "列出本机在跑的会话；digest 汇总 token 用量、export 导出历史会话、rename 起名"),
     (("send",), "send_command", "send <会话> <消息>", "给另一个会话发一条消息"),
-    (("mcp",), "mcp_command", "mcp add|list|remove", "管理 MCP server 声明"),
+    (("mcp",), "mcp_command", "mcp add|list|remove|probe", "管理 MCP server 声明；probe 不经模型直接探测一个 server"),
     (("plugin", "plugins"), "plugin_command", "plugin add|list|update|remove",
      "装卸插件包（skills + MCP）"),
     (("serve",), "serve_command", "serve", "以 HTTP API 服务启动（需 [serve] 可选依赖）"),
     (("acp",), "_acp_command", "acp", "以 ACP 协议 server 启动，供编辑器客户端驱动（等价 --acp）"),
-    (("doctor",), "doctor_command", "doctor",
-     "体检环境（凭据有无 / 配置 / 代理 / 沙箱 / 磁盘 / MCP 配置）"),
+    (("doctor",), "doctor_command", "doctor [--probe] [--bundle]",
+     "体检环境（凭据有无 / 配置 / 代理 / 沙箱 / 磁盘 / MCP 配置）；--probe 真发一条请求，--bundle 打诊断包"),
+    (("completion",), "completion_command", "completion bash|zsh|fish",
+     "输出 shell 补全脚本（eval \"$(xiaoyu completion zsh)\"）"),
     (("terminal-setup",), "terminal_setup_command", "terminal-setup",
      "给 VS Code 系编辑器配 Shift+Enter 换行"),
     (("update",), "update_command", "update",
@@ -189,6 +197,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="本会话 token 软预算（prompt+completion 累计）：模型会收到倒计时并在到线前收尾",
     )
     parser.add_argument(
+        "--goal",
+        metavar="TEXT",
+        help="验收目标（一句话）：模型收尾前会被要求核对它是否完全达成，未达成继续做；会话里同 /goal",
+    )
+    parser.add_argument(
         "--env-file",
         dest="env_file",
         help="指定 .env 路径，默认依次读当前目录、项目根、用户配置目录",
@@ -243,6 +256,7 @@ def build_parser() -> argparse.ArgumentParser:
         "（agentclientprotocol.com，给 Zed/Neovim 等编辑器客户端驱动）",
     )
     add_output_format(parser)
+    add_stats_flag(parser)
     return parser
 
 
@@ -442,6 +456,15 @@ def collect_image_parts(
         if not pasted:
             return [], "--paste：剪贴板里没有图片（截图或复制图片文件后再试）"
     return parts, ""
+
+
+def add_stats_flag(parser: argparse.ArgumentParser) -> None:
+    """`--stats`：轮末在用量行后追加耗时 / 首 token / 吐字速率。主命令与 resume 共用。"""
+    parser.add_argument(
+        "--stats",
+        action="store_true",
+        help="每轮结束在用量行后追加耗时、首 token 延迟与输出速率（-p 与交互模式都认）",
+    )
 
 
 def add_output_format(parser: argparse.ArgumentParser) -> None:
@@ -692,7 +715,16 @@ def split_resume_positionals(first: str | None, rest: list[str]) -> tuple[int | 
 def _session_label(info: SessionInfo) -> str:
     """会话在行内菜单里的一行标签（截到终端宽度，长了菜单高度就不准了）。"""
     place = Path(info.workspace).name or info.workspace
-    return ui.fit(f"{info.started_at}  {info.model}  {place}  {_named(info)}{info.preview}", 12)
+    return ui.fit(f"{info.started_at}  {info.model}  {place}  {_named(info)}{_session_text(info)}", 12)
+
+
+def _session_text(info: SessionInfo) -> str:
+    """列表里的正文：起过名用名字，否则首条消息开头；再带末条摘要——"想干什么"
+    与"聊到哪了"一起看，挑会话续聊才不用逐个打开。末条与开头相同（单轮会话）不重复。"""
+    head = info.label
+    if info.last and not info.last.startswith(info.preview.rstrip("…")):
+        return f"{head}  ⇢ {info.last}"
+    return head
 
 
 def _named(info: SessionInfo) -> str:
@@ -723,7 +755,7 @@ def choose_session(
         place = Path(info.workspace).name or info.workspace
         print(
             f"  {number:>2}. {info.started_at}  {ui.secondary(info.model)}  "
-            f"{ui.secondary(place)}  {_named(info)}{info.preview}"
+            f"{ui.secondary(place)}  {_named(info)}{_session_text(info)}"
         )
     try:
         answer = input(ui.prompt("恢复哪个？（序号，回车取消）: ")).strip()
@@ -848,11 +880,37 @@ def build_toolbox(config: Config, peer: "peers.Registration | None") -> Toolbox:
     return toolbox
 
 
+def session_start_refused(agent: Agent) -> bool:
+    """SessionStart 钩子（hooks.toml）在首轮之前跑一次；拦截 = 拒绝启动。
+
+    放在 run_once / run_repl 的开头而不是各个 main 里：新会话与 resume 两条装配
+    链最后都汇到这两个入口，钩子只该有一处触发点。接回的历史此时已经 restore
+    完，钩子注入的那行环境说明排在本次会话的输入前面。
+    """
+    #  getattr：这两个入口的测试用极简替身充当 agent，钩子不是替身关心的事
+    begin = getattr(agent, "begin_session", None)
+    decision = begin() if begin is not None else None
+    if decision is None or not decision.blocked:
+        return False
+    print(ui.error(f"SessionStart hook 拒绝启动：{decision.reason}"), file=sys.stderr)
+    return True
+
+
+def end_session(agent: Agent) -> None:
+    """SessionEnd 钩子（hooks.toml）：会话收尾时一次，与 session_start_refused 成对。"""
+    end = getattr(agent, "end_session", None)
+    if end is not None:
+        end()
+
+
 def run_repl(repl_fn: Any, agent: Agent) -> int:
     """跑 REPL，退出时抹掉会话登记（抹不掉也无妨：心跳一停别人自会清理）。"""
+    if session_start_refused(agent):
+        return 2
     try:
         return repl_fn(agent)
     finally:
+        end_session(agent)
         if agent.peer is not None:
             agent.peer.close()
 
@@ -866,11 +924,17 @@ def sessions_command(argv: list[str]) -> int:
     """
     if argv and argv[0] == "digest":
         return sessions_digest_command(argv[1:])
+    if argv and argv[0] == "export":
+        return sessions_export_command(argv[1:])
+    if argv and argv[0] == "rename":
+        return sessions_rename_command(argv[1:])
     parser = argparse.ArgumentParser(
         prog="xiaoyu sessions",
         description=(
             "列出本机在跑的小羽会话（可作为 `xiaoyu send` 的收件人）。"
-            "`xiaoyu sessions digest` 汇总历史会话的 token 用量。"
+            "`xiaoyu sessions digest` 汇总历史会话的 token 用量；"
+            "`xiaoyu sessions export <会话>` 导出一场历史会话；"
+            "`xiaoyu sessions rename <会话> <名字>` 给它起个显示名。"
         ),
     )
     parser.parse_args(argv)
@@ -949,6 +1013,87 @@ def sessions_digest_command(argv: list[str]) -> int:
     return 0
 
 
+def _session_ref_help() -> str:
+    return "会话引用：`xiaoyu resume` 列表里的序号、--session-id 的名字，或会话文件名"
+
+
+def _locate_session(ref: str, everywhere: bool) -> SessionInfo | None:
+    info = find_session(ref, None if everywhere else str(Path.cwd().resolve()))
+    if info is None:
+        print(ui.error(f"找不到会话 {ref!r}（{_session_ref_help()}；--all 不按当前工作区过滤）"), file=sys.stderr)
+    return info
+
+
+def sessions_export_command(argv: list[str]) -> int:
+    """`xiaoyu sessions export <会话>`：导出一场历史会话的用户可见内容。
+
+    只含 user / assistant 正文与工具调用摘要（tool 结果一行摘要），不含 system
+    提示——那是内核的内部话，不是对话本身。默认打到 stdout，`-o` 落文件。
+    """
+    parser = argparse.ArgumentParser(
+        prog="xiaoyu sessions export",
+        description="导出一场历史会话（Markdown 或 JSON），不含 system 提示。",
+    )
+    parser.add_argument("ref", help=_session_ref_help())
+    parser.add_argument("--format", choices=("md", "json"), default="md", help="md（默认）或 json")
+    parser.add_argument("-o", "--out", help="写到这个文件（默认 stdout）")
+    parser.add_argument("--all", action="store_true", help="不按当前工作区过滤")
+    args = parser.parse_args(argv)
+    info = _locate_session(args.ref, args.all)
+    if info is None:
+        return 2
+    try:
+        if args.format == "json":
+            payload = {
+                "session": {
+                    "path": str(info.path), "started_at": info.started_at, "model": info.model,
+                    "workspace": info.workspace, "title": info.title, "session_id": info.session_id,
+                },
+                "messages": export_messages(info.path),
+            }
+            text = json.dumps(payload, ensure_ascii=False, indent=2) + "\n"
+        else:
+            text = export_markdown(info)
+    except (OSError, ValueError) as exc:
+        print(ui.error(f"导出失败：{exc}"), file=sys.stderr)
+        return 2
+    if args.out:
+        target = Path(args.out).expanduser()
+        if target.is_symlink():
+            print(ui.error(f"输出路径是符号链接，拒绝写入：{target}"), file=sys.stderr)
+            return 2
+        target.write_text(text, encoding="utf-8")
+        print(ui.success(f"已导出到 {target}"))
+    else:
+        print(text, end="")
+    return 0
+
+
+def sessions_rename_command(argv: list[str]) -> int:
+    """`xiaoyu sessions rename <会话> <名字>`：给历史会话起显示名（列表里代替首条消息开头）。"""
+    parser = argparse.ArgumentParser(
+        prog="xiaoyu sessions rename",
+        description="给一场历史会话起显示名；正在被别的进程续写的会话不能改。",
+    )
+    parser.add_argument("ref", help=_session_ref_help())
+    parser.add_argument("title", help="新名字（最长 80 字符）")
+    parser.add_argument("--all", action="store_true", help="不按当前工作区过滤")
+    args = parser.parse_args(argv)
+    info = _locate_session(args.ref, args.all)
+    if info is None:
+        return 2
+    try:
+        title = rename_session(info.path, args.title)
+    except SessionLockedError as exc:
+        print(ui.error(f"会话正在被续写，改不了名：{exc}"), file=sys.stderr)
+        return 2
+    except (OSError, ValueError) as exc:
+        print(ui.error(f"改名失败：{exc}"), file=sys.stderr)
+        return 2
+    print(ui.success(f"已改名：{title}") + ui.secondary(f"  ({info.path.name})"))
+    return 0
+
+
 def shorten_home(path: str) -> str:
     """`/Users/me/x` → `~/x`。列表里工作区是关键信息，但不值得占满一行。"""
     home = str(Path.home())
@@ -1024,6 +1169,7 @@ def resume_command(argv: list[str]) -> int:
     add_system_prompt_flags(parser)
     add_prompt_flag(parser)
     add_output_format(parser)
+    add_stats_flag(parser)
     args = parser.parse_args(argv)
     try:
         resolve_system_prompt_flags(args)
@@ -1176,6 +1322,7 @@ def resume_command(argv: list[str]) -> int:
         print(ui.error(str(exc)), file=sys.stderr)
         return 2
     install_exit_logging(agent.session_log)
+    agent.show_stats = args.stats
 
     #  接回上下文并复制进新会话文件（新文件自包含，可再次 resume）
     agent.restore(loaded, source=str(chosen.path))
@@ -1218,10 +1365,28 @@ def doctor_command(argv: list[str]) -> int:
     )
     parser.add_argument("--json", action="store_true", help="机器可读输出（含进程快照）")
     parser.add_argument("-w", "--workspace", default="", help="按哪个工作区检查（默认当前目录）")
+    parser.add_argument(
+        "--probe",
+        action="store_true",
+        help="对默认模型真发一条最小请求（会出网、花一点点 token），记耗时并按分类报错；默认不出网",
+    )
+    parser.add_argument(
+        "--bundle",
+        nargs="?",
+        const="",
+        default=None,
+        metavar="SESSION",
+        help="打诊断包：体检结果 + 脱敏配置 + 指定会话（缺省最近一场）日志尾部 + 崩溃日志 + 版本平台信息，"
+        "写成一个 JSON。密钥脱敏，但含路径与命令历史，分享前自查",
+    )
+    parser.add_argument("-o", "--out", help="诊断包的输出路径（默认当前目录 xiaoyu-doctor-<时间>.json）")
     args = parser.parse_args(argv)
 
     workspace = Path(args.workspace).expanduser() if args.workspace else None
     checks = diagnostics.run_doctor(workspace)
+    if args.probe:
+        load_dotenv()
+        checks.append(diagnostics.probe_model())
     if args.json:
         print(diagnostics.to_json(checks))
     else:
@@ -1232,7 +1397,107 @@ def doctor_command(argv: list[str]) -> int:
                 print(paint[mark](line[:4]) + line[4:])
             else:
                 print(ui.secondary(line))
+    if args.bundle is not None:
+        session: Path | None = None
+        if args.bundle:
+            info = find_session(args.bundle, str((workspace or Path.cwd()).resolve()))
+            if info is None:
+                print(ui.error(f"找不到会话 {args.bundle!r}（{_session_ref_help()}）"), file=sys.stderr)
+                return 2
+            session = info.path
+        try:
+            out = diagnostics.build_bundle(
+                checks, workspace, session, Path(args.out) if args.out else None
+            )
+        except (OSError, ValueError) as exc:
+            print(ui.error(f"诊断包写入失败：{exc}"), file=sys.stderr)
+            return 2
+        #  --json 时 stdout 只准出现那个 JSON：人读的两行走 stderr
+        where = sys.stderr if args.json else sys.stdout
+        print(ui.success(f"诊断包已写到 {out}"), file=where)
+        print(ui.warning(f"  {diagnostics.BUNDLE_NOTICE}"), file=where)
     return 1 if diagnostics.overall(checks) == "fail" else 0
+
+
+# ---------- shell 补全 ----------
+
+COMPLETION_SHELLS = ("bash", "zsh", "fish")
+
+
+def completion_words() -> tuple[list[tuple[str, str]], list[tuple[str, str]]]:
+    """补全词表：(子命令, 说明) 与 (主命令旗标, 说明)，都从现有的表/parser 现取——
+    不另维护一份清单，加了子命令或旗标补全自动跟上。"""
+    subcommands = [(name, summary) for names, _, _, summary in SUBCOMMANDS for name in names]
+    flags: list[tuple[str, str]] = []
+    for action in build_parser()._actions:  # noqa: SLF001 - argparse 没有公开的动作清单
+        for option in action.option_strings:
+            if option.startswith("--"):
+                flags.append((option, (action.help or "").split("（")[0].split("：")[0][:60]))
+    return subcommands, flags
+
+
+def _sh_quote(text: str) -> str:
+    return "'" + text.replace("'", "'\\''") + "'"
+
+
+def completion_script(shell: str) -> str:
+    """最简补全脚本：第一个词补子命令与旗标，之后补旗标。手写而不引入 argcomplete：
+    一个运行期依赖换"补全子命令名"不划算，子命令自己的旗标也不逐个展开。"""
+    subcommands, flags = completion_words()
+    sub_names = " ".join(name for name, _ in subcommands)
+    flag_names = " ".join(flag for flag, _ in flags)
+    if shell == "bash":
+        return (
+            "# xiaoyu bash 补全：eval \"$(xiaoyu completion bash)\" 或存进 ~/.bash_completion.d/\n"
+            "_xiaoyu_complete() {\n"
+            "    local cur=\"${COMP_WORDS[COMP_CWORD]}\"\n"
+            "    if [ \"$COMP_CWORD\" -eq 1 ]; then\n"
+            f"        COMPREPLY=( $(compgen -W \"{sub_names} {flag_names}\" -- \"$cur\") )\n"
+            "    else\n"
+            f"        COMPREPLY=( $(compgen -W \"{flag_names}\" -- \"$cur\") )\n"
+            "    fi\n"
+            "}\n"
+            "complete -o default -F _xiaoyu_complete xiaoyu\n"
+        )
+    if shell == "zsh":
+        sub_specs = " ".join(_sh_quote(f"{name}:{summary}") for name, summary in subcommands)
+        flag_specs = " ".join(_sh_quote(f"{flag}:{summary}" if summary else flag) for flag, summary in flags)
+        return (
+            "# xiaoyu zsh 补全：eval \"$(xiaoyu completion zsh)\"（需先 autoload -U compinit && compinit）\n"
+            "_xiaoyu() {\n"
+            "    local -a subs flags\n"
+            f"    subs=({sub_specs})\n"
+            f"    flags=({flag_specs})\n"
+            "    if (( CURRENT == 2 )); then\n"
+            "        _describe -t subcommands '子命令' subs\n"
+            "    fi\n"
+            "    _describe -t options '旗标' flags\n"
+            "    _files\n"
+            "}\n"
+            "compdef _xiaoyu xiaoyu\n"
+        )
+    if shell == "fish":
+        lines = ["# xiaoyu fish 补全：xiaoyu completion fish > ~/.config/fish/completions/xiaoyu.fish"]
+        for name, summary in subcommands:
+            lines.append(f"complete -c xiaoyu -n __fish_use_subcommand -a {name} -d {_sh_quote(summary)}")
+        for flag, summary in flags:
+            desc = f" -d {_sh_quote(summary)}" if summary else ""
+            lines.append(f"complete -c xiaoyu -l {flag[2:]}{desc}")
+        return "\n".join(lines) + "\n"
+    raise ValueError(f"不支持的 shell：{shell}")
+
+
+def completion_command(argv: list[str]) -> int:
+    """`xiaoyu completion bash|zsh|fish`：把补全脚本打到 stdout。"""
+    parser = argparse.ArgumentParser(
+        prog="xiaoyu completion",
+        description='输出 shell 补全脚本。用法：eval "$(xiaoyu completion zsh)"，'
+        "或 fish：xiaoyu completion fish > ~/.config/fish/completions/xiaoyu.fish",
+    )
+    parser.add_argument("shell", choices=COMPLETION_SHELLS)
+    args = parser.parse_args(argv)
+    print(completion_script(args.shell), end="")
+    return 0
 
 
 def terminal_setup_command(argv: list[str]) -> int:
@@ -1577,6 +1842,16 @@ def serve_command(argv: list[str]) -> int:
         help="把 OpenAPI schema 打到 stdout 后退出（贴给 Dify 自定义工具用），不起服务",
     )
     parser.add_argument(
+        "--tls-cert",
+        dest="tls_cert",
+        help="TLS 证书（PEM）。与 --tls-key 成对给，服务改以 https 监听（uvicorn 直接终止 TLS）",
+    )
+    parser.add_argument(
+        "--tls-key",
+        dest="tls_key",
+        help="TLS 私钥（PEM），与 --tls-cert 成对给",
+    )
+    parser.add_argument(
         "--public-url",
         dest="public_url",
         default="",
@@ -1589,6 +1864,18 @@ def serve_command(argv: list[str]) -> int:
     if not root.is_dir():
         print(ui.error(f"工作区不存在：{root}"), file=sys.stderr)
         return 2
+    #  TLS 两件必须成对：只给一个起不了 https，静默退回 http 会让人以为已加密
+    if bool(args.tls_cert) != bool(args.tls_key):
+        print(ui.error("--tls-cert 与 --tls-key 必须一起给"), file=sys.stderr)
+        return 2
+    tls_cert = tls_key = None
+    if args.tls_cert:
+        tls_cert = Path(args.tls_cert).expanduser()
+        tls_key = Path(args.tls_key).expanduser()
+        for label, path in (("--tls-cert", tls_cert), ("--tls-key", tls_key)):
+            if not path.is_file():
+                print(ui.error(f"{label} 指向的文件不存在：{path}"), file=sys.stderr)
+                return 2
     #  与主命令同一道门，且必须在 load_dotenv 之前：工作区 .env 是被门管的对象。
     #  服务端不可能弹窗问人，所以非交互判定（headless 纪律，与 --acp 一致）
     trust = resolve_folder_trust(root, grant=False, interactive=False)
@@ -1614,12 +1901,14 @@ def serve_command(argv: list[str]) -> int:
         state_dir=Path(args.state_dir).expanduser().resolve() if args.state_dir else None,
         persist=args.persist,
         public_url=args.public_url,
+        tls_cert=tls_cert,
+        tls_key=tls_key,
     )
     try:
         if args.print_openapi:
             return print_openapi(cfg)
         if args.host in ("127.0.0.1", "::1", "localhost") or args.token:
-            print(ui.success(f"xiaoyu serve → http://{args.host}:{args.port}  (root: {root})"))
+            print(ui.success(f"xiaoyu serve → {cfg.scheme}://{args.host}:{args.port}  (root: {root})"))
             extra = " · MCP /mcp" if args.mcp else ""
             print(ui.secondary(f"  文档 /docs · schema /openapi.json{extra} · Ctrl+C 停"))
         return serve(cfg)
@@ -1761,6 +2050,8 @@ _MCP_ADD_FLAGS = {
     "--url": True,
     "--header": True,
     "-H": True,
+    "--cwd": True,
+    "--tools": True,
     "--force": False,
     "-f": False,
     "--help": False,
@@ -1768,7 +2059,9 @@ _MCP_ADD_FLAGS = {
 }
 
 
-def split_mcp_command(argv: list[str]) -> tuple[list[str], list[str]]:
+def split_mcp_command(
+    argv: list[str], flags: dict[str, bool] | None = None
+) -> tuple[list[str], list[str]]:
     """把 `<名字> [选项…] <命令> [参数…]` 切成（交给 argparse 的段, 启动命令段）。
 
     argparse 干不了这活：nargs=REMAINDER 从第一个位置参数之后就通吃，
@@ -1783,7 +2076,7 @@ def split_mcp_command(argv: list[str]) -> tuple[list[str], list[str]]:
             return argv[:index], argv[index + 1 :]
         if token.startswith("-") and token != "-":
             #  未知选项按"不吃值"处理，留给 argparse 去报错
-            takes_value = _MCP_ADD_FLAGS.get(token.split("=", 1)[0], False)
+            takes_value = (flags if flags is not None else _MCP_ADD_FLAGS).get(token.split("=", 1)[0], False)
             index += 2 if takes_value and "=" not in token else 1
             continue
         if not seen_name:
@@ -1800,6 +2093,7 @@ MCP_USAGE = (
     "  xiaoyu mcp add <名字> --url https://…         添加一个远端 MCP server\n"
     "  xiaoyu mcp list                              列出已声明的 server\n"
     "  xiaoyu mcp remove <名字> [--scope …]          删除一个声明\n"
+    "  xiaoyu mcp probe <名字 | 命令行> [--script f]   不经模型探测一个 server：握手、列工具，或按脚本调用\n"
     "例：xiaoyu mcp add chrome-devtools --scope user npx -y chrome-devtools-mcp@latest"
 )
 
@@ -1817,6 +2111,8 @@ def mcp_command(argv: list[str]) -> int:
         return mcp_list_command(argv[1:])
     if action in ("remove", "rm"):
         return mcp_remove_command(argv[1:])
+    if action == "probe":
+        return mcp_probe_command(argv[1:])
     if action in ("", "-h", "--help", "help"):
         print(MCP_USAGE)
         return 0
@@ -1878,10 +2174,27 @@ def mcp_add_command(argv: list[str]) -> int:
         default=[],
         help="远端 server 每次请求都带的头，可重复。值里同样支持 ${env:VAR} 延迟展开",
     )
+    parser.add_argument(
+        "--cwd",
+        metavar="目录",
+        help="stdio server 的工作目录（文件系统类 server 把它当根用）；同样支持 ${env:VAR}",
+    )
+    parser.add_argument(
+        "--tools",
+        metavar="名,名",
+        help="只暴露这几个工具（逗号分隔；server 其余工具模型看不见也调不到）",
+    )
     parser.add_argument("-f", "--force", action="store_true", help="同名声明已存在时覆盖")
     head, command_argv = split_mcp_command(argv)
     args = parser.parse_args(head)
     scope = args.scope or "project"
+    tools = [item.strip() for item in (args.tools or "").split(",") if item.strip()]
+    if args.tools is not None and not tools:
+        print(ui.error("--tools 至少要给一个工具名"), file=sys.stderr)
+        return 2
+    if args.url and args.cwd:
+        print(ui.error("--cwd 只对 stdio server 有意义（远端 server 没有本地进程）"), file=sys.stderr)
+        return 2
 
     if not MCP_NAME_PATTERN.match(args.name):
         print(ui.error(f"server 名字只能用字母/数字/下划线/连字符：{args.name}"), file=sys.stderr)
@@ -1941,6 +2254,10 @@ def mcp_add_command(argv: list[str]) -> int:
             entry["args"] = command_args
         if env:
             entry["env"] = env
+        if args.cwd:
+            entry["cwd"] = args.cwd
+    if tools:
+        entry["tools"] = tools
     if args.timeout is not None:
         entry["timeout"] = args.timeout
 
@@ -2024,6 +2341,10 @@ def mcp_list_command(argv: list[str]) -> int:
                 notes.append("被工作区同名声明覆盖")
             if raw.get("env"):
                 notes.append("env: " + ", ".join(raw["env"]))
+            if raw.get("cwd"):
+                notes.append(f"cwd: {raw['cwd']}")
+            if isinstance(raw.get("tools"), list):
+                notes.append(f"只暴露 {len(raw['tools'])} 个工具")
             line = f"  {ui.accent(name)}  {ui.secondary('·')}  {argv_text}"
             print(line + (ui.secondary("  ·  " + "  ·  ".join(notes)) if notes else ""))
     if failed:
@@ -2081,6 +2402,224 @@ def mcp_remove_command(argv: list[str]) -> int:
     _trust_resync(scope, workspace, trust_before)
     print(ui.success(f"已从 {path} 删除 {args.name}"))
     return 0
+
+
+_PROBE_FLAGS = {"--script": True, "--url": True, "--timeout": True, "--help": False, "-h": False}
+#  probe 脚本里认的步骤名（驼峰与下划线都收：手写 JSON 的人两种都会写）
+_PROBE_OPS = {"listTools": "listTools", "list_tools": "listTools", "callTool": "callTool", "call_tool": "callTool"}
+#  脚本模式下每步结果文本的封顶：排障要的是形状与错误，不是整页正文
+_PROBE_TEXT_CAP = 4000
+
+
+def _probe_spec(target: list[str], url: str | None, timeout: float | None):
+    """`xiaoyu mcp probe` 的目标 → ServerSpec。
+
+    一个词且是已声明的 server 名 → 用配置里那条（与运行期同一条加载路径：
+    ${env:VAR} 展开、准入规则都在）；否则整段当启动命令行（临时 server，不写盘）；
+    --url 则是远端。
+    """
+    from . import mcp
+
+    if url:
+        spec = mcp.ServerSpec(name="probe", command="", url=url)
+    elif len(target) == 1 and MCP_NAME_PATTERN.match(target[0]):
+        known = {spec.name: spec for spec in mcp.load_server_specs(Path.cwd())}
+        spec = known.get(target[0])
+        if spec is None:
+            if shutil.which(target[0]) is None:
+                names = ", ".join(known) or "（无）"
+                raise ValueError(
+                    f"没有名为 {target[0]!r} 的 MCP server，PATH 里也没有这个命令。已声明：{names}"
+                )
+            spec = mcp.ServerSpec(name=target[0], command=target[0])
+    elif target:
+        spec = mcp.ServerSpec(name=Path(target[0]).name or "probe", command=target[0], args=target[1:])
+    else:
+        raise ValueError("要探测谁？给一个已声明的 server 名、一条启动命令行，或 --url")
+    if timeout is not None:
+        spec = replace(spec, timeout=timeout)
+    return spec
+
+
+def _probe_script(path: str) -> list[dict[str, Any]]:
+    """读 --script：顶层是步骤列表，或 {"steps": [...]}；每步 {"op": ..., "name", "args"}。"""
+    try:
+        data = json.loads(Path(path).read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise ValueError(f"脚本 {path} 读不了：{exc}") from exc
+    steps = data.get("steps") if isinstance(data, dict) else data
+    if not isinstance(steps, list):
+        raise ValueError("脚本顶层应是步骤列表，或 {\"steps\": [...]}")
+    parsed: list[dict[str, Any]] = []
+    for index, step in enumerate(steps, 1):
+        if not isinstance(step, dict):
+            raise ValueError(f"第 {index} 步不是对象")
+        op = _PROBE_OPS.get(str(step.get("op", "")))
+        if op is None:
+            raise ValueError(f"第 {index} 步的 op 只能是 listTools / callTool：{step.get('op')!r}")
+        name = step.get("name")
+        if op == "callTool" and (not isinstance(name, str) or not name):
+            raise ValueError(f"第 {index} 步缺 name（要调哪个工具）")
+        args = step.get("args", step.get("arguments", {}))
+        if not isinstance(args, dict):
+            raise ValueError(f"第 {index} 步的 args 应是对象")
+        parsed.append({"op": op, "name": name, "args": args})
+    return parsed
+
+
+def _probe_emit(record: dict[str, Any]) -> None:
+    print(json.dumps(record, ensure_ascii=False), flush=True)
+
+
+def _probe_run_script(server, steps: list[dict[str, Any]]) -> bool:
+    """按脚本逐步执行，每步一行 JSON（耗时、错误分类都在）。返回是否全部成功。"""
+    from . import mcp
+
+    all_ok = True
+    for index, step in enumerate(steps, 1):
+        record: dict[str, Any] = {"step": index, "op": step["op"]}
+        if step["name"]:
+            record["name"] = step["name"]
+        started = time.monotonic()
+        try:
+            if step["op"] == "listTools":
+                declared = server._list_tools()  # noqa: SLF001 - 排障工具，直接走协议层
+                record["ok"] = True
+                record["tools"] = [str(item.get("name", "")) for item in declared]
+            else:
+                #  走 _request 而不是 call_tool：call_tool 把协议错误折成文本，这里要的
+                #  正是错误分类（timeout / rpc / dropped…）
+                result = server._request(  # noqa: SLF001
+                    "tools/call",
+                    {"name": step["name"], "arguments": step["args"]},
+                    timeout=server.spec.timeout,
+                )
+                text, media = mcp._render_result(result)  # noqa: SLF001
+                record["ok"] = not bool(result.get("isError"))
+                record["is_error"] = bool(result.get("isError"))
+                record["text"] = text[:_PROBE_TEXT_CAP] + ("…" if len(text) > _PROBE_TEXT_CAP else "")
+                if media:
+                    record["media"] = len(media)
+                if isinstance(result.get("structuredContent"), dict):
+                    record["structured"] = result["structuredContent"]
+        except mcp.McpError as exc:
+            record["ok"] = False
+            record["error"] = mcp._redact(str(exc))  # noqa: SLF001
+            record["error_kind"] = exc.kind or "unknown"
+            if exc.status is not None:
+                record["status"] = exc.status
+        record["seconds"] = round(time.monotonic() - started, 3)
+        all_ok = all_ok and bool(record["ok"])
+        _probe_emit(record)
+    return all_ok
+
+
+def mcp_probe_command(argv: list[str]) -> int:
+    """`xiaoyu mcp probe`：不经模型、不进会话，直接把一个 server 拉起来看。
+
+    无脚本：握手 + 列工具，打印 serverInfo / 协议版本 / 能力 / instructions / 工具表。
+    有脚本：按顺序执行 listTools / callTool，每步一行 JSON——给人和脚本都能读的
+    排障输出（耗时、错误分类、结果形状）。走的是运行期同一个 McpServer：准入规则、
+    OSV 预检、cwd 校验、超时与错误分类都和会话里一模一样，"probe 通了会话里却不通"
+    不会发生在这一层。
+    """
+    from . import mcp
+
+    parser = argparse.ArgumentParser(
+        prog="xiaoyu mcp probe",
+        description="不经模型探测一个 MCP server：握手、列工具；给 --script 则按脚本调用并逐步输出 JSON 行。",
+        usage="xiaoyu mcp probe [--script FILE] [--timeout 秒] <server名 | 命令 [参数…] | --url 地址>",
+        epilog="脚本形状：[{\"op\":\"listTools\"}, {\"op\":\"callTool\",\"name\":\"echo\",\"args\":{\"text\":\"hi\"}}]",
+    )
+    parser.add_argument("target", nargs="*", help="已声明的 server 名，或一条启动命令行（选项要写在它前面）")
+    parser.add_argument("--url", help="直接探测一个远端 Streamable HTTP 地址（不必先 add）")
+    parser.add_argument("--script", metavar="FILE", help="按脚本顺序执行 listTools / callTool，每步一行 JSON")
+    parser.add_argument("--timeout", type=float, metavar="秒", help="每次调用的超时（默认取声明里的或内置默认）")
+    #  选项段 | 目标段的切分与 add 同一套：probe 没有"名字"这个位置参数，垫一个占位
+    head, rest = split_mcp_command(["_", *argv], _PROBE_FLAGS)
+    args = parser.parse_args(head[1:])
+    target = [*args.target, *rest]
+    if args.timeout is not None and args.timeout <= 0:
+        print(ui.error("--timeout 得是正数"), file=sys.stderr)
+        return 2
+    try:
+        spec = _probe_spec(target, args.url, args.timeout)
+        steps = _probe_script(args.script) if args.script else None
+    except ValueError as exc:
+        print(ui.error(str(exc)), file=sys.stderr)
+        return 2
+
+    #  日志单独起名：同名 server 可能正在某个会话里跑，不能截断它的日志
+    log_path = mcp.McpManager._log_path(f"probe-{spec.name}")  # noqa: SLF001
+    server = mcp.McpServer(spec, log_path=log_path)
+    #  server 自己的日志通知（notifications/message）直接上 stderr——这就是排障要看的
+    server.on_log = lambda level, text: print(ui.warning(f"  [{spec.name} {level}] {text}"), file=sys.stderr)
+    scripted = steps is not None
+    started = time.monotonic()
+    try:
+        try:
+            server.ensure_started()
+        except mcp.McpError as exc:
+            reason = mcp._redact(str(exc))  # noqa: SLF001
+            if scripted:
+                record = {
+                    "step": 0, "op": "initialize", "ok": False, "error": reason,
+                    "error_kind": exc.kind or "unknown",
+                    "seconds": round(time.monotonic() - started, 3),
+                }
+                if not spec.is_http:
+                    record["log"] = str(log_path)
+                    record["log_tail"] = mcp.log_tail(log_path)
+                _probe_emit(record)
+            else:
+                print(ui.error(f"连不上 {spec.name}：{reason}"), file=sys.stderr)
+                if not spec.is_http and "排障看日志" not in reason:
+                    print(ui.secondary("  " + mcp.log_hint(log_path).replace("\n", "\n  ")), file=sys.stderr)
+            return 1
+        elapsed = time.monotonic() - started
+        capabilities = sorted(server.capabilities)
+        if scripted:
+            _probe_emit({
+                "step": 0, "op": "initialize", "ok": True,
+                "seconds": round(elapsed, 3),
+                "server": server.server_info, "protocol": server.protocol_version,
+                "capabilities": capabilities, "tools": len(server.live_declared),
+                "instructions": server.instructions,
+            })
+            return 0 if _probe_run_script(server, steps or []) else 1
+        print(ui.success(
+            f"已连接 {spec.name}"
+            + (f" · {server.server_info}" if server.server_info else "")
+            + f" · 协议 {server.protocol_version} · 握手 {elapsed:.2f}s"
+        ))
+        if not spec.is_http:
+            print(ui.secondary(f"  命令：{' '.join([spec.command, *spec.args])}" + (f"  (cwd {spec.cwd})" if spec.cwd else "")))
+        else:
+            print(ui.secondary(f"  地址：{mcp.display_url(spec.url)}"))
+        print(ui.secondary("  能力：" + (", ".join(capabilities) or "（无）")))
+        if server.instructions:
+            text = server.instructions.strip()
+            if len(text) > _PROBE_TEXT_CAP:
+                text = text[:_PROBE_TEXT_CAP] + "…"
+            print(ui.secondary("  instructions："))
+            for line in text.splitlines():
+                print(ui.secondary(f"    {line}"))
+        declared = server.live_declared
+        hidden = [item for item in declared if not spec.allows_tool(str(item.get("name", "")))]
+        print(ui.heading(f"  工具（{len(declared)}）" + (f"，其中 {len(hidden)} 个不在声明的 tools 名单里" if hidden else "")))
+        for item in declared:
+            name = str(item.get("name", ""))
+            description = str(item.get("description") or "").strip().splitlines()
+            brief = description[0] if description else "(无描述)"
+            if len(brief) > 100:
+                brief = brief[:100] + "…"
+            mark = "  " if spec.allows_tool(name) else "✗ "
+            print(f"    {mark}{ui.accent(name)}  {ui.secondary(brief)}")
+        if not spec.is_http:
+            print(ui.secondary(f"  日志：{shorten_home(str(log_path))}"))
+        return 0
+    finally:
+        server.close()
 
 
 PLUGIN_USAGE = (
@@ -2542,6 +3081,7 @@ def ask_one_text(item: dict[str, Any], position: str = "") -> str | None:
 
 def text_ask_questions(questions: list[dict[str, Any]]) -> dict[str, str]:
     """明文 REPL 的 asker（ask_user 工具）：顺序逐题问，语义与 TUI 面板对齐。"""
+    attention.waiting(attention.WAITING_INPUT)
     answers: dict[str, str] = {}
     total = len(questions)
     for number, item in enumerate(questions, start=1):
@@ -2873,6 +3413,10 @@ def main(argv: list[str] | None = None) -> int:
         print(ui.error(str(exc)), file=sys.stderr)
         return 2
     install_exit_logging(agent.session_log)
+    if args.goal:
+        #  --goal 与会话里的 /goal 同义：一次性模式没有机会敲斜杠命令
+        agent.set_goal(args.goal)
+    agent.show_stats = args.stats
     if config.unguarded and prompt:
         #  一次性模式不进 repl/TUI，开场警告走 stderr（stdout 是这条命令的产物）
         from . import guardrails
@@ -2983,7 +3527,12 @@ def wire_main(args: argparse.Namespace, workspace_trusted: bool = True) -> int:
     install_exit_logging(agent.session_log)
     #  wire 侧不打招呼——stdout 只有协议；接回的条数由 initialize 的 messages 字段说
     agent.restore(restored, copy=False)
-    return server.serve()
+    if session_start_refused(agent):
+        return 2
+    try:
+        return server.serve()
+    finally:
+        end_session(agent)
 
 
 def acp_main(args: argparse.Namespace) -> int:
@@ -3060,7 +3609,31 @@ def terminate_background_commands(agent: Agent) -> list[dict[str, Any]]:
     ]
 
 
+def turn_stats_line(agent: Any) -> str:
+    """`--stats` 开着时本轮的计时一行；没开或本轮没请求返回空串。
+    getattr 兜底：测试里的替身 agent 没有这两个属性。"""
+    if not getattr(agent, "show_stats", False):
+        return ""
+    stats = getattr(agent, "turn_stats", None)
+    return stats.summary() if stats is not None else ""
+
+
 def run_once(
+    agent: Agent,
+    user_input: str | list[dict[str, Any]],
+    output_format: str = "text",
+    output_schema: dict[str, Any] | None = None,
+) -> int:
+    """一次性模式的外壳：SessionStart / SessionEnd 钩子包在这一轮外面。"""
+    if session_start_refused(agent):
+        return 2
+    try:
+        return _run_once(agent, user_input, output_format, output_schema)
+    finally:
+        end_session(agent)
+
+
+def _run_once(
     agent: Agent,
     user_input: str | list[dict[str, Any]],
     output_format: str = "text",
@@ -3124,6 +3697,8 @@ def run_once(
             )
         #  一次性模式也把用量打出来：做了模型路由就得看得见每个模型花了多少
         print(ui.secondary(f"\n{agent.usage}"))
+        if stats := turn_stats_line(agent):
+            print(ui.secondary(stats))
         return 1 if error else 0
 
     #  json / stream-json 的收尾对象结构相同；stream-json 带 kind 与事件流同一词汇
@@ -3134,6 +3709,15 @@ def run_once(
     }
     if output_schema is not None:
         payload["output"] = agent.structured_output
+    if getattr(agent, "show_stats", False):
+        #  --stats 的结构化形态：与 text 那一行同源的数字，不另算
+        stats = agent.turn_stats
+        payload["stats"] = {
+            "duration_ms": stats.duration_ms,
+            "ttft_ms": stats.ttft_ms,
+            "completion_tokens": stats.completion_tokens,
+            "requests": stats.requests,
+        }
     if agent.session_log:
         payload["session_log"] = str(agent.session_log.path)
         if not getattr(agent.session_log, "complete", True):
@@ -3276,6 +3860,15 @@ def background_status(agent: Agent) -> str:
 
 
 def repl(agent: Agent) -> int:
+    #  窗口标题随会话走，任何退出路径都还原（与 TUI 同一纪律）
+    attention.set_title(agent.config.workspace)
+    try:
+        return _repl_loop(agent)
+    finally:
+        attention.clear_title()
+
+
+def _repl_loop(agent: Agent) -> int:
     config = agent.config
     #  模型/工作区/help 提示都在启动横幅里了，这里只留必须扎眼的警告
     if config.unguarded:
@@ -3301,9 +3894,15 @@ def repl(agent: Agent) -> int:
             print(ui.secondary(f"  {action.hint}"))
             continue
         if action.kind == "slash":
-            if handle_slash(agent, action.args):
-                return 0
-            continue
+            #  /<技能名> 参数… 展开成本轮提示；不是技能的才交给内建命令表
+            expanded = skill_prompt(agent, action.args)
+            if expanded is None:
+                if handle_slash(agent, action.args):
+                    return 0
+                continue
+            if not expanded:
+                continue
+            action = keys.InputAction("send", expanded)
         if action.kind == "shell":
             _repl_shell(agent, action.args)
             continue
@@ -3322,6 +3921,10 @@ def repl(agent: Agent) -> int:
             print(ui.error(f"\n请求失败：{type(exc).__name__}: {exc}"))
         if note := background_status(agent):
             print(ui.secondary(note))
+        if stats := turn_stats_line(agent):
+            print(ui.secondary(f"  {stats}"))
+        #  一轮收尾 = 回到"等人"：铃（opt-in）+ 状态钩子
+        attention.waiting(attention.WAITING_INPUT)
         print()
 
 
@@ -3385,6 +3988,45 @@ def _rewind_flow(agent: Agent, rest: list[str]) -> None:
     print(ui.success(f"  {result}"))
     if conversation:
         print(ui.secondary("  （屏幕上方的旧输出只是显示残留，模型已不记得被截掉的轮次）"))
+
+
+#  技能的显式入口前缀：/skill:<名字>。与内建命令撞名的技能只能从这里进
+SKILL_SLASH_PREFIX = "/skill:"
+#  内建命令名（含表外别名）：斜杠名字空间里内建永远优先，技能撞名不许遮住它
+_BUILTIN_SLASH = frozenset(name for name in SLASH_COMMANDS if "<" not in name) | {"/undo"}
+
+
+def skill_shadowed(name: str) -> bool:
+    """这个技能名直接写成 /<名字> 会不会撞上内建命令。"""
+    return f"/{name}" in _BUILTIN_SLASH
+
+
+def skill_prompt(agent: Agent, line: str) -> str | None:
+    """`/<技能名> 参数…` → 展开成本轮提示文本。
+
+    返回 None = 这行不是技能调用（内建命令或没这个技能），交给 handle_slash；
+    返回空串 = 是技能调用但展开失败（已打印原因），本轮不发。
+    名字空间规则：内建命令 > 技能——`/help` 永远是帮助，同名技能要写
+    `/skill:help`。`/skill:` 前缀下找不到也报错而不是回落到内建，用户既然
+    写了前缀就是明确要技能。
+    """
+    head, _, rest = line.strip().partition(" ")
+    explicit = head.startswith(SKILL_SLASH_PREFIX)
+    name = head[len(SKILL_SLASH_PREFIX):] if explicit else head[1:]
+    if not name or (not explicit and (head in _BUILTIN_SLASH or not agent.skills)):
+        return None
+    if not explicit and not any(skill.name == name for skill in agent.skills):
+        #  不是已知技能：当作敲错的内建命令报"未知命令"，别为每个错字重扫磁盘
+        return None
+    arguments = rest.strip()
+    result = agent._load_skill(name, arguments)  # noqa: SLF001 - 同包的前端入口
+    if result.startswith("ERROR:"):
+        print(ui.error(f"  {result}"))
+        return ""
+    print(ui.secondary(f"  已展开技能 {name}" + (f"（参数：{arguments}）" if arguments else "")))
+    #  模型看到的就是 skill 工具加载的那份（目录头 + 支持文件 + 正文），外加
+    #  一句"这是用户点名要执行的"：和模型自己按索引挑技能加载是两种语气
+    return f"按下面这个技能的说明执行（用户以 /{name} 直接调用）：\n\n{result}"
 
 
 def handle_slash(agent: Agent, line: str, select: Any = None) -> bool:
@@ -3466,7 +4108,12 @@ def handle_slash(agent: Agent, line: str, select: Any = None) -> bool:
                 origin = ui.secondary(f"  [插件 {skill.plugin}]") if skill.plugin else ""
                 if skill.project:
                     origin = ui.secondary("  [工作区]")
+                if skill_shadowed(skill.name):
+                    #  与内建命令撞名的技能不是不能用，只是 /<名字> 归内建；说清入口
+                    origin += ui.warning(f"  [与内建命令撞名，用 /skill:{skill.name} 调用]")
                 print(f"  {skill.name}  {ui.secondary(skill.description or str(skill.path))}{origin}")
+            if agent.skills:
+                print(ui.secondary("  /<技能名> 参数… 可把技能直接展开成本轮提示"))
             from . import skills as skills_mod
 
             if hidden := skills_mod.disabled_skills(agent.config.workspace):
@@ -3596,6 +4243,15 @@ def handle_slash(agent: Agent, line: str, select: Any = None) -> bool:
         else:
             state = "开启（只读规划态）" if agent.plan_mode else "关闭"
             print(ui.secondary(f"  plan mode 当前{state}；/plan on|off 切换"))
+    elif command == "/goal":
+        if rest and rest == ["clear"]:
+            print(ui.secondary(f"  {agent.set_goal('')}"))
+        elif rest:
+            print(ui.secondary(f"  {agent.set_goal(' '.join(rest))}"))
+        elif agent.goal:
+            print(ui.secondary(f"  当前验收目标：{agent.goal}（/goal clear 清除）"))
+        else:
+            print(ui.secondary("  未设验收目标；/goal <一句话> 设定后，模型收尾前会先核对是否达成"))
     elif command == "/perm":
         print(ui.secondary(f"当前模式：{modes.describe(agent.mode, sandbox_ready=agent.sandbox_ready())}"))
         print(ui.secondary(agent.permissions.describe()))
@@ -3618,6 +4274,9 @@ def handle_slash(agent: Agent, line: str, select: Any = None) -> bool:
     elif command == "/clear":
         agent.reset()
         print(ui.secondary("对话已清空"))
+    elif command.startswith(SKILL_SLASH_PREFIX):
+        #  正常路径上 skill_prompt 已先一步接走；走到这里说明前端没接技能展开
+        print(ui.warning(f"技能调用（{command}）只在交互前端里可用，/skills 看技能列表"))
     else:
         print(ui.warning(f"未知命令 {command}，/help 看可用命令"))
     return False
@@ -3667,6 +4326,8 @@ def make_confirm(permissions: Permissions):
     """
 
     def confirm(name: str, args: dict[str, Any]) -> bool | str:
+        #  审批挂起 = 轮次卡在等人：铃（opt-in）与状态钩子把切走的人叫回来
+        attention.waiting(attention.WAITING_APPROVAL)
         if name == "write_file":
             content = str(args.get("content", ""))
             head = content.split("\n")[:12]

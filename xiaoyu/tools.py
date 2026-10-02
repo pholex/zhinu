@@ -30,7 +30,7 @@ import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Collection
 
 from . import browser, fsguard, mcp, media, sandbox, tempdirs
 from .background import (
@@ -42,6 +42,7 @@ from .background import (
 )
 from .config import Config
 from .errors import Interrupted
+from .invisible import strip_invisible
 from .rewind import RewindStore
 
 
@@ -142,6 +143,51 @@ def wrap_untrusted(source: str, text: str) -> str:
         f"{neutralize_untrusted_markers(text)}\n"
         f"</{UNTRUSTED_TAG}>"
     )
+
+
+#  模型写工具名时常见的"命名空间"前缀：有的模型把工具当成 functions 命名空间
+#  下的成员来调（训练语料里的 schema 形态），有的照 tools 数组的键名写
+_TOOL_NAME_PREFIXES = ("functions.", "functions:", "tools.", "tools:")
+#  MCP 全限定名的三种畸变写法里 server 与 tool 之间的分隔
+_MCP_NAME_SEPARATORS = ("__", ".", ":")
+
+
+def canonical_tool_name(name: str, known: Collection[str]) -> str | None:
+    """把模型写歪的工具名归一到实际广告的名字；归不回去返回 None。
+
+    只做**精确**归一，不做模糊匹配（编辑距离那种"猜你想调 bash"会把 deny 规则
+    点名的工具猜成没点名的）。认两类畸变：
+    - 命名空间前缀：`functions.bash` / `tools.read_file` → 去掉前缀后在广告名单里；
+    - MCP 名字拼法：`server.tool` / `server__tool` / `server:tool`（含带 `mcp__`
+      前缀的）→ 按确定性命名算出 `mcp__<server>__<tool>`，恰好在名单里才算。
+      server 名自己可以含分隔符，每个切分位置都试；多个切法都命中（不同的
+      真实工具）就是歧义，不猜。
+    """
+    name = name.strip()
+    if not name:
+        return None
+    if name in known:
+        return name
+    bare = name
+    for prefix in _TOOL_NAME_PREFIXES:
+        if bare.startswith(prefix) and len(bare) > len(prefix):
+            bare = bare[len(prefix):]
+            break
+    if bare in known:
+        return bare
+    body = bare[len("mcp__"):] if bare.startswith("mcp__") else bare
+    matches: set[str] = set()
+    for separator in _MCP_NAME_SEPARATORS:
+        start = 0
+        while (at := body.find(separator, start)) > 0:
+            server, tool = body[:at], body[at + len(separator):]
+            start = at + 1
+            if not tool:
+                continue
+            candidate = mcp.public_tool_name(server, tool)
+            if candidate in known:
+                matches.add(candidate)
+    return matches.pop() if len(matches) == 1 else None
 
 
 def hardline_violation(command: str) -> str | None:
@@ -1163,6 +1209,10 @@ def _glob_matches(item: Path, root: Path, glob: str) -> bool:
     return fnmatch.fnmatch(relative, glob.lstrip("/"))
 
 
+#  "属性不存在"的哨兵（attach_mcp_log 用：None 是"没接线"，缺属性是"不是 manager"）
+_UNSET = object()
+
+
 class Toolbox:
     """持有 config 的工具集合。
 
@@ -1250,6 +1300,10 @@ class Toolbox:
         #  等注入后第一次组装 schemas 时补发）。已公告：server → 工具集指纹。
         self.notify_hook: Callable[[str, str], None] | None = None
         self._announced: dict[str, str] = {}
+        #  MCP 工具运行期间的进度（server 的 notifications/progress）→ 前端。
+        #  mcp_progress_hook(工具名, {"progress","total","message"})，由 Agent 注入；
+        #  在 server 的读线程上被调用，实现方只许发事件不许阻塞
+        self.mcp_progress_hook: Callable[[str, dict[str, Any]], None] | None = None
         if self._mcp_search:
             self._register_mcp_search()
         if only is not None:
@@ -1410,23 +1464,36 @@ class Toolbox:
             return f"ERROR: MCP 工具 {name} 当前不可用（server 未就绪或已退出）。"
         #  目的参数是给审批框看的，别漏进远端参数
         tool_input.pop(PURPOSE_PARAM, None)
-        return self._interruptible(remote.handler)(**tool_input)
+        return self._interruptible(remote.handler, name)(**tool_input)
 
-    def _interruptible(self, handler: Callable[..., str]) -> Callable[..., str]:
+    def _interruptible(self, handler: Callable[..., str], name: str = "") -> Callable[..., str]:
         """给 MCP 工具的 handler 包一层：调用期间把本工具箱的"有没有人叫停"挂到
         当前线程上（mcp.stop_scope），在飞的远端调用据此停得下来。
 
         handler 是 manager 级的闭包，父子 agent 的工具箱共用同一个；stop_requested
         却是每个 Agent 各自注入的，而且注入晚于工具箱构造——所以在调用的那一刻
         现取。原 handler 记在 remote 属性上，_absorb_mcp 靠它认"还是不是同一代"。
+        进度回调同一时刻现取：有人接（mcp_progress_hook）才让远端发进度。
         """
 
         def call(**kwargs: Any) -> str:
-            with mcp.stop_scope(self.stop_requested, media_owner=self):
+            hook = self.mcp_progress_hook
+            progress = (lambda info: hook(name, info)) if hook is not None else None
+            with mcp.stop_scope(self.stop_requested, media_owner=self, progress=progress):
                 return handler(**kwargs)
 
         call.remote = handler  # type: ignore[attr-defined]
         return call
+
+    def attach_mcp_log(self, hook: Callable[[str, str, str], None]) -> None:
+        """把 MCP server 的日志通知（warning 及以上）接到前端。只有持有 manager
+        的顶层工具箱接线：子 agent 拿的是父级的筛选视图，再接一次就是同一条
+        告警打两遍。已有人接线的不覆盖（嵌入宿主自建的 manager 可能先接了）。"""
+        #  鸭子类型而不是 isinstance：嵌入 / SDK 场景里 manager 可能是打桩或包装对象。
+        #  视图（McpView）没有 on_log 这个属性，自然落空
+        manager = self._mcp
+        if manager is not None and getattr(manager, "on_log", _UNSET) is None:
+            manager.on_log = hook
 
     def mcp_content_trusted(self, tool_name: str) -> bool:
         """use_tool 触达的 MCP 工具，其 server 是否声明了 trustContent（结果不套
@@ -1493,7 +1560,7 @@ class Toolbox:
                     name=remote.name,
                     description=remote.description,
                     parameters=remote.parameters,
-                    handler=self._interruptible(remote.handler),
+                    handler=self._interruptible(remote.handler, remote.name),
                     requires_approval=True,
                     #  server 进程退出后工具自动从 schemas 消失、拒绝执行
                     check_fn=remote.check_fn,
@@ -1605,6 +1672,11 @@ class Toolbox:
         """执行工具。参数错误/文件不存在等都作为文本结果返回给模型。"""
         tool = self.get(name)
         if tool is None:
+            #  直接调用方（测试、嵌入）也享受名字归一；主循环在权限判定之前已经
+            #  归一过一次，到这里的名字多半已是真名
+            if (canonical := canonical_tool_name(name, self.names())) is not None:
+                name, tool = canonical, self.get(canonical)
+        if tool is None:
             return f"ERROR: 未知工具 {name!r}。可用工具：{', '.join(self.names())}"
         if not tool.available():
             return f"ERROR: 工具 {name} 当前不可用（环境探测未通过），换其它办法。"
@@ -1625,7 +1697,13 @@ class Toolbox:
                 return f"ERROR: 调用 {name} 的参数不对：{problem}"
 
         try:
-            output = self._bound_output(name, tool.handler(**args), tool.output_limit)
+            produced = tool.handler(**args)
+            if isinstance(produced, str):
+                #  工具结果汇入上下文的唯一收口：读到的文件、网页、MCP 结果里的
+                #  隐形字符都在这里剥（见 invisible.py）。放在落盘之前——spill
+                #  文件和内联预览看到的是同一份
+                produced = strip_invisible(produced, f"工具 {name} 的结果")
+            output = self._bound_output(name, produced, tool.output_limit)
         except Interrupted:
             #  打断不是工具的错误：不能折成 ERROR 文本回给模型然后接着跑
             raise

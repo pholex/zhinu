@@ -6,6 +6,7 @@ from __future__ import annotations
 import contextlib
 import io
 import json
+import re
 import unittest
 
 from xiaoyu import messages as msgs
@@ -216,3 +217,88 @@ class NativeTaskBudgetTest(AgentTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def read_call_with_prompt(n: int, prompt: int) -> list:
+    return [chunk(tool_calls=[call_fragment(0, f"c{n}", "read_file", '{"path": "calc.py"}')]),
+            usage_chunk(prompt, 50)]
+
+
+class HeadroomNoticeTest(AgentTestCase):
+    """上下文余量 / 轮数余量的主动提示：跨线各报一次、走 operator 通道、不碰 system prompt。"""
+
+    def _send(self, agent, prompt="干活"):
+        buffer = io.StringIO()
+        with contextlib.redirect_stdout(buffer):
+            agent.send(prompt)
+        return buffer.getvalue()
+
+    @staticmethod
+    def _notes(agent) -> list[str]:
+        return [
+            str(m.get("content")) for m in agent.messages
+            if m.get(OPERATOR_KEY) and str(m.get("content")).startswith("[余量]")
+        ]
+
+    def test_context_notices_at_half_and_four_fifths_of_threshold(self):
+        #  窗口 40k × 阈值 0.7 = 28k。首步没有锚点，system prompt + 工具 schema 的
+        #  本地估算约 5k（18%，不过线）；之后锚点 16000 → 约 57%（过 50%）、
+        #  23500 → 约 84%（过 80%）。数值离阈值与提示线都留了余量：锚点之后的
+        #  增量估算浮动不会把判定推过线，也不会碰到压缩阈值
+        self.config.context_limit = 40_000
+        self.config.compact_at = 0.7
+        agent = self.build([
+            read_call_with_prompt(0, 16_000),
+            read_call_with_prompt(1, 23_500),
+            read_call_with_prompt(2, 23_600),
+            text("完成", prompt=23_700),
+        ])
+        out = self._send(agent)
+        notes = self._notes(agent)
+        self.assertEqual(len(notes), 2, notes)
+        self.assertIn("距压缩阈值（28k）", notes[0])
+        #  百分比按锚点 + 增量估算得出，只断言落在各自的区间里，不押具体数值
+        percents = [int(re.search(r"（(\d+)%）", note).group(1)) for note in notes]
+        self.assertTrue(50 <= percents[0] < 80, percents)
+        self.assertTrue(80 <= percents[1] < 100, percents)
+        self.assertIn("[余量]", out)
+        #  system prompt 一个字不动：它是 prompt cache 的前缀资产
+        self.assertEqual(agent.messages[0]["content"], agent._system_prompt())
+        #  提示文案进了合成文本集合，压缩时不会被当成用户原话
+        self.assertTrue(all(note in agent.compactor.synthetic_user_texts for note in notes))
+
+    def test_context_notice_rebases_after_history_rewrite(self):
+        """历史被改写（压缩/回滚/翻篇）后按现状重定基线：已越过的线不回头再报。"""
+        self.config.context_limit = 40_000
+        self.config.compact_at = 0.7
+        agent = self.build([read_call_with_prompt(0, 16_000), text("完成", prompt=16_100)])
+        self._send(agent)
+        self.assertEqual(len(self._notes(agent)), 1)
+        #  模拟一次改写：锚点作废、版本 +1，用量仍在 50% 以上
+        agent._history_rewritten()
+        agent._anchor = (16_500, len(agent.messages))
+        self.client.completions.script.extend([text("再来", prompt=16_600)])
+        self._send(agent, "继续")
+        self.assertEqual(len(self._notes(agent)), 1)
+
+    def test_turn_notices_once_per_threshold_per_turn(self):
+        self.config.max_iterations = 5
+        self.config.turn_extension = 0
+        agent = self.build([
+            read_call(0), read_call(1), read_call(2), read_call(3), text("完成"),
+        ])
+        self._send(agent)
+        notes = self._notes(agent)
+        #  第 3 步前（已用 2/5 = 40%）不报；第 4 步前 3/5 = 60% 过 50%；第 5 步前 4/5 = 80%
+        self.assertEqual(len(notes), 2, notes)
+        self.assertIn("轮数已用 3 / 5", notes[0])
+        self.assertIn("轮数已用 4 / 5", notes[1])
+        #  新的一轮按轮归零，再次跨线再报
+        self.client.completions.script.extend([read_call(4), read_call(5), read_call(6), text("好")])
+        self._send(agent, "继续")
+        self.assertEqual(len(self._notes(agent)), 3)
+
+    def test_no_notice_when_far_from_limits(self):
+        agent = self.build([read_call(0), text("完成")])
+        self._send(agent)
+        self.assertEqual(self._notes(agent), [])

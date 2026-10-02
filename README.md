@@ -29,6 +29,9 @@
 pip install "xiaoyu-agent[tui]"        # [tui]：补全 / 历史 / 粘贴折叠 / 贴图 / diff 高亮
 pip install "xiaoyu-agent[tui,serve]"  # 还要 HTTP API（n8n / Dify 编排）就带上 [serve]
 xiaoyu doctor                          # 体检：版本与安装方式 / 凭据有无 / 沙箱 / 磁盘 / MCP 配置（--json 给脚本，任一 FAIL 退出码 1）
+xiaoyu doctor --probe                  # 再对默认模型真发一条最小请求，报耗时与分类后的错误（默认不出网）
+xiaoyu doctor --bundle                 # 打诊断包（体检 + 脱敏配置 + 最近会话尾部 + 崩溃日志）给报 issue 用；含路径与命令历史，分享前自查
+eval "$(xiaoyu completion zsh)"       # shell 补全（bash / zsh / fish）
 xiaoyu update                          # 升级（已装 serve 时自动一并升级；有新版时交互式启动会提一行）
 xiaoyu uninstall                       # 卸载；--purge 连配置目录一起删
 ```
@@ -70,13 +73,17 @@ xy resume --last "继续把测试修完"
 xy -s nightly "跑一下回归"                # 命名会话：同名接着聊，脚本反复调用用它
 
 xiaoyu sessions                         # 列出本机会话
+xiaoyu sessions export 1 > chat.md      # 导出一场历史会话（Markdown / --format json，不含 system 提示）
+xiaoyu sessions rename 1 "登录页修复"   # 给它起个名字，resume 列表里代替首条消息
+xy --stats "跑一下测试"                  # 收尾多一行：耗时 / 首 token / 输出 tok/s（交互模式也认）
 xiaoyu send zhinu-1 "顺便把 lint 跑一下"  # 给另一个终端里的小羽递话
 
 xiaoyu mcp add chrome-devtools --scope user npx -y chrome-devtools-mcp@latest
 xiaoyu mcp list                         # 写的就是 .mcp.json / mcp.json
+xiaoyu mcp probe chrome-devtools        # 不经模型直接握手、列工具；--script 按脚本调用并逐步输出 JSON
 ```
 
-REPL 里：`/help` `/tools` `/skills` `/model` `/effort` `/mode` `/usage` `/context` `/compact` `/clear` `/exit` `/tasks` `/plan` `/perm` `/allow` `/deny` `/resume` `/rewind` `/mcp` `/quit`
+REPL 里：`/help` `/tools` `/skills` `/model` `/effort` `/mode` `/usage` `/context` `/compact` `/clear` `/exit` `/tasks` `/plan` `/goal` `/perm` `/allow` `/deny` `/resume` `/rewind` `/mcp` `/quit`
 
 无人值守时没人按确认键：先用 `/allow` 配规则，或 `--mode auto`、`--yolo`。放进 CI 跑见 [docs/ci.md](docs/ci.md)（附 GitHub Actions 样本）。
 
@@ -126,6 +133,12 @@ auto 档**放行的依据是沙箱，不是信任**——沙箱不可用时自�
 - **可嵌入**：新增独立 Python 包 `xiaoyu-agent-sdk`（源码版），提供同步/异步会话、审批、事件流、业务工具与严格结构化结果；见 [SDK 指南](docs/sdk.md) 和 [完整示例](examples/sdk/README.md)。现有 `import xiaoyu` 公开 API 保持兼容，契约见 [docs/embedding.md](docs/embedding.md)；跨语言可用 `--wire` 的 stdio JSON-RPC。
 - **可编排**：`xiaoyu serve` 起 HTTP API，n8n / Dify / 自研调度直接驱动（异步提交 + 状态轮询 + 事件游标，需要放行的工具调用挂起等 HTTP 回决定）。OpenAPI schema 由代码生成，贴给 Dify 自定义工具即用——见 [docs/http-api.md](docs/http-api.md)。同一服务还在 `/mcp` 挂着 **agent 级 MCP server**（`xiaoyu` / `xiaoyu_reply` / `xiaoyu_close` 三工具，streamable HTTP），LangChain / LangGraph 经官方 `langchain-mcp-adapters` 即插即用，其它 MCP client 同理——见 [docs/mcp-server.md](docs/mcp-server.md)。**浏览器桥**：浏览器扩展连上同一服务，agent 就能在用户登录态的浏览器里读页 / 点击 / 截图，写类动作走审批——见 [docs/browser-bridge.md](docs/browser-bridge.md)
 - **浏览器**：推荐挂 chrome-devtools MCP；内置 `[browser]` 是纯 pip 的兜底，`playwright install chromium` 后即用
+
+## 安全与贡献
+
+- 报告漏洞、支持的版本、给使用者的风险告诫：[SECURITY.md](SECURITY.md)；审批 / 沙箱 / 硬红线的设计：[docs/security.md](docs/security.md)
+- 在本仓库里干活的 agent（和人）先读 [AGENTS.md](AGENTS.md)：测试命令、提交纪律、公开 API 冻结面
+- 想给 bash 命令加一道模型二审：[examples/hooks/adversary](examples/hooks/adversary/)（PreToolUse 钩子样本，补充层、fail-open）
 
 ---
 

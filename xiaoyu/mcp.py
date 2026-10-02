@@ -91,9 +91,10 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Iterator
 
-from . import diagnostics, fsguard, mcp_guard, mcp_watchdog, media, netproxy
+from . import diagnostics, fsguard, mcp_guard, mcp_watchdog, media, netproxy, ui
 from .config import Config, user_config_dir
 from .errors import Interrupted, attach_partial
+from .invisible import strip_invisible
 
 #  活着的 MCP 连接数（stdio 子进程 + HTTP 会话），/diagnostics 与 doctor 可见
 CONNECTIONS_LIVE = diagnostics.Gauge("mcp.connections.live")
@@ -165,26 +166,42 @@ _CANCELLED_IN_FLIGHT = (
 )
 _CANCELLED_UNSENT = "宿主请求打断，本地已取消——请求还没有发出，server 没有执行"
 
+#  notifications/message 里要上屏的级别（规范的 syslog 八级，warning 起算）；
+#  更低的只进日志文件。单条文本封顶，server 把整个响应体当日志发也刷不了屏
+_LOG_SURFACE_LEVELS = frozenset({"warning", "error", "critical", "alert", "emergency"})
+_LOG_MESSAGE_CAP = 500
+
 #  当前线程上的"有没有人叫停"（见 stop_scope）
 _call_scope = threading.local()
 
 
 @contextlib.contextmanager
-def stop_scope(stop_requested: Callable[[], bool] | None, *, media_owner: Any = None) -> "Iterator[None]":
+def stop_scope(
+    stop_requested: Callable[[], bool] | None,
+    *,
+    media_owner: Any = None,
+    progress: Callable[[dict[str, Any]], None] | None = None,
+) -> "Iterator[None]":
     """在当前线程上挂一个"有没有人叫停"，期间发起的 MCP 工具调用会轮询它。
 
     工具的 handler 是 manager 级的闭包，一个 manager 被父子 agent 的多个工具箱
     共用；打断标志却是每个 Agent 自己的。所以标志不进 handler 的签名（那里是
     远端工具的参数），由调用方在调用期间挂到自己的线程上——handler 同步跑在
     调用方线程里，谁调的就看谁的标志。
+
+    progress 同理：期间发起的 tools/call 会带 progressToken，server 的
+    notifications/progress 经它回到调用方（在读线程上被调用，只许改状态）。
     """
     previous = getattr(_call_scope, "stop", None)
+    previous_progress = getattr(_call_scope, "progress", None)
     _call_scope.stop = stop_requested
+    _call_scope.progress = progress
     try:
         with media_scope(media_owner):
             yield
     finally:
         _call_scope.stop = previous
+        _call_scope.progress = previous_progress
 
 
 @contextlib.contextmanager
@@ -260,6 +277,16 @@ class ServerSpec:
     #  自定义头（Authorization / API key 之类）。
     url: str = ""
     headers: dict[str, str] = field(default_factory=dict)
+    #  stdio server 的工作目录（空 = 继承小羽自己的）。文件系统类 server 把"当前目录"
+    #  当根用，宿主由编辑器/systemd 拉起时当前目录是哪儿全看运气；写死在 args 里
+    #  又得每个 server 各记一套写法。启动前先验目录存在：不存在时 Popen 报的是
+    #  一句 FileNotFoundError，看起来像"命令找不到"，排错方向完全错
+    cwd: str = ""
+    #  只暴露名单内的工具（None = 全部）。几十个工具的 server 往往只用两三个：
+    #  其余的既占检索结果又是多余的攻击面（一个 delete_repo 摆在那儿，模型
+    #  调错一次就够了）。名单在注册与调用两处都卡：注册时过滤掉的工具模型看
+    #  不见，调用时再验一次——防止拿着全限定名绕过检索直接点名
+    tools: list[str] | None = None
     #  跳过 rug-pull 隔离：工具描述/schema 相对基线变化时自动接受并刷新基线，只在
     #  stderr 记一行，不再等 /mcp approve。给"来源可信、又跟着 @latest 走"的 server
     #  用（每次上游发版都要重批一遍，防线就成了噪音，用户会顺手全批）。不是默认：
@@ -278,6 +305,10 @@ class ServerSpec:
     @property
     def is_http(self) -> bool:
         return bool(self.url)
+
+    def allows_tool(self, name: str) -> bool:
+        """这个工具在不在 tools 名单里（没写名单 = 全部放行）。"""
+        return self.tools is None or name in self.tools
 
 
 #  ${env:VAR} 与 ${VAR} 两种写法都认——不同客户端生态各用其一，
@@ -531,6 +562,60 @@ def _redact(text: str) -> str:
     return _CREDENTIAL_PATTERN.sub("[REDACTED]", text)
 
 
+#  报错里附带的日志尾部：行数与每行宽度。够看到最后一条 traceback / 一句
+#  "missing env X"，又不至于把一屏错误塞满
+_LOG_TAIL_LINES = 8
+_LOG_TAIL_WIDTH = 160
+#  只读文件末尾这么多字节：日志可能很大，要的只是最后几行
+_LOG_TAIL_BYTES = 64 * 1024
+
+
+def log_tail(path: Path, lines: int = _LOG_TAIL_LINES, width: int = _LOG_TAIL_WIDTH) -> list[str]:
+    """server 日志的末 N 行（跳过空行，每行脱敏、去控制序列、截断）。读不了返回空。
+
+    "排障看日志：<路径>"是让人再去开一个文件；绝大多数启动失败的原因就在
+    日志最后几行（缺模块、缺环境变量、端口被占），直接带出来省一个来回。
+    脱敏在截断之前做（_redact 的纪律），server 把令牌打进日志也不会随报错外泄。
+    """
+    try:
+        with open(path, "rb") as handle:
+            handle.seek(0, os.SEEK_END)
+            size = handle.tell()
+            handle.seek(max(0, size - _LOG_TAIL_BYTES))
+            data = handle.read()
+    except OSError:
+        return []
+    text = data.decode("utf-8", "replace")
+    tail = [line.rstrip() for line in text.splitlines() if line.strip()][-lines:]
+    shown: list[str] = []
+    for line in tail:
+        line = ui.strip_sequences(_redact(line)).strip()
+        if len(line) > width:
+            line = line[:width] + "…"
+        shown.append(line)
+    return shown
+
+
+def tail_text(path: Path) -> str:
+    """日志末几行的展示形态（空日志 = 空串），接在一句报错后面。"""
+    tail = log_tail(path)
+    if not tail:
+        return ""
+    return f"；日志末 {len(tail)} 行：\n" + "\n".join(f"    | {line}" for line in tail)
+
+
+def log_hint(path: Path) -> str:
+    """"排障看日志"那句话，日志里有内容时顺带附上末几行。"""
+    return f"排障看日志：{path}{tail_text(path)}"
+
+
+def _with_log_hint(text: str, path: Path) -> str:
+    """给一段报错补上日志提示；文本里已经带了（来自 _exit_reason）就不重复。"""
+    if "排障看日志" in text:
+        return text
+    return f"{text}。{log_hint(path)}"
+
+
 def config_paths(workspace: Path) -> list[Path]:
     """配置文件位置，前面的优先（同名 server 覆盖后面的）。"""
     return [workspace / WORKSPACE_FILE, user_config_dir() / "mcp.json"]
@@ -637,7 +722,8 @@ def spec_fingerprint(spec: ServerSpec) -> str:
     重新连一次拿新 schema。远端 server 的 command 恒为空——不把 url 算进来的话，
     所有远端 server 的指纹都一样。"""
     material = json.dumps(
-        [spec.command, spec.args, spec.env, spec.url, spec.headers],
+        #  cwd 进指纹：文件系统类 server 的工具集可能随根目录变，换了目录缓存就不算数
+        [spec.command, spec.args, spec.env, spec.url, spec.headers, spec.cwd],
         ensure_ascii=False, sort_keys=True,
     )
     return hashlib.sha256(material.encode("utf-8")).hexdigest()[:16]
@@ -691,6 +777,22 @@ def parse_server_mapping(
     unresolved: dict[str, None] = {}
     own_words = False
 
+    def tools_field(name: str, raw: dict[str, Any]) -> list[str] | None:
+        """`tools` 名单：缺省 None = 全部。形状不对按"没写"处理并报出来——
+        写错了静默暴露全部工具，恰恰是用户写名单想避免的事。"""
+        value = raw.get("tools")
+        if value is None:
+            return None
+        if not isinstance(value, list) or not all(
+            isinstance(item, str) and item.strip() for item in value
+        ):
+            problems.append(f"server {name!r}：tools 必须是工具名（字符串）列表，已忽略，暴露全部工具")
+            return None
+        names = list(dict.fromkeys(item.strip() for item in value))
+        if not names:
+            problems.append(f"server {name!r}：tools 是空列表，这个 server 不会暴露任何工具")
+        return names
+
     def ex(value: Any) -> str:
         if not expand:
             return str(value)
@@ -729,7 +831,10 @@ def parse_server_mapping(
             #  有的客户端生态里 mcp.json 的 timeout 按毫秒计（默认 120000）。用户
             #  跨家抄配置很常见，≥1000 一律按毫秒解释——没人需要 17 分钟以上的工具超时。
             timeout /= 1000
+        tools = tools_field(str(name), raw)
         if remote:
+            if raw.get("cwd"):
+                problems.append(f"server {name!r}：cwd 只对 stdio server 有意义，已忽略")
             specs.append(
                 ServerSpec(
                     name=str(name),
@@ -740,6 +845,7 @@ def parse_server_mapping(
                     },
                     timeout=float(timeout),
                     disabled=bool(raw.get("disabled", False)),
+                    tools=tools,
                     trust_tool_changes=bool(raw.get("trustToolChanges", False)),
                     trust_content=bool(raw.get("trustContent", False)),
                 )
@@ -756,11 +862,15 @@ def parse_server_mapping(
                 command=ex(raw["command"]),
                 args=[ex(item) for item in raw.get("args") or []],
                 env={str(key): ex(value) for key, value in (raw.get("env") or {}).items()},
+                #  cwd 与 url/headers 同一套 ${env:VAR} 展开：`${env:HOME}/data` 这类写法
+                #  跨机器可用
+                cwd=ex(raw["cwd"]).strip() if isinstance(raw.get("cwd"), str) else "",
                 timeout=float(timeout),
                 disabled=bool(raw.get("disabled", False)),
                 inherit_env=[
                     str(name) for name in raw.get("inheritEnv") or [] if str(name).strip()
                 ],
+                tools=tools,
                 trust_tool_changes=bool(raw.get("trustToolChanges", False)),
                 trust_content=bool(raw.get("trustContent", False)),
             )
@@ -938,8 +1048,7 @@ class _HttpChannel:
         #  建连、写请求）的 OSError 包成 URLError；等响应头与读响应体阶段的异常
         #  原样抛出——这条边界就是"送没送到"的判据。
         try:
-            response = netproxy.urlopen(request, timeout=timeout,
-                **({"allow_redirects": False} if self.spec.authorization is not None else {}))
+            response = netproxy.urlopen(request, timeout=timeout, allow_redirects=False)
         except urllib.error.HTTPError as exc:
             raise self._http_error(exc) from exc
         except urllib.error.URLError as exc:
@@ -1012,6 +1121,20 @@ class _HttpChannel:
         with contextlib.suppress(Exception):
             exc.close()
         suffix = f"：{detail}" if detail else ""
+        if 300 <= code < 400:
+            #  MCP 端点一律不跟重定向：urllib 跟过去时会把 Authorization、
+            #  Mcp-Session-Id 等全部请求头原样带到新地址（不分跨域），写死在配置
+            #  里的静态凭据就这么泄给了第三方；而且 POST 会被改成 GET、丢掉请求体，
+            #  协议上也走不通。让人把 url 直接改成最终地址
+            target = ""
+            with contextlib.suppress(Exception):
+                target = str(exc.headers.get("Location") or "")
+            where = f"，目标 {_redact(target)[:200]}" if target else ""
+            return McpError(
+                f"server 回了重定向（HTTP {code}{where}）：为防凭据外泄不自动跟随，"
+                "请把这个 server 的 url 改成最终地址",
+                kind="http", status=code,
+            )
         if code == 404 and self.session_id:
             return McpError(
                 "远端会话已失效（HTTP 404），需要重新握手", kind="session_expired", status=code
@@ -1045,8 +1168,7 @@ class _HttpChannel:
             self.spec.url, headers=self._headers("text/event-stream"), method="GET"
         )
         try:
-            stream = netproxy.urlopen(request, timeout=self._STREAM_TIMEOUT,
-                **({"allow_redirects": False} if self.spec.authorization is not None else {}))
+            stream = netproxy.urlopen(request, timeout=self._STREAM_TIMEOUT, allow_redirects=False)
         except urllib.error.HTTPError as exc:
             #  HTTPError 本身就是一个开着的响应：不关就是把连接留给垃圾回收。
             #  405 是常态（多数 server 不提供这条流），漏的是每连一个 server 一条
@@ -1108,8 +1230,7 @@ class _HttpChannel:
             request = urllib.request.Request(
                 self.spec.url, headers=self._headers("application/json"), method="DELETE"
             )
-            netproxy.urlopen(request, timeout=5.0,
-                **({"allow_redirects": False} if self.spec.authorization is not None else {})).close()
+            netproxy.urlopen(request, timeout=5.0, allow_redirects=False).close()
         except urllib.error.HTTPError as exc:
             #  不支持 DELETE 的 server 回 405：同样是个开着的响应，要关
             with contextlib.suppress(Exception):
@@ -1290,8 +1411,20 @@ class McpServer:
         self._breaker_until = 0.0
         #  server 声明的名字/版本（initialize 响应里的 serverInfo），/mcp 展示用
         self.server_info = ""
+        #  握手拿到的能力表与 instructions（`xiaoyu mcp probe` 展示用；运行期只看
+        #  有没有 tools 这一项）
+        self.capabilities: dict[str, Any] = {}
+        self.instructions = ""
         #  本代 initialize 协商出的协议版本（空串 = 未握手）；restart 清零重协商
         self.protocol_version = ""
+        #  在飞的 tools/call 的进度回调：progressToken → 回调。请求带了 token，
+        #  server 的 notifications/progress 才会来；回调在读线程上跑，只许改状态
+        #  不许发请求（与 on_tools_changed 同一条纪律）
+        self._progress_hooks: dict[int, Callable[[dict[str, Any]], None]] = {}
+        self._progress_seq = 0
+        #  on_log(level, text) ← notifications/message 里 warning 及以上的（manager 接线，
+        #  再转给前端）。全部级别都进本 server 的日志文件，这里只管上屏那一部分
+        self.on_log: Callable[[str, str], None] | None = None
         #  最近一次 call_tool 的图片部件（见 call_tool）：调用方紧接着取走
         self._call_media = threading.local()
         #  惰性启动状态：schema 缓存命中的 server 直到第一次真实调用才 spawn
@@ -1411,6 +1544,9 @@ class McpServer:
         #  没声明 tools capability 的 server（纯 prompts/resources 型）不发
         #  tools/list：省一次注定报 method-not-found 的往返
         capabilities = result.get("capabilities") or {}
+        self.capabilities = capabilities if isinstance(capabilities, dict) else {}
+        instructions = result.get("instructions")
+        self.instructions = instructions if isinstance(instructions, str) else ""
         declared = self._list_tools() if "tools" in capabilities else []
         self.live_declared = declared
         self.live_names = {str(item.get("name", "")) for item in declared}
@@ -1462,6 +1598,11 @@ class McpServer:
                 sys.executable, "-m", "xiaoyu.mcp_watchdog",
                 "--ppid", str(os.getpid()), "--", *argv,
             ]
+        #  工作目录先验再交给 Popen：目录不存在时 Popen 抛的 FileNotFoundError 不说
+        #  是哪个路径，看起来和"命令找不到"一模一样
+        cwd = os.path.expanduser(self.spec.cwd) if self.spec.cwd else None
+        if cwd is not None and not os.path.isdir(cwd):
+            raise McpError(f"工作目录不存在：{cwd}（声明里的 cwd）")
         log = open(self.log_path, "w", encoding="utf-8")  # noqa: SIM115
         try:
             self._proc = subprocess.Popen(
@@ -1474,6 +1615,7 @@ class McpServer:
                 errors="replace",
                 #  行缓冲：协议就是一行一条消息
                 bufsize=1,
+                cwd=cwd,
                 env=_safe_env(self.spec.env, self.spec.inherit_env),
                 **_subprocess_hardening(),
             )
@@ -1702,7 +1844,14 @@ class McpServer:
                 )
             return (
                 f"ERROR: MCP server {self.spec.name} 进程已退出，无法调用。{hint}"
-                f"排障看日志：{self.log_path}"
+                + log_hint(self.log_path)
+            )
+        #  名单的第二道闸（第一道在注册时过滤）：拿着全限定名绕过检索直接点名、
+        #  或旧一代的工具对象还在手里，都到不了 server
+        if not self.spec.allows_tool(tool):
+            return (
+                f"ERROR: MCP server {self.spec.name} 的 {tool} 不在声明的 tools 名单里，"
+                "不可调用。换其它工具，或告知用户把它加进 mcp.json 的 tools。"
             )
         #  熔断快速失败：同步主循环里每次干等满超时（默认 120s），模型对着
         #  一个坏 server 重试几轮就能烧掉十几分钟。开路期间立即返回。
@@ -1714,10 +1863,21 @@ class McpServer:
                 f"约 {remaining}s 后自动恢复。不要立刻重试这个工具——"
                 "先做别的事，或改用其它工具/告知用户。"
             )
+        params: dict[str, Any] = {"name": tool, "arguments": args}
+        #  调用方线程上挂了进度回调（progress_scope）才带 progressToken：规范规定
+        #  不带 token 就没有进度通知，没人看的进度不必让 server 白发
+        progress = getattr(_call_scope, "progress", None)
+        token: int | None = None
+        if progress is not None:
+            with self._cond:
+                self._progress_seq += 1
+                token = self._progress_seq
+                self._progress_hooks[token] = progress
+            params["_meta"] = {"progressToken": token}
         try:
             result = self._request(
                 "tools/call",
-                {"name": tool, "arguments": args},
+                params,
                 timeout=self.spec.timeout,
                 stop_requested=stop_requested,
             )
@@ -1748,6 +1908,10 @@ class McpServer:
             if self.reconnecting and not self._closing:
                 text += "（连接已断开，后台正在自动重连）"
             return text
+        finally:
+            if token is not None:
+                with self._cond:
+                    self._progress_hooks.pop(token, None)
         self._failures = 0
         text, self.last_media = _render_result(result)
         return text
@@ -1984,15 +2148,20 @@ class McpServer:
         if generation is not None and self._proc is not generation:
             return
         if "method" in message:
+            method = message.get("method")
             if message.get("id") is not None:
                 self._answer_server_request(message)
-            elif message.get("method") == "notifications/tools/list_changed":
+            elif method == "notifications/tools/list_changed":
                 #  热更新钩子：只报信，fetch/swap 由 manager 的独立线程做
                 #  （在本线程发请求会自锁死：响应正等着本线程派发）
                 callback = self.on_tools_changed
                 if callback is not None and not self._closing:
                     callback()
-            #  其余通知（progress、logging…）一律忽略
+            elif method == "notifications/progress":
+                self._on_progress(message.get("params"))
+            elif method == "notifications/message":
+                self._on_log_message(message.get("params"))
+            #  其余通知（resources/prompts 的 list_changed…）一律忽略
             return
         if "id" in message:
             response_id = message["id"]
@@ -2154,14 +2323,66 @@ class McpServer:
         except McpError:
             pass
 
+    def _on_progress(self, params: Any) -> None:
+        """notifications/progress → 对应在飞调用的回调。对不上 token 的（调用已
+        返回/超时之后才到的）当场丢。"""
+        if not isinstance(params, dict):
+            return
+        token = params.get("progressToken")
+        if isinstance(token, str) and token.isdigit():
+            token = int(token)
+        if not isinstance(token, int) or isinstance(token, bool):
+            return
+        with self._cond:
+            hook = self._progress_hooks.get(token)
+        if hook is None:
+            return
+        progress = params.get("progress")
+        total = params.get("total")
+        message = params.get("message")
+        info = {
+            "progress": float(progress) if isinstance(progress, (int, float)) and not isinstance(progress, bool) else None,
+            "total": float(total) if isinstance(total, (int, float)) and not isinstance(total, bool) else None,
+            "message": message if isinstance(message, str) else "",
+        }
+        with contextlib.suppress(Exception):
+            hook(info)
+
+    def _on_log_message(self, params: Any) -> None:
+        """notifications/message（server 的日志）：全部级别追加进本 server 的日志
+        文件，warning 及以上再经 on_log 上屏。debug/info 不上屏——那是 server 自己
+        的运行流水，刷到用户眼前只会淹掉真正要紧的那一条。"""
+        if not isinstance(params, dict):
+            return
+        level = str(params.get("level") or "info").lower()
+        data = params.get("data")
+        if isinstance(data, str):
+            text = data
+        else:
+            try:
+                text = json.dumps(data, ensure_ascii=False)
+            except (TypeError, ValueError):
+                text = str(data)
+        logger = params.get("logger")
+        prefix = f"[{level}{' ' + str(logger) if isinstance(logger, str) and logger else ''}]"
+        #  server 发来的文本不可信：控制序列先摘掉再落盘/上屏，长度封顶
+        text = ui.strip_sequences(_redact(text)).strip()
+        if len(text) > _LOG_MESSAGE_CAP:
+            text = text[:_LOG_MESSAGE_CAP] + "…"
+        with contextlib.suppress(OSError):
+            self.log_path.parent.mkdir(parents=True, exist_ok=True)
+            with open(self.log_path, "a", encoding="utf-8") as handle:
+                handle.write(f"{time.strftime('%H:%M:%S')} {prefix} {text}\n")
+        callback = self.on_log
+        if callback is not None and level in _LOG_SURFACE_LEVELS and not self._closing:
+            with contextlib.suppress(Exception):
+                callback(level, text)
+
     def _exit_reason(self) -> str:
         if self._http is not None:
             return f"与远端 server 的连接已断开（{display_url(self.spec.url)}）"
         code = self._proc.returncode if self._proc else None
-        return (
-            f"server 进程已退出（exit {code}）。"
-            f"排障看日志：{self.log_path}"
-        )
+        return f"server 进程已退出（exit {code}）。{log_hint(self.log_path)}"
 
 
 def _version() -> str:
@@ -2237,14 +2458,19 @@ def _normalize_schema(node: Any) -> Any:
     - type 是数组：["string","null"] 折叠成 "string"（取第一个非 null）
     - required 里指向不存在属性的项剪掉（Gemini 会 400）
     - 有 properties 却缺 type 的补 "object"
+    - anyOf / oneOf 全是纯 const 的折叠成 enum（_collapse_const_union）
     只递归 schema 位置；required/enum/examples 的值不是 schema，不进去
-    （进去会把字面量误当裸字符串 schema 替换掉）。
+    （进去会把字面量误当裸字符串 schema 替换掉）。$ref 的内联在它之前单独
+    一遍（_inline_refs），那需要看整棵树。
     """
     if isinstance(node, str):
         return {"type": "object", "properties": {}}
     if not isinstance(node, dict):
         return node
     node = dict(node)  # 浅拷贝：不改 server 给的原对象
+    if isinstance(node.get("description"), str):
+        #  参数描述与工具描述一样是 server 写给模型看的文本
+        node["description"] = strip_invisible(node["description"], "MCP 工具的参数描述")
     kind = node.get("type")
     if isinstance(kind, list):
         non_null = [item for item in kind if item != "null"]
@@ -2279,20 +2505,26 @@ _CONST_TYPES: tuple[tuple[type, str], ...] = (
 
 
 def _collapse_const_union(node: dict[str, Any]) -> dict[str, Any]:
-    """anyOf 全是同型纯 const 时折叠成 enum。
+    """anyOf / oneOf 全是同型纯 const 时折叠成 enum。
 
     某些语言生态的 server 把闭集枚举生成为
-    `{"anyOf": [{"const": "red"}, {"const": "green"}]}`，而严格校验的端点
-    对这种形态要么拒绝要么误处理，property 级 `enum` 才是通行形态。
+    `{"anyOf": [{"const": "red"}, {"const": "green"}]}`（带文档的枚举则是
+    oneOf，每个分支各带一句 description），而严格校验的端点对这种形态要么
+    拒绝要么误处理，property 级 `enum` 才是通行形态。
     只在**每个非 null 分支都是同一 primitive 类型的纯 const**（分支里除
     const 外只有注解类键）时才折叠；单个 {"type":"null"} 分支容忍并丢弃
     ——与上面 type 数组折叠丢 null 的既有取舍一致（运行期报错好过注册期
     整个 tools 数组 400）。混合 union 原样穿透。分支序保序。
+    分支各自的 description 不能随折叠丢掉——那是模型选值的依据——并进
+    节点 description 里，一值一行。两种键同时存在时不动：那不是枚举。
     """
-    branches = node.get("anyOf")
-    if not isinstance(branches, list) or not branches:
+    keys = [key for key in ("anyOf", "oneOf") if isinstance(node.get(key), list) and node[key]]
+    if len(keys) != 1:
         return node
+    key = keys[0]
+    branches = node[key]
     values: list[Any] = []
+    notes: list[str] = []
     kind: str | None = None
     for branch in branches:
         if not isinstance(branch, dict):
@@ -2314,13 +2546,106 @@ def _collapse_const_union(node: dict[str, Any]) -> dict[str, Any]:
         #  同型才走到这里，True==1 跨型撞值的坑已被 kind 检查挡在门外
         if value not in values:
             values.append(value)
+            if isinstance(branch.get("description"), str) and branch["description"].strip():
+                notes.append(
+                    f"{json.dumps(value, ensure_ascii=False)}: {branch['description'].strip()}"
+                )
     if kind is None or not values:
         return node
     node = dict(node)
-    del node["anyOf"]
+    del node[key]
     node["type"] = kind
     node["enum"] = values
+    if notes:
+        head = node.get("description")
+        head = head.strip() if isinstance(head, str) else ""
+        node["description"] = "\n".join(([head] if head else []) + notes)
     return node
+
+
+#  $ref 只认指向本 schema 顶层定义表的两种写法；外部 URI、指向 properties
+#  深处的 JSON pointer 都不动
+_LOCAL_REF = re.compile(r"^#/(\$defs|definitions)/([^/]+)$")
+#  老方言下 $ref 旁边的键按规范被忽略、定义表叫 definitions 且常带 id 解析：
+#  按新语义内联会改变含义，整个跳过
+_OLD_DIALECT = re.compile(r"draft-0[0-4]\b")
+#  链式引用（A 引 B 引 C）逐遍内联到不动为止的上限；超过说明是环
+_INLINE_PASSES = 8
+
+
+def _inline_refs(schema: dict[str, Any]) -> dict[str, Any]:
+    """把 `$ref: #/$defs/x`（或 definitions）指向的叶子定义就地内联，剪掉没人引用的定义。
+
+    Gemini 的函数声明不认 $ref（见到直接 400）、OpenAI strict 对 $defs 另有
+    规矩，而 pydantic / zod 这类生成器对嵌套模型默认都走 $ref。只内联**叶子**
+    定义（自身不再含 $ref 的）；链式引用多遍收敛；递归定义（自己引自己）永远
+    成不了叶子，原样留着——它本来就表达不成函数声明，不硬拆。引用处与定义
+    合并时引用处的注解（description 等）优先：生成器把字段文档写在引用处。
+    `$schema` 标明 draft-04 及更老方言的整个跳过。
+    """
+    dialect = schema.get("$schema")
+    if isinstance(dialect, str) and _OLD_DIALECT.search(dialect):
+        return schema
+
+    def tables(root: dict[str, Any]) -> dict[str, dict[str, Any]]:
+        found: dict[str, dict[str, Any]] = {}
+        for key in ("$defs", "definitions"):
+            table = root.get(key)
+            if isinstance(table, dict):
+                for name, definition in table.items():
+                    if isinstance(definition, dict):
+                        found[f"#/{key}/{name}"] = definition
+        return found
+
+    def walk(node: Any, leaves: dict[str, dict[str, Any]], seen: set[str]) -> Any:
+        """只沿 schema 位置递归（与 _normalize_schema 同一张键表），记下遇到的 $ref。"""
+        if isinstance(node, list):
+            return [walk(item, leaves, seen) for item in node]
+        if not isinstance(node, dict):
+            return node
+        ref = node.get("$ref")
+        if isinstance(ref, str) and ref in leaves:
+            node = {**leaves[ref], **{key: value for key, value in node.items() if key != "$ref"}}
+        elif isinstance(ref, str):
+            seen.add(ref)
+        node = dict(node)
+        for key in _SCHEMA_MAP_KEYS:
+            if isinstance(node.get(key), dict):
+                node[key] = {name: walk(sub, leaves, seen) for name, sub in node[key].items()}
+        for key in _SCHEMA_LIST_KEYS:
+            if isinstance(node.get(key), list):
+                node[key] = [walk(sub, leaves, seen) for sub in node[key]]
+        for key in _SCHEMA_ONE_KEYS:
+            if key in node and not isinstance(node[key], bool):
+                node[key] = walk(node[key], leaves, seen)
+        return node
+
+    def contains_ref(node: Any) -> bool:
+        probe: set[str] = set()
+        walk(node, {}, probe)
+        return bool(probe)
+
+    if not tables(schema):
+        return schema
+    seen: set[str] = set()
+    for _ in range(_INLINE_PASSES):
+        defs = tables(schema)
+        leaves = {ref: definition for ref, definition in defs.items() if not contains_ref(definition)}
+        seen = set()
+        schema = walk(schema, leaves, seen)
+        if not (seen & set(defs)):
+            break  # 剩下的引用都不指向本地定义（或已无引用）：收敛
+    #  剪掉没人引用的定义（含刚被内联掉的）；表空了整个键去掉
+    for key in ("$defs", "definitions"):
+        table = schema.get(key)
+        if not isinstance(table, dict):
+            continue
+        kept = {name: sub for name, sub in table.items() if f"#/{key}/{name}" in seen}
+        if kept:
+            schema[key] = kept
+        else:
+            del schema[key]
+    return schema
 
 
 # ---------- 远程工具 + 管理器 ----------
@@ -2353,14 +2678,19 @@ def _make_remote_tool(
 ) -> RemoteTool:
     tool_name = str(declared.get("name", ""))
     exposed = public_tool_name(server.spec.name, tool_name)
-    description = str(declared.get("description") or "").strip() or "(server 未提供描述)"
+    #  工具描述是 server 写给模型看的、用户基本不读的文本：隐形字符先剥
+    #  （参数描述在 _normalize_schema 里剥）
+    description = strip_invisible(
+        str(declared.get("description") or "").strip(),
+        f"MCP server {server.spec.name} 的工具描述",
+    ) or "(server 未提供描述)"
     if len(description) > _DESCRIPTION_CAP:
         description = description[:_DESCRIPTION_CAP] + "…"
     #  描述里带上来源：审批框里用户一眼看出这是哪个 server 的能力
     description = f"[MCP·{server.spec.name}] {description}"
     schema = declared.get("inputSchema")
     if isinstance(schema, dict):
-        schema = _normalize_schema(schema)
+        schema = _normalize_schema(_inline_refs(schema))
     if not isinstance(schema, dict) or schema.get("type") != "object":
         #  缺失/畸形 schema 补一个空对象 schema：OpenAI 端点会拒绝非 object 的顶层
         schema = {"type": "object", "properties": {}}
@@ -2371,9 +2701,8 @@ def _make_remote_tool(
             server.ensure_started()
         except McpError as exc:
             return (
-                f"ERROR: MCP server {server.spec.name} 启动失败：{exc}。"
-                f"排障看日志：{server.log_path}；告知用户修好后执行 "
-                f"/mcp reconnect {server.spec.name} 恢复"
+                _with_log_hint(f"ERROR: MCP server {server.spec.name} 启动失败：{exc}", server.log_path)
+                + f"；告知用户修好后执行 /mcp reconnect {server.spec.name} 恢复"
             )
         #  缓存与现实对账（每 server 一次）：server 新增的工具补注册
         manager.reconcile(server)
@@ -2473,6 +2802,12 @@ class McpManager:
         self._reconnecting: set[str] = set()
         #  已不可恢复地失败（认证被拒）的 server：不再立案重连
         self._failed_hard: set[str] = set()
+        #  tools 名单里 server 没提供的名字，已告警过的（server → 缺的那组）：
+        #  同一组只报一次，换代后缺的变了再报
+        self._tools_warned: dict[str, tuple[str, ...]] = {}
+        #  on_log(server, level, text) ← server 的 notifications/message（warning 及以上）。
+        #  由持有 manager 的顶层工具箱接线到前端；没接线就打 stderr
+        self.on_log: Callable[[str, str, str], None] | None = None
         #  close 时置位：重连线程的退避等待立即醒来退场
         self._close_event = threading.Event()
         #  工具指纹基线（防 rug-pull）与 schema 缓存都放用户配置目录
@@ -2485,6 +2820,39 @@ class McpManager:
         self._decls_path = self._state_dir / "mcp-approved-decls.json"
         self._decls = mcp_guard.load_declarations(self._decls_path)
         self._cache = self._load_cache() if use_cache and _enabled("XIAOYU_MCP_CACHE") else {}
+
+    def _new_server(self, spec: ServerSpec) -> McpServer:
+        """建一个 server 对象：日志路径 + 日志通知接线，三条创建路径共用。"""
+        server = McpServer(spec, log_path=self._log_path(spec.name, self._state_dir))
+        server.on_log = lambda level, text: self._surface_log(spec.name, level, text)
+        return server
+
+    def _surface_log(self, name: str, level: str, text: str) -> None:
+        callback = self.on_log
+        if callback is not None:
+            callback(name, level, text)
+        else:
+            print(f"[MCP {name} {level}] {text}", file=sys.stderr)
+
+    def _permitted_locked(
+        self, name: str, spec: ServerSpec, declared: list[dict[str, Any]]
+    ) -> list[dict[str, Any]]:
+        """按声明的 tools 名单过滤一代声明。名单里 server 没提供的名字告警一次：
+        多半是拼错了，静默的话用户以为工具在、模型却永远检索不到。"""
+        if spec.tools is None:
+            return declared
+        offered = {str(item.get("name", "")) for item in declared}
+        missing = tuple(tool for tool in spec.tools if tool not in offered)
+        if missing and self._tools_warned.get(name) != missing:
+            self._tools_warned[name] = missing
+            print(
+                f"[MCP {name}：tools 名单里的 {', '.join(missing[:5])}"
+                f"{'…' if len(missing) > 5 else ''} 这个 server 没有提供"
+                f"（它提供 {len(offered)} 个：{', '.join(sorted(offered)[:8])}"
+                f"{'…' if len(offered) > 8 else ''}），核对 mcp.json 里的拼写]",
+                file=sys.stderr,
+            )
+        return [item for item in declared if str(item.get("name", "")) in spec.tools]
 
     def _load_cache(self) -> dict[str, Any]:
         try:
@@ -2507,7 +2875,7 @@ class McpManager:
                 and entry.get("fingerprint") == spec_fingerprint(spec)
                 and isinstance(entry.get("tools"), list)
             ):
-                server = McpServer(spec, log_path=self._log_path(spec.name, self._state_dir))
+                server = self._new_server(spec)
                 server.server_info = str(entry.get("server_info", ""))
                 with self._lock:
                     self._owned_servers.append(server)
@@ -2527,15 +2895,20 @@ class McpManager:
             thread.start()
 
     def _bootstrap_one(self, spec: ServerSpec) -> None:
-        server = McpServer(spec, log_path=self._log_path(spec.name, self._state_dir))
+        server = self._new_server(spec)
         with self._lock:
             self._owned_servers.append(server)
         try:
             declared = server.bootstrap()
         except McpError as exc:
             server.close()
+            #  stdio 的启动失败原因多半在 server 自己的 stderr 里：状态里直接带日志尾部，
+            #  /mcp 一眼看到，不必再去翻文件
+            reason = str(exc)
+            if not spec.is_http and "排障看日志" not in reason:
+                reason += tail_text(server.log_path)
             with self._lock:
-                self._states[spec.name] = f"failed: {exc}"
+                self._states[spec.name] = f"failed: {reason}"
             return
         except Exception as exc:  # noqa: BLE001 - 单个 server 崩不拦其它的
             server.close()
@@ -2584,6 +2957,9 @@ class McpManager:
         顺序纪律：保留/替换的工具停在原位（原位替换 = dict 覆盖语义，full-schema
         模式的 prompt cache 前缀不动），删除只挪后缀，新工具追加在最尾。
         """
+        #  tools 名单在裁决之前过滤：名单外的工具不进基线也不比对——它们的描述
+        #  怎么变都与本会话无关，不该为此隔离整代
+        declared = self._permitted_locked(name, server.spec, declared)
         admitted, quarantined, updates = mcp_guard.admit_tools(
             self._baseline.get(name, {}), declared
         )
@@ -2863,7 +3239,7 @@ class McpManager:
                     server.on_tools_changed = None
                     print(
                         f"[MCP {name}：连续 {self.RECONNECT_MAX_ATTEMPTS} 次重连失败，"
-                        f"工具已整代下线。排障看日志：{server.log_path}]",
+                        f"工具已整代下线。{log_hint(server.log_path)}]",
                         file=sys.stderr,
                     )
                     return
@@ -3095,7 +3471,7 @@ class McpManager:
             self._specs = [spec if item.name == name else item for item in self._specs]
         if server is None:
             #  从未登记过（启动即失败 / 首代被回滚）：没有旧代工具绑在旧对象上，新建即可
-            server = McpServer(spec, log_path=self._log_path(name, self._state_dir))
+            server = self._new_server(spec)
             with self._lock:
                 self._owned_servers.append(server)
         succeeded = False
@@ -3182,7 +3558,7 @@ class McpManager:
                 "把凭据写进配置文件，或设好后重启会话"
             )
         elif not server.spec.is_http:
-            text += f"。排障看日志：{server.log_path}"
+            text = _with_log_hint(text, server.log_path)
         return text
 
     def command(self, parts: list[str]) -> str:

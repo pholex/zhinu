@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import contextlib
+import io
+import json
 import os
 import tempfile
 import unittest
@@ -81,6 +84,86 @@ class SystemPromptPointerTest(AgentTestCase):
 
     def test_no_nested_docs_leaves_the_prompt_untouched(self) -> None:
         self.assertNotIn("子目录里还有各自的约定文件", self.build([]).messages[0]["content"])
+
+
+class LazyNestedDocsTest(AgentTestCase):
+    """子目录约定文件按触达懒加载：路径参数首次落进某目录，那条路径上各层的约定文件
+    随工具结果附上；每目录一次、只向下、不出工作区、受会话预算约束。"""
+
+    def setUp(self) -> None:
+        super().setUp()
+        put(self.root, "api/AGENTS.md", "API 约定：接口一律加版本前缀")
+        put(self.root, "api/sub/CLAUDE.md", "SUB 约定：这里的文件用四空格缩进")
+        put(self.root, "api/sub/x.py", "x = 1\n")
+        put(self.root, "node_modules/pkg/AGENTS.md", "依赖目录的约定不算")
+        put(self.root, "node_modules/pkg/index.js", "")
+
+    def execute(self, agent, name: str, arguments: str) -> str:
+        call = {"id": "t1", "function": {"name": name, "arguments": arguments}}
+        with contextlib.redirect_stdout(io.StringIO()):
+            return agent._execute(call)["content"]
+
+    def test_read_loads_every_layer_down_to_the_touched_directory(self) -> None:
+        agent = self.build([])
+        out = self.execute(agent, "read_file", json.dumps({"path": "api/sub/x.py"}))
+        self.assertIn("API 约定：接口一律加版本前缀", out)
+        self.assertIn("SUB 约定：这里的文件用四空格缩进", out)
+        self.assertLess(out.index("API 约定"), out.index("SUB 约定"))
+        self.assertIn("api/AGENTS.md", out)
+        self.assertIn("api/sub/CLAUDE.md", out)
+
+    def test_each_directory_only_once(self) -> None:
+        agent = self.build([])
+        self.execute(agent, "read_file", json.dumps({"path": "api/sub/x.py"}))
+        again = self.execute(agent, "read_file", json.dumps({"path": "api/sub/x.py"}))
+        self.assertNotIn("API 约定", again)
+        self.assertNotIn("SUB 约定", again)
+
+    def test_bash_path_words_count_as_touch(self) -> None:
+        agent = self.build([])
+        out = self.execute(agent, "bash", json.dumps({"command": "ls -la api/sub"}))
+        self.assertIn("API 约定", out)
+        self.assertIn("SUB 约定", out)
+
+    def test_workspace_root_and_outside_paths_do_not_load(self) -> None:
+        put(self.root, "AGENTS.md", "根约定（已在 system prompt 里）")
+        outside = self.root.parent / (self.root.name + "-outside")
+        put(outside, "AGENTS.md", "外面的约定")
+        put(outside, "y.py", "y = 2\n")
+        self.addCleanup(lambda: __import__("shutil").rmtree(outside, ignore_errors=True))
+        agent = self.build([])
+        out = self.execute(agent, "read_file", json.dumps({"path": "calc.py"}))
+        self.assertNotIn("根约定", out)
+        out = self.execute(agent, "read_file", json.dumps({"path": str(outside / "y.py")}))
+        self.assertNotIn("外面的约定", out)
+        escaped = "api/../../" + outside.name + "/y.py"
+        out = self.execute(agent, "read_file", json.dumps({"path": escaped}))
+        self.assertNotIn("外面的约定", out)
+
+    def test_dependency_directories_are_skipped(self) -> None:
+        agent = self.build([])
+        out = self.execute(agent, "read_file", json.dumps({"path": "node_modules/pkg/index.js"}))
+        self.assertNotIn("依赖目录的约定不算", out)
+
+    def test_budget_exhausted_leaves_a_pointer(self) -> None:
+        agent = self.build([])
+        agent._nested_docs_budget = 10
+        out = self.execute(agent, "read_file", json.dumps({"path": "api/sub/x.py"}))
+        #  第一份被截断后预算归零，第二份只给指针
+        self.assertIn("已截断", out)
+        self.assertIn("api/sub/CLAUDE.md（本会话附带正文的预算已用完", out)
+        self.assertNotIn("SUB 约定", out)
+
+    def test_disabled_project_instructions_disable_lazy_loading(self) -> None:
+        self.config.load_project_instructions = False
+        agent = self.build([])
+        out = self.execute(agent, "read_file", json.dumps({"path": "api/sub/x.py"}))
+        self.assertNotIn("API 约定", out)
+
+    def test_system_prompt_pointer_mentions_lazy_loading(self) -> None:
+        agent = self.build([])
+        self.assertIn("会随工具结果附上", agent.messages[0]["content"])
+        self.assertIn("api/AGENTS.md", agent.messages[0]["content"])
 
 
 if __name__ == "__main__":

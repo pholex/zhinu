@@ -508,6 +508,101 @@ class TestChatPassthrough(unittest.TestCase):
         self.assertEqual(sorted(sent), ["messages", "model"])
 
 
+class TestChatCacheControl(unittest.TestCase):
+    """网关下 Claude 后端的 chat 载荷缓存断点：没有断点上游一个 token 都不缓存
+    （2026-10-02 对自建 LiteLLM 网关实测）。断点只落在发送副本上。"""
+
+    def send(self, provider: str, model: str, messages: list, tools: list | None = None) -> dict:
+        inner = FakeClient(FakeResponses())
+        client = Transport(inner, responses.CHAT, provider=provider)
+        kwargs: dict[str, Any] = {"model": model, "messages": messages}
+        if tools is not None:
+            kwargs["tools"] = tools
+        client.chat.completions.create(**kwargs)
+        return inner.chat.completions.calls[0]
+
+    @staticmethod
+    def marked(messages: list) -> list[int]:
+        return [
+            index for index, message in enumerate(messages)
+            if "cache_control" in message
+            or (isinstance(message.get("content"), list)
+                and any("cache_control" in block for block in message["content"]))
+        ]
+
+    def test_provider_name_matches_registry(self) -> None:
+        from xiaoyu.providers import GATEWAY
+
+        self.assertEqual(responses.GATEWAY_PROVIDER, GATEWAY)
+
+    def test_system_tools_and_tail_get_breakpoints(self) -> None:
+        history = [
+            {"role": "system", "content": "你是小羽"},
+            {"role": "user", "content": "hi"},
+        ]
+        sent = self.send("gateway", "claude-sonnet-5.5", history, [TOOL])
+        self.assertEqual(
+            sent["messages"][0]["content"],
+            [{"type": "text", "text": "你是小羽", "cache_control": {"type": "ephemeral"}}],
+        )
+        self.assertEqual(
+            sent["messages"][1]["content"],
+            [{"type": "text", "text": "hi", "cache_control": {"type": "ephemeral"}}],
+        )
+        self.assertEqual(sent["tools"][-1]["cache_control"], {"type": "ephemeral"})
+        #  原始历史与工具表一个字不动：内核还要拿它们继续对话
+        self.assertEqual(history[0]["content"], "你是小羽")
+        self.assertEqual(history[1]["content"], "hi")
+        self.assertNotIn("cache_control", TOOL)
+
+    def test_tool_tail_uses_message_level_field_and_secondary_anchor(self) -> None:
+        """尾部是 tool 结果：消息级字段；再往前 ≥20 条处的最近一条 user/tool 作次锚点。"""
+        history: list[dict[str, Any]] = [{"role": "system", "content": "s"}, {"role": "user", "content": "开始"}]
+        for n in range(15):
+            history.append({"role": "assistant", "content": None,
+                            "tool_calls": [{"id": f"c{n}", "type": "function",
+                                            "function": {"name": "read_file", "arguments": "{}"}}]})
+            history.append({"role": "tool", "tool_call_id": f"c{n}", "content": f"r{n}"})
+        sent = self.send("gateway", "anthropic.claude-opus-5", history)
+        tail = len(history) - 1
+        self.assertEqual(sent["messages"][tail]["cache_control"], {"type": "ephemeral"})
+        self.assertEqual(sent["messages"][tail]["content"], "r14")
+        #  次锚点：下标 ≤ tail-20 的最近一条 user/tool
+        anchor = max(i for i in range(1, tail - 20 + 1) if history[i]["role"] in ("user", "tool"))
+        self.assertEqual(self.marked(sent["messages"]), [0, anchor, tail])
+        #  断点总数不超过 Anthropic 的上限 4（这里没有 tools）
+        self.assertLessEqual(len(self.marked(sent["messages"])), 4)
+        self.assertNotIn("cache_control", history[tail])
+
+    def test_short_history_has_no_secondary_anchor(self) -> None:
+        history = [{"role": "system", "content": "s"}, {"role": "user", "content": "a"},
+                   {"role": "assistant", "content": "b"}, {"role": "user", "content": "c"}]
+        sent = self.send("gateway", "claude-sonnet-5.5", history)
+        self.assertEqual(self.marked(sent["messages"]), [0, 3])
+
+    def test_image_only_tail_is_left_alone(self) -> None:
+        history = [{"role": "system", "content": "s"},
+                   {"role": "user", "content": [{"type": "image_url", "image_url": {"url": "data:x"}}]}]
+        sent = self.send("gateway", "claude-sonnet-5.5", history)
+        self.assertEqual(self.marked(sent["messages"]), [0])
+
+    def test_other_models_and_providers_untouched(self) -> None:
+        history = [{"role": "system", "content": "s"}, {"role": "user", "content": "hi"}]
+        for provider, model in (("gateway", "deepseek-flash"), ("deepseek", "claude-ish"), ("", "claude-sonnet-5.5")):
+            sent = self.send(provider, model, history, [TOOL])
+            self.assertEqual(sent["messages"], history, (provider, model))
+            self.assertEqual(sent["tools"], [TOOL], (provider, model))
+
+    def test_env_switch_turns_it_off(self) -> None:
+        import os
+        from unittest import mock
+
+        history = [{"role": "system", "content": "s"}, {"role": "user", "content": "hi"}]
+        with mock.patch.dict(os.environ, {responses.CHAT_CACHE_ENV: "0"}):
+            sent = self.send("gateway", "claude-sonnet-5.5", history)
+        self.assertEqual(sent["messages"], history)
+
+
 class TestPromptCacheKey(unittest.TestCase):
     """缓存路由键：xai 2026-09-29 实测不带时 6k 前缀只命中 ~19%，带上后 ~99%。"""
 

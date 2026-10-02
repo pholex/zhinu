@@ -222,6 +222,14 @@ def _progress_message(event: dict[str, Any]) -> str:
     """事件 → progress 通知的一行人话。全量事件在 REST /events，这里只报站。"""
     kind = str(event.get("kind", ""))
     name = event.get("name") or event.get("tool") or ""
+    if kind == "tool.progress":
+        #  下游 server 的进度原样转述：这一站"在哪一步"正是 progress 通道该说的
+        from .render import progress_text
+
+        detail = progress_text(
+            event.get("progress"), event.get("total"), str(event.get("message") or "")
+        )
+        return f"{kind} {name}{' · ' + detail if detail else ''}".strip()
     return f"{kind} {name}".strip()
 
 

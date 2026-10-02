@@ -265,6 +265,25 @@ def clean_value(value: Any, whole: bool = False) -> Any:
     return value
 
 
+def progress_text(progress: float | None, total: float | None, message: str) -> str:
+    """tool.progress 的一行文案，各前端共用：有 total 报"3/10（30%）"，只有 progress
+    报裸数字，message 跟在后面。整数值不带小数点（规范里 progress 是数字，server
+    多半发的是步数）。"""
+
+    def number(value: float) -> str:
+        return str(int(value)) if float(value).is_integer() else f"{value:.1f}"
+
+    parts: list[str] = []
+    if progress is not None and total:
+        percent = max(0, min(100, int(progress / total * 100)))
+        parts.append(f"{number(progress)}/{number(total)}（{percent}%）")
+    elif progress is not None:
+        parts.append(number(progress))
+    if message:
+        parts.append(message)
+    return " · ".join(parts)
+
+
 def sanitize_event(event: UIEvent) -> UIEvent:
     """给终端渲染用的事件副本：字符串字段（含 args / plan 里嵌套的）去掉控制字符。
 

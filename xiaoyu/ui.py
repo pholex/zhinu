@@ -147,14 +147,29 @@ _TERMINAL_SEQUENCES = re.compile(
 )
 
 
-def strip_sequences(text: str) -> str:
-    """strip_controls 的整串版：先把完整的转义序列连参数一起摘掉，再删零散的控制字符。
+#  双向文本控制字符：嵌入/覆盖（U+202A–202E）、隔离（U+2066–2069）、方向标记
+#  （U+200E/200F）。它们不是 C0/C1，上面的正则盖不到；审批框里一条
+#  `rm -rf ‮…` 形态的命令，终端按双向算法渲染出来的顺序和真正执行的字节序
+#  不一样——用户批的是看到的那条，跑的是另一条。转成可见的 \\uXXXX 而不是删：
+#  删掉之后显示又"正常"了，用户反而不知道这条命令藏着东西
+_BIDI_CONTROLS = re.compile("[‪-‮⁦-⁩‎‏]")
 
-    只给**完整的字符串**用（工具输出预览、参数、提示文案）：带颜色的命令输出里，
-    只删 ESC 会留下一地 "[31m" "[0m"。流式正文的分片不能用——序列可能被切在
-    两片之间，那条路继续逐字符删。
+
+def escape_bidi(text: str) -> str:
+    """把双向控制字符换成 \\uXXXX 字面形式，让它们在终端上现形。"""
+    return _BIDI_CONTROLS.sub(lambda match: f"\\u{ord(match.group()):04x}", text)
+
+
+def strip_sequences(text: str) -> str:
+    """strip_controls 的整串版：先把完整的转义序列连参数一起摘掉，再删零散的控制字符，
+    最后把双向控制字符转成可见形式（escape_bidi）。
+
+    只给**完整的字符串**用（工具输出预览、参数、提示文案、审批框）：带颜色的命令
+    输出里，只删 ESC 会留下一地 "[31m" "[0m"。流式正文的分片不能用——序列可能
+    被切在两片之间，那条路继续逐字符删（正文里的双向字符也不转：阿拉伯文、
+    希伯来文的正常段落用得着它们，而正文不是拿来批准执行的）。
     """
-    return strip_controls(_TERMINAL_SEQUENCES.sub("", text))
+    return escape_bidi(strip_controls(_TERMINAL_SEQUENCES.sub("", text)))
 
 
 def preview(value: object, limit: int = 100) -> str:
