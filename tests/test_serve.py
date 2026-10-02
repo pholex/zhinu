@@ -608,20 +608,75 @@ class TestToken(ServeCase):
 
 
 class TestCors(ServeCase):
-    """浏览器 origin 白名单：只对名单里的 origin 发 CORS 头，默认一个都不发。"""
+    """浏览器 origin 白名单：只对名单里的 origin 发 CORS 头；Chrome 扩展 origin 默认放行，其余默认一个都不发。"""
 
     token = "s3cr3t"
     EXT = "chrome-extension://abcdefghijklmnopabcdefghijklmnop"
 
-    def test_no_cors_headers_by_default(self):
+    def test_no_cors_headers_by_default_for_web_origin(self):
         client = self.start("text: 无所谓\n")
         response = client.options(
             "/session",
-            headers={"Origin": self.EXT, "Access-Control-Request-Method": "POST"},
+            headers={"Origin": "https://console.example.com", "Access-Control-Request-Method": "POST"},
         )
         self.assertNotIn("access-control-allow-origin", response.headers)
-        response = client.get("/health", headers={"Origin": self.EXT})
+        response = client.get("/health", headers={"Origin": "https://console.example.com"})
         self.assertNotIn("access-control-allow-origin", response.headers)
+
+    def test_extension_origin_allowed_by_default(self):
+        #  扩展 id 无法预知（开发者模式每台机器不同、商店版又是另一个），所以不用列 --cors-origin
+        client = self.start("text: 无所谓\n")
+        response = client.options(
+            "/session",
+            headers={
+                "Origin": self.EXT,
+                "Access-Control-Request-Method": "POST",
+                "Access-Control-Request-Headers": "authorization,content-type",
+                "Access-Control-Request-Private-Network": "true",
+            },
+        )
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.headers["access-control-allow-origin"], self.EXT)
+        self.assertIn("authorization", response.headers["access-control-allow-headers"].lower())
+        self.assertEqual(response.headers["access-control-allow-private-network"], "true")
+        #  只是 CORS：没 token 照样 401
+        response = client.post("/session", json={}, headers={"Origin": self.EXT})
+        self.assertEqual(response.status_code, 401)
+        self.assertEqual(response.headers["access-control-allow-origin"], self.EXT)
+        response = client.post("/session", json={}, headers={"Origin": self.EXT, **self.headers()})
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.headers["access-control-allow-origin"], self.EXT)
+
+    def test_malformed_extension_origin_is_not_matched(self):
+        client = self.start("text: 无所谓\n")
+        for origin in (
+            "chrome-extension://evil.example",
+            "chrome-extension://abcdefghijklmnopabcdefghijklmno",  # 31 位
+            "chrome-extension://ABCDEFGHIJKLMNOPABCDEFGHIJKLMNOP",  # 大写
+            "chrome-extension://abcdefghijklmnopabcdefghijklmnop.evil.example",
+            "moz-extension://abcdefghijklmnopabcdefghijklmnop",
+        ):
+            response = client.options(
+                "/session",
+                headers={"Origin": origin, "Access-Control-Request-Method": "POST", "Access-Control-Request-Private-Network": "true"},
+            )
+            self.assertNotIn("access-control-allow-origin", response.headers, origin)
+            self.assertNotIn("access-control-allow-private-network", response.headers, origin)
+
+    def test_no_cors_extensions_switch(self):
+        #  关掉默认放行后回到只认白名单：名单里的扩展照发，名单外的扩展不发
+        other = "chrome-extension://ponmlkjihgfedcbaponmlkjihgfedcba"
+        client = self.start("text: 无所谓\n", cors_extensions=False, cors_origins=(self.EXT,))
+        response = client.get("/health", headers={"Origin": self.EXT})
+        self.assertEqual(response.headers["access-control-allow-origin"], self.EXT)
+        response = client.get("/health", headers={"Origin": other})
+        self.assertNotIn("access-control-allow-origin", response.headers)
+        response = client.options(
+            "/session",
+            headers={"Origin": other, "Access-Control-Request-Method": "POST", "Access-Control-Request-Private-Network": "true"},
+        )
+        self.assertNotIn("access-control-allow-origin", response.headers)
+        self.assertNotIn("access-control-allow-private-network", response.headers)
 
     def test_preflight_and_response_for_allowed_origin(self):
         client = self.start("text: 无所谓\n", cors_origins=(self.EXT,))
@@ -683,7 +738,9 @@ class TestLocalGuard(ServeCase):
 
     def test_cross_site_origin_is_refused(self):
         client = self.start("text: 无所谓\n")
-        for origin in ("https://evil.example", "null", "http://127.0.0.1:9999"):
+        #  名单外的扩展也在内：CORS 层默认放行扩展 origin，但无 token 的闸只认显式白名单，
+        #  否则本机随便装个扩展就能驱动无 token 的 serve
+        for origin in ("https://evil.example", "null", "http://127.0.0.1:9999", self.EXT):
             response = client.post("/session", json={}, headers={"Origin": origin})
             self.assertEqual(response.status_code, 403, (origin, response.text))
         self.assertEqual(client.app.state.sessions, {})

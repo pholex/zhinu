@@ -84,6 +84,7 @@ import copy
 import hashlib
 import hmac
 import json
+import re
 import sys
 import threading
 import time
@@ -226,10 +227,15 @@ class ServeConfig:
     #  schema 不带 servers（FastAPI 默认，同源访问够用），--print-openapi 按监听地址推。
     public_url: str = ""
     #  允许跨源（CORS）的浏览器 origin 白名单，如 `chrome-extension://<id>`、
-    #  `https://console.example.com`。空 = 不发任何 CORS 头（非浏览器客户端不需要）。
+    #  `https://console.example.com`。空 = 除下面的扩展默认外不发 CORS 头（非浏览器客户端不需要）。
     #  只是"浏览器肯不肯把响应交给页面脚本"的门，不是鉴权——token 仍照常校验。
     #  无 token 时它兼作 Origin 白名单：名单外的浏览器 origin 一律 403（_install_local_guard）。
     cors_origins: tuple[str, ...] = ()
+    #  默认给所有 Chrome 扩展 origin（chrome-extension://<32 位 id>）发 CORS 头：扩展 id 每台机器
+    #  开发者模式装载各不相同、商店版又是另一个，没法预先列进白名单。只是 CORS，token 仍照常校验；
+    #  无 token 时 _install_local_guard 仍只放行显式白名单，装了什么扩展都驱动不了无 token 的本机 serve。
+    #  --no-cors-extensions 关掉，回到只认 cors_origins
+    cors_extensions: bool = True
     #  浏览器桥（/session/{id}/browser）：等扩展回一次调用结果的上限（秒）
     browser_timeout: float = DEFAULT_CALL_TIMEOUT
 
@@ -753,12 +759,22 @@ def _install_local_guard(app: Any, cfg: ServeConfig) -> None:
     app.add_middleware(_LocalGuard)
 
 
-def _install_cors(app: Any, origins: tuple[str, ...]) -> None:
+#  Chrome / Edge 扩展的 origin：固定 32 个 a-p 小写字母的 id。写死形状而不是 `chrome-extension://.*`，
+#  免得 `chrome-extension://evil.example` 这类畸形 origin 也被放过
+EXTENSION_ORIGIN_RE = r"^chrome-extension://[a-p]{32}$"
+
+
+def _install_cors(app: Any, origins: tuple[str, ...], extensions: bool = True) -> None:
     """给白名单里的浏览器 origin 发 CORS 头（含 Chrome 的 Private Network Access 预检）。
 
     典型消费方是浏览器扩展 / 自研 Web 控制台：它们的脚本跑在另一个 origin 上，
     没有这些头浏览器会把响应拦在页面脚本之外（请求其实到了服务端）。
-    非浏览器客户端（curl / n8n / SDK）从不看这些头，所以默认一个都不发。
+    非浏览器客户端（curl / n8n / SDK）从不看这些头，所以名单外一个都不发。
+
+    `extensions=True`（默认）额外放行所有形状合法的 Chrome 扩展 origin：扩展 id 无法预知
+    （开发者模式每台机器不同、商店版又是另一个），逐个 `--cors-origin` 不现实。
+    这只是让浏览器肯把响应交给扩展，token 仍照常校验；无 token 的回环 serve 另有
+    `_install_local_guard` 在外层按显式白名单挡 Origin，默认放行不会让任意扩展驱动它。
 
     `allow_credentials=False`：凭据走 `Authorization` / `X-Xiaoyu-Token` 头，
     不用 cookie；这样也就不必为 `*` 通配开口子。
@@ -766,6 +782,10 @@ def _install_cors(app: Any, origins: tuple[str, ...]) -> None:
     from starlette.middleware.cors import CORSMiddleware
 
     allowed = tuple(o.rstrip("/") for o in origins)
+    extension_re = re.compile(EXTENSION_ORIGIN_RE) if extensions else None
+
+    def is_allowed(origin: str) -> bool:
+        return origin in allowed or bool(extension_re and extension_re.match(origin))
 
     class _PrivateNetworkAccess:
         """Chrome 从"公网/扩展"origin 访问回环地址会多发一次 PNA 预检，要求响应带
@@ -782,7 +802,7 @@ def _install_cors(app: Any, origins: tuple[str, ...]) -> None:
             headers = {k.decode("latin-1").lower(): v for k, v in scope.get("headers", [])}
             origin = headers.get("origin", b"").decode("latin-1").rstrip("/")
             wants = headers.get("access-control-request-private-network", b"").lower() == b"true"
-            if not (wants and origin in allowed):
+            if not (wants and is_allowed(origin)):
                 await self.inner(scope, receive, send)
                 return
 
@@ -802,6 +822,7 @@ def _install_cors(app: Any, origins: tuple[str, ...]) -> None:
     app.add_middleware(
         CORSMiddleware,
         allow_origins=list(allowed),
+        allow_origin_regex=EXTENSION_ORIGIN_RE if extensions else None,
         allow_credentials=False,
         allow_methods=["*"],
         allow_headers=["Authorization", "Content-Type", "X-Xiaoyu-Token"],
@@ -883,8 +904,8 @@ def create_app(cfg: ServeConfig):  # noqa: C901 - 路由表天然长，拆开反
     )
     #  会话注册表挂到 app.state：测试 / 运维脚本可直接查会话对象（包括私有 MCP manager）
     app.state.sessions = sessions
-    if cfg.cors_origins:
-        _install_cors(app, cfg.cors_origins)
+    if cfg.cors_origins or cfg.cors_extensions:
+        _install_cors(app, cfg.cors_origins, cfg.cors_extensions)
     if not cfg.token:
         _install_local_guard(app, cfg)
 

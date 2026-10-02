@@ -419,10 +419,11 @@ Windows 为 `%APPDATA%\xiaoyu\serve\<root slug>\`；启动后 `GET /health` 的 
 - folder trust 非交互判定（与 `--acp` 同一纪律）：没信任记录的目录不吃工作区级
   `.mcp.json` / `permissions` / `.env`，也绝不在协议通道上发问
 - 要暴露到公网就自己在前面放反代 + TLS。这个服务本身不做 TLS，也不做限流
-- 默认**不发 CORS 头**。浏览器里跑的客户端（浏览器扩展、自研 Web 控制台）要用
-  `--cors-origin chrome-extension://<id>`（可重复）把它的 origin 加进白名单——这只是
-  "浏览器肯不肯把响应交给页面脚本"的门，token 仍照常校验。Chrome 访问回环地址的
-  Private Network Access 预检也一并应答
+- CORS：**Chrome 扩展 origin（`chrome-extension://<id>`）默认放行**，装了扩展填上地址和 token
+  就能连，不用逐个列 id（开发者模式每台机器的 id 不同、商店版又是另一个）；`--no-cors-extensions`
+  关掉。其它浏览器客户端（自研 Web 控制台）默认**不发 CORS 头**，要用 `--cors-origin https://console.example.com`
+  （可重复）加进白名单——这只是"浏览器肯不肯把响应交给页面脚本"的门，token 仍照常校验。
+  Chrome 访问回环地址的 Private Network Access 预检也一并应答
 - 浏览器桥（`/session/{id}/browser`）是反过来的：扩展连上来后 agent 能操作**用户登录态的
   浏览器**。写类动作（开页 / 跳转 / 点击 / 输入）默认走审批回路，只读三件免审；
   token 在第一帧里校验，会话私有，断线即注销——见 [docs/browser-bridge.md](browser-bridge.md)

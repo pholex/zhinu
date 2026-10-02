@@ -1548,9 +1548,16 @@ def serve_command(argv: list[str]) -> int:
         action="append",
         default=[],
         metavar="ORIGIN",
-        help="允许跨源访问的浏览器 origin（可重复），如 chrome-extension://<id> 或 "
-        "https://console.example.com。默认不发 CORS 头；非浏览器客户端不需要。token 仍照常校验；"
-        "无 token 时名单外的浏览器 origin 一律 403",
+        help="允许跨源访问的浏览器 origin（可重复），如 https://console.example.com。"
+        "Chrome 扩展 origin 默认已放行（见 --no-cors-extensions），不必逐个列。名单外不发 CORS 头；"
+        "非浏览器客户端不需要。token 仍照常校验；无 token 时名单外的浏览器 origin 一律 403",
+    )
+    parser.add_argument(
+        "--no-cors-extensions",
+        dest="cors_extensions",
+        action="store_false",
+        help="不默认给 Chrome 扩展 origin（chrome-extension://<id>）发 CORS 头，只认 --cors-origin 白名单"
+        "（默认放行：扩展 id 每台机器不同，没法预先列）",
     )
     parser.add_argument(
         "--state-dir",
@@ -1602,6 +1609,7 @@ def serve_command(argv: list[str]) -> int:
         mcp=args.mcp,
         agent_mcp=args.agent_mcp,
         cors_origins=tuple(args.cors_origins),
+        cors_extensions=args.cors_extensions,
         browser_timeout=max(1.0, args.browser_timeout),
         state_dir=Path(args.state_dir).expanduser().resolve() if args.state_dir else None,
         persist=args.persist,
