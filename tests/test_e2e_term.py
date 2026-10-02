@@ -41,6 +41,9 @@ class TermShellMixin:
         super().setUp()  # type: ignore[misc]
         if not shutil.which(self.shell):
             self.skipTest(f"需要 {self.shell}")  # type: ignore[attr-defined]
+        if os.name == "nt":
+            #  Windows 走 PowerShell；runner 上的 Git Bash 不是目标环境，交互式驱动在那儿退 1
+            self.skipTest("sh 系集成只在 POSIX 上跑")  # type: ignore[attr-defined]
 
     def launcher(self) -> str:
         return f"{shlex.quote(sys.executable)} -P -m xiaoyu"

@@ -95,7 +95,8 @@ class ScriptRenderTest(unittest.TestCase):
 
     def test_launcher_and_directory_are_quoted(self) -> None:
         text = self.render("zsh", launcher="/opt/py thon -m xiaoyu", directory=Path("/My Dir/term"))
-        self.assertIn("'/My Dir/term'", text)
+        #  Windows 上 Path 会把分隔符换成反斜杠，断言按本平台的写法来
+        self.assertIn(f"'{Path('/My Dir/term')}'", text)
         self.assertIn("/opt/py thon -m xiaoyu term run", text)
         text = self.render("powershell", directory=Path("C:\\Users\\it's\\term"))
         self.assertIn("'C:\\Users\\it''s\\term'", text)
@@ -118,15 +119,17 @@ class ScriptRenderTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             term.session_id_for("有 空格")
 
-    @unittest.skipUnless(shutil.which("zsh"), "需要 zsh")
+    #  sh 系脚本只在 POSIX 上校验：Windows 走 PowerShell，runner 上那个 Git Bash
+    #  不是目标环境（路径与换行语义都不同，-n 的结论没有意义）
+    @unittest.skipUnless(shutil.which("zsh") and os.name != "nt", "需要 zsh（POSIX）")
     def test_zsh_script_parses(self) -> None:
         self._parses("zsh", ["zsh", "-n"])
 
-    @unittest.skipUnless(shutil.which("bash"), "需要 bash")
+    @unittest.skipUnless(shutil.which("bash") and os.name != "nt", "需要 bash（POSIX）")
     def test_bash_script_parses(self) -> None:
         self._parses("bash", ["bash", "-n"])
 
-    @unittest.skipUnless(shutil.which("fish"), "需要 fish")
+    @unittest.skipUnless(shutil.which("fish") and os.name != "nt", "需要 fish（POSIX）")
     def test_fish_script_parses(self) -> None:
         self._parses("fish", ["fish", "-n"])
 
@@ -149,7 +152,8 @@ class ScriptRenderTest(unittest.TestCase):
     def _parses(self, shell: str, checker: list[str]) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "init.sh"
-            path.write_text(self.render(shell, command_not_found=True), encoding="utf-8")
+            #  newline="\n"：脚本给 shell 读，不能让平台默认换行把 \r 混进去
+            path.write_text(self.render(shell, command_not_found=True), encoding="utf-8", newline="\n")
             proc = subprocess.run(
                 [*checker, str(path)], capture_output=True, text=True, encoding="utf-8", timeout=60
             )
