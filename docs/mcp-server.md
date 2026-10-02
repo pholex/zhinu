@@ -43,6 +43,7 @@ xiaoyu serve --workspace ~/code/myrepo
 coding agent 一轮动辄几分钟，MCP client 普遍有请求超时。`tools/call` 一律
 以 SSE 应答，请求的 `_meta.progressToken` 带上后，事件流会折成
 `notifications/progress` 逐站上报（`tool.pending foo` / `tool.completed foo` /
+`tool.progress mcp__x__y · 3/10（30%） · 正在下载`（下游 MCP server 自报的进度原样转述）/
 `permission.requested` / `run.completed`…，`text.delta` 这类碎屑不报）——
 多数客户端以 progress 为超时重置依据。全量事件仍在 REST 的
 `GET /session/{id}/events`。

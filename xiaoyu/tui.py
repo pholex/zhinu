@@ -105,11 +105,12 @@ from .events import (
     ToolCompleted,
     ToolDenied,
     ToolPending,
+    ToolProgress,
     ToolPurpose,
     ToolRunning,
     UIEvent,
 )
-from .permissions import Permissions, parse_rule, suggest_allow_rule
+from .permissions import Permissions, parse_rule, suggest_allow_rule, suggest_deny_rule
 from .session_log import _ensure_private_dir, _open_private
 from . import render
 from .render import args_preview
@@ -263,11 +264,15 @@ class _RunningLine:
         #  见 _TIP_START：跨运行把整张提示表轮完，而不是每次都从头四条开始
         self._tip_start = next(_TIP_START)
         self.started = time.monotonic()
+        #  工具自报的进度（tool.progress 事件写入，刷新线程读）：有它就顶掉轮播
+        #  提示——"第 3/10 步 · 正在下载"比上手提示更回答"还要等多久"
+        self.progress = ""
 
     def __rich__(self) -> Text:
         elapsed = time.monotonic() - self.started
+        suffix = self.progress or self._suffix(elapsed)
         return Text(
-            f"{self.name} {self.verb} · {elapsed:.0f}s · {self._suffix(elapsed)}",
+            f"{self.name} {self.verb} · {elapsed:.0f}s · {suffix}",
             style="text.secondary",
         )
 
@@ -839,6 +844,8 @@ class RichSink:
         self.bash_timeout: int | None = None
         self.request_timeout: int | None = None
         self._status: Any | None = None
+        #  活区正在画的那一行（tool.progress 往上面写进度；spinner 收掉即清）
+        self._running_line: _RunningLine | None = None
         self._ro_counts: dict[str, int] = {}
         #  当前正文块是否已打开 OSC 133 锚点（TextEnd 负责收束配对），
         #  语义与 PlainSink 对齐，见 render.OSC133_TEXT_START 的注释
@@ -851,6 +858,7 @@ class RichSink:
             ToolPending: self._tool_pending,
             ToolPurpose: self._tool_purpose,
             ToolRunning: self._tool_running,
+            ToolProgress: self._tool_progress,
             ToolCompleted: self._tool_completed,
             ToolDenied: self._tool_denied,
             PlanUpdated: self._plan,
@@ -888,6 +896,7 @@ class RichSink:
             with contextlib.suppress(Exception):
                 self._status.stop()
             self._status = None
+        self._running_line = None
 
     def _flush_ro_group(self) -> None:
         """只读折叠组落盘：遇到任何非只读事件（或一轮结束）时汇成一行。
@@ -977,9 +986,18 @@ class RichSink:
             return
         self._stop_status()
         line = _RunningLine(event.name, self._timeout_for(event))
+        self._running_line = line
         self._status = self.console.status(line, spinner="dots")
         with contextlib.suppress(Exception):
             self._status.start()
+
+    def _tool_progress(self, event: ToolProgress) -> None:
+        """工具自报的进度写进活区那一行（没有活区就丢：进度是可覆盖的状态，
+        不值得在 scrollback 里各占一行）。读线程上来的调用，只改一个字符串。"""
+        line = self._running_line
+        if line is None:
+            return
+        line.progress = render.progress_text(event.progress, event.total, event.message)
 
     def _timeout_for(self, event: ToolRunning) -> int | None:
         """这次调用的超时上限（只有 bash 有）：显式传的优先，否则用配置默认值。
@@ -1731,10 +1749,11 @@ class Tui:
     # ---------- 确认框 ----------
 
     def confirm(self, name: str, args: dict[str, Any]) -> bool | str | tuple[bool, str]:
-        """交互确认（Agent 的 approver）：三选项菜单。
+        """交互确认（Agent 的 approver）：行内单选菜单。
 
         允许一次 / 本会话不再问 / 总是允许（规则写入前可编辑）/
-        拒绝并告诉小羽下一步怎么做。Tab = 批准并附言：附言随 tool result
+        拒绝并告诉小羽下一步怎么做 / 以后都拒绝（写 deny 规则，同样可编辑）。
+        Tab = 批准并附言：附言随 tool result
         回灌模型（拒绝理由走同一条通道，拒绝只是附言的特例）。
         返回值：(True, 附言) 也是批准——附言由 Agent 拼进 tool result。
         """
@@ -1791,6 +1810,10 @@ class Tui:
         if rule is not None:
             options.append(("always", f"总是允许（规则写入前可编辑：{rule}）", "!"))
         options.append(("deny", "拒绝，并告诉小羽下一步怎么做", "n"))
+        #  与「总是允许」对称的持久拒绝：写的是 deny 规则，任何模式（含 --yolo）都拦
+        deny_rule = suggest_deny_rule(name, args, self.permissions.workspace)
+        if deny_rule is not None:
+            options.append(("never", f"以后都拒绝（规则写入前可编辑：{deny_rule}）", "x"))
 
         try:
             choice = self._inline_select(self._confirm_title(name, shown), options, expand)
@@ -1831,6 +1854,33 @@ class Tui:
             reason = self._ask_reason()
             self._echo_verdict("⨯ 已拒绝" + (f"：{reason}" if reason else ""))
             return reason or False
+        if choice == "never":
+            assert deny_rule is not None  # 只有推导出规则才有这个选项
+            edited = self._ask_rule(str(deny_rule), empty_means="仅本次拒绝")
+            #  取消或置空都退化成普通拒绝：这一次总归是不执行的
+            parsed = parse_rule(edited.strip()) if edited and edited.strip() else None
+            if edited is not None and edited.strip() and parsed is None:
+                self.console.print(
+                    Text(f"  规则格式无法解析：{edited.strip()}（应为 deny bash(curl *) 这类）", style="status.error")
+                )
+            elif parsed is not None and parsed.behavior != "deny":
+                #  这个入口只写 deny：改成 allow 等于把"拒绝"按成了"放行"，不收
+                self.console.print(
+                    Text(f"  这里只写 deny 规则，{parsed} 未写入", style="status.error")
+                )
+                parsed = None
+            if parsed is None:
+                self._echo_verdict("⨯ 已拒绝")
+                return False
+            try:
+                path = self.permissions.add_persistent(parsed)
+            except ValueError as exc:
+                self.console.print(Text(f"  规则被拒绝：{exc}", style="status.error"))
+                self._echo_verdict("⨯ 已拒绝")
+                return False
+            self._echo_verdict(f"⨯ 已拒绝，并写入 {path}：{parsed}")
+            #  拒绝理由回灌模型：说明这是持久规则，同类调用不必再试
+            return f"用户已拒绝，并写入持久规则「{parsed}」——以后同类调用都会被拦，换别的办法"
         #  Esc / Ctrl-C：普通拒绝
         self._echo_verdict("⨯ 已拒绝")
         return False
@@ -1857,14 +1907,14 @@ class Tui:
             return f"要{verb} {base} 吗？"
         return f"允许执行 {name} 吗？"
 
-    def _ask_rule(self, rule: str) -> str | None:
-        """「总是允许」的规则写入前可编辑（选项预填可改的命令前缀）。
-        回车接受原文；置空 = 不写规则、仅本次允许；Esc/Ctrl-C = 取消。"""
+    def _ask_rule(self, rule: str, empty_means: str = "仅本次允许") -> str | None:
+        """「总是允许」/「以后都拒绝」的规则写入前可编辑（选项预填推导出的规则）。
+        回车接受原文；置空 = 不写规则、只按本次的判定走；Esc/Ctrl-C = 取消。"""
         if self._confirm_session is None:
             self._confirm_session = PromptSession()
         try:
             return self._confirm_session.prompt(
-                [(theme.ptk("menu.title"), "  规则（可编辑，置空 = 仅本次允许）：")], default=rule
+                [(theme.ptk("menu.title"), f"  规则（可编辑，置空 = {empty_means}）：")], default=rule
             )
         except (EOFError, KeyboardInterrupt):
             print()

@@ -100,7 +100,8 @@ sink，不经协议层，所以不需要任何自定义扩展方法；可选能�
                                 （与模型选择同一纪律，last_mode 留痕）。
     session/request_permission  审批桥，选项与 TUI 确认框同一套语义：允许一次 /
                                 本会话内该工具都允许 / 总是允许（能推导出安全
-                                规则才出现，选中即写入持久规则）/ 拒绝。协议
+                                规则才出现，选中即写入持久规则）/ 拒绝 / 以后都
+                                拒绝（reject_always：写入 deny 规则）。协议
                                 没有"会话作用域"的选项 kind——会话档借最接近
                                 的 allow_always 渲染，真实语义由 optionId 承载、
                                 回程按 id 还原。持久规则的安全禁令（不许覆盖
@@ -158,7 +159,7 @@ from typing import Any, Callable, Iterator, TextIO
 
 from . import __version__, errors, folder_trust, fsguard, mcp, mcp_guard, media, modes, ui
 from .config import EFFORT_LEVELS, Config, MissingConfig, load_dotenv, user_env_path
-from .permissions import Permissions, suggest_allow_rule
+from .permissions import Permissions, suggest_allow_rule, suggest_deny_rule
 from .session_log import (
     SessionLockedError,
     SessionLog,
@@ -1921,6 +1922,21 @@ class AcpServer:
                 }
             )
         options.append({"optionId": "reject-once", "name": "拒绝", "kind": "reject_once"})
+        #  与「总是允许」对称的持久拒绝（协议原生就有 reject_always 这一档）；
+        #  编辑器客户端没有"写入前可编辑"的交互，规则按推导结果原样落盘
+        deny_rule = (
+            suggest_deny_rule(name, args, session.agent.permissions.workspace)
+            if session is not None
+            else None
+        )
+        if deny_rule is not None:
+            options.append(
+                {
+                    "optionId": "reject-always",
+                    "name": f"以后都拒绝（写入规则 {deny_rule}）",
+                    "kind": "reject_always",
+                }
+            )
         req_id, event, slot = self._register_pending(session_id)
         tool_call: dict[str, Any] = {
             "title": _tool_title(name, args),
@@ -1945,7 +1961,7 @@ class AcpServer:
         while not event.wait(0.2):
             if self._closed:
                 return Deny("acp 连接已关闭，无人审批")
-        return self._resolve_verdict(session, name, args, rule, slot.get("result"))
+        return self._resolve_verdict(session, name, args, rule, slot.get("result"), deny_rule)
 
     def _resolve_verdict(
         self,
@@ -1954,6 +1970,7 @@ class AcpServer:
         args: dict[str, Any],
         rule: Any,
         payload: Any,
+        deny_rule: Any = None,
     ) -> Allow | Deny:
         """审批回包 → Allow/Deny，含会话授权与持久规则的落地。
         看不懂的一律 fail closed 按拒绝。"""
@@ -1987,6 +2004,18 @@ class AcpServer:
                 return Allow()
             session.sink.emit(Notice(f"[已写入 {path}：{rule}]", "info"))
             return Allow()
+        if option == "reject-always" and session is not None and deny_rule is not None:
+            #  deny 不受持久 allow 那条禁令的限制（永远只会更严），写盘不会被拒；
+            #  真写不进去（磁盘/权限）也得说出来，本次照样拒绝
+            try:
+                path = session.agent.permissions.add_persistent(deny_rule)
+            except (ValueError, OSError) as exc:
+                session.sink.emit(Notice(f"[规则未写入：{exc}；已仅拒绝本次]", "warn"))
+                return Deny("用户拒绝了本次调用")
+            session.sink.emit(Notice(f"[已写入 {path}：{deny_rule}]", "info"))
+            return Deny(
+                f"用户已拒绝，并写入持久规则「{deny_rule}」——以后同类调用都会被拦，换别的办法"
+            )
         return Deny("用户拒绝了本次调用")
 
     def _resolve_pending(self, message: dict[str, Any]) -> None:

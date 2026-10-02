@@ -1209,6 +1209,10 @@ def _glob_matches(item: Path, root: Path, glob: str) -> bool:
     return fnmatch.fnmatch(relative, glob.lstrip("/"))
 
 
+#  "属性不存在"的哨兵（attach_mcp_log 用：None 是"没接线"，缺属性是"不是 manager"）
+_UNSET = object()
+
+
 class Toolbox:
     """持有 config 的工具集合。
 
@@ -1296,6 +1300,10 @@ class Toolbox:
         #  等注入后第一次组装 schemas 时补发）。已公告：server → 工具集指纹。
         self.notify_hook: Callable[[str, str], None] | None = None
         self._announced: dict[str, str] = {}
+        #  MCP 工具运行期间的进度（server 的 notifications/progress）→ 前端。
+        #  mcp_progress_hook(工具名, {"progress","total","message"})，由 Agent 注入；
+        #  在 server 的读线程上被调用，实现方只许发事件不许阻塞
+        self.mcp_progress_hook: Callable[[str, dict[str, Any]], None] | None = None
         if self._mcp_search:
             self._register_mcp_search()
         if only is not None:
@@ -1456,23 +1464,36 @@ class Toolbox:
             return f"ERROR: MCP 工具 {name} 当前不可用（server 未就绪或已退出）。"
         #  目的参数是给审批框看的，别漏进远端参数
         tool_input.pop(PURPOSE_PARAM, None)
-        return self._interruptible(remote.handler)(**tool_input)
+        return self._interruptible(remote.handler, name)(**tool_input)
 
-    def _interruptible(self, handler: Callable[..., str]) -> Callable[..., str]:
+    def _interruptible(self, handler: Callable[..., str], name: str = "") -> Callable[..., str]:
         """给 MCP 工具的 handler 包一层：调用期间把本工具箱的"有没有人叫停"挂到
         当前线程上（mcp.stop_scope），在飞的远端调用据此停得下来。
 
         handler 是 manager 级的闭包，父子 agent 的工具箱共用同一个；stop_requested
         却是每个 Agent 各自注入的，而且注入晚于工具箱构造——所以在调用的那一刻
         现取。原 handler 记在 remote 属性上，_absorb_mcp 靠它认"还是不是同一代"。
+        进度回调同一时刻现取：有人接（mcp_progress_hook）才让远端发进度。
         """
 
         def call(**kwargs: Any) -> str:
-            with mcp.stop_scope(self.stop_requested, media_owner=self):
+            hook = self.mcp_progress_hook
+            progress = (lambda info: hook(name, info)) if hook is not None else None
+            with mcp.stop_scope(self.stop_requested, media_owner=self, progress=progress):
                 return handler(**kwargs)
 
         call.remote = handler  # type: ignore[attr-defined]
         return call
+
+    def attach_mcp_log(self, hook: Callable[[str, str, str], None]) -> None:
+        """把 MCP server 的日志通知（warning 及以上）接到前端。只有持有 manager
+        的顶层工具箱接线：子 agent 拿的是父级的筛选视图，再接一次就是同一条
+        告警打两遍。已有人接线的不覆盖（嵌入宿主自建的 manager 可能先接了）。"""
+        #  鸭子类型而不是 isinstance：嵌入 / SDK 场景里 manager 可能是打桩或包装对象。
+        #  视图（McpView）没有 on_log 这个属性，自然落空
+        manager = self._mcp
+        if manager is not None and getattr(manager, "on_log", _UNSET) is None:
+            manager.on_log = hook
 
     def mcp_content_trusted(self, tool_name: str) -> bool:
         """use_tool 触达的 MCP 工具，其 server 是否声明了 trustContent（结果不套
@@ -1539,7 +1560,7 @@ class Toolbox:
                     name=remote.name,
                     description=remote.description,
                     parameters=remote.parameters,
-                    handler=self._interruptible(remote.handler),
+                    handler=self._interruptible(remote.handler, remote.name),
                     requires_approval=True,
                     #  server 进程退出后工具自动从 schemas 消失、拒绝执行
                     check_fn=remote.check_fn,

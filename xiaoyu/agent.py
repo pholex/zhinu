@@ -67,6 +67,7 @@ from .events import (
     ToolCompleted,
     ToolDenied,
     ToolPending,
+    ToolProgress,
     ToolPurpose,
     ToolRunning,
     UISink,
@@ -1054,6 +1055,12 @@ class Agent:
             self.toolbox.tasks.notify = self.notify
         #  前台命令的等待循环靠它发现打断（见 Toolbox.stop_requested）
         self.toolbox.stop_requested = self.interrupt_requested
+        #  MCP 工具的进度与 server 日志告警进事件流：进度刷活区一行，告警按
+        #  Notice 打一行。两个回调都在 server 的读线程上被调用，只发事件不阻塞
+        if hasattr(self.toolbox, "mcp_progress_hook"):
+            self.toolbox.mcp_progress_hook = self._mcp_progress
+        if hasattr(self.toolbox, "attach_mcp_log"):
+            self.toolbox.attach_mcp_log(self._mcp_log)
         #  MCP 检索模式的 server 上线公告走同一条轨道（tools._announce_mcp），
         #  但**不唤醒**：模型已经在给收尾正文时，为一条"某某 server 上线了"
         #  强制再跑一步，模型会把同一个问题再答一遍（client 端拼成一条，
@@ -2410,6 +2417,23 @@ class Agent:
             return True
         upstream = self._upstream_stop
         return upstream is not None and bool(upstream())
+
+    def _mcp_progress(self, name: str, info: dict[str, Any]) -> None:
+        """MCP 工具的一次进度上报 → tool.progress 事件（见 Toolbox.mcp_progress_hook）。"""
+        self.sink.emit(
+            ToolProgress(
+                name=name,
+                message=str(info.get("message") or ""),
+                progress=info.get("progress"),
+                total=info.get("total"),
+            )
+        )
+
+    def _mcp_log(self, server: str, level: str, text: str) -> None:
+        """MCP server 的日志告警（warning 及以上）→ Notice。error 一族按 error 档，
+        其余按 warn；文案带上 server 名，几个 server 同时在跑时才分得清是谁在喊。"""
+        severity = "error" if level in ("error", "critical", "alert", "emergency") else "warn"
+        self.sink.emit(Notice(f"[MCP {server}·{level}] {text}", severity))
 
     def _checkpoint(self) -> None:
         """打断检查点：有待处理的打断就清掉自己的标志并抛 Interrupted。
