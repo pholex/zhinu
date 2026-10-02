@@ -20,7 +20,7 @@ dependencies = [
     "openai==2.52.0",
     #  Anthropic Messages 协议直连（xiaoyu/messages.py）。与 openai 同为
     #  Stainless 生成、共享 httpx 传输，锁版本纪律相同
-    "anthropic==0.121.0",
+    "anthropic==1.9.0",
     #  bash 语法白名单解析（权限判定用）：解析失败/缺包时代码自动回退字符串黑名单，
     #  所以两个包即使某平台没有 wheel 也不致命
     "tree-sitter>=0.22",
