@@ -896,6 +896,49 @@ class TestTuiFrontend(AgentTestCase):
         with mock.patch.object(tui, "_inline_select", return_value=None):
             self.assertIs(tui.confirm("bash", {"command": "ls /"}), False)
 
+    def test_confirm_never_choice_persists_deny_rule(self) -> None:
+        """「以后都拒绝」：写 deny 规则（写入前可编辑），本次拒绝并把规则告诉模型。"""
+        from xiaoyu import permissions as perm_mod
+
+        tui = self.make_tui()
+        rules_path = self.root / "rules.txt"
+        with mock.patch.object(perm_mod, "user_rules_path", return_value=rules_path):
+            with mock.patch.object(tui, "_inline_select", return_value="never") as select:
+                with mock.patch.object(tui, "_ask_rule", return_value="deny bash(pip install*)") as ask:
+                    verdict = tui.confirm("bash", {"command": "pip install requests"})
+        #  菜单里有这一项，预填的是推导出的 deny 规则
+        options = select.call_args.args[1]
+        self.assertIn(("never", "以后都拒绝（规则写入前可编辑：deny bash(pip install*)）", "x"), options)
+        self.assertEqual(ask.call_args.kwargs.get("empty_means"), "仅本次拒绝")
+        self.assertIsInstance(verdict, str)
+        self.assertIn("deny bash(pip install*)", verdict)
+        self.assertIn("deny bash(pip install*)", rules_path.read_text(encoding="utf-8"))
+        #  规则立即生效：同类调用直接被拦
+        self.assertEqual(tui.permissions.decide("bash", {"command": "pip install x"}), "deny")
+
+    def test_confirm_never_refuses_allow_edits_and_empty_means_plain_deny(self) -> None:
+        from xiaoyu import permissions as perm_mod
+
+        tui = self.make_tui()
+        rules_path = self.root / "rules.txt"
+        with mock.patch.object(perm_mod, "user_rules_path", return_value=rules_path):
+            with mock.patch.object(tui, "_inline_select", return_value="never"):
+                #  改成 allow 不收：这个入口只写 deny
+                with mock.patch.object(tui, "_ask_rule", return_value="allow bash(pip install*)"):
+                    self.assertIs(tui.confirm("bash", {"command": "pip install x"}), False)
+                #  置空 / 取消 = 普通拒绝
+                with mock.patch.object(tui, "_ask_rule", return_value=""):
+                    self.assertIs(tui.confirm("bash", {"command": "pip install x"}), False)
+                with mock.patch.object(tui, "_ask_rule", return_value=None):
+                    self.assertIs(tui.confirm("bash", {"command": "pip install x"}), False)
+        self.assertFalse(rules_path.exists())
+
+    def test_confirm_never_absent_when_underivable(self) -> None:
+        tui = self.make_tui()
+        with mock.patch.object(tui, "_inline_select", return_value="once") as select:
+            tui.confirm("bash", {"command": "ls -la && make"})
+        self.assertNotIn("never", [value for value, _, _ in select.call_args.args[1]])
+
     def test_bang_shell_output_enters_context(self) -> None:
         """! 前缀：命令在工作区执行，退出码与输出进对话历史（供模型参考）。"""
         agent = self.build([])
@@ -935,6 +978,19 @@ class TestRunningLine(unittest.TestCase):
         line = _RunningLine("bash", timeout)
         line.started = time.monotonic() - elapsed
         return line.__rich__().plain
+
+    def test_progress_replaces_the_tip(self) -> None:
+        """工具自报的进度顶掉轮播提示：它才回答"还要等多久"。"""
+        import time
+
+        from xiaoyu.tui import _RunningLine
+
+        line = _RunningLine("mcp__s__slow")
+        line.started = time.monotonic() - 10
+        line.progress = "2/3（66%） · step 2"
+        text = line.__rich__().plain
+        self.assertIn("mcp__s__slow 运行中 · 10s · 2/3（66%） · step 2", text)
+        self.assertNotIn("Ctrl-C", text)
 
     def test_short_runs_stay_quiet(self) -> None:
         """绝大多数工具一闪而过，那半秒里插提示纯属打扰。"""
@@ -1089,6 +1145,22 @@ class TestRequestSpinner(unittest.TestCase):
         sink = RichSink(Console(file=io.StringIO(), force_terminal=True, width=80))
         self.addCleanup(sink.interrupt)  # 断言失败时别把 spinner 线程留下
         return sink
+
+    def test_tool_progress_updates_the_live_line(self) -> None:
+        from xiaoyu.events import ToolCompleted, ToolProgress, ToolRunning
+
+        sink = self.build()
+        sink.emit(ToolRunning("mcp__s__slow", {}))
+        self.assertIsNotNone(sink._running_line)
+        sink.emit(ToolProgress(name="mcp__s__slow", message="step 1", progress=1, total=3))
+        self.assertEqual(sink._running_line.progress, "1/3（33%） · step 1")
+        #  控制序列按终端注入面处理
+        sink.emit(ToolProgress(name="mcp__s__slow", message="x\x1b[31my", progress=2, total=3))
+        self.assertNotIn("\x1b", sink._running_line.progress)
+        sink.emit(ToolCompleted("mcp__s__slow", "done", True, 0.1))
+        self.assertIsNone(sink._running_line)
+        #  没有活区时进度直接丢，不崩
+        sink.emit(ToolProgress(name="mcp__s__slow", message="late", progress=3, total=3))
 
     def test_spinner_runs_while_waiting_for_the_model(self) -> None:
         from xiaoyu.events import RequestStarted

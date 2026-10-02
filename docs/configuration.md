@@ -233,6 +233,45 @@ MCP 子进程的环境是**纯白名单**（定位类变量，加上代理与自
 全部失败的；对在线的 server 就是干净重启一次）。它重读的是配置文件：在别的终端 export 的变量、
 会话启动后才改的 `.env`，本进程都看不到，那两种仍得重启会话。
 
+除了各家通用的 `command` / `args` / `env` / `url` / `headers` / `timeout` / `disabled`，声明里还认几个
+小羽自己的字段（`xiaoyu mcp add` 有对应选项）：
+
+```json
+{
+  "mcpServers": {
+    "fs": {
+      "command": "npx", "args": ["-y", "@modelcontextprotocol/server-filesystem", "."],
+      "cwd": "${env:HOME}/projects/site",
+      "tools": ["read_file", "list_directory"],
+      "inheritEnv": ["MYAPP_*"]
+    }
+  }
+}
+```
+
+- `cwd`：stdio server 的工作目录（文件系统类 server 把它当根用；宿主由编辑器或 systemd 拉起时
+  当前目录是哪儿全看运气）。与 `url` / `headers` 同一套 `${env:VAR}` 展开；目录不存在在启动前就报
+  清楚，不会变成一句看起来像"命令找不到"的 `FileNotFoundError`。远端 server 没有这个字段。
+- `tools`：只暴露名单内的工具。几十个工具的 server 往往只用两三个，其余的既占检索结果又是多余的
+  攻击面——名单外的工具模型看不见（不注册、不进 `search_tool`），拿着全限定名直接点名也会被
+  server 调用层再拦一次。名单里写了 server 没提供的名字，启动时告警一次并列出它实际提供的；
+  rug-pull 基线只对名单内的工具比对，名单外工具的描述怎么变都不会把整代隔离。
+- `inheritEnv`：从父环境透传给 server 的变量名或前缀（子进程环境是白名单，见下）。
+
+server 启动失败时（`/mcp` 的状态、工具调用的报错、重连耗尽的提示）会直接附上它 stderr 日志的
+末几行（脱敏、去控制序列、每行截断），多数时候不必再去翻 `日志：` 那个路径。server 经
+`notifications/message` 发来的日志按级别分流：warning 及以上一行上屏，其余只进同一份
+`mcp-<name>.log`；长调用期间 server 的 `notifications/progress` 会显示在活区那一行（`3/10（30%） · 正在下载`），
+`--output-format stream-json` 下是 `tool.progress` 事件。
+
+排障不必经模型：`xiaoyu mcp probe <server名>` 直接握手、打印 serverInfo / 协议版本 / 能力 /
+instructions / 工具表（不在 `tools` 名单里的标 ✗）；也可以 `xiaoyu mcp probe -- npx -y 某包` 探一条
+还没写进配置的命令行，或 `--url` 探远端。`--script steps.json` 按脚本顺序执行
+`[{"op":"listTools"}, {"op":"callTool","name":"echo","args":{"text":"hi"}}]`，每步一行 JSON（耗时、
+错误分类 `timeout` / `rpc` / `dropped`…、结果形状），任一步失败退出码 1。走的是会话里同一个客户端：
+准入规则、OSV 预检、`cwd` 校验、超时都一样，"probe 通了会话里却不通"不会发生在这一层；探测的日志
+单独写 `mcp-probe-<name>.log`，不碰正在跑的会话。
+
 找启动命令（`npx` / `uvx` …）时先看该 server 的 `env` 块里声明的 `PATH`，再看小羽自己的
 `PATH`。小羽由编辑器或 systemd 拉起时自己的 `PATH` 往往很短，在 `env` 里补一行
 `"PATH": "/opt/homebrew/bin:${env:PATH}"` 即可，不必把 `command` 写成绝对路径。

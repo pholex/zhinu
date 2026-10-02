@@ -74,6 +74,7 @@ xiaoyu send zhinu-1 "顺便把 lint 跑一下"  # 给另一个终端里的小羽
 
 xiaoyu mcp add chrome-devtools --scope user npx -y chrome-devtools-mcp@latest
 xiaoyu mcp list                         # 写的就是 .mcp.json / mcp.json
+xiaoyu mcp probe chrome-devtools        # 不经模型直接握手、列工具；--script 按脚本调用并逐步输出 JSON
 ```
 
 REPL 里：`/help` `/tools` `/skills` `/model` `/effort` `/mode` `/usage` `/context` `/compact` `/clear` `/exit` `/tasks` `/plan` `/perm` `/allow` `/deny` `/resume` `/rewind` `/mcp` `/quit`

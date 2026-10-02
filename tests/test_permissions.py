@@ -1067,5 +1067,67 @@ class SuggestAllowRuleTest(unittest.TestCase):
             self.assertEqual(perms.decide(name, args), "allow", (name, args))
 
 
+class SuggestDenyRuleTest(unittest.TestCase):
+    """确认框「以后都拒绝」选项的规则推导：与「总是允许」对称，但没有那几道
+    放行方向的关——危险命令、注入口、任意代码执行入口都给前缀；只够会话
+    授权的脚本文件给整条命令的精确匹配；复合命令推不出。"""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name).resolve()
+        self.addCleanup(self.tmp.cleanup)
+
+    def suggest(self, name, args):
+        return perm_mod.suggest_deny_rule(name, args, self.root)
+
+    def test_prefix_mirrors_allow(self):
+        self.assertEqual(self.suggest("bash", {"command": "git push --force"}),
+                         Rule("deny", "bash", "git push*"))
+        self.assertEqual(self.suggest("bash", {"command": "npm -v"}), Rule("deny", "bash", "npm -v"))
+
+    def test_dangerous_and_interpreter_entries_still_derive(self):
+        """allow 推不出的（危险命令 / python *），deny 恰恰最想一劳永逸拒掉。"""
+        self.assertIsNotNone(self.suggest("bash", {"command": "rm -rf build"}))
+        rule = self.suggest("bash", {"command": "python -c 'import os'"})
+        self.assertIsNotNone(rule)
+        self.assertEqual(rule.behavior, "deny")
+
+    def test_script_file_denies_the_exact_command(self):
+        rule = self.suggest("bash", {"command": "python deploy.py --prod"})
+        self.assertEqual(rule, Rule("deny", "bash", "python deploy.py --prod"))
+        perms = Permissions(self.root, rules=[rule])
+        self.assertEqual(perms.decide("bash", {"command": "python deploy.py --prod"}), "deny")
+        self.assertEqual(perms.decide("bash", {"command": "python deploy.py"}), "ask")
+
+    def test_literal_pattern_escapes_globs(self):
+        import fnmatch
+
+        pattern = perm_mod._literal_pattern("ls *.py [a]?")
+        self.assertEqual(pattern, "ls [*].py [[]a][?]")
+        self.assertTrue(fnmatch.fnmatch("ls *.py [a]?", pattern))
+        self.assertFalse(fnmatch.fnmatch("ls x.py aa", pattern))
+
+    def test_compound_and_empty_derive_nothing(self):
+        self.assertIsNone(self.suggest("bash", {"command": "git add . && git push"}))
+        self.assertIsNone(self.suggest("bash", {"command": ""}))
+
+    def test_file_tools_and_mcp_mirror_allow_shape(self):
+        self.assertEqual(self.suggest("write_file", {"path": "src/a.py"}), Rule("deny", "write_file", "src/*"))
+        self.assertEqual(self.suggest("write_file", {"path": "a.py"}), Rule("deny", "write_file"))
+        self.assertEqual(
+            self.suggest("use_tool", {"tool_name": "mcp__gh__delete_repo", "tool_input": {}}),
+            Rule("deny", "mcp__gh__delete_repo"),
+        )
+
+    def test_deny_rule_persists_without_the_allow_ban(self):
+        """deny 不受 banned_allow_reason 限制：python * 这类规则作为 deny 可以落盘。"""
+        rules_path = self.root / "rules.txt"
+        with mock.patch.object(perm_mod, "user_rules_path", return_value=rules_path):
+            perms = Permissions(self.root)
+            path = perms.add_persistent(Rule("deny", "bash", "python *"))
+        self.assertEqual(path, rules_path)
+        self.assertEqual(perms.decide("bash", {"command": "python x.py"}), "deny")
+
+
 if __name__ == "__main__":
     unittest.main()

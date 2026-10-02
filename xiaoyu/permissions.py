@@ -514,6 +514,47 @@ def suggest_allow_rule(name: str, args: dict, workspace: Path) -> Rule | None:
     command = str(args.get("command", "")).strip()
     if not command or command_check.dangerous_command(command):
         return None
+    spec = _bash_prefix_spec(command, strict=True)
+    if spec is None:
+        return None
+    rule = Rule("allow", "bash", spec)
+    return None if banned_allow_reason(rule) else rule
+
+
+def suggest_deny_rule(name: str, args: dict, workspace: Path) -> Rule | None:
+    """从一次待确认的调用推导「以后都拒绝」的持久规则；推不出返回 None。
+
+    与 suggest_allow_rule 对称（确认框的"总是允许 / 以后都拒绝"是一对），形态
+    与 `/deny` 手写的一致。但 deny 没有 allow 那几道关：deny 宽了只是多拦，
+    危险命令、注入口、任意代码执行入口恰恰是用户最想一劳永逸拒掉的。
+    推导顺序：能取出稳定前缀就给前缀模式（`deny bash(git push*)`）；只够会话
+    授权的形态（解释器跑脚本文件）给整条命令的精确匹配——规则按文件名记，
+    拒绝的方向上"记住文件名"没有放行时那个"内容随时能改"的风险；复合命令
+    推不出（拒的是哪一段说不清），与 allow 一样少一个选项。
+    """
+    name, args = call_identity(name, args)
+    if name != "bash":
+        allow = suggest_allow_rule(name, args, workspace)
+        return Rule("deny", name, allow.spec if allow is not None else None)
+    command = str(args.get("command", "")).strip()
+    if not command:
+        return None
+    spec = _bash_prefix_spec(command, strict=False)
+    return Rule("deny", "bash", spec) if spec is not None else None
+
+
+def _literal_pattern(text: str) -> str:
+    """把命令原文变成只匹配它自己的 fnmatch 模式（通配符转义）。"""
+    return re.sub(r"([*?\[])", r"[\1]", text)
+
+
+def _bash_prefix_spec(command: str, *, strict: bool) -> str | None:
+    """一条 bash 命令 → 规则模式（`git status*` / `npm -v`）；推不出返回 None。
+
+    strict 是 allow 的口径：注入口不推导、只够会话授权的范围不落规则。deny 的
+    口径（strict=False）放开这两条：注入口按前缀拒、脚本文件按整条命令精确拒。
+    复合命令、重定向、命令替换两种口径都不推导。
+    """
     argv: list[str] | None
     if os.name != "nt" and bash_ast.available():
         argvs = bash_ast.parse_plain_commands(command)
@@ -531,24 +572,22 @@ def suggest_allow_rule(name: str, args: dict, workspace: Path) -> Rule | None:
             argv = shlex.split(command)
         except ValueError:
             return None
-    if not argv or command_check.injection_risk_argv(argv):
+    if not argv or (strict and command_check.injection_risk_argv(argv)):
         return None
     found = _stable_prefix(argv)
     if found is None:
-        return None
+        return None if strict else _literal_pattern(command)
     _, used, suffix = found
     if suffix is _SESSION_ONLY:
-        return None
+        return None if strict else _literal_pattern(command)
     literal = argv[:used]
     if any(not token or _has_glob(token) or any(ch.isspace() for ch in token)
            for token in literal):
         #  规则是命令文本上的 fnmatch 模式：前缀里的词自带通配符或空白就拼不出
         #  一条"恰好是它"的模式，宁可不给这个选项
-        return None
+        return None if strict else _literal_pattern(command)
     #  裸命令（ls）与纯选项命令（npm -v）是精确匹配，宁窄勿宽
-    spec = " ".join(literal) + suffix
-    rule = Rule("allow", "bash", spec)
-    return None if banned_allow_reason(rule) else rule
+    return " ".join(literal) + suffix
 
 
 @dataclass(frozen=True)

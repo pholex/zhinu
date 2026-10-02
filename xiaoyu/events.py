@@ -121,6 +121,22 @@ class ToolRunning(UIEvent):
 
 
 @dataclass(frozen=True)
+class ToolProgress(UIEvent):
+    """运行中的工具报了一次进度（目前只有 MCP server 的 notifications/progress 会发）。
+
+    不改变四态机：它只出现在 running 与终态之间，可以有零到多次，前端拿它刷新
+    活区文案（"第 3/10 步 · 正在下载"），不打新行——进度是可覆盖的状态，不是
+    事件流里值得各占一行的里程碑。progress/total 按规范都是数字，total 可能没有。
+    """
+
+    kind: ClassVar[str] = "tool.progress"
+    name: str
+    message: str = ""
+    progress: float | None = None
+    total: float | None = None
+
+
+@dataclass(frozen=True)
 class ToolCompleted(UIEvent):
     """执行完毕。ok=False 表示工具返回了 ERROR: 前缀（工具级错误照样是终态）。"""
 

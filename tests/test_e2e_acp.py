@@ -334,11 +334,11 @@ class ToolFlowTest(AcpCase):
         self.assertEqual(params["toolCall"]["kind"], "execute")
         self.assertEqual(
             [o["optionId"] for o in params["options"]],
-            ["allow-once", "allow-session", "allow-always", "reject-once"],
+            ["allow-once", "allow-session", "allow-always", "reject-once", "reject-always"],
         )
         self.assertEqual(
             [o["kind"] for o in params["options"]],
-            ["allow_once", "allow_always", "allow_always", "reject_once"],
+            ["allow_once", "allow_always", "allow_always", "reject_once", "reject_always"],
         )
         #  审批前已有 pending 的 tool_call 声明
         pending = [u for u in self.updates(before) if u.get("sessionUpdate") == "tool_call"]
@@ -454,6 +454,25 @@ class ApprovalScopeTest(AcpCase):
             if u.get("sessionUpdate") == "agent_thought_chunk"
         )
         self.assertIn("不再逐次确认", thoughts)
+
+    def test_reject_always_writes_deny_rule_effective_immediately(self):
+        """「以后都拒绝」：deny 规则落盘，第二条同类调用不再问、直接被规则拦。"""
+        response, skipped = self.run_with_choice("reject-always")
+        self.assertEqual(response["result"]["stopReason"], "end_turn")
+        prompts, done = self.counts(skipped)
+        self.assertEqual(prompts, 0)
+        self.assertEqual(done, 0)
+        failed = sum(
+            1 for u in self.updates(skipped)
+            if u.get("sessionUpdate") == "tool_call_update" and u.get("status") == "failed"
+        )
+        self.assertEqual(failed, 2)
+        thoughts = " ".join(
+            u["content"]["text"] for u in self.updates(skipped)
+            if u.get("sessionUpdate") == "agent_thought_chunk"
+        )
+        self.assertIn("已写入", thoughts)
+        self.assertIn("deny bash(echo *)", thoughts)
 
     def test_allow_always_writes_rule_effective_immediately(self):
         response, skipped = self.run_with_choice("allow-always")

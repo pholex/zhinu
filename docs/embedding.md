@@ -150,6 +150,7 @@ async with contextlib.aclosing(async_agent.stream("任务")) as events:
 | `ToolPending` | `tool.pending` | `name`, `args` |
 | `ToolPurpose` | `tool.purpose` | `name`, `purpose` |
 | `ToolRunning` | `tool.running` | `name`, `args` |
+| `ToolProgress` | `tool.progress` | `name`, `message`, `progress`, `total`（running 与终态之间零到多次；目前只有 MCP 的 `notifications/progress` 会发；不在顶层导出面，按 `kind` 消费） |
 | `ToolCompleted` | `tool.completed` | `name`, `output`, `ok`, `seconds` |
 | `ToolDenied` | `tool.denied` | `name`, `by`（`rule` / `user`） |
 | `SteerAccepted` | `steer.accepted` | `text` |
