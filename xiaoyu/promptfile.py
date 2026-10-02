@@ -22,6 +22,8 @@ import re
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from .invisible import strip_invisible
+
 _OPEN, _CLOSE = "<!--", "-->"
 _FENCE = re.compile(r"^ {0,3}(`{3,}|~{3,})")
 #  模板占位符 `{{NAME}}`：只用于提醒"拿着没填完的模板直接上了"，不改内容
@@ -111,7 +113,8 @@ def _comment_end(lines: list[str], start: int) -> int | None:
 
 
 def parse(raw: str) -> PromptFile:
-    text, unclosed = strip_comments(raw)
+    #  提示词文件是 system prompt 的一部分：隐形字符先剥，再剥注释
+    text, unclosed = strip_comments(strip_invisible(raw, "提示词文件"))
     text = text.strip()
     return PromptFile(text, unclosed, len(_PLACEHOLDER.findall(text)))
 

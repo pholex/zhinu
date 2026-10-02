@@ -94,6 +94,7 @@ from typing import Any, Callable, Iterator
 from . import diagnostics, fsguard, mcp_guard, mcp_watchdog, media, netproxy
 from .config import Config, user_config_dir
 from .errors import Interrupted, attach_partial
+from .invisible import strip_invisible
 
 #  活着的 MCP 连接数（stdio 子进程 + HTTP 会话），/diagnostics 与 doctor 可见
 CONNECTIONS_LIVE = diagnostics.Gauge("mcp.connections.live")
@@ -2248,14 +2249,19 @@ def _normalize_schema(node: Any) -> Any:
     - type 是数组：["string","null"] 折叠成 "string"（取第一个非 null）
     - required 里指向不存在属性的项剪掉（Gemini 会 400）
     - 有 properties 却缺 type 的补 "object"
+    - anyOf / oneOf 全是纯 const 的折叠成 enum（_collapse_const_union）
     只递归 schema 位置；required/enum/examples 的值不是 schema，不进去
-    （进去会把字面量误当裸字符串 schema 替换掉）。
+    （进去会把字面量误当裸字符串 schema 替换掉）。$ref 的内联在它之前单独
+    一遍（_inline_refs），那需要看整棵树。
     """
     if isinstance(node, str):
         return {"type": "object", "properties": {}}
     if not isinstance(node, dict):
         return node
     node = dict(node)  # 浅拷贝：不改 server 给的原对象
+    if isinstance(node.get("description"), str):
+        #  参数描述与工具描述一样是 server 写给模型看的文本
+        node["description"] = strip_invisible(node["description"], "MCP 工具的参数描述")
     kind = node.get("type")
     if isinstance(kind, list):
         non_null = [item for item in kind if item != "null"]
@@ -2290,20 +2296,26 @@ _CONST_TYPES: tuple[tuple[type, str], ...] = (
 
 
 def _collapse_const_union(node: dict[str, Any]) -> dict[str, Any]:
-    """anyOf 全是同型纯 const 时折叠成 enum。
+    """anyOf / oneOf 全是同型纯 const 时折叠成 enum。
 
     某些语言生态的 server 把闭集枚举生成为
-    `{"anyOf": [{"const": "red"}, {"const": "green"}]}`，而严格校验的端点
-    对这种形态要么拒绝要么误处理，property 级 `enum` 才是通行形态。
+    `{"anyOf": [{"const": "red"}, {"const": "green"}]}`（带文档的枚举则是
+    oneOf，每个分支各带一句 description），而严格校验的端点对这种形态要么
+    拒绝要么误处理，property 级 `enum` 才是通行形态。
     只在**每个非 null 分支都是同一 primitive 类型的纯 const**（分支里除
     const 外只有注解类键）时才折叠；单个 {"type":"null"} 分支容忍并丢弃
     ——与上面 type 数组折叠丢 null 的既有取舍一致（运行期报错好过注册期
     整个 tools 数组 400）。混合 union 原样穿透。分支序保序。
+    分支各自的 description 不能随折叠丢掉——那是模型选值的依据——并进
+    节点 description 里，一值一行。两种键同时存在时不动：那不是枚举。
     """
-    branches = node.get("anyOf")
-    if not isinstance(branches, list) or not branches:
+    keys = [key for key in ("anyOf", "oneOf") if isinstance(node.get(key), list) and node[key]]
+    if len(keys) != 1:
         return node
+    key = keys[0]
+    branches = node[key]
     values: list[Any] = []
+    notes: list[str] = []
     kind: str | None = None
     for branch in branches:
         if not isinstance(branch, dict):
@@ -2325,13 +2337,106 @@ def _collapse_const_union(node: dict[str, Any]) -> dict[str, Any]:
         #  同型才走到这里，True==1 跨型撞值的坑已被 kind 检查挡在门外
         if value not in values:
             values.append(value)
+            if isinstance(branch.get("description"), str) and branch["description"].strip():
+                notes.append(
+                    f"{json.dumps(value, ensure_ascii=False)}: {branch['description'].strip()}"
+                )
     if kind is None or not values:
         return node
     node = dict(node)
-    del node["anyOf"]
+    del node[key]
     node["type"] = kind
     node["enum"] = values
+    if notes:
+        head = node.get("description")
+        head = head.strip() if isinstance(head, str) else ""
+        node["description"] = "\n".join(([head] if head else []) + notes)
     return node
+
+
+#  $ref 只认指向本 schema 顶层定义表的两种写法；外部 URI、指向 properties
+#  深处的 JSON pointer 都不动
+_LOCAL_REF = re.compile(r"^#/(\$defs|definitions)/([^/]+)$")
+#  老方言下 $ref 旁边的键按规范被忽略、定义表叫 definitions 且常带 id 解析：
+#  按新语义内联会改变含义，整个跳过
+_OLD_DIALECT = re.compile(r"draft-0[0-4]\b")
+#  链式引用（A 引 B 引 C）逐遍内联到不动为止的上限；超过说明是环
+_INLINE_PASSES = 8
+
+
+def _inline_refs(schema: dict[str, Any]) -> dict[str, Any]:
+    """把 `$ref: #/$defs/x`（或 definitions）指向的叶子定义就地内联，剪掉没人引用的定义。
+
+    Gemini 的函数声明不认 $ref（见到直接 400）、OpenAI strict 对 $defs 另有
+    规矩，而 pydantic / zod 这类生成器对嵌套模型默认都走 $ref。只内联**叶子**
+    定义（自身不再含 $ref 的）；链式引用多遍收敛；递归定义（自己引自己）永远
+    成不了叶子，原样留着——它本来就表达不成函数声明，不硬拆。引用处与定义
+    合并时引用处的注解（description 等）优先：生成器把字段文档写在引用处。
+    `$schema` 标明 draft-04 及更老方言的整个跳过。
+    """
+    dialect = schema.get("$schema")
+    if isinstance(dialect, str) and _OLD_DIALECT.search(dialect):
+        return schema
+
+    def tables(root: dict[str, Any]) -> dict[str, dict[str, Any]]:
+        found: dict[str, dict[str, Any]] = {}
+        for key in ("$defs", "definitions"):
+            table = root.get(key)
+            if isinstance(table, dict):
+                for name, definition in table.items():
+                    if isinstance(definition, dict):
+                        found[f"#/{key}/{name}"] = definition
+        return found
+
+    def walk(node: Any, leaves: dict[str, dict[str, Any]], seen: set[str]) -> Any:
+        """只沿 schema 位置递归（与 _normalize_schema 同一张键表），记下遇到的 $ref。"""
+        if isinstance(node, list):
+            return [walk(item, leaves, seen) for item in node]
+        if not isinstance(node, dict):
+            return node
+        ref = node.get("$ref")
+        if isinstance(ref, str) and ref in leaves:
+            node = {**leaves[ref], **{key: value for key, value in node.items() if key != "$ref"}}
+        elif isinstance(ref, str):
+            seen.add(ref)
+        node = dict(node)
+        for key in _SCHEMA_MAP_KEYS:
+            if isinstance(node.get(key), dict):
+                node[key] = {name: walk(sub, leaves, seen) for name, sub in node[key].items()}
+        for key in _SCHEMA_LIST_KEYS:
+            if isinstance(node.get(key), list):
+                node[key] = [walk(sub, leaves, seen) for sub in node[key]]
+        for key in _SCHEMA_ONE_KEYS:
+            if key in node and not isinstance(node[key], bool):
+                node[key] = walk(node[key], leaves, seen)
+        return node
+
+    def contains_ref(node: Any) -> bool:
+        probe: set[str] = set()
+        walk(node, {}, probe)
+        return bool(probe)
+
+    if not tables(schema):
+        return schema
+    seen: set[str] = set()
+    for _ in range(_INLINE_PASSES):
+        defs = tables(schema)
+        leaves = {ref: definition for ref, definition in defs.items() if not contains_ref(definition)}
+        seen = set()
+        schema = walk(schema, leaves, seen)
+        if not (seen & set(defs)):
+            break  # 剩下的引用都不指向本地定义（或已无引用）：收敛
+    #  剪掉没人引用的定义（含刚被内联掉的）；表空了整个键去掉
+    for key in ("$defs", "definitions"):
+        table = schema.get(key)
+        if not isinstance(table, dict):
+            continue
+        kept = {name: sub for name, sub in table.items() if f"#/{key}/{name}" in seen}
+        if kept:
+            schema[key] = kept
+        else:
+            del schema[key]
+    return schema
 
 
 # ---------- 远程工具 + 管理器 ----------
@@ -2364,14 +2469,19 @@ def _make_remote_tool(
 ) -> RemoteTool:
     tool_name = str(declared.get("name", ""))
     exposed = public_tool_name(server.spec.name, tool_name)
-    description = str(declared.get("description") or "").strip() or "(server 未提供描述)"
+    #  工具描述是 server 写给模型看的、用户基本不读的文本：隐形字符先剥
+    #  （参数描述在 _normalize_schema 里剥）
+    description = strip_invisible(
+        str(declared.get("description") or "").strip(),
+        f"MCP server {server.spec.name} 的工具描述",
+    ) or "(server 未提供描述)"
     if len(description) > _DESCRIPTION_CAP:
         description = description[:_DESCRIPTION_CAP] + "…"
     #  描述里带上来源：审批框里用户一眼看出这是哪个 server 的能力
     description = f"[MCP·{server.spec.name}] {description}"
     schema = declared.get("inputSchema")
     if isinstance(schema, dict):
-        schema = _normalize_schema(schema)
+        schema = _normalize_schema(_inline_refs(schema))
     if not isinstance(schema, dict) or schema.get("type") != "object":
         #  缺失/畸形 schema 补一个空对象 schema：OpenAI 端点会拒绝非 object 的顶层
         schema = {"type": "object", "properties": {}}
