@@ -938,8 +938,7 @@ class _HttpChannel:
         #  建连、写请求）的 OSError 包成 URLError；等响应头与读响应体阶段的异常
         #  原样抛出——这条边界就是"送没送到"的判据。
         try:
-            response = netproxy.urlopen(request, timeout=timeout,
-                **({"allow_redirects": False} if self.spec.authorization is not None else {}))
+            response = netproxy.urlopen(request, timeout=timeout, allow_redirects=False)
         except urllib.error.HTTPError as exc:
             raise self._http_error(exc) from exc
         except urllib.error.URLError as exc:
@@ -1012,6 +1011,20 @@ class _HttpChannel:
         with contextlib.suppress(Exception):
             exc.close()
         suffix = f"：{detail}" if detail else ""
+        if 300 <= code < 400:
+            #  MCP 端点一律不跟重定向：urllib 跟过去时会把 Authorization、
+            #  Mcp-Session-Id 等全部请求头原样带到新地址（不分跨域），写死在配置
+            #  里的静态凭据就这么泄给了第三方；而且 POST 会被改成 GET、丢掉请求体，
+            #  协议上也走不通。让人把 url 直接改成最终地址
+            target = ""
+            with contextlib.suppress(Exception):
+                target = str(exc.headers.get("Location") or "")
+            where = f"，目标 {_redact(target)[:200]}" if target else ""
+            return McpError(
+                f"server 回了重定向（HTTP {code}{where}）：为防凭据外泄不自动跟随，"
+                "请把这个 server 的 url 改成最终地址",
+                kind="http", status=code,
+            )
         if code == 404 and self.session_id:
             return McpError(
                 "远端会话已失效（HTTP 404），需要重新握手", kind="session_expired", status=code
@@ -1045,8 +1058,7 @@ class _HttpChannel:
             self.spec.url, headers=self._headers("text/event-stream"), method="GET"
         )
         try:
-            stream = netproxy.urlopen(request, timeout=self._STREAM_TIMEOUT,
-                **({"allow_redirects": False} if self.spec.authorization is not None else {}))
+            stream = netproxy.urlopen(request, timeout=self._STREAM_TIMEOUT, allow_redirects=False)
         except urllib.error.HTTPError as exc:
             #  HTTPError 本身就是一个开着的响应：不关就是把连接留给垃圾回收。
             #  405 是常态（多数 server 不提供这条流），漏的是每连一个 server 一条
@@ -1108,8 +1120,7 @@ class _HttpChannel:
             request = urllib.request.Request(
                 self.spec.url, headers=self._headers("application/json"), method="DELETE"
             )
-            netproxy.urlopen(request, timeout=5.0,
-                **({"allow_redirects": False} if self.spec.authorization is not None else {})).close()
+            netproxy.urlopen(request, timeout=5.0, allow_redirects=False).close()
         except urllib.error.HTTPError as exc:
             #  不支持 DELETE 的 server 回 405：同样是个开着的响应，要关
             with contextlib.suppress(Exception):
