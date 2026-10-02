@@ -118,6 +118,8 @@ SUBCOMMANDS: tuple[tuple[tuple[str, ...], str, str, str], ...] = (
      "列出本机在跑的会话（sessions digest 汇总 token 用量）"),
     (("send",), "send_command", "send <会话> <消息>", "给另一个会话发一条消息"),
     (("mcp",), "mcp_command", "mcp add|list|remove", "管理 MCP server 声明"),
+    (("term",), "term_command", "term init|run|log|info",
+     "shell 集成：在自己的 shell 里 @x 提问，带上刚跑过的命令"),
     (("plugin", "plugins"), "plugin_command", "plugin add|list|update|remove",
      "装卸插件包（skills + MCP）"),
     (("serve",), "serve_command", "serve", "以 HTTP API 服务启动（需 [serve] 可选依赖）"),
@@ -1206,6 +1208,183 @@ def resume_command(argv: list[str]) -> int:
     if note:
         print(ui.secondary(note))
     return run_repl(repl_fn, agent)
+
+
+TERM_USAGE = """用法：
+  xiaoyu term init <bash|zsh|fish|powershell> [--name 名字] [--command-not-found]
+        输出 shell 脚本：eval "$(xiaoyu term init zsh)"（fish 用 | source，PowerShell 用 Invoke-Expression）
+  xiaoyu term run <问题…>      带着自上次提问以来跑过的命令向模型提问（脚本里定义成 @x / @xiaoyu）
+  xiaoyu term log <命令行>     备用入口：手动记一条命令（钩子不方便用内建追加的环境）
+  xiaoyu term info             一行：会话 id · 模型 · 已用 token · 待交付命令数（放进提示符用）
+详见 docs/terminal-integration.md"""
+
+
+def term_command(argv: list[str]) -> int:
+    """`xiaoyu term`：shell 集成。
+
+    人不进 REPL，在自己的 shell 里干活，`@x 问题` 时把刚跑过的命令作为上下文
+    交给模型并续写同一个会话。`log` / `info` 是 shell 钩子与提示符要调的，
+    走 term.fast_command（__main__ 入口在导入本模块之前就把它们拦下了；从
+    这里进来说明入口没走 __main__，照样能用，只是慢）。
+    """
+    from . import term
+
+    action = argv[0] if argv else ""
+    if action == "init":
+        return term_init_command(argv[1:])
+    if action == "run":
+        return term_run_command(argv[1:])
+    if action in ("log", "info"):
+        return term.fast_command(argv)
+    if action in ("", "-h", "--help", "help"):
+        print(TERM_USAGE)
+        return 0
+    print(ui.error(f"未知的 term 子命令：{action}"), file=sys.stderr)
+    print(TERM_USAGE, file=sys.stderr)
+    return 2
+
+
+def term_init_command(argv: list[str]) -> int:
+    """`xiaoyu term init <shell>`：把集成脚本打到 stdout，由用户 eval / source。"""
+    from . import term
+
+    parser = argparse.ArgumentParser(
+        prog="xiaoyu term init",
+        description="输出 shell 集成脚本（会话变量、@x 别名、记命令的钩子）。",
+    )
+    parser.add_argument("shell", choices=term.SHELLS)
+    parser.add_argument(
+        "--name",
+        help="具名会话：id 固定为 term-<名字>，多个终端共用、关掉重开也续着聊（默认每个终端一个随机 id）",
+    )
+    parser.add_argument(
+        "--command-not-found",
+        action="store_true",
+        help="敲错的命令整行交给模型（默认不开：每个 typo 都打一次模型太费钱）",
+    )
+    parser.add_argument(
+        "--launcher",
+        help="脚本里怎么调 xiaoyu（默认：PATH 上有就用 xiaoyu，没有就用当前解释器 -m xiaoyu）",
+    )
+    args = parser.parse_args(argv)
+    try:
+        session_id = term.session_id_for(args.name)
+    except ValueError as exc:
+        print(ui.error(str(exc)), file=sys.stderr)
+        return 2
+    #  pending 文件里是脱敏前的原始命令行：目录自己可读就够了
+    directory = term.pending_dir()
+    try:
+        directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+    except OSError as exc:
+        print(ui.error(f"建不了 {directory}：{exc}"), file=sys.stderr)
+        return 1
+    sys.stdout.write(
+        term.render_script(
+            args.shell,
+            session_id,
+            named=bool(args.name),
+            command_not_found=args.command_not_found,
+            launcher=args.launcher,
+            directory=directory,
+        )
+    )
+    return 0
+
+
+def open_term_session(config: Config, session_id: str) -> tuple[SessionLog, list[dict[str, Any]]]:
+    """终端会话：有则续、无则建，与 `--session-id` 同一套，只是目录固定在
+    sessions/term/ 下——shell 里 cd 到哪都是同一段对话。"""
+    from . import term
+
+    log, restored = open_named(session_id, config.model, str(config.workspace), term.term_sessions_dir())
+    if config.system_prompt is None:
+        config.system_prompt = load_system_prompt(log.path)
+    return log, restored
+
+
+def term_run_command(argv: list[str]) -> int:
+    """`xiaoyu term run <问题…>`（脚本里的 @x）：取走 pending 里的命令，拼成
+    终端上下文放在问题前面，走一次性路径续写本终端的会话。
+
+    与 `-p` 共用一切：审批（stdin 是终端就照常问）、信任门、输出格式 text。
+    刻意不默认 --yolo：这是在用户自己的机器、自己的目录里跑。
+    """
+    from . import term
+
+    parser = argparse.ArgumentParser(
+        prog="xiaoyu term run",
+        description="带着自上次提问以来跑过的命令向模型提问（续写本终端的会话）。",
+    )
+    parser.add_argument("question", nargs="*", help="问题（也可从管道给：cat err.log | @x 这是什么错）")
+    parser.add_argument("--model", help="这一问换个模型")
+    parser.add_argument("--mode", choices=list(modes.CYCLE), default=None, help="起始模式（同主命令）")
+    parser.add_argument("--yolo", action="store_true", help="不再逐个确认写文件和执行命令")
+    parser.add_argument("--effort", choices=list(EFFORT_LEVELS), default=None, help="推理深度")
+    args = parser.parse_args(argv)
+
+    session_id = term.current_session()
+    if not session_id:
+        print(
+            ui.error(
+                f"没有 {term.SESSION_ENV}：先在 shell 里 eval \"$(xiaoyu term init zsh)\""
+                "（bash/fish/powershell 同理，见 xiaoyu term --help）"
+            ),
+            file=sys.stderr,
+        )
+        return 2
+    question = compose_prompt(args.question, read_piped_stdin())
+    if not question:
+        print(ui.error("要问什么？用法：@x <问题>"), file=sys.stderr)
+        return 2
+
+    workspace = Path.cwd()
+    #  与主命令同一道门，先于 load_dotenv：工作区 .env 是被门管的对象
+    trust = resolve_folder_trust(
+        workspace, grant=False, interactive=sys.stdin.isatty() and sys.stderr.isatty()
+    )
+    load_dotenv(untrusted_dir=None if trust.trusted else workspace)
+    _warn_env_problems()
+
+    pending = term.pending_path(session_id)
+    entries = term.drain_pending(pending)
+    prompt = term.compose(question, entries)
+    try:
+        config = Config.from_env(
+            workspace=workspace,
+            model=args.model,
+            auto_approve=args.yolo or None,
+            mode=args.mode,
+            effort=args.effort,
+            workspace_trusted=trust.trusted,
+        )
+        permissions = Permissions.load(config.workspace, include_workspace=trust.trusted)
+        approver, sink = oneshot_frontend(permissions, "text")
+        session_log, restored = open_term_session(config, session_id)
+        agent = Agent(
+            config,
+            build_toolbox(config, None),
+            approver=approver,
+            session_log=session_log,
+            permissions=permissions,
+            sink=sink,
+        )
+    except (MissingConfig, ValueError, SessionLockedError) as exc:
+        #  没交到模型手上的命令放回去，修好配置再问时还带着
+        term.requeue(pending, entries)
+        print(ui.error(str(exc)), file=sys.stderr)
+        return 2
+    install_exit_logging(agent.session_log)
+    #  copy=False：续写的就是历史所在那个文件（同 --session-id）
+    agent.restore(restored, copy=False)
+    note = [f"会话 {session_id}"]
+    if entries:
+        note.append(f"带上 {len(entries)} 条命令")
+    if restored:
+        note.append(f"接上 {len(restored)} 条消息")
+    #  走 stderr：stdout 可能正被管道接去当结果用
+    print(ui.secondary(" · ".join(note)), file=sys.stderr)
+    return run_once(agent, prompt, "text")
 
 
 def doctor_command(argv: list[str]) -> int:

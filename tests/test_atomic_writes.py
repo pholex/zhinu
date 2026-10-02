@@ -25,6 +25,7 @@ _PKG_DIR = Path(__file__).resolve().parent.parent / "xiaoyu"
 _ALLOWED = {
     "fsguard.py": "write_atomic 本身",
     "plugins.py": "插件目录整体换代（挪的是目录，不是写文件）",
+    "term.py": "取走 pending：先把 shell 正在追加的文件整个改名据为己有再读（挪的是待读文件，写入走 write_atomic）",
 }
 
 

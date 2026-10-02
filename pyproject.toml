@@ -67,11 +67,13 @@ Repository = "https://github.com/pholex/zhinu"
 Issues = "https://github.com/pholex/zhinu/issues"
 
 [project.scripts]
-xiaoyu = "xiaoyu.cli:main"
-xy = "xiaoyu.cli:main"
+# 入口走 __main__：`term log` / `term info` 在导入 cli 之前拦下来走快路径
+# （shell 钩子与提示符要调它，等不起 agent/tools 整套导入），其余照旧进 cli.main
+xiaoyu = "xiaoyu.__main__:main"
+xy = "xiaoyu.__main__:main"
 # 与包同名的别名：uvx 默认跑「与包同名的 console script」，ACP registry 的
 # uvx 分发（uvx xiaoyu-agent --acp）靠它一跑即中，无需 --from
-xiaoyu-agent = "xiaoyu.cli:main"
+xiaoyu-agent = "xiaoyu.__main__:main"
 xiaoyu-eval = "xiaoyu.evals.runner:main"
 
 [tool.setuptools]
