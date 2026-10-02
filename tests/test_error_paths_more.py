@@ -11,9 +11,10 @@ import threading
 import unittest
 from unittest import mock
 
-import httpx
+import httpx2
 import openai
 
+from xiaoyu import netproxy
 from xiaoyu.errors import classify
 
 from .test_agent_paths import AgentTestCase, chunk, usage_chunk
@@ -90,13 +91,13 @@ def serve_cut_stream(test: unittest.TestCase, events: list[bytes]) -> str:
 
 
 class BareTransportErrorTest(unittest.TestCase):
-    """流迭代到一半断开时，SDK 抛的是没有包装的 httpx 传输层异常。"""
+    """两套 SDK 流迭代到一半断开时，网络异常都必须能恢复。"""
 
     def test_bare_transport_errors_are_transient(self):
         for exc in (
-            httpx.ReadError("peer closed"),
-            httpx.RemoteProtocolError("incomplete chunked read"),
-            httpx.ReadTimeout("timed out"),
+            httpx2.ReadError("peer closed"),
+            httpx2.RemoteProtocolError("incomplete chunked read"),
+            httpx2.ReadTimeout("timed out"),
         ):
             verdict = classify(exc)
             self.assertEqual(verdict.kind, "transient", exc)
@@ -105,11 +106,11 @@ class BareTransportErrorTest(unittest.TestCase):
 
     def test_certificate_failure_is_still_fatal(self):
         """证书失败同样是传输层异常（ConnectError），但重试、换路由都没用。"""
-        worded = httpx.ConnectError(
+        worded = httpx2.ConnectError(
             "[SSL: CERTIFICATE_VERIFY_FAILED] certificate verify failed: "
             "self-signed certificate in certificate chain (_ssl.c:1000)"
         )
-        chained = httpx.ConnectError("tls handshake failed")
+        chained = httpx2.ConnectError("tls handshake failed")
         chained.__cause__ = ssl.SSLCertVerificationError(1, "unable to get local issuer")
         for exc in (worded, chained):
             verdict = classify(exc)
@@ -127,7 +128,7 @@ class BareTransportErrorTest(unittest.TestCase):
         )
         client = openai.OpenAI(
             base_url=f"{base}/v1", api_key="k", max_retries=0, timeout=10,
-            http_client=httpx.Client(trust_env=False),
+            http_client=netproxy.http_client(),
         )
         self.addCleanup(client.close)
         seen: list[str] = []
@@ -138,8 +139,9 @@ class BareTransportErrorTest(unittest.TestCase):
                 seen.append(piece.choices[0].delta.content or "")
         #  先确认真的是"流开了头才断"，再看分类
         self.assertEqual(seen, ["hi"])
-        self.assertIsInstance(caught.exception, httpx.TransportError)
+        self.assertIsInstance(caught.exception, (httpx2.TransportError, openai.APIConnectionError))
         self.assertEqual(classify(caught.exception).kind, "transient")
+        self.assertTrue(classify(caught.exception).retryable)
 
     def test_anthropic_sdk_mid_stream_disconnect(self):
         import anthropic
@@ -155,7 +157,7 @@ class BareTransportErrorTest(unittest.TestCase):
         )
         client = anthropic.Anthropic(
             base_url=base, api_key="k", max_retries=0, timeout=10,
-            http_client=httpx.Client(trust_env=False),
+            http_client=httpx2.Client(trust_env=False),
         )
         self.addCleanup(client.close)
         seen: list[str] = []
@@ -165,7 +167,7 @@ class BareTransportErrorTest(unittest.TestCase):
             ):
                 seen.append(event.type)
         self.assertEqual(seen, ["message_start"])
-        self.assertIsInstance(caught.exception, httpx.TransportError)
+        self.assertIsInstance(caught.exception, httpx2.TransportError)
         self.assertEqual(classify(caught.exception).kind, "transient")
 
 
@@ -175,7 +177,7 @@ class MidStreamDisconnectRecoveryTest(AgentTestCase):
     def test_retries_in_place(self):
         def cut():
             yield chunk(content="半截")
-            raise httpx.ReadError("peer closed")
+            raise httpx2.ReadError("peer closed")
 
         agent = self.build([cut(), [chunk(content="完整回答"), usage_chunk(10, 3)]])
         with mock.patch("xiaoyu.agent.Agent._sleep") as fake_sleep, \
@@ -252,7 +254,38 @@ def _raising(exc: Exception):
 
 
 class BedrockStreamExceptionTest(unittest.TestCase):
-    """Bedrock 事件流里的异常帧：SDK 抛的是没有状态码的裸 ValueError。"""
+    """Bedrock 异常帧：兼容旧解码器和新版类型化流错误。"""
+
+    def status_error(self, kind, message="stream broke", status=200):
+        import anthropic
+
+        body = {"type": "error", "error": {"type": kind, "message": message}}
+        return anthropic.APIStatusError(
+            str(body), body=body,
+            response=httpx2.Response(status, request=httpx2.Request("POST", "http://unused")),
+        )
+
+    def test_typed_stream_errors_preserve_retry_and_validation_boundaries(self):
+        from xiaoyu.errors import StreamFailed
+
+        for kind in ("modelStreamErrorException", "internalServerException",
+                     "modelTimeoutException", "serviceUnavailableException"):
+            with self.subTest(kind=kind):
+                texts, raised = self.consume(self.status_error(kind))
+                self.assertEqual(texts, ["半截"])
+                self.assertIsInstance(raised, StreamFailed)
+                self.assertTrue(classify(raised).retryable)
+        _, throttled = self.consume(self.status_error("throttlingException", "Too many requests"))
+        self.assertEqual(classify(throttled).kind, "rate_limit")
+        for exc in (self.status_error("validationException", "Malformed input request"),
+                    self.status_error("unknownException"),
+                    self.status_error("modelStreamErrorException", status=400)):
+            with self.subTest(error=str(exc)):
+                _, raised = self.consume(exc)
+                self.assertIs(raised, exc)
+                self.assertFalse(classify(raised).retryable)
+        _, too_long = self.consume(self.status_error("validationException", "Input is too long"))
+        self.assertEqual(classify(too_long).kind, "context_overflow")
 
     def consume(self, exc: Exception) -> tuple[list[str], Exception]:
         from xiaoyu import messages
@@ -348,7 +381,7 @@ class BedrockStreamExceptionTest(unittest.TestCase):
         )
         client = anthropic.AnthropicBedrock(
             api_key="k", aws_region="us-east-1", base_url=base, max_retries=0, timeout=10,
-            http_client=httpx.Client(trust_env=False),
+            http_client=httpx2.Client(trust_env=False),
         )
         self.addCleanup(client.close)
         stream = client.messages.create(
@@ -380,7 +413,7 @@ class TransientStatusTest(unittest.TestCase):
             self.assertTrue(verdict.retryable, status)
 
     def test_real_sdk_status_errors(self):
-        response = httpx.Response(409, request=httpx.Request("POST", "http://unused"))
+        response = httpx2.Response(409, request=httpx2.Request("POST", "http://unused"))
         self.assertEqual(
             classify(openai.ConflictError("lock timeout", response=response, body=None)).kind,
             "transient",
@@ -425,7 +458,7 @@ class MoreOverflowWordingTest(unittest.TestCase):
                 _StatusError(wording, 400),
                 openai.BadRequestError(
                     wording,
-                    response=httpx.Response(400, request=httpx.Request("POST", "http://unused")),
+                    response=httpx2.Response(400, request=httpx2.Request("POST", "http://unused")),
                     body=None,
                 ),
             ):
@@ -478,8 +511,8 @@ _GEMINI_BODY = [
 
 
 def _rate_limited(message: str, body=None, headers=None) -> openai.RateLimitError:
-    response = httpx.Response(
-        429, request=httpx.Request("POST", "http://unused"), headers=headers
+    response = httpx2.Response(
+        429, request=httpx2.Request("POST", "http://unused"), headers=headers
     )
     return openai.RateLimitError(message, response=response, body=body)
 

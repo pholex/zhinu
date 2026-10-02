@@ -9,7 +9,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-import httpx
+import httpx2
 import openai
 
 from xiaoyu import providers
@@ -962,7 +962,7 @@ class TestRouteAndClients(ProviderTestCase):
 
 
 class TestTimeouts(ProviderTestCase):
-    """建连超时必须和 request_timeout 分开：把单个秒数交给 SDK，httpx 会把
+    """建连超时必须和 request_timeout 分开：把单个秒数交给 SDK，httpx2 会把
     connect 也设成它——端点写错/网关挂了要干等十分钟才报错，用户只看到假死。"""
 
     ENV = {"XIAOYU_API_KEY": "gw", "DEEPSEEK_API_KEY": "ds"}
@@ -985,7 +985,7 @@ class TestTimeouts(ProviderTestCase):
             fake.side_effect = lambda **kw: object()
             registry.client("deepseek")
         passed = fake.call_args.kwargs["timeout"]
-        self.assertIsInstance(passed, httpx.Timeout)
+        self.assertIsInstance(passed, httpx2.Timeout)
         self.assertEqual(passed.connect, providers._CONNECT_TIMEOUT)
 
 
@@ -1083,3 +1083,15 @@ class TestAutoDiscovery(ProviderTestCase):
             got = providers._discover_models(self.LOCAL, "local", "XIAOYU_PROVIDER_LOCAL")
         self.assertEqual(got, ())
         self.assertIn("探测失败", err.getvalue())
+
+    def test_discover_models_empty_error_keeps_startup_alive(self) -> None:
+        for message in ("", "\n", "   "):
+            with self.subTest(message=message):
+                fake = mock.MagicMock()
+                fake.with_options.return_value.models.list.side_effect = AssertionError(message)
+                with mock.patch.object(providers, "OpenAI", return_value=fake), \
+                     contextlib.redirect_stderr(io.StringIO()) as err:
+                    got = providers._discover_models(self.LOCAL, "local", "T")
+                self.assertEqual(got, ())
+                self.assertIn("AssertionError", err.getvalue())
+                fake.close.assert_called_once()

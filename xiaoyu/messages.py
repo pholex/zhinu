@@ -43,8 +43,8 @@ import json
 import re
 from typing import Any, Iterator
 
-#  httpx 是 anthropic SDK 的硬传递依赖，顶层 import 安全（同 errors.py）
-import httpx
+#  httpx2 是 anthropic SDK 的硬传递依赖，顶层 import 安全（同 errors.py）
+import httpx2
 
 from .errors import ContentFiltered, StreamFailed
 from .responses import (
@@ -531,24 +531,28 @@ def _refusal_detail(event: Any) -> str:
     return "安全分类器拒绝（无详情）"
 
 
-#  Bedrock 事件流解码器对异常帧的报法：一条裸 ValueError，文本以此开头，后面跟着
+#  旧 Bedrock 事件流解码器对异常帧的报法：裸 ValueError，文本以此开头，后面跟着
 #  整帧的 repr（`:exception-type` 头 + body 里的 message）
 _BEDROCK_FRAME_ERROR = "Bad response code, expected 200"
+_BEDROCK_RETRYABLE_ERRORS = frozenset({
+    "modelStreamErrorException", "internalServerException", "modelTimeoutException",
+    "serviceUnavailableException", "throttlingException",
+})
 
 
 def _events(events: Iterator[Any]) -> Iterator[Any]:
     """逐个取事件，把 Bedrock 事件流里的异常帧翻成 StreamFailed。
 
     Bedrock 的流内异常（modelStreamErrorException / internalServerException /
-    modelTimeoutException / serviceUnavailableException / throttlingException）不走
-    SDK 的类型化异常：解码器抛的是没有状态码的裸 ValueError，分类器只能判 fatal。
-    这几种都是服务端侧的问题，包成 StreamFailed——原文照带，限流、超窗等措辞判定
+    modelTimeoutException / serviceUnavailableException / throttlingException）：
+    旧解码器以裸 ValueError 报出；新版以 HTTP 200 的 APIStatusError 报出。
+    这些都是流内服务端问题，包成 StreamFailed——原文照带，限流、超窗等措辞判定
     仍先生效，全没命中才兜底成瞬时错误。
 
     validationException 不包：那是请求本身不合法，原样重发结果相同。它照旧按文本
     判（"Input is too long" 仍是超窗），其余落 fatal。
 
-    只接取事件这一步抛的 ValueError：循环体里翻译逻辑自己的错不该被改写成流失败。
+    只接取事件这一步抛的已知异常：翻译逻辑自己的错不该被改写成流失败。
     """
     iterator = iter(events)
     while True:
@@ -556,11 +560,19 @@ def _events(events: Iterator[Any]) -> Iterator[Any]:
             event = next(iterator)
         except StopIteration:
             return
-        except ValueError as exc:
-            text = str(exc)
-            if _BEDROCK_FRAME_ERROR not in text or "validationexception" in text.lower():
-                raise
-            raise StreamFailed(f"Bedrock 流内异常：{text}") from exc
+        except Exception as exc:
+            if isinstance(exc, ValueError):
+                text = str(exc)
+                if _BEDROCK_FRAME_ERROR not in text or "validationexception" in text.lower():
+                    raise
+            else:
+                body = getattr(exc, "body", None)
+                error = body.get("error") if isinstance(body, dict) else None
+                kind = error.get("type") if isinstance(error, dict) else None
+                if (getattr(exc, "status_code", None) != 200 or not isinstance(kind, str)
+                        or kind not in _BEDROCK_RETRYABLE_ERRORS):
+                    raise
+            raise StreamFailed(f"Bedrock 流内异常：{exc}") from exc
         yield event
 
 
@@ -738,7 +750,7 @@ def _usage(raw: Any) -> Usage | None:
 # ---------- client 工厂 ----------
 
 
-def client(base_url: str, api_key: str, timeout: float | httpx.Timeout) -> Any:
+def client(base_url: str, api_key: str, timeout: float | httpx2.Timeout) -> Any:
     """构造 anthropic SDK client。Transport 首次遇到 Messages 协议请求才调用
     （懒构造：不用 Claude 直连的进程不付 import 和连接池成本）。
 
@@ -770,7 +782,7 @@ BEDROCK_EXTRA_HINT = (
 
 
 def bedrock_client(
-    region: str, timeout: float | httpx.Timeout, api_key: str | None = None
+    region: str, timeout: float | httpx2.Timeout, api_key: str | None = None
 ) -> Any:
     """构造 Bedrock client（同 SDK 的 AnthropicBedrock）。
 

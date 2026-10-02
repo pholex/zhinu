@@ -238,10 +238,10 @@ class BreakerTest(QixiangTestCase):
     """鉴权不过、额度用尽：换一项重试也不会好，别把余下的每一项都跑一遍再失败。"""
 
     def auth_error(self):
-        import httpx
+        import httpx2
         import openai
 
-        response = httpx.Response(401, request=httpx.Request("POST", "http://unused"))
+        response = httpx2.Response(401, request=httpx2.Request("POST", "http://unused"))
         return openai.AuthenticationError("bad key", response=response, body=None)
 
     def test_stops_starting_items_after_three_hopeless_failures(self):
