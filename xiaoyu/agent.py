@@ -899,6 +899,46 @@ class Usage:
         return "\n".join(lines)
 
 
+@dataclass
+class TurnStats:
+    """一轮里全部模型请求的计时汇总（含重试与子调用），`--stats` 的数据源。
+
+    与 Usage 的分工：Usage 是会话累计的 token 账（跨轮、父子共享），这里只管
+    **本轮**的时间维度——总耗时、首 token 延迟、吐字速率。每轮 send() 开头清零。
+    ttft 取本轮**第一次**请求的首 token 延迟：那是用户按下回车后真正干等的时长，
+    后续工具回合的等待被工具执行遮住了，平均起来反而不说明问题。
+    """
+
+    requests: int = 0
+    duration_ms: int = 0
+    ttft_ms: int | None = None
+    completion_tokens: int = 0
+    #  吐字段的累计时长（扣掉首 token 之前的等待），tok/s 的分母
+    generation_ms: int = 0
+
+    def record(self, duration_ms: int, ttft_ms: int | None, completion_tokens: int) -> None:
+        self.requests += 1
+        self.duration_ms += max(duration_ms, 0)
+        if self.ttft_ms is None and ttft_ms is not None:
+            self.ttft_ms = ttft_ms
+        self.completion_tokens += max(completion_tokens, 0)
+        if ttft_ms is not None:
+            self.generation_ms += max(duration_ms - ttft_ms, 0)
+
+    def summary(self) -> str:
+        """一行人读文案；本轮没有请求返回空串。"""
+        if not self.requests:
+            return ""
+        parts = [f"耗时 {self.duration_ms / 1000:.1f}s"]
+        if self.ttft_ms is not None:
+            parts.append(f"首 token {self.ttft_ms / 1000:.1f}s")
+        if self.completion_tokens and self.generation_ms > 0:
+            parts.append(f"输出 {self.completion_tokens * 1000 / self.generation_ms:.0f} tok/s")
+        if self.requests > 1:
+            parts.append(f"{self.requests} 次请求")
+        return " · ".join(parts)
+
+
 #  进程级仪表：serve /diagnostics 与 doctor 读它回答"现在有几轮在跑"
 _TURNS_ACTIVE = diagnostics.Gauge("core.turns.active")
 
@@ -952,9 +992,12 @@ class Agent:
     _content_filtered = False
     _completion_tokens: int | None = None
     _prompt_tokens_seen: int | None = None
+    _cached_tokens_seen: int = 0
     _request_clock: float | None = None
     _first_chunk_at: float | None = None
     _response_id = ""
+    #  `--stats`：轮末在用量行后追加耗时/首 token/吐字速率（CLI 置位，内核只记数）
+    show_stats: bool = False
 
     def __init__(
         self,
@@ -998,6 +1041,7 @@ class Agent:
         #  而不是等用户开始对话了才炸。
         self.registry = registry or providers.build(config)
         self.usage = usage if usage is not None else Usage()
+        self.turn_stats = TurnStats()
         #  quiet 用于子 agent：不刷正文，只用缩进显示它调了什么工具。
         #  所有面向用户的输出走 sink（第 0 步重构）：不传就按 quiet 构造明文渲染。
         self.quiet = quiet
@@ -2823,6 +2867,7 @@ class Agent:
         投影（`media.text_of`）——hook 载荷、插话比对、trace 都不需要认识部件。
         """
         self._peer_state("busy")
+        self.turn_stats = TurnStats()
         #  /rewind 快照的轮次边界：begin 开一个新点，finally 里 finish 补 after
         #  快照并归档——中断/异常路径也要收口，否则该轮的改动不可回滚。
         store = getattr(self.toolbox, "rewind", None)
@@ -4372,6 +4417,24 @@ class Agent:
             )
         return effort
 
+    def _request_ended(self) -> RequestEnded:
+        """组这次请求的 request.ended：计时与用量取自 _consume_chunks 记下的现场，
+        同时记进本轮的 turn_stats。异常/中断路径也走这里——耗时照记，usage 可能为空。"""
+        now = time.monotonic()
+        started = self._request_clock
+        duration_ms = round((now - started) * 1000) if started is not None else 0
+        first = self._first_chunk_at
+        ttft_ms = round((first - started) * 1000) if started is not None and first is not None else None
+        usage: dict[str, Any] = {}
+        if self._prompt_tokens_seen is not None:
+            usage = {
+                "prompt_tokens": self._prompt_tokens_seen,
+                "completion_tokens": self._completion_tokens or 0,
+                "cached_tokens": self._cached_tokens_seen,
+            }
+        self.turn_stats.record(duration_ms, ttft_ms, int(usage.get("completion_tokens", 0)))
+        return RequestEnded(duration_ms=duration_ms, ttft_ms=ttft_ms, usage=usage)
+
     def _log_request(
         self,
         route: Route,
@@ -4531,6 +4594,7 @@ class Agent:
         self._first_chunk_at: float | None = None
         self._response_id = ""
         self._prompt_tokens_seen: int | None = None
+        self._cached_tokens_seen = 0
         try:
             stream = route.client.chat.completions.create(**request)
             self._consume_stream(route, stream, content_parts, pending, reasoning)
@@ -4555,7 +4619,7 @@ class Agent:
             #  事件消费者不该为失败路径写补偿逻辑。
             if content_parts:
                 self.sink.emit(TextEnd())
-            self.sink.emit(RequestEnded())
+            self.sink.emit(self._request_ended())
 
         if not self._stream_finished:
             #  流结束了却没有任何收尾信号（finish_reason / usage 都没见到），而某个
@@ -4734,6 +4798,10 @@ class Agent:
                 prompt_tokens = chunk.usage.prompt_tokens or 0
                 self._prompt_tokens_seen = prompt_tokens
                 self._completion_tokens = chunk.usage.completion_tokens
+                #  缓存命中数：三条协议都已归一到 prompt_tokens_details.cached_tokens
+                #  （chat 原生、Messages/Responses 的适配层各自填），没有就是 0
+                details = getattr(chunk.usage, "prompt_tokens_details", None)
+                self._cached_tokens_seen = int(getattr(details, "cached_tokens", 0) or 0)
                 self.usage.add(
                     route.qualified,
                     prompt_tokens,

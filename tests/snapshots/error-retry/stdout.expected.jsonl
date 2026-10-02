@@ -1,8 +1,8 @@
 {"kind": "request.started", "model": "snapshot-model"}
-{"kind": "request.ended"}
+{"kind": "request.ended", "duration_ms": 0, "ttft_ms": null, "usage": {}}
 {"kind": "notice", "text": "[限流，<wait>s 后重试（1/2）]", "level": "warn"}
 {"kind": "request.started", "model": "snapshot-model"}
 {"kind": "text.delta", "text": "恢复了。"}
 {"kind": "text.end"}
-{"kind": "request.ended"}
+{"kind": "request.ended", "duration_ms": 0, "ttft_ms": 0, "usage": {"prompt_tokens": 120, "completion_tokens": 5, "cached_tokens": 0}}
 {"kind": "result", "result": "恢复了。", "usage": {"turns": 1, "prompt_tokens": 120, "completion_tokens": 5, "by_model": {"_scripted/snapshot-model": {"calls": 1, "prompt_tokens": 120, "completion_tokens": 5}}}, "model": "snapshot-model", "session_log": "<session_log>"}

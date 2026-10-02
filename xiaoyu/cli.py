@@ -18,8 +18,8 @@ from pathlib import Path
 from typing import Any
 
 from . import (
-    __version__, command_check, envprobe, errors, keys, media, modes, peers, providers,
-    skills, terminal, ui,
+    __version__, attention, command_check, envprobe, errors, keys, media, modes, peers,
+    providers, skills, terminal, ui,
 )
 from .agent import Agent
 from .banner import build_banner
@@ -29,11 +29,15 @@ from .session_log import (
     SessionLockedError,
     SessionLog,
     check_session_id,
+    export_markdown,
+    export_messages,
+    find_session,
     install_exit_logging,
     list_sessions,
     load_messages,
     load_system_prompt,
     open_named,
+    rename_session,
     turn_starts,
     usage_digest,
 )
@@ -116,16 +120,18 @@ SLASH_HELP = "可用命令：\n" + "\n".join(
 SUBCOMMANDS: tuple[tuple[tuple[str, ...], str, str, str], ...] = (
     (("config",), "config_command", "config", "初始化/查看配置"),
     (("resume",), "resume_command", "resume", "恢复历史会话"),
-    (("sessions",), "sessions_command", "sessions",
-     "列出本机在跑的会话（sessions digest 汇总 token 用量）"),
+    (("sessions",), "sessions_command", "sessions [digest|export|rename]",
+     "列出本机在跑的会话；digest 汇总 token 用量、export 导出历史会话、rename 起名"),
     (("send",), "send_command", "send <会话> <消息>", "给另一个会话发一条消息"),
     (("mcp",), "mcp_command", "mcp add|list|remove|probe", "管理 MCP server 声明；probe 不经模型直接探测一个 server"),
     (("plugin", "plugins"), "plugin_command", "plugin add|list|update|remove",
      "装卸插件包（skills + MCP）"),
     (("serve",), "serve_command", "serve", "以 HTTP API 服务启动（需 [serve] 可选依赖）"),
     (("acp",), "_acp_command", "acp", "以 ACP 协议 server 启动，供编辑器客户端驱动（等价 --acp）"),
-    (("doctor",), "doctor_command", "doctor",
-     "体检环境（凭据有无 / 配置 / 代理 / 沙箱 / 磁盘 / MCP 配置）"),
+    (("doctor",), "doctor_command", "doctor [--probe] [--bundle]",
+     "体检环境（凭据有无 / 配置 / 代理 / 沙箱 / 磁盘 / MCP 配置）；--probe 真发一条请求，--bundle 打诊断包"),
+    (("completion",), "completion_command", "completion bash|zsh|fish",
+     "输出 shell 补全脚本（eval \"$(xiaoyu completion zsh)\"）"),
     (("terminal-setup",), "terminal_setup_command", "terminal-setup",
      "给 VS Code 系编辑器配 Shift+Enter 换行"),
     (("update",), "update_command", "update",
@@ -250,6 +256,7 @@ def build_parser() -> argparse.ArgumentParser:
         "（agentclientprotocol.com，给 Zed/Neovim 等编辑器客户端驱动）",
     )
     add_output_format(parser)
+    add_stats_flag(parser)
     return parser
 
 
@@ -449,6 +456,15 @@ def collect_image_parts(
         if not pasted:
             return [], "--paste：剪贴板里没有图片（截图或复制图片文件后再试）"
     return parts, ""
+
+
+def add_stats_flag(parser: argparse.ArgumentParser) -> None:
+    """`--stats`：轮末在用量行后追加耗时 / 首 token / 吐字速率。主命令与 resume 共用。"""
+    parser.add_argument(
+        "--stats",
+        action="store_true",
+        help="每轮结束在用量行后追加耗时、首 token 延迟与输出速率（-p 与交互模式都认）",
+    )
 
 
 def add_output_format(parser: argparse.ArgumentParser) -> None:
@@ -699,7 +715,16 @@ def split_resume_positionals(first: str | None, rest: list[str]) -> tuple[int | 
 def _session_label(info: SessionInfo) -> str:
     """会话在行内菜单里的一行标签（截到终端宽度，长了菜单高度就不准了）。"""
     place = Path(info.workspace).name or info.workspace
-    return ui.fit(f"{info.started_at}  {info.model}  {place}  {_named(info)}{info.preview}", 12)
+    return ui.fit(f"{info.started_at}  {info.model}  {place}  {_named(info)}{_session_text(info)}", 12)
+
+
+def _session_text(info: SessionInfo) -> str:
+    """列表里的正文：起过名用名字，否则首条消息开头；再带末条摘要——"想干什么"
+    与"聊到哪了"一起看，挑会话续聊才不用逐个打开。末条与开头相同（单轮会话）不重复。"""
+    head = info.label
+    if info.last and not info.last.startswith(info.preview.rstrip("…")):
+        return f"{head}  ⇢ {info.last}"
+    return head
 
 
 def _named(info: SessionInfo) -> str:
@@ -730,7 +755,7 @@ def choose_session(
         place = Path(info.workspace).name or info.workspace
         print(
             f"  {number:>2}. {info.started_at}  {ui.secondary(info.model)}  "
-            f"{ui.secondary(place)}  {_named(info)}{info.preview}"
+            f"{ui.secondary(place)}  {_named(info)}{_session_text(info)}"
         )
     try:
         answer = input(ui.prompt("恢复哪个？（序号，回车取消）: ")).strip()
@@ -899,11 +924,17 @@ def sessions_command(argv: list[str]) -> int:
     """
     if argv and argv[0] == "digest":
         return sessions_digest_command(argv[1:])
+    if argv and argv[0] == "export":
+        return sessions_export_command(argv[1:])
+    if argv and argv[0] == "rename":
+        return sessions_rename_command(argv[1:])
     parser = argparse.ArgumentParser(
         prog="xiaoyu sessions",
         description=(
             "列出本机在跑的小羽会话（可作为 `xiaoyu send` 的收件人）。"
-            "`xiaoyu sessions digest` 汇总历史会话的 token 用量。"
+            "`xiaoyu sessions digest` 汇总历史会话的 token 用量；"
+            "`xiaoyu sessions export <会话>` 导出一场历史会话；"
+            "`xiaoyu sessions rename <会话> <名字>` 给它起个显示名。"
         ),
     )
     parser.parse_args(argv)
@@ -982,6 +1013,87 @@ def sessions_digest_command(argv: list[str]) -> int:
     return 0
 
 
+def _session_ref_help() -> str:
+    return "会话引用：`xiaoyu resume` 列表里的序号、--session-id 的名字，或会话文件名"
+
+
+def _locate_session(ref: str, everywhere: bool) -> SessionInfo | None:
+    info = find_session(ref, None if everywhere else str(Path.cwd().resolve()))
+    if info is None:
+        print(ui.error(f"找不到会话 {ref!r}（{_session_ref_help()}；--all 不按当前工作区过滤）"), file=sys.stderr)
+    return info
+
+
+def sessions_export_command(argv: list[str]) -> int:
+    """`xiaoyu sessions export <会话>`：导出一场历史会话的用户可见内容。
+
+    只含 user / assistant 正文与工具调用摘要（tool 结果一行摘要），不含 system
+    提示——那是内核的内部话，不是对话本身。默认打到 stdout，`-o` 落文件。
+    """
+    parser = argparse.ArgumentParser(
+        prog="xiaoyu sessions export",
+        description="导出一场历史会话（Markdown 或 JSON），不含 system 提示。",
+    )
+    parser.add_argument("ref", help=_session_ref_help())
+    parser.add_argument("--format", choices=("md", "json"), default="md", help="md（默认）或 json")
+    parser.add_argument("-o", "--out", help="写到这个文件（默认 stdout）")
+    parser.add_argument("--all", action="store_true", help="不按当前工作区过滤")
+    args = parser.parse_args(argv)
+    info = _locate_session(args.ref, args.all)
+    if info is None:
+        return 2
+    try:
+        if args.format == "json":
+            payload = {
+                "session": {
+                    "path": str(info.path), "started_at": info.started_at, "model": info.model,
+                    "workspace": info.workspace, "title": info.title, "session_id": info.session_id,
+                },
+                "messages": export_messages(info.path),
+            }
+            text = json.dumps(payload, ensure_ascii=False, indent=2) + "\n"
+        else:
+            text = export_markdown(info)
+    except (OSError, ValueError) as exc:
+        print(ui.error(f"导出失败：{exc}"), file=sys.stderr)
+        return 2
+    if args.out:
+        target = Path(args.out).expanduser()
+        if target.is_symlink():
+            print(ui.error(f"输出路径是符号链接，拒绝写入：{target}"), file=sys.stderr)
+            return 2
+        target.write_text(text, encoding="utf-8")
+        print(ui.success(f"已导出到 {target}"))
+    else:
+        print(text, end="")
+    return 0
+
+
+def sessions_rename_command(argv: list[str]) -> int:
+    """`xiaoyu sessions rename <会话> <名字>`：给历史会话起显示名（列表里代替首条消息开头）。"""
+    parser = argparse.ArgumentParser(
+        prog="xiaoyu sessions rename",
+        description="给一场历史会话起显示名；正在被别的进程续写的会话不能改。",
+    )
+    parser.add_argument("ref", help=_session_ref_help())
+    parser.add_argument("title", help="新名字（最长 80 字符）")
+    parser.add_argument("--all", action="store_true", help="不按当前工作区过滤")
+    args = parser.parse_args(argv)
+    info = _locate_session(args.ref, args.all)
+    if info is None:
+        return 2
+    try:
+        title = rename_session(info.path, args.title)
+    except SessionLockedError as exc:
+        print(ui.error(f"会话正在被续写，改不了名：{exc}"), file=sys.stderr)
+        return 2
+    except (OSError, ValueError) as exc:
+        print(ui.error(f"改名失败：{exc}"), file=sys.stderr)
+        return 2
+    print(ui.success(f"已改名：{title}") + ui.secondary(f"  ({info.path.name})"))
+    return 0
+
+
 def shorten_home(path: str) -> str:
     """`/Users/me/x` → `~/x`。列表里工作区是关键信息，但不值得占满一行。"""
     home = str(Path.home())
@@ -1057,6 +1169,7 @@ def resume_command(argv: list[str]) -> int:
     add_system_prompt_flags(parser)
     add_prompt_flag(parser)
     add_output_format(parser)
+    add_stats_flag(parser)
     args = parser.parse_args(argv)
     try:
         resolve_system_prompt_flags(args)
@@ -1209,6 +1322,7 @@ def resume_command(argv: list[str]) -> int:
         print(ui.error(str(exc)), file=sys.stderr)
         return 2
     install_exit_logging(agent.session_log)
+    agent.show_stats = args.stats
 
     #  接回上下文并复制进新会话文件（新文件自包含，可再次 resume）
     agent.restore(loaded, source=str(chosen.path))
@@ -1251,10 +1365,28 @@ def doctor_command(argv: list[str]) -> int:
     )
     parser.add_argument("--json", action="store_true", help="机器可读输出（含进程快照）")
     parser.add_argument("-w", "--workspace", default="", help="按哪个工作区检查（默认当前目录）")
+    parser.add_argument(
+        "--probe",
+        action="store_true",
+        help="对默认模型真发一条最小请求（会出网、花一点点 token），记耗时并按分类报错；默认不出网",
+    )
+    parser.add_argument(
+        "--bundle",
+        nargs="?",
+        const="",
+        default=None,
+        metavar="SESSION",
+        help="打诊断包：体检结果 + 脱敏配置 + 指定会话（缺省最近一场）日志尾部 + 崩溃日志 + 版本平台信息，"
+        "写成一个 JSON。密钥脱敏，但含路径与命令历史，分享前自查",
+    )
+    parser.add_argument("-o", "--out", help="诊断包的输出路径（默认当前目录 xiaoyu-doctor-<时间>.json）")
     args = parser.parse_args(argv)
 
     workspace = Path(args.workspace).expanduser() if args.workspace else None
     checks = diagnostics.run_doctor(workspace)
+    if args.probe:
+        load_dotenv()
+        checks.append(diagnostics.probe_model())
     if args.json:
         print(diagnostics.to_json(checks))
     else:
@@ -1265,7 +1397,107 @@ def doctor_command(argv: list[str]) -> int:
                 print(paint[mark](line[:4]) + line[4:])
             else:
                 print(ui.secondary(line))
+    if args.bundle is not None:
+        session: Path | None = None
+        if args.bundle:
+            info = find_session(args.bundle, str((workspace or Path.cwd()).resolve()))
+            if info is None:
+                print(ui.error(f"找不到会话 {args.bundle!r}（{_session_ref_help()}）"), file=sys.stderr)
+                return 2
+            session = info.path
+        try:
+            out = diagnostics.build_bundle(
+                checks, workspace, session, Path(args.out) if args.out else None
+            )
+        except (OSError, ValueError) as exc:
+            print(ui.error(f"诊断包写入失败：{exc}"), file=sys.stderr)
+            return 2
+        #  --json 时 stdout 只准出现那个 JSON：人读的两行走 stderr
+        where = sys.stderr if args.json else sys.stdout
+        print(ui.success(f"诊断包已写到 {out}"), file=where)
+        print(ui.warning(f"  {diagnostics.BUNDLE_NOTICE}"), file=where)
     return 1 if diagnostics.overall(checks) == "fail" else 0
+
+
+# ---------- shell 补全 ----------
+
+COMPLETION_SHELLS = ("bash", "zsh", "fish")
+
+
+def completion_words() -> tuple[list[tuple[str, str]], list[tuple[str, str]]]:
+    """补全词表：(子命令, 说明) 与 (主命令旗标, 说明)，都从现有的表/parser 现取——
+    不另维护一份清单，加了子命令或旗标补全自动跟上。"""
+    subcommands = [(name, summary) for names, _, _, summary in SUBCOMMANDS for name in names]
+    flags: list[tuple[str, str]] = []
+    for action in build_parser()._actions:  # noqa: SLF001 - argparse 没有公开的动作清单
+        for option in action.option_strings:
+            if option.startswith("--"):
+                flags.append((option, (action.help or "").split("（")[0].split("：")[0][:60]))
+    return subcommands, flags
+
+
+def _sh_quote(text: str) -> str:
+    return "'" + text.replace("'", "'\\''") + "'"
+
+
+def completion_script(shell: str) -> str:
+    """最简补全脚本：第一个词补子命令与旗标，之后补旗标。手写而不引入 argcomplete：
+    一个运行期依赖换"补全子命令名"不划算，子命令自己的旗标也不逐个展开。"""
+    subcommands, flags = completion_words()
+    sub_names = " ".join(name for name, _ in subcommands)
+    flag_names = " ".join(flag for flag, _ in flags)
+    if shell == "bash":
+        return (
+            "# xiaoyu bash 补全：eval \"$(xiaoyu completion bash)\" 或存进 ~/.bash_completion.d/\n"
+            "_xiaoyu_complete() {\n"
+            "    local cur=\"${COMP_WORDS[COMP_CWORD]}\"\n"
+            "    if [ \"$COMP_CWORD\" -eq 1 ]; then\n"
+            f"        COMPREPLY=( $(compgen -W \"{sub_names} {flag_names}\" -- \"$cur\") )\n"
+            "    else\n"
+            f"        COMPREPLY=( $(compgen -W \"{flag_names}\" -- \"$cur\") )\n"
+            "    fi\n"
+            "}\n"
+            "complete -o default -F _xiaoyu_complete xiaoyu\n"
+        )
+    if shell == "zsh":
+        sub_specs = " ".join(_sh_quote(f"{name}:{summary}") for name, summary in subcommands)
+        flag_specs = " ".join(_sh_quote(f"{flag}:{summary}" if summary else flag) for flag, summary in flags)
+        return (
+            "# xiaoyu zsh 补全：eval \"$(xiaoyu completion zsh)\"（需先 autoload -U compinit && compinit）\n"
+            "_xiaoyu() {\n"
+            "    local -a subs flags\n"
+            f"    subs=({sub_specs})\n"
+            f"    flags=({flag_specs})\n"
+            "    if (( CURRENT == 2 )); then\n"
+            "        _describe -t subcommands '子命令' subs\n"
+            "    fi\n"
+            "    _describe -t options '旗标' flags\n"
+            "    _files\n"
+            "}\n"
+            "compdef _xiaoyu xiaoyu\n"
+        )
+    if shell == "fish":
+        lines = ["# xiaoyu fish 补全：xiaoyu completion fish > ~/.config/fish/completions/xiaoyu.fish"]
+        for name, summary in subcommands:
+            lines.append(f"complete -c xiaoyu -n __fish_use_subcommand -a {name} -d {_sh_quote(summary)}")
+        for flag, summary in flags:
+            desc = f" -d {_sh_quote(summary)}" if summary else ""
+            lines.append(f"complete -c xiaoyu -l {flag[2:]}{desc}")
+        return "\n".join(lines) + "\n"
+    raise ValueError(f"不支持的 shell：{shell}")
+
+
+def completion_command(argv: list[str]) -> int:
+    """`xiaoyu completion bash|zsh|fish`：把补全脚本打到 stdout。"""
+    parser = argparse.ArgumentParser(
+        prog="xiaoyu completion",
+        description='输出 shell 补全脚本。用法：eval "$(xiaoyu completion zsh)"，'
+        "或 fish：xiaoyu completion fish > ~/.config/fish/completions/xiaoyu.fish",
+    )
+    parser.add_argument("shell", choices=COMPLETION_SHELLS)
+    args = parser.parse_args(argv)
+    print(completion_script(args.shell), end="")
+    return 0
 
 
 def terminal_setup_command(argv: list[str]) -> int:
@@ -1610,6 +1842,16 @@ def serve_command(argv: list[str]) -> int:
         help="把 OpenAPI schema 打到 stdout 后退出（贴给 Dify 自定义工具用），不起服务",
     )
     parser.add_argument(
+        "--tls-cert",
+        dest="tls_cert",
+        help="TLS 证书（PEM）。与 --tls-key 成对给，服务改以 https 监听（uvicorn 直接终止 TLS）",
+    )
+    parser.add_argument(
+        "--tls-key",
+        dest="tls_key",
+        help="TLS 私钥（PEM），与 --tls-cert 成对给",
+    )
+    parser.add_argument(
         "--public-url",
         dest="public_url",
         default="",
@@ -1622,6 +1864,18 @@ def serve_command(argv: list[str]) -> int:
     if not root.is_dir():
         print(ui.error(f"工作区不存在：{root}"), file=sys.stderr)
         return 2
+    #  TLS 两件必须成对：只给一个起不了 https，静默退回 http 会让人以为已加密
+    if bool(args.tls_cert) != bool(args.tls_key):
+        print(ui.error("--tls-cert 与 --tls-key 必须一起给"), file=sys.stderr)
+        return 2
+    tls_cert = tls_key = None
+    if args.tls_cert:
+        tls_cert = Path(args.tls_cert).expanduser()
+        tls_key = Path(args.tls_key).expanduser()
+        for label, path in (("--tls-cert", tls_cert), ("--tls-key", tls_key)):
+            if not path.is_file():
+                print(ui.error(f"{label} 指向的文件不存在：{path}"), file=sys.stderr)
+                return 2
     #  与主命令同一道门，且必须在 load_dotenv 之前：工作区 .env 是被门管的对象。
     #  服务端不可能弹窗问人，所以非交互判定（headless 纪律，与 --acp 一致）
     trust = resolve_folder_trust(root, grant=False, interactive=False)
@@ -1647,12 +1901,14 @@ def serve_command(argv: list[str]) -> int:
         state_dir=Path(args.state_dir).expanduser().resolve() if args.state_dir else None,
         persist=args.persist,
         public_url=args.public_url,
+        tls_cert=tls_cert,
+        tls_key=tls_key,
     )
     try:
         if args.print_openapi:
             return print_openapi(cfg)
         if args.host in ("127.0.0.1", "::1", "localhost") or args.token:
-            print(ui.success(f"xiaoyu serve → http://{args.host}:{args.port}  (root: {root})"))
+            print(ui.success(f"xiaoyu serve → {cfg.scheme}://{args.host}:{args.port}  (root: {root})"))
             extra = " · MCP /mcp" if args.mcp else ""
             print(ui.secondary(f"  文档 /docs · schema /openapi.json{extra} · Ctrl+C 停"))
         return serve(cfg)
@@ -2825,6 +3081,7 @@ def ask_one_text(item: dict[str, Any], position: str = "") -> str | None:
 
 def text_ask_questions(questions: list[dict[str, Any]]) -> dict[str, str]:
     """明文 REPL 的 asker（ask_user 工具）：顺序逐题问，语义与 TUI 面板对齐。"""
+    attention.waiting(attention.WAITING_INPUT)
     answers: dict[str, str] = {}
     total = len(questions)
     for number, item in enumerate(questions, start=1):
@@ -3159,6 +3416,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.goal:
         #  --goal 与会话里的 /goal 同义：一次性模式没有机会敲斜杠命令
         agent.set_goal(args.goal)
+    agent.show_stats = args.stats
     if config.unguarded and prompt:
         #  一次性模式不进 repl/TUI，开场警告走 stderr（stdout 是这条命令的产物）
         from . import guardrails
@@ -3351,6 +3609,15 @@ def terminate_background_commands(agent: Agent) -> list[dict[str, Any]]:
     ]
 
 
+def turn_stats_line(agent: Any) -> str:
+    """`--stats` 开着时本轮的计时一行；没开或本轮没请求返回空串。
+    getattr 兜底：测试里的替身 agent 没有这两个属性。"""
+    if not getattr(agent, "show_stats", False):
+        return ""
+    stats = getattr(agent, "turn_stats", None)
+    return stats.summary() if stats is not None else ""
+
+
 def run_once(
     agent: Agent,
     user_input: str | list[dict[str, Any]],
@@ -3430,6 +3697,8 @@ def _run_once(
             )
         #  一次性模式也把用量打出来：做了模型路由就得看得见每个模型花了多少
         print(ui.secondary(f"\n{agent.usage}"))
+        if stats := turn_stats_line(agent):
+            print(ui.secondary(stats))
         return 1 if error else 0
 
     #  json / stream-json 的收尾对象结构相同；stream-json 带 kind 与事件流同一词汇
@@ -3440,6 +3709,15 @@ def _run_once(
     }
     if output_schema is not None:
         payload["output"] = agent.structured_output
+    if getattr(agent, "show_stats", False):
+        #  --stats 的结构化形态：与 text 那一行同源的数字，不另算
+        stats = agent.turn_stats
+        payload["stats"] = {
+            "duration_ms": stats.duration_ms,
+            "ttft_ms": stats.ttft_ms,
+            "completion_tokens": stats.completion_tokens,
+            "requests": stats.requests,
+        }
     if agent.session_log:
         payload["session_log"] = str(agent.session_log.path)
         if not getattr(agent.session_log, "complete", True):
@@ -3582,6 +3860,15 @@ def background_status(agent: Agent) -> str:
 
 
 def repl(agent: Agent) -> int:
+    #  窗口标题随会话走，任何退出路径都还原（与 TUI 同一纪律）
+    attention.set_title(agent.config.workspace)
+    try:
+        return _repl_loop(agent)
+    finally:
+        attention.clear_title()
+
+
+def _repl_loop(agent: Agent) -> int:
     config = agent.config
     #  模型/工作区/help 提示都在启动横幅里了，这里只留必须扎眼的警告
     if config.unguarded:
@@ -3634,6 +3921,10 @@ def repl(agent: Agent) -> int:
             print(ui.error(f"\n请求失败：{type(exc).__name__}: {exc}"))
         if note := background_status(agent):
             print(ui.secondary(note))
+        if stats := turn_stats_line(agent):
+            print(ui.secondary(f"  {stats}"))
+        #  一轮收尾 = 回到"等人"：铃（opt-in）+ 状态钩子
+        attention.waiting(attention.WAITING_INPUT)
         print()
 
 
@@ -4035,6 +4326,8 @@ def make_confirm(permissions: Permissions):
     """
 
     def confirm(name: str, args: dict[str, Any]) -> bool | str:
+        #  审批挂起 = 轮次卡在等人：铃（opt-in）与状态钩子把切走的人叫回来
+        attention.waiting(attention.WAITING_APPROVAL)
         if name == "write_file":
             content = str(args.get("content", ""))
             head = content.split("\n")[:12]

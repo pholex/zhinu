@@ -80,8 +80,10 @@ def normalize_event(event: dict[str, Any], tmp: str) -> dict[str, Any]:
     """stream-json 的一行 → 可比对形态（在 test_e2e_scripted 的雏形上扩）。"""
     out: dict[str, Any] = {}
     for key, value in event.items():
-        if key == "seconds":
-            out[key] = 0
+        if key in ("seconds", "duration_ms", "ttft_ms"):
+            #  计时字段（工具耗时、请求耗时、首 token 延迟）每次都不同，一律归零；
+            #  ttft 的 None（一个 chunk 都没等到）是语义，保留
+            out[key] = 0 if value is not None else None
         elif key == "session_log":
             out[key] = "<session_log>"
         elif isinstance(value, str):

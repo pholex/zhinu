@@ -418,7 +418,8 @@ Windows 为 `%APPDATA%\xiaoyu\serve\<root slug>\`；启动后 `GET /health` 的 
 - `--workspace` 是 root，会话只能落在它或它的子目录里，越界 `400`
 - folder trust 非交互判定（与 `--acp` 同一纪律）：没信任记录的目录不吃工作区级
   `.mcp.json` / `permissions` / `.env`，也绝不在协议通道上发问
-- 要暴露到公网就自己在前面放反代 + TLS。这个服务本身不做 TLS，也不做限流
+- 要暴露到公网，首选前面放反代做 TLS；没有反代可放时 `--tls-cert/--tls-key` 让服务自己以
+  https 监听（见下节）。限流不做
 - CORS：**Chrome 扩展 origin（`chrome-extension://<id>`）默认放行**，装了扩展填上地址和 token
   就能连，不用逐个列 id（开发者模式每台机器的 id 不同、商店版又是另一个）；`--no-cors-extensions`
   关掉。其它浏览器客户端（自研 Web 控制台）默认**不发 CORS 头**，要用 `--cors-origin https://console.example.com`
@@ -427,6 +428,18 @@ Windows 为 `%APPDATA%\xiaoyu\serve\<root slug>\`；启动后 `GET /health` 的 
 - 浏览器桥（`/session/{id}/browser`）是反过来的：扩展连上来后 agent 能操作**用户登录态的
   浏览器**。写类动作（开页 / 跳转 / 点击 / 输入）默认走审批回路，只读三件免审；
   token 在第一帧里校验，会话私有，断线即注销——见 [docs/browser-bridge.md](browser-bridge.md)
+
+### TLS：`--tls-cert` / `--tls-key`
+
+```bash
+xiaoyu serve --host 0.0.0.0 --token "$TOKEN" --tls-cert fullchain.pem --tls-key privkey.pem
+#  → https://0.0.0.0:8420
+```
+
+两个文件（PEM）必须成对给，只给一个直接拒绝启动——静默退回 http 会让人以为已加密。
+证书由 uvicorn 直接加载（`ssl_certfile` / `ssl_keyfile`），自签证书照样可用，客户端自己决定
+信不信。`--public-url` 记得写 `https://…`，OpenAPI schema 里的 `servers` 才对得上。
+绑非回环地址仍然必须给 `--token`：TLS 管的是链路加密，不是鉴权。
 
 ---
 

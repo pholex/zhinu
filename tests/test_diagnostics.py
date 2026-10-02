@@ -322,5 +322,131 @@ class DoctorCommandTest(unittest.TestCase):
         self.assertIn("gauges", payload["diagnostics"])
 
 
+
+#  假凭据按运行期拼出来：字面量会撞提交前的敏感词检查，而且本来就不该有一个"长得像真的"的 key 躺在仓库里
+FAKE_KEY = "sk-" + "a" * 24
+
+
+class ProbeTest(unittest.TestCase):
+    """--probe：对默认模型真发一条请求。这里用假 registry，不出网。"""
+
+    def _route(self, client):
+        import types
+
+        return types.SimpleNamespace(provider="fake", model="m", qualified="fake/m", client=client)
+
+    def _run(self, client):
+        import types
+
+        registry = types.SimpleNamespace(resolve=lambda name: self._route(client))
+        config = types.SimpleNamespace(model="m")
+        with mock.patch("xiaoyu.providers.build", return_value=registry):
+            return diagnostics.probe_model(config)
+
+    def test_ok_reports_latency_and_reply(self) -> None:
+        import types
+
+        message = types.SimpleNamespace(content="ok")
+        response = types.SimpleNamespace(
+            choices=[types.SimpleNamespace(message=message)],
+            usage=types.SimpleNamespace(prompt_tokens=5, completion_tokens=1),
+        )
+        client = types.SimpleNamespace(
+            chat=types.SimpleNamespace(
+                completions=types.SimpleNamespace(create=lambda **kw: response)
+            )
+        )
+        check = self._run(client)
+        self.assertEqual(check.status, "ok")
+        self.assertIn("fake/m 应答", check.summary)
+        self.assertIn("ms", check.summary)
+        self.assertIn("回复：ok", check.details)
+
+    def test_failure_is_classified_not_raised(self) -> None:
+        import types
+
+        import httpx
+        import openai
+
+        def boom(**kw):
+            request = httpx.Request("POST", "http://unused")
+            response = httpx.Response(401, request=request)
+            raise openai.AuthenticationError("bad key " + FAKE_KEY, response=response, body=None)
+
+        client = types.SimpleNamespace(
+            chat=types.SimpleNamespace(completions=types.SimpleNamespace(create=boom))
+        )
+        check = self._run(client)
+        self.assertEqual(check.status, "fail")
+        self.assertIn("auth", check.summary)
+        self.assertTrue(check.remedy)
+        #  报错正文里的凭据不进体检输出
+        self.assertNotIn(FAKE_KEY, "\n".join(check.details))
+
+    def test_missing_config_is_a_check_not_a_traceback(self) -> None:
+        from xiaoyu.config import MissingConfig
+
+        with mock.patch("xiaoyu.providers.build", side_effect=MissingConfig("没有 key")):
+            check = diagnostics.probe_model(object())
+        self.assertEqual(check.status, "fail")
+        self.assertIn("provider", check.summary)
+
+
+class BundleTest(unittest.TestCase):
+    """--bundle：诊断包的脱敏、尾部截取、symlink 拒绝、0600。"""
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+
+    def test_redact_value_by_name_and_by_pattern(self) -> None:
+        self.assertEqual(diagnostics.redact_value("XIAOYU_API_KEY", "abc"), "[REDACTED]")
+        self.assertEqual(diagnostics.redact_value("XIAOYU_SERVE_TOKEN", "abc"), "[REDACTED]")
+        self.assertEqual(diagnostics.redact_value("XIAOYU_MODEL", "deepseek-flash"), "deepseek-flash")
+        self.assertNotIn(
+            FAKE_KEY,
+            diagnostics.redact_value("XIAOYU_BASE_URL", "https://x/?k=" + FAKE_KEY),
+        )
+
+    def test_tail_lines_respects_both_limits(self) -> None:
+        path = self.root / "log.jsonl"
+        path.write_text("".join(f"line {i}\n" for i in range(1000)), encoding="utf-8")
+        self.assertEqual(diagnostics.tail_lines(path, 3, 10_000), ["line 997", "line 998", "line 999"])
+        #  字节上限切在行中间：半截首行丢掉，剩下的都是完整行
+        lines = diagnostics.tail_lines(path, 1000, 50)
+        self.assertTrue(all(line.startswith("line ") for line in lines))
+        self.assertEqual(lines[-1], "line 999")
+
+    def test_bundle_redacts_secrets_and_refuses_symlink(self) -> None:
+        session = self.root / "20260101-000000-1.jsonl"
+        session.write_text(
+            json.dumps({"event": "meta", "model": "m", "workspace": "/ws"}) + "\n"
+            + json.dumps({"role": "user", "content": "token " + FAKE_KEY}) + "\n",
+            encoding="utf-8",
+        )
+        checks = [diagnostics.Check("python", "ok", "fine")]
+        env = {"XIAOYU_API_KEY": FAKE_KEY, "XIAOYU_MODEL": "m"}
+        out = self.root / "bundle.json"
+        with mock.patch.dict(os.environ, env), mock.patch(
+            "xiaoyu.crash_guard._resolve_path", return_value=self.root / "crash.log"
+        ):
+            written = diagnostics.build_bundle(checks, self.root, session, out)
+        self.assertEqual(written, out)
+        payload = json.loads(out.read_text(encoding="utf-8"))
+        self.assertEqual(payload["config"]["env"]["XIAOYU_API_KEY"], "[REDACTED]")
+        self.assertEqual(payload["config"]["env"]["XIAOYU_MODEL"], "m")
+        self.assertEqual(payload["session"]["tail_lines"], 2)
+        self.assertNotIn("sk-", json.dumps(payload))
+        self.assertEqual(payload["doctor"]["checks"][0]["id"], "python")
+        self.assertIn("分享前", payload["notice"])
+        if os.name != "nt":
+            self.assertEqual(out.stat().st_mode & 0o777, 0o600)
+            link = self.root / "link.json"
+            link.symlink_to(out)
+            with self.assertRaises(ValueError):
+                diagnostics.build_bundle(checks, self.root, session, link)
+
+
 if __name__ == "__main__":
     unittest.main()

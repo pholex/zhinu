@@ -29,6 +29,9 @@
 pip install "xiaoyu-agent[tui]"        # [tui]：补全 / 历史 / 粘贴折叠 / 贴图 / diff 高亮
 pip install "xiaoyu-agent[tui,serve]"  # 还要 HTTP API（n8n / Dify 编排）就带上 [serve]
 xiaoyu doctor                          # 体检：版本与安装方式 / 凭据有无 / 沙箱 / 磁盘 / MCP 配置（--json 给脚本，任一 FAIL 退出码 1）
+xiaoyu doctor --probe                  # 再对默认模型真发一条最小请求，报耗时与分类后的错误（默认不出网）
+xiaoyu doctor --bundle                 # 打诊断包（体检 + 脱敏配置 + 最近会话尾部 + 崩溃日志）给报 issue 用；含路径与命令历史，分享前自查
+eval "$(xiaoyu completion zsh)"       # shell 补全（bash / zsh / fish）
 xiaoyu update                          # 升级（已装 serve 时自动一并升级；有新版时交互式启动会提一行）
 xiaoyu uninstall                       # 卸载；--purge 连配置目录一起删
 ```
@@ -70,6 +73,9 @@ xy resume --last "继续把测试修完"
 xy -s nightly "跑一下回归"                # 命名会话：同名接着聊，脚本反复调用用它
 
 xiaoyu sessions                         # 列出本机会话
+xiaoyu sessions export 1 > chat.md      # 导出一场历史会话（Markdown / --format json，不含 system 提示）
+xiaoyu sessions rename 1 "登录页修复"   # 给它起个名字，resume 列表里代替首条消息
+xy --stats "跑一下测试"                  # 收尾多一行：耗时 / 首 token / 输出 tok/s（交互模式也认）
 xiaoyu send zhinu-1 "顺便把 lint 跑一下"  # 给另一个终端里的小羽递话
 
 xiaoyu mcp add chrome-devtools --scope user npx -y chrome-devtools-mcp@latest

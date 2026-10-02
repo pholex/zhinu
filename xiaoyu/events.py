@@ -23,7 +23,7 @@ from __future__ import annotations
 import threading
 import time
 
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from typing import Any, ClassVar, Literal, Protocol
 
 NoticeLevel = Literal["info", "warn", "error"]
@@ -73,9 +73,20 @@ class RequestEnded(UIEvent):
     """这次模型调用的响应流已消费完（或因异常/中断终止）。
 
     只是兜底的终态：正文或工具调用一出现，前端就该收掉等待指示了，不必等到这里。
+
+    顺带捎上这一次调用的计时与用量——"慢"到底慢在排队（首 token 迟迟不来）
+    还是慢在吐字（tok/s 低），只看一轮总耗时分不出来；按请求记才有分辨率。
+    三个字段都有默认值：老消费方 `RequestEnded()` 照常构造，线上形态只是多几个键。
+    - duration_ms：从发出请求到流消费完；
+    - ttft_ms：首个 chunk 到达的延迟，一个 chunk 都没等到（异常/中断）为 None；
+    - usage：这次调用的 prompt_tokens / completion_tokens / cached_tokens，
+      上游没回 usage 时为空 dict（不编数）。
     """
 
     kind: ClassVar[str] = "request.ended"
+    duration_ms: int = 0
+    ttft_ms: int | None = None
+    usage: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)

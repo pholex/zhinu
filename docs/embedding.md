@@ -145,7 +145,8 @@ async with contextlib.aclosing(async_agent.stream("任务")) as events:
 
 | 事件 | kind | 字段 |
 |---|---|---|
-| `RequestStarted` / `RequestEnded` | `request.started` / `request.ended` | `model` |
+| `RequestStarted` | `request.started` | `model` |
+| `RequestEnded` | `request.ended` | `duration_ms`、`ttft_ms`（首个 chunk 延迟；一个都没等到为 `null`）、`usage`（这次调用的 `prompt_tokens` / `completion_tokens` / `cached_tokens`；上游没回 usage 为 `{}`） |
 | `TextDelta` / `TextEnd` | `text.delta` / `text.end` | `text` |
 | `ToolPending` | `tool.pending` | `name`, `args` |
 | `ToolPurpose` | `tool.purpose` | `name`, `purpose` |
