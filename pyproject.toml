@@ -17,7 +17,7 @@ requires-python = ">=3.11"
 # 精确锁版本（供应链纪律）：范围声明会让 PyPI 上被投毒的
 # 新版本无需审查自动进入用户机器。升级 = 有意改这一行并重跑测试。
 dependencies = [
-    "openai==2.52.0",
+    "openai==3.20.0",
     #  Anthropic Messages 协议直连（xiaoyu/messages.py）。与 openai 同为
     #  Stainless 生成、共享 httpx 传输，锁版本纪律相同
     "anthropic==0.121.0",
