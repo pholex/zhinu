@@ -15,6 +15,13 @@
 `doctor` 部分只回答"这台机器能不能把小羽跑顺"：Python 版本、配置目录、磁盘、
 provider 凭据**有无**（永不回显值）、出网代理解析结果、沙箱、命令解析器、MCP 配置、会话目录。
 每项 ok / warn / fail 三档，任一 fail 退出码非零，`--json` 给脚本用。
+
+两个按需的扩展，默认都不跑：
+- `--probe`：对默认模型发一条最小真实请求（会出网、会花一点点钱），记耗时，
+  失败按 errors.classify 的分类报——"配置看着都对但就是不通"只有真发一次才知道；
+- `--bundle`：把体检结果、脱敏后的生效配置、一场会话日志的尾部、崩溃日志尾部和
+  版本/平台信息打成一个 JSON，给报 issue 用。密钥一律脱敏，但路径与命令历史
+  会原样带着——分享前自己过一遍。
 """
 
 from __future__ import annotations
@@ -591,6 +598,204 @@ def run_doctor(workspace: Path | None = None) -> list[Check]:
         check_sessions(sessions_dir()),
     ]
     return checks
+
+
+# ---------- --probe：最小真实请求 ----------
+
+PROBE_PROMPT = "回复 ok"
+
+
+def probe_model(config: Any = None) -> Check:
+    """对默认模型发一条最小真实请求，记耗时；失败按 errors 的分类报。
+
+    默认不跑（会出网）：只在 `doctor --probe` 时调。非流式、不带工具，
+    与压缩摘要走的是同一条 create 路径——三条协议的适配层都认。
+    """
+    from . import errors, providers
+    from .config import Config, MissingConfig
+    from .mcp import _redact
+
+    try:
+        config = config if config is not None else Config.from_env()
+        registry = providers.build(config)
+        route = registry.resolve(config.model)
+    except MissingConfig as exc:
+        return Check("probe", "fail", "没有可用的 provider 配置", [str(exc)], remedy="先跑 xiaoyu config")
+    except Exception as exc:  # noqa: BLE001 - 装配阶段的任何失败都是体检结论，不是 traceback
+        return Check("probe", "fail", f"装配 provider 失败：{type(exc).__name__}", [_redact(str(exc))[:300]])
+    started = time.monotonic()
+    try:
+        response = route.client.chat.completions.create(
+            model=route.model,
+            messages=[{"role": "user", "content": PROBE_PROMPT}],
+        )
+    except Exception as exc:  # noqa: BLE001 - 请求失败正是要报告的东西
+        elapsed = round((time.monotonic() - started) * 1000)
+        verdict = errors.classify(exc)
+        return Check(
+            "probe", "fail",
+            f"{route.qualified} 请求失败（{verdict.kind}，{elapsed} ms）",
+            [f"{type(exc).__name__}: {_redact(str(exc))[:300]}"],
+            remedy=verdict.hint,
+        )
+    elapsed = round((time.monotonic() - started) * 1000)
+    text = ""
+    with contextlib.suppress(Exception):
+        text = str(response.choices[0].message.content or "")
+    text = " ".join(text.split())[:60]
+    details = [f"回复：{text or '（空）'}"]
+    usage = getattr(response, "usage", None)
+    if usage is not None:
+        details.append(
+            f"usage：in {getattr(usage, 'prompt_tokens', 0) or 0} / out {getattr(usage, 'completion_tokens', 0) or 0}"
+        )
+    if not text:
+        return Check("probe", "warn", f"{route.qualified} 应答但正文为空（{elapsed} ms）", details)
+    return Check("probe", "ok", f"{route.qualified} 应答 {elapsed} ms", details)
+
+
+# ---------- --bundle：诊断包 ----------
+
+#  会话日志尾部的上限：行数与字节数取先到的那个——报 issue 要的是"最后发生了什么"
+BUNDLE_TAIL_LINES = 200
+BUNDLE_TAIL_BYTES = 256 * 1024
+#  崩溃日志只带尾部
+BUNDLE_CRASH_BYTES = 64 * 1024
+#  变量名含这些片段的一律按密钥处理，值不进包
+_SECRET_NAME_MARKERS = ("KEY", "TOKEN", "SECRET", "PASSWORD", "PASSWD", "CREDENTIAL")
+
+BUNDLE_NOTICE = "诊断包含工作区路径与命令历史（密钥已脱敏），分享前请自查。"
+
+
+def redact_value(name: str, value: str) -> str:
+    """配置值脱敏：名字像密钥的整个换掉，其余过凭据正则（sk-… / Bearer / URL 账号密码）。"""
+    from .mcp import _redact
+
+    upper = name.upper()
+    if any(marker in upper for marker in _SECRET_NAME_MARKERS):
+        return "[REDACTED]" if value else ""
+    return _redact(value)
+
+
+def effective_config() -> dict[str, Any]:
+    """脱敏后的生效配置：XIAOYU_* 环境变量（含 .env 合并后的）+ 生效 provider 清单。"""
+    from . import providers
+    from .config import Config, MissingConfig, load_dotenv, user_config_dir
+
+    with contextlib.suppress(Exception):
+        load_dotenv()
+    variables = {
+        name: redact_value(name, value)
+        for name, value in sorted(os.environ.items())
+        if name.startswith("XIAOYU_")
+    }
+    result: dict[str, Any] = {"env": variables, "config_dir": str(user_config_dir())}
+    try:
+        registry = providers.build(Config.from_env())
+    except MissingConfig as exc:
+        result["providers_error"] = str(exc)
+    except Exception as exc:  # noqa: BLE001 - 配置坏了也是诊断信息
+        result["providers_error"] = f"{type(exc).__name__}: {exc}"
+    else:
+        result["providers"] = [
+            {"name": provider.name, "display": provider.display, "models": list(provider.models)}
+            for provider in registry.providers
+        ]
+    return result
+
+
+def tail_lines(path: Path, max_lines: int, max_bytes: int) -> list[str]:
+    """文件尾部的若干行（两个上限先到为准）。被字节上限切掉的首行丢弃——半行没有意义。"""
+    try:
+        size = path.stat().st_size
+        with path.open("rb") as handle:
+            if size > max_bytes:
+                handle.seek(size - max_bytes)
+                truncated = True
+            else:
+                truncated = False
+            raw = handle.read()
+    except OSError:
+        return []
+    text = raw.decode("utf-8", errors="replace")
+    lines = text.splitlines()
+    if truncated and lines:
+        lines = lines[1:]
+    return lines[-max_lines:]
+
+
+def session_tail(path: Path) -> dict[str, Any]:
+    """一场会话日志的尾部，逐行脱敏；读不了也如实写进包。"""
+    from .mcp import _redact
+
+    lines = tail_lines(path, BUNDLE_TAIL_LINES, BUNDLE_TAIL_BYTES)
+    return {
+        "path": str(path),
+        "tail_lines": len(lines),
+        "lines": [_redact(line) for line in lines],
+    }
+
+
+def write_private(path: Path, text: str) -> None:
+    """0600 写文件，拒绝 symlink：诊断包落在别人指过来的位置等于把配置写去别处。"""
+    if path.is_symlink():
+        raise ValueError(f"输出路径是符号链接，拒绝写入：{path}")
+    flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, "O_NOFOLLOW", 0)
+    fd = os.open(str(path), flags, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as handle:
+        handle.write(text)
+
+
+def build_bundle(
+    checks: list[Check],
+    workspace: Path | None = None,
+    session: Path | None = None,
+    out: Path | None = None,
+) -> Path:
+    """把体检结果与现场打成一个 JSON 文件，返回路径。
+
+    session=None 时取当前工作区最近一场（没有就全局最近）；out=None 落在当前
+    目录的 `xiaoyu-doctor-<时间戳>.json`。密钥脱敏，其余原样——见 BUNDLE_NOTICE。
+    """
+    import platform
+    from datetime import datetime
+
+    from . import __version__, crash_guard
+    from .mcp import _redact
+    from .session_log import list_sessions
+
+    workspace = (workspace or Path.cwd()).resolve()
+    if session is None:
+        found = list_sessions(limit=1, workspace=str(workspace)) or list_sessions(limit=1)
+        session = found[0].path if found else None
+    payload: dict[str, Any] = {
+        "generated_at": datetime.now().isoformat(timespec="seconds"),
+        "notice": BUNDLE_NOTICE,
+        "version": __version__,
+        "platform": {
+            "python": sys.version.split()[0],
+            "platform": platform.platform(),
+            "os": os.name,
+            "executable": sys.executable,
+        },
+        "workspace": str(workspace),
+        "doctor": {"status": overall(checks), "checks": [check.to_dict() for check in checks]},
+        "diagnostics": report(),
+        "config": effective_config(),
+        "session": session_tail(session) if session is not None else {"note": "没有会话记录"},
+    }
+    crash = crash_guard._resolve_path()
+    if crash.is_file():
+        crash_lines = tail_lines(crash, 400, BUNDLE_CRASH_BYTES)
+        payload["crash_log"] = {"path": str(crash), "lines": [_redact(line) for line in crash_lines]}
+    else:
+        payload["crash_log"] = {"path": str(crash), "note": "没有崩溃记录"}
+    if out is None:
+        stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+        out = Path.cwd() / f"xiaoyu-doctor-{stamp}.json"
+    out = out.expanduser()
+    write_private(out, json.dumps(payload, ensure_ascii=False, indent=2))
+    return out
 
 
 def overall(checks: list[Check]) -> str:

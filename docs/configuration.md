@@ -144,6 +144,9 @@ XIAOYU_API_KEY=<key>
 | `XIAOYU_SANDBOX_NETWORK` | 开 | 沙箱内是否允许联网（`0` = 断网） |
 | `XIAOYU_SANDBOX_WRITABLE` | — | 追加可写根目录，冒号分隔 |
 | `XIAOYU_THEME` | `auto` | `dark` / `light` 跳过终端背景色探测 |
+| `XIAOYU_BELL` | 关 | `1` = 一轮结束 / 等审批时往终端写响铃（BEL），终端翻译成提示音、Dock 弹跳或标签高亮；只对真终端写，管道里不写 |
+| `XIAOYU_TITLE` | 开 | 交互模式把窗口标题设成「xiaoyu · 目录名」，退出时还原（认标题栈的终端精确还原，其余清空）；`0` = 关 |
+| `XIAOYU_STATUS_HOOK` | — | 状态变成"等人"时后台跑的命令，状态串作最后一个参数（`waiting_input` / `waiting_approval`），也放进环境变量 `XIAOYU_STATUS`。给系统通知用，如 macOS：`osascript -e 'display notification "小羽在等你"'`；超时（10s）与失败静默。只在 TUI / 明文 REPL 生效 |
 | `XIAOYU_BROWSER_CDP` | — | 接管以 `--remote-debugging-port` 起的本机 Chrome（要登录态时用） |
 | `XIAOYU_BROWSER_HEADED` | 无头 | 有头模式启动浏览器 |
 

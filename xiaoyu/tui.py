@@ -90,7 +90,7 @@ from rich.syntax import Syntax
 from rich.text import Text
 from rich.theme import Theme as RichTheme
 
-from . import command_check, keys, media, modes, theme, ui
+from . import attention, command_check, keys, media, modes, theme, ui
 from .agent import Agent
 from .config import user_config_dir
 from .events import (
@@ -1727,6 +1727,8 @@ class Tui:
         #  poller 不停手会把用户的选择按键当成插话吃掉
         if self._poller is not None:
             self._poller.pause()
+        #  审批挂起 = 轮次卡在等人：铃（opt-in）与状态钩子把切走的人叫回来
+        attention.waiting(attention.WAITING_APPROVAL)
         try:
             return self._confirm_inner(name, args)
         finally:
@@ -1743,6 +1745,7 @@ class Tui:
         if self._poller is not None:
             self._poller.pause()
         self.sink._stop_status()  # noqa: SLF001 - 同模块前端搭档
+        attention.waiting(attention.WAITING_INPUT)
         try:
             return ask_questions(questions, self.console)
         finally:
@@ -2044,6 +2047,14 @@ class Tui:
         """交互循环。与明文 repl 的差异：Ctrl-C 需在 2 秒内按两次才退出
         （单次防误触），Ctrl-D 仍即刻退出；多出 @ 文件补全与 Ctrl-O 等按键
         （! / # 前缀两个前端已对齐，路由同走 keys.classify_input）。"""
+        #  窗口标题随会话走，退出时还原——任何退出路径（Ctrl-D、/exit、异常）都要还
+        attention.set_title(agent.config.workspace)
+        try:
+            return self._run_loop(agent)
+        finally:
+            attention.clear_title()
+
+    def _run_loop(self, agent: Agent) -> int:
         from .cli import handle_slash
 
         self.agent = agent
@@ -2151,7 +2162,13 @@ class Tui:
 
             if note := background_status(agent):
                 self.console.print(Text(note, style="text.secondary"))
+            from .cli import turn_stats_line
+
+            if stats := turn_stats_line(agent):
+                self.console.print(Text(f"  {stats}", style="text.secondary"))
             self._print_expand_hint()
+            #  一轮收尾 = 回到"等人"：铃（opt-in）+ 状态钩子，把切去别处的人叫回来
+            attention.waiting(attention.WAITING_INPUT)
             #  没赶上本轮的插话（模型收尾后才按的回车）+ 等待期敲的其余内容：
             #  都转成下一轮输入行的预填——用户的话绝不凭空消失，也绝不自动提交
             leftover = agent.drain_steers()

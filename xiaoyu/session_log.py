@@ -35,7 +35,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Iterable
 
-from . import __version__, media
+from . import __version__, fsguard, media
 from .config import user_config_dir
 
 #  会话文件格式版本：resume 遇到比自己新的版本要明确拒绝，不能静默错乱。
@@ -654,6 +654,19 @@ class SessionInfo:
     workspace: str
     preview: str  # 首条用户消息的开头，作为"标题"
     session_id: str = ""  # `--session-id` 起的名字；匿名会话为空
+    title: str = ""  # `xiaoyu sessions rename` 起的显示名（meta.title）；没起过为空
+    last: str = ""  # 末条用户/助手消息的摘要（≤ LAST_PREVIEW 字）：这场聊到哪了
+
+    @property
+    def label(self) -> str:
+        """列表里的"标题"：起过名用名字，否则首条消息开头。"""
+        return self.title or self.preview
+
+
+#  末条消息摘要的长度与尾部读取窗口：只看文件最后 32KB——够找到最后一条正文，
+#  又不至于为每个文件读整场对话
+LAST_PREVIEW = 128
+_TAIL_WINDOW = 32 * 1024
 
 
 #  列表时每个文件最多读这么多行：
@@ -718,6 +731,8 @@ def _head_info(path: Path) -> SessionInfo | None:
         workspace=str(meta.get("workspace", "")),
         preview=preview or "（无用户消息）",
         session_id=str(meta.get("session_id", "")),
+        title=str(meta.get("title", "") or ""),
+        last=last_preview(path),
     )
 
 
@@ -727,6 +742,151 @@ def _head_info(path: Path) -> SessionInfo | None:
 #  （见 Agent._log_usage），所以每个文件只需取最后一条，不用重放求和。
 #  没有 usage 事件的文件（旧版本记录的、或一次调用都没发生的）单独计数，
 #  绝不静默略过——沉默会暗示"全都算进来了"。
+
+
+def last_preview(path: Path, limit: int = LAST_PREVIEW) -> str:
+    """末条有正文的用户/助手消息摘要：只读文件尾部窗口，倒着找第一条合格记录。
+
+    首条消息说的是"这场想干什么"，末条说的是"聊到哪了"——挑会话续聊时后者
+    更管用。被窗口切掉的半行、坏行、工具结果、空正文一律跳过；找不到返回空串。
+    """
+    try:
+        size = path.stat().st_size
+        with path.open("rb") as handle:
+            if size > _TAIL_WINDOW:
+                handle.seek(size - _TAIL_WINDOW)
+            raw = handle.read()
+    except OSError:
+        return ""
+    lines = raw.decode("utf-8", errors="replace").splitlines()
+    if size > _TAIL_WINDOW and lines:
+        lines = lines[1:]  # 窗口起点落在行中间：首行是半截
+    for line in reversed(lines):
+        try:
+            record = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(record, dict) or record.get("role") not in ("user", "assistant"):
+            continue
+        text = " ".join(media.text_of(record.get("content")).split())
+        if text:
+            return text[:limit]
+    return ""
+
+
+def find_session(ref: str, workspace: str | None = None) -> SessionInfo | None:
+    """按用户给的引用找会话：列表序号（`xiaoyu resume` 里的数字）、`--session-id`
+    的名字、或文件名（带不带 .jsonl 都行）。先在当前工作区找，找不到放眼全部。"""
+    ref = ref.strip()
+    if not ref:
+        return None
+    if ref.isdigit():
+        sessions = list_sessions(workspace=workspace) if workspace else []
+        if not sessions:
+            sessions = list_sessions()
+        index = int(ref)
+        return sessions[index - 1] if 1 <= index <= len(sessions) else None
+    scopes = [workspace, None] if workspace else [None]
+    for scope in scopes:
+        for info in list_sessions(limit=100_000, workspace=scope):
+            if ref in (info.session_id, info.path.name, info.path.stem, str(info.path)):
+                return info
+    return None
+
+
+MAX_TITLE = 80
+
+
+def rename_session(path: Path, title: str) -> str:
+    """给会话起显示名：改写首行 meta 的 title，其余字节原样。返回规整后的名字。
+
+    为什么改 meta 而不是追加事件：列表只读文件头几行（_head_info），名字放尾部
+    就得每个文件扫到底。整文件重写只发生在这个一次性命令里，而且先抢写锁——
+    正在被别的进程续写的会话抛 SessionLockedError，绝不在它脚下重写文件。
+    """
+    from . import ui
+
+    clean = " ".join(ui.strip_sequences(title).split())
+    if not clean:
+        raise ValueError("名字不能为空")
+    if len(clean) > MAX_TITLE:
+        raise ValueError(f"名字最长 {MAX_TITLE} 个字符，收到 {len(clean)} 个")
+    lock = SessionWriteLock(path)
+    try:
+        lines = path.read_text(encoding="utf-8", errors="replace").splitlines(keepends=True)
+        for index, line in enumerate(lines):
+            try:
+                record = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(record, dict) and record.get("event") == "meta":
+                record["title"] = clean
+                lines[index] = json.dumps(record, ensure_ascii=False) + "\n"
+                break
+        else:
+            raise ValueError("文件里没有 meta 行，不是小羽的会话记录")
+        #  原子写（同目录临时文件 + 改名，沿用目标的 0600）：中途断电也不会留下半个会话文件
+        fsguard.write_atomic(path, "".join(lines))
+    finally:
+        lock.close()
+    return clean
+
+
+def export_messages(path: Path) -> list[dict[str, Any]]:
+    """导出用的"用户可见"消息：user / assistant 的正文与工具调用摘要、tool 结果
+    的一行摘要。system 不导出——那是内核的内部提示，不是对话本身。"""
+    from . import ui
+
+    exported: list[dict[str, Any]] = []
+    for message in load_messages(path):
+        role = message.get("role")
+        if role == "user":
+            text = media.text_of(message.get("content")).strip()
+            if text:
+                exported.append({"role": "user", "text": text})
+        elif role == "assistant":
+            entry: dict[str, Any] = {"role": "assistant", "text": media.text_of(message.get("content")).strip()}
+            calls = []
+            for call in message.get("tool_calls") or []:
+                function = call.get("function") or {}
+                name = str(function.get("name", "") or "")
+                try:
+                    args = json.loads(function.get("arguments") or "{}")
+                except (TypeError, ValueError):
+                    args = {}
+                calls.append({"name": name, "summary": ui.tool_summary(name, args if isinstance(args, dict) else {})})
+            if calls:
+                entry["tool_calls"] = calls
+            if entry["text"] or calls:
+                exported.append(entry)
+        elif role == "tool":
+            text = " ".join(media.text_of(message.get("content")).split())
+            exported.append({"role": "tool", "text": text[:200]})
+    return exported
+
+
+def export_markdown(info: SessionInfo) -> str:
+    """一场会话的 Markdown 转写（给人读、贴 issue、归档）。"""
+    lines = [f"# {info.label}", ""]
+    lines.append(f"- 开始：{info.started_at}")
+    lines.append(f"- 模型：{info.model}")
+    lines.append(f"- 工作区：{info.workspace}")
+    lines.append(f"- 文件：{info.path}")
+    lines.append("")
+    for entry in export_messages(info.path):
+        if entry["role"] == "user":
+            lines += ["## 用户", "", entry["text"], ""]
+        elif entry["role"] == "assistant":
+            lines += ["## 小羽", ""]
+            if entry["text"]:
+                lines += [entry["text"], ""]
+            for call in entry.get("tool_calls", []):
+                lines.append(f"- 调用 `{call['name']}`：{call['summary']}")
+            if entry.get("tool_calls"):
+                lines.append("")
+        else:
+            lines += [f"> 工具结果：{entry['text']}", ""]
+    return "\n".join(lines).rstrip() + "\n"
 
 
 @dataclass

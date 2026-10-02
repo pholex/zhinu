@@ -232,6 +232,14 @@ class ServeConfig:
     cors_origins: tuple[str, ...] = ()
     #  浏览器桥（/session/{id}/browser）：等扩展回一次调用结果的上限（秒）
     browser_timeout: float = DEFAULT_CALL_TIMEOUT
+    #  TLS：证书与私钥成对给（PEM），由 uvicorn 直接终止 TLS。只给一个在 CLI 层就拒绝。
+    #  没有反代可放、又要出回环地址时用；有反代的仍建议在反代上做 TLS
+    tls_cert: Path | None = None
+    tls_key: Path | None = None
+
+    @property
+    def scheme(self) -> str:
+        return "https" if self.tls_cert is not None else "http"
 
     def resolved_state_dir(self) -> Path:
         if self.state_dir is not None:
@@ -1981,7 +1989,10 @@ def serve(cfg: ServeConfig) -> int:
         )
         return 2
     app = create_app(cfg)
-    uvicorn.run(app, host=cfg.host, port=cfg.port, log_level="warning")
+    tls: dict[str, Any] = {}
+    if cfg.tls_cert is not None and cfg.tls_key is not None:
+        tls = {"ssl_certfile": str(cfg.tls_cert), "ssl_keyfile": str(cfg.tls_key)}
+    uvicorn.run(app, host=cfg.host, port=cfg.port, log_level="warning", **tls)
     return 0
 
 
