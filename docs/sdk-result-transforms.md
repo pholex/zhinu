@@ -1,6 +1,6 @@
 # 工具结果文本变换
 
-当前源码新增，尚未发布。宿主通过 `SessionOptions.result_transforms` 显式注册
+自 0.62.0 起提供。宿主通过 `SessionOptions.result_transforms` 显式注册
 同步或异步 Python 回调，在工具返回文本进入截断、recall 落盘与模型上下文之前
 完成业务脱敏或格式转换。默认空元组，不启用变换，不增加依赖。
 
