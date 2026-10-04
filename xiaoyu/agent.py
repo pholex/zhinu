@@ -1088,6 +1088,10 @@ class Agent:
         #  steer：运行中追加的用户输入，任意线程可入队，
         #  agent 在 step 边界消费。queue.Queue 自带锁，与 interrupt 同一纪律。
         self._steer_queue: queue.Queue[str] = queue.Queue()
+        # SDK-owned durable inputs commit at the same safe boundary as steers.
+        # True means history changed and a final text response must not end the turn.
+        self._on_step_input: Callable[[], bool] | None = None
+        self._on_turn_input: Callable[[], bool] | None = None
         #  通知轨道（后台完成的"搭便车"提醒）：异步事件包成
         #  <system-reminder> 搭在下一条工具结果尾部顺路送达，模型不用轮询、
         #  角色交替与 tool_calls 配对两个不变量都不动。面向嵌入宿主
@@ -2286,7 +2290,8 @@ class Agent:
             self.mode = self._resume_mode()
         self.drain_steers()
         self._drain_notifications()
-        self._notified_keys.clear()
+        with self._notify_lock:
+            self._notified_keys.clear()
         #  快照点的对话锚点（用户原话）随历史清空而失效，整表一起清
         store = getattr(self.toolbox, "rewind", None)
         if store is not None:
@@ -2571,9 +2576,11 @@ class Agent:
                 key in self._notified_keys
                 or any(queued == key for queued, _, _ in self._notify_queue)
             )
+            if repeated:
+                return
             self._notify_queue.append((key, text, wake))
         callback = self.on_notification
-        if callback is None or repeated:
+        if callback is None:
             return
         try:
             callback({"key": key, "text": text, "wake": wake})
@@ -2589,11 +2596,12 @@ class Agent:
         """
         with self._notify_lock:
             queued = list(self._notify_queue)
+            delivered = set(self._notified_keys)
         seen: set[str] = set()
         items: list[dict[str, Any]] = []
         for key, text, wake in queued:
             if key:
-                if key in self._notified_keys or key in seen:
+                if key in delivered or key in seen:
                     continue
                 seen.add(key)
             items.append({"key": key, "text": text, "wake": wake})
@@ -2610,13 +2618,13 @@ class Agent:
             if wake_only and not any(wake for _, _, wake in self._notify_queue):
                 return []
             pending, self._notify_queue = self._notify_queue, []
-        items: list[str] = []
-        for key, text, _ in pending:
-            if key:
-                if key in self._notified_keys:
-                    continue
-                self._notified_keys.add(key)
-            items.append(text)
+            items: list[str] = []
+            for key, text, _ in pending:
+                if key:
+                    if key in self._notified_keys:
+                        continue
+                    self._notified_keys.add(key)
+                items.append(text)
         return items
 
     def _consume_inbox(self, midturn: bool = False) -> bool:
@@ -2659,6 +2667,8 @@ class Agent:
             if self.session_log:
                 self.session_log.event("steer")
             consumed = True
+        if self._on_step_input is not None:
+            consumed = self._on_step_input() or consumed
         #  wake_only 跟着 consumed 走：插话/信箱已经让这一步非跑不可时，
         #  捎带把不唤醒的通知也送了；否则只有 wake 项才值得多跑一步。
         for note in self._drain_notifications(wake_only=not consumed):
@@ -2798,7 +2808,7 @@ class Agent:
         if conversation:
             self.messages = self.messages[:found]
             self._history_rewritten()
-            self.plan = []
+            self.plan = plan_from_history(self.messages)
             if self.session_log:
                 #  与 compact 同一套 replacement 机制：resume 重放时撞到即
                 #  整体替换，不需要理解 rewind 语义
@@ -2996,6 +3006,8 @@ class Agent:
             if decision.blocked:
                 self.emit(Notice(f"[hook 拦截了本轮输入：{decision.reason}]", "warn"))
                 return
+        if self._on_turn_input is not None:
+            self._on_turn_input()
         self._record({"role": "user", "content": user_input})
 
         nudged_empty = False

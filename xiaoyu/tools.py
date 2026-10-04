@@ -41,7 +41,7 @@ from .background import (
     mark_group_leader as _mark_group_leader,
 )
 from .config import Config
-from .errors import Interrupted
+from .errors import Interrupted, attach_partial
 from .invisible import strip_invisible
 from .rewind import RewindStore
 
@@ -1235,6 +1235,8 @@ class Toolbox:
         #  "有没有人叫停"：Agent 接线时注入（interrupt_requested）。没有 Agent 的
         #  用法（测试、直接拿 Toolbox 跑工具）保持 None，等待照旧一口气等到底
         self.stop_requested: Callable[[], bool] | None = None
+        # Host text processing runs before recall persistence and output clipping.
+        self.result_transform: Callable[[str, dict[str, Any], str], str] | None = None
         self._tools: dict[str, Tool] = {}
         #  后台任务表（bash run_in_background / monitor）。通知回调由 Agent
         #  注入（agent.__init__ 里 tasks.notify = self.notify）；受限子集
@@ -1698,6 +1700,38 @@ class Toolbox:
 
         try:
             produced = tool.handler(**args)
+        except Interrupted as exc:
+            if self.result_transform is not None:
+                attach_partial(exc, lambda: "[工具执行中断；未经结果变换的输出已扣留，请核实状态后再决定是否重试。]")
+            raise
+        except TypeError as exc:
+            produced = f"ERROR: 调用 {name} 的参数不对：{exc}"
+            if self.result_transform is None:
+                return produced
+        except Exception as exc:  # noqa: BLE001
+            produced = f"ERROR: {type(exc).__name__}: {exc}"
+            if self.result_transform is None:
+                return produced
+        except BaseException as exc:
+            if self.result_transform is not None:
+                attach_partial(exc, lambda: "[工具执行异常；未经结果变换的输出已扣留，请核实状态后再决定是否重试。]")
+            raise
+
+        if self.result_transform is not None:
+            try:
+                produced = self.result_transform(name, args, produced)
+            except BaseException as exc:
+                # The action already happened. Never expose its unprocessed text,
+                # or let history repair describe the action as never executed.
+                with contextlib.suppress(Exception):
+                    self.take_media()
+                attach_partial(exc, lambda: (
+                    "[工具已执行，但结果变换未完成；原始结果已扣留。"
+                    "请先核实状态，不要直接重试工具。]"
+                ))
+                raise
+
+        try:
             if isinstance(produced, str):
                 #  工具结果汇入上下文的唯一收口：读到的文件、网页、MCP 结果里的
                 #  隐形字符都在这里剥（见 invisible.py）。放在落盘之前——spill

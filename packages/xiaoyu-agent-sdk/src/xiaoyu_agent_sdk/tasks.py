@@ -156,6 +156,8 @@ class TaskManager:
     def submit(self, specs: tuple[TaskSpec, ...]) -> tuple[TaskHandle, ...]:
         with self.session._mutex:
             self.session._check_idle()
+            if self.session._agent is not None and self.session._agent.mode == "plan":
+                raise ConfigurationError("Task submission is disabled in plan mode")
             self.session._ensure_started()
             with self._condition:
                 if self._closed:
@@ -241,6 +243,7 @@ class TaskManager:
                     if settled is not None:
                         settled.wait()
                 self.session._context.task_callbacks = None
+                self.session._save_usage()
 
     def _execute_child(self, task: TaskSnapshot, stop: threading.Event) -> tuple[str, str, str]:
         parent = self.session._agent
@@ -266,7 +269,8 @@ class TaskManager:
             task=prompt, stop_requested=lambda: stop.is_set() or self.session._cancel.is_set(), on_agent=on_agent,
             on_settled=self.retain_pending_child,
             resume_from=task.resume_from or None,
-            guards=ParentGuards(mode=lambda: "default", hooks=lambda: parent.hook_engine))
+            guards=ParentGuards(mode=lambda: parent.mode, hooks=lambda: parent.hook_engine,
+                                result_transform=parent.toolbox.result_transform))
         # Raw provider/tool errors may contain private endpoint details.
         error = "Child execution failed" if result.error or result.failure else ""
         agent = self._agents.get(task.task_id)
@@ -318,6 +322,8 @@ class TaskManager:
     def retry(self, task_id: str, *, allow_uncertain: bool = False, continue_history: bool = False) -> TaskHandle:
         with self.session._mutex:
             self.session._check_idle()
+            if self.session._agent is not None and self.session._agent.mode == "plan":
+                raise ConfigurationError("Task retry is disabled in plan mode")
             self.session._ensure_started()
             with self._condition:
                 task = self.get(task_id)
