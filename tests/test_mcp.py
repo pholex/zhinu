@@ -1394,6 +1394,31 @@ class RedactTest(unittest.TestCase):
         self.assertIn("x=1", mcp._redact(f"https://h/?tavilyApiKey={leaked}&x=1"))
         self.assertIn("host.example/mcp", mcp._redact(f"https://bob:{leaked}@host.example/mcp"))
 
+    def test_url_userinfo_is_redacted_as_a_whole(self):
+        for userinfo in (
+            "opaque_demo_token",
+            "alice:p@ss",
+            "alice:p@ss@word",
+            "alice:p%40ss",
+            "ghp_" + "a" * 30 + ":private-password",
+        ):
+            with self.subTest(userinfo=userinfo):
+                text = f'failed: "https://{userinfo}@git.example:8443/a.git"'
+                expected = 'failed: "https://[REDACTED]@git.example:8443/a.git"'
+                self.assertEqual(mcp._redact(text), expected)
+                self.assertEqual(mcp._redact(expected), expected)
+
+    def test_url_userinfo_matching_stops_at_authority_boundary(self):
+        for text in (
+            "https://host.example/path/alice@example.com",
+            "https://host.example?contact=alice@example.com",
+            "https://host.example#alice@example.com",
+            '"https://host.example", "alice@example.com"',
+            "'https://host.example','alice@example.com'",
+        ):
+            with self.subTest(text=text):
+                self.assertEqual(mcp._redact(text), text)
+
     def test_display_url_keeps_only_where_it_points(self):
         self.assertEqual(
             mcp.display_url("https://bob:pw@mcp.example.com:8443/v1/mcp?exaApiKey=abc#frag"),
