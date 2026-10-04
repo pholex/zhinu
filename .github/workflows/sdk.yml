@@ -55,6 +55,7 @@ jobs:
       - run: python -m pip install build
       - run: python scripts/build_sdk.py
       - run: python -m venv /tmp/sdk-install
-      - run: /tmp/sdk-install/bin/python -m pip install --find-links dist/sdk-release/kernel dist/sdk-release/sdk/*.whl
+      # 显式安装同次构建的两个 wheel，避免同版本的已发布内核替代当前候选。
+      - run: /tmp/sdk-install/bin/python -m pip install dist/sdk-release/kernel/*.whl dist/sdk-release/sdk/*.whl
       - run: /tmp/sdk-install/bin/python -m pip check
       - run: /tmp/sdk-install/bin/python -I tests/sdk_wheel_smoke.py
