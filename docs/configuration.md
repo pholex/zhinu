@@ -120,7 +120,9 @@ XIAOYU_API_KEY=<key>
 | `XIAOYU_SKILLS_DISABLED` | 停用清单（不是开关）：逗号分隔的技能名，可通配，如 `lark-*,remotion-*,aws-core:*`。按带插件前缀的全名或目录名匹配。技能库是几家客户端共用的，要给索引腾预算时在这里点名，不必去删文件；`/skills` 会列出被停用的 |
 | `XIAOYU_SKILLS_DIR` | 覆盖技能扫描目录（`os.pathsep` 分隔）：给了就只认它、不混默认目录，工作区自带的也不扫（宿主指定技能库 / 测试隔离用） |
 | `XIAOYU_ENABLE_WEB_SEARCH` | `web_search` 工具 |
-| `XIAOYU_SEARCH_PROVIDER` | 搜索走哪家：目前只有 `xai`（默认，grok-4.7，真搜且带引用，单次约 0.65 元；需 `XAI_API_KEY`）。deepseek 官方 Responses 不支持内置搜索，已移除。后端没配 key 时不挂载 `web_search` 工具 |
+| `XIAOYU_ENABLE_X_SEARCH` | `x_search` 工具（默认开启，需 `XAI_API_KEY`；`0` 关闭），独立于网页搜索后端 |
+| `XIAOYU_ENABLE_DEEP_RESEARCH` | Gemini 后台研究工具（默认开启，需 Gemini key；`0` 关闭），支持提交、查询报告与取消 |
+| `XIAOYU_SEARCH_PROVIDER` | 搜索走哪家：`deepseek`（默认，deepseek-flash，需 `DEEPSEEK_API_KEY`）、`xai`（grok-4.7，需 `XAI_API_KEY`）或 `bedrock`（openai.gpt-5.6-luna，走 Mantle Responses）。DeepSeek 搜索单独走 Anthropic 兼容接口，主对话协议不变；其 Responses 接口不支持内置搜索。所选 provider 未注册时不挂载工具；Bedrock 鉴权与权限见下方 |
 | `XIAOYU_ENABLE_BROWSER` | `browser` 浏览器工具（依赖可选 `[browser]` extra 的 playwright，没装时本来就不出现） |
 | `XIAOYU_ENABLE_PLUGINS` | entry point 组 `xiaoyu.tools` 的第三方工具**包**（代码级；和 `xiaoyu plugin` 装的**内容包**不是一回事，见下） |
 | `XIAOYU_ENABLE_MCP` | MCP server 挂载 |
@@ -138,6 +140,71 @@ XIAOYU_API_KEY=<key>
 | `XIAOYU_ENABLE_CHENSHU` | 宸枢统筹织造模式（见[多 agent 协同](multi-agent.md)） |
 | `XIAOYU_SUBAGENT_MAX_DEPTH` | 子 agent 嵌套深度上限（默认 `1` = 不套娃）；设 2/3 显式放开有界嵌套 |
 | `XIAOYU_ENABLE_PEERS` | 跨会话消息（`--yolo` 下默认关，见[安全](security.md)） |
+
+会话中可用 `/search` 查看当前搜索后端及各后端的配置状态，
+用 `/search deepseek`、`/search xai` 或 `/search bedrock` 切换。
+切换从下一次搜索开始生效，只影响当前会话，不修改 `.env`；新进程仍按环境配置选择。
+未配置的后端不能切换，主对话模型不受影响。TUI 支持后端名 Tab 补全，ACP 也提供此命令。
+
+### X 平台搜索
+
+配置 `XAI_API_KEY` 后，`x_search` 可搜索 X 帖子、用户与讨论串，使用 `grok-4.7`
+的 Responses 内置搜索，无需额外 SDK。它与 `web_search` 同时可用，
+不受 `XIAOYU_SEARCH_PROVIDER` 或 `/search` 切换影响。
+例如直接问「查一下 @某账号 最近一周关于某话题的帖子，附原帖链接」。
+
+支持 `allowed_x_handles` / `excluded_x_handles`（二选一，最多 20 个账号）、
+`from_date` / `to_date`（UTC 的 `YYYY-MM-DD` 日期，包含首尾当天）以及图片、视频分析
+`enable_image_understanding` / `enable_video_understanding`（默认关闭，按需开启）。
+返回内容标注外部来源，帖子中的说法不代表已核实事实。未配置 xAI 时不暴露工具，
+可用 `XIAOYU_ENABLE_X_SEARCH=0` 关闭；检索子 agent 与评估任务默认不启用。
+X Search 除模型 token 外另收搜索费用，按抓取的帖子和用户资料计费，见
+[官方文档](https://docs.x.ai/developers/tools/x-search)。
+
+### Gemini 深度研究
+
+配置 `GEMINI_API_KEY`（或 `GOOGLE_API_KEY`）后，内置的 `deep_research` 可提交
+Gemini 后台研究任务，`deep_research_status` 查询进度并获取完整报告，
+`deep_research_cancel` 取消任务（按现有权限规则确认）。例如：
+「用 Gemini Deep Research 研究某主题，返回带来源的中文报告」，
+随后「查询刚才研究任务的进度」。任务 ID 会返回到会话，可在新会话中凭 ID 查询。
+
+默认 `tier=standard` 使用 `deep-research-preview-04-2026`；
+要求更全面的研究时可选 `tier=max`（`deep-research-max-preview-04-2026`）。
+`previous_interaction_id` 可继续旧研究。研究经官方 Interactions API 后台执行，
+通常需要数分钟；本地不会常驻轮询或自动推送，稍后主动查询即可。
+报告保留正文与来源，长输出沿用 `recall` 查看全文。
+
+此能力独立于主对话模型、`web_search` 和 `/search`；默认开启，未配置 Gemini key
+时不暴露工具，`XIAOYU_ENABLE_DEEP_RESEARCH=0` 可关闭。检索子 agent 与评估默认关闭。
+不增加 SDK 依赖，沿用现有代理配置；提交失败不会自动重试，避免重复付费任务。
+任务单独计费，取消不退还已产生用量。本进程提交的任务在查询到终态后计入模型用量
+（思考 token 归入输出），同一工具实例重复查询不重复记账；恢复旧任务只展示服务端用量。
+API 当前为预览，权限、配额及费用见
+[官方说明](https://ai.google.dev/gemini-api/docs/deep-research)。
+
+### Bedrock 联网搜索
+
+```dotenv
+XIAOYU_SEARCH_PROVIDER=bedrock
+XIAOYU_BEDROCK_REGION=us-east-1
+```
+
+搜索使用 `bedrock-mantle.<区域>.api.aws/openai/v1` 的 Responses API，模型为
+`openai.gpt-5.6-luna`；现有 Bedrock 主对话仍走自己的模型与协议。
+鉴权复用 `AWS_BEARER_TOKEN_BEDROCK`；没配置 token 时使用 AWS 默认凭证链
+（支持 `AWS_PROFILE`），这条 IAM 路径需要可选依赖 `pip install 'xiaoyu-agent[bedrock]'`。
+
+调用身份需要 `bedrock-mantle:CreateInference` 与 `bedrock-websearch:InvokeSearch`、
+`bedrock-websearch:InvokeFetch`；使用 bearer token 时还需 `bedrock-mantle:CallWithBearerToken`。
+工具固定发送 `external_web_access=false`，
+只查询 AWS 索引与缓存，不要求 `bedrock-websearch:ExternalWebAccess`。
+未注册 Bedrock 时不挂载工具；缺凭证、权限不足或未返回搜索证据时明确报错，
+不会自动改走其它厂商。
+
+区域和模型支持范围以 [AWS Web Search 文档](https://docs.aws.amazon.com/bedrock/latest/userguide/web-search.html)
+为准；官方发布文章列出的区域为 `us-east-1`、`us-east-2`、`us-west-2`。
+这项服务适合检索最新公开知识，缓存与索引可能有延迟，不能保证实时天气或行情。
 
 ### 沙箱与界面
 

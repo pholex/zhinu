@@ -496,7 +496,8 @@ VISION_CAPTION_HEADER = (
 #  structured_output 在列：它只把结果存进内存、不碰现场；不在列的话
 #  `-p --mode plan --output-schema` 永远交不了结果（无人值守又退不出 plan mode）
 PLAN_MODE_TOOLS = frozenset(
-    {"read_file", "grep", "list_files", "explore", "skill", "web_search",
+    {"read_file", "grep", "list_files", "explore", "skill", "web_search", "x_search",
+     "deep_research", "deep_research_status",
      "update_plan", "exit_plan_mode", "ask_user", "list_sessions", "task_output",
      "search_tool", "get_context_remaining", "structured_output"}
 )
@@ -1274,6 +1275,18 @@ class Agent:
             self.toolbox.register(
                 make_web_search_tool(config, self.registry, self.usage, self.sink)
             )
+        if config.enable_x_search and self.toolbox.get("x_search") is None:
+            from .xsearch import make_x_search_tool
+
+            self.toolbox.register(
+                make_x_search_tool(config, self.registry, self.usage, self.sink)
+            )
+        if config.enable_deep_research:
+            from .deepresearch import make_deep_research_tools
+
+            for tool in make_deep_research_tools(config, self.registry, self.usage):
+                if self.toolbox.get(tool.name) is None:
+                    self.toolbox.register(tool)
         #  交互模式（默认 / auto / plan，见 modes.py）。plan mode 是其中一档：
         #  /plan on 或 /mode plan 开启；exit_plan_mode 只在态内可见（check_fn 每轮
         #  求值的工具动态可见性）。requires_approval=True 让
@@ -5338,7 +5351,7 @@ class Agent:
                 call,
                 f"ERROR: 当前处于 plan mode（只读规划态），{name} 被拦截。"
                 "此态下只能用只读工具（read_file/grep/list_files/explore/skill/"
-                f"web_search）和 update_plan；唯一可编辑的文件是 plan 文件"
+                f"web_search、x_search、deep_research、deep_research_status）和 update_plan；唯一可编辑的文件是 plan 文件"
                 f"（{self.plan_file}）。请继续调研；计划成形后调用 "
                 "exit_plan_mode 提交计划，用户批准后才能执行。",
             )

@@ -42,6 +42,8 @@ def _isolated_env(tmp: str, script_path: Path) -> dict[str, str]:
         "XIAOYU_ENABLE_AGENTS": "0",
         "XIAOYU_ENABLE_EXPLORE": "0",
         "XIAOYU_ENABLE_WEB_SEARCH": "0",
+        "XIAOYU_ENABLE_X_SEARCH": "0",
+        "XIAOYU_ENABLE_DEEP_RESEARCH": "0",
         "XIAOYU_ENABLE_BROWSER": "0",
         "XIAOYU_SANDBOX": "0",
     }

@@ -928,6 +928,8 @@ def execute_delegation(
         mcp_tool_search=config.mcp_tool_search,
         enable_explore=False,
         enable_web_search=False,
+        enable_x_search=False,
+        enable_deep_research=False,
         enable_skills=False,
         load_project_instructions=config.load_project_instructions,
         skill_directories=config.skill_directories,

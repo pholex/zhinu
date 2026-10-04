@@ -91,6 +91,8 @@ class E2ECase(unittest.TestCase):
             "XIAOYU_ENABLE_AGENTS": "0",
             "XIAOYU_ENABLE_EXPLORE": "0",
             "XIAOYU_ENABLE_WEB_SEARCH": "0",
+            "XIAOYU_ENABLE_X_SEARCH": "0",
+            "XIAOYU_ENABLE_DEEP_RESEARCH": "0",
             #  browser 的可用性=「宿主装没装 playwright」（GitHub runner 的
             #  ubuntu/macos 镜像就预装了包）——不关掉的话 golden 工具表随环境漂移
             "XIAOYU_ENABLE_BROWSER": "0",

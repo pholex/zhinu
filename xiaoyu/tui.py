@@ -1135,6 +1135,13 @@ class SlashCompleter(Completer):
             for model in self.tui.agent.switchable_models():
                 if model.startswith(word):
                     yield Completion(model, start_position=-len(word))
+        elif parts[0] == "/search" and len(parts) == 2:
+            from .websearch import SEARCH_BACKENDS
+
+            word = parts[1]
+            for name, backend in SEARCH_BACKENDS.items():
+                if name.startswith(word):
+                    yield Completion(name, start_position=-len(word), display_meta=backend.model)
 
     #  技能补全的 meta 长度：描述是给索引写的、动辄几百字，菜单里一行放不下
     _SKILL_META_CAP = 60

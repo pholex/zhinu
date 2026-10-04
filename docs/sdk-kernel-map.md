@@ -87,7 +87,8 @@
 | 动态 allow／ask 权限管理 | 暂不增加可变 Permissions；用显式 deny_rules、approver 和 PreToolUse hook | 只读免确认工具若也需询问须在 hook 中实现；后续规则 API 须定义优先级、并发切换与恢复授权来源，不能用普通 approver 宣称覆盖全部 ask 规则 |
 | 后台 shell 与 DAG 统一管理 | 保持两类身份独立；DAG 用 tasks，shell 用模型任务工具及通知 | 确有统一管理场景时增加带类型的句柄与各自取消／退出契约，不直接合并任务 ID |
 
-显式的宿主 Tool / MCP 配置仍有效。以上延后项有替代路径或明确
+同时补上 SDK 对新增 x_search / deep_research 的显式关闭，防止内核默认开关扩大
+SDK 工具面。显式的宿主 Tool / MCP 配置仍有效。以上延后项有替代路径或明确
 接入前提，不阻塞下一阶段工具结果变换设计；也不意味着完整内核能力已经对齐。
 
 ## 剩余验收

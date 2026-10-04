@@ -353,16 +353,18 @@ class Config:
     enable_skills: bool = True
     #  是否挂 update_plan 计划工具（explore 子 agent 关掉：检索任务不需要计划）
     enable_plan: bool = True
-    #  是否挂 web_search 联网搜索工具（借厂商 Responses 接口的内置搜索；
+    #  是否挂 web_search 联网搜索工具（借厂商接口的内置搜索；
     #  对应厂商的 key 没配时即便开着也不会出现。explore 子 agent 与 eval 关掉：
     #  前者只查代码不上网，后者要行为确定）
     enable_web_search: bool = True
+    #  独立的 X 平台搜索；需 xAI 直连，网页搜索后端切换不影响它。
+    enable_x_search: bool = True
+    #  Gemini 后台深度研究；需 Gemini 直连 key，与快速网页搜索独立。
+    enable_deep_research: bool = True
     #  web_search 用哪家的内置搜索（websearch.SEARCH_BACKENDS 的键）。
-    #  目前只有 xai（2026-09-14 起）：deepseek 官方 Responses 忽略 web_search 等内置工具，
-    #  实测服务端不真正搜索，后端已移除。grok-4.7 实测真搜且带引用，单次约 0.3 元（2026-09-29 一题 3 次搜索 $0.042；4.6 时约 0.65 元）
-    #  （token 贵 + 每次搜索按次收费，2026-08 对比实测见 playbook）。没配 XAI_API_KEY 时
-    #  web_search 不进 schemas（见 websearch 的 check_fn），不会拿到坏结果
-    search_provider: str = "xai"
+    #  默认 deepseek：搜索单独走 Anthropic 兼容接口；xai 与 bedrock Mantle 可选。
+    #  对应后端没配 key 时 web_search 不进 schemas（见 websearch 的 check_fn）。
+    search_provider: str = "deepseek"
     #  是否挂 browser 浏览器工具（依赖可选 extra `[browser]` 的 playwright，
     #  没装时即便开着也不出现，见 tools.py 的 check_fn 门控）。单独给开关是因为
     #  可用性绑在「宿主装没装某个包」上：装了 playwright 又用不到浏览器的机器
@@ -568,6 +570,10 @@ class Config:
             cfg.enable_skills = flag.strip().lower() not in ("0", "false", "no", "off")
         if (flag := os.environ.get("XIAOYU_ENABLE_WEB_SEARCH")) is not None:
             cfg.enable_web_search = flag.strip().lower() not in ("0", "false", "no", "off")
+        if (flag := os.environ.get("XIAOYU_ENABLE_X_SEARCH")) is not None:
+            cfg.enable_x_search = flag.strip().lower() not in ("0", "false", "no", "off")
+        if (flag := os.environ.get("XIAOYU_ENABLE_DEEP_RESEARCH")) is not None:
+            cfg.enable_deep_research = flag.strip().lower() not in ("0", "false", "no", "off")
         if backend := os.environ.get("XIAOYU_SEARCH_PROVIDER", "").strip():
             cfg.search_provider = backend
         #  个人默认交互模式（default/auto/plan）。命令行 --mode 经 overrides

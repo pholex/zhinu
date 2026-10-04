@@ -1093,6 +1093,8 @@ class ChenshuRuntime:
                 auto_approve=False,
                 enable_explore=False,
                 enable_web_search=False,
+                enable_x_search=False,
+                enable_deep_research=False,
                 enable_skills=False,
                 enable_plan=False,
                 enable_plugins=False,

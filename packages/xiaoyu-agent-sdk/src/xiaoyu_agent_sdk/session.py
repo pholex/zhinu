@@ -260,6 +260,7 @@ class Session:
             enable_explore=False, enable_plan=options.enable_plan, enable_skills=bool(options.skill_directories),
             skill_directories=tuple(Path(p).resolve() for p in options.skill_directories),
             enable_web_search=False, enable_browser=False, enable_plugins=False,
+            enable_x_search=False, enable_deep_research=False,
             enable_mcp=False, enable_hooks=False, enable_agents=False,
             enable_chenshu=False, enable_peers=False, turn_extension=0,
             load_project_instructions=options.load_project_instructions,

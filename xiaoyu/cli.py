@@ -70,6 +70,7 @@ SLASH_COMMANDS: dict[str, str] = {
     "/skills": "列出可用技能；/skills reload 重扫磁盘并刷新索引",
     "/<技能名>": "把技能展开成本轮提示（/<技能名> 参数…，正文里的 $ARGUMENTS / $1 / $名字 用参数填）；与内建命令撞名时写 /skill:<技能名>",
     "/model": "查看或切换模型（/model 名字）",
+    "/search": "查看或切换搜索后端（/search deepseek|xai|bedrock，仅当前会话）",
     "/usage": "本次会话的 token 统计",
     "/effort": "查看或设置推理深度（/effort low|medium|high|xhigh|max）",
     "/context": "当前上下文占用与压缩状态",
@@ -4298,6 +4299,10 @@ def handle_slash(agent: Agent, line: str, select: Any = None) -> bool:
             if hidden := skills_mod.disabled_skills(agent.config.workspace):
                 shown = "、".join(hidden[:12]) + (f" 等 {len(hidden)} 个" if len(hidden) > 12 else "")
                 print(ui.secondary(f"  已停用（{skills_mod.DISABLED_ENV}）：{shown}"))
+    elif command == "/search":
+        from .websearch import search_command
+
+        print(ui.secondary(search_command(agent.config, agent.registry, " ".join(rest))))
     elif command == "/model":
         if rest:
             #  先解析再切：名字没人接就报错、原模型不动。否则"已切换到 grok"打了
