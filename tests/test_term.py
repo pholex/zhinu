@@ -1,12 +1,13 @@
 """shell 集成（`xiaoyu term`）。
 
 锁住五件事：
-1. 四种 shell 的脚本渲染：会话变量、@x 别名、记命令的钩子、幂等守卫、
+1. 四种 shell 的脚本渲染：会话变量、@x 别名、记命令与退出码的钩子、幂等守卫、
    --command-not-found 开关、没有残留的占位符；
-2. pending 文件：追加 / 取走 / 清空 / 上限截尾 / 字段转义 / 自己人不记 / 放回；
+2. pending 文件：追加 / 取走 / 清空 / 上限截尾 / 字段转义 / 自己人不记 / 放回 /
+   状态行认领；
 3. 脱敏：常见的命令行凭据形态；
 4. `term run` 的 prompt 构造：前缀进了 prompt、命令被 <untrusted_content> 包裹、
-   没命令不加前缀、配置失败把命令放回；
+   没命令不加前缀、配置失败把命令放回、不带问题时读一行原样文本；
 5. `term log` / `term info` 的快路径：不导入 agent / tools / cli。
 """
 
@@ -39,7 +40,7 @@ class ScriptRenderTest(unittest.TestCase):
 
     def test_every_shell_exports_session_defines_alias_and_hooks(self) -> None:
         expectations = {
-            "zsh": ("@x()", "add-zsh-hook preexec __xiaoyu_term_preexec", "print -r --"),
+            "zsh": ("alias @x=", "add-zsh-hook preexec __xiaoyu_term_preexec", "print -r --"),
             "bash": ("@x()", "trap '__xiaoyu_term_debug' DEBUG", "printf '%s\\t%s\\t%s\\n'"),
             "fish": ("function @x", "--on-event fish_preexec", "printf"),
             "powershell": ("function global:x", "Get-History", "Add-Content"),
@@ -57,6 +58,34 @@ class ScriptRenderTest(unittest.TestCase):
                 #  钩子只用内建写文件：脚本里不该出现起 Python 的 `term log`
                 self.assertNotIn("term log", text)
                 self.assertNotIn("@@", text, "占位符没替换干净")
+
+    def test_every_shell_records_exit_status(self) -> None:
+        hooks = {
+            "zsh": ("add-zsh-hook precmd __xiaoyu_term_precmd", "local st=$?"),
+            "bash": ("__xiaoyu_term_status", "local st=$?"),
+            "fish": ("--on-event fish_postexec", "set -l st $status"),
+            "powershell": ("$ok = $global:?", "$code = $global:LASTEXITCODE"),
+        }
+        for shell, needles in hooks.items():
+            with self.subTest(shell=shell):
+                text = self.render(shell)
+                for needle in needles:
+                    self.assertIn(needle, text)
+
+    def test_zsh_entry_is_a_noglob_alias(self) -> None:
+        text = self.render("zsh")
+        self.assertIn("alias @x='noglob __xiaoyu_term_ask'", text)
+        self.assertIn("alias @xiaoyu='noglob __xiaoyu_term_ask'", text)
+        #  同名函数不能留：重复 eval 时别名已在，`@x() {…}` 会先被别名展开、定义就坏了
+        self.assertNotIn("@x()", text)
+        self.assertNotIn("@xiaoyu()", text)
+
+    def test_bash_status_hook_runs_first(self) -> None:
+        #  排在最前才读得到没被别的提示符命令动过的 $?；数组与字符串两种形态都要
+        text = self.render("bash")
+        self.assertIn('PROMPT_COMMAND=(__xiaoyu_term_status "${PROMPT_COMMAND[@]}" __xiaoyu_term_prompt)', text)
+        self.assertIn("PROMPT_COMMAND=$'__xiaoyu_term_status\\n'", text)
+        self.assertIn('return "$st"', text)
 
     def test_anonymous_session_keeps_existing_named_overrides(self) -> None:
         #  匿名：已有就沿用（子 shell / 重复 eval 接着用同一个终端的会话）
@@ -149,6 +178,62 @@ class ScriptRenderTest(unittest.TestCase):
             )
             self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
 
+    @unittest.skipUnless(shutil.which("pwsh"), "需要 pwsh")
+    def test_powershell_hook_records_exit_status(self) -> None:
+        """真起 pwsh：非交互下没有 PSReadLine 也没有历史，用 Add-History 造「人敲的
+        那一行」，再手调 prompt——钩子读的正是这两样。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp).resolve()
+            quoted = "'" + sys.executable.replace("'", "''") + "'"
+            driver = "\n".join(
+                [
+                    term.render_script("powershell", "term-ps1", named=True, launcher="xiaoyu", directory=directory),
+                    "function Add-Typed($line) {",
+                    "    [PSCustomObject]@{CommandLine=$line; ExecutionStatus='Completed';"
+                    " StartExecutionTime=(Get-Date); EndExecutionTime=(Get-Date)} | Add-History",
+                    "}",
+                    "Add-Typed 'native ok'",
+                    f"& {quoted} -c 'import sys; sys.exit(0)'",
+                    "prompt | Out-Null",
+                    "Add-Typed 'native fail'",
+                    f"& {quoted} -c 'import sys; sys.exit(3)'",
+                    "prompt | Out-Null",
+                    #  没有新命令的提示符（空回车）：不该多出一条
+                    "prompt | Out-Null",
+                    #  cmdlet 失败没有数字；上一条原生命令留下的 3 不能算到它头上
+                    "Add-Typed 'Get-Item no-such-item-404 -ErrorAction SilentlyContinue'",
+                    "Get-Item no-such-item-404 -ErrorAction SilentlyContinue",
+                    "prompt | Out-Null",
+                    "Add-Typed 'cmdlet ok'",
+                    "Get-Date | Out-Null",
+                    "prompt | Out-Null",
+                    "Add-Typed 'x 为什么'",
+                    "Get-Date | Out-Null",
+                    "prompt | Out-Null",
+                    "",
+                ]
+            )
+            script = directory / "drive.ps1"
+            script.write_text(driver, encoding="utf-8")
+            #  读进来再 Invoke-Expression：与 $PROFILE 里那一行同一种装法，也不碰执行策略
+            literal = "'" + str(script).replace("'", "''") + "'"
+            proc = subprocess.run(
+                ["pwsh", "-NoProfile", "-NonInteractive", "-Command",
+                 f"Invoke-Expression (Get-Content -Raw -Encoding utf8 -LiteralPath {literal})"],
+                capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=120, cwd=tmp,
+            )
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            entries = term.drain_pending(directory / "term-ps1.pending")
+            self.assertEqual(
+                [(entry.command, entry.status) for entry in entries],
+                [
+                    ("native ok", 0),
+                    ("native fail", 3),
+                    ("Get-Item no-such-item-404 -ErrorAction SilentlyContinue", 1),
+                    ("cmdlet ok", 0),
+                ],
+            )
+
     def _parses(self, shell: str, checker: list[str]) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "init.sh"
@@ -184,6 +269,46 @@ class PendingFileTest(unittest.TestCase):
         assert entry is not None
         self.assertEqual((entry.ts, entry.command), (0, "ls"))
 
+    def test_status_line_roundtrip(self) -> None:
+        line = term.format_status(1700000000, 130)
+        self.assertEqual(term.parse_status(line), (1700000000, 130))
+        #  状态行不是命令行：按命令解析必须回 None，待交付条数也不算它
+        self.assertIsNone(term.parse_line(line))
+        for garbage in ("", "1\t/w\tls", "=abc\t1", "=1\tx", "=1", "=1\t2\t3"):
+            with self.subTest(garbage=garbage):
+                self.assertIsNone(term.parse_status(garbage))
+
+    def test_status_is_claimed_by_its_command(self) -> None:
+        lines = [
+            "=5\t9",  # 命令行已被上一问取走：无主，丢
+            "10\t/w\tmake test",
+            "=10\t2",
+            "10\t/w\tgit diff",  # 同一秒的下一条：各认各的
+            "=10\t0",
+            "11\t/w\tsleep 100",  # 还没跑完：没有状态
+        ]
+        self.path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        self.assertEqual(term.count_pending(self.path), 3)
+        entries = term.drain_pending(self.path)
+        self.assertEqual(
+            [(e.command, e.status) for e in entries],
+            [("make test", 2), ("git diff", 0), ("sleep 100", None)],
+        )
+
+    def test_status_from_shared_session_interleaves(self) -> None:
+        #  具名会话两个终端共用一个文件：后开跑的先跑完，状态行隔着别人的命令回来
+        lines = ["10\t/a\tmake long", "12\t/b\tls", "=12\t0", "=10\t2"]
+        self.path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        entries = term.drain_pending(self.path)
+        self.assertEqual([(e.command, e.status) for e in entries], [("make long", 2), ("ls", 0)])
+
+    def test_own_command_keeps_its_status_to_itself(self) -> None:
+        #  混进来的自己人命令照样认领自己的状态行，不让它落到前一条头上
+        lines = ["10\t/w\tls", "10\t/w\t@x 问", "=10\t0", "=10\t7"]
+        self.path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        entries = term.drain_pending(self.path)
+        self.assertEqual([(e.command, e.status) for e in entries], [("ls", 7)])
+
     def test_append_drain_clears(self) -> None:
         self.assertTrue(term.append_pending(self.path, "ls -la", cwd="/w", ts=1))
         self.assertTrue(term.append_pending(self.path, "make test", cwd="/w", ts=2))
@@ -216,6 +341,16 @@ class PendingFileTest(unittest.TestCase):
         self.assertEqual(entries[0].command, "cmd50")
         self.assertEqual(entries[-1].command, f"cmd{term.MAX_PENDING_LINES + 49}")
 
+    def test_line_cap_counts_commands_not_status_lines(self) -> None:
+        with open(self.path, "w", encoding="utf-8") as handle:
+            for index in range(term.MAX_PENDING_LINES + 50):
+                handle.write(term.format_line(index, "/w", f"cmd{index}") + "\n")
+                handle.write(term.format_status(index, index % 3) + "\n")
+        entries = term.drain_pending(self.path)
+        self.assertEqual(len(entries), term.MAX_PENDING_LINES)
+        self.assertEqual((entries[0].command, entries[0].status), ("cmd50", 50 % 3))
+        self.assertTrue(all(entry.status is not None for entry in entries))
+
     def test_byte_cap_keeps_tail(self) -> None:
         big = "x" * 4000
         with open(self.path, "w", encoding="utf-8") as handle:
@@ -241,6 +376,11 @@ class PendingFileTest(unittest.TestCase):
         term.append_pending(self.path, "later", cwd="/w", ts=3)
         term.requeue(self.path, taken)
         self.assertEqual([e.command for e in term.drain_pending(self.path)], ["ls", "make", "later"])
+
+    def test_requeue_keeps_status(self) -> None:
+        taken = [term.Entry(1, "/w", "make", 2), term.Entry(1, "/w", "ls", 0), term.Entry(2, "/w", "vim")]
+        term.requeue(self.path, taken)
+        self.assertEqual(term.drain_pending(self.path), taken)
 
     def test_pending_path_prefers_exported(self) -> None:
         with mock.patch.dict(os.environ, {term.PENDING_ENV: str(self.path)}):
@@ -304,6 +444,22 @@ class PrefixTest(unittest.TestCase):
         self.assertTrue(lines[4].startswith("09-30 "), lines[4])
         self.assertEqual(lines[5], "--:--  $ cat x")
 
+    def test_exit_status_is_shown_when_known(self) -> None:
+        entries = [
+            term.Entry(0, "/w", "make test", 2),
+            term.Entry(0, "/w", "git diff", 0),
+            term.Entry(0, "/w", "sleep 100"),
+        ]
+        text = term.build_prefix(entries)
+        self.assertIn("只有命令文本与行尾的退出码、没有输出", text)
+        body = text.split("<untrusted_content>\n", 1)[1].split("\n</untrusted_content>")[0]
+        self.assertEqual(
+            body.splitlines(),
+            ["# /w", "--:--  $ make test  → 退出码 2", "--:--  $ git diff  → 退出码 0", "--:--  $ sleep 100"],
+        )
+        #  一条都没记到：说明文字不提退出码
+        self.assertIn("只有命令文本、没有输出", term.build_prefix([term.Entry(0, "/w", "ls")]))
+
     def test_redacts_and_neutralizes_fake_markers(self) -> None:
         entries = [
             term.Entry(1, "/w", "curl -H 'Authorization: Bearer tok123456' u"),
@@ -339,6 +495,11 @@ class FakeConfig:
         )
 
 
+class _Tty(io.StringIO):
+    def isatty(self) -> bool:
+        return True
+
+
 class TermRunTest(unittest.TestCase):
     """term run 的编排：真实的 pending 文件 + 桩掉的 agent 构造与 run_once。"""
 
@@ -364,6 +525,8 @@ class TermRunTest(unittest.TestCase):
             mock.patch.object(cli, "load_dotenv", return_value=[]),
             mock.patch.object(cli, "_warn_env_problems", lambda: None),
             mock.patch.object(cli, "read_piped_stdin", return_value=""),
+            #  从终端跑测试时 stdin 是 tty：钉成不是，免得「不带问题」那条去等人输入
+            mock.patch.object(sys, "stdin", io.StringIO()),
             mock.patch.object(cli, "Config", FakeConfig),
             mock.patch.object(cli.Permissions, "load", classmethod(lambda cls, *a, **k: object())),
             mock.patch.object(cli, "oneshot_frontend", return_value=(None, None)),
@@ -444,6 +607,45 @@ class TermRunTest(unittest.TestCase):
         self.assertEqual(code, 2)
         self.assertIn("要问什么", err)
         self.assertEqual(term.count_pending(self.pending), 1)
+
+    def test_bare_call_reads_one_raw_line_from_the_terminal(self) -> None:
+        term.append_pending(self.pending, "make test", cwd="/w", ts=1)
+        raw = "why did it fail? (again) | 'x' $HOME *.log"
+        with mock.patch.object(sys, "stdin", _Tty()), mock.patch("builtins.input", return_value=f"  {raw}  ") as typed:
+            code, err = self.run_term()
+        self.assertEqual(code, 0, err)
+        typed.assert_called_once_with()
+        self.assertTrue(self.sent[0][1].endswith(f"</untrusted_content>\n\n{raw}"), self.sent[0][1])
+        #  提示符走 stderr：stdout 留给回答
+        self.assertIn("问 › ", err)
+
+    def test_bare_call_keeps_flags(self) -> None:
+        with mock.patch.object(sys, "stdin", _Tty()), mock.patch("builtins.input", return_value="问"):
+            code, _ = self.run_term("--model", "gpt-6")
+        self.assertEqual(code, 0)
+        self.assertEqual(FakeConfig.calls[0]["model"], "gpt-6")
+
+    def test_bare_call_cancelled_keeps_pending(self) -> None:
+        term.append_pending(self.pending, "ls", cwd="/w", ts=1)
+        for interrupt in (KeyboardInterrupt, EOFError):
+            with self.subTest(interrupt=interrupt.__name__):
+                with mock.patch.object(sys, "stdin", _Tty()), mock.patch("builtins.input", side_effect=interrupt):
+                    code, err = self.run_term()
+                self.assertEqual(code, 130)
+                self.assertNotIn("要问什么", err)
+        #  空行不是取消，是没问：照旧报用法
+        with mock.patch.object(sys, "stdin", _Tty()), mock.patch("builtins.input", return_value="   "):
+            code, err = self.run_term()
+        self.assertEqual(code, 2)
+        self.assertIn("要问什么", err)
+        self.assertEqual(self.sent, [])
+        self.assertEqual(term.count_pending(self.pending), 1)
+
+    def test_question_on_the_command_line_never_prompts(self) -> None:
+        with mock.patch.object(sys, "stdin", _Tty()), mock.patch("builtins.input", side_effect=AssertionError("不该读")):
+            code, err = self.run_term("在吗")
+        self.assertEqual(code, 0, err)
+        self.assertEqual(self.sent[0][1], "在吗")
 
     def test_config_failure_requeues_commands(self) -> None:
         term.append_pending(self.pending, "ls", cwd="/w", ts=1)

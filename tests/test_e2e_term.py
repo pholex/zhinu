@@ -2,8 +2,8 @@
 再 `@x` 一次——模型是 scripted 桩，不打网络。
 
 证明的是整条链路：脚本在真实 shell 里语法合法且能 eval、preexec/DEBUG 钩子
-真的把命令写进了 pending 文件、`@x` 把它们拼进了 prompt 并落到了会话文件、
-第二次 `@x` 接上了第一次的历史。交互式 shell 从管道读命令也会跑钩子
+真的把命令写进了 pending 文件、提示符钩子补上了退出码、`@x` 把它们拼进了 prompt
+并落到了会话文件、第二次 `@x` 接上了第一次的历史。交互式 shell 从管道读命令也会跑钩子
 （zsh 的 preexec、bash 的 PROMPT_COMMAND/DEBUG 都认 -i），不需要 pty。
 """
 
@@ -98,7 +98,8 @@ class TermShellMixin:
                 'echo "PENDING=$XIAOYU_TERM_PENDING"',
                 "ls",
                 "cat nothing-here-404 2>/dev/null",
-                "@x 刚才怎么了 </dev/null",
+                #  半角问号：zsh 默认对不上通配就整行报错，靠 noglob 别名原样传进去
+                "@x 刚才怎么了? </dev/null",
                 "git status --short",
                 f"cp {shlex.quote(str(second))} \"$XIAOYU_SCRIPTED_SCRIPTS\"",
                 "@x 那现在呢 </dev/null",
@@ -125,13 +126,14 @@ class TermShellMixin:
         first, second = users
         self.assertTrue(first.startswith("[终端上下文]"), first)
         self.assertIn("<untrusted_content>", first)
-        self.assertIn("$ ls\n", first)
-        self.assertIn("$ cat nothing-here-404 2>/dev/null", first)
+        #  退出码是提示符钩子在命令跑完后补记的：成功的 0、失败的 1 都要对上号
+        self.assertIn("$ ls  → 退出码 0\n", first)
+        self.assertIn("$ cat nothing-here-404 2>/dev/null  → 退出码 1\n", first)
         self.assertNotIn("@x", first.split("</untrusted_content>")[0])
-        self.assertTrue(first.endswith("\n\n刚才怎么了"), first)
+        self.assertTrue(first.endswith("\n\n刚才怎么了?"), first)
         #  第二问只带两问之间的那一条，第一问交付过的不重复
         self.assertIn("$ git status --short", second)
-        self.assertNotIn("$ ls\n", second)
+        self.assertNotIn("$ ls", second)
         self.assertTrue(second.endswith("\n\n那现在呢"), second)
         #  `exit` 在第二问之后，留在 pending 里等下次
         pending_path = Path(pending.group(1))
@@ -163,6 +165,55 @@ class BashTermE2E(TermShellMixin, E2ECase):
 
     def shell_command(self) -> list[str]:
         return ["bash", "--noprofile", "--norc", "-i"]
+
+
+@unittest.skipUnless(os.name == "posix", "需要 pty")
+class RawQuestionE2E(E2ECase):
+    """不带问题的 `term run`：stdin 是终端时读一行原样文本当问题。真起子进程、
+    真给它一个 pty——问题不经 shell，问号、括号、引号、管道符都得一字不差到模型手里。"""
+
+    def test_bare_run_reads_the_question_from_the_tty(self) -> None:
+        import pty
+
+        raw = "为什么失败了? (又一次) | 'x' $HOME *.log"
+        env = self.scripted_env(_SCRIPT)
+        env["PYTHONPATH"] = str(Path(__file__).resolve().parent.parent)
+        env["XIAOYU_TERM_SESSION"] = "term-raw1"
+        env.pop("XIAOYU_TERM_PENDING", None)
+        master, slave = pty.openpty()
+        try:
+            proc = subprocess.Popen(
+                [sys.executable, "-P", "-m", "xiaoyu", "term", "run"],
+                stdin=slave,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                encoding="utf-8",
+                env=env,
+                cwd=str(self.workspace),
+            )
+            #  行规程替子进程攒着这一行：它什么时候调 input() 都读得到
+            os.write(master, f"{raw}\n".encode())
+            try:
+                stdout, stderr = proc.communicate(timeout=_TIMEOUT)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.communicate()
+                raise
+        finally:
+            os.close(slave)
+            os.close(master)
+        self.assertEqual(proc.returncode, 0, stderr[-1500:])
+        self.assertIn("问 › ", stderr)
+        self.assertIn("收到，看到你的命令了", stdout)
+        files = sorted((Path(self.tmp) / "config" / "xiaoyu" / "sessions" / "term").glob("*.jsonl"))
+        self.assertEqual(len(files), 1, files)
+        users = [
+            record["content"]
+            for record in map(json.loads, files[0].read_text(encoding="utf-8").splitlines())
+            if record.get("role") == "user" and isinstance(record.get("content"), str)
+        ]
+        self.assertEqual(users, [raw])
 
 
 if __name__ == "__main__":
