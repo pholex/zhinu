@@ -2,21 +2,21 @@
 
 所有以下类型均从 `xiaoyu_agent_sdk` 导入。使用说明与失效语义见 [SDK 指南](sdk.md)。
 
-本页列出首版接口、0.59.0 新增能力及明确标注的当前源码扩展。
+本页列出首版接口、0.59.0 新增能力及明确标注的 0.62.0 扩展。
 `Asker`、`asker`、`question_timeout`、`TextBlock` / `ImageBlock` / `Prompt`、
-`steer` / `drain_steers` 与 SDK 的 `SteerAccepted` 导出是当前源码新增，尚未发布。`SessionStore`、
+`steer` / `drain_steers` 与 SDK 的 `SteerAccepted` 导出自 0.62.0 起提供。`SessionStore`、
 `SessionWriter`、`SQLiteSessionStore`、`StoredSessionInfo`、`session_id` 与
 `resume_id` 见 [存储扩展](sdk-storage.md)。
 动态 MCP/OAuth、`TaskSpec` / `TaskHandle` / `TaskSnapshot` / `TaskManager`、
 `BudgetOptions` / `ModelPrice` / `CostSnapshot`、扩展 Hook 和 OpenTelemetry 的
 接口见 [平台能力](sdk-platform.md)。
 
-通知、状态快照和 `PlanUpdated` / `ToolPurpose` 的 SDK 导出同样为当前源码新增，
-尚未发布。能力覆盖范围见 [内核接入清单](sdk-kernel-map.md)。
+通知、状态快照和 `PlanUpdated` / `ToolPurpose` 的 SDK 导出同样自 0.62.0 起提供。
+能力覆盖范围见 [内核接入清单](sdk-kernel-map.md)。
 
-本轮还新增 `SessionMode`、`SessionOptions.mode` 和下列空闲控制方法，尚未发布。
-可选计划工具 `SessionOptions.enable_plan` 与快照类型 `PlanStep` 同样尚未发布。
-工具结果变换也为当前源码新增，完整处理顺序与失败边界见
+0.62.0 还新增 `SessionMode`、`SessionOptions.mode` 和下列空闲控制方法，
+以及可选计划工具 `SessionOptions.enable_plan` 与快照类型 `PlanStep`。
+工具结果变换同为 0.62.0 新增，完整处理顺序与失败边界见
 [工具结果文本变换](sdk-result-transforms.md)。
 
 | 变换入口 | 契约 |
@@ -38,7 +38,7 @@ QuestionSnapshot.state 新增 open，QuestionEvent.kind 新增 question.opened�
 `session.questions` 提供 get／list_pending／answer／cancel，异步会话四者均 await。
 另有 questions.watch() 返回带版本的状态观察流，异步会话使用 async for；
 初次含已有终态，慢观察者合并中间状态，会话关闭结束。
-字段、幂等与事务契约见 [持久化待答指南](sdk-deferred-questions.md)，全部尚未发布。
+字段、幂等与事务契约见 [持久化待答指南](sdk-deferred-questions.md)，均自 0.62.0 起提供。
 
 | 同步入口 | 返回值；异步对应 |
 |---|---|
@@ -47,17 +47,17 @@ QuestionSnapshot.state 新增 open，QuestionEvent.kind 新增 question.opened�
 | `session.run(prompt, *, output=None)` | `RunResult`；异步版需 await |
 | `session.stream(prompt, *, output=None)` | `Generator[UIEvent]`；异步版 `AsyncGenerator[UIEvent]` |
 | `session.interrupt()` | 无返回；异步版同样是普通方法 |
-| `session.steer(text)`（当前源码新增） | bool，是否排队；异步版同样是普通方法 |
-| `session.drain_steers()`（当前源码新增） | `list[str]`，取回未接纳插话；异步版同样是普通方法 |
-| `session.notify(text, key="", wake=True)`（当前源码新增） | None，投递通知；异步版同样是普通方法 |
-| `session.pending_notifications()`（当前源码新增） | `tuple[Notification, ...]`；异步版同样是普通方法 |
-| `session.watch_notifications()`（当前源码新增） | `Generator[tuple[Notification, ...]]`；异步版 `AsyncGenerator` |
-| `session.status()`（当前源码新增） | `SessionState` 字符串；异步版同样是普通方法 |
-| `session.snapshot()`（当前源码新增） | `SessionSnapshot`；异步版需 await |
-| `session.reset()`（当前源码新增） | None，清对话但保留身份、资源与累计消耗；异步版需 await |
-| `session.set_mode(mode)`（当前源码新增） | str，内核模式说明；异步版需 await |
-| `session.switch_model(model)`（当前源码新增） | None，同端点／client 换模型名；异步版需 await |
-| `session.set_budget_tokens(budget)`（当前源码新增） | None，累计 token 软预算，正整数或 None；异步版需 await |
+| `session.steer(text)`（0.62.0 起） | bool，是否排队；异步版同样是普通方法 |
+| `session.drain_steers()`（0.62.0 起） | `list[str]`，取回未接纳插话；异步版同样是普通方法 |
+| `session.notify(text, key="", wake=True)`（0.62.0 起） | None，投递通知；异步版同样是普通方法 |
+| `session.pending_notifications()`（0.62.0 起） | `tuple[Notification, ...]`；异步版同样是普通方法 |
+| `session.watch_notifications()`（0.62.0 起） | `Generator[tuple[Notification, ...]]`；异步版 `AsyncGenerator` |
+| `session.status()`（0.62.0 起） | `SessionState` 字符串；异步版同样是普通方法 |
+| `session.snapshot()`（0.62.0 起） | `SessionSnapshot`；异步版需 await |
+| `session.reset()`（0.62.0 起） | None，清对话但保留身份、资源与累计消耗；异步版需 await |
+| `session.set_mode(mode)`（0.62.0 起） | str，内核模式说明；异步版需 await |
+| `session.switch_model(model)`（0.62.0 起） | None，同端点／client 换模型名；异步版需 await |
+| `session.set_budget_tokens(budget)`（0.62.0 起） | None，累计 token 软预算，正整数或 None；异步版需 await |
 | `session.close()` | 无返回；异步版需 await |
 | `session.fork(*, options=None)` | 独立 `Session`；异步版 await 返回 `AsyncSession` |
 | `session.checkpoints()` | `tuple[int, ...]`；异步版同样是普通方法 |
@@ -73,7 +73,7 @@ QuestionSnapshot.state 新增 open，QuestionEvent.kind 新增 question.opened�
 `TextBlock(text: str)`、`ImageBlock(data: bytes)` 为 frozen 数据类，内容列表不能为空。
 图片支持 PNG/JPEG/GIF/WebP 编码字节，每张至多 7 MiB；在启动轮次前校验、复制，
 不接受原始协议字典。图片以内联内容随会话持久化，使用方式见
-[图片输入与插话](sdk.md#图片输入与运行中插话当前源码新增)。
+[图片输入与插话](sdk.md#图片输入与运行中插话)。
 
 `steer` 返回 True 只表示排队；以 `SteerAccepted(text)` 确认进入用户历史。
 未接纳项在轮次结束后通过 `drain_steers` 取回，不自动进入下一轮，也不跨重启恢复。
@@ -83,9 +83,9 @@ QuestionSnapshot.state 新增 open，QuestionEvent.kind 新增 question.opened�
 通知、去重 key 与观察订阅不跨重启恢复，也不随 fork 复制。
 观察流给出初始及合并变化后的待通知快照，在关闭开始时结束；不是逐条投递日志。
 `snapshot` 要求会话空闲；`status` 与 `pending_notifications` 可在运行中和关闭后查询。
-完整生命周期说明见 [通知与状态观察](sdk.md#通知与状态观察当前源码新增)。
+完整生命周期说明见 [通知与状态观察](sdk.md#通知与状态观察)。
 
-## 只读视图类型（当前源码新增）
+## 只读视图类型
 
 下列数据类均为 frozen，嵌套集合为 tuple，不持有可变内核对象。
 
@@ -100,7 +100,7 @@ QuestionSnapshot.state 新增 open，QuestionEvent.kind 新增 question.opened�
 
 `SessionState` 为 `Literal["idle", "running", "tasks", "settling", "broken", "closing", "closed"]`。
 `SessionSnapshot` 另有 `plan: tuple[PlanStep, ...] = ()`，表示当前任务清单。
-它与权限模式 `mode="plan"` 独立；事件及恢复语义见 [可选计划工具](sdk.md#可选计划工具当前源码新增)。
+它与权限模式 `mode="plan"` 独立；事件及恢复语义见 [可选计划工具](sdk.md#可选计划工具)。
 usage 包含恢复／分叉的已记录累计基线及后续实际用量，不从对话文本推算；history 是当前上下文的展示
 投影，不包含 system、图片字节和原始调用参数，不作恢复数据格式。
 
@@ -112,16 +112,16 @@ request_timeout=120.0, client=None)`。client 是借用的同步 OpenAI 兼容�
 | `SessionOptions` 字段 | 默认值 |
 |---|---|
 | `model`, `workspace` | 必填 `ModelOptions`、`Path` |
-| `mode`（当前源码新增） | `"default"`；`SessionMode = Literal["default", "auto", "plan"]` |
-| `enable_plan`（当前源码新增） | False；显式启用内核 `update_plan`，独立于 builtin_tools 的选择 |
-| `result_transforms`（当前源码新增） | 空元组；显式的 ResultTransform 序列 |
-| `result_transform_timeout`（当前源码新增） | 30.0 秒；每项回调的有限正超时 |
+| `mode`（0.62.0 起） | `"default"`；`SessionMode = Literal["default", "auto", "plan"]` |
+| `enable_plan`（0.62.0 起） | False；显式启用内核 `update_plan`，独立于 builtin_tools 的选择 |
+| `result_transforms`（0.62.0 起） | 空元组；显式的 ResultTransform 序列 |
+| `result_transform_timeout`（0.62.0 起） | 30.0 秒；每项回调的有限正超时 |
 | `system_prompt` | None，使用内核提示词 |
 | `builtin_tools` | None，使用内核工具；空元组禁用这些工具 |
 | `tools`, `hooks`, `mcp_servers`, `subagents`, `plugins` | 空元组 |
 | `approver` | None，需要审批时拒绝 |
-| `asker`（当前源码新增） | None，不向模型广告 `ask_user` |
-| `question_timeout`（当前源码新增） | 120.0 秒，有限正数 |
+| `asker`（0.62.0 起） | None，不向模型广告 `ask_user` |
+| `question_timeout`（0.62.0 起） | 120.0 秒，有限正数 |
 | `approval_timeout`, `close_timeout` | 120.0 秒、10.0 秒 |
 | `max_iterations`, `budget_tokens` | 50、None；后者是会话 token 软预算 |
 | `load_project_instructions`, `skill_directories` | False、空元组 |
@@ -133,7 +133,7 @@ request_timeout=120.0, client=None)`。client 是借用的同步 OpenAI 兼容�
 请在构造后保持 options 和嵌套配置不变；不要用修改配置对象来热更新会话。
 控制方法成功后由 SDK 替换当前 options 快照。恢复时仍由宿主提供模式、模型和预算
 上限；不会从旧日志自动授权更宽模式。控制均要求空闲，失败可能使会话进入 broken，
-完整语义见 [会话控制与用量连续性](sdk.md#会话控制与用量连续性当前源码新增)。
+完整语义见 [会话控制与用量连续性](sdk.md#会话控制与用量连续性)。
 
 ## 扩展与结果
 
@@ -159,7 +159,7 @@ context_tokens 是当前上下文估算。仅 output_status 为 valid 时消费 
 `Asker = Callable[[list[dict[str, Any]]], dict[str, str] | Awaitable[dict[str, str]]]`。
 问题是归一化的独立副本，答案按问题原文索引，可省略未回答项；空字典表示主动跳过。
 同步 Session 不接受异步 asker。超时、错误返回和回调异常作为工具错误回灌；
-提问不代替审批。完整生命周期与使用方式见 [宿主提问回调](sdk.md#宿主提问回调当前源码新增)。
+提问不代替审批。完整生命周期与使用方式见 [宿主提问回调](sdk.md#宿主提问回调)。
 
 ## 兼容矩阵
 

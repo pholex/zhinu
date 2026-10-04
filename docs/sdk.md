@@ -2,9 +2,10 @@
 
 `xiaoyu-agent-sdk` 是与 `xiaoyu-agent` 同仓库、同版本的独立发行包，导入名为
 `xiaoyu_agent_sdk`。SDK 在宿主进程里调用现有执行内核，不启动 CLI 子进程。
-旧 `import xiaoyu` 和 CLI 保持兼容。本页覆盖 0.59.0 起的平台接口及当前源码扩展。
-`SessionOptions.asker` / `question_timeout`、类型化输入与插话、通知与状态观察、会话控制、可选计划工具为当前源码新增、尚未发布的接口；使用它们
-需安装当前源码。工具结果变换 `result_transforms`、持久化待答 `questions` 同样尚未发布。平台扩展不包含在 0.58.0 中。
+旧 `import xiaoyu` 和 CLI 保持兼容。本页覆盖 0.59.0 起的平台接口及 0.62.0 的扩展。
+`SessionOptions.asker` / `question_timeout`、类型化输入与插话、通知与状态观察、会话控制、可选计划工具、
+工具结果变换 `result_transforms`、持久化待答 `questions` 自 0.62.0 起提供，使用它们需安装 0.62.0 或更新的版本。
+平台扩展不包含在 0.58.0 中。
 
 ## 安装与首次调用
 
@@ -45,14 +46,14 @@ print(result.text, result.stopped, result.usage)
 | `ModelOptions` | 显式模型、凭据、端点、协议、超时；可借用同步兼容 client |
 | `SessionOptions` | 工作区、工具、审批、扩展、会话目录与预算 |
 | `Tool` / `ToolResult` | Python 业务工具和可识别的工具失败 |
-| `ResultTransform` / `ToolOutput` | 截断和 recall 落盘前的工具返回文本处理（当前源码新增） |
-| `QuestionOptions` / `QuestionAnswer` | SQLite 持久化待答，显式提交、安全边界接纳（当前源码新增） |
+| `ResultTransform` / `ToolOutput` | 截断和 recall 落盘前的工具返回文本处理（0.62.0 起） |
+| `QuestionOptions` / `QuestionAnswer` | SQLite 持久化待答，显式提交、安全边界接纳（0.62.0 起） |
 | `Hook` / `HookDecision` | Python 生命周期回调 |
-| `Asker` | 宿主提供的同步／异步澄清问题回调（当前源码新增） |
-| `TextBlock` / `ImageBlock` / `Prompt` | 类型化文字和图片输入（当前源码新增） |
-| `SteerAccepted` | 插话已进入会话上下文的事件（当前源码新增 SDK 导出） |
-| `Notification` / `SessionSnapshot` | 不可变的待通知与会话展示快照（当前源码新增） |
-| `PlanUpdated` / `ToolPurpose` | 内核计划与调用目的事件类型（当前源码新增 SDK 导出） |
+| `Asker` | 宿主提供的同步／异步澄清问题回调（0.62.0 起） |
+| `TextBlock` / `ImageBlock` / `Prompt` | 类型化文字和图片输入（0.62.0 起） |
+| `SteerAccepted` | 插话已进入会话上下文的事件（0.62.0 起的 SDK 导出） |
+| `Notification` / `SessionSnapshot` | 不可变的待通知与会话展示快照（0.62.0 起） |
+| `PlanUpdated` / `ToolPurpose` | 内核计划与调用目的事件类型（0.62.0 起的 SDK 导出） |
 | `McpServer` / `McpServerStatus` | 静态 MCP 清单与状态快照 |
 | `Subagent` / `Plugin` | 子 Agent 隔离与显式 Python 插件选择 |
 | `RewindResult` | 回滚状态、处理文件与冲突清单 |
@@ -185,7 +186,7 @@ SDK 为每个会话分配独立的临时 MCP 缓存、工具声明记录和日�
 工厂契约（Config → 内核 Tool 或其列表），是可信的进程内代码，所创建资源由插件
 负责回收。项目插件 bundle 的自动发现仍关闭；普通业务工具优先使用公开 `Tool`。
 
-## 通知与状态观察（当前源码新增）
+## 通知与状态观察
 
 `session.notify(text, key="", wake=True)` 向主会话投递后台结果或环境变化，空闲与执行中
 均可调用，线程安全。两个会话类上都是普通方法，无需 await。
@@ -262,7 +263,7 @@ async def observe(options):
 替代接口和剩余项目统一见 [接入清单](sdk-kernel-map.md)。`PlanUpdated` 的类型导出
 本身不启用工具，需显式配置 `enable_plan=True`；`ToolPurpose` 会在对应工具审批事件流中出现。
 
-## 工具结果文本变换（当前源码新增）
+## 工具结果文本变换
 
 `SessionOptions.result_transforms` 显式注册 `ResultTransform`，按顺序处理完整的工具
 返回文本，再进行截断、recall 落盘、事件与历史记录。支持同步／异步回调，SDK
@@ -272,7 +273,7 @@ async def observe(options):
 这与 PostToolUse 的附加反馈是两个契约，也不覆盖工具参数、媒体或工具内部日志。
 接口、数据流、异常与关闭语义见 [工具结果文本变换](sdk-result-transforms.md)。
 
-## 可选计划工具（当前源码新增）
+## 可选计划工具
 
 `SessionOptions(enable_plan=True, ...)` 启用内核 `update_plan`，默认 False。
 它与 `builtin_tools` 独立：即使基础工具设为空元组，也能单独启用任务清单。
@@ -307,7 +308,7 @@ with Session(replace(options, enable_plan=True)) as session:
 离线示例：[planning.py](../examples/sdk/planning.py)。其他可选能力的选择与验收条件见
 [接入取舍](sdk-kernel-map.md#可选能力与部分接入的取舍)。
 
-## 图片输入与运行中插话（当前源码新增）
+## 图片输入与运行中插话
 
 `run`、`run_async` 与两个会话类的 `run` / `stream` 均接受 `Prompt`：普通字符串，
 或由 `TextBlock`、`ImageBlock` 组成的非空 list/tuple。旧字符串调用保持不变。
@@ -354,7 +355,7 @@ hooks 接收文字投影和图片占位标记，不接收图片字节。
 完整同步／异步调用中的图片与插话契约一致。可运行的异步宿主示例见
 [inputs.py](../examples/sdk/inputs.py)，持久化待答首版见下节。
 
-## 持久化待答（当前源码新增）
+## 持久化待答
 
 `SessionOptions.questions=QuestionOptions()` 配合 `SQLiteSessionStore` 开启独立
 问题服务，与 asker 回调互斥。默认立即返回 pending，可用
@@ -367,7 +368,7 @@ questions.watch() 使用 async for 观察版本变化。空闲时不自动启动
 serve 端点见 [HTTP 持久化问答](serve-questions.md)。前台等待、恢复、reset、fork 及暂不支持的
 对话 rewind 边界见 [持久化待答指南](sdk-deferred-questions.md)。
 
-## 宿主提问回调（当前源码新增）
+## 宿主提问回调
 
 通过 `SessionOptions(asker=..., question_timeout=120.0)` 为内核 `ask_user` 工具接入
 宿主界面。未配置时不向模型广告该工具。同步 `Session` 接受同步函数；
@@ -456,7 +457,7 @@ else:
 
 不要向外部用户无筛选地展示 `__cause__` 或完整 traceback，它们可能包含供应商错误正文。
 
-## 会话控制与用量连续性（当前源码新增）
+## 会话控制与用量连续性
 
 `reset()`、`set_mode(mode)`、`switch_model(model)`、`set_budget_tokens(budget)`
 均为仅空闲时接受的控制操作；AsyncSession 对应方法都需 await。

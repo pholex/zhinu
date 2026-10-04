@@ -1,6 +1,6 @@
-# HTTP 持久化问答（当前源码新增）
+# HTTP 持久化问答
 
-尚未发布。serve 与 SDK 共用问题状态机；serve 使用自己的会话日志、访问控制和
+自 0.62.0 起提供。serve 与 SDK 共用问题状态机；serve 使用自己的会话日志、访问控制和
 事件缓冲，不需要安装 SDK 包。SDK 的 Python 调用见[持久化待答](sdk-deferred-questions.md)。
 
 ## 开启

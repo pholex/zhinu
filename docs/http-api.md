@@ -52,13 +52,13 @@ curl -X POST :8420/session/$SID/prompt -d '{"text":"评估这个 PR 能不能合
 
 ---
 
-## 持久化问答（当前源码新增）
+## 持久化问答
 
 创建会话时传 `questions: {foreground_timeout_seconds: 60}` 可开启前台等待；
 `questions: {}` 立即待答。问题查询、幂等提交／取消走 `/session/{id}/questions`，
 版本变化进入已有 events／SSE。只支持持久化会话，空闲时提交回答不会自动跑模型，
 问答不替代 permissions 审批。完整端点、重连与恢复契约见
-[HTTP 持久化问答](serve-questions.md)，尚未发布。
+[HTTP 持久化问答](serve-questions.md)，自 0.62.0 起提供。
 
 ## 状态机（编排的主要抓手）
 
