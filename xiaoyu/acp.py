@@ -234,6 +234,9 @@ _TOOL_KINDS = {
     "explore": "search",
     "search_tool": "search",
     "web_search": "fetch",
+    "x_search": "fetch",
+    "deep_research": "fetch",
+    "deep_research_status": "fetch",
     "browser": "fetch",
     "update_plan": "think",
     "exit_plan_mode": "think",
@@ -381,6 +384,12 @@ def _cmd_usage(agent: Agent, args: str) -> str:
     return str(agent.usage)
 
 
+def _cmd_search(agent: Agent, args: str) -> str:
+    from .websearch import search_command
+
+    return search_command(agent.config, agent.registry, args)
+
+
 def _cmd_context(agent: Agent, args: str) -> str:
     used = agent.context_tokens()
     limit = agent.config.context_limit
@@ -483,6 +492,7 @@ _ACP_COMMANDS: tuple[AcpCommand, ...] = (
     AcpCommand("context", "", _cmd_context),
     AcpCommand("compact", "", _cmd_compact),
     AcpCommand("tools", "", _cmd_tools),
+    AcpCommand("search", "deepseek|xai|bedrock（可选）", _cmd_search),
     AcpCommand("skills", "", _cmd_skills),
     AcpCommand("tasks", "", _cmd_tasks),
     AcpCommand("mcp", "diff|approve|reconnect <server名>（可选）", _cmd_mcp),
@@ -2149,5 +2159,3 @@ class AcpServer:
         for session in self._sessions.values():
             if session.agent.session_log is not None:
                 session.agent.session_log.close("disconnect")
-
-

@@ -323,6 +323,7 @@ def _scan(
     """
     found: dict[str, Skill] = {}
     disabled: list[Skill] = []
+    seen: set[tuple[Path, str | None]] = set()
     patterns = disabled_patterns() if directories is None else []
     for source in (skill_sources(workspace) if directories is None else [SkillSource(p) for p in directories]):
         if not source.directory.is_dir():
@@ -331,6 +332,11 @@ def _scan(
             try:
                 #  glob 不看文件类型：仓库里 SKILL.md 可以是指向设备的链接
                 fsguard.require_regular(skill_md)
+                #  家目录作为工作区、或来源含符号链接时，同一文件可能被扫到多次。
+                #  按真实路径和插件命名空间去重，保留最先来源的身份与优先级。
+                identity = (skill_md.resolve(), source.plugin)
+                if identity in seen:
+                    continue
                 #  frontmatter 里的 description 进 system prompt 的技能索引：同样剥隐形字符
                 meta = parse_frontmatter(
                     strip_invisible(
@@ -339,6 +345,7 @@ def _scan(
                 )
             except OSError:
                 continue
+            seen.add(identity)
             name = (meta.get("name") or skill_md.parent.name).strip()
             if not name:
                 continue

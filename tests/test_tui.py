@@ -313,6 +313,13 @@ class TestTuiFrontend(AgentTestCase):
         #  第三个词不再补模型名
         self.assertEqual(self.completions(tui, "/model main-model x"), [])
 
+    def test_search_backend_completion(self) -> None:
+        tui = self.make_tui(self.build([]))
+        self.assertIn("/search", self.completions(tui, "/se"))
+        self.assertEqual(self.completions(tui, "/search "), ["deepseek", "xai", "bedrock"])
+        self.assertEqual(self.completions(tui, "/search d"), ["deepseek"])
+        self.assertEqual(self.completions(tui, "/search xai extra"), [])
+
     def test_truncation_hint_prints_once_at_turn_end(self) -> None:
         """折叠提示是整轮的一个状态：
         每个折叠行只说"藏了多少"，"怎么展开"在一轮收尾统一提一次。"""

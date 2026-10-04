@@ -118,6 +118,22 @@ class TextEnd(UIEvent):
 
 
 @dataclass(frozen=True)
+class ToolPreparing(UIEvent):
+    """参数仍在生成；仅供展示，不代表完整、合法或获准的调用。
+
+    index 在当前 request.started/ended 区间内标识调用，所有预览在
+    request.ended 时失效（含异常、中断、截断和重试）。不进入工具四态机。
+    """
+
+    kind: ClassVar[str] = "tool.preparing"
+    name: str
+    index: int
+    argument_chars: int
+    path: str = ""
+    purpose: str = ""
+
+
+@dataclass(frozen=True)
 class ToolPending(UIEvent):
     """收到一次工具调用（参数已解析合法；可能还要等权限/确认）。"""
 

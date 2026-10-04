@@ -111,6 +111,8 @@ def run_case(case: Case, model: str, base_url: str | None, verbose: bool) -> dic
             enable_mcp=False,
             #  联网搜索结果随时间变，eval 里必须关掉
             enable_web_search=False,
+            enable_x_search=False,
+            enable_deep_research=False,
             max_iterations=case.max_iterations,
             request_timeout=REQUEST_TIMEOUT,
             #  eval 是无人值守 + 全放行的，必须挡住"往系统 Python 里 pip install"。

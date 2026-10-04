@@ -5,9 +5,9 @@ on:
   workflow_dispatch:
   push:
     branches: ["**"]
-    paths: ["xiaoyu/**", "packages/xiaoyu-agent-sdk/**", "tests/*sdk*", "scripts/**", "examples/sdk/**", ".github/workflows/**", "pyproject.toml", "MANIFEST.in"]
+    paths: ["xiaoyu/**", "packages/xiaoyu-agent-sdk/**", "tests/*sdk*", "tests/test_serve_questions*", "scripts/**", "examples/sdk/**", "examples/serve/**", ".github/workflows/**", "pyproject.toml", "MANIFEST.in"]
   pull_request:
-    paths: ["xiaoyu/**", "packages/xiaoyu-agent-sdk/**", "tests/*sdk*", "scripts/**", "examples/sdk/**", ".github/workflows/**", "pyproject.toml", "MANIFEST.in"]
+    paths: ["xiaoyu/**", "packages/xiaoyu-agent-sdk/**", "tests/*sdk*", "tests/test_serve_questions*", "scripts/**", "examples/sdk/**", "examples/serve/**", ".github/workflows/**", "pyproject.toml", "MANIFEST.in"]
 
 jobs:
   contracts:
@@ -17,18 +17,30 @@ jobs:
         python: ["3.11", "3.14"]
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
-      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: ${{ matrix.python }}
-      - run: python -m pip install -e ".[sdk]"
+      - run: python -m pip install -e ".[sdk,serve]"
+      - run: python -m pip install httpx==0.28.1
       - run: python -m pip install -e packages/xiaoyu-agent-sdk
       - run: python -m pip install mypy==2.3.1
       - run: python -m pip install opentelemetry-sdk==1.45.0
       - run: python -m mypy --follow-imports=silent packages/xiaoyu-agent-sdk/src examples/sdk
-      - run: python -m unittest tests.test_sdk tests.test_sdk_storage tests.test_sdk_tasks tests.test_sdk_mcp_management tests.test_sdk_accounting tests.test_sdk_transport_reliability tests.test_sdk_fault_windows tests.test_sdk_reliability tests.test_sandbox.WorkspaceTrustCacheTest tests.test_sdk_release tests.test_public_api tests.test_embedding_smoke -v
+      - run: python -m mypy --follow-imports=silent examples/serve xiaoyu/questions.py xiaoyu/serve_questions.py xiaoyu/_observation.py
+      - run: python -m unittest tests.test_serve_questions_example -v
+      - run: python examples/serve/questions.py --demo
+      - run: python -m unittest tests.test_sdk tests.test_sdk_questions tests.test_sdk_deferred_questions tests.test_sdk_foreground_questions tests.test_serve_questions tests.test_sdk_inputs tests.test_sdk_observation tests.test_sdk_controls tests.test_sdk_planning tests.test_sdk_result_transforms tests.test_sdk_storage tests.test_sdk_tasks tests.test_sdk_mcp_management tests.test_sdk_accounting tests.test_sdk_transport_reliability tests.test_sdk_fault_windows tests.test_sdk_reliability tests.test_sandbox.WorkspaceTrustCacheTest tests.test_sdk_release tests.test_public_api tests.test_embedding_smoke -v
       - run: python examples/sdk/sync.py --demo
       - run: python examples/sdk/async_service.py --demo
+      - run: python examples/sdk/questions.py --demo
+      - run: python examples/sdk/deferred_questions.py --demo
+      - run: python examples/sdk/inputs.py --demo
+      - run: python examples/sdk/observation.py --demo
+      - run: python examples/sdk/controls.py --demo
+      - run: python examples/sdk/planning.py --demo
+      - run: python examples/sdk/result_transforms.py --demo
+      - run: python examples/sdk/cache_report.py --demo
       - run: python examples/sdk/storage.py --demo
       - run: python examples/sdk/orchestration.py --demo
       - run: python examples/sdk/mcp_management.py --demo
@@ -36,13 +48,14 @@ jobs:
   artifacts:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
-      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: "3.11"
       - run: python -m pip install build
       - run: python scripts/build_sdk.py
       - run: python -m venv /tmp/sdk-install
-      - run: /tmp/sdk-install/bin/python -m pip install --find-links dist/sdk-release/kernel dist/sdk-release/sdk/*.whl
+      # 显式安装同次构建的两个 wheel，避免同版本的已发布内核替代当前候选。
+      - run: /tmp/sdk-install/bin/python -m pip install dist/sdk-release/kernel/*.whl dist/sdk-release/sdk/*.whl
       - run: /tmp/sdk-install/bin/python -m pip check
       - run: /tmp/sdk-install/bin/python -I tests/sdk_wheel_smoke.py

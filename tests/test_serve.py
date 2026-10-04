@@ -42,6 +42,8 @@ def _isolated_env(tmp: str, script_path: Path) -> dict[str, str]:
         "XIAOYU_ENABLE_AGENTS": "0",
         "XIAOYU_ENABLE_EXPLORE": "0",
         "XIAOYU_ENABLE_WEB_SEARCH": "0",
+        "XIAOYU_ENABLE_X_SEARCH": "0",
+        "XIAOYU_ENABLE_DEEP_RESEARCH": "0",
         "XIAOYU_ENABLE_BROWSER": "0",
         "XIAOYU_SANDBOX": "0",
     }
@@ -210,6 +212,11 @@ class TestBasics(ServeCase):
         #  工具四态机里的两态必须原样透传到 HTTP 面（前端契约不因换传输而变）
         self.assertIn("tool.pending", kinds)
         self.assertIn("tool.completed", kinds)
+        self.assertIn("tool.preparing", kinds)
+        self.assertLess(kinds.index("tool.preparing"), kinds.index("tool.pending"))
+        previews = [item for item in self.events(session_id) if item["kind"] == "tool.preparing"]
+        self.assertEqual(previews[-1]["path"], "auto.txt")
+        self.assertGreater(previews[-1]["argument_chars"], 0)
 
     def test_second_run_while_busy_is_409(self):
         #  第一轮永远跑不完（脚本给了一轮工具调用，审批会挂住）

@@ -188,7 +188,7 @@ class InspectTest(IsolatedConfigTest):
             src / "plugin.json",
             {
                 "name": "demo",
-                "extensions": {"com.anthropic.claude-code": {"hooks": "./hooks/hooks.json"}},
+                "extensions": {"com.example.client": {"hooks": "./hooks/hooks.json"}},
             },
         )
         notes = plugins.inspect_bundle(src).notes
@@ -196,7 +196,7 @@ class InspectTest(IsolatedConfigTest):
 
     def test_hooks_found_by_convention_without_manifest_pointer(self):
         src = make_bundle(self.root / "src")
-        write_json(src / "com.anthropic.claude-code" / "hooks" / "hooks.json", {"hooks": {}})
+        write_json(src / "com.example.client" / "hooks" / "hooks.json", {"hooks": {}})
         notes = plugins.inspect_bundle(src).notes
         self.assertTrue(any("hooks" in note for note in notes), notes)
 
@@ -697,6 +697,22 @@ class RemoveTest(IsolatedConfigTest):
 
 
 class ListRedactionTest(IsolatedConfigTest):
+    def test_source_userinfo_is_hidden_without_changing_update_metadata(self):
+        src = make_bundle(self.root / "src")
+        self.assertEqual(self.run_cli(["add", str(src), "--accept-mcp"])[0], 0)
+        registry = plugins.load_registry()
+        for userinfo in ("opaque_demo_token", "alice:p@ss@word"):
+            with self.subTest(userinfo=userinfo):
+                source = f"https://{userinfo}@git.example/x/y.git"
+                registry["demo"].update(source=source, url=source)
+                plugins.save_registry(registry)
+                code, out, err = self.run_cli(["list"])
+                self.assertEqual(code, 0)
+                self.assertEqual(err, "")
+                self.assertIn("https://[REDACTED]@git.example/x/y.git", out)
+                self.assertNotIn(userinfo, out)
+                self.assertEqual(plugins.load_registry(), registry)
+
     def test_credentials_in_the_source_are_not_echoed(self):
         src = make_bundle(self.root / "src")
         self.assertEqual(self.run_cli(["add", str(src), "--accept-mcp"])[0], 0)

@@ -107,7 +107,8 @@ except ImportError:  # pragma: no cover - 没装 [serve] 时 create_app 会先�
     WebSocket = Any  # type: ignore[assignment,misc]
     WebSocketDisconnect = Exception  # type: ignore[assignment,misc]
 
-from . import diagnostics, folder_trust, mcp, mcp_guard
+from . import diagnostics, folder_trust, mcp, mcp_guard, serve_questions
+from . import questions as question_types
 from .agent import Agent, Allow, Deny
 from .config import Config, MissingConfig
 from .embedding import AsyncAgent, RunCompleted
@@ -425,6 +426,9 @@ class _Session:
         self._task: asyncio.Task | None = None
         #  浏览器桥（扩展连上才有；断开即 None）。工具随连接注册/注销
         self.bridge: BrowserBridge | None = None
+        self.questions: question_types.QuestionManager | None = None
+        self.question_options: dict[str, Any] | None = None
+        self.question_closing = False
 
     # ---------- 挂起的审批（跨线程，一律走这三个口） ----------
 
@@ -562,6 +566,7 @@ class _Session:
     def info_dict(self) -> dict[str, Any]:
         return {
             **self.status_dict(),
+            "questions": self.question_options,
             "workspace": str(self.workspace),
             "model": self.agent.config.model,
             "mode": getattr(self.agent.config, "mode", ""),
@@ -579,6 +584,7 @@ class _Session:
         """
         return {
             "session_id": self.id,
+            "questions": self.question_options,
             "workspace": str(self.workspace),
             "agent": self.agent_ref,
             "agent_config": self.agent_config,
@@ -846,11 +852,12 @@ def create_app(cfg: ServeConfig):  # noqa: C901 - 路由表天然长，拆开反
     """构造 FastAPI app。抽成函数是为了让测试与 --print-openapi 不必起服务。"""
     try:
         from fastapi import Body, Depends, FastAPI, Header, HTTPException, Query
-        from fastapi.responses import StreamingResponse
+        from fastapi.responses import StreamingResponse, JSONResponse, Response
     except ImportError as exc:  # pragma: no cover - 缺包路径在 CLI 侧有提示
         raise ServeUnavailable(str(exc)) from exc
 
     sessions: dict[str, _Session] = {}
+    question_cleanup: set[asyncio.Task] = set()
     state_dir = cfg.resolved_state_dir()
     log_dir = state_dir / "logs"
     agents = AgentStore(state_dir / "agents" if cfg.persist else None)
@@ -874,10 +881,27 @@ def create_app(cfg: ServeConfig):  # noqa: C901 - 路由表天然长，拆开反
             max_workers=cfg.max_sessions, thread_name_prefix="xiaoyu-serve"
         )
         asyncio.get_running_loop().set_default_executor(pool)
+        # Foreground waits may occupy every model worker. HTTP answers need an
+        # independent bounded control pool to unblock those workers.
+        controls = ThreadPoolExecutor(max_workers=2, thread_name_prefix="xiaoyu-question-control")
+        app.state.question_pool = controls
         restore_sessions()
         try:
             yield
         finally:
+            for session in sessions.values():
+                if session.questions is not None:
+                    session.question_closing = True
+                    session.async_agent.interrupt()
+                    session.questions._wake()
+                    for request in session.snapshot_pending():
+                        request.verdict = Deny("服务正在关闭")
+                        request.done.set()
+            active = [s._task for s in sessions.values() if s.questions is not None and s._task is not None]
+            if active:
+                await asyncio.gather(*active, return_exceptions=True)
+            if question_cleanup:
+                await asyncio.gather(*question_cleanup, return_exceptions=True)
             #  优雅停机：把每个会话的游标水位落盘（next_seq 一直在涨，逐事件写盘
             #  不值得；停机时写一次即可让重启后的编号接得上）
             for session in sessions.values():
@@ -886,6 +910,7 @@ def create_app(cfg: ServeConfig):  # noqa: C901 - 路由表天然长，拆开反
                 #  进程真退出时内核也会放，但嵌入宿主可能在同一进程里停了再起
                 if session.agent.session_log is not None:
                     session.agent.session_log.release()
+            controls.shutdown(wait=True, cancel_futures=True)
             pool.shutdown(wait=False, cancel_futures=True)
 
     app = FastAPI(
@@ -1067,6 +1092,7 @@ def create_app(cfg: ServeConfig):  # noqa: C901 - 路由表天然长，拆开反
         budget: Budget | None,
         pricing: dict[str, dict[str, float]],
         session_log: SessionLog | None = None,
+        question_options: dict[str, Any] | None = None,
     ) -> _Session:
         """新建与重启恢复共用的装配口：Agent、_Session、approver/sink 绑定。"""
         ref = _SessionRef()
@@ -1103,6 +1129,15 @@ def create_app(cfg: ServeConfig):  # noqa: C901 - 路由表天然长，拆开反
         agent.on_notification = lambda item: loop.call_soon_threadsafe(
             session.note_notification, item
         )
+        if question_options is not None:
+            try:
+                serve_questions.attach(session, question_options)
+            except Exception:
+                if agent.session_log is not None:
+                    agent.session_log.release()
+                if manager is not None:
+                    manager.close()
+                raise
         sessions[session_id] = session
         SESSIONS_LIVE.set(len(sessions))
         return session
@@ -1114,6 +1149,7 @@ def create_app(cfg: ServeConfig):  # noqa: C901 - 路由表天然长，拆开反
         agent: Any = None,
         budget: Any = None,
         fork_from: Any = None,
+        questions: Any = None,
     ) -> _Session:
         """装配一个会话并登记进注册表。REST 的 POST /session 与 MCP 的 xiaoyu
         工具共用这一个装配口——两张脸建出的会话必须一模一样，包括 approver 与
@@ -1128,6 +1164,10 @@ def create_app(cfg: ServeConfig):  # noqa: C901 - 路由表天然长，拆开反
         workspace / agent / model / mode 就沿用来源会话的工作区与 agent 版本。
         预算不沿用——用量从零记起，要设预算在这次请求里给。
         """
+        try:
+            question_options = serve_questions.parse_options(questions, persist=cfg.persist)
+        except question_types.ConfigurationError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from None
         source, history = fork_history(fork_from)
         if source is not None:
             if not workspace:
@@ -1166,6 +1206,7 @@ def create_app(cfg: ServeConfig):  # noqa: C901 - 路由表天然长，拆开反
             agent_config=agent_config,
             budget=session_budget,
             pricing=agent_config.get("pricing") or {},
+            question_options=question_options,
         )
         if source is not None:
             origin = source.agent.session_log
@@ -1253,6 +1294,7 @@ def create_app(cfg: ServeConfig):  # noqa: C901 - 路由表天然长，拆开反
                     budget=Budget.parse(manifest.get("budget")),
                     pricing=check_pricing(manifest.get("pricing")),
                     session_log=log,
+                    question_options=serve_questions.parse_options(manifest.get("questions"), persist=cfg.persist),
                 )
             except Exception as exc:  # noqa: BLE001 - 一个坏清单不能拖死整个服务
                 if log is not None:
@@ -1294,7 +1336,11 @@ def create_app(cfg: ServeConfig):  # noqa: C901 - 路由表天然长，拆开反
     def close_session(session: _Session) -> None:
         """摘除一个会话：先打断，再把挂着的审批放掉（否则工作线程堵到
         approval_timeout），最后出注册表。REST DELETE 与 MCP xiaoyu_close 共用。"""
+        if session.questions is not None:
+            session.question_closing = True
         session.async_agent.interrupt()
+        if session.questions is not None:
+            session.questions._wake()
         for request in session.snapshot_pending():
             request.verdict = Deny("会话已被关闭")
             request.done.set()
@@ -1307,10 +1353,32 @@ def create_app(cfg: ServeConfig):  # noqa: C901 - 路由表天然长，拆开反
             #  这里在事件循环上，排个任务即可，不阻塞关会话
             with contextlib.suppress(RuntimeError):
                 asyncio.get_running_loop().create_task(bridge.close("session closed"))
-        if session.agent.session_log:
-            session.agent.session_log.close("closed")
-        if session.mcp_manager is not None:
-            session.mcp_manager.close()
+        def release_resources():
+            try:
+                if session.questions is not None:
+                    session.questions._cancel_pending()
+                    session.questions._changes.close()
+            finally:
+                if session.agent.session_log:
+                    session.agent.session_log.close("closed")
+                if session.mcp_manager is not None:
+                    session.mcp_manager.close()
+
+        if session.questions is None:
+            release_resources()
+        else:
+            async def finish():
+                try:
+                    if session._task is not None:
+                        await asyncio.shield(session._task)
+                finally:
+                    try:
+                        await asyncio.get_running_loop().run_in_executor(app.state.question_pool, release_resources)
+                    except Exception as exc:
+                        print(f"serve: question cleanup failed ({type(exc).__name__})", file=sys.stderr)
+            cleanup = asyncio.create_task(finish())
+            question_cleanup.add(cleanup)
+            cleanup.add_done_callback(question_cleanup.discard)
 
     def earlier_submission(session: _Session, key: str, text: str) -> dict[str, Any] | None:
         """带着同一个幂等键的上一次提交；没有返回 None。
@@ -1378,6 +1446,11 @@ def create_app(cfg: ServeConfig):  # noqa: C901 - 路由表天然长，拆开反
         默默排队会让编排器以为自己的第二次提交立刻生效了。"""
         if session.busy:
             raise HTTPException(status_code=409, detail="该会话正在跑一轮，先等它结束或 /abort")
+        if session.questions is not None:
+            try:
+                session.questions._check()
+            except question_types.QuestionError:
+                raise HTTPException(status_code=503, detail="Question storage is unavailable; restart and reconcile") from None
         reason = session.check_budget()
         if reason:
             session.budget_reason = reason
@@ -1420,6 +1493,8 @@ def create_app(cfg: ServeConfig):  # noqa: C901 - 路由表天然长，拆开反
                         session.budget_reason = reason
                         session.publish("budget.reached", reason=reason)
                         session.async_agent.interrupt()
+                        if session.questions is not None:
+                            session.questions._wake()
         except Exception as exc:  # noqa: BLE001 - 编排方要结构化错误，不要 traceback
             session.status = "error"
             session.detail = "failed"
@@ -1445,7 +1520,8 @@ def create_app(cfg: ServeConfig):  # noqa: C901 - 路由表天然长，拆开反
         finally:
             session.busy = False
             session.in_flight = None
-            manifests.save(session.manifest())
+            if sessions.get(session.id) is session:
+                manifests.save(session.manifest())
             #  会话若在跑的过程中被 DELETE，挂起的审批要有人收尸，否则工作线程
             #  一直阻塞到 approval_timeout。这里统一兜底放拒绝。
             for request in session.snapshot_pending():
@@ -1597,6 +1673,8 @@ def create_app(cfg: ServeConfig):  # noqa: C901 - 路由表天然长，拆开反
             embed=True,
             description="本会话的硬预算 {tokens, usd}；缺省用 agent 的默认预算；usd 需要 agent 带 pricing",
         ),
+        questions: dict[str, Any] | None = Body(default=None, embed=True,
+            description="显式启用持久化问答：{} 或 {foreground_timeout_seconds: 60}；须启用 persist"),
         fork_from: str | dict[str, Any] | None = Body(
             default=None,
             embed=True,
@@ -1606,10 +1684,13 @@ def create_app(cfg: ServeConfig):  # noqa: C901 - 路由表天然长，拆开反
             ),
         ),
     ) -> dict[str, Any]:
-        return make_session(
-            workspace=workspace, model=model, mode=mode, agent=agent, budget=budget,
-            fork_from=fork_from,
-        ).info_dict()
+        try:
+            return make_session(
+                workspace=workspace, model=model, mode=mode, agent=agent, budget=budget,
+                fork_from=fork_from, questions=questions,
+            ).info_dict()
+        except question_types.SessionStorageError:
+            raise HTTPException(status_code=503, detail="Question storage is unavailable") from None
 
     @app.get(
         "/session",
@@ -1852,6 +1933,70 @@ def create_app(cfg: ServeConfig):  # noqa: C901 - 路由表天然长，拆开反
                 bridge.detach("disconnected")
                 session.publish("browser.disconnected")
 
+    def pick_questions(session_id: str) -> question_types.QuestionManager:
+        manager = pick(session_id).questions
+        if manager is None:
+            raise HTTPException(status_code=409, detail="Questions are not enabled for this session")
+        return manager
+
+    async def question_call(operation, *args):
+        try:
+            return await asyncio.get_running_loop().run_in_executor(
+                app.state.question_pool, lambda: operation(*args))
+        except question_types.QuestionNotFoundError:
+            raise HTTPException(status_code=404, detail="Question not found in this session") from None
+        except (question_types.QuestionConflictError, question_types.SessionClosedError):
+            raise HTTPException(status_code=409, detail="Question conflicts with current session state") from None
+        except question_types.ConfigurationError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from None
+        except question_types.SessionStorageError:
+            raise HTTPException(status_code=503, detail="Question storage is unavailable; restart and reconcile") from None
+
+    @app.get("/session/{session_id}/questions", tags=["questions"], dependencies=guard,
+             operation_id="list_questions", summary="查询待答问题或重连时的全部状态")
+    async def questions_list(session_id: str, include_terminal: bool = False):
+        manager = pick_questions(session_id)
+        # Capture the event cursor BEFORE the snapshot. Racing transitions may
+        # appear twice; clients deduplicate by question version, never miss them.
+        cursor = pick(session_id).next_seq
+        items = await question_call(serve_questions.snapshots, manager, include_terminal)
+        return {"session_id": session_id, "questions": items, "next_seq": cursor}
+
+    @app.get("/session/{session_id}/questions/{question_id}", tags=["questions"], dependencies=guard,
+             operation_id="get_question", summary="查询问题状态与提交回执")
+    async def questions_get(session_id: str, question_id: str):
+        return {"question": asdict(await question_call(pick_questions(session_id).get, question_id))}
+
+    @app.post("/session/{session_id}/questions/{question_id}/answers", tags=["questions"], dependencies=guard,
+              operation_id="answer_question", summary="幂等提交回答，不启动空闲模型",
+              openapi_extra={"requestBody": {"required": True, "content": {"application/json": {"schema": {
+                  "type": "object", "required": ["answers", "idempotency_key"], "additionalProperties": False,
+                  "properties": {"idempotency_key": {"type": "string", "maxLength": 200}, "answers": {
+                      "type": "array", "minItems": 1, "maxItems": 4, "items": {"type": "object",
+                      "required": ["item_id"], "properties": {"item_id": {"type": "string"},
+                      "selected": {"type": "array", "items": {"type": "string"}},
+                      "custom": {"type": "string", "maxLength": 4000}, "skipped": {"type": "boolean"}}}}}}}}}})
+    async def questions_answer(session_id: str, question_id: str, request: Request):
+        manager = pick_questions(session_id)
+        data = bytearray()
+        async for chunk in request.stream():
+            if len(data) + len(chunk) > 131072:
+                raise HTTPException(status_code=413, detail="Answer body exceeds 128 KiB")
+            data.extend(chunk)
+        try:
+            body = json.loads(data.decode("utf-8", errors="replace"))
+            answers, key = serve_questions.parse_answer(body)
+        except (ValueError, question_types.ConfigurationError):
+            raise HTTPException(status_code=400, detail="Invalid answer body") from None
+        receipt = await question_call(manager.answer, question_id, answers, key)
+        return JSONResponse({"question": asdict(receipt)}, status_code=200 if receipt.state == "answered" else 202)
+
+    @app.delete("/session/{session_id}/questions/{question_id}", tags=["questions"], dependencies=guard,
+                operation_id="cancel_question", summary="取消未接纳的问题", status_code=204)
+    async def questions_cancel(session_id: str, question_id: str):
+        await question_call(pick_questions(session_id).cancel, question_id)
+        return Response(status_code=204)
+
     @app.get(
         "/session/{session_id}/permissions",
         summary="挂起的审批",
@@ -1945,6 +2090,8 @@ def create_app(cfg: ServeConfig):  # noqa: C901 - 路由表天然长，拆开反
                 "detail": f"第 {turn} 轮不在跑" + (f"（在跑的是第 {running} 轮）" if running else ""),
             }
         session.async_agent.interrupt()
+        if session.questions is not None:
+            session.questions._wake()
         #  打断时挂着审批的话，工作线程还堵在 Event 上——先把它放掉，
         #  否则 interrupt 要等到 approval_timeout 才生效
         for request in session.snapshot_pending():

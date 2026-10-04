@@ -453,6 +453,30 @@ class SessionLog:
         """记一条非消息事件（meta / compact / clear …）。"""
         self._write({"ts": self._now(), "event": kind, **fields})
 
+    def commit_event(self, kind: str, **fields: Any) -> None:
+        """Strict append for acknowledged host state; require the writer lease.
+
+        A state transition and its history message occupy one JSONL record.
+        A lost acknowledgement is reconciled by replay, never a blind retry.
+        Ordinary diagnostic logging retains its existing best-effort behavior.
+        """
+        with self._mutex:
+            if self._closed or self._released or self._broken or not self.locked:
+                raise OSError("Session journal is unavailable")
+            try:
+                self._write_locked({"ts": self._now(), "event": kind, **fields})
+                if self._broken or not self.locked:
+                    raise OSError("Session journal append failed")
+                fd = _open_private(self.path, os.O_RDWR)
+                try:
+                    os.fsync(fd)
+                finally:
+                    os.close(fd)
+            except OSError:
+                self._broken = True
+                self.broken_reason = "Acknowledged state write failed"
+                raise
+
     def preamble(self, kind: str, **fields: Any) -> None:
         """记一条会话前言事件：与 meta 同性质的"这场会话的设定"，不算发生过什么。
 
@@ -1295,6 +1319,11 @@ def _replay_lines(lines: Iterable[str]) -> LoadedMessages:
             elif kind == "clear":
                 messages = []
                 corrupt = []
+            elif kind == "sdk.question.delivery":
+                message = record.get("message")
+                if not isinstance(message, dict) or set(message) != {"role", "content"} or message.get("role") != "user" or not isinstance(message.get("content"), str):
+                    raise ValueError("Invalid question delivery message")
+                messages.append(dict(message))
             continue
         if "role" in record:
             messages.append({key: value for key, value in record.items() if key != "ts"})

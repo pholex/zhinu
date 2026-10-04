@@ -148,6 +148,7 @@ async with contextlib.aclosing(async_agent.stream("任务")) as events:
 | `RequestStarted` | `request.started` | `model` |
 | `RequestEnded` | `request.ended` | `duration_ms`、`ttft_ms`（首个 chunk 延迟；一个都没等到为 `null`）、`usage`（这次调用的 `prompt_tokens` / `completion_tokens` / `cached_tokens`；上游没回 usage 为 `{}`） |
 | `TextDelta` / `TextEnd` | `text.delta` / `text.end` | `text` |
+| `ToolPreparing` | `tool.preparing` | `name`, `index`, `argument_chars`, `path`, `purpose`（参数生成中的临时预览） |
 | `ToolPending` | `tool.pending` | `name`, `args` |
 | `ToolPurpose` | `tool.purpose` | `name`, `purpose` |
 | `ToolRunning` | `tool.running` | `name`, `args` |
@@ -161,6 +162,13 @@ async with contextlib.aclosing(async_agent.stream("任务")) as events:
 
 不变量：每个 `tool.pending` 最终恰好收到一个终态（`completed` 或 `denied`）；
 每个 `request.started` 恰好对应一个 `request.ended`。
+
+`tool.preparing` 在模型流内、`tool.pending` 之前产生。用当前请求与 `index`
+关联预览；`argument_chars` 是累计原始 JSON 字符数，不是 token 或文件字节数。
+`path` / `purpose` 仅展示已闭合且不超过 2048 原始字符的顶层字符串；其他参数不外发。
+元信息变化立即发，只有字符数变化时最多每秒十次，结束时补齐最后计数。
+收到 `request.ended` 后必须清除该请求的全部预览，包括异常、中断与重试。
+预览不表示工具已获准或一定执行；审批与执行仍只使用收齐、解析后的参数。
 
 ## 后台事件：会话空闲时也要知道
 
@@ -280,7 +288,7 @@ EOF / 连接关闭：挂起审批全部拒绝、打断当前轮、等工作线�
 - **审批 / 提问**：`Allow`、`Deny`、`Approver`、`Asker`、`AsyncApprover`、`normalize_verdict`
 - **单轮结算**：`RunResult`、`RunCompleted`、`measured_send`、`Interrupted`
 - **事件**：`UIEvent`、`UISink`、`RequestStarted`、`RequestEnded`、`TextDelta`、
-  `TextEnd`、`ToolPending`、`ToolPurpose`、`ToolRunning`、`ToolCompleted`、
+  `TextEnd`、`ToolPreparing`、`ToolPending`、`ToolPurpose`、`ToolRunning`、`ToolCompleted`、
   `ToolDenied`、`SteerAccepted`、`PlanUpdated`、`Notice`
 - **会话**：`SessionLog`、`SessionLockedError`、`load_messages`、`list_sessions`
 - **权限**：`Permissions`、`Rule`、`parse_rule`、`suggest_allow_rule`、

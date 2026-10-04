@@ -68,14 +68,14 @@ class TestAgentEmitsSinkEvents(AgentTestCase):
         self.assertEqual(
             recorder.kinds(),
             [
-                "request.started", "request.ended",
+                "request.started", "tool.preparing", "request.ended",
                 "tool.pending", "tool.running", "tool.completed",
                 "request.started", "text.delta", "text.delta", "text.end", "request.ended",
             ],
         )
         started = [e for e in recorder.events if e.kind == "request.started"]
         self.assertEqual([e.model for e in started], ["main-model", "main-model"])
-        pending, running, completed = recorder.events[2:5]
+        pending, running, completed = recorder.events[3:6]
         self.assertEqual(pending.name, "read_file")
         self.assertEqual(pending.args, {"path": "calc.py"})
         self.assertEqual(running.args, {"path": "calc.py"})
@@ -112,7 +112,7 @@ class TestAgentEmitsSinkEvents(AgentTestCase):
         ), contextlib.redirect_stdout(io.StringIO()), self.assertRaises(KeyboardInterrupt):
             agent.send("跑个长命令")
         tool_kinds = [k for k in recorder.kinds() if k.startswith("tool.")]
-        self.assertEqual(tool_kinds, ["tool.pending", "tool.running", "tool.completed"])
+        self.assertEqual(tool_kinds, ["tool.preparing", "tool.pending", "tool.running", "tool.completed"])
         completed = next(e for e in recorder.events if e.kind == "tool.completed")
         self.assertFalse(completed.ok)
         self.assertIn("中断", completed.output)
@@ -152,7 +152,7 @@ class TestAgentEmitsSinkEvents(AgentTestCase):
             agent.send("读一下")
 
         tool_kinds = [k for k in recorder.kinds() if k.startswith("tool.")]
-        self.assertEqual(tool_kinds, ["tool.pending", "tool.denied"])
+        self.assertEqual(tool_kinds, ["tool.preparing", "tool.pending", "tool.denied"])
         denied = next(e for e in recorder.events if isinstance(e, ToolDenied))
         self.assertEqual(denied.by, "rule")
 
@@ -171,7 +171,7 @@ class TestAgentEmitsSinkEvents(AgentTestCase):
             agent.send("写文件")
 
         tool_kinds = [k for k in recorder.kinds() if k.startswith("tool.")]
-        self.assertEqual(tool_kinds, ["tool.pending", "tool.denied"])
+        self.assertEqual(tool_kinds, ["tool.preparing", "tool.pending", "tool.denied"])
         denied = next(e for e in recorder.events if isinstance(e, ToolDenied))
         self.assertEqual(denied.by, "user")
 

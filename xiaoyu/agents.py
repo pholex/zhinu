@@ -640,16 +640,17 @@ def distill_history(
 
 @dataclass(frozen=True)
 class ParentGuards:
-    """委托时要从父会话带下去的护栏。两项都是取值回调：父会话运行中会变
+    """委托时要从父会话带下去的护栏。模式与钩子都是取值回调：父会话运行中会变
     （Shift+Tab 换档不回写 config），委托发起的那一刻现取。
 
-    不传（None）按最保守的来：确认档、不带钩子。
+    不传（None）按最保守的来：确认档、不带钩子。结果变换传递宿主处理函数。
     """
 
     #  父会话此刻的交互模式（"default" / "auto" / "plan"）
     mode: Callable[[], str] | None = None
     #  父会话的 hooks.HookEngine（没有钩子时为 None）
     hooks: Callable[[], Any] | None = None
+    result_transform: Callable[[str, dict[str, Any], str], str] | None = None
 
     def child_mode(self) -> str:
         """子 agent 该用哪一档：跟父级走，但只在确认档与 auto 之间取。
@@ -927,6 +928,8 @@ def execute_delegation(
         mcp_tool_search=config.mcp_tool_search,
         enable_explore=False,
         enable_web_search=False,
+        enable_x_search=False,
+        enable_deep_research=False,
         enable_skills=False,
         load_project_instructions=config.load_project_instructions,
         skill_directories=config.skill_directories,
@@ -964,6 +967,7 @@ def execute_delegation(
         upstream_stop=stop_requested,
     )
     sub_agent.agent_name = spec.name
+    sub_agent.toolbox.result_transform = guards.result_transform
     if on_agent is not None:
         on_agent(sub_agent)
     system_text = spec.system_prompt.format(workspace=workdir)

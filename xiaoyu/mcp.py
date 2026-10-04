@@ -524,14 +524,16 @@ _CREDENTIAL_KEY = (
     r")"
 )
 _CREDENTIAL_PATTERN = re.compile(
+    #  URL authority 内最后一个 @ 之前都是 userinfo：令牌可以直接当用户名，
+    #  密码也可能含 @。先于令牌前缀匹配，避免只盖住用户名而留下密码。
+    #  不跨路径、查询串、片段或日志引号，免得吃掉 URL 外的邮箱。
+    r"(?<=://)[^/\s?#\"'<>]+(?=@)"
     #  已知前缀的令牌。sk- 要求左边不是单词字符或路径分隔：`task-…`、`disk-…`、
     #  `/risk-assessment-…` 这类普通文本不该被吃掉
-    r"(?<![A-Za-z0-9])(?:ghp|gho|ghu|ghs|ghr)_[A-Za-z0-9]{20,}"
+    r"|(?<![A-Za-z0-9])(?:ghp|gho|ghu|ghs|ghr)_[A-Za-z0-9]{20,}"
     r"|(?<![A-Za-z0-9])github_pat_[A-Za-z0-9_]{20,}"
     r"|(?<![A-Za-z0-9_/.-])sk-[A-Za-z0-9_-]{16,}"
     r"|Bearer\s+\S+"
-    #  URL 里的账号密码（https://user:pass@host）
-    r"|(?<=://)[^/\s:@]+:[^/\s@]+(?=@)"
     #  键=值 / 键: 值 / "键": "值"（JSON）。值到空白、引号、逗号、& 为止；值前面
     #  带认证方案名（Authorization: Bearer xxx）时连方案后面的令牌一起盖掉
     rf"|(?<![A-Za-z0-9])[\"']?{_CREDENTIAL_KEY}[\"']?\s*[=:]\s*[\"']?"

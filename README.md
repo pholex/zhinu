@@ -75,6 +75,7 @@ xy -s nightly "跑一下回归"                # 命名会话：同名接着聊�
 
 xiaoyu sessions                         # 列出本机会话
 xiaoyu sessions export 1 > chat.md      # 导出一场历史会话（Markdown / --format json，不含 system 提示）
+xiaoyu sessions inspect 1 --errors     # 按原始行号诊断失败请求、工具错误与拒绝；--raw 展开脱敏记录
 xiaoyu sessions rename 1 "登录页修复"   # 给它起个名字，resume 列表里代替首条消息
 xy --stats "跑一下测试"                  # 收尾多一行：耗时 / 首 token / 输出 tok/s（交互模式也认）
 xiaoyu send zhinu-1 "顺便把 lint 跑一下"  # 给另一个终端里的小羽递话
@@ -87,7 +88,7 @@ eval "$(xiaoyu term init zsh)"          # 放进 ~/.zshrc（bash/fish/powershell
 @x 刚才那个报错怎么回事                   # 随时提问，带着刚跑过的命令，续写同一会话；见 docs/terminal-integration.md
 ```
 
-REPL 里：`/help` `/tools` `/skills` `/model` `/effort` `/mode` `/usage` `/context` `/compact` `/clear` `/exit` `/tasks` `/plan` `/goal` `/perm` `/allow` `/deny` `/resume` `/rewind` `/mcp` `/quit`
+REPL 里：`/help` `/tools` `/skills` `/model` `/search` `/effort` `/mode` `/usage` `/context` `/compact` `/clear` `/exit` `/tasks` `/plan` `/goal` `/perm` `/allow` `/deny` `/resume` `/rewind` `/mcp` `/quit`
 
 无人值守时没人按确认键：先用 `/allow` 配规则，或 `--mode auto`、`--yolo`。放进 CI 跑见 [docs/ci.md](docs/ci.md)（附 GitHub Actions 样本）。
 
@@ -121,7 +122,7 @@ auto 档**放行的依据是沙箱，不是信任**——沙箱不可用时自�
 
 ## 大致能做什么
 
-- **工具组**：读 / grep / glob / 精确替换 / 写文件 / bash（Windows 换 PowerShell）/ 任务清单；`explore` 子 agent 把检索委托给便宜模型；`web_search` 联网
+- **工具组**：读 / grep / glob / 精确替换 / 写文件 / bash（Windows 换 PowerShell）/ 任务清单；`explore` 子 agent 把检索委托给便宜模型；`web_search` 联网，`x_search` 查 X 帖子，Gemini Deep Research 支持后台研究与报告查询（见[配置](docs/configuration.md)）
 - **后台任务**：bash 加 `run_in_background` 立即返回接着干别的，完成自动通知（不用轮询）；`monitor` 盯 CI / tail 日志，事件逐行送达并自动限流；`/tasks` 查看、`kill_task` 终止
 - **编辑不出岔子**：改前必须完整读过，替换目标不唯一或文件被外部改动即打回
 - **沙箱**：bash 跑在内核级沙箱里（macOS Seatbelt / Linux bubblewrap），只能写工作区、临时目录和构建缓存；`--no-network` 可断网

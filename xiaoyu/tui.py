@@ -105,6 +105,7 @@ from .events import (
     ToolCompleted,
     ToolDenied,
     ToolPending,
+    ToolPreparing,
     ToolProgress,
     ToolPurpose,
     ToolRunning,
@@ -846,6 +847,8 @@ class RichSink:
         self._status: Any | None = None
         #  活区正在画的那一行（tool.progress 往上面写进度；spinner 收掉即清）
         self._running_line: _RunningLine | None = None
+        self._preparing_request = False
+        self._preparing_index: int | None = None
         self._ro_counts: dict[str, int] = {}
         #  当前正文块是否已打开 OSC 133 锚点（TextEnd 负责收束配对），
         #  语义与 PlainSink 对齐，见 render.OSC133_TEXT_START 的注释
@@ -856,6 +859,7 @@ class RichSink:
             TextDelta: self._text_delta,
             TextEnd: self._text_end,
             ToolPending: self._tool_pending,
+            ToolPreparing: self._tool_preparing,
             ToolPurpose: self._tool_purpose,
             ToolRunning: self._tool_running,
             ToolProgress: self._tool_progress,
@@ -879,6 +883,7 @@ class RichSink:
     def interrupt(self) -> None:
         """中断/异常路径的清扫：spinner 若还在转就停掉，折叠组落盘，避免悬空。"""
         self._stop_status()
+        self._preparing_request = False
         self._flush_ro_group()
 
     def begin_turn(self) -> None:
@@ -916,6 +921,8 @@ class RichSink:
     def _request_started(self, event: RequestStarted) -> None:
         """等模型的活区指示。补上"请求已发出、还没有任何输出"这段空白——
         以前这里什么都不画，用户无从判断它在干活还是卡死了。"""
+        self._preparing_request = True
+        self._preparing_index = None
         self._flush_ro_group()
         if not self.verbose or not self.console.is_terminal:
             return
@@ -930,6 +937,20 @@ class RichSink:
         #  兜底：正常路径上活区早在首个正文/工具行时就收掉了，这里管的是
         #  "一个字都没吐出来就结束"（空响应、异常、Ctrl-C）
         self._stop_status()
+        self._preparing_request = False
+        self._preparing_index = None
+
+    def _tool_preparing(self, event: ToolPreparing) -> None:
+        if not self._preparing_request or not self.verbose or not self.console.is_terminal:
+            return
+        if self._running_line is None or self._preparing_index != event.index:
+            self._stop_status()
+            self._preparing_index = event.index
+            self._running_line = _RunningLine(event.name, verb="生成参数中")
+            self._status = self.console.status(self._running_line, spinner="dots")
+            with contextlib.suppress(Exception):
+                self._status.start()
+        self._running_line.progress = ui.fit(render.preparation_text(event), width=self.console.width)
 
     def _text_delta(self, event: TextDelta) -> None:
         #  正文是裸 print，活区必须先收掉，否则 rich 的刷新线程会和它抢同一片
@@ -1135,6 +1156,13 @@ class SlashCompleter(Completer):
             for model in self.tui.agent.switchable_models():
                 if model.startswith(word):
                     yield Completion(model, start_position=-len(word))
+        elif parts[0] == "/search" and len(parts) == 2:
+            from .websearch import SEARCH_BACKENDS
+
+            word = parts[1]
+            for name, backend in SEARCH_BACKENDS.items():
+                if name.startswith(word):
+                    yield Completion(name, start_position=-len(word), display_meta=backend.model)
 
     #  技能补全的 meta 长度：描述是给索引写的、动辄几百字，菜单里一行放不下
     _SKILL_META_CAP = 60

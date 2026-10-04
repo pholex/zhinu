@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Any, Awaitable, Callable, Literal, TYPE_CHECKING
 
 if TYPE_CHECKING:
+    from .questions import QuestionOptions
     from .storage import SessionStore
     from .mcp import McpPool
     from .oauth import OAuthClient
@@ -17,8 +18,10 @@ from xiaoyu.hooks import Decision as HookDecision
 
 Approval = bool | str | tuple[bool, str] | Allow | Deny
 Approver = Callable[[str, dict[str, Any]], Approval | Awaitable[Approval]]
+Asker = Callable[[list[dict[str, Any]]], dict[str, str] | Awaitable[dict[str, str]]]
 ToolHandler = Callable[..., Any]
 HookHandler = Callable[[dict[str, Any]], HookDecision | Awaitable[HookDecision]]
+SessionMode = Literal["default", "auto", "plan"]
 
 
 @dataclass(frozen=True)
@@ -51,6 +54,29 @@ class Tool:
 class ToolResult:
     content: Any
     is_error: bool = False
+
+
+@dataclass(frozen=True)
+class ToolOutput:
+    """Text after execution, before output clipping and persistence."""
+
+    tool_name: str
+    text: str
+    is_error: bool
+    session_id: str
+    run_id: str
+    task_id: str
+    tool_call_id: str
+
+
+ResultTransformHandler = Callable[[ToolOutput], str | Awaitable[str]]
+
+
+@dataclass(frozen=True)
+class ResultTransform:
+    name: str
+    callback: ResultTransformHandler = field(repr=False)
+    tool_name: str = ""
 
 
 @dataclass(frozen=True)
@@ -127,6 +153,13 @@ class SessionOptions:
     max_parallel_tasks: int = 4
     budget: BudgetOptions | None = None
     telemetry: TelemetryOptions | None = None
+    asker: Asker | None = field(default=None, repr=False)
+    question_timeout: float = 120.0
+    mode: SessionMode = "default"
+    enable_plan: bool = False
+    result_transforms: tuple[ResultTransform, ...] = ()
+    result_transform_timeout: float = 30.0
+    questions: QuestionOptions | None = None
 
 
 class SDKError(Exception):
@@ -151,6 +184,10 @@ class CloseTimeoutError(SDKError, TimeoutError):
 
 class ExecutionError(SDKError):
     """Model/engine failure. Original exception is available as __cause__."""
+
+
+class ResultTransformError(ExecutionError):
+    """Tool executed, but its text was withheld; never retry the action blindly."""
 
 
 class SessionStorageError(SDKError):

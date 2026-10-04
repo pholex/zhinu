@@ -204,6 +204,35 @@ class ScanTest(unittest.TestCase):
         self.assertIn("撞名", stderr.getvalue())
         self.assertIn("config-skills", stderr.getvalue())
 
+    def test_same_file_through_symlink_is_not_a_name_conflict(self):
+        original = write_skill(self.primary, "deploy", "name: deploy\ndescription: 部署流程")
+        alias = self.secondary / "deploy" / "SKILL.md"
+        alias.parent.mkdir(parents=True)
+        try:
+            alias.symlink_to(original)
+        except OSError as exc:
+            self.skipTest(f"无法创建符号链接：{exc}")
+        stderr = io.StringIO()
+        with contextlib.redirect_stderr(stderr):
+            found = skills.scan_skills()
+        self.assertEqual([item.path for item in found], [original])
+        self.assertEqual(stderr.getvalue(), "")
+
+    def test_same_file_in_different_namespaces_stays_visible(self):
+        write_skill(self.primary, "deploy", "name: deploy\ndescription: 部署流程")
+        stderr = io.StringIO()
+        with (
+            mock.patch.object(skills, "skill_sources", return_value=[
+                skills.SkillSource(self.primary),
+                skills.SkillSource(self.primary, plugin="pkg-a"),
+                skills.SkillSource(self.primary, plugin="pkg-b"),
+            ]),
+            contextlib.redirect_stderr(stderr),
+        ):
+            found = skills.scan_skills()
+        self.assertEqual([item.name for item in found], ["deploy", "pkg-a:deploy", "pkg-b:deploy"])
+        self.assertEqual(stderr.getvalue(), "")
+
     def test_plugin_skills_are_namespaced(self):
         """插件技能带包名前缀：两家插件各带一个同名技能也不会互相顶掉。"""
         plugin_a = Path(self.tmp.name) / "pa"
@@ -430,6 +459,20 @@ class ProjectSkillsTest(unittest.TestCase):
             (found,) = skills.scan_skills(self.workspace)
         self.assertEqual((found.path, found.description, found.project), (mine, "我自己的", False))
         self.assertIn("撞名", stderr.getvalue())
+
+    def test_home_workspace_does_not_report_user_skills_as_duplicates(self):
+        home = Path(self.tmp.name)
+        directory = home / ".agents" / "skills"
+        mine = write_skill(directory, "deploy", "name: deploy\ndescription: 我自己的")
+        stderr = io.StringIO()
+        with (
+            mock.patch.object(skills, "skill_dirs", return_value=[directory]),
+            contextlib.redirect_stderr(stderr),
+        ):
+            (found,) = skills.scan_skills(home)
+        self.assertEqual(found.path, mine)
+        self.assertFalse(found.project)
+        self.assertEqual(stderr.getvalue(), "")
 
     def test_repo_skill_cannot_claim_a_plugin_namespace(self):
         """仓库里的技能自己起个 `<插件>:<技能>` 的名字，不能把已装插件的那份顶掉。"""

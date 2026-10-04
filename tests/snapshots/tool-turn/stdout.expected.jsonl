@@ -1,4 +1,6 @@
 {"kind": "request.started", "model": "snapshot-model", "provider": "_scripted"}
+{"kind": "tool.preparing", "name": "bash", "index": 0, "argument_chars": 0, "path": "", "purpose": ""}
+{"kind": "tool.preparing", "name": "bash", "index": 0, "argument_chars": 31, "path": "", "purpose": ""}
 {"kind": "request.ended", "duration_ms": 0, "ttft_ms": 0, "usage": {"prompt_tokens": 150, "completion_tokens": 20, "cached_tokens": 0}, "model": "", "response_id": "", "finish_reason": "", "error": ""}
 {"kind": "tool.pending", "name": "bash", "args": {"command": "echo snapshot-ok"}}
 {"kind": "tool.running", "name": "bash", "args": {"command": "echo snapshot-ok"}}
