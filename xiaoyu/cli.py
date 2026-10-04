@@ -1360,7 +1360,8 @@ def resume_command(argv: list[str]) -> int:
 TERM_USAGE = """用法：
   xiaoyu term init <bash|zsh|fish|powershell> [--name 名字] [--command-not-found]
         输出 shell 脚本：eval "$(xiaoyu term init zsh)"（fish 用 | source，PowerShell 用 Invoke-Expression）
-  xiaoyu term run <问题…>      带着自上次提问以来跑过的命令向模型提问（脚本里定义成 @x / @xiaoyu）
+  xiaoyu term run [问题…]      带着自上次提问以来跑过的命令向模型提问（脚本里定义成 @x / @xiaoyu）；
+                               不带问题就读一行原样文本当问题（问号、引号、管道符都不必转义）
   xiaoyu term log <命令行>     备用入口：手动记一条命令（钩子不方便用内建追加的环境）
   xiaoyu term info             一行：会话 id · 模型 · 已用 token · 待交付命令数（放进提示符用）
 详见 docs/terminal-integration.md"""
@@ -1450,8 +1451,24 @@ def open_term_session(config: Config, session_id: str) -> tuple[SessionLog, list
     return log, restored
 
 
+def read_question_line() -> str | None:
+    """`@x` 不带问题时读一行当问题。写在命令行上的问题要先过 shell 的解析，
+    问号、引号、括号、管道符都会被它吃掉或报错；这里读到的是原样文本。
+
+    提示符写到 stderr：stdout 留给回答（`@x > 答案.txt` 时它不是终端）。
+    返回 None = 用户取消（Ctrl-C / Ctrl-D）。
+    """
+    sys.stderr.write(ui.prompt("问 › "))
+    sys.stderr.flush()
+    try:
+        return input().strip()
+    except (EOFError, KeyboardInterrupt):
+        print(file=sys.stderr)
+        return None
+
+
 def term_run_command(argv: list[str]) -> int:
-    """`xiaoyu term run <问题…>`（脚本里的 @x）：取走 pending 里的命令，拼成
+    """`xiaoyu term run [问题…]`（脚本里的 @x）：取走 pending 里的命令，拼成
     终端上下文放在问题前面，走一次性路径续写本终端的会话。
 
     与 `-p` 共用一切：审批（stdin 是终端就照常问）、信任门、输出格式 text。
@@ -1463,7 +1480,11 @@ def term_run_command(argv: list[str]) -> int:
         prog="xiaoyu term run",
         description="带着自上次提问以来跑过的命令向模型提问（续写本终端的会话）。",
     )
-    parser.add_argument("question", nargs="*", help="问题（也可从管道给：cat err.log | @x 这是什么错）")
+    parser.add_argument(
+        "question",
+        nargs="*",
+        help="问题（也可从管道给：cat err.log | @x 这是什么错；不带问题就读一行原样文本）",
+    )
     parser.add_argument("--model", help="这一问换个模型")
     parser.add_argument("--mode", choices=list(modes.CYCLE), default=None, help="起始模式（同主命令）")
     parser.add_argument("--yolo", action="store_true", help="不再逐个确认写文件和执行命令")
@@ -1481,8 +1502,16 @@ def term_run_command(argv: list[str]) -> int:
         )
         return 2
     question = compose_prompt(args.question, read_piped_stdin())
+    if not question and sys.stdin.isatty():
+        typed = read_question_line()
+        if typed is None:
+            return 130
+        question = typed
     if not question:
-        print(ui.error("要问什么？用法：@x <问题>"), file=sys.stderr)
+        print(
+            ui.error("要问什么？用法：@x <问题>；或只敲 @x 回车，再输入问题（原样读入，不必转义）"),
+            file=sys.stderr,
+        )
         return 2
 
     workspace = Path.cwd()

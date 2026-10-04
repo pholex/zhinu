@@ -1,6 +1,6 @@
 """shell 集成（`xiaoyu term`）：人在自己的 shell 里干活，随时 `@x 问题`。
 
-不进 REPL 的工作方式：shell 钩子把每条敲过的命令（只有命令文本，没有输出）
+不进 REPL 的工作方式：shell 钩子把每条敲过的命令（命令文本与退出码，没有输出）
 追加进一个 pending 文件；`@x 问题` 时 `term run` 把这些命令作为「终端上下文」
 放在问题前面交给模型，并续写同一个会话，所以可以连续追问。
 
@@ -9,8 +9,9 @@
 - **钩子里不起 Python 进程。** 每条命令 fork 一次解释器（百毫秒级）会让 shell
   明显发卡，所以 `term init` 输出的脚本全用 shell 内建（`print -r` /
   `printf` / `string` / `Add-Content`）追加一行 `<epoch>\\t<cwd>\\t<命令行>`，
-  Python 只在 `@x` 时才启动。备用入口 `term log` 走 `__main__` 的快路径，
-  同样不导入 agent / tools 这些重模块。
+  命令跑完再追加一行 `=<epoch>\\t<退出码>`，Python 只在 `@x` 时才启动。
+  备用入口 `term log` 走 `__main__` 的快路径，同样不导入 agent / tools 这些
+  重模块。
 - **本模块本身要轻。** 快路径会导入它，所以模块级只碰标准库与 config；
   会话日志、脱敏正则（mcp）、`<untrusted_content>` 消毒（tools）都在函数
   里按需导入。
@@ -27,7 +28,7 @@ import secrets
 import shlex
 import sys
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime
 from pathlib import Path
 
@@ -58,6 +59,8 @@ class Entry:
     ts: int
     cwd: str
     command: str
+    #  退出码；None = 没记到（旧版脚本、`term log`、命令还没跑完、shell 被杀）
+    status: int | None = None
 
 
 # ---------------------------------------------------------------- 会话与路径
@@ -138,6 +141,30 @@ def parse_line(line: str) -> Entry | None:
     return Entry(ts, unescape_field(cwd), command)
 
 
+#  状态行：`=<命令行的 epoch>\t<退出码>`。命令行在命令开跑前就写了（管道里的
+#  `cmd | @x …` 要在跑的当口就看得见这一行），退出码要等跑完才有，只能另起一行；
+#  用开跑时刻认领它属于哪条命令。两个字段，命令行的解析读它必然回 None
+STATUS_MARK = "="
+
+
+def format_status(ts: int, status: int) -> str:
+    return f"{STATUS_MARK}{int(ts)}\t{int(status)}"
+
+
+def parse_status(line: str) -> tuple[int, int] | None:
+    """解析状态行，回 (命令行的 epoch, 退出码)；不是状态行或写坏了回 None。"""
+    line = line.rstrip("\r\n")
+    if not line.startswith(STATUS_MARK):
+        return None
+    parts = line[len(STATUS_MARK):].split("\t")
+    if len(parts) != 2:
+        return None
+    try:
+        return int(parts[0]), int(parts[1])
+    except ValueError:
+        return None
+
+
 def is_own_command(command: str) -> bool:
     return bool(_OWN_COMMAND.search(command))
 
@@ -146,13 +173,20 @@ def is_own_command(command: str) -> bool:
 
 
 def _tail(lines: list[str]) -> list[str]:
-    """按行数与字节数两个上限截尾（留最新的）。"""
-    kept = lines[-MAX_PENDING_LINES:]
-    total = sum(len(line.encode("utf-8", "replace")) + 1 for line in kept)
-    while kept and total > MAX_PENDING_BYTES:
-        total -= len(kept[0].encode("utf-8", "replace")) + 1
-        kept.pop(0)
-    return kept
+    """按命令条数与字节数两个上限截尾（留最新的）。状态行只占字节、不占条数；
+    截掉了命令行的状态行留在头部也无妨，认领不到命令就被丢弃。"""
+    commands = total = 0
+    start = len(lines)
+    for index in range(len(lines) - 1, -1, -1):
+        line = lines[index]
+        size = len(line.encode("utf-8", "replace")) + 1
+        is_command = not line.startswith(STATUS_MARK)
+        if total + size > MAX_PENDING_BYTES or (is_command and commands >= MAX_PENDING_LINES):
+            break
+        total += size
+        commands += is_command
+        start = index
+    return lines[start:]
 
 
 def _read_lines(path: Path) -> list[str]:
@@ -223,20 +257,39 @@ def drain_pending(path: Path) -> list[Entry]:
 
 
 def _entries(lines: list[str]) -> list[Entry]:
-    entries = []
+    entries: list[Entry] = []
     for line in lines:
+        finished = parse_status(line)
+        if finished is not None:
+            _claim_status(entries, *finished)
+            continue
         entry = parse_line(line)
-        if entry is not None and not is_own_command(entry.command):
+        if entry is not None:
             entries.append(entry)
-    return entries
+    #  认领完再滤掉自己人：先滤的话，它后面那条状态行会找错主
+    return [entry for entry in entries if not is_own_command(entry.command)]
+
+
+def _claim_status(entries: list[Entry], ts: int, status: int) -> None:
+    """状态行归最近一条同一时刻开跑、还没有退出码的命令。找不到就丢：命令行
+    已被上一次提问取走（`cmd | @x …`）或被截尾截掉了。"""
+    for index in range(len(entries) - 1, -1, -1):
+        entry = entries[index]
+        if entry.ts == ts and entry.status is None:
+            entries[index] = replace(entry, status=status)
+            return
 
 
 def requeue(path: Path, entries: list[Entry]) -> None:
     """取走之后没能交给模型（配置错、会话被占）：放回文件头，下次提问还带着。"""
     if not entries:
         return
-    lines = [format_line(e.ts, e.cwd, e.command) for e in entries] + _read_lines(path)
-    _write_lines(path, _tail(lines))
+    lines: list[str] = []
+    for entry in entries:
+        lines.append(format_line(entry.ts, entry.cwd, entry.command))
+        if entry.status is not None:
+            lines.append(format_status(entry.ts, entry.status))
+    _write_lines(path, _tail(lines + _read_lines(path)))
 
 
 # ---------------------------------------------------------------- 脱敏
@@ -301,8 +354,9 @@ def _stamp(ts: int, now: float) -> str:
 def build_prefix(entries: list[Entry], now: float | None = None) -> str:
     """终端上下文段落；没有命令就回空串（`term run` 不加前缀）。
 
-    连续同目录的命令只标一次目录；每行是 `时刻  $ 命令`。整段裹进
-    <untrusted_content>：命令文本可能是粘贴来的，里面若有伪造的闭合标记先消毒。
+    连续同目录的命令只标一次目录；每行是 `时刻  $ 命令`，记到了退出码的在
+    行尾标 `→ 退出码 N`。整段裹进 <untrusted_content>：命令文本可能是粘贴来的，
+    里面若有伪造的闭合标记先消毒。
     """
     if not entries:
         return ""
@@ -315,11 +369,14 @@ def build_prefix(entries: list[Entry], now: float | None = None) -> str:
         if entry.cwd != last_cwd:
             lines.append(f"# {shorten_home(entry.cwd)}")
             last_cwd = entry.cwd
-        lines.append(f"{_stamp(entry.ts, now)}  $ {redact(entry.command)}")
+        outcome = "" if entry.status is None else f"  → 退出码 {entry.status}"
+        lines.append(f"{_stamp(entry.ts, now)}  $ {redact(entry.command)}{outcome}")
     body = neutralize_untrusted_markers("\n".join(lines))
+    #  一条退出码都没记到（旧版脚本还在跑）就不提它：别让模型去找不存在的东西
+    recorded = "与行尾的退出码" if any(entry.status is not None for entry in entries) else ""
     return (
         "[终端上下文] 自上次提问以来，你在这些目录跑过这些命令（按时间；"
-        "只有命令文本、没有输出，需要结果可以自己重跑）：\n"
+        f"只有命令文本{recorded}、没有输出，需要结果可以自己重跑）：\n"
         f"<untrusted_content>\n{body}\n</untrusted_content>"
     )
 
@@ -405,7 +462,11 @@ def render_script(
     )
 
 
-#  zsh：preexec 拿到的 $1 就是整行命令。zsh/datetime 给 $EPOCHSECONDS（内建）
+#  zsh：preexec 拿到的 $1 就是整行命令。zsh/datetime 给 $EPOCHSECONDS（内建）。
+#  precmd 进来时 $? 还是刚跑完那条命令的（zsh 在每个钩子函数之后把它复原）；
+#  __xiaoyu_term_ts 只在记了命令时才有值，空回车、自己人的调用不会多写状态行。
+#  `@x` 是 noglob 别名而不是函数：zsh 默认对不上通配就整行报错，问题里一个半角
+#  问号就问不出去。别名展开只发生在命令位置，preexec 的 $1 仍是人敲的原文
 _ZSH = r"""# xiaoyu 终端集成（zsh）——放进 ~/.zshrc：eval "$(xiaoyu term init zsh)"
 @@SESSION@@
 export @@PENDING_ENV@@=@@DIR@@/"$@@SESSION_ENV@@".pending
@@ -419,15 +480,25 @@ __xiaoyu_term_preexec() {
   local cwd=$PWD
   line=${line//\\/\\\\}; line=${line//$'\t'/\\t}; line=${line//$'\n'/\\n}
   cwd=${cwd//\\/\\\\}; cwd=${cwd//$'\t'/\\t}; cwd=${cwd//$'\n'/\\n}
-  print -r -- "${EPOCHSECONDS:-0}"$'\t'"$cwd"$'\t'"$line" >> "$@@PENDING_ENV@@" 2>/dev/null
+  typeset -g __xiaoyu_term_ts=${EPOCHSECONDS:-0}
+  print -r -- "$__xiaoyu_term_ts"$'\t'"$cwd"$'\t'"$line" >> "$@@PENDING_ENV@@" 2>/dev/null
   return 0
 }
-@xiaoyu() { @@LAUNCHER@@ term run "$@"; }
-@x() { @@LAUNCHER@@ term run "$@"; }
+__xiaoyu_term_precmd() {
+  local st=$?
+  [[ -n ${__xiaoyu_term_ts:-} ]] || return 0
+  print -r -- "=$__xiaoyu_term_ts"$'\t'"$st" >> "$@@PENDING_ENV@@" 2>/dev/null
+  __xiaoyu_term_ts=
+  return 0
+}
+__xiaoyu_term_ask() { @@LAUNCHER@@ term run "$@"; }
+alias @xiaoyu='noglob __xiaoyu_term_ask'
+alias @x='noglob __xiaoyu_term_ask'
 if [[ -z "${__xiaoyu_term_hooked:-}" ]]; then
   zmodload zsh/datetime 2>/dev/null
   autoload -Uz add-zsh-hook
   add-zsh-hook preexec __xiaoyu_term_preexec
+  add-zsh-hook precmd __xiaoyu_term_precmd
   typeset -g __xiaoyu_term_hooked=1
 fi
 @@CNF@@"""
@@ -435,7 +506,10 @@ fi
 #  bash：没有 preexec，用 DEBUG trap + PROMPT_COMMAND 置位的旗标，每个提示符
 #  周期只记第一次触发（DEBUG 对管道/循环里的每个简单命令都会触发）。整行命令
 #  从 `history 1` 取（$BASH_COMMAND 只是管道里的第一段）；history 取不到或
-#  对不上（HISTCONTROL=ignorespace 时它还是上一条）就退回 $BASH_COMMAND
+#  对不上（HISTCONTROL=ignorespace 时它还是上一条）就退回 $BASH_COMMAND。
+#  退出码：__xiaoyu_term_status 排在 PROMPT_COMMAND 最前，那时 $? 还没被别的
+#  提示符命令动过；它原样 return 回去，排在后面、同样要读 $? 的提示符命令不受影响。
+#  字符串形态用换行拼接：原值以分号结尾时再接 `; ` 是语法错
 _BASH = r"""# xiaoyu 终端集成（bash）——放进 ~/.bashrc：eval "$(xiaoyu term init bash)"
 @@SESSION@@
 export @@PENDING_ENV@@=@@DIR@@/"$@@SESSION_ENV@@".pending
@@ -451,7 +525,16 @@ __xiaoyu_term_record() {
   line=${line//\\/\\\\}; line=${line//$'\t'/\\t}; line=${line//$'\n'/\\n}
   cwd=${cwd//\\/\\\\}; cwd=${cwd//$'\t'/\\t}; cwd=${cwd//$'\n'/\\n}
   printf '%s\t%s\t%s\n' "$ts" "$cwd" "$line" >> "$@@PENDING_ENV@@" 2>/dev/null
+  __xiaoyu_term_ts=$ts
   return 0
+}
+__xiaoyu_term_status() {
+  local st=$?
+  if [[ -n ${__xiaoyu_term_ts:-} ]]; then
+    printf '=%s\t%s\n' "$__xiaoyu_term_ts" "$st" >> "$@@PENDING_ENV@@" 2>/dev/null
+    __xiaoyu_term_ts=
+  fi
+  return "$st"
 }
 __xiaoyu_term_prompt() { __xiaoyu_term_ready=1; }
 __xiaoyu_term_debug() {
@@ -473,8 +556,8 @@ __xiaoyu_term_debug() {
 @x() { @@LAUNCHER@@ term run "$@"; }
 if [ -z "${__xiaoyu_term_hooked:-}" ]; then
   case "$(declare -p PROMPT_COMMAND 2>/dev/null)" in
-    "declare -a"*) PROMPT_COMMAND+=(__xiaoyu_term_prompt) ;;
-    *) PROMPT_COMMAND="${PROMPT_COMMAND:+$PROMPT_COMMAND; }__xiaoyu_term_prompt" ;;
+    "declare -a"*) PROMPT_COMMAND=(__xiaoyu_term_status "${PROMPT_COMMAND[@]}" __xiaoyu_term_prompt) ;;
+    *) PROMPT_COMMAND=$'__xiaoyu_term_status\n'"${PROMPT_COMMAND:+$PROMPT_COMMAND$'\n'}__xiaoyu_term_prompt" ;;
   esac
   trap '__xiaoyu_term_debug' DEBUG
   __xiaoyu_term_hooked=1
@@ -483,7 +566,9 @@ fi
 
 #  fish：fish_preexec 事件带整行命令。fish 没有内建的 epoch，`date` 这一次
 #  fork 是外部进程里最便宜的一种（fish 的提示符本来就常年 fork git）。
-#  `string` 从管道读时按行处理，换行要最后用 `string join` 合回一行
+#  `string` 从管道读时按行处理，换行要最后用 `string join` 合回一行。
+#  退出码在 fish_postexec 里取：事件处理函数进来时 $status 还是那条命令的，
+#  处理完 fish 会把它复原，提示符照常读得到
 _FISH = r"""# xiaoyu 终端集成（fish）——放进 ~/.config/fish/config.fish：xiaoyu term init fish | source
 @@SESSION@@
 set -gx @@PENDING_ENV@@ @@DIR@@/$@@SESSION_ENV@@.pending
@@ -497,7 +582,16 @@ function __xiaoyu_term_preexec --on-event fish_preexec
     end
     set -l line (string replace -a -- '\\' '\\\\' "$raw" | string replace -a -- \t '\\t' | string join -- '\\n' | string trim --left)
     set -l cwd (string replace -a -- '\\' '\\\\' "$PWD" | string replace -a -- \t '\\t' | string join -- '\\n')
-    printf '%s\t%s\t%s\n' (date +%s) "$cwd" "$line" >> "$@@PENDING_ENV@@" 2>/dev/null
+    set -g __xiaoyu_term_ts (date +%s)
+    printf '%s\t%s\t%s\n' "$__xiaoyu_term_ts" "$cwd" "$line" >> "$@@PENDING_ENV@@" 2>/dev/null
+    return 0
+end
+function __xiaoyu_term_postexec --on-event fish_postexec
+    set -l st $status
+    if set -q __xiaoyu_term_ts
+        printf '=%s\t%s\n' "$__xiaoyu_term_ts" $st >> "$@@PENDING_ENV@@" 2>/dev/null
+        set -e __xiaoyu_term_ts
+    end
     return 0
 end
 function @xiaoyu
@@ -512,11 +606,16 @@ set -g __xiaoyu_term_hooked 1
 #  PowerShell：`@x` 在这里是 splatting 语法、当不了命令名，改叫 `x` / `Ask-Xiaoyu`。
 #  不包 PSReadLine 的回车键（会顶掉用户自己的绑定），改在 prompt 函数里读
 #  Get-History 的增量：命令跑完、下一个提示符出来之前记下来，对 `x 问题` 来说
-#  一样及时。包 prompt 时保留原来的 prompt 函数并接着调它
+#  一样及时。包 prompt 时保留原来的 prompt 函数并接着调它。
+#  退出码：prompt 的第一句就把 $? 与 $LASTEXITCODE 取走。$? 为真记 0；为假时
+#  cmdlet 失败没有数字、记 1，原生命令失败用 $LASTEXITCODE。$LASTEXITCODE 是上一个
+#  原生命令留下的、cmdlet 不会清它，所以先看最近一条错误记录是不是这一行报的：
+#  是就是 cmdlet 失败，不去读那个可能过期的数
 _PWSH = r"""# xiaoyu 终端集成（PowerShell）——放进 $PROFILE：Invoke-Expression (xiaoyu term init powershell | Out-String)
 @@SESSION@@
 $env:@@PENDING_ENV@@ = Join-Path @@DIR@@ ($env:@@SESSION_ENV@@ + '.pending')
 function global:__xiaoyu_term_record {
+    param($ok, $code)
     $item = Get-History -Count 1
     if (-not $item) { return }
     if ($global:__xiaoyu_term_last_id -eq $item.Id) { return }
@@ -528,7 +627,15 @@ function global:__xiaoyu_term_record {
     $cwd = (Get-Location).Path
     $line = $line -replace '\\', '\\' -replace "`t", '\t' -replace "`r?`n", '\n'
     $cwd = $cwd -replace '\\', '\\' -replace "`t", '\t' -replace "`r?`n", '\n'
-    Add-Content -LiteralPath $env:@@PENDING_ENV@@ -Value "$ts`t$cwd`t$line" -Encoding utf8 -ErrorAction SilentlyContinue
+    $status = 0
+    if (-not $ok) {
+        $status = 1
+        $err = if ($global:Error.Count -gt 0) { $global:Error[0] } else { $null }
+        $at = if (($err -is [System.Management.Automation.ErrorRecord]) -and $err.InvocationInfo) { "$($err.InvocationInfo.Line)".Trim() } else { '' }
+        $own = $at -and $item.CommandLine.Contains($at)
+        if (-not $own -and $code -is [int] -and $code -ne 0) { $status = $code }
+    }
+    Add-Content -LiteralPath $env:@@PENDING_ENV@@ -Value @("$ts`t$cwd`t$line", "=$ts`t$status") -Encoding utf8 -ErrorAction SilentlyContinue
 }
 function global:x { @@LAUNCHER@@ term run @args }
 function global:Ask-Xiaoyu { @@LAUNCHER@@ term run @args }
@@ -537,7 +644,9 @@ if (-not $global:__xiaoyu_term_hooked) {
     $global:__xiaoyu_term_last_id = (Get-History -Count 1).Id
     if (Test-Path function:prompt) { $function:global:__xiaoyu_term_prev_prompt = $function:prompt }
     function global:prompt {
-        __xiaoyu_term_record
+        $ok = $global:?
+        $code = $global:LASTEXITCODE
+        __xiaoyu_term_record $ok $code
         if (Test-Path function:__xiaoyu_term_prev_prompt) { & $function:__xiaoyu_term_prev_prompt }
         else { "PS $($executionContext.SessionState.Path.CurrentLocation)> " }
     }
