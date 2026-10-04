@@ -299,7 +299,8 @@ PRESETS: dict[str, Preset] = {
         #  Google 官方 OpenAI 兼容端点（Gemini API）。2026-08-24 实测：
         #  chat / 流式 / tool_calls / 多轮工具回传 / include_usage /
         #  reasoning_effort（low/high 都认，low 时思考明显收缩）全通
-        models=("gemini-3.7-flash",),
+        #  2026-10-03 升级到 3.8 Flash：官方 GA，直连文字、流式工具调用与回传实测通过。
+        models=("gemini-3.8-flash",),
         base_url="https://generativelanguage.googleapis.com/v1beta/openai/",
         #  Google 官方 SDK 两个名字都认（GEMINI_API_KEY 优先），同 qwen 的双键理由
         key_envs=("GEMINI_API_KEY", "GOOGLE_API_KEY"),
