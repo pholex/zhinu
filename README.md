@@ -75,6 +75,7 @@ xy -s nightly "跑一下回归"                # 命名会话：同名接着聊�
 
 xiaoyu sessions                         # 列出本机会话
 xiaoyu sessions export 1 > chat.md      # 导出一场历史会话（Markdown / --format json，不含 system 提示）
+xiaoyu sessions inspect 1 --errors     # 按原始行号诊断失败请求、工具错误与拒绝；--raw 展开脱敏记录
 xiaoyu sessions rename 1 "登录页修复"   # 给它起个名字，resume 列表里代替首条消息
 xy --stats "跑一下测试"                  # 收尾多一行：耗时 / 首 token / 输出 tok/s（交互模式也认）
 xiaoyu send zhinu-1 "顺便把 lint 跑一下"  # 给另一个终端里的小羽递话

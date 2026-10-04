@@ -121,8 +121,8 @@ SLASH_HELP = "可用命令：\n" + "\n".join(
 SUBCOMMANDS: tuple[tuple[tuple[str, ...], str, str, str], ...] = (
     (("config",), "config_command", "config", "初始化/查看配置"),
     (("resume",), "resume_command", "resume", "恢复历史会话"),
-    (("sessions",), "sessions_command", "sessions [digest|export|rename]",
-     "列出本机在跑的会话；digest 汇总 token 用量、export 导出历史会话、rename 起名"),
+    (("sessions",), "sessions_command", "sessions [digest|export|rename|inspect]",
+     "列出本机会话；digest 汇总用量、export 导出、rename 起名、inspect 诊断日志"),
     (("send",), "send_command", "send <会话> <消息>", "给另一个会话发一条消息"),
     (("mcp",), "mcp_command", "mcp add|list|remove|probe", "管理 MCP server 声明；probe 不经模型直接探测一个 server"),
     (("term",), "term_command", "term init|run|log|info",
@@ -931,6 +931,8 @@ def sessions_command(argv: list[str]) -> int:
         return sessions_export_command(argv[1:])
     if argv and argv[0] == "rename":
         return sessions_rename_command(argv[1:])
+    if argv and argv[0] == "inspect":
+        return sessions_inspect_command(argv[1:])
     parser = argparse.ArgumentParser(
         prog="xiaoyu sessions",
         description=(
@@ -938,6 +940,7 @@ def sessions_command(argv: list[str]) -> int:
             "`xiaoyu sessions digest` 汇总历史会话的 token 用量；"
             "`xiaoyu sessions export <会话>` 导出一场历史会话；"
             "`xiaoyu sessions rename <会话> <名字>` 给它起个显示名。"
+            "`xiaoyu sessions inspect <会话>` 查看执行时间线。"
         ),
     )
     parser.parse_args(argv)
@@ -1025,6 +1028,41 @@ def _locate_session(ref: str, everywhere: bool) -> SessionInfo | None:
     if info is None:
         print(ui.error(f"找不到会话 {ref!r}（{_session_ref_help()}；--all 不按当前工作区过滤）"), file=sys.stderr)
     return info
+
+
+def sessions_inspect_command(argv: list[str]) -> int:
+    """按物理行号查看日志；支持存档路径与现有会话引用。"""
+    from .session_inspect import inspect_session, render_report
+
+    parser = argparse.ArgumentParser(prog="xiaoyu sessions inspect", description="只读查看会话执行时间线，默认脱敏。")
+    parser.add_argument("ref", help=_session_ref_help() + "，也可直接给 JSONL 路径")
+    parser.add_argument("--all", action="store_true", help="跨工作区查找会话")
+    parser.add_argument("--kind", action="append", default=[], help="按类型筛选，可重复：request、tool、approval、compact…")
+    parser.add_argument("--turn", type=int, help="用户输入段序号（0 为前言，插话也另起一段）")
+    parser.add_argument("--request", type=int, help="全文件中的请求序号，从 1 开始")
+    parser.add_argument("--tool-call", help="工具调用 ID")
+    parser.add_argument("--errors", action="store_true", help="只看错误、拒绝与空补全")
+    parser.add_argument("--raw", action="store_true", help="附带完整记录字段（仍脱敏，可能含对话正文）")
+    parser.add_argument("--json", action="store_true", help="输出结构化 JSON")
+    parser.add_argument("--limit", type=int, default=200, help="过滤后保留最后多少条，默认 200")
+    args = parser.parse_args(argv)
+    if args.limit < 1 or (args.turn is not None and args.turn < 0) or (args.request is not None and args.request < 1):
+        parser.error("limit、request 必须大于 0，turn 必须不小于 0")
+    path = Path(args.ref).expanduser()
+    if not path.exists():
+        info = _locate_session(args.ref, args.all)
+        if info is None:
+            return 2
+        path = info.path
+    try:
+        report = inspect_session(path, kinds=tuple(args.kind), turn=args.turn, request=args.request,
+                                 tool_call=args.tool_call, errors_only=args.errors, raw=args.raw, limit=args.limit)
+    except (OSError, ValueError) as exc:
+        from .mcp import _redact
+        print(ui.error(f"诊断失败：{_redact(str(exc))}"), file=sys.stderr)
+        return 2
+    print(json.dumps(report, ensure_ascii=True, indent=2) if args.json else render_report(report, raw=args.raw), end="\n" if args.json else "")
+    return 0
 
 
 def sessions_export_command(argv: list[str]) -> int:

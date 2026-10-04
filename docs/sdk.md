@@ -103,6 +103,7 @@ async def handle(options):
 多个预览，收到 `RequestEnded` 就清除该请求的全部预览；此时工具可能因中断、
 参数错误或审批拒绝而不执行。详细边界见[事件契约](embedding.md#事件消费)。
 
+持久化日志可用[会话诊断](session-inspection.md)只读查看。
 完整的超时与迟到回答协议另见[设计稿](sdk-deferred-questions-design.md)，SQLite
 安全边界接纳及版本观察已实现，见[持久化待答](sdk-deferred-questions.md)。下文的基础
 `asker` 支持同步／异步宿主回调，但本轮会等待其完成，
