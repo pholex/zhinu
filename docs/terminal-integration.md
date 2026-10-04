@@ -1,6 +1,6 @@
-# 终端集成：在自己的 shell 里 `@x`
+# 终端集成：在自己的 shell 里 `@x` 与 `@c`
 
-不进 REPL。你照常在 shell 里敲命令，卡住了就 `@x 问题`——小羽带着**你刚跑过的那些命令和它们的退出码**回答，并且续写同一个会话，可以接着追问。
+不进 REPL。你照常在 shell 里敲命令，卡住了就 `@x 问题`——小羽带着**你刚跑过的那些命令和它们的退出码**回答，并且续写同一个会话，可以接着追问。只是想不起某条命令怎么写，用 `@c 一句话需求`：它只给一条命令，放回你的提示符，由你回车（见下文「`@c`：一句话换一条命令」）。
 
 ```text
 $ make test
@@ -24,7 +24,7 @@ $ @x 那把失败的那个用例单独跑一下
 脚本做三件事：
 
 1. 导出 `XIAOYU_TERM_SESSION`（这个终端的会话 id）和 `XIAOYU_TERM_PENDING`（记命令的文件）；
-2. 定义 `@x` / `@xiaoyu`（zsh 里是 `noglob` 别名，问题里的 `?` `*` `[` 不会被当通配符；PowerShell 里 `@` 是 splatting 语法当不了命令名，改叫 `x` / `Ask-Xiaoyu`）；
+2. 定义 `@x` / `@xiaoyu`（zsh 里是 `noglob` 别名，问题里的 `?` `*` `[` 不会被当通配符；PowerShell 里 `@` 是 splatting 语法当不了命令名，改叫 `x` / `Ask-Xiaoyu`），zsh 与 bash 里另有 `@c`；
 3. 挂两个钩子：命令开跑前记下命令行（zsh `preexec`、bash `DEBUG` trap、fish `fish_preexec`），跑完后补记退出码（zsh `precmd`、bash `PROMPT_COMMAND`、fish `fish_postexec`）；PowerShell 包 `prompt`，在下一个提示符出现前把 `Get-History` 的增量和退出码一起记下。钩子只用 shell 内建追加一行文本，**不起 Python 进程**，shell 不会因此变卡。
 
 重复 eval 不会挂两次钩子。`xiaoyu` 不在 PATH 上（venv 没激活）时，脚本会钉死生成它的那个解释器 `-m xiaoyu`；要指定别的写法用 `--launcher`。
@@ -60,6 +60,52 @@ xiaoyu term info                         # 一行：会话 id · 模型 · 已�
 
 行尾没有退出码的命令是没记到：还没跑完、终端被关掉、用 `term log` 手动记的，或者这个终端里加载的还是旧版脚本（升级后开个新终端即可）。
 
+## `@c`：一句话换一条命令
+
+当前源码新增，尚未发布。只在 **zsh 与 bash** 里有。
+
+```text
+~/proj % @c 找出当前目录下大于 100M 的文件，按大小倒序
+列出大于 100M 的文件并按大小倒序
+~/proj % find . -type f -size +100M -exec du -h {} + | sort -rh█
+```
+
+第二个提示符上的命令是放上去的，没有执行：可以改，回车才跑，Ctrl-C 就放弃。
+
+- **zsh**：命令直接出现在下一个提示符上。
+- **bash**：函数里写不了行编辑器的缓冲区，命令打出来并推进历史——**按一次 ↑ 就是它**（`@c …` 这一行自己不留在历史里）。
+- **可以追问**：`@c 只看 .log，排除 node_modules` 会在上一条的基础上改。记得住这个终端最近 4 次、30 分钟之内给过的命令。
+- **回路是通的**：你回车执行的那条命令照常被钩子记下，之后 `@c 修一下` 或 `@x 为什么失败` 都带得上它和它的退出码（没有输出）。
+- **不是一条命令能办的事**（闲聊、要讲解、信息不够）它不会硬给：只打一句说明或反问，提示符上什么都不放。要它动手、要它解释，用 `@x`。
+- 需求里有引号、括号、`|`、`$` 时只敲 `@c` 回车，再在「要什么命令 ›」提示符下输入，原样读入。`cat access.log | @c 提取访问最多的 10 个 IP` 这样把管道内容当材料也行。
+- 旗标只认写在需求**前面**的：`@c --model gpt-6 …`、`@c --effort high …`。需求里出现的 `-rf`、`--verbose` 不会被当旗标。
+
+和 `@x` 的区别，也是它存在的理由：
+
+| | `@x` | `@c` |
+|---|---|---|
+| 做什么 | 一整轮 agent：会读文件、会自己跑命令 | 只把一句话翻成一条命令 |
+| 命令在哪跑 | 小羽的子进程里，逐条审批 | **你自己的 shell 里**，你回车 |
+| 适合 | 排查、修改、要它动手的事 | `cd` / `export` / 激活 venv / `ssh` / `sudo` / 交互程序，以及想留在历史里的命令 |
+| 会话 | 续写本终端的会话 | 不进会话，不取走待交付的命令 |
+| 耗时 | 随任务 | 一两秒 |
+
+**它不过审批。** 命令是你自己回车执行的，小羽的权限判定、沙箱都不参与——放上提示符的命令请照常看一眼。能认出来的两种形态会多一行提示：强制删除（`rm -f` / `-rf`）与提权（`sudo` 等）；认不出来不代表安全。命令进提示符之前会摘掉终端控制序列，双向文本控制字符换成可见的 `\uXXXX`。
+
+**用哪个模型**：默认用辅助模型（`XIAOYU_SUMMARY_MODEL`，与对话压缩同一个），它没有 provider 能接时用主模型；`--model` 点名。推理深度默认 `low`——把一句话翻成一条命令不需要多想，想得深只是让你多等。单次请求最多等 30 秒。
+
+### 本机环境只探一次
+
+BSD 与 GNU 的 `sed -i`、`date -d`、`stat` 写法不同，是命令给错的头号原因。第一次 `@c` 时小羽探一遍本机并记下，之后直接读：
+
+```text
+已记下本机环境：macOS 27.0 · arm64 · zsh 5.9 · BSD 工具链 · 包管理 brew
+```
+
+记的是：系统与版本、架构、shell 与版本、基础命令是 BSD / GNU / BusyBox 哪一套、有哪些包管理器、一份常用工具清单里哪些装了哪些没装（`rg` `fd` `jq` `gsed` `docker` `pbcopy` `systemctl` …）。全是读文件和查 PATH，不起子进程、不出网。
+
+文件在 `<配置目录>/term/environment-<shell>.json`，每种 shell 一份。**系统、架构或 shell 版本变了会自动重探**，另外每 7 天重探一次（跟上工具的装卸）。刚装了新工具想立刻生效：删掉这个文件。
+
 ## 具名会话
 
 默认每个终端一个随机 id（`term-<8 位>`），关掉终端这段对话就留在历史里（`xiaoyu resume --all` 还能找到）。要多个终端共用、或关掉重开接着聊：
@@ -94,13 +140,14 @@ xiaoyu term log "make test"
 - **交给模型之前脱敏**：`Authorization: …`、`Bearer …`、`sk-…` / `ghp_…` 这类已知前缀的令牌、URL 里的 `user:pass@`、`token=…` / `password: …` 这类键值、`--password x` / `--token x` 这类旗标值、`XXX_SECRET_KEY=…` 这类环境变量赋值、mysql 系的 `-p密码`、`sshpass -p`、`curl -u user:pass` 都换成 `[REDACTED]`。脱敏是模式匹配，不认识的形态会漏——敲过明文密码的话自己留个心。
 - **pending 文件**：`<配置目录>/term/<会话id>.pending`（macOS/Linux `~/.config/xiaoyu/term/`，Windows `%APPDATA%\xiaoyu\term\`），命令开跑前一行 `时间\t目录\t命令`，跑完后一行 `=时间\t退出码`（用开跑时间认领是哪条命令的），记的是脱敏**前**的原文，目录权限 0700。上限 500 条命令 / 256 KB，超了只留最新的。
 - **会话文件**：`<配置目录>/sessions/term/`，与 `--session-id` 同一种格式，`xiaoyu resume --all` 可见。
-- 自己的 `@x …` 与 `xiaoyu term …` 不记。
+- 自己的 `@x …`、`@c …` 与 `xiaoyu term …` 不记。
+- **`@c` 的两个文件**（都在 `<配置目录>/term/`）：`environment-<shell>.json` 是本机环境画像；`<会话id>.recall` 是这个终端最近 4 次 `@c` 的需求与命令（追问用，原文，30 分钟后不再带给模型）。`@c` 发给模型的是：环境画像、当前目录、最近 12 条命令（脱敏后，只看不取）、最近几次 `@c`、你的需求，以及管道内容（有的话，最多 16000 字符）。
 
 **关掉**：从启动文件删掉那一行，开个新终端即可。当前终端里要立刻停：zsh `add-zsh-hook -d preexec __xiaoyu_term_preexec; add-zsh-hook -d precmd __xiaoyu_term_precmd`、bash `trap - DEBUG`、fish `functions -e __xiaoyu_term_preexec __xiaoyu_term_postexec`、PowerShell 恢复 `$function:prompt = $function:__xiaoyu_term_prev_prompt`。（命令行不再记，退出码的钩子也就无事可做。）
 
 ## 各 shell 的边角
 
-- **bash**：用的是 `DEBUG` trap，会顶掉你自己设的 `DEBUG` trap（有的话）。整行命令从 `history 1` 取，`HISTCONTROL=ignorespace` 下以空格开头的命令取不到整行，退回记管道里的第一段。需要 bash 4+（`EPOCHSECONDS` 没有时退回 `date`）。记退出码的函数排在 `PROMPT_COMMAND` 最前面并把 `$?` 原样传下去，你自己的提示符命令读到的 `$?` 不变。对不上通配符的词 bash 默认原样保留，`@x 为什么?` 能直接问；设了 `failglob` / `nullglob` 的话走不带问题的 `@x`。
-- **zsh**：`preexec` 拿到的就是整行，最省心。`@x` 是别名，`setopt no_aliases` 的环境里用不了，改调 `__xiaoyu_term_ask`。
-- **fish**：没有内建的 epoch，时间戳那一下会 fork 一次 `date`。fish 3.x 里 `?` 还是通配符，问题带问号时走不带问题的 `@x`。
-- **PowerShell**：命令在跑完、下一个提示符出现前记下，对 `x 问题` 来说一样及时；不包 PSReadLine 的回车键，不会动你的键位。退出码取自 `$?` 与 `$LASTEXITCODE`：成功记 0，原生命令失败记它的退出码，cmdlet 失败没有数字、记 1。
+- **bash**：用的是 `DEBUG` trap，会顶掉你自己设的 `DEBUG` trap（有的话）。整行命令从 `history 1` 取，`HISTCONTROL=ignorespace` 下以空格开头的命令取不到整行，退回记管道里的第一段。需要 bash 4+（`EPOCHSECONDS` 没有时退回 `date`）。记退出码的函数排在 `PROMPT_COMMAND` 最前面并把 `$?` 原样传下去，你自己的提示符命令读到的 `$?` 不变。对不上通配符的词 bash 默认原样保留，`@x 为什么?` 能直接问；设了 `failglob` / `nullglob` 的话走不带问题的 `@x`。`@c` 给的命令进的是历史（`history -s`），关了历史（`set +o history`）就只能照着打出来的那行自己敲。
+- **zsh**：`preexec` 拿到的就是整行，最省心。`@x` / `@c` 是别名，`setopt no_aliases` 的环境里用不了，改调 `__xiaoyu_term_ask` / `__xiaoyu_term_command`。`@c` 靠 `print -z` 把命令放上提示符，只在交互式 shell 里有意义。
+- **fish**：没有内建的 epoch，时间戳那一下会 fork 一次 `date`。fish 3.x 里 `?` 还是通配符，问题带问号时走不带问题的 `@x`。没有 `@c`。
+- **PowerShell**：没有 `@c`。命令在跑完、下一个提示符出现前记下，对 `x 问题` 来说一样及时；不包 PSReadLine 的回车键，不会动你的键位。退出码取自 `$?` 与 `$LASTEXITCODE`：成功记 0，原生命令失败记它的退出码，cmdlet 失败没有数字、记 1。

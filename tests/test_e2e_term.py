@@ -5,6 +5,10 @@
 真的把命令写进了 pending 文件、提示符钩子补上了退出码、`@x` 把它们拼进了 prompt
 并落到了会话文件、第二次 `@x` 接上了第一次的历史。交互式 shell 从管道读命令也会跑钩子
 （zsh 的 preexec、bash 的 PROMPT_COMMAND/DEBUG 都认 -i），不需要 pty。
+
+`@c` 另有两条：bash 照样从管道驱动（命令进了历史、没被执行）；zsh 要给它一个
+真的 pty——`print -z` 把命令压进行编辑器的缓冲区，只有行编辑器在跑才看得到它
+出现在提示符上，也只有这样才能证明「回车才执行」。
 """
 
 from __future__ import annotations
@@ -16,10 +20,12 @@ import shlex
 import shutil
 import subprocess
 import sys
+import time
 import unittest
 from pathlib import Path
 
 from tests.test_e2e_scripted import E2ECase
+from xiaoyu import term
 
 #  每次 @x 是一个新进程、从脚本第一轮读起：两问各一份脚本，shell 里在两问之间换文件
 _SCRIPT = """text: 收到，看到你的命令了
@@ -28,6 +34,12 @@ usage: {"prompt_tokens": 50, "completion_tokens": 8}
 _SCRIPT_2 = """text: 接着上次说
 usage: {"prompt_tokens": 90, "completion_tokens": 6}
 """
+
+#  @c 的回答：命令里带一个算术展开——屏幕上出现 42 只可能是 shell 真的执行了它，
+#  出现原文则只是被放到了提示符 / 历史里
+_COMMAND_SCRIPT = """text: {"command": "echo SUGGESTED-$((40+2))", "note": "口算一下"}
+"""
+_SUGGESTED = "echo SUGGESTED-$((40+2))"
 
 _TIMEOUT = 180
 
@@ -165,6 +177,155 @@ class BashTermE2E(TermShellMixin, E2ECase):
 
     def shell_command(self) -> list[str]:
         return ["bash", "--noprofile", "--norc", "-i"]
+
+
+class BashCommandE2E(E2ECase):
+    """bash 里的 `@c`：命令打出来、推进历史（顶掉 `@c …` 那一行），不执行。"""
+
+    def setUp(self) -> None:
+        super().setUp()
+        if os.name == "nt" or not shutil.which("bash"):
+            self.skipTest("需要 POSIX 上的 bash")
+
+    def test_at_c_pushes_the_command_into_history_without_running_it(self) -> None:
+        launcher = f"{shlex.quote(sys.executable)} -P -m xiaoyu"
+        env = self.scripted_env(_COMMAND_SCRIPT)
+        env["PYTHONPATH"] = str(Path(__file__).resolve().parent.parent)
+        env.pop("XIAOYU_TERM_SESSION", None)
+        env.pop("XIAOYU_TERM_PENDING", None)
+        env["HISTFILE"] = str(Path(self.tmp) / "bash_history")
+        body = "\n".join(
+            [
+                f'eval "$({launcher} term init bash --launcher {shlex.quote(launcher)})"',
+                'echo "PENDING=$XIAOYU_TERM_PENDING"',
+                "ls",
+                #  </dev/null：不然它会把管道里剩下的脚本当「管道材料」读走
+                "@c 算一下 -x 开头的 </dev/null",
+                'echo "STATUS=$?"',
+                "history 3",
+                "exit",
+                "",
+            ]
+        )
+        proc = subprocess.run(
+            ["bash", "--noprofile", "--norc", "-i"],
+            input=body, capture_output=True, text=True, encoding="utf-8",
+            env=env, cwd=str(self.workspace), timeout=_TIMEOUT,
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr[-1500:])
+        self.assertIn("STATUS=0", proc.stdout)
+        #  命令原文打出来了，但没被执行
+        self.assertIn(_SUGGESTED, proc.stdout)
+        self.assertNotIn("SUGGESTED-42", proc.stdout)
+        self.assertIn("口算一下", proc.stderr)
+        self.assertIn("按 ↑ 取用", proc.stderr)
+        self.assertRegex(proc.stderr, r"已记下本机环境：.*bash \d")
+        #  历史里是那条命令，`@c …` 自己被它顶掉了
+        self.assertRegex(proc.stdout, rf"(?m)^\s*\d+\s+{re.escape(_SUGGESTED)}$")
+        self.assertNotRegex(proc.stdout, r"(?m)^\s*\d+\s+@c ")
+        pending = re.search(r"PENDING=(\S+)", proc.stdout)
+        self.assertTrue(pending, proc.stdout)
+        recorded = Path(pending.group(1)).read_text(encoding="utf-8")
+        self.assertIn("\tls\n", recorded)
+        self.assertNotIn("@c", recorded)
+
+
+@unittest.skipUnless(os.name == "posix" and shutil.which("zsh"), "需要 zsh 与 pty")
+class ZshCommandE2E(E2ECase):
+    """zsh 里的 `@c`：命令出现在下一个提示符上，回车才执行，执行后照常进 pending。"""
+
+    def test_at_c_puts_the_command_on_the_prompt_and_enter_runs_it(self) -> None:
+        import fcntl
+        import pty
+        import select
+        import struct
+        import termios
+
+        launcher = f"{shlex.quote(sys.executable)} -P -m xiaoyu"
+        env = self.scripted_env(_COMMAND_SCRIPT)
+        env["PYTHONPATH"] = str(Path(__file__).resolve().parent.parent)
+        env.pop("XIAOYU_TERM_SESSION", None)
+        env.pop("XIAOYU_TERM_PENDING", None)
+        env["ZDOTDIR"] = str(Path(self.tmp) / "home")
+        env["TERM"] = "xterm"
+        env["PS1"] = "READY> "
+
+        master, slave = pty.openpty()
+        #  够宽：提示符 + 命令不折行，屏幕上的命令才是连续的一段
+        fcntl.ioctl(master, termios.TIOCSWINSZ, struct.pack("HHHH", 40, 200, 0, 0))
+        #  新会话：zsh 不该去碰跑测试的那个终端的前台进程组
+        proc = subprocess.Popen(
+            ["zsh", "-f", "-i"], stdin=slave, stdout=slave, stderr=slave,
+            env=env, cwd=str(self.workspace), start_new_session=True,
+        )
+        os.close(slave)
+        seen = ""
+
+        def expect(pattern: str, timeout: float = 60.0) -> re.Match[str]:
+            """读到屏幕输出里出现 pattern（只看上一次匹配之后的部分）为止。"""
+            nonlocal seen
+            deadline = time.monotonic() + timeout
+            while True:
+                match = re.search(pattern, seen)
+                if match:
+                    seen = seen[match.end():]
+                    return match
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    self.fail(f"等不到 {pattern!r}；屏幕尾部：{seen[-600:]!r}")
+                ready, _, _ = select.select([master], [], [], min(remaining, 1.0))
+                if ready:
+                    try:
+                        chunk = os.read(master, 65536)
+                    except OSError:
+                        chunk = b""
+                    if not chunk:
+                        self.fail(f"shell 提前退出，没等到 {pattern!r}；屏幕尾部：{seen[-600:]!r}")
+                    seen += chunk.decode("utf-8", "replace")
+
+        def send(line: str) -> None:
+            os.write(master, line.encode() + b"\r")
+
+        try:
+            expect(r"READY> ")
+            send(f'eval "$({launcher} term init zsh --launcher {shlex.quote(launcher)})"')
+            send('echo "PENDING=$XIAOYU_TERM_PENDING"')
+            pending = Path(expect(r"PENDING=(/\S+\.pending)").group(1))
+            send("@c 算一下 (括号) 和 ? 都原样")
+            #  说明走 stderr 直接上屏；随后的新提示符上就是那条命令，还没执行
+            expect(r"口算一下")
+            expect(r"READY> .*" + re.escape(_SUGGESTED))
+            self.assertNotIn("SUGGESTED-42", seen)
+            send("")
+            expect(r"SUGGESTED-42")
+            expect(r"READY> ")
+            send("exit")
+            #  退出前写的东西得有人读走：macOS 上 pty 从端关闭时要等输出排空，
+            #  这边不读，zsh 就卡在退出的半路上
+            deadline = time.monotonic() + 30
+            while proc.poll() is None and time.monotonic() < deadline:
+                if select.select([master], [], [], 0.2)[0]:
+                    try:
+                        os.read(master, 65536)
+                    except OSError:
+                        break
+            self.assertEqual(proc.wait(timeout=10), 0)
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+                proc.wait()
+            os.close(master)
+        #  回车执行的那条命令被钩子照常记下，退出码也补上了：下一次 @x 带得上它；
+        #  `@c …` 自己不进 pending
+        recorded = [(e.command, e.status) for e in term.drain_pending(pending)]
+        self.assertIn((_SUGGESTED, 0), recorded)
+        self.assertFalse([command for command, _ in recorded if command.startswith("@c")], recorded)
+        #  这一次的需求与命令记进了上文（追问用），需求是 shell 交过来的原文
+        recall = list(pending.parent.glob("*.recall"))
+        self.assertEqual(len(recall), 1, recall)
+        record = json.loads(recall[0].read_text(encoding="utf-8").splitlines()[-1])
+        self.assertEqual(record["command"], _SUGGESTED)
+        self.assertEqual(record["ask"], "算一下 (括号) 和 ? 都原样")
 
 
 @unittest.skipUnless(os.name == "posix", "需要 pty")
