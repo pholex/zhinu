@@ -1005,11 +1005,11 @@ class Tool:
             parameters = {
                 **parameters,
                 "properties": {
-                    **parameters.get("properties", {}),
                     PURPOSE_PARAM: {
                         "type": "string",
-                        "description": "用一句话说明这次调用的目的（会展示在用户的确认提示里）",
+                        "description": "先生成此字段，用一句话说明调用目的；再生成路径、命令或正文。会展示给用户。",
                     },
+                    **parameters.get("properties", {}),
                 },
             }
         return {
@@ -1845,6 +1845,7 @@ class Toolbox:
                     "只在新建文件或需要全量重写时用；改动已有文件的局部请用 str_replace。"
                     "覆盖已有文件前必须先用 read_file 把它完整读过（只读过一部分的不能覆盖）。"
                     "父目录不存在会自动创建。"
+                    "先生成 path，再生成 content，便于用户提前看到写入位置。"
                 ),
                 parameters={
                     "type": "object",
@@ -1871,6 +1872,7 @@ class Toolbox:
                     "并且在整个文件里只能出现一次；"
                     "如果不唯一，就把上下文往外扩几行直到唯一。"
                     "删除代码就把 new_str 设为空字符串。"
+                    "先生成 path，再生成 old_str 和 new_str。"
                 ),
                 parameters={
                     "type": "object",

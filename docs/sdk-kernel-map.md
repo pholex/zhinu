@@ -61,7 +61,7 @@
 | 能力 | SDK 对应 | 状态与边界 |
 |---|---|---|
 | `UIEvent`、`RequestStarted`、`RequestEnded`、`TextDelta`、`TextEnd` | 同名导出与事件流 | 已接入 |
-| `ToolPending`、`ToolPurpose`、`ToolRunning`、`ToolCompleted`、`ToolDenied` | 同名导出与事件流 | 已接入；`ToolPurpose` 为本轮补齐导出，复用原类型 |
+| `ToolPreparing`、`ToolPending`、`ToolPurpose`、`ToolRunning`、`ToolCompleted`、`ToolDenied` | 同名导出与事件流 | 已接入；`ToolPurpose` 为本轮补齐导出，复用原类型 |
 | `SteerAccepted`、`PlanUpdated`、`Notice` | 同名类型导出 | 已接入；计划工具需显式 enable_plan，快照通过 plan / PlanStep 提供任务清单 |
 | 内置工具与宿主 Python 工具 | `builtin_tools`、`Tool` / `ToolResult` | 已接入；部分内核上下文管理工具不受 builtin_tools 空元组控制 |
 | 生命周期 hooks | `Hook` / `HookDecision` | 已接入已有宿主事件；返回文本替换另由 ResultTransform 提供，PostToolUse 仍为附加反馈 |

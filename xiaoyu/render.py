@@ -22,11 +22,13 @@ from .events import (
     Notice,
     PlanUpdated,
     RequestStarted,
+    RequestEnded,
     SteerAccepted,
     TextDelta,
     TextEnd,
     ToolCompleted,
     ToolPending,
+    ToolPreparing,
     ToolPurpose,
     UIEvent,
 )
@@ -163,12 +165,15 @@ class PlainSink:
         self.verbose = verbose
         #  当前正文块是否已打开 OSC 133 锚点（TextEnd 负责收束配对）
         self._osc133_open = False
+        self._preparing: dict[int, tuple[str, str, str]] | None = None
         #  按事件类型分发；不认识的事件（将来新增的）静默忽略——
         #  旧前端遇到新事件不该崩，这是事件协议的向后兼容底线
         self._handlers: dict[type, Callable[[Any], None]] = {
             TextDelta: self._text_delta,
             TextEnd: self._text_end,
             RequestStarted: self._request_started,
+            RequestEnded: self._request_ended,
+            ToolPreparing: self._tool_preparing,
             ToolPending: self._tool_pending,
             ToolPurpose: self._tool_purpose,
             ToolCompleted: self._tool_completed,
@@ -190,8 +195,21 @@ class PlainSink:
         但在 --no-tui 或缺依赖的交互场景里，一行提示总好过完全静默。
         以 stdout 是不是终端为准：不是终端就等于没人在看。
         """
+        self._preparing = {}
         if self.verbose and sys.stdout.isatty():
             print(ui.secondary(f"{self.indent}· {event.model} 思考中…"))
+
+    def _request_ended(self, event: RequestEnded) -> None:
+        self._preparing = None
+
+    def _tool_preparing(self, event: ToolPreparing) -> None:
+        if self._preparing is None or not self.verbose or not sys.stdout.isatty():
+            return
+        metadata = (event.name, event.path, event.purpose)
+        if self._preparing.get(event.index) == metadata:
+            return
+        self._preparing[event.index] = metadata
+        print(ui.secondary(ui.fit(f"{self.indent}· 正在生成 {preparation_text(event)}")))
 
     def _text_delta(self, event: TextDelta) -> None:
         if self.verbose:
@@ -281,6 +299,17 @@ def progress_text(progress: float | None, total: float | None, message: str) -> 
         parts.append(number(progress))
     if message:
         parts.append(message)
+    return " · ".join(parts)
+
+
+def preparation_text(event: ToolPreparing) -> str:
+    """准备状态只展示小段元信息，参数正文不进预览。"""
+    parts = [event.name]
+    if event.path:
+        parts.append(event.path)
+    if event.purpose:
+        parts.append(event.purpose)
+    parts.append(f"参数 {event.argument_chars:,} 字符")
     return " · ".join(parts)
 
 

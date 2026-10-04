@@ -227,6 +227,7 @@ class ToolTurnTest(E2ECase):
             self.kinds(events),
             [
                 "request.started",
+                "tool.preparing",
                 "request.ended",
                 "tool.pending",
                 "tool.running",
@@ -237,7 +238,7 @@ class ToolTurnTest(E2ECase):
                 "request.ended",
             ],
         )
-        completed = events[4]
+        completed = events[5]
         self.assertEqual(completed["name"], "bash")
         self.assertTrue(completed["ok"])
         self.assertIn("e2e-ok", completed["output"])

@@ -40,7 +40,7 @@ from xiaoyu.events import (
     Notice as Notice, RequestEnded as RequestEnded, RequestStarted as RequestStarted,
     TextDelta as TextDelta, TextEnd as TextEnd, ToolCompleted as ToolCompleted,
     ToolDenied as ToolDenied, ToolPending as ToolPending, ToolRunning as ToolRunning,
-    SteerAccepted as SteerAccepted,
+    ToolPreparing as ToolPreparing, SteerAccepted as SteerAccepted,
     PlanUpdated as PlanUpdated, ToolPurpose as ToolPurpose,
     UIEvent as UIEvent,
 )
@@ -66,7 +66,7 @@ __all__ = [
     "SessionOptions", "OutputSpec", "Tool", "ToolResult", "ToolHandler", "Hook",
     "HookHandler", "HookDecision", "McpServer", "Subagent", "Approval", "Approver", "Asker",
     "Allow", "Deny", "RunResult", "RunCompleted", "UIEvent", "Notice", "TextDelta",
-    "TextEnd", "RequestStarted", "RequestEnded", "ToolPending", "ToolRunning",
+    "TextEnd", "RequestStarted", "RequestEnded", "ToolPreparing", "ToolPending", "ToolRunning",
     "ToolCompleted", "ToolDenied", "SDKError", "ConfigurationError", "ExecutionError",
     "CloseTimeoutError", "SessionBusyError", "SessionClosedError", "SessionStorageError",
     "SessionLockedError", "SessionInfo", "list_sessions", "OutputSchemaError",

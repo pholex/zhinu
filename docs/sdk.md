@@ -97,6 +97,12 @@ async def handle(options):
 成功或正常停止的流最后产生一个 `RunCompleted`；模型/内核异常从迭代器抛出。
 事件队列默认容量 128，慢消费者向执行线程施加背压。文本片段不是已验证的业务结果。
 
+`ToolPreparing`（`tool.preparing`）提前报告工具参数生成进度：`index` 是当前请求内
+的调用序号，`argument_chars` 是累计参数 JSON 字符数，`path` 与 `purpose` 是
+已收齐的短字段。SDK 附加 session/run/request 关联 ID。用请求 ID 与 index 区分
+多个预览，收到 `RequestEnded` 就清除该请求的全部预览；此时工具可能因中断、
+参数错误或审批拒绝而不执行。详细边界见[事件契约](embedding.md#事件消费)。
+
 完整的超时与迟到回答协议另见[设计稿](sdk-deferred-questions-design.md)，SQLite
 安全边界接纳及版本观察已实现，见[持久化待答](sdk-deferred-questions.md)。下文的基础
 `asker` 支持同步／异步宿主回调，但本轮会等待其完成，

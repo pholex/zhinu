@@ -69,6 +69,33 @@ class SDKTests(unittest.TestCase):
         with self.assertRaises(SessionClosedError):
             session.run("third")
 
+    def test_preparing_events_keep_request_identity_and_precede_execution(self):
+        from xiaoyu_agent_sdk import ToolPreparing
+
+        effects = []
+        tool = Tool("draft", "Prepare a draft", {"type": "object", "properties": {
+            "path": {"type": "string"}, "content": {"type": "string"}}},
+            lambda **args: effects.append(args) or "done", requires_approval=False)
+        options = self.options([
+            [call("draft", '{"path":"note.txt","content":"'),
+             chunk(tool_calls=[call_fragment(0, None, None, 'body"}')]), usage_chunk(10, 2)],
+            [chunk("done"), usage_chunk(20, 2)],
+        ], tools=(tool,))
+        with Session(options) as session:
+            events = []
+            for event in session.stream("draft"):
+                events.append(event)
+            previews = [e for e in events if isinstance(e, ToolPreparing)]
+            self.assertTrue(previews)
+            self.assertTrue(all(e.session_id == session.session_id for e in previews))
+            started = next(e for e in events if e.kind == "request.started")
+            self.assertTrue(started.request_id)
+            self.assertTrue(all(e.request_id == started.request_id for e in previews))
+            self.assertTrue(all(e.tool_call_id == "call" for e in previews))
+            self.assertEqual(previews[0].path, "note.txt")
+            self.assertLess(events.index(previews[-1]), next(i for i, e in enumerate(events) if e.kind == "tool.pending"))
+            self.assertEqual(effects, [{"path": "note.txt", "content": "body"}])
+
     def test_null_is_valid_and_next_turn_has_no_output_tool(self):
         options = self.options([[call("structured_output", '{"value":null}')], [chunk("done")]])
         with Session(options) as session:

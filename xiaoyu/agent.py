@@ -4865,12 +4865,17 @@ class Agent:
         #  中断/异常路径上 pending 也保持"arguments 是完整字符串"的形状，
         #  调用方任何一条路径读到的都与逐片 += 一致
         arg_parts: dict[int, list[str]] = {}
+        preparations: dict[int, Any] = {}
         try:
-            self._consume_chunks(route, stream, content_parts, pending, reasoning, arg_parts)
+            self._consume_chunks(route, stream, content_parts, pending, reasoning, arg_parts, preparations)
         finally:
             for index, parts in arg_parts.items():
                 function = pending[index]["function"]
                 function["arguments"] = function["arguments"] + "".join(parts)
+            for index, preview in preparations.items():
+                call = pending[index]
+                if event := preview.event(call["function"]["name"], call["id"], force=True):
+                    self.emit(event)
 
     def _consume_chunks(
         self,
@@ -4880,8 +4885,11 @@ class Agent:
         pending: dict[int, dict[str, Any]],
         reasoning: list[dict[str, Any]],
         arg_parts: dict[int, list[str]],
+        preparations: dict[int, Any],
     ) -> None:
         """_consume_stream 的逐 chunk 循环体；arguments 分片攒进 arg_parts。"""
+        from .tool_preparation import Preparation
+
         #  无 index 分片归组用：最近写过的一格。不能用 max(pending) 代替——
         #  编号最大 ≠ 最近在写（带 id 的分片可以把写入点拉回旧格），续错格
         #  就是把 arguments 拼成一坨坏 JSON
@@ -4997,6 +5005,12 @@ class Agent:
                     slot["function"]["name"] = fragment.function.name
                 if fragment.function.arguments:
                     arg_parts.setdefault(index, []).append(fragment.function.arguments)
+                preview = preparations.get(index)
+                if preview is None:
+                    preview = preparations[index] = Preparation(index)
+                preview.feed(fragment.function.arguments or "")
+                if event := preview.event(slot["function"]["name"], slot["id"]):
+                    self.emit(event)
 
     # ---------- 工具执行 ----------
 
