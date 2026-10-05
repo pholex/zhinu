@@ -45,7 +45,14 @@ pip install "xiaoyu-agent[tui,serve,otel,bedrock,browser,sdk]"
 playwright install chromium
 ```
 
-日常维护：`xiaoyu update` 升级，`xiaoyu uninstall` 卸载（加 `--purge` 连配置一起删），`eval "$(xiaoyu completion zsh)"` 开 shell 补全（bash / zsh / fish）。连不上模型时用 `xiaoyu doctor --probe` 真发一条请求排查；报 issue 时用 `xiaoyu doctor --bundle` 打诊断包（含路径与命令历史，分享前看一眼）。
+升级与卸载：
+
+```bash
+xiaoyu update                     # 升级
+xiaoyu uninstall                  # 卸载；加 --purge 连配置一起删
+```
+
+`eval "$(xiaoyu completion zsh)"` 开 shell 补全（bash / zsh / fish）。连不上模型时用 `xiaoyu doctor --probe` 真发一条请求排查；报 issue 时用 `xiaoyu doctor --bundle` 打诊断包（含路径与命令历史，分享前看一眼）。
 
 ## 配置
 
