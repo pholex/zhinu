@@ -38,6 +38,13 @@ xiaoyu doctor                     # 装完体检一遍
 - `[browser]`：内置浏览器工具，装完再跑一次 `playwright install chromium`
 - `[sdk]`：作为库嵌进你的程序（[docs/sdk.md](docs/sdk.md)）
 
+想一次装全：
+
+```bash
+pip install "xiaoyu-agent[tui,serve,otel,bedrock,browser,sdk]"
+playwright install chromium
+```
+
 日常维护：`xiaoyu update` 升级，`xiaoyu uninstall` 卸载（加 `--purge` 连配置一起删），`eval "$(xiaoyu completion zsh)"` 开 shell 补全（bash / zsh / fish）。连不上模型时用 `xiaoyu doctor --probe` 真发一条请求排查；报 issue 时用 `xiaoyu doctor --bundle` 打诊断包（含路径与命令历史，分享前看一眼）。
 
 ## 配置
