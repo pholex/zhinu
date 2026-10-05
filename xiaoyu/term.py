@@ -747,6 +747,7 @@ def render_script(
     *,
     named: bool,
     command_not_found: bool = False,
+    natural: bool = False,
     launcher: str | None = None,
     directory: Path | None = None,
 ) -> str:
@@ -758,6 +759,8 @@ def render_script(
     """
     if shell not in SHELLS:
         raise ValueError(f"不支持的 shell：{shell}（可选 {', '.join(SHELLS)}）")
+    if natural and shell not in _NATURAL:
+        raise ValueError(f"--natural 目前只支持 {' / '.join(_NATURAL)}（{shell} 里请照常写 @c）")
     directory = pending_dir() if directory is None else directory
     launcher = default_launcher(shell) if launcher is None else launcher
     template = _TEMPLATES[shell]
@@ -780,10 +783,10 @@ def render_script(
             if named
             else f'if [ -z "${{{SESSION_ENV}:-}}" ]; then export {SESSION_ENV}={quote(session_id)}; fi'
         )
-    cnf = _CNF[shell] if command_not_found else ""
-    #  先拼进 command-not-found 段再替换启动命令：那段里也有 @@LAUNCHER@@
+    extras = (_CNF[shell] if command_not_found else "") + (_NATURAL[shell] if natural else "")
+    #  先拼进可选段再替换启动命令：command-not-found 那段里也有 @@LAUNCHER@@
     return (
-        template.replace("@@CNF@@", cnf)
+        template.replace("@@CNF@@", extras)
         .replace("@@SESSION@@", session_block)
         .replace("@@DIR@@", quote(str(directory)))
         .replace("@@LAUNCHER@@", launcher)
@@ -1023,6 +1026,45 @@ _CNF = {
         "    $CommandLookupEventArgs.StopSearch = $true\n"
         "}\n"
     ),
+}
+
+#  --natural（默认不开，只有 zsh）：不敲 `@c`，整行是一句自然语言就转给它。
+#  包的是回车键的 accept-line，所以判断发生在 shell 解析这一行**之前**——拿到的
+#  是人敲的原文，改写成 `@c -- '原文'` 再照常提交：屏幕与历史里都看得见这一行
+#  是被转走的，引号、括号、分号全在单引号里，不会被 shell 解释。
+#  判定只往保守的方向错：整行里有非 ASCII 字符，**并且**第一个词既不是任何
+#  命令 / 别名 / 函数 / 保留字、不是目录（autocd）、也不带 shell 语法字符
+#  （路径、赋值、展开、引号、重定向、分组……）。凡是 shell 自己可能认得的行都
+#  原样放行；代价是以命令名开头的句子（「git 怎么回滚」）转不走，仍要写 `@c`。
+#  原来的 accept-line（可能已被别的插件包过）存成别名接着调，不是直接顶掉；
+#  守卫变量不能省：重复 eval 时再存一次，存下的就是自己，回车即死循环
+_NATURAL = {
+    "zsh": r"""__xiaoyu_term_natural() {
+  emulate -L zsh
+  local line=$1
+  [[ $line == *$'\n'* ]] && return 1
+  line=${line#"${line%%[![:space:]]*}"}
+  line=${line%"${line##*[![:space:]]}"}
+  [[ -n $line && $line == *[^[:ascii:]]* ]] || return 1
+  local first=${line%%[[:space:]]*}
+  [[ $first == *[\$\`\'\"\\/=\(\)\{\}\<\>\|\&\;\!\#\~%]* ]] && return 1
+  whence -- "$first" >/dev/null && return 1
+  [[ -d $first ]] && return 1
+  REPLY="@c -- ${(qq)line}"
+  return 0
+}
+__xiaoyu_term_accept_line() {
+  if [[ $CONTEXT == start && -z $PREBUFFER ]] && __xiaoyu_term_natural "$BUFFER"; then
+    BUFFER=$REPLY
+  fi
+  zle __xiaoyu_term_natural_next "$@"
+}
+if [[ -o interactive && -z "${__xiaoyu_term_natural_hooked:-}" ]]; then
+  zle -A accept-line __xiaoyu_term_natural_next
+  zle -N accept-line __xiaoyu_term_accept_line
+  typeset -g __xiaoyu_term_natural_hooked=1
+fi
+""",
 }
 
 

@@ -1397,7 +1397,7 @@ def resume_command(argv: list[str]) -> int:
 
 
 TERM_USAGE = """用法：
-  xiaoyu term init <bash|zsh|fish|powershell> [--name 名字] [--command-not-found]
+  xiaoyu term init <bash|zsh|fish|powershell> [--name 名字] [--command-not-found] [--natural]
         输出 shell 脚本：eval "$(xiaoyu term init zsh)"（fish 用 | source，PowerShell 用 Invoke-Expression）
   xiaoyu term run [问题…]      带着自上次提问以来跑过的命令向模型提问（脚本里定义成 @x / @xiaoyu）；
                                不带问题就读一行原样文本当问题（问号、引号、管道符都不必转义）
@@ -1441,7 +1441,7 @@ def term_init_command(argv: list[str]) -> int:
 
     parser = argparse.ArgumentParser(
         prog="xiaoyu term init",
-        description="输出 shell 集成脚本（会话变量、@x 别名、记命令的钩子）。",
+        description="输出 shell 集成脚本（会话变量、@x / @c、记命令的钩子）。",
     )
     parser.add_argument("shell", choices=term.SHELLS)
     parser.add_argument(
@@ -1454,32 +1454,39 @@ def term_init_command(argv: list[str]) -> int:
         help="敲错的命令整行交给模型（默认不开：每个 typo 都打一次模型太费钱）",
     )
     parser.add_argument(
+        "--natural",
+        action="store_true",
+        help="不敲 @c：整行是一句自然语言（含非 ASCII 字符、且第一个词不是命令）就转给 @c。"
+        "只支持 zsh，会包一层回车键（默认不开）",
+    )
+    parser.add_argument(
         "--launcher",
         help="脚本里怎么调 xiaoyu（默认：PATH 上有就用 xiaoyu，没有就用当前解释器 -m xiaoyu）",
     )
     args = parser.parse_args(argv)
+    directory = term.pending_dir()
     try:
         session_id = term.session_id_for(args.name)
+        #  先渲染再建目录：参数不对（--natural 配了不支持的 shell）就什么都别留下
+        script = term.render_script(
+            args.shell,
+            session_id,
+            named=bool(args.name),
+            command_not_found=args.command_not_found,
+            natural=args.natural,
+            launcher=args.launcher,
+            directory=directory,
+        )
     except ValueError as exc:
         print(ui.error(str(exc)), file=sys.stderr)
         return 2
     #  pending 文件里是脱敏前的原始命令行：目录自己可读就够了
-    directory = term.pending_dir()
     try:
         directory.mkdir(parents=True, exist_ok=True, mode=0o700)
     except OSError as exc:
         print(ui.error(f"建不了 {directory}：{exc}"), file=sys.stderr)
         return 1
-    sys.stdout.write(
-        term.render_script(
-            args.shell,
-            session_id,
-            named=bool(args.name),
-            command_not_found=args.command_not_found,
-            launcher=args.launcher,
-            directory=directory,
-        )
-    )
+    sys.stdout.write(script)
     return 0
 
 

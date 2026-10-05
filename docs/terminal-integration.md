@@ -106,6 +106,39 @@ BSD 与 GNU 的 `sed -i`、`date -d`、`stat` 写法不同，是命令给错的�
 
 文件在 `<配置目录>/term/environment-<shell>.json`，每种 shell 一份。**系统、架构或 shell 版本变了会自动重探**，另外每 7 天重探一次（跟上工具的装卸）。刚装了新工具想立刻生效：删掉这个文件。
 
+### 不敲 `@c`：`--natural`（只有 zsh，默认不开）
+
+```bash
+eval "$(xiaoyu term init zsh --natural)"
+```
+
+开了之后，在提示符上直接敲一句话回车就行：
+
+```text
+~/proj % 找出当前目录下大于 100M 的文件，按大小倒序        ← 敲的是这一行
+~/proj % @c -- '找出当前目录下大于 100M 的文件，按大小倒序'   ← 回车的一刻它被改写成这样
+列出大于 100M 的文件并按大小倒序
+~/proj % find . -type f -size +100M -exec du -h {} + | sort -rh█
+```
+
+改写后的那一行留在屏幕和历史里，所以哪一行被转走了一眼看得出。之后与手敲 `@c` 完全一样。
+
+**什么样的行会被转走**——两条都满足才算，往保守的方向错：
+
+1. 整行里有非 ASCII 字符（中文、日文……）；
+2. 第一个词不是任何命令、别名、函数、保留字，不是目录，也不带 shell 语法字符（`/` `=` `$` 引号 `\` 括号 `<` `>` `|` `&` `;` `!` `#` `~` `%`）。
+
+所以真命令永远照常执行，哪怕参数是中文（`echo 你好`、`git commit -m "修复"`）。转不走、仍要写 `@c` 的有两种：
+
+- **以命令名开头的句子**：`git 怎么回滚上一次提交` 第一个词是真命令，shell 会真的去跑 `git`。
+- **纯英文的句子**：`show me big files` 和敲错的命令分不清，交给 shell 报 command not found。
+
+顺带的好处：整句话进了单引号，里面的 `;` `|` `$HOME` `?` 括号都不会被 shell 解释，不用再走「只敲 `@c` 回车」那条路。想让某一行绕过判定，行首加一个 `\`。
+
+**它包了一层回车键**（zsh 的 `accept-line`），这是默认不开的原因。原来的 `accept-line` 留在调用链上：先于它或后于它包回车键的别的东西照常被调到（按两种先后顺序测过），但没有拿真实的第三方插件逐个验证——开了之后回车行为不对，先关掉它排查。当前终端里立刻停：`zle -A __xiaoyu_term_natural_next accept-line`。
+
+bash / fish / PowerShell 没有这个开关（`term init bash --natural` 会直接报错）：bash 没有在 shell 解析之前拿到整行的干净办法。
+
 ## 具名会话
 
 默认每个终端一个随机 id（`term-<8 位>`），关掉终端这段对话就留在历史里（`xiaoyu resume --all` 还能找到）。要多个终端共用、或关掉重开接着聊：
@@ -148,6 +181,6 @@ xiaoyu term log "make test"
 ## 各 shell 的边角
 
 - **bash**：用的是 `DEBUG` trap，会顶掉你自己设的 `DEBUG` trap（有的话）。整行命令从 `history 1` 取，`HISTCONTROL=ignorespace` 下以空格开头的命令取不到整行，退回记管道里的第一段。需要 bash 4+（`EPOCHSECONDS` 没有时退回 `date`）。记退出码的函数排在 `PROMPT_COMMAND` 最前面并把 `$?` 原样传下去，你自己的提示符命令读到的 `$?` 不变。对不上通配符的词 bash 默认原样保留，`@x 为什么?` 能直接问；设了 `failglob` / `nullglob` 的话走不带问题的 `@x`。`@c` 给的命令进的是历史（`history -s`），关了历史（`set +o history`）就只能照着打出来的那行自己敲。
-- **zsh**：`preexec` 拿到的就是整行，最省心。`@x` / `@c` 是别名，`setopt no_aliases` 的环境里用不了，改调 `__xiaoyu_term_ask` / `__xiaoyu_term_command`。`@c` 靠 `print -z` 把命令放上提示符，只在交互式 shell 里有意义。
+- **zsh**：`preexec` 拿到的就是整行，最省心。`@x` / `@c` 是别名，`setopt no_aliases` 的环境里用不了，改调 `__xiaoyu_term_ask` / `__xiaoyu_term_command`。`@c` 靠 `print -z` 把命令放上提示符，只在交互式 shell 里有意义。`--natural` 只在交互式 shell 里挂回车键；判定时把目录名一律当命令放行，不看你开没开 `autocd`。
 - **fish**：没有内建的 epoch，时间戳那一下会 fork 一次 `date`。fish 3.x 里 `?` 还是通配符，问题带问号时走不带问题的 `@x`。没有 `@c`。
 - **PowerShell**：没有 `@c`。命令在跑完、下一个提示符出现前记下，对 `x 问题` 来说一样及时；不包 PSReadLine 的回车键，不会动你的键位。退出码取自 `$?` 与 `$LASTEXITCODE`：成功记 0，原生命令失败记它的退出码，cmdlet 失败没有数字、记 1。

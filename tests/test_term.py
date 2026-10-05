@@ -128,6 +128,106 @@ class ScriptRenderTest(unittest.TestCase):
             with self.subTest(shell=shell):
                 self.assertNotIn("term command", self.render(shell))
 
+    def test_natural_is_opt_in_and_zsh_only(self) -> None:
+        for shell in term.SHELLS:
+            with self.subTest(shell=shell):
+                #  默认不动任何人的回车键
+                self.assertNotIn("accept-line", self.render(shell))
+        on = self.render("zsh", natural=True)
+        #  原来的 accept-line 存成别名接着调，不是直接顶掉
+        self.assertIn("zle -A accept-line __xiaoyu_term_natural_next", on)
+        self.assertIn("zle -N accept-line __xiaoyu_term_accept_line", on)
+        self.assertIn('zle __xiaoyu_term_natural_next "$@"', on)
+        #  重复 eval 再存一次别名，存下的就是自己：守卫不能少
+        self.assertIn("__xiaoyu_term_natural_hooked", on)
+        self.assertNotIn("@@", on)
+        #  与 command-not-found 可以同开
+        both = self.render("zsh", natural=True, command_not_found=True)
+        self.assertIn("command_not_found_handler", both)
+        self.assertIn("__xiaoyu_term_accept_line", both)
+        for shell in ("bash", "fish", "powershell"):
+            with self.subTest(shell=shell):
+                with self.assertRaisesRegex(ValueError, "只支持 zsh"):
+                    self.render(shell, natural=True)
+
+    def test_init_refuses_natural_outside_zsh_and_leaves_nothing_behind(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp) / "term"
+            out, err = io.StringIO(), io.StringIO()
+            with mock.patch.object(term, "pending_dir", lambda: directory), \
+                    contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+                self.assertEqual(cli.main(["term", "init", "bash", "--natural"]), 2)
+                self.assertEqual((out.getvalue(), directory.exists()), ("", False))
+                self.assertIn("只支持 zsh", err.getvalue())
+                self.assertEqual(cli.main(["term", "init", "zsh", "--natural", "--launcher", "xiaoyu"]), 0)
+            self.assertIn("__xiaoyu_term_accept_line", out.getvalue())
+            self.assertTrue(directory.is_dir())
+
+    @unittest.skipUnless(shutil.which("zsh") and os.name != "nt", "需要 zsh（POSIX）")
+    def test_natural_rule_only_takes_lines_the_shell_could_not_mean(self) -> None:
+        """判定规则放进真的 zsh 里跑一张表：往保守的方向错——shell 自己可能认得的
+        行一律放行，转走的行整行进单引号（里面的分号、展开都不再被 shell 解释）。"""
+        taken = {
+            "找出大于 100M 的文件，按大小倒序": "@c -- '找出大于 100M 的文件，按大小倒序'",
+            "  这是什么?  ": "@c -- '这是什么?'",
+            "把 (a|b) 'x' $HOME *.log 里的 ? 换掉": "@c -- '把 (a|b) '\\''x'\\'' $HOME *.log 里的 ? 换掉'",
+            "list 所有容器": "@c -- 'list 所有容器'",
+            "-x 开头的文件": "@c -- '-x 开头的文件'",
+            #  后半句不会被 shell 执行：它只是需求的一部分
+            "删掉所有 .pyc; rm -rf /": "@c -- '删掉所有 .pyc; rm -rf /'",
+        }
+        passed = [
+            "git 怎么回滚上一次提交",  # 第一个词是命令
+            "echo 你好",
+            "show me big files",  # 没有非 ASCII 字符：分不清是英文句子还是敲错的命令
+            "gti status",
+            "查看 当前目录",  # 别名
+            "函数名 参数",  # 函数
+            "目录",  # 目录（autocd）
+            "./脚本.sh 参数",
+            "名字=值 make",
+            "ls;echo 你好",
+            "$(echo 你好)",
+            '"引号开头" 的句子',
+            "\\跳过 这一行",
+            "#注释 你好",
+            "!! 再来",
+            "~/文档",
+            "(子shell 你好)",
+            "{ echo 你好; }",
+            ">文件 你好",
+            "",
+            "   ",
+            "两行\n文本",
+        ]
+        import shlex
+
+        with tempfile.TemporaryDirectory() as tmp:
+            (Path(tmp) / "目录").mkdir()
+            lines = [
+                self.render("zsh", natural=True, launcher="true"),
+                "alias 查看='ls -la'",
+                "函数名() { :; }",
+                "check() { if __xiaoyu_term_natural \"$1\"; then print -r -- \"Y $REPLY\"; else print -r -- N; fi }",
+                *(f"check {shlex.quote(case)}" for case in [*taken, *passed]),
+            ]
+            script = Path(tmp) / "cases.zsh"
+            script.write_text("\n".join(lines) + "\n", encoding="utf-8", newline="\n")
+            env = {**os.environ, term.SESSION_ENV: "term-n1"}
+            proc = subprocess.run(
+                ["zsh", "-f", str(script)], capture_output=True, text=True, encoding="utf-8",
+                cwd=tmp, env=env, timeout=60,
+            )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        verdicts = proc.stdout.splitlines()
+        self.assertEqual(len(verdicts), len(taken) + len(passed), proc.stdout + proc.stderr)
+        for (case, rewritten), verdict in zip(taken.items(), verdicts):
+            with self.subTest(taken=case):
+                self.assertEqual(verdict, f"Y {rewritten}")
+        for case, verdict in zip(passed, verdicts[len(taken):]):
+            with self.subTest(passed=case):
+                self.assertEqual(verdict, "N")
+
     def test_command_not_found_is_opt_in(self) -> None:
         handlers = {
             "zsh": "command_not_found_handler()",
@@ -258,7 +358,8 @@ class ScriptRenderTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "init.sh"
             #  newline="\n"：脚本给 shell 读，不能让平台默认换行把 \r 混进去
-            path.write_text(self.render(shell, command_not_found=True), encoding="utf-8", newline="\n")
+            script = self.render(shell, command_not_found=True, natural=shell == "zsh")
+            path.write_text(script, encoding="utf-8", newline="\n")
             proc = subprocess.run(
                 [*checker, str(path)], capture_output=True, text=True, encoding="utf-8", timeout=60
             )
