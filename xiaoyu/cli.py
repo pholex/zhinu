@@ -1739,6 +1739,7 @@ def term_suggest_command(argv: list[str]) -> int:
         ask,
         environment=environment,
         cwd=str(workspace),
+        situation=term.session_situation(),
         entries=entries,
         recall=term.load_recall(session_id),
         material=material,

@@ -896,6 +896,48 @@ class CommandRequestTest(_TermDirMixin, unittest.TestCase):
         self.assertTrue(messages[1]["content"].endswith("需求：找大文件"))
         self.assertNotIn("untrusted_content", messages[1]["content"])
 
+    def test_session_situation_is_read_live(self) -> None:
+        """root / sudo / SSH / 容器：每次现读，只说是与否，不带用户名与主机名。"""
+        clean = {key: "" for key in ("SSH_CONNECTION", "SSH_TTY", "SSH_CLIENT", "container", "KUBERNETES_SERVICE_HOST")}
+
+        def situation(*, euid: int, sudo: bool, env: dict[str, str] | None = None, markers: tuple[str, ...] = ()) -> str:
+            with mock.patch.object(os, "geteuid", lambda: euid, create=True), \
+                    mock.patch("shutil.which", lambda name: "/usr/bin/sudo" if sudo and name == "sudo" else None), \
+                    mock.patch.dict(os.environ, {**clean, **(env or {})}), \
+                    mock.patch.object(os.path, "exists", lambda path: path in markers):
+                return term.session_situation()
+
+        self.assertEqual(situation(euid=501, sudo=True), "普通用户，有 sudo")
+        self.assertEqual(situation(euid=501, sudo=False), "普通用户，没有 sudo")
+        #  root 不提 sudo：有没有都不该用
+        self.assertEqual(situation(euid=0, sudo=True), "已经是 root")
+        self.assertEqual(
+            situation(euid=501, sudo=True, env={"SSH_CONNECTION": "10.0.0.2 51000 10.0.0.9 22"}),
+            "普通用户，有 sudo · SSH 远程会话",
+        )
+        self.assertIn("SSH 远程会话", situation(euid=501, sudo=True, env={"SSH_TTY": "/dev/pts/0"}))
+        self.assertEqual(situation(euid=0, sudo=False, markers=("/.dockerenv",)), "已经是 root · 在容器里")
+        self.assertIn("在容器里", situation(euid=0, sudo=False, markers=("/run/.containerenv",)))
+        self.assertIn("在容器里", situation(euid=0, sudo=False, env={"container": "podman"}))
+        self.assertIn("在容器里", situation(euid=0, sudo=False, env={"KUBERNETES_SERVICE_HOST": "10.96.0.1"}))
+
+    def test_session_situation_without_posix_identity(self) -> None:
+        #  Windows 上没有 geteuid：不猜身份，别的照说
+        with mock.patch.object(term, "os", SimpleNamespace(environ={"SSH_TTY": "x"}, path=os.path)), \
+                mock.patch.object(os.path, "exists", lambda path: False):
+            self.assertEqual(term.session_situation(), "SSH 远程会话")
+
+    def test_situation_rides_with_the_request_not_the_environment(self) -> None:
+        messages = term.command_messages(
+            "重启 nginx", environment=self.ENVIRONMENT, cwd="/w", situation="已经是 root · 在容器里"
+        )
+        self.assertNotIn("已经是 root · 在容器里", messages[0]["content"])
+        self.assertIn("[当前会话] 已经是 root · 在容器里", messages[-1]["content"])
+        self.assertIn("已经是 root 就不要加 sudo", messages[0]["content"])
+        #  读不出处境（Windows 本地终端）就不留空壳
+        bare = term.command_messages("重启 nginx", environment=self.ENVIRONMENT, cwd="/w")
+        self.assertNotIn("[当前会话]", bare[-1]["content"])
+
     def test_recent_commands_are_wrapped_redacted_and_carry_status(self) -> None:
         entries = [
             term.Entry(1, "/w", "curl -H 'Authorization: Bearer abcdef123456' x", 0),
@@ -1180,6 +1222,11 @@ class TermCommandTest(_TermDirMixin, unittest.TestCase):
         self.assertTrue(messages[-1]["content"].endswith("需求：看看 各项占用"))
         self.assertIn("zsh 5.9", messages[0]["content"])
         self.assertEqual((model, effort), (None, None))
+
+    def test_live_situation_reaches_the_request(self) -> None:
+        with mock.patch.object(term, "session_situation", lambda: "已经是 root · SSH 远程会话"):
+            self.run_command("重启 nginx")
+        self.assertIn("[当前会话] 已经是 root · SSH 远程会话", self.requests[0][0][-1]["content"])
 
     def test_environment_is_announced_once(self) -> None:
         _, _, first = self.run_command("a")

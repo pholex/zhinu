@@ -106,6 +106,16 @@ BSD 与 GNU 的 `sed -i`、`date -d`、`stat` 写法不同，是命令给错的�
 
 文件在 `<配置目录>/term/environment-<shell>.json`，每种 shell 一份。**系统、架构或 shell 版本变了会自动重探**，另外每 7 天重探一次（跟上工具的装卸）。刚装了新工具想立刻生效：删掉这个文件。
 
+有三件事不进这份记录，**每次 `@c` 现读**，因为同一台机器上它们也会变：
+
+| 现读的 | 影响什么 |
+|---|---|
+| 是不是 root，不是的话有没有 `sudo` | 已经是 root 不加 `sudo`；普通用户才加；没有 `sudo` 时给 root 下能直接跑的写法，并说明要换 root 来跑 |
+| 是不是 SSH 进来的会话 | 远程会话碰不到你本机的剪贴板、浏览器、图形界面，会在说明里点出来 |
+| 是不是在容器里 | 容器里多半没有 systemd，不会给 `systemctl` |
+
+只说是与否，不带用户名和主机名。判断依据：有效用户 id、PATH 上有没有 `sudo`、`SSH_CONNECTION` / `SSH_TTY` / `SSH_CLIENT`、`/.dockerenv` / `/run/.containerenv` / `container` / `KUBERNETES_SERVICE_HOST`。
+
 ### 不敲 `@c`：`--natural`（只有 zsh，默认不开）
 
 ```bash
@@ -174,7 +184,7 @@ xiaoyu term log "make test"
 - **pending 文件**：`<配置目录>/term/<会话id>.pending`（macOS/Linux `~/.config/xiaoyu/term/`，Windows `%APPDATA%\xiaoyu\term\`），命令开跑前一行 `时间\t目录\t命令`，跑完后一行 `=时间\t退出码`（用开跑时间认领是哪条命令的），记的是脱敏**前**的原文，目录权限 0700。上限 500 条命令 / 256 KB，超了只留最新的。
 - **会话文件**：`<配置目录>/sessions/term/`，与 `--session-id` 同一种格式，`xiaoyu resume --all` 可见。
 - 自己的 `@x …`、`@c …` 与 `xiaoyu term …` 不记。
-- **`@c` 的两个文件**（都在 `<配置目录>/term/`）：`environment-<shell>.json` 是本机环境画像；`<会话id>.recall` 是这个终端最近 4 次 `@c` 的需求与命令（追问用，原文，30 分钟后不再带给模型）。`@c` 发给模型的是：环境画像、当前目录、最近 12 条命令（脱敏后，只看不取）、最近几次 `@c`、你的需求，以及管道内容（有的话，最多 16000 字符）。
+- **`@c` 的两个文件**（都在 `<配置目录>/term/`）：`environment-<shell>.json` 是本机环境画像；`<会话id>.recall` 是这个终端最近 4 次 `@c` 的需求与命令（追问用，原文，30 分钟后不再带给模型）。`@c` 发给模型的是：环境画像、当前目录、会话处境（是不是 root / 有没有 sudo / 是不是 SSH / 是不是容器，不含用户名与主机名）、最近 12 条命令（脱敏后，只看不取）、最近几次 `@c`、你的需求，以及管道内容（有的话，最多 16000 字符）。
 
 **关掉**：从启动文件删掉那一行，开个新终端即可。当前终端里要立刻停：zsh `add-zsh-hook -d preexec __xiaoyu_term_preexec; add-zsh-hook -d precmd __xiaoyu_term_precmd`、bash `trap - DEBUG`、fish `functions -e __xiaoyu_term_preexec __xiaoyu_term_postexec`、PowerShell 恢复 `$function:prompt = $function:__xiaoyu_term_prev_prompt`。（命令行不再记，退出码的钩子也就无事可做。）
 

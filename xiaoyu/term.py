@@ -578,6 +578,7 @@ COMMAND_SYSTEM = """你把用户的一句话需求翻译成一条能在其终端
 规则：
 - 只给一条命令。要多步就用 && 或管道连起来。
 - 按下面「环境」里的系统、shell 和工具链来写：BSD 与 GNU 的旗标不同；列为未装的工具不要用，已装的更顺手的工具可以用。
+- 按「当前会话」来写：已经是 root 就不要加 sudo；普通用户做要管理员权限的事加 sudo。写着「没有 sudo」时命令里不能出现 sudo：给出 root 身份下能直接跑的写法，并在 note 里说明这条要换成 root 来跑。SSH 远程会话里碰不到用户本机的剪贴板、浏览器和图形界面。容器里多半没有 systemd，也常常缺 ps、ip 这类工具。
 - 取最常见、最短、读得懂的写法。用户没说的路径、名字、数值，用 <尖括号占位> 标出来，不要编。
 - 有破坏性或不可逆的操作（删除、覆盖、强制推送、改权限……）照样给命令，但要在 note 里点明后果；能先预览的优先给预览写法。
 - 用户说的不是一件能用一条命令办到的事（闲聊、要讲解概念、信息不够确定命令），command 留空串，在 note 里用一句话说明或反问。
@@ -586,6 +587,36 @@ COMMAND_SYSTEM = """你把用户的一句话需求翻译成一条能在其终端
 
 只输出一个 JSON 对象，不要代码围栏，不要别的文字：
 {"command": "<命令>", "note": "<一句话说明，和用户用同一种语言，40 字以内>"}"""
+
+
+def _in_container() -> bool:
+    if os.environ.get("container") or os.environ.get("KUBERNETES_SERVICE_HOST"):
+        return True
+    return any(os.path.exists(marker) for marker in ("/.dockerenv", "/run/.containerenv"))
+
+
+def session_situation() -> str:
+    """这一次是在什么处境下要命令：是不是 root（有没有 sudo）、是不是 SSH 进来的、
+    是不是在容器里。它们决定命令要不要加 sudo、能不能碰剪贴板与图形界面、有没有
+    systemd。
+
+    每次现读、不进环境画像：身份会变（`sudo -i`、`su`），同一台机器上本地开的
+    终端与 SSH 进来的终端也不一样。只说是与否，不带用户名和主机名。
+    """
+    import shutil
+
+    facts: list[str] = []
+    geteuid = getattr(os, "geteuid", None)  # Windows 上没有
+    if geteuid is not None:
+        if geteuid() == 0:
+            facts.append("已经是 root")
+        else:
+            facts.append("普通用户，" + ("有 sudo" if shutil.which("sudo") else "没有 sudo"))
+    if any(os.environ.get(name) for name in ("SSH_CONNECTION", "SSH_TTY", "SSH_CLIENT")):
+        facts.append("SSH 远程会话")
+    if _in_container():
+        facts.append("在容器里")
+    return " · ".join(facts)
 
 
 def recall_path(session_id: str) -> Path:
@@ -635,13 +666,15 @@ def command_messages(
     *,
     environment: dict[str, object],
     cwd: str,
+    situation: str = "",
     entries: list[Entry] | None = None,
     recall: list[tuple[str, str]] | None = None,
     material: str = "",
     now: float | None = None,
 ) -> list[dict[str, str]]:
     """`@c` 的整段请求。环境放在 system 里（每次都一样），之前几次 `@c` 排成
-    真正的对话轮次（追问靠它），目录、最近的命令、管道材料跟着这一次的需求走。"""
+    真正的对话轮次（追问靠它），目录、会话处境、最近的命令、管道材料跟着这一次
+    的需求走。"""
     from .tools import neutralize_untrusted_markers
 
     messages = [{"role": "system", "content": f"{COMMAND_SYSTEM}\n\n{environment_block(environment)}"}]
@@ -649,6 +682,8 @@ def command_messages(
         messages.append({"role": "user", "content": f"需求：{earlier_ask}"})
         messages.append({"role": "assistant", "content": _suggestion_json(earlier_command)})
     parts = [f"[当前目录] {shorten_home(cwd)}"]
+    if situation:
+        parts.append(f"[当前会话] {situation}")
     if entries:
         parts.append(
             "[最近的命令] 只有命令文本与行尾的退出码，没有输出：\n"
