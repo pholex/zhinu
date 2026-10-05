@@ -26,16 +26,13 @@
 ## 安装
 
 ```bash
-pip install "xiaoyu-agent[tui]"        # [tui]：补全 / 历史 / 粘贴折叠 / 贴图 / diff 高亮
-pip install "xiaoyu-agent[tui,serve]"  # 还要 HTTP API（n8n / Dify 编排）就带上 [serve]
-pip install "xiaoyu-agent[otel]"       # OpenTelemetry 导出：设 OTEL_EXPORTER_OTLP_ENDPOINT 即把每轮/每次模型与工具调用打成 span 推到你的 collector（docs/observability.md）
-xiaoyu doctor                          # 体检：版本与安装方式 / 凭据有无 / 沙箱 / 磁盘 / MCP 配置（--json 给脚本，任一 FAIL 退出码 1）
-xiaoyu doctor --probe                  # 再对默认模型真发一条最小请求，报耗时与分类后的错误（默认不出网）
-xiaoyu doctor --bundle                 # 打诊断包（体检 + 脱敏配置 + 最近会话尾部 + 崩溃日志）给报 issue 用；含路径与命令历史，分享前自查
-eval "$(xiaoyu completion zsh)"       # shell 补全（bash / zsh / fish）
-xiaoyu update                          # 升级（已装 serve 时自动一并升级；有新版时交互式启动会提一行）
-xiaoyu uninstall                       # 卸载；--purge 连配置目录一起删
+pip install "xiaoyu-agent[tui]"   # 带交互界面：补全、历史、贴图、diff 高亮
+xiaoyu doctor                     # 装完体检一遍
 ```
+
+可选组件按需加进方括号：`[serve]` 提供 HTTP API（[docs/http-api.md](docs/http-api.md)），`[otel]` 导出 OpenTelemetry（[docs/observability.md](docs/observability.md)），例如 `pip install "xiaoyu-agent[tui,serve]"`。
+
+日常维护：`xiaoyu update` 升级，`xiaoyu uninstall` 卸载（加 `--purge` 连配置一起删），`eval "$(xiaoyu completion zsh)"` 开 shell 补全（bash / zsh / fish）。连不上模型时用 `xiaoyu doctor --probe` 真发一条请求排查；报 issue 时用 `xiaoyu doctor --bundle` 打诊断包（含路径与命令历史，分享前看一眼）。
 
 ## 配置
 
