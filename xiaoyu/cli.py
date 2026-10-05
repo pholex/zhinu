@@ -125,8 +125,8 @@ SUBCOMMANDS: tuple[tuple[tuple[str, ...], str, str, str], ...] = (
      "列出本机会话；digest 汇总用量、export 导出、rename 起名、inspect 诊断日志"),
     (("send",), "send_command", "send <会话> <消息>", "给另一个会话发一条消息"),
     (("mcp",), "mcp_command", "mcp add|list|remove|probe", "管理 MCP server 声明；probe 不经模型直接探测一个 server"),
-    (("term",), "term_command", "term init|run|log|info",
-     "shell 集成：在自己的 shell 里 @x 提问，带上刚跑过的命令"),
+    (("term",), "term_command", "term init|run|command|log|info",
+     "shell 集成：在自己的 shell 里 @x 提问，带上刚跑过的命令；@c 一句话换一条命令"),
     (("plugin", "plugins"), "plugin_command", "plugin add|list|update|remove",
      "装卸插件包（skills + MCP）"),
     (("serve",), "serve_command", "serve", "以 HTTP API 服务启动（需 [serve] 可选依赖）"),
@@ -1397,10 +1397,12 @@ def resume_command(argv: list[str]) -> int:
 
 
 TERM_USAGE = """用法：
-  xiaoyu term init <bash|zsh|fish|powershell> [--name 名字] [--command-not-found]
+  xiaoyu term init <bash|zsh|fish|powershell> [--name 名字] [--command-not-found] [--natural]
         输出 shell 脚本：eval "$(xiaoyu term init zsh)"（fish 用 | source，PowerShell 用 Invoke-Expression）
   xiaoyu term run [问题…]      带着自上次提问以来跑过的命令向模型提问（脚本里定义成 @x / @xiaoyu）；
                                不带问题就读一行原样文本当问题（问号、引号、管道符都不必转义）
+  xiaoyu term command [需求…]  一句话换一条命令，打到 stdout（zsh / bash 脚本里定义成 @c：zsh 放回提示符，
+                               bash 推进历史按 ↑ 取）；不进会话、不执行任何东西
   xiaoyu term log <命令行>     备用入口：手动记一条命令（钩子不方便用内建追加的环境）
   xiaoyu term info             一行：会话 id · 模型 · 已用 token · 待交付命令数（放进提示符用）
 详见 docs/terminal-integration.md"""
@@ -1421,6 +1423,8 @@ def term_command(argv: list[str]) -> int:
         return term_init_command(argv[1:])
     if action == "run":
         return term_run_command(argv[1:])
+    if action == "command":
+        return term_suggest_command(argv[1:])
     if action in ("log", "info"):
         return term.fast_command(argv)
     if action in ("", "-h", "--help", "help"):
@@ -1437,7 +1441,7 @@ def term_init_command(argv: list[str]) -> int:
 
     parser = argparse.ArgumentParser(
         prog="xiaoyu term init",
-        description="输出 shell 集成脚本（会话变量、@x 别名、记命令的钩子）。",
+        description="输出 shell 集成脚本（会话变量、@x / @c、记命令的钩子）。",
     )
     parser.add_argument("shell", choices=term.SHELLS)
     parser.add_argument(
@@ -1450,32 +1454,39 @@ def term_init_command(argv: list[str]) -> int:
         help="敲错的命令整行交给模型（默认不开：每个 typo 都打一次模型太费钱）",
     )
     parser.add_argument(
+        "--natural",
+        action="store_true",
+        help="不敲 @c：整行是一句自然语言（含非 ASCII 字符、且第一个词不是命令）就转给 @c。"
+        "只支持 zsh，会包一层回车键（默认不开）",
+    )
+    parser.add_argument(
         "--launcher",
         help="脚本里怎么调 xiaoyu（默认：PATH 上有就用 xiaoyu，没有就用当前解释器 -m xiaoyu）",
     )
     args = parser.parse_args(argv)
+    directory = term.pending_dir()
     try:
         session_id = term.session_id_for(args.name)
+        #  先渲染再建目录：参数不对（--natural 配了不支持的 shell）就什么都别留下
+        script = term.render_script(
+            args.shell,
+            session_id,
+            named=bool(args.name),
+            command_not_found=args.command_not_found,
+            natural=args.natural,
+            launcher=args.launcher,
+            directory=directory,
+        )
     except ValueError as exc:
         print(ui.error(str(exc)), file=sys.stderr)
         return 2
     #  pending 文件里是脱敏前的原始命令行：目录自己可读就够了
-    directory = term.pending_dir()
     try:
         directory.mkdir(parents=True, exist_ok=True, mode=0o700)
     except OSError as exc:
         print(ui.error(f"建不了 {directory}：{exc}"), file=sys.stderr)
         return 1
-    sys.stdout.write(
-        term.render_script(
-            args.shell,
-            session_id,
-            named=bool(args.name),
-            command_not_found=args.command_not_found,
-            launcher=args.launcher,
-            directory=directory,
-        )
-    )
+    sys.stdout.write(script)
     return 0
 
 
@@ -1490,14 +1501,14 @@ def open_term_session(config: Config, session_id: str) -> tuple[SessionLog, list
     return log, restored
 
 
-def read_question_line() -> str | None:
-    """`@x` 不带问题时读一行当问题。写在命令行上的问题要先过 shell 的解析，
+def read_question_line(label: str = "问 › ") -> str | None:
+    """`@x` / `@c` 不带问题时读一行当问题。写在命令行上的问题要先过 shell 的解析，
     问号、引号、括号、管道符都会被它吃掉或报错；这里读到的是原样文本。
 
     提示符写到 stderr：stdout 留给回答（`@x > 答案.txt` 时它不是终端）。
     返回 None = 用户取消（Ctrl-C / Ctrl-D）。
     """
-    sys.stderr.write(ui.prompt("问 › "))
+    sys.stderr.write(ui.prompt(label))
     sys.stderr.flush()
     try:
         return input().strip()
@@ -1600,6 +1611,187 @@ def term_run_command(argv: list[str]) -> int:
     #  走 stderr：stdout 可能正被管道接去当结果用
     print(ui.secondary(" · ".join(note)), file=sys.stderr)
     return run_once(agent, prompt, "text")
+
+
+#  `@c` 等多久：一条命令的事，模型十几秒不回就是出了问题，不该陪着生成级的长超时
+TERM_COMMAND_TIMEOUT = 30.0
+#  默认推理深度：把一句话翻成一条命令是有界任务，想得深只是让人多等
+TERM_COMMAND_EFFORT = "low"
+
+
+def _leading_flags(
+    argv: list[str], valued: tuple[str, ...], switches: tuple[str, ...]
+) -> tuple[list[str], list[str]]:
+    """把 argv 切成（开头的旗标段, 其余）。旗标只认开头那一段：需求本身常带着
+    横杠（「把 -rf 开头的文件删掉」「去掉 --verbose」），整段交给 argparse 会被
+    当成不认识的旗标报错。`--` 可以显式结束旗标段。"""
+    index = 0
+    while index < len(argv):
+        token = argv[index]
+        if token == "--":
+            return argv[:index], argv[index + 1 :]
+        if token in switches:
+            index += 1
+        elif token in valued:
+            index += 2
+        elif token.split("=", 1)[0] in valued:
+            index += 1
+        else:
+            break
+    return argv[:index], argv[index:]
+
+
+def term_command_reply(config: Config, messages: list[dict[str, str]], model: str | None, effort: str | None) -> str:
+    """`@c` 的那一次请求：非流式、不带工具，与压缩摘要走同一条 create 路径。
+
+    用哪个模型：点名了就用点名的；没点名先用辅助模型（XIAOYU_SUMMARY_MODEL，
+    与摘要同一个"有界任务用便宜模型"的位置），它没有 provider 能接再用主模型。
+    推理深度默认 low；这一档是替用户选的，端点不认时去掉它再试一次，而不是
+    让一个用户没提过的参数把请求打死。点名的 --effort 被拒就照实报错。
+    """
+    from . import providers
+
+    registry = providers.build(config)
+    try:
+        route = registry.resolve(model or config.summary_model or config.model)
+    except providers.UnknownModel:
+        if model:
+            raise
+        route = registry.resolve(config.model)
+    request: dict[str, Any] = {"model": route.model, "messages": messages}
+    level = providers.effort_for(
+        route.provider, route.model, effort or TERM_COMMAND_EFFORT, EFFORT_LEVELS
+    )
+    try:
+        response = route.client.chat.completions.create(**request, reasoning_effort=level)
+    except Exception:  # noqa: BLE001 - 只有替用户选的那一档才重试，见 docstring
+        if effort:
+            raise
+        response = route.client.chat.completions.create(**request)
+    return str(response.choices[0].message.content or "")
+
+
+def term_suggest_command(argv: list[str]) -> int:
+    """`xiaoyu term command [需求…]`（脚本里的 @c）：一句话换一条命令。
+
+    命令打到 stdout（shell 函数接走，放回人的提示符或历史），说明与提示走
+    stderr。不进会话、不带工具、不取走 pending：见 term 模块 docstring。
+    退出码：0 给了命令；1 模型认为这不是一条命令能办的事（说明照打）；
+    2 用法或配置错；130 被打断。
+    """
+    from . import command_check, errors, folder_trust, term
+    from .mcp import _redact
+
+    flags, words = _leading_flags(
+        argv, ("--model", "--effort", "--shell", "--shell-version"), ("-h", "--help")
+    )
+    parser = argparse.ArgumentParser(
+        prog="xiaoyu term command",
+        description="一句话换一条命令（脚本里的 @c）：命令放回你的提示符，由你回车执行。"
+        "旗标只认写在需求前面的。",
+        add_help=False,
+    )
+    parser.add_argument("-h", "--help", action="store_true", help="显示这段说明")
+    parser.add_argument("--model", help="这一次换个模型（默认用辅助模型 XIAOYU_SUMMARY_MODEL）")
+    parser.add_argument(
+        "--effort", choices=list(EFFORT_LEVELS), default=None,
+        help=f"推理深度（默认 {TERM_COMMAND_EFFORT}）",
+    )
+    parser.add_argument("--shell", default="", help="命令要在哪种 shell 里跑（集成脚本会带上）")
+    parser.add_argument("--shell-version", default="", help="shell 版本（集成脚本会带上）")
+    args = parser.parse_args(flags)
+    if args.help:
+        #  stdout 是给 shell 函数接命令用的：帮助打到那里会被放上提示符
+        parser.print_help(sys.stderr)
+        return 0
+
+    ask = " ".join(words).strip()
+    material = read_piped_stdin()
+    if not ask and material:
+        ask, material = material, ""
+    if not ask and sys.stdin.isatty():
+        typed = read_question_line("要什么命令 › ")
+        if typed is None:
+            return 130
+        ask = typed
+    if not ask:
+        print(
+            ui.error("要什么命令？用法：@c <一句话需求>；或只敲 @c 回车，再输入需求（原样读入，不必转义）"),
+            file=sys.stderr,
+        )
+        return 2
+
+    workspace = Path.cwd()
+    #  与主命令同一道门，但不发问也不提示：没过门只是不读工作区的 .env，
+    #  这里既不加载工作区的工具也不执行任何东西
+    trust = folder_trust.evaluate(workspace, interactive=False)
+    load_dotenv(untrusted_dir=None if trust.trusted else workspace)
+    _warn_env_problems()
+
+    session_id = term.current_session()
+    environment, fresh = term.load_environment(args.shell, args.shell_version)
+    if fresh:
+        print(ui.secondary(f"已记下本机环境：{term.environment_summary(environment)}"), file=sys.stderr)
+    entries = (
+        term.peek_pending(term.pending_path(session_id), term.RECENT_COMMANDS) if session_id else []
+    )
+    messages = term.command_messages(
+        ask,
+        environment=environment,
+        cwd=str(workspace),
+        situation=term.session_situation(),
+        entries=entries,
+        recall=term.load_recall(session_id),
+        material=material,
+    )
+    #  一两秒里屏幕上什么都没有，人会以为没按上回车：占一行，拿到回答就擦掉
+    waiting = sys.stderr.isatty()
+    if waiting:
+        sys.stderr.write(ui.secondary("想一下…"))
+        sys.stderr.flush()
+    try:
+        config = Config.from_env(
+            workspace=workspace, model=args.model, workspace_trusted=trust.trusted
+        )
+        config.request_timeout = min(config.request_timeout, TERM_COMMAND_TIMEOUT)
+        try:
+            reply = term_command_reply(config, messages, args.model, args.effort)
+        finally:
+            if waiting:
+                sys.stderr.write("\r\x1b[2K")
+                sys.stderr.flush()
+    except KeyboardInterrupt:
+        print(file=sys.stderr)
+        return 130
+    except (MissingConfig, ValueError) as exc:
+        print(ui.error(str(exc)), file=sys.stderr)
+        return 2
+    except Exception as exc:  # noqa: BLE001 - 请求失败按分类说一句，不甩 traceback 到提示符上
+        verdict = errors.classify(exc)
+        print(
+            ui.error(f"没拿到命令（{verdict.kind}）：{type(exc).__name__}: {_redact(str(exc))[:300]}"),
+            file=sys.stderr,
+        )
+        if verdict.hint:
+            print(ui.secondary(verdict.hint), file=sys.stderr)
+        return 1
+    try:
+        command, note = term.parse_suggestion(reply)
+    except ValueError as exc:
+        print(ui.error(f"{exc}，没有可用的命令"), file=sys.stderr)
+        return 1
+    if not command:
+        print(ui.secondary(note or "这不像是一条命令能办的事；要它动手可以用 @x"), file=sys.stderr)
+        return 1
+    if note:
+        print(ui.secondary(note), file=sys.stderr)
+    #  这条命令由人自己回车，不过审批：能认出来的破坏性与提权形态在这里点一句
+    for reason in (command_check.dangerous_command(command), command_check.privileged_command(command)):
+        if reason:
+            print(ui.warning(f"留意：{reason}"), file=sys.stderr)
+    term.save_recall(session_id, ask, command)
+    print(command)
+    return 0
 
 
 def doctor_command(argv: list[str]) -> int:

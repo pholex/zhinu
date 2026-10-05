@@ -86,6 +86,7 @@ xiaoyu mcp probe chrome-devtools        # 不经模型直接握手、列工具�
 
 eval "$(xiaoyu term init zsh)"          # 放进 ~/.zshrc（bash/fish/powershell 同理）：之后在自己的 shell 里
 @x 刚才那个报错怎么回事                   # 随时提问，带着刚跑过的命令，续写同一会话；见 docs/terminal-integration.md
+@c 找出大于 100M 的文件，按大小倒序        # 一句话换一条命令，放回你的提示符，回车才执行（zsh / bash）
 ```
 
 REPL 里：`/help` `/tools` `/skills` `/model` `/search` `/effort` `/mode` `/usage` `/context` `/compact` `/clear` `/exit` `/tasks` `/plan` `/goal` `/perm` `/allow` `/deny` `/resume` `/rewind` `/mcp` `/quit`
