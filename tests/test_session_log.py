@@ -14,10 +14,12 @@ from unittest import mock
 
 from xiaoyu.session_log import (
     SESSION_FORMAT,
+    TERM_SUBDIR,
     LoadedMessages,
     SessionLockedError,
     SessionLog,
     check_session_id,
+    find_session,
     has_orphan_compact,
     list_sessions,
     load_messages,
@@ -446,6 +448,14 @@ class UsageDigestTest(SessionDirTestCase):
         digest = usage_digest(workspace="/ws/a")
         self.assertEqual(set(digest.by_workspace), {"/ws/a"})
 
+    def test_workspace_filter_counts_terminal_sessions_too(self):
+        """`@x` 的会话住在 term/：按工作区汇总时也要算进起头的那个目录。"""
+        (sessions_dir() / TERM_SUBDIR).mkdir(parents=True, exist_ok=True)
+        t = self.make_log(f"{TERM_SUBDIR}/t.jsonl", "/ws/a")
+        self.usage_event(t, **{"p/m1": (2, 40, 4)})
+        self.assertEqual(usage_digest(workspace="/ws/a").by_workspace["/ws/a"].by_model["p/m1"], [2, 40, 4])
+        self.assertEqual(usage_digest(workspace="/ws/b").by_workspace, {})
+
     def test_usage_event_is_ignored_on_replay(self):
         """resume 重放不认识 usage 事件——照常跳过，不进历史。"""
         log = self.make_log("r.jsonl", "/ws/a")
@@ -592,6 +602,41 @@ class ResumeTest(SessionDirTestCase):
         log.append({"role": "user", "content": "x"})
         self.assertEqual(len(list_sessions(workspace="/ws/target")), 1)
         self.assertEqual(list_sessions(workspace="/ws/other"), [])
+
+    def test_list_sessions_hides_empty_sessions(self):
+        """开了没说话就退出的会话不列：选中它只会得到「没有可恢复的消息」。"""
+        talked = SessionLog.create("m", "/ws/a")
+        talked.append({"role": "user", "content": "修登录页"})
+        talked.close()
+        talked.path.rename(talked.path.with_name("19990101-000000-1.jsonl"))
+        SessionLog.create("m", "/ws/a")  # 更新、但是空的
+        self.assertEqual([info.preview for info in list_sessions(workspace="/ws/a")], ["修登录页"])
+        self.assertEqual(len(list_sessions()), 1)
+        #  按名字找会话的地方要能看见它
+        everything = list_sessions(workspace="/ws/a", include_empty=True)
+        self.assertEqual(len(everything), 2)
+        self.assertTrue(everything[0].empty)
+
+    def test_events_before_the_first_message_do_not_make_it_empty(self):
+        """头部只扫前几行：用户消息排在一堆事件后面时，凭尾部的正文判它不空。"""
+        log = SessionLog.create("m", "/ws/a")
+        for index in range(20):
+            log.event("note", n=index)
+        log.append({"role": "user", "content": "很靠后的第一句"})
+        log.append({"role": "assistant", "content": "收到"})
+        infos = list_sessions(workspace="/ws/a")
+        self.assertEqual(len(infos), 1)
+        self.assertFalse(infos[0].empty)
+
+    def test_terminal_sessions_belong_to_the_directory_they_started_in(self):
+        """`@x` 的会话住在 term/，不按工作区分目录：在这个目录问过的，回到这里
+        resume 不加 --all 也看得见；别的目录看不见。"""
+        log, _ = open_named("term-ab12cd34", "m", "/ws/a", sessions_dir() / TERM_SUBDIR)
+        log.append({"role": "user", "content": "docker 里哪些镜像能清"})
+        infos = list_sessions(workspace="/ws/a")
+        self.assertEqual([info.session_id for info in infos], ["term-ab12cd34"])
+        self.assertEqual(list_sessions(workspace="/ws/other"), [])
+        self.assertEqual(find_session("term-ab12cd34", workspace="/ws/a").path, log.path)
 
     def test_list_sessions_includes_legacy_flat_files(self):
         """分区之前的存量文件平铺在根目录：列举兼容，不搬家。"""

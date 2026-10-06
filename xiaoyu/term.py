@@ -104,9 +104,9 @@ def pending_path(session_id: str) -> Path:
 def term_sessions_dir() -> Path:
     """终端会话的会话文件目录：不按工作区分子目录——人在 shell 里 cd 来 cd 去，
     一个终端就是一段对话，不该换个目录就换个会话。"""
-    from .session_log import sessions_dir
+    from .session_log import TERM_SUBDIR, sessions_dir
 
-    return sessions_dir() / "term"
+    return sessions_dir() / TERM_SUBDIR
 
 
 # ---------------------------------------------------------------- 行格式
