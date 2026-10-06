@@ -577,6 +577,24 @@ def check_tools() -> Check:
     return Check("tools", "ok", "常用工具链齐全", details)
 
 
+def check_shell_integration() -> Check:
+    """终端集成（@x / @c）接没接上。可选功能：没接也是 ok，只在细节里指路。"""
+    from . import shell_setup, term
+
+    details = [
+        f"{path}（{'term install 写入' if kind == 'marked' else '手写'}）"
+        for path, kind in shell_setup.installed_in()
+    ]
+    if os.environ.get(term.SESSION_ENV):
+        return Check("shell", "ok", "当前终端已接入终端集成", details)
+    if details:
+        return Check("shell", "ok", "启动文件已接入终端集成，新开的终端生效", details)
+    return Check(
+        "shell", "ok", "未接入终端集成（可选）",
+        ["在 shell 里用 @x 提问、@c 要命令：xiaoyu term install"],
+    )
+
+
 def run_doctor(workspace: Path | None = None) -> list[Check]:
     from .config import user_config_dir
     from .session_log import sessions_dir
@@ -594,6 +612,7 @@ def run_doctor(workspace: Path | None = None) -> list[Check]:
         check_sandbox(),
         check_bash_parser(),
         check_tools(),
+        check_shell_integration(),
         check_mcp_config(workspace),
         check_sessions(sessions_dir()),
     ]

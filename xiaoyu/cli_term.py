@@ -36,6 +36,9 @@ from .session_log import (
 TERM_USAGE = """用法：
   xiaoyu term init <bash|zsh|fish|powershell> [--name 名字] [--command-not-found] [--natural]
         输出 shell 脚本：eval "$(xiaoyu term init zsh)"（fish 用 | source，PowerShell 用 Invoke-Expression）
+  xiaoyu term install [zsh|bash|fish] [--natural] [--command-not-found] [--name 名字] [--yes] [--dry-run]
+        把上面那一行写进 shell 启动文件（~/.zshrc 等）；不写 shell 就按 $SHELL 认，重跑可改选项
+  xiaoyu term uninstall [--yes] [--dry-run]   从启动文件里移除 install 写入的那一段
   xiaoyu term run [问题…]      带着自上次提问以来跑过的命令向模型提问（脚本里定义成 @x / @xiaoyu）；
                                不带问题就读一行原样文本当问题（问号、引号、管道符都不必转义）
   xiaoyu term command [需求…]  一句话换一条命令，打到 stdout（zsh / bash 脚本里定义成 @c：zsh 放回提示符，
@@ -58,6 +61,10 @@ def term_command(argv: list[str]) -> int:
     action = argv[0] if argv else ""
     if action == "init":
         return term_init_command(argv[1:])
+    if action == "install":
+        return term_install_command(argv[1:])
+    if action == "uninstall":
+        return term_uninstall_command(argv[1:])
     if action == "run":
         return term_run_command(argv[1:])
     if action == "command":
@@ -125,6 +132,118 @@ def term_init_command(argv: list[str]) -> int:
         return 1
     sys.stdout.write(script)
     return 0
+
+
+def _confirm(question: str) -> bool:
+    try:
+        answer = input(ui.prompt(question)).strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        print()
+        return False
+    return answer in ("y", "yes")
+
+
+def term_install_command(argv: list[str]) -> int:
+    """`xiaoyu term install`：把 `term init` 那一行写进 shell 启动文件。
+
+    改的是工作区之外的用户配置，所以和 terminal-setup 同一姿势：先把计划打出来，
+    确认后才写，写前留 .bak。
+    """
+    from . import shell_setup, term
+
+    parser = argparse.ArgumentParser(
+        prog="xiaoyu term install",
+        description="把终端集成（@x / @c）写进 shell 启动文件，新开的终端自动生效。",
+    )
+    parser.add_argument("shell", nargs="?", choices=shell_setup.SHELLS, help="默认按 $SHELL 认")
+    parser.add_argument("--name", help="具名会话（同 term init --name）")
+    parser.add_argument("--command-not-found", action="store_true", help="同 term init --command-not-found")
+    parser.add_argument("--natural", action="store_true", help="同 term init --natural（只支持 zsh）")
+    parser.add_argument("--yes", action="store_true", help="不询问，直接写入")
+    parser.add_argument("--dry-run", action="store_true", help="只看计划，不写任何文件")
+    args = parser.parse_args(argv)
+
+    shell = args.shell or shell_setup.detect_shell()
+    if shell is None:
+        print(ui.error("认不出你用的 shell，请写明：xiaoyu term install zsh|bash|fish"), file=sys.stderr)
+        print(ui.secondary("PowerShell 请照 docs/terminal-integration.md 把那一行贴进 $PROFILE。"), file=sys.stderr)
+        return 2
+    if args.natural and shell not in term._NATURAL:
+        print(ui.error(f"--natural 目前只支持 {' / '.join(term._NATURAL)}（{shell} 里请照常写 @c）"), file=sys.stderr)
+        return 2
+    line = shell_setup.init_line(
+        shell,
+        term.default_launcher(shell),
+        name=args.name,
+        command_not_found=args.command_not_found,
+        natural=args.natural,
+    )
+    plan = shell_setup.plan_install(shell, line)
+    marks = {"install": ui.success("将写入"), "update": ui.success("将更新"), "already": ui.secondary("已配好"),
+             "manual": ui.warning("跳过"), "broken": ui.error("跳过")}
+    print(f"  {marks[plan.action]}  {_display_path(plan.path)}：{plan.detail}")
+    if plan.action in ("install", "update"):
+        print(ui.secondary(f"        {line}"))
+    if plan.action not in ("install", "update"):
+        return 0 if plan.action == "already" else 1
+    if args.dry_run:
+        return 0
+    if not args.yes:
+        print(ui.secondary("  会先留一份 .bak 备份；只动小羽自己标记的那一段。"))
+        if not _confirm("写入？[y/N] "):
+            print(ui.secondary("没有改动。"))
+            return 1
+    try:
+        print(ui.success("  " + shell_setup.apply(plan)))
+    except OSError as exc:
+        print(ui.error(f"  写入失败：{exc}"), file=sys.stderr)
+        return 1
+    print(ui.secondary(f"新开一个终端即可使用 @x / @c；当前终端执行 source {_display_path(plan.path)} 立刻生效。"))
+    return 0
+
+
+def term_uninstall_command(argv: list[str]) -> int:
+    """`xiaoyu term uninstall`：移除 install 写入的段落；用户手写的行不动。"""
+    from . import shell_setup
+
+    parser = argparse.ArgumentParser(
+        prog="xiaoyu term uninstall",
+        description="从 shell 启动文件里移除 xiaoyu term install 写入的终端集成。",
+    )
+    parser.add_argument("--yes", action="store_true", help="不询问，直接移除")
+    parser.add_argument("--dry-run", action="store_true", help="只看计划，不写任何文件")
+    args = parser.parse_args(argv)
+
+    plans = shell_setup.removal_plans()
+    manual = [path for path, kind in shell_setup.installed_in() if kind == "manual"]
+    for plan in plans:
+        print(f"  {ui.success('将移除')}  {_display_path(plan.path)}（留 .bak 备份）")
+    for path in manual:
+        print(f"  {ui.warning('跳过')}  {path}：term init 是你自己写的，要停用请手动删那一行")
+    if not plans:
+        print(ui.secondary("没有需要移除的。"))
+        return 0
+    if args.dry_run:
+        return 0
+    if not args.yes and not _confirm(f"移除这 {len(plans)} 处？[y/N] "):
+        print(ui.secondary("没有改动。"))
+        return 1
+    for plan in plans:
+        try:
+            print(ui.success("  " + shell_setup.apply_removal(plan)))
+        except OSError as exc:
+            print(ui.error(f"  {plan.path}：写入失败 {exc}"), file=sys.stderr)
+            return 1
+    print(ui.secondary("已打开的终端里 @x / @c 仍在，关掉重开后消失。"))
+    return 0
+
+
+def _display_path(path: Path) -> str:
+    home = Path.home()
+    try:
+        return "~/" + str(path.relative_to(home))
+    except ValueError:
+        return str(path)
 
 
 def open_term_session(config: Config, session_id: str) -> tuple[SessionLog, list[dict[str, Any]]]:

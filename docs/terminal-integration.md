@@ -14,6 +14,16 @@ $ @x 那把失败的那个用例单独跑一下
 
 ## 安装
 
+```bash
+xiaoyu term install              # 按 $SHELL 认出 zsh / bash / fish，把那一行写进启动文件
+xiaoyu term install --natural    # 选项与 term init 相同（--name / --command-not-found / --natural），重跑即改
+xiaoyu term uninstall            # 移除；xiaoyu uninstall 也会顺手收走
+```
+
+它先打出要写哪个文件、写哪一行，你确认后才动手（`--yes` 跳过确认，`--dry-run` 只看不写），写前留一份 `.bak`。写进去的是首尾带标记的一小段，重跑只替换这一段、不会重复加；文件里已经有你自己手写的 `term init` 那一行就原样不动。bash 在 macOS 上写 `~/.bash_profile`（系统终端开的是登录 shell，不读 `.bashrc`），zsh 认 `$ZDOTDIR`。写完新开一个终端生效，或在当前终端 `source` 一下。`xiaoyu doctor` 会报告接没接上。
+
+想自己动手，或者用的是 PowerShell（`$PROFILE` 的位置随版本而变，install 不猜），把下面这一行放进启动文件：
+
 | shell | 放进启动文件的那一行 |
 |---|---|
 | zsh | `~/.zshrc`：`eval "$(xiaoyu term init zsh)"` |
