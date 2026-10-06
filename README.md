@@ -29,7 +29,7 @@
 pip install "xiaoyu-agent[tui,serve]"
 ```
 
-其它可选组件：`[otel]`、`[bedrock]`、`[browser]`；嵌入 Python 程序用独立包 `xiaoyu-agent-sdk`。
+其它可选组件：`[bedrock]`、`[browser]`、`[otel]`；嵌入 Python 程序用独立包 `xiaoyu-agent-sdk`。
 
 升级与卸载：
 
