@@ -26,6 +26,9 @@ from tests.test_agent_paths import chunk, call_fragment
 
 
 QUESTION = {"questions": [{"question": "Which color?", "options": ["Blue", "Green"]}]}
+#  异步用例里"等某件事发生"的上限只防卡死，不是性能断言。Windows CI 上会话要先走
+#  两步模型并写 SQLite，正常跑 0.4–2.7 秒，偶尔被拖到 10 秒以上；原来的 3 秒会误报
+WAIT = 30
 
 
 def script():
@@ -493,7 +496,7 @@ class AsyncDeferredQuestionTests(unittest.IsolatedAsyncioTestCase):
             async with AsyncSession(config) as session:
                 active = asyncio.create_task(session.run("Ask and work"))
                 try:
-                    await asyncio.wait_for(entered.wait(), 3)
+                    await asyncio.wait_for(entered.wait(), WAIT)
                     q, = await session.questions.list_pending()
                     receipt = await session.questions.answer(q.question_id, answers(q), "submit")
                 finally:
@@ -520,18 +523,18 @@ class AsyncDeferredQuestionTests(unittest.IsolatedAsyncioTestCase):
                 pending_event = asyncio.create_task(anext(watch))
                 active = asyncio.create_task(session.run("Ask and work"))
                 try:
-                    event = await asyncio.wait_for(pending_event, 3)
+                    event = await asyncio.wait_for(pending_event, WAIT)
                     self.assertEqual(event.kind, "question.pending")
-                    await asyncio.wait_for(entered.wait(), 3)
+                    await asyncio.wait_for(entered.wait(), WAIT)
                     receipt = await session.questions.answer(event.question.question_id, answers(event.question), "submit")
-                    self.assertEqual((await asyncio.wait_for(anext(watch), 3)).question, receipt)
+                    self.assertEqual((await asyncio.wait_for(anext(watch), WAIT)).question, receipt)
                 finally:
                     release.set()
                 await active
-                accepted = await asyncio.wait_for(anext(watch), 3)
+                accepted = await asyncio.wait_for(anext(watch), WAIT)
                 self.assertEqual((accepted.kind, accepted.question.version), ("question.answered", 3))
                 closing_event = asyncio.create_task(anext(watch, None))
-            self.assertIsNone(await asyncio.wait_for(closing_event, 3))
+            self.assertIsNone(await asyncio.wait_for(closing_event, WAIT))
             await watch.aclose()
 
     async def test_async_watch_cancellation_removes_subscription(self):
