@@ -16,7 +16,7 @@ async def foreground_demo(root: Path) -> None:
         [text_chunk("Using your submitted color.")]], root),
         questions=QuestionOptions(foreground_timeout_seconds=60),
         session_store=SQLiteSessionStore(root / "foreground.sqlite"))
-    async with AsyncSession(config) as session:
+    async with await AsyncSession.open(config) as session:
         async def respond() -> None:
             async with aclosing(session.questions.watch()) as events:
                 async for event in events:
@@ -49,10 +49,10 @@ async def main() -> None:
             '{"questions":[{"question":"Which output format?","options":["JSON","Markdown"]}]}')],
             [text_chunk("Waiting for your format preference.")], [text_chunk("Using JSON.")]], root),
             questions=QuestionOptions(), session_store=SQLiteSessionStore(root / "questions.sqlite"))
-        async with AsyncSession(config) as session:
+        async with await AsyncSession.open(config) as session:
             await session.run("Use ask_user to ask which output format I prefer.")
             ident = session.session_id
-        async with AsyncSession(config, resume_id=ident) as session:
+        async with await AsyncSession.open(config, resume_id=ident) as session:
             for question in await session.questions.list_pending():
                 reply = []
                 for item in question.items:

@@ -32,7 +32,7 @@ async def main(demo: bool, workspace: Path, resume: Path | None) -> None:
     output = OutputSpec({"type": "object", "properties": {
         "order_id": {"type": "string"}, "ready": {"type": "boolean"}},
         "required": ["order_id", "ready"], "additionalProperties": False})
-    async with AsyncSession(config, resume_from=resume) as session:
+    async with await AsyncSession.open(config, resume_from=resume) as session:
         if resume:
             print((await session.run("Which order did we just look up?")).text)
         else:

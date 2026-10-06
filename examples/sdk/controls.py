@@ -18,7 +18,7 @@ async def main() -> None:
         config = replace(options(args.demo, [[text_chunk("First answer.")],
                          [text_chunk("Fresh conversation.")]], Path(temporary).resolve()),
                          session_dir=Path(temporary) / "sessions")
-        async with AsyncSession(config) as session:
+        async with await AsyncSession.open(config) as session:
             await session.run("Say hello.")
             print(await session.set_mode("plan"))
             print(await session.set_mode("default"))

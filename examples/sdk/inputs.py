@@ -33,7 +33,7 @@ async def main() -> None:
         config = replace(options(args.demo, [[text_chunk("First description.")],
                          [text_chunk("简要图片描述。")]], Path(temporary).resolve()),
                          hooks=(Hook("UserPromptSubmit", on_prompt),))
-        async with AsyncSession(config) as session:
+        async with await AsyncSession.open(config) as session:
             async def consume() -> None:
                 prompt: Prompt = [TextBlock("Describe this image."), ImageBlock(image)]
                 async for event in session.stream(prompt):

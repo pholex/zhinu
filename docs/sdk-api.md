@@ -44,7 +44,7 @@ QuestionSnapshot.state 新增 open，QuestionEvent.kind 新增 question.opened�
 |---|---|
 | `run(prompt, options, *, output=None)` | `RunResult`；`await run_async(...)` |
 | `Session(options, *, resume_from=None)` | 上下文管理器；`AsyncSession` 为异步上下文管理器 |
-| —（当前源码新增，尚未发布） | 异步专有：`await AsyncSession.open(options, *, resume_from=None, resume_id=None)`，参数与构造相同，创建过程不阻塞事件循环 |
+| `await AsyncSession.open(options, *, resume_from=None, resume_id=None)` | 异步专有（0.66.0 起）：参数与构造相同，同步的建会话放到线程里做，创建过程不阻塞事件循环；在事件循环里优先用它而不是直接构造 |
 | `session.run(prompt, *, output=None)` | `RunResult`；异步版需 await |
 | `session.stream(prompt, *, output=None)` | `Generator[UIEvent]`；异步版 `AsyncGenerator[UIEvent]` |
 | `session.interrupt()` | 无返回；异步版同样是普通方法 |
