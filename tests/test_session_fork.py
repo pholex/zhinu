@@ -142,5 +142,60 @@ class ResumeByIdE2ETest(ForkE2ETest):
         self.assertIn("找不到会话", proc.stderr)
 
 
+class ResumeByNameE2ETest(ForkE2ETest):
+    """具名会话的名字（`--session-id`、终端集成的 `term-…`）也能点名接回。"""
+
+    def _plant_term_session(self) -> Path:
+        from xiaoyu.session_log import TERM_SUBDIR
+
+        sessions = Path(self.tmp) / "config" / "xiaoyu" / "sessions" / TERM_SUBDIR
+        sessions.mkdir(parents=True)
+        path = sessions / "20260808-000000-7-id-term-ab12cd34.jsonl"
+        records = [
+            {"event": "meta", "format": 2, "model": "m", "workspace": str(self.workspace),
+             "started_at": "2026-08-08T00:00:00", "session_id": "term-ab12cd34"},
+            {"role": "user", "content": "终端里问的：为什么 make 挂了"},
+            {"role": "assistant", "content": "因为少了依赖"},
+        ]
+        path.write_text(
+            "".join(json.dumps(r, ensure_ascii=False) + "\n" for r in records),
+            encoding="utf-8",
+        )
+        return path
+
+    def test_resume_by_term_name_picks_that_session_not_latest(self):
+        term_log = self._plant_term_session()
+        self._plant_session()  # 文件名更新的匿名会话：默认「最近一个」会是它
+        proc = self._run_resume(
+            "text: 接上了\n", ["term-ab12cd34", "继续", "--output-format", "stream-json"]
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        result = json.loads(proc.stdout.splitlines()[-1])
+        resumed = Path(result["session_log"]).read_text(encoding="utf-8")
+        sources = [
+            Path(record["source"])
+            for record in map(json.loads, filter(str.strip, resumed.splitlines()))
+            if record.get("event") == "resumed_from"
+        ]
+        self.assertEqual(sources, [term_log])
+        self.assertIn("为什么 make 挂了", resumed)
+        self.assertIn('"继续"', resumed)  # 名字之后的词才是指令
+        #  接回写的是新文件，原 term 会话一个字节不动（终端里的 @x 仍续它）
+        self.assertNotIn("继续", term_log.read_text(encoding="utf-8"))
+
+    def test_unknown_term_name_is_error_not_prompt(self):
+        self._plant_session()
+        proc = self._run_resume("text: x\n", ["term-00000000", "继续"])
+        self.assertEqual(proc.returncode, 2, proc.stdout)
+        self.assertIn("找不到会话", proc.stderr)
+
+    def test_unknown_plain_word_stays_an_instruction(self):
+        self._plant_session()
+        proc = self._run_resume("text: 收到\n", ["fix", "the", "bug", "--output-format", "stream-json"])
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        result = json.loads(proc.stdout.splitlines()[-1])
+        self.assertIn("fix the bug", Path(result["session_log"]).read_text(encoding="utf-8"))
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -189,7 +189,7 @@ bash / fish / PowerShell 没有这个开关（`term init bash --natural` 会直�
 
 ## 具名会话
 
-默认每个终端一个随机 id（`term-<8 位>`），关掉终端这段对话就留在历史里：回到第一次 `@x` 时所在的目录敲 `xiaoyu resume` 就列得出来（在别的目录用 `xiaoyu resume --all`），选中后进交互界面接着聊。要多个终端共用、或关掉重开接着聊：
+默认每个终端一个随机 id（`term-<8 位>`），关掉终端这段对话就留在历史里。`@x` 答完会给一行 `接回本会话：xiaoyu resume term-<id>`，照敲就进交互界面接着聊；也可以回到第一次 `@x` 时所在的目录敲 `xiaoyu resume` 从列表里挑（在别的目录用 `xiaoyu resume --all`）。接回后交互界面写的是**新**会话文件，这个终端里再 `@x` 仍续原来那份——从那一刻起是两条线，互不知道对方。要多个终端共用、或关掉重开接着聊：
 
 ```bash
 eval "$(xiaoyu term init zsh --name work)"     # 会话 id 固定为 term-work
@@ -220,7 +220,7 @@ xiaoyu term log "make test"
 - **只记命令文本和退出码，不记输出。** 想让模型看到输出，让它自己重跑，或 `cmd 2>&1 | @x …` 当管道材料给它。
 - **交给模型之前脱敏**：`Authorization: …`、`Bearer …`、`sk-…` / `ghp_…` 这类已知前缀的令牌、URL 里的 `user:pass@`、`token=…` / `password: …` 这类键值、`--password x` / `--token x` 这类旗标值、`XXX_SECRET_KEY=…` 这类环境变量赋值、mysql 系的 `-p密码`、`sshpass -p`、`curl -u user:pass` 都换成 `[REDACTED]`。脱敏是模式匹配，不认识的形态会漏——敲过明文密码的话自己留个心。
 - **pending 文件**：`<配置目录>/term/<会话id>.pending`（macOS/Linux `~/.config/xiaoyu/term/`，Windows `%APPDATA%\xiaoyu\term\`），命令开跑前一行 `时间\t目录\t命令`，跑完后一行 `=时间\t退出码`（用开跑时间认领是哪条命令的），记的是脱敏**前**的原文，目录权限 0700。上限 500 条命令 / 256 KB，超了只留最新的。
-- **会话文件**：`<配置目录>/sessions/term/`，与 `--session-id` 同一种格式；`xiaoyu resume` 按第一次提问时所在的目录列出它，`--all` 全列。
+- **会话文件**：`<配置目录>/sessions/term/`，与 `--session-id` 同一种格式；`xiaoyu resume term-<id>` 直接接回，`xiaoyu resume` 按第一次提问时所在的目录列出它，`--all` 全列。
 - 自己的 `@x …`、`@c …` 与 `xiaoyu term …` 不记。
 - **`@c` 的两个文件**（都在 `<配置目录>/term/`）：`environment-<shell>.json` 是本机环境画像；`<会话id>.recall` 是这个终端最近 4 次 `@c` 的需求与命令（追问用，原文，30 分钟后不再带给模型）。`@c` 发给模型的是：环境画像、当前目录、会话处境（是不是 root / 有没有 sudo / 是不是 SSH / 是不是容器，不含用户名与主机名）、最近 12 条命令（脱敏后，只看不取）、最近几次 `@c`、你的需求，以及管道内容（有的话，最多 16000 字符）。
 

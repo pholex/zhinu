@@ -75,6 +75,7 @@ xy --output-format json "总结这个仓库"     # 或 stream-json（NDJSON 事�
 xy --output-schema schema.json "给这个仓库打分"   # 按 JSON Schema 收尾，结果在 output 字段（脚本/CI 用）
 xy resume --last "继续把测试修完"
 xy resume 20261006-101500-12345          # 按会话 id 接回：开场和退出时「接回本会话」那行给的就是这条命令
+xy resume nightly                        # 具名会话按名字接回（-s 起的名字、终端集成的 term-…）
 xy -s nightly "跑一下回归"                # 命名会话：同名接着聊，脚本反复调用用它
 
 xiaoyu sessions                         # 列出本机会话

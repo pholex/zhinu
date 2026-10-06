@@ -858,6 +858,35 @@ def find_by_id(ref: str, directory: Path | None = None) -> SessionInfo | None:
     return None
 
 
+def find_by_name(ref: str, directory: Path | None = None) -> SessionInfo | None:
+    """按具名会话的名字（`--session-id` 起的、终端集成的 `term-…`）定位；找不到回 None。
+
+    与 find_by_id 同一纪律：不扫目录读头尾，只按文件名 glob 收窄再核对 meta
+    （见 find_named 为什么必须核对）。名字在各工作区分区与 term/ 里都可能有，
+    逐个子目录探；同名多份取文件名最新的。不是合法会话名的词直接回 None——
+    resume 用它把「点名会话」和「指令的第一个词」分开，中文指令过不了字符集。
+    """
+    name = ref.strip().removesuffix(".jsonl")
+    try:
+        check_session_id(name)
+    except ValueError:
+        return None
+    directory = directory if directory is not None else sessions_dir()
+    if not directory.is_dir():
+        return None
+    folders = [directory, *sorted(p for p in directory.iterdir() if p.is_dir())]
+    candidates = sorted(
+        (path for folder in folders for path in folder.glob(f"*{_NAMED_MARK}{name}.jsonl")),
+        key=lambda p: p.name,
+        reverse=True,
+    )
+    for path in candidates:
+        info = _head_info(path)
+        if info is not None and info.session_id == name:
+            return info
+    return None
+
+
 def find_session(ref: str, workspace: str | None = None) -> SessionInfo | None:
     """按用户给的引用找会话：列表序号（`xiaoyu resume` 里的数字）、`--session-id`
     的名字、或文件名（带不带 .jsonl 都行）。先在当前工作区找，找不到放眼全部。"""
