@@ -316,7 +316,7 @@ class DoctorCommandTest(unittest.TestCase):
         self.assertEqual(
             ids,
             ["install", "python", "config_dir", "disk", "providers", "env", "proxy", "sandbox",
-             "bash_parser", "tools", "mcp_config", "sessions"],
+             "bash_parser", "tools", "shell", "mcp_config", "sessions"],
         )
         self.assertEqual(code, 1 if payload["status"] == "fail" else 0)
         self.assertIn("gauges", payload["diagnostics"])

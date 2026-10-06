@@ -129,7 +129,7 @@ SUBCOMMANDS: tuple[tuple[tuple[str, ...], str, str, str], ...] = (
      "列出本机会话；digest 汇总用量、export 导出、rename 起名、inspect 诊断日志"),
     (("send",), "send_command", "send <会话> <消息>", "给另一个会话发一条消息"),
     (("mcp",), "cli_mcp.mcp_command", "mcp add|list|remove|probe", "管理 MCP server 声明；probe 不经模型直接探测一个 server"),
-    (("term",), "cli_term.term_command", "term init|run|command|log|info",
+    (("term",), "cli_term.term_command", "term install|init|run|command|log|info",
      "shell 集成：在自己的 shell 里 @x 提问，带上刚跑过的命令；@c 一句话换一条命令"),
     (("plugin", "plugins"), "cli_plugin.plugin_command", "plugin add|list|update|remove",
      "装卸插件包（skills + MCP）"),
@@ -2032,19 +2032,19 @@ def serve_command(argv: list[str]) -> int:
 def uninstall_command(argv: list[str]) -> int:
     """卸载小羽：pip uninstall 本体 + 收拾装完之后留下的东西。
 
-    裸 `pip uninstall` 只删包，不会碰用户配置目录和 terminal-setup 写进
-    编辑器的键绑定；这条命令把"从装上到用过"的全过程反向走一遍。
+    裸 `pip uninstall` 只删包，不会碰用户配置目录、terminal-setup 写进
+    编辑器的键绑定和 term install 写进 shell 启动文件的那一段；这条命令把"从装上到用过"的全过程反向走一遍。
     默认保留配置目录（用户可能只是换环境重装），--purge 才连它一起删。
     pip 的讲究与 update_command 相同：走 `sys.executable -m pip`，
     pipx/uv tool 环境没有 pip 模块，只能给出对应命令让用户自己跑。
     """
-    from . import editor_setup
+    from . import editor_setup, shell_setup
     from .config import user_config_dir
 
     parser = argparse.ArgumentParser(
         prog="xiaoyu uninstall",
         description="卸载小羽（pip uninstall xiaoyu-agent），并移除 terminal-setup "
-        "写入的编辑器键绑定；--purge 连配置目录（会话记录、用户级 .env、MCP 配置等）一起删",
+        "写入的编辑器键绑定、term install 写入 shell 启动文件的终端集成；--purge 连配置目录（会话记录、用户级 .env、MCP 配置等）一起删",
     )
     parser.add_argument("--purge", action="store_true", help="连配置目录一起删（默认保留，重装可复用）")
     parser.add_argument("--yes", action="store_true", help="不询问，直接执行")
@@ -2053,6 +2053,7 @@ def uninstall_command(argv: list[str]) -> int:
 
     #  先把要动的东西全部打出来，确认后才动手——和 terminal-setup 同一姿势
     plans = editor_setup.removal_plans()
+    shell_plans = shell_setup.removal_plans()
     config_dir = user_config_dir()
     purge_target = config_dir if args.purge and config_dir.is_dir() else None
     pip_ok = (
@@ -2063,6 +2064,9 @@ def uninstall_command(argv: list[str]) -> int:
     for plan in plans:
         print(f"  {ui.success('将移除')}  {plan.editor.name}：shift+enter 绑定（留 .bak 备份）")
         print(ui.secondary(f"        {plan.path}"))
+    for shell_plan in shell_plans:
+        print(f"  {ui.success('将移除')}  终端集成（留 .bak 备份）")
+        print(ui.secondary(f"        {shell_plan.path}"))
     if purge_target is not None:
         print(f"  {ui.success('将删除')}  配置目录（会话记录、用户级 .env、MCP 配置等）")
         print(ui.secondary(f"        {purge_target}"))
@@ -2095,6 +2099,12 @@ def uninstall_command(argv: list[str]) -> int:
             print(ui.success("  " + editor_setup.apply_removal(plan)))
         except OSError as exc:
             print(ui.error(f"  {plan.editor.name}：写入失败 {exc}"), file=sys.stderr)
+            return 1
+    for shell_plan in shell_plans:
+        try:
+            print(ui.success("  " + shell_setup.apply_removal(shell_plan)))
+        except OSError as exc:
+            print(ui.error(f"  {shell_plan.path}：写入失败 {exc}"), file=sys.stderr)
             return 1
     if purge_target is not None:
         try:

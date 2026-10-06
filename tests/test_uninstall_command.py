@@ -2,7 +2,7 @@
 
 锁住五件事：
 1. 默认保留配置目录，--purge 才删；
-2. terminal-setup 写入的编辑器键绑定在卸载时一并移除；
+2. terminal-setup 写入的编辑器键绑定、term install 写入 shell 启动文件的那一段在卸载时一并移除；
 3. pip 不存在（pipx/uv tool 环境）时收尾照做、包本体给出替代命令并返回 1；
 4. pip uninstall 作为独立 argv 由本解释器执行，失败返回 1；
 5. --dry-run 只打计划，什么都不动；
@@ -21,7 +21,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
-from xiaoyu import cli, editor_setup
+from xiaoyu import cli, editor_setup, shell_setup
 
 UNINSTALL_ARGV = [sys.executable, "-m", "pip", "uninstall", "-y", "xiaoyu-agent"]
 
@@ -44,6 +44,8 @@ class UninstallCommandTest(unittest.TestCase):
             #  真跑会去敲 macOS Keychain（security 子进程），测试里一律断开
             ("xiaoyu.cli._hint_keychain_leftover", {}),
             ("xiaoyu.editor_setup.removal_plans", {"return_value": []}),
+            #  真跑会去读本机的 ~/.zshrc 等，测试里一律断开
+            ("xiaoyu.shell_setup.removal_plans", {"return_value": []}),
             #  开发环境常以可编辑方式装着 SDK，默认按没装算，单测里再显式打开
             ("xiaoyu.cli._sdk_installed", {"return_value": False}),
         ):
@@ -95,6 +97,19 @@ class UninstallCommandTest(unittest.TestCase):
             [{"key": "ctrl+k", "command": "保留我"}],
         )
         self.assertIn("测试编辑器", output)
+
+    def test_removes_shell_integration(self) -> None:
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        path = Path(tmp.name) / ".zshrc"
+        path.write_text("alias l=ls\n\n" + shell_setup.block('eval "$(xiaoyu term init zsh)"'), encoding="utf-8")
+        plan = shell_setup.Plan(path, "remove")
+        with mock.patch.object(cli.subprocess, "run", side_effect=self.fake_run()), \
+                mock.patch("xiaoyu.shell_setup.removal_plans", return_value=[plan]):
+            code, output = _run(["--yes"])
+        self.assertEqual(code, 0)
+        self.assertEqual(path.read_text(encoding="utf-8"), "alias l=ls\n")
+        self.assertIn("终端集成", output)
 
     def test_no_pip_still_cleans_but_returns_one(self) -> None:
         """pipx/uv 环境：附属物照收拾，包本体给出对应命令，返回 1 表示没卸完。"""
