@@ -158,7 +158,7 @@ def report() -> dict[str, Any]:
 GIB = 1024**3
 DISK_WARN = 5 * GIB
 DISK_FAIL = 1 * GIB
-MIN_PYTHON = (3, 10)
+MIN_PYTHON = (3, 11)
 
 _ORDER = {"ok": 0, "warn": 1, "fail": 2}
 

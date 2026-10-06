@@ -137,6 +137,17 @@ class DoctorChecksTest(unittest.TestCase):
         self.assertEqual(len(payload["checks"]), 2)
 
 
+class MinPythonMatchesPackageTest(unittest.TestCase):
+    def test_doctor_floor_equals_requires_python(self) -> None:
+        """doctor 的版本下限与 pyproject 的 requires-python 是同一个数，改一处必须改另一处。"""
+        import tomllib
+
+        root = Path(__file__).resolve().parents[1]
+        with (root / "pyproject.toml").open("rb") as handle:
+            spec = tomllib.load(handle)["project"]["requires-python"]
+        self.assertEqual(spec, ">=" + ".".join(map(str, diagnostics.MIN_PYTHON)))
+
+
 class RemediesPointSomewhereRealTest(unittest.TestCase):
     """doctor 给的出路得真的走得通。"""
 
