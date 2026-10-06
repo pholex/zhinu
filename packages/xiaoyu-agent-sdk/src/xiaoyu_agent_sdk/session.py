@@ -6,6 +6,7 @@ import copy
 from contextlib import nullcontext
 import inspect
 import json
+import logging
 import math
 import queue
 import tempfile
@@ -1171,11 +1172,93 @@ class Session:
         self.close()
 
 
+_log = logging.getLogger(__name__)
+
+
+def _close_abandoned_setup(setup: Future) -> None:
+    """Close a session whose ``AsyncSession.open`` was cancelled during setup.
+
+    Done callback of the setup thread's future: it fires once the session
+    exists, whether or not the event loop that started the open is still alive.
+    """
+    if setup.cancelled() or setup.exception() is not None:
+        return
+    session = setup.result()
+
+    def close() -> None:
+        try:
+            session.close()
+        except Exception:  # noqa: BLE001 - nobody awaits this close; report it instead of killing the thread
+            _log.exception("Closing a session whose open was cancelled failed; its resources may remain")
+
+    # close may block on storage I/O: keep it off the event loop thread (the
+    # callback runs there when setup had already finished), and non-daemon so
+    # interpreter exit still waits for the writer to be released.
+    threading.Thread(target=close, name="xiaoyu-sdk-abandoned-open").start()
+
+
 class AsyncSession:
-    """Async host interface; callbacks run on the caller's event loop."""
+    """Async host interface; callbacks run on the caller's event loop.
+
+    Prefer ``await AsyncSession.open(...)``: the constructor builds the session
+    synchronously (opening storage, preparing transport and worker) on the
+    calling thread, which stalls the event loop for that long.
+    """
 
     def __init__(self, options: SessionOptions, *, resume_from: Path | None = None, resume_id: str | None = None) -> None:
         self._session = Session(options, resume_from=resume_from, resume_id=resume_id)
+
+    @classmethod
+    async def open(
+        cls, options: SessionOptions, *, resume_from: Path | None = None, resume_id: str | None = None
+    ) -> AsyncSession:
+        """Create a session without blocking the event loop.
+
+        Same arguments and errors as the constructor; the synchronous setup runs
+        in a worker thread. Cancellation takes effect at once; setup cannot be
+        stopped midway, so the session it produces is closed in the background
+        as soon as it exists, leaving no storage lock or worker behind.
+        """
+        setup: Future = Future()
+
+        def build() -> None:
+            if not setup.set_running_or_notify_cancel():
+                return  # cancelled before we got going: build nothing
+            try:
+                setup.set_result(Session(options, resume_from=resume_from, resume_id=resume_id))
+            except BaseException as exc:  # noqa: BLE001 - handed back through setup.result() on the loop side
+                setup.set_exception(exc)
+
+        # A thread of our own with a concurrent future, not a Task over
+        # to_thread: loop shutdown cancels every Task (asyncio.run does on its
+        # way out) while the thread keeps building, and a cancelled Task would
+        # make the close callback skip the session it produces. This future
+        # cannot be cancelled once running, and its callbacks fire even after
+        # the loop is gone. Non-daemon: interpreter exit waits for setup.
+        threading.Thread(target=build, name="xiaoyu-sdk-open").start()
+        wakeup = asyncio.wrap_future(setup)
+        try:
+            # wait, not shield: cancelling us leaves setup running, and a later
+            # setup failure is consumed by the callback instead of being logged.
+            await asyncio.wait({wakeup})
+        except asyncio.CancelledError:
+            wakeup.cancel()  # reaches the thread only if it has not started building
+            setup.add_done_callback(_close_abandoned_setup)
+            raise
+        # read through the wrapper: a setup error left unretrieved there gets logged at GC
+        return cls._adopt(wakeup.result())
+
+    @classmethod
+    def _adopt(cls, inner: Session) -> AsyncSession:
+        """Wrap a ``Session`` built off the loop (``open``, ``fork``) and bind it.
+
+        No constructor runs here; a subclass that adds state in ``__init__``
+        overrides this to set it up.
+        """
+        session = cls.__new__(cls)
+        session._session = inner
+        session._bind_loop()
+        return session
 
     def _bind_loop(self) -> None:
         loop = asyncio.get_running_loop()
@@ -1290,9 +1373,7 @@ class AsyncSession:
 
     async def fork(self, *, options: SessionOptions | None = None) -> AsyncSession:
         self._bind_loop()
-        child = object.__new__(AsyncSession)
-        child._session = await asyncio.to_thread(self._session.fork, options=options)
-        return child
+        return type(self)._adopt(await asyncio.to_thread(self._session.fork, options=options))
 
     async def rewind(self, index: int, *, conversation: bool = True, files: bool = True) -> RewindResult:
         return await asyncio.to_thread(self._session.rewind, index, conversation=conversation, files=files)
@@ -1348,7 +1429,7 @@ def run(prompt: Prompt, options: SessionOptions, *, output: OutputSpec | None = 
 
 
 async def run_async(prompt: Prompt, options: SessionOptions, *, output: OutputSpec | None = None) -> RunResult:
-    async with AsyncSession(options) as session:
+    async with await AsyncSession.open(options) as session:
         return await session.run(prompt, output=output)
 
 

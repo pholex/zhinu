@@ -15,7 +15,7 @@ from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "packages/xiaoyu-agent-sdk/src"))
 from xiaoyu_agent_sdk import (CloseTimeoutError, ConfigurationError, McpManagementError, McpPool, McpServer,
-    MemoryTokenStore, ModelOptions, OAuthClient, OAuthError, OAuthTokens, Session, SessionBusyError, SessionLockedError, SessionOptions)
+    MemoryTokenStore, ModelOptions, OAuthClient, OAuthError, OAuthTokens, Session, SessionBusyError, SessionLockedError, SessionOptions, Tool)
 from tests.test_agent_paths import FakeClient, chunk
 from tests.test_mcp import FAKE_SERVER, _HttpServerCase, _McpHttpHandler
 
@@ -77,6 +77,19 @@ class ManagementTests(unittest.TestCase):
         finally:
             pool.close()
         self.assertEqual(pool.shutdown_pending(), ())
+
+    def test_failed_construction_after_lease_releases_the_pool(self):
+        #  租约在构造中段拿到，之后的校验（这里是工具 schema）失败时要连租约一起退回，
+        #  否则这个 pool 对后面的会话永远是"已被占用"
+        pool = McpPool((self.spec(),))
+        bad = Tool("broken", "schema is not an object", {"type": "array"}, lambda **args: "")
+        try:
+            with self.assertRaises(ConfigurationError):
+                Session(self.options(mcp_pool=pool, tools=(bad,)))
+            with Session(self.options(mcp_pool=pool)):
+                pass
+        finally:
+            pool.close()
 
     def test_readding_name_does_not_approve_changed_declarations(self):
         with Session(self.options(mcp_servers=(self.spec(),))) as session:

@@ -114,6 +114,12 @@ async def handle(options):
 立即关闭生成器。中断是协作式的：保留历史、补齐未闭合的工具消息，之后可继续。
 取消 `AsyncSession.run()` 会请求中断并等待本轮和回调清理，然后传播 `CancelledError`。
 
+`AsyncSession(options)` 的构造是同步的：打开存储、准备传输与 worker 都在调用线程上
+完成，在事件循环里直接调用会让循环停这么久（慢盘上可达 1 秒）。在服务里创建会话改用
+`async with await AsyncSession.open(options) as session:`（当前源码新增，尚未发布）：
+参数与构造函数相同，同步部分放到线程里做；创建途中被取消立即生效，已经建出来的会话
+会在后台关闭，不留存储锁。`run_async` 内部已改用它。
+
 会话拥有 worker、内置工具后台任务、自己创建的 HTTP clients、MCP manager 和本地
 日志锁；业务回调与借用的 client 由宿主提供。`close()` 可重复调用。无法及时结束
 模型请求或 Python 同步回调时抛 `CloseTimeoutError`，`closed` 仍为 false；会话进入
