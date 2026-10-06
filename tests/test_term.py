@@ -11,7 +11,8 @@
 5. `term log` / `term info` 的快路径：不导入 agent / tools / cli；
 6. `@c`（`term command`）：只在 zsh / bash 里定义、本机环境第一次探测并记下、
    请求怎么拼（环境 / 追问的上文 / 只看不取的最近命令 / 管道材料）、回答怎么读
-   （不守格式的尽量救、散文不上提示符、控制序列摘掉）、那一次请求发给谁。
+   （不守格式的尽量救、散文不上提示符、控制序列摘掉）、那一次请求发给谁、
+   命令位置上撞了用户别名会在本机提示一行。
 """
 
 from __future__ import annotations
@@ -227,6 +228,64 @@ class ScriptRenderTest(unittest.TestCase):
         for case, verdict in zip(passed, verdicts[len(taken):]):
             with self.subTest(passed=case):
                 self.assertEqual(verdict, "N")
+
+    def _shadow_warnings(self, shell: str, argv: list[str], cases: list[str]) -> list[str]:
+        """在真的 shell 里定义几个别名，对每条命令跑一次检查，返回每条各自的提示行。"""
+        import shlex
+
+        aliases = [
+            #  换了个命令：要提示
+            "alias ipconfig=\"ifconfig | awk '{print \\$1}'\"",
+            "alias ll='ls -la'",
+            #  只是给同名命令加参数（含 command 前缀）：不提示
+            "alias grep='grep --color=auto'",
+            "alias ls='command ls -G'",
+        ]
+        lines = [
+            self.render(shell, launcher="true"),
+            *aliases,
+            *(f"__xiaoyu_term_shadowed {shlex.quote(case)} 2>&1; echo '--'" for case in cases),
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            script = Path(tmp) / f"cases.{shell}"
+            script.write_text("\n".join(lines) + "\n", encoding="utf-8", newline="\n")
+            env = {**os.environ, term.SESSION_ENV: "term-s1"}
+            proc = subprocess.run(
+                [*argv, str(script)], capture_output=True, text=True, encoding="utf-8",
+                cwd=tmp, env=env, timeout=60,
+            )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        blocks = proc.stdout.split("--\n")[:-1]
+        self.assertEqual(len(blocks), len(cases), proc.stdout + proc.stderr)
+        return blocks
+
+    _SHADOW_CASES = {
+        "ipconfig getifaddr en0 || ipconfig getifaddr en1": ["ipconfig"],  # 同名只提一次
+        "find . -name x | ll": ["ll"],  # 管道后面也是命令位置
+        "cd /tmp && ll": ["ll"],
+        "echo ipconfig ll": [],  # 参数位置不算
+        "grep -r foo . ; ls": [],  # 同名加参数的别名不算
+        "command ipconfig getifaddr en0": [],  # 模型已经绕开了
+        "sudo ipconfig getifaddr en0": [],  # sudo 不展开别名
+        "FOO=1 make": [],
+    }
+
+    def _check_shadow(self, shell: str, argv: list[str]) -> None:
+        blocks = self._shadow_warnings(shell, argv, list(self._SHADOW_CASES))
+        for (case, names), block in zip(self._SHADOW_CASES.items(), blocks):
+            with self.subTest(shell=shell, case=case):
+                warned = [line.split("：", 1)[1].split(" ", 1)[0] for line in block.splitlines()]
+                self.assertEqual(warned, names, block)
+        self.assertIn("command ipconfig", blocks[0])
+        self.assertIn("ifconfig | awk", blocks[0])
+
+    @unittest.skipUnless(shutil.which("zsh") and os.name != "nt", "需要 zsh（POSIX）")
+    def test_at_c_warns_when_an_alias_takes_over_the_command_zsh(self) -> None:
+        self._check_shadow("zsh", ["zsh", "-f"])
+
+    @unittest.skipUnless(shutil.which("bash") and os.name != "nt", "需要 bash（POSIX）")
+    def test_at_c_warns_when_an_alias_takes_over_the_command_bash(self) -> None:
+        self._check_shadow("bash", ["bash"])
 
     def test_command_not_found_is_opt_in(self) -> None:
         handlers = {
