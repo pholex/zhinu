@@ -723,7 +723,7 @@ def resume_hint(agent: Agent) -> str:
     id 就是会话文件名（见 looks_like_session_id）——同一个 id 也是
     `xiaoyu sessions inspect/export` 的引用，拿去给别的工具分析这场会话。
     """
-    log = agent.session_log
+    log = getattr(agent, "session_log", None)  # run_repl 的测试替身没有它
     return f"接回本会话：xiaoyu resume {log.path.stem}" if log is not None else ""
 
 
@@ -928,6 +928,11 @@ def run_repl(repl_fn: Any, agent: Agent) -> int:
         end_session(agent)
         if agent.peer is not None:
             agent.peer.close()
+        #  开场那行早被滚出屏幕了：退出时再给一次，复制最方便。没说过话的会话
+        #  不给——resume 它只会得到「没有可恢复的消息」
+        messages = getattr(agent, "messages", [])
+        if any(m.get("role") == "user" for m in messages) and (hint := resume_hint(agent)):
+            print(ui.secondary(hint))
 
 
 def sessions_command(argv: list[str]) -> int:

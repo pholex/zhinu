@@ -1115,6 +1115,21 @@ class TitleExportTest(SessionDirTestCase):
         self.assertIsNone(find_by_id("20990101-000000-1"))
         self.assertIsNone(find_by_id("job-7"))  # 名字走 find_session，不归它管
 
+    def test_repl_exit_prints_resume_command_only_after_talking(self):
+        import contextlib
+        import io
+        import types
+
+        from xiaoyu import cli
+
+        log = self._session()
+        for messages, expect in (([{"role": "system"}], False), ([{"role": "user"}], True)):
+            agent = types.SimpleNamespace(peer=None, session_log=log, messages=messages)
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                cli.run_repl(lambda _agent: 0, agent)
+            self.assertEqual(f"xiaoyu resume {log.path.stem}" in out.getvalue(), expect)
+
     def test_export_skips_system_and_summarizes_tools(self):
         from xiaoyu.session_log import export_markdown, export_messages
 
