@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 from pathlib import Path
 from typing import Any
@@ -144,46 +145,57 @@ def _confirm(question: str) -> bool:
 
 
 def term_install_command(argv: list[str]) -> int:
-    """`xiaoyu term install`：把 `term init` 那一行写进 shell 启动文件。
+    """`xiaoyu term install`：把终端集成与 Tab 补全写进 shell 启动文件。
 
-    改的是工作区之外的用户配置，所以和 terminal-setup 同一姿势：先把计划打出来，
+    各平台写哪个文件、补全怎么接，见 shell_setup 的模块说明。改的是工作区之外的用户配置，所以和 terminal-setup 同一姿势：先把计划打出来，
     确认后才写，写前留 .bak。
     """
     from . import shell_setup, term
 
     parser = argparse.ArgumentParser(
         prog="xiaoyu term install",
-        description="把终端集成（@x / @c）写进 shell 启动文件，新开的终端自动生效。",
+        description="把终端集成（@x / @c）与 Tab 补全写进 shell 启动文件，新开的终端自动生效。",
     )
     parser.add_argument("shell", nargs="?", choices=shell_setup.SHELLS, help="默认按 $SHELL 认")
     parser.add_argument("--name", help="具名会话（同 term init --name）")
     parser.add_argument("--command-not-found", action="store_true", help="同 term init --command-not-found")
     parser.add_argument("--natural", action="store_true", help="同 term init --natural（只支持 zsh）")
+    parser.add_argument("--no-completion", action="store_true", help="不写 Tab 补全（默认一起写）")
     parser.add_argument("--yes", action="store_true", help="不询问，直接写入")
     parser.add_argument("--dry-run", action="store_true", help="只看计划，不写任何文件")
     args = parser.parse_args(argv)
 
     shell = args.shell or shell_setup.detect_shell()
     if shell is None:
-        print(ui.error("认不出你用的 shell，请写明：xiaoyu term install zsh|bash|fish"), file=sys.stderr)
-        print(ui.secondary("PowerShell 请照 docs/terminal-integration.md 把那一行贴进 $PROFILE。"), file=sys.stderr)
+        if os.name == "nt":
+            print(ui.error("Windows 上 install 只管 Git Bash：xiaoyu term install bash"), file=sys.stderr)
+            print(
+                ui.secondary("PowerShell 请照 docs/terminal-integration.md 把那一行贴进 $PROFILE（没有 Tab 补全）。"),
+                file=sys.stderr,
+            )
+        else:
+            print(ui.error("认不出你用的 shell，请写明：xiaoyu term install zsh|bash|fish"), file=sys.stderr)
         return 2
     if args.natural and shell not in term._NATURAL:
         print(ui.error(f"--natural 目前只支持 {' / '.join(term._NATURAL)}（{shell} 里请照常写 @c）"), file=sys.stderr)
         return 2
-    line = shell_setup.init_line(
+    lines, notes = shell_setup.integration_lines(
         shell,
         term.default_launcher(shell),
         name=args.name,
         command_not_found=args.command_not_found,
         natural=args.natural,
+        completion=not args.no_completion,
     )
-    plan = shell_setup.plan_install(shell, line)
+    plan = shell_setup.plan_install(shell, lines)
     marks = {"install": ui.success("将写入"), "update": ui.success("将更新"), "already": ui.secondary("已配好"),
              "manual": ui.warning("跳过"), "broken": ui.error("跳过")}
     print(f"  {marks[plan.action]}  {_display_path(plan.path)}：{plan.detail}")
     if plan.action in ("install", "update"):
-        print(ui.secondary(f"        {line}"))
+        for line in lines:
+            print(ui.secondary(f"        {line}"))
+    for note in notes + plan.notes:
+        print(ui.secondary(f"  {note}"))
     if plan.action not in ("install", "update"):
         return 0 if plan.action == "already" else 1
     if args.dry_run:
@@ -199,6 +211,8 @@ def term_install_command(argv: list[str]) -> int:
         print(ui.error(f"  写入失败：{exc}"), file=sys.stderr)
         return 1
     print(ui.secondary(f"新开一个终端即可使用 @x / @c；当前终端执行 source {_display_path(plan.path)} 立刻生效。"))
+    if any("xiaoyu completion" in line for line in lines):
+        print(ui.secondary("Tab 补全：xiaoyu te<Tab> 补子命令，--<Tab> 补全局旗标。"))
     return 0
 
 
@@ -215,7 +229,7 @@ def term_uninstall_command(argv: list[str]) -> int:
     args = parser.parse_args(argv)
 
     plans = shell_setup.removal_plans()
-    manual = [path for path, kind in shell_setup.installed_in() if kind == "manual"]
+    manual = [found.path for found in shell_setup.installed_in() if found.kind == "manual"]
     for plan in plans:
         print(f"  {ui.success('将移除')}  {_display_path(plan.path)}（留 .bak 备份）")
     for path in manual:
@@ -234,7 +248,7 @@ def term_uninstall_command(argv: list[str]) -> int:
         except OSError as exc:
             print(ui.error(f"  {plan.path}：写入失败 {exc}"), file=sys.stderr)
             return 1
-    print(ui.secondary("已打开的终端里 @x / @c 仍在，关掉重开后消失。"))
+    print(ui.secondary("已打开的终端里 @x / @c 与 Tab 补全仍在，关掉重开后消失。"))
     return 0
 
 

@@ -581,10 +581,17 @@ def check_shell_integration() -> Check:
     """终端集成（@x / @c）接没接上。可选功能：没接也是 ok，只在细节里指路。"""
     from . import shell_setup, term
 
+    found = shell_setup.installed_in()
     details = [
-        f"{path}（{'term install 写入' if kind == 'marked' else '手写'}）"
-        for path, kind in shell_setup.installed_in()
+        f"{item.path}（{'term install 写入' if item.kind == 'marked' else '手写'}，"
+        f"Tab 补全{'已接' if item.completion else '未接'}）"
+        for item in found
     ]
+    if found and not any(item.completion for item in found):
+        if any(item.kind == "marked" for item in found):
+            details.append("补全：重跑 xiaoyu term install（PATH 上要有 xiaoyu 命令）")
+        else:
+            details.append("补全：xiaoyu term install --dry-run 会给出要加在 term init 前面的那几行")
     if os.environ.get(term.SESSION_ENV):
         return Check("shell", "ok", "当前终端已接入终端集成", details)
     if details:
