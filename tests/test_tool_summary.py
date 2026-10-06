@@ -79,3 +79,48 @@ class ToolSummaryTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class EscalationNoticeTest(unittest.TestCase):
+    """确认框里的升权点名：档位、后果、理由都要上屏，没申请就一行不多。"""
+
+    def test_full_access_names_tier_consequence_and_reason(self) -> None:
+        lines = ui.escalation_notice(
+            {
+                "command": "npm i -g x",
+                "sandbox_permissions": "danger-full-access",
+                "justification": "要写 nvm 全局 node_modules",
+            }
+        )
+        self.assertEqual(len(lines), 2)
+        self.assertIn("danger-full-access", lines[0])
+        self.assertIn("不套沙箱", lines[0])
+        self.assertIn("要写 nvm 全局 node_modules", lines[1])
+
+    def test_network_tier_has_its_own_consequence(self) -> None:
+        lines = ui.escalation_notice(
+            {"command": "pip install x", "sandbox_permissions": "allow-network", "justification": "装包"}
+        )
+        self.assertIn("放行网络", lines[0])
+        self.assertNotIn("不套沙箱", lines[0])
+
+    def test_missing_reason_is_said_not_hidden(self) -> None:
+        lines = ui.escalation_notice({"command": "x", "sandbox_permissions": "danger-full-access"})
+        self.assertEqual(len(lines), 2)
+        self.assertIn("没有给理由", lines[1])
+
+    def test_plain_call_adds_nothing(self) -> None:
+        self.assertEqual(ui.escalation_notice({"command": "ls"}), [])
+        self.assertEqual(ui.escalation_notice({"command": "ls", "sandbox_permissions": " "}), [])
+        self.assertEqual(ui.escalation_notice("not a dict"), [])
+
+    def test_reason_is_capped_and_stripped_of_sequences(self) -> None:
+        lines = ui.escalation_notice(
+            {
+                "command": "x",
+                "sandbox_permissions": "danger-full-access",
+                "justification": "\x1b[31m红\x1b[0m" + "长" * 500,
+            }
+        )
+        self.assertNotIn("\x1b", lines[1])
+        self.assertLess(len(lines[1]), 200)

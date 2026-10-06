@@ -1830,6 +1830,10 @@ class Tui:
                 str(shown.get("new_str", "")),
             )
         elif name == "bash":
+            #  升权申请先于命令风险点名：按下"允许"批的是"这次不套沙箱"，
+            #  而不只是这条命令本身，用户得在按键前看到
+            for line in ui.escalation_notice(args):
+                self.console.print(Text(f"  ⚠ {line}", style="status.warning"))
             if reason := command_check.command_risk(str(args.get("command", ""))):
                 self.console.print(Text(f"  ⚠ 注意：{reason}", style="status.warning"))
 
@@ -1931,6 +1935,8 @@ class Tui:
         """确认框问句带具体宾语：「要修改 foo.py 吗？」
         比泛泛的「允许执行吗？」信息密度高。"""
         if name == "bash":
+            if str(args.get("sandbox_permissions") or "").strip():
+                return "要升权执行这条命令吗？"
             return "要执行这条命令吗？"
         if name in ("write_file", "str_replace"):
             verb = "写入" if name == "write_file" else "修改"

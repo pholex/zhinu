@@ -681,6 +681,32 @@ class ConfirmSessionGrantTest(unittest.TestCase):
             self.assertEqual(confirm("bash", {"command": "mv a b"}), "改用 git mv")
         self.assertEqual(perms.session_allowed, set())
 
+    def test_escalation_request_is_named_before_the_prompt(self):
+        """升权是"必问"项：确认框得写明档位、后果和模型的理由，不能画成普通命令。"""
+        from xiaoyu.cli import make_confirm
+
+        perms = Permissions(Path("/tmp"))
+        confirm = make_confirm(perms)
+        out = io.StringIO()
+        with mock.patch("builtins.input", return_value="n"), contextlib.redirect_stdout(out):
+            confirm(
+                "bash",
+                {
+                    "command": "lark-cli update",
+                    "sandbox_permissions": "danger-full-access",
+                    "justification": "要写 nvm 全局目录",
+                },
+            )
+        shown = out.getvalue()
+        self.assertIn("danger-full-access", shown)
+        self.assertIn("不套沙箱", shown)
+        self.assertIn("要写 nvm 全局目录", shown)
+        #  普通命令不多画一行
+        out = io.StringIO()
+        with mock.patch("builtins.input", return_value="n"), contextlib.redirect_stdout(out):
+            confirm("bash", {"command": "ls"})
+        self.assertNotIn("升权", out.getvalue())
+
     def test_explicit_no_is_plain_deny(self):
         from xiaoyu.cli import make_confirm
 
