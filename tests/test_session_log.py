@@ -1102,6 +1102,19 @@ class TitleExportTest(SessionDirTestCase):
         self.assertIsNone(find_session("9", "/ws/a"))
         self.assertIsNone(find_session("nope", None))
 
+    def test_find_by_id_probes_filename_only(self):
+        from xiaoyu.session_log import find_by_id, looks_like_session_id
+
+        log = self._session("job-7")
+        self.assertTrue(looks_like_session_id(log.path.stem))
+        self.assertTrue(looks_like_session_id("20261006-101500-12345.jsonl"))
+        for word in ("继续跑测试", "job-7", "2026-10-06", "20261006-1015-1", "1"):
+            self.assertFalse(looks_like_session_id(word), word)
+        self.assertEqual(find_by_id(log.path.stem).path, log.path)
+        self.assertEqual(find_by_id(log.path.name).path, log.path)
+        self.assertIsNone(find_by_id("20990101-000000-1"))
+        self.assertIsNone(find_by_id("job-7"))  # 名字走 find_session，不归它管
+
     def test_export_skips_system_and_summarizes_tools(self):
         from xiaoyu.session_log import export_markdown, export_messages
 

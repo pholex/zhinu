@@ -111,5 +111,29 @@ class ForkE2ETest(E2ECase):
         self.assertIn("超出范围", proc.stderr)
 
 
+class ResumeByIdE2ETest(ForkE2ETest):
+    """开场横幅给的会话 id（文件名）能直接点名接回，不被当成指令的第一个词。"""
+
+    def test_resume_by_id_picks_that_session_not_latest(self):
+        older = self._plant_session()
+        newer = older.with_name("20260810-000000-2.jsonl")
+        newer.write_text(older.read_text(encoding="utf-8").replace("第一轮", "新会话"), encoding="utf-8")
+        proc = self._run_resume(
+            "text: 接上了\n", [older.stem, "继续", "--output-format", "stream-json"]
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        result = json.loads(proc.stdout.splitlines()[-1])
+        resumed = Path(result["session_log"]).read_text(encoding="utf-8")
+        self.assertIn(str(older), resumed)  # resumed_from 指向点名的那份，不是最新的
+        self.assertIn("第一轮：查清结构", resumed)
+        self.assertIn('"继续"', resumed)  # id 之后的词才是指令
+
+    def test_unknown_id_is_error_not_prompt(self):
+        self._plant_session()
+        proc = self._run_resume("text: x\n", ["20990101-000000-9", "继续"])
+        self.assertEqual(proc.returncode, 2, proc.stdout)
+        self.assertIn("找不到会话", proc.stderr)
+
+
 if __name__ == "__main__":
     unittest.main()
