@@ -618,12 +618,27 @@ class StdioInterruptTest(_StdioCase):
 
     def test_late_answer_is_dropped_not_kept(self):
         server = self.make_server(timeout=0.4)
+        #  读线程按调用时现查 self._dispatch：包一层记下它处理过的应答 id，
+        #  用"迟到的那条确实被读到了"代替固定 sleep——假 server 用定时器线程发它，
+        #  CI 机器一忙就可能晚于任何拍脑袋的等待时间
+        dispatched: list = []
+        original = server._dispatch
+
+        def spy(message, generation=None):
+            original(message, generation)
+            dispatched.append(message.get("id"))
+
+        server._dispatch = spy
         self.assertIn("超时", server.call_tool("late", {"after": 0.9}))
-        time.sleep(1.0)
-        #  server 按顺序写 stdout：echo 的应答读到时，迟到的那条已经先过了读线程
-        self.assertEqual(server.call_tool("echo", {"text": "后面的"}), "echo: 后面的")
+        late_id = _call_id(self.received(), "late")
+        self.wait_until(lambda: late_id in dispatched, message="迟到的应答始终没被读线程读到")
         self.assertEqual(server._responses, {}, "没人等的应答留在了响应槽里")
         self.assertEqual(server._awaited, set())
+        #  0.4 秒只是为了让上面那次调用超时；连接还能用的这一步给足时间，
+        #  否则 Windows 机器忙时一次正常往返也会被判成超时
+        server.spec.timeout = 10.0
+        self.assertEqual(server.call_tool("echo", {"text": "后面的"}), "echo: 后面的")
+        self.assertEqual(server._responses, {})
 
     def test_stop_requested_before_sending_sends_nothing(self):
         server = self.make_server()
