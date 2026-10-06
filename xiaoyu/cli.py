@@ -1662,6 +1662,25 @@ def _serve_available() -> bool:
     )
 
 
+_SDK_DISTRIBUTION = "xiaoyu-agent-sdk"
+
+
+def _sdk_installed() -> bool:
+    """同一环境里装没装嵌入 SDK（独立发行包 xiaoyu-agent-sdk）。
+
+    SDK 精确钉住同版本的 xiaoyu-agent：update 只升本体会让它的 pin 落空，
+    uninstall 只卸本体会留下一个导入即坏的 SDK——两条命令都要带上它。
+    按发行包元数据判断而非可导入性：要交给 pip 的正是这个包名。
+    """
+    from importlib.metadata import PackageNotFoundError, distribution
+
+    try:
+        distribution(_SDK_DISTRIBUTION)
+    except PackageNotFoundError:
+        return False
+    return True
+
+
 #  自己动不了自己时给的兜底命令：不经 xiaoyu.exe 就没有自锁
 _WINDOWS_MANUAL_UPGRADE = "python -m pip install --upgrade xiaoyu-agent"
 _WINDOWS_MANUAL_UNINSTALL = "python -m pip uninstall xiaoyu-agent"
@@ -1719,6 +1738,7 @@ def _defer_pip_to_detached(mode: str, spec: str) -> bool:
     子进程刻意**不**加 DETACHED_PROCESS：那会连控制台一起脱掉，用户就看不见
     pip 的输出了。只加 CREATE_NEW_PROCESS_GROUP，让它不被这个控制台的 Ctrl+C
     带走。拉不起来就返回 False，调用方照旧在本进程里硬跑——不比以前差。
+    spec 可以是空格分隔的多个包，子进程侧按空白切开。
     """
     if _running_launcher() is None or not _detached_child_usable():
         return False
@@ -1781,14 +1801,17 @@ def update_command(argv: list[str]) -> int:
     if _serve_available():
         extras.append("serve")
         print(ui.secondary("检测到 serve（HTTP API）依赖，一并升级到本版锁定版本"))
-    spec = "xiaoyu-agent" + (f"[{','.join(extras)}]" if extras else "")
-    print(ui.secondary(f"当前 xiaoyu {__version__}，执行 pip install --upgrade {spec}"))
-    if _defer_pip_to_detached("update", spec):
+    specs = ["xiaoyu-agent" + (f"[{','.join(extras)}]" if extras else "")]
+    if _sdk_installed():
+        specs.append(_SDK_DISTRIBUTION)
+        print(ui.secondary("检测到嵌入 SDK（xiaoyu-agent-sdk），一并升级以保持同版本"))
+    print(ui.secondary(f"当前 xiaoyu {__version__}，执行 pip install --upgrade {' '.join(specs)}"))
+    if _defer_pip_to_detached("update", " ".join(specs)):
         print(ui.secondary("Windows 不让程序覆盖正在运行的自己，升级改在本进程退出后继续。"))
         print(ui.secondary("pip 输出会接着打在这个窗口里，跑完按一次 Enter 回到命令提示符。"))
         return 0
     #  spec 作为独立 argv 传入、不经 shell，[] 不会被展开，无需引号
-    result = subprocess.run([sys.executable, "-m", "pip", "install", "--upgrade", spec])
+    result = subprocess.run([sys.executable, "-m", "pip", "install", "--upgrade", *specs])
     if result.returncode != 0:
         print(ui.error("升级失败，原因见上方 pip 输出。"), file=sys.stderr)
         if os.name == "nt":
@@ -2035,6 +2058,7 @@ def uninstall_command(argv: list[str]) -> int:
     pip_ok = (
         subprocess.run([sys.executable, "-m", "pip", "--version"], capture_output=True).returncode == 0
     )
+    packages = ["xiaoyu-agent"] + ([_SDK_DISTRIBUTION] if _sdk_installed() else [])
 
     for plan in plans:
         print(f"  {ui.success('将移除')}  {plan.editor.name}：shift+enter 绑定（留 .bak 备份）")
@@ -2047,7 +2071,7 @@ def uninstall_command(argv: list[str]) -> int:
     else:
         print(ui.secondary(f"  保留配置目录（--purge 可连它一起删）：{config_dir}"))
     if pip_ok:
-        print(f"  {ui.success('将执行')}  pip uninstall xiaoyu-agent")
+        print(f"  {ui.success('将执行')}  pip uninstall {' '.join(packages)}")
     else:
         print(ui.warning("  当前 Python 环境里没有 pip，包本体需要你自己卸："))
         print(ui.secondary("    pipx 安装的话：pipx uninstall xiaoyu-agent"))
@@ -2084,11 +2108,11 @@ def uninstall_command(argv: list[str]) -> int:
     if not pip_ok:
         return 1
     #  附属物已经收拾完，剩下卸包这一步整段交给脱离的子进程（同 update）
-    if _defer_pip_to_detached("uninstall", "xiaoyu-agent"):
+    if _defer_pip_to_detached("uninstall", " ".join(packages)):
         print(ui.secondary("Windows 不让程序删掉正在运行的自己，卸包改在本进程退出后继续。"))
         print(ui.secondary("pip 输出会接着打在这个窗口里，跑完按一次 Enter 回到命令提示符。"))
         return 0
-    result = subprocess.run([sys.executable, "-m", "pip", "uninstall", "-y", "xiaoyu-agent"])
+    result = subprocess.run([sys.executable, "-m", "pip", "uninstall", "-y", *packages])
     if result.returncode != 0:
         print(ui.error("卸载失败，原因见上方 pip 输出。"), file=sys.stderr)
         if os.name == "nt":

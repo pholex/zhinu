@@ -89,7 +89,10 @@ def _installed_version() -> str:
 
 def run(mode: str, spec: str, old_version: str) -> int:
     """跑 pip 并播报结果。调用方已经退出，此时不再有任何自锁。"""
-    args = ("install", "--upgrade", spec) if mode == "update" else ("uninstall", "-y", spec)
+    #  spec 可以是空格分隔的多个包（本体之外还要带上同版本钉住的 SDK）；
+    #  包名与 extras 里都不会有空格，按空白切开即可
+    specs = spec.split()
+    args = ("install", "--upgrade", *specs) if mode == "update" else ("uninstall", "-y", *specs)
     code = 1
     for attempt in range(_ATTEMPTS):
         code = _pip(*args)

@@ -4,6 +4,7 @@
 1. pip 不存在（pipx/uv tool 环境）时不硬跑，给出替代命令并返回 1；
 2. 未装 TUI 可选依赖 → 升级 spec 自动带上 [tui]；已装 → 只升本体；
    serve 方向相反：装了 fastapi+uvicorn 才带 [serve]（跟上新 pin），没装不塞；
+   装了嵌入 SDK 就把 xiaoyu-agent-sdk 一并升级（它精确钉住本体版本）；
 3. spec 必须作为独立 argv 传给 sys.executable -m pip（不经 shell，无引号问题）；
 4. pip 失败向上返回 1，成功后用新解释器读版本号播报；
 5. 从 Windows 启动器 exe 跑起来时，pip **不在本进程里执行**——它锁着自己，
@@ -33,10 +34,11 @@ def _run(argv: list[str]) -> tuple[int, str]:
 
 
 @contextlib.contextmanager
-def _extras(tui: bool = True, serve: bool = False):
-    """把两个可选依赖探测都钉住——测试环境里装没装 fastapi 不该影响断言。"""
+def _extras(tui: bool = True, serve: bool = False, sdk: bool = False):
+    """把可选依赖与 SDK 探测都钉住——测试环境里装没装 fastapi / SDK 不该影响断言。"""
     with mock.patch.object(cli, "_tui_available", return_value=tui), \
-            mock.patch.object(cli, "_serve_available", return_value=serve):
+            mock.patch.object(cli, "_serve_available", return_value=serve), \
+            mock.patch.object(cli, "_sdk_installed", return_value=sdk):
         yield
 
 
@@ -146,6 +148,30 @@ class UpdateCommandTest(unittest.TestCase):
         self.assertEqual(code, 0)
         specs = [c.args[0][-1] for c in run.call_args_list if "install" in c.args[0]]
         self.assertEqual(specs, ["xiaoyu-agent[tui,serve]"])
+
+    def test_sdk_upgraded_alongside_when_installed(self):
+        """SDK 钉死同版本本体：只升本体会让已装的 SDK 依赖落空。"""
+        with mock.patch.object(
+            cli.subprocess, "run",
+            return_value=SimpleNamespace(returncode=0, stdout="9.9.9\n"),
+        ) as run, _extras(serve=True, sdk=True):
+            code, output = _run([])
+        self.assertEqual(code, 0)
+        self.assertIn(
+            [sys.executable, "-m", "pip", "install", "--upgrade",
+             "xiaoyu-agent[serve]", "xiaoyu-agent-sdk"],
+            [c.args[0] for c in run.call_args_list],
+        )
+        self.assertIn("SDK", output)
+
+    def test_sdk_joins_detached_spec_from_launcher(self):
+        with _fake_windows_launcher():
+            with mock.patch.object(cli.subprocess, "run", side_effect=_probe_ok), \
+                    mock.patch.object(cli.subprocess, "Popen") as popen, \
+                    _extras(sdk=True):
+                code, _ = _run([])
+        self.assertEqual(code, 0)
+        self.assertEqual(popen.call_args.args[0][7], "xiaoyu-agent xiaoyu-agent-sdk")
 
     def test_pip_failure_returns_one(self):
         def fake_run(argv, **kwargs):
