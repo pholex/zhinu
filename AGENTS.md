@@ -22,6 +22,18 @@
 - `tests/wheel_smoke.py` 不是 unittest 用例：要先 `python -m build`，CI 的 build job 调它。
 - 改了会话 / 工具 / 权限相关代码，跑一遍全量；只改文档可以不跑。
 
+## 分析用户的会话
+
+用户给出会话 id（开场那行 `接回本会话：xiaoyu resume <id>` 里的 id，即会话文件名）
+时，用它取这场会话的完整记录，别去猜目录：
+
+```bash
+xiaoyu sessions export <id> --format json   # 对话正文 + 工具调用摘要，不含 system 提示
+xiaoyu sessions inspect <id> --errors       # 执行时间线：请求、工具错误、拒绝、压缩；--raw 展开记录、--json 结构化
+```
+
+id 精确到文件，在哪个目录跑都找得到；记录可能含用户隐私，只用于分析问题。
+
 ## 提交纪律
 
 - **不在 main 上直接提交**：开 feature 分支，完成后由人合回。

@@ -31,11 +31,13 @@ from .session_log import (
     check_session_id,
     export_markdown,
     export_messages,
+    find_by_id,
     find_session,
     install_exit_logging,
     list_sessions,
     load_messages,
     load_system_prompt,
+    looks_like_session_id,
     open_named,
     rename_session,
     turn_starts,
@@ -715,6 +717,16 @@ def split_resume_positionals(first: str | None, rest: list[str]) -> tuple[int | 
     return None, [first, *rest]
 
 
+def resume_hint(agent: Agent) -> str:
+    """开场一行：接回本会话的完整命令，复制即用。
+
+    id 就是会话文件名（见 looks_like_session_id）——同一个 id 也是
+    `xiaoyu sessions inspect/export` 的引用，拿去给别的工具分析这场会话。
+    """
+    log = agent.session_log
+    return f"接回本会话：xiaoyu resume {log.path.stem}" if log is not None else ""
+
+
 def _session_label(info: SessionInfo) -> str:
     """会话在行内菜单里的一行标签（截到终端宽度，长了菜单高度就不准了）。"""
     place = Path(info.workspace).name or info.workspace
@@ -1180,7 +1192,9 @@ def resume_command(argv: list[str]) -> int:
         description="恢复历史会话。默认列出当前工作区的最近会话供选择。",
     )
     parser.add_argument(
-        "index", nargs="?", help="列表里的序号；给的不是数字就当指令（此时默认恢复最近会话）"
+        "index",
+        nargs="?",
+        help="列表里的序号，或开场横幅给的会话 id；两者都不是就当指令（此时默认恢复最近会话）",
     )
     parser.add_argument(
         "prompt",
@@ -1230,6 +1244,14 @@ def resume_command(argv: list[str]) -> int:
     #  位置参数消歧：`resume 3 "继续"` 里 3 是序号，`resume "继续跑测试"` 里
     #  首个词是指令的开头——argparse 分不出来，按"纯数字=序号"判
     index, words = split_resume_positionals(args.index, args.prompt)
+    #  开场横幅给的「会话 id」（会话文件名）：首个词长这样就是在点名会话，不是指令
+    by_id: SessionInfo | None = None
+    if index is None and args.index is not None and looks_like_session_id(args.index):
+        by_id = find_by_id(args.index)
+        if by_id is None:
+            print(ui.error(f"找不到会话 {args.index}"), file=sys.stderr)
+            return 2
+        words = list(args.prompt)
     #  `-p` 的值不参与序号消歧：写在 -p 后面的一定是指令，哪怕它是纯数字
     if args.prompt_opt:
         words = [args.prompt_opt, *words]
@@ -1260,11 +1282,13 @@ def resume_command(argv: list[str]) -> int:
     if not sessions and not args.all:
         #  当前工作区没有就退回全量列表，别让用户空手而归
         sessions = list_sessions()
-    if not sessions:
+    if not sessions and by_id is None:
         print(ui.warning("没有可恢复的会话。"))
         return 1
 
-    if args.last:
+    if by_id is not None:
+        chosen = by_id
+    elif args.last:
         chosen = sessions[0]
     elif index is not None:
         if not 1 <= index <= len(sessions):
@@ -1388,6 +1412,9 @@ def resume_command(argv: list[str]) -> int:
     if budget_note := skills.budget_warning():
         print(ui.secondary(budget_note))
     print(ui.secondary(f"已恢复会话（{len(loaded)} 条消息，来自 {chosen.path.name}{forked}）"))
+    if hint := resume_hint(agent):
+        #  恢复写进的是新文件：下次要接的是这一份（它自包含，接得上之前的全部）
+        print(ui.secondary(hint))
     #  回放最近几轮补进 scrollback（重建 turn 喂同一个
     #  渲染器），恢复后不再两眼一抹黑（/resume 切会话共用同一条路径）
     replay_recent(agent, loaded)
@@ -3916,6 +3943,8 @@ def main(argv: list[str] | None = None) -> int:
     if env_files:
         print(ui.secondary("已加载 " + ", ".join(str(p) for p in env_files)))
     print(ui.secondary(sandbox_status(config)))
+    if hint := resume_hint(agent):
+        print(ui.secondary(hint))
     if budget_note := skills.budget_warning():
         print(ui.secondary(budget_note))
     if resumed:

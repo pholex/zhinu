@@ -821,6 +821,43 @@ def last_preview(path: Path, limit: int = LAST_PREVIEW) -> str:
     return ""
 
 
+def looks_like_session_id(ref: str) -> bool:
+    """形如会话文件名（`时间戳-pid`，命名会话再带 `-id-名字`），可带 .jsonl。
+
+    开场横幅给出的「会话 id」就是文件名本身——不另造一套 id，文件名天然唯一、
+    免读文件就能定位。`resume` 靠这个判据把它与指令的第一个词分开。
+    """
+    stem = ref.strip().removesuffix(".jsonl")
+    head = stem.split(_NAMED_MARK, 1)[0]
+    parts = head.split("-")
+    return (
+        len(parts) == 3
+        and len(parts[0]) == 8
+        and len(parts[1]) == 6
+        and all(part.isascii() and part.isdigit() for part in parts)
+    )
+
+
+def find_by_id(ref: str, directory: Path | None = None) -> SessionInfo | None:
+    """按会话 id（文件名，带不带 .jsonl 都行）直接定位：只探路径不扫目录。
+
+    find_session 要把每个文件的头尾都读一遍，会话一多就慢；id 已经精确到文件名，
+    挨个子目录（工作区分区 + term/ + 存量平铺）探一下就够了。
+    """
+    stem = ref.strip().removesuffix(".jsonl")
+    if not looks_like_session_id(stem):
+        return None
+    directory = directory if directory is not None else sessions_dir()
+    if not directory.is_dir():
+        return None
+    name = f"{stem}.jsonl"
+    for folder in [directory, *sorted(p for p in directory.iterdir() if p.is_dir())]:
+        path = folder / name
+        if path.is_file():
+            return _head_info(path)
+    return None
+
+
 def find_session(ref: str, workspace: str | None = None) -> SessionInfo | None:
     """按用户给的引用找会话：列表序号（`xiaoyu resume` 里的数字）、`--session-id`
     的名字、或文件名（带不带 .jsonl 都行）。先在当前工作区找，找不到放眼全部。"""
@@ -833,6 +870,8 @@ def find_session(ref: str, workspace: str | None = None) -> SessionInfo | None:
             sessions = list_sessions()
         index = int(ref)
         return sessions[index - 1] if 1 <= index <= len(sessions) else None
+    if (info := find_by_id(ref)) is not None:
+        return info  # 会话 id 精确到文件名：不必把全部会话的头尾读一遍
     scopes = [workspace, None] if workspace else [None]
     for scope in scopes:
         for info in list_sessions(limit=100_000, workspace=scope, include_empty=True):
