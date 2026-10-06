@@ -26,8 +26,7 @@
 ## 安装
 
 ```bash
-pip install xiaoyu-agent                 # 核心：脚本 / -p 调用，交互退回明文
-pip install "xiaoyu-agent[tui,serve]"    # 推荐：交互界面 + HTTP API / 浏览器扩展
+pip install "xiaoyu-agent[tui,serve]"
 ```
 
 其它可选组件：`[otel]`、`[bedrock]`、`[browser]`；嵌入 Python 程序用独立包 `xiaoyu-agent-sdk`。
