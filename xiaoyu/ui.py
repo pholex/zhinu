@@ -257,6 +257,41 @@ def tool_summary(name: str, args: object) -> str:
     return " ".join(pairs)
 
 
+#  升权档位 → 用户看得懂的一句后果。档位名本身（danger-full-access）对不熟
+#  沙箱的人只是个字符串，确认框里得把"批下去会怎样"写明白
+_ESCALATION_MEANING: dict[str, str] = {
+    "allow-network": "仍套沙箱，但本次放行网络",
+    "danger-full-access": "本次不套沙箱，命令能写你有权限的任何路径",
+}
+#  理由是模型给的一句话：封顶、剥转义序列，和其它上屏的模型文本同一待遇
+_JUSTIFICATION_CAP = 160
+
+
+def escalation_notice(args: object) -> list[str]:
+    """bash 调用带了沙箱升权申请时，确认框要点名的几行（没申请 = 空列表）。
+
+    升权是"必问"三项之一，确认框却只画命令本身的话，用户按下的那个"允许"
+    批的是什么他并不知道——看着是在批一条命令，实际批的是"这次不套沙箱"。
+    这几行把档位、后果、模型给的理由一起摆到按键之前，TUI 与纯 CLI 两套
+    确认框共用，别各写一份。
+    """
+    if not isinstance(args, dict):
+        return []
+    tier = str(args.get("sandbox_permissions") or "").strip()
+    if not tier:
+        return []
+    meaning = _ESCALATION_MEANING.get(tier)
+    head = f"申请沙箱升权：{preview(tier, 40)}"
+    if meaning:
+        head += f"——{meaning}"
+    lines = [head]
+    reason = str(args.get("justification") or "").strip()
+    lines.append(
+        f"模型给的理由：{preview(reason, _JUSTIFICATION_CAP)}" if reason else "模型没有给理由"
+    )
+    return lines
+
+
 def fit(value: object, reserve: int = 0, width: int | None = None) -> str:
     """按终端实际宽度压成一行（`preview` 的自适应版）。"""
     return preview(value, budget(reserve, width))

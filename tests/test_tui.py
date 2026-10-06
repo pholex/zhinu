@@ -917,6 +917,13 @@ class TestTuiFrontend(AgentTestCase):
         self.assertEqual(
             tui._confirm_title("write_file", {"path": "bar.py"}), "要写入 bar.py 吗？"
         )
+        #  带升权申请的 bash：问句本身就得说出"升权"，不能和普通命令长一样
+        self.assertEqual(
+            tui._confirm_title(
+                "bash", {"command": "ls", "sandbox_permissions": "danger-full-access"}
+            ),
+            "要升权执行这条命令吗？",
+        )
 
     def test_confirm_deny_with_reason_returns_text(self) -> None:
         """拒绝即改指令：用户给的一句话原文回灌模型。"""

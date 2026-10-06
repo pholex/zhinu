@@ -3456,6 +3456,7 @@ def make_confirm(permissions: Permissions):
     def confirm(name: str, args: dict[str, Any]) -> bool | str:
         #  审批挂起 = 轮次卡在等人：铃（opt-in）与状态钩子把切走的人叫回来
         attention.waiting(attention.WAITING_APPROVAL)
+        escalation = ui.escalation_notice(args) if name == "bash" else []
         if name == "write_file":
             content = str(args.get("content", ""))
             head = content.split("\n")[:12]
@@ -3472,13 +3473,17 @@ def make_confirm(permissions: Permissions):
                 print(ui.success(f"  │ + {ui.fit(row, 6)}"))
             print(ui.secondary("  └"))
         elif name == "bash":
+            #  升权申请先点名：批的是"这次不套沙箱"，不只是这条命令（与 TUI 同一份文案）
+            for line in escalation:
+                print(ui.warning(f"  ⚠ {line}"))
             #  破坏性操作 / 参数注入口在确认框里点名：用户看到的是"为什么要多想一下"
             if reason := command_check.command_risk(str(args.get("command", ""))):
                 print(ui.warning(f"  ⚠ 注意：{reason}"))
 
+        verb = "升权执行" if escalation else "执行"
         try:
             answer = input(
-                ui.warning(f"  允许执行 {name}? [y/N/a=本会话都允许，其它输入=拒绝理由] ")
+                ui.warning(f"  允许{verb} {name}? [y/N/a=本会话都允许，其它输入=拒绝理由] ")
             ).strip()
         except (EOFError, KeyboardInterrupt):
             print()
