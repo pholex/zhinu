@@ -35,15 +35,16 @@ xiaoyu doctor                     # 装完体检一遍
 - `[serve]`：HTTP API，给 n8n / Dify 这类编排器用（[docs/http-api.md](docs/http-api.md)）
 - `[otel]`：导出 OpenTelemetry（[docs/observability.md](docs/observability.md)）
 - `[bedrock]`：凭 AWS 凭证链直连 Bedrock（[docs/configuration.md](docs/configuration.md)）
-- `[browser]`：内置浏览器工具，装完再跑一次 `playwright install chromium`
-- `[sdk]`：作为库嵌进你的程序（[docs/sdk.md](docs/sdk.md)）
+- `[browser]`：内置浏览器工具，用 playwright 另起一个 Chromium，装完再跑一次 `playwright install chromium`（想操作你自己登录着的 Chrome，用的是浏览器扩展，见 [docs/browser-bridge.md](docs/browser-bridge.md)）
 
 想一次装全：
 
 ```bash
-pip install "xiaoyu-agent[tui,serve,otel,bedrock,browser,sdk]"
+pip install "xiaoyu-agent[tui,serve,otel,bedrock,browser]"
 playwright install chromium
 ```
+
+要把小羽作为库嵌进你的 Python 程序，装独立的 SDK 包 `pip install xiaoyu-agent-sdk`（[docs/sdk.md](docs/sdk.md)）。
 
 升级与卸载：
 
