@@ -167,7 +167,7 @@ def term_install_command(argv: list[str]) -> int:
 
     shell = args.shell or shell_setup.detect_shell()
     if shell is None:
-        if os.name == "nt":
+        if _on_windows():
             print(ui.error("Windows 上 install 只管 Git Bash：xiaoyu term install bash"), file=sys.stderr)
             print(
                 ui.secondary("PowerShell 请照 docs/terminal-integration.md 把那一行贴进 $PROFILE（没有 Tab 补全）。"),
@@ -250,6 +250,11 @@ def term_uninstall_command(argv: list[str]) -> int:
             return 1
     print(ui.secondary("已打开的终端里 @x / @c 与 Tab 补全仍在，关掉重开后消失。"))
     return 0
+
+
+def _on_windows() -> bool:
+    #  单独成函数好让测试替换：直接改 os.name 会让 3.11 的 pathlib 建不出 Path
+    return os.name == "nt"
 
 
 def _display_path(path: Path) -> str:
