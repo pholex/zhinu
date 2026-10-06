@@ -30,7 +30,7 @@ jobs:
       - run: python -m mypy --follow-imports=silent examples/serve xiaoyu/questions.py xiaoyu/serve_questions.py xiaoyu/_observation.py
       - run: python -m unittest tests.test_serve_questions_example -v
       - run: python examples/serve/questions.py --demo
-      - run: python -m unittest tests.test_sdk tests.test_sdk_questions tests.test_sdk_deferred_questions tests.test_sdk_foreground_questions tests.test_serve_questions tests.test_sdk_inputs tests.test_sdk_observation tests.test_sdk_controls tests.test_sdk_planning tests.test_sdk_result_transforms tests.test_sdk_storage tests.test_sdk_tasks tests.test_sdk_mcp_management tests.test_sdk_accounting tests.test_sdk_transport_reliability tests.test_sdk_fault_windows tests.test_sdk_reliability tests.test_sandbox.WorkspaceTrustCacheTest tests.test_sdk_release tests.test_public_api tests.test_embedding_smoke -v
+      - run: python -m unittest tests.test_sdk tests.test_sdk_questions tests.test_sdk_async_open tests.test_sdk_deferred_questions tests.test_sdk_foreground_questions tests.test_serve_questions tests.test_sdk_inputs tests.test_sdk_observation tests.test_sdk_controls tests.test_sdk_planning tests.test_sdk_result_transforms tests.test_sdk_storage tests.test_sdk_tasks tests.test_sdk_mcp_management tests.test_sdk_accounting tests.test_sdk_transport_reliability tests.test_sdk_fault_windows tests.test_sdk_reliability tests.test_sandbox.WorkspaceTrustCacheTest tests.test_sdk_release tests.test_public_api tests.test_embedding_smoke -v
       - run: python examples/sdk/sync.py --demo
       - run: python examples/sdk/async_service.py --demo
       - run: python examples/sdk/questions.py --demo

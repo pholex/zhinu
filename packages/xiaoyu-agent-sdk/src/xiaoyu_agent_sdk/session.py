@@ -1171,11 +1171,52 @@ class Session:
         self.close()
 
 
+def _close_abandoned_setup(setup: asyncio.Future) -> None:
+    """Close a session whose ``AsyncSession.open`` was cancelled during setup."""
+    if setup.cancelled() or setup.exception() is not None:
+        return
+    # close may block on storage I/O: keep it off the event loop thread, and
+    # non-daemon so interpreter exit still waits for the writer to be released.
+    threading.Thread(target=setup.result().close, name="xiaoyu-sdk-abandoned-open").start()
+
+
 class AsyncSession:
-    """Async host interface; callbacks run on the caller's event loop."""
+    """Async host interface; callbacks run on the caller's event loop.
+
+    Prefer ``await AsyncSession.open(...)``: the constructor builds the session
+    synchronously (opening storage, preparing transport and worker) on the
+    calling thread, which stalls the event loop for that long.
+    """
 
     def __init__(self, options: SessionOptions, *, resume_from: Path | None = None, resume_id: str | None = None) -> None:
         self._session = Session(options, resume_from=resume_from, resume_id=resume_id)
+
+    @classmethod
+    async def open(
+        cls, options: SessionOptions, *, resume_from: Path | None = None, resume_id: str | None = None
+    ) -> AsyncSession:
+        """Create a session without blocking the event loop.
+
+        Same arguments and errors as the constructor; the synchronous setup runs
+        in a worker thread. Cancellation takes effect at once; setup cannot be
+        stopped midway, so the session it produces is closed in the background
+        as soon as it exists, leaving no storage lock or worker behind.
+        """
+        setup = asyncio.ensure_future(
+            asyncio.to_thread(Session, options, resume_from=resume_from, resume_id=resume_id)
+        )
+        try:
+            # wait, not shield: cancelling us leaves setup running, and a later
+            # setup failure is consumed by the callback instead of being logged.
+            await asyncio.wait({setup})
+        except asyncio.CancelledError:
+            setup.add_done_callback(_close_abandoned_setup)
+            raise
+        inner = setup.result()
+        session = object.__new__(cls)
+        session._session = inner
+        session._bind_loop()
+        return session
 
     def _bind_loop(self) -> None:
         loop = asyncio.get_running_loop()
@@ -1348,7 +1389,7 @@ def run(prompt: Prompt, options: SessionOptions, *, output: OutputSpec | None = 
 
 
 async def run_async(prompt: Prompt, options: SessionOptions, *, output: OutputSpec | None = None) -> RunResult:
-    async with AsyncSession(options) as session:
+    async with await AsyncSession.open(options) as session:
         return await session.run(prompt, output=output)
 
 
