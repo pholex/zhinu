@@ -233,6 +233,37 @@ class TestCommand(unittest.TestCase):
         self.assertEqual(code, 1)
         self.assertFalse(self.path.exists())
 
+    def test_no_terminal_points_back_to_users_own_terminal(self) -> None:
+        """在 agent 的 bash 工具里跑（stdin 是 /dev/null）：说清楚没改的原因和去处，
+        而且不提 --yes——沙箱里加了也写不进去，只会把模型引去申请升权。"""
+        with mock.patch("builtins.input", side_effect=EOFError):
+            code, out = self.run_cmd(["install", "zsh", "--natural"])
+        self.assertEqual(code, 1)
+        self.assertFalse(self.path.exists())
+        self.assertIn("在自己的终端里运行 xiaoyu term install zsh --natural", out)
+        self.assertNotIn("--yes", out)
+
+    def test_permission_denied_points_back_to_users_own_terminal(self) -> None:
+        with mock.patch.object(shell_setup, "apply", side_effect=PermissionError(1, "Operation not permitted")):
+            code, out = self.run_cmd(["install", "zsh", "--yes"])
+        self.assertEqual(code, 1)
+        self.assertIn("沙箱", out)
+        self.assertIn("在自己的终端里运行 xiaoyu term install zsh --yes", out)
+
+    def test_other_write_errors_do_not_blame_the_sandbox(self) -> None:
+        with mock.patch.object(shell_setup, "apply", side_effect=OSError(28, "No space left on device")):
+            code, out = self.run_cmd(["install", "zsh", "--yes"])
+        self.assertEqual(code, 1)
+        self.assertNotIn("沙箱", out)
+
+    def test_uninstall_without_terminal_explains(self) -> None:
+        self.run_cmd(["install", "zsh", "--yes"])
+        with mock.patch("builtins.input", side_effect=EOFError):
+            code, out = self.run_cmd(["uninstall"])
+        self.assertEqual(code, 1)
+        self.assertIn("在自己的终端里运行 xiaoyu term uninstall", out)
+        self.assertIn("term init", _read(self.path))
+
     def test_natural_rejected_for_bash(self) -> None:
         code, out = self.run_cmd(["install", "bash", "--natural", "--yes"])
         self.assertEqual(code, 2)

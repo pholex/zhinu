@@ -135,22 +135,14 @@ def term_init_command(argv: list[str]) -> int:
     return 0
 
 
-def _confirm(question: str) -> bool:
-    try:
-        answer = input(ui.prompt(question)).strip().lower()
-    except (EOFError, KeyboardInterrupt):
-        print()
-        return False
-    return answer in ("y", "yes")
-
-
 def term_install_command(argv: list[str]) -> int:
     """`xiaoyu term install`：把终端集成与 Tab 补全写进 shell 启动文件。
 
-    各平台写哪个文件、补全怎么接，见 shell_setup 的模块说明。改的是工作区之外的用户配置，所以和 terminal-setup 同一姿势：先把计划打出来，
-    确认后才写，写前留 .bak。
+    各平台写哪个文件、补全怎么接，见 shell_setup 的模块说明。改的是工作区之外的
+    用户配置，所以和 terminal-setup 同一姿势：先把计划打出来，确认后才写，写前留 .bak。
     """
     from . import shell_setup, term
+    from .cli import _rerun_command, confirm_config_change, report_config_write_error
 
     parser = argparse.ArgumentParser(
         prog="xiaoyu term install",
@@ -200,15 +192,15 @@ def term_install_command(argv: list[str]) -> int:
         return 0 if plan.action == "already" else 1
     if args.dry_run:
         return 0
+    rerun = _rerun_command("xiaoyu term install", argv)
     if not args.yes:
         print(ui.secondary("  会先留一份 .bak 备份；只动小羽自己标记的那一段。"))
-        if not _confirm("写入？[y/N] "):
-            print(ui.secondary("没有改动。"))
+        if not confirm_config_change("写入？[y/N] ", rerun):
             return 1
     try:
         print(ui.success("  " + shell_setup.apply(plan)))
     except OSError as exc:
-        print(ui.error(f"  写入失败：{exc}"), file=sys.stderr)
+        report_config_write_error(_display_path(plan.path), exc, rerun)
         return 1
     print(ui.secondary(f"新开一个终端即可使用 @x / @c；当前终端执行 source {_display_path(plan.path)} 立刻生效。"))
     if any("xiaoyu completion" in line for line in lines):
@@ -219,6 +211,7 @@ def term_install_command(argv: list[str]) -> int:
 def term_uninstall_command(argv: list[str]) -> int:
     """`xiaoyu term uninstall`：移除 install 写入的段落；用户手写的行不动。"""
     from . import shell_setup
+    from .cli import _rerun_command, confirm_config_change, report_config_write_error
 
     parser = argparse.ArgumentParser(
         prog="xiaoyu term uninstall",
@@ -239,14 +232,14 @@ def term_uninstall_command(argv: list[str]) -> int:
         return 0
     if args.dry_run:
         return 0
-    if not args.yes and not _confirm(f"移除这 {len(plans)} 处？[y/N] "):
-        print(ui.secondary("没有改动。"))
+    rerun = _rerun_command("xiaoyu term uninstall", argv)
+    if not args.yes and not confirm_config_change(f"移除这 {len(plans)} 处？[y/N] ", rerun):
         return 1
     for plan in plans:
         try:
             print(ui.success("  " + shell_setup.apply_removal(plan)))
         except OSError as exc:
-            print(ui.error(f"  {plan.path}：写入失败 {exc}"), file=sys.stderr)
+            report_config_write_error(_display_path(plan.path), exc, rerun)
             return 1
     print(ui.secondary("已打开的终端里 @x / @c 与 Tab 补全仍在，关掉重开后消失。"))
     return 0

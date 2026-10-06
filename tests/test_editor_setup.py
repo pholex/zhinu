@@ -6,13 +6,15 @@
 
 from __future__ import annotations
 
+import contextlib
+import io
 import json
 import tempfile
 import unittest
 from pathlib import Path
 from unittest import mock
 
-from xiaoyu import editor_setup
+from xiaoyu import cli, editor_setup
 
 
 class TestSequence(unittest.TestCase):
@@ -173,6 +175,39 @@ class TestRemoval(unittest.TestCase):
             editor_setup.apply_removal(
                 editor_setup.Plan(self.editor, self.path, "install")
             )
+
+
+class TestCommandWithoutTerminal(unittest.TestCase):
+    """terminal-setup 在 agent 的工具里跑：读不到确认就指回用户自己的终端。"""
+
+    def setUp(self) -> None:
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.path = Path(tmp.name) / "keybindings.json"
+        plan = editor_setup.Plan(editor_setup.Editor("测试编辑器", "Test"), self.path, "install", "新建")
+        patcher = mock.patch.object(editor_setup, "make_plans", return_value=[plan])
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def run_cmd(self, argv: list[str]) -> tuple[int, str]:
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(out):
+            code = cli.terminal_setup_command(argv)
+        return code, out.getvalue()
+
+    def test_no_terminal(self) -> None:
+        with mock.patch("builtins.input", side_effect=EOFError):
+            code, out = self.run_cmd([])
+        self.assertEqual(code, 1)
+        self.assertFalse(self.path.exists())
+        self.assertIn("在自己的终端里运行 xiaoyu terminal-setup", out)
+        self.assertNotIn("--yes", out)
+
+    def test_permission_denied(self) -> None:
+        with mock.patch.object(editor_setup, "apply", side_effect=PermissionError(1, "Operation not permitted")):
+            code, out = self.run_cmd(["--yes"])
+        self.assertEqual(code, 1)
+        self.assertIn("沙箱", out)
 
 
 if __name__ == "__main__":
