@@ -718,13 +718,13 @@ def split_resume_positionals(first: str | None, rest: list[str]) -> tuple[int | 
 
 
 def resume_hint(agent: Agent) -> str:
-    """开场一行：接回本会话的完整命令，复制即用。
+    """接回本会话的提示：命令单独占一行，三击选中整行就是完整命令，复制即用。
 
     id 就是会话文件名（见 looks_like_session_id）——同一个 id 也是
     `xiaoyu sessions inspect/export` 的引用，拿去给别的工具分析这场会话。
     """
     log = getattr(agent, "session_log", None)  # run_repl 的测试替身没有它
-    return f"接回本会话：xiaoyu resume {log.path.stem}" if log is not None else ""
+    return f"接回本会话：\nxiaoyu resume {log.path.stem}" if log is not None else ""
 
 
 def _session_label(info: SessionInfo) -> str:
