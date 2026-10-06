@@ -26,25 +26,11 @@
 ## 安装
 
 ```bash
-pip install "xiaoyu-agent[tui]"   # 带交互界面：补全、历史、贴图、diff 高亮
-xiaoyu doctor                     # 装完体检一遍
+pip install xiaoyu-agent                 # 核心：脚本 / -p 调用，交互退回明文
+pip install "xiaoyu-agent[tui,serve]"    # 推荐：交互界面 + HTTP API / 浏览器扩展
 ```
 
-可选组件按需加进方括号，例如 `pip install "xiaoyu-agent[tui,serve]"`：
-
-- `[serve]`：HTTP API，给 n8n / Dify 这类编排器用（[docs/http-api.md](docs/http-api.md)）
-- `[otel]`：导出 OpenTelemetry（[docs/observability.md](docs/observability.md)）
-- `[bedrock]`：凭 AWS 凭证链直连 Bedrock（[docs/configuration.md](docs/configuration.md)）
-- `[browser]`：内置浏览器工具，用 playwright 另起一个 Chromium，装完再跑一次 `playwright install chromium`（想操作你自己登录着的 Chrome，用的是浏览器扩展，见 [docs/browser-bridge.md](docs/browser-bridge.md)）
-
-想一次装全：
-
-```bash
-pip install "xiaoyu-agent[tui,serve,otel,bedrock,browser]"
-playwright install chromium
-```
-
-要把小羽作为库嵌进你的 Python 程序，装独立的 SDK 包 `pip install xiaoyu-agent-sdk`（[docs/sdk.md](docs/sdk.md)）。
+其它可选组件：`[otel]`、`[bedrock]`、`[browser]`；嵌入 Python 程序用独立包 `xiaoyu-agent-sdk`。
 
 升级与卸载：
 
@@ -53,7 +39,7 @@ xiaoyu update                     # 升级
 xiaoyu uninstall                  # 卸载；加 --purge 连配置一起删
 ```
 
-`eval "$(xiaoyu completion zsh)"` 开 shell 补全（bash / zsh / fish）。连不上模型时用 `xiaoyu doctor --probe` 真发一条请求排查；报 issue 时用 `xiaoyu doctor --bundle` 打诊断包（含路径与命令历史，分享前看一眼）。
+装完跑 `xiaoyu doctor` 体检一遍；`eval "$(xiaoyu completion zsh)"` 开 shell 补全（bash / zsh / fish）。连不上模型时用 `xiaoyu doctor --probe` 真发一条请求排查；报 issue 时用 `xiaoyu doctor --bundle` 打诊断包（含路径与命令历史，分享前看一眼）。
 
 ## 配置
 
