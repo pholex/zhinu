@@ -240,13 +240,13 @@ class TestCommand(unittest.TestCase):
         self.assertFalse(self.path.exists())
 
     def test_unknown_shell_asks_to_name_it(self) -> None:
-        with mock.patch.dict(os.environ, {"SHELL": ""}), mock.patch.object(cli_term.os, "name", "posix"):
+        with mock.patch.dict(os.environ, {"SHELL": ""}), mock.patch.object(cli_term, "_on_windows", return_value=False):
             code, out = self.run_cmd(["install", "--yes"])
         self.assertEqual(code, 2)
         self.assertIn("xiaoyu term install zsh", out)
 
     def test_windows_without_shell_points_to_git_bash_and_powershell(self) -> None:
-        with mock.patch.dict(os.environ, {"SHELL": ""}), mock.patch.object(cli_term.os, "name", "nt"):
+        with mock.patch.dict(os.environ, {"SHELL": ""}), mock.patch.object(cli_term, "_on_windows", return_value=True):
             code, out = self.run_cmd(["install", "--yes"])
         self.assertEqual(code, 2)
         self.assertIn("term install bash", out)
