@@ -657,6 +657,42 @@ def save_recall(session_id: str, ask: str, command: str, now: float | None = Non
         pass
 
 
+#  `@c` 判定这不是一条命令能办的事时的退出码：集成脚本据此把同一句需求转给 `@x`。
+#  需求可能是在「要什么命令 ›」提示符下读的、可能带着管道材料，shell 手里都没有，
+#  所以经一个文件交接（与 pending 同目录，同样只有自己可读），`term run --handoff` 取走即删
+HANDOFF_EXIT = 3
+
+
+def handoff_path(session_id: str) -> Path:
+    return pending_dir() / f"{session_id}.handoff"
+
+
+def save_handoff(session_id: str, question: str) -> bool:
+    """写不进去返回 False：调用方退回只打一句说明，不让 shell 去接一个空交接。"""
+    from . import fsguard
+
+    path = handoff_path(session_id)
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        fsguard.write_atomic(path, question, private=True)
+    except OSError:
+        return False
+    return True
+
+
+def take_handoff(session_id: str) -> str:
+    path = handoff_path(session_id)
+    try:
+        question = path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return ""
+    try:
+        path.unlink()
+    except OSError:
+        pass
+    return question.strip()
+
+
 def _suggestion_json(command: str, note: str = "") -> str:
     return json.dumps({"command": command, "note": note}, ensure_ascii=False)
 
@@ -837,7 +873,9 @@ def render_script(
 #  问号就问不出去。别名展开只发生在命令位置，preexec 的 $1 仍是人敲的原文。
 #  `@c`：命令从子进程的 stdout 拿回来（说明走 stderr，直接上屏），`print -z` 把它
 #  压进编辑缓冲区栈——下一个提示符上就是这条命令，可改，回车才执行。-r 不能少：
-#  不带的话 print 会把命令里的反斜杠当转义吃掉
+#  不带的话 print 会把命令里的反斜杠当转义吃掉。退出码 3（HANDOFF_EXIT）= 不是一条
+#  命令能办的事，同一句需求转给 `term run --handoff`（bash 同）；--handoff 由脚本带上，
+#  升级前 eval 的旧脚本不认 3，所以没带它的调用照旧只打一句说明
 _ZSH = r"""# xiaoyu 终端集成（zsh）——放进 ~/.zshrc：eval "$(xiaoyu term init zsh)"
 @@SESSION@@
 export @@PENDING_ENV@@=@@DIR@@/"$@@SESSION_ENV@@".pending
@@ -882,8 +920,11 @@ __xiaoyu_term_shadowed() {
   return 0
 }
 __xiaoyu_term_command() {
-  local cmd
-  cmd=$(@@LAUNCHER@@ term command --shell zsh --shell-version "$ZSH_VERSION" "$@") || return $?
+  local cmd st
+  cmd=$(@@LAUNCHER@@ term command --handoff --shell zsh --shell-version "$ZSH_VERSION" "$@")
+  st=$?
+  (( st == 3 )) && { @@LAUNCHER@@ term run --handoff; return $?; }
+  (( st == 0 )) || return $st
   [[ -n $cmd ]] || return 0
   __xiaoyu_term_shadowed "$cmd"
   print -rz -- "$cmd"
@@ -981,8 +1022,11 @@ __xiaoyu_term_shadowed() {
   return 0
 }
 @c() {
-  local cmd
-  cmd=$(@@LAUNCHER@@ term command --shell bash --shell-version "$BASH_VERSION" "$@") || return $?
+  local cmd st
+  cmd=$(@@LAUNCHER@@ term command --handoff --shell bash --shell-version "$BASH_VERSION" "$@")
+  st=$?
+  [[ $st == 3 ]] && { @@LAUNCHER@@ term run --handoff; return $?; }
+  [[ $st == 0 ]] || return $st
   [[ -n $cmd ]] || return 0
   __xiaoyu_term_shadowed "$cmd"
   builtin history -s -- "$cmd"

@@ -229,6 +229,38 @@ class BashCommandE2E(E2ECase):
         self.assertIn("\tls\n", recorded)
         self.assertNotIn("@c", recorded)
 
+    def test_declined_request_is_handed_to_at_x(self) -> None:
+        """不是一条命令能办的事：同一句需求直接转给 @x，人不必再敲一遍。
+        两次请求读的是同一份脚本——@x 收到的回答就是那段 JSON 原文，看得见即证明它跑了。"""
+        launcher = f"{shlex.quote(sys.executable)} -P -m xiaoyu"
+        env = self.scripted_env('text: {"command": "", "note": "这得用 @x"}\n')
+        env["PYTHONPATH"] = str(Path(__file__).resolve().parent.parent)
+        env.pop("XIAOYU_TERM_SESSION", None)
+        env.pop("XIAOYU_TERM_PENDING", None)
+        env["HISTFILE"] = str(Path(self.tmp) / "bash_history")
+        body = "\n".join(
+            [
+                f'eval "$({launcher} term init bash --launcher {shlex.quote(launcher)})"',
+                "@c 本机的 ip 是哪块网卡，讲讲 </dev/null",
+                'echo "STATUS=$?"',
+                "exit",
+                "",
+            ]
+        )
+        proc = subprocess.run(
+            ["bash", "--noprofile", "--norc", "-i"],
+            input=body, capture_output=True, text=True, encoding="utf-8",
+            env=env, cwd=str(self.workspace), timeout=_TIMEOUT,
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr[-1500:])
+        self.assertIn("STATUS=0", proc.stdout)
+        self.assertIn("转给 @x", proc.stderr)
+        self.assertRegex(proc.stderr, r"会话 term-[0-9a-f]+")
+        self.assertIn("这得用 @x", proc.stdout)
+        sessions = sorted((Path(self.tmp) / "config" / "xiaoyu" / "sessions" / "term").glob("*.jsonl"))
+        self.assertEqual(len(sessions), 1, sessions)
+        self.assertIn("本机的 ip 是哪块网卡，讲讲", sessions[0].read_text(encoding="utf-8"))
+
 
 class _ZshOnPty:
     """一个跑在 pty 上的交互式 zsh：敲一行、等屏幕上出现某段输出。"""

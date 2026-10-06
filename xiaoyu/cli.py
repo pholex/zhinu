@@ -1539,6 +1539,10 @@ def term_run_command(argv: list[str]) -> int:
     parser.add_argument("--mode", choices=list(modes.CYCLE), default=None, help="起始模式（同主命令）")
     parser.add_argument("--yolo", action="store_true", help="不再逐个确认写文件和执行命令")
     parser.add_argument("--effort", choices=list(EFFORT_LEVELS), default=None, help="推理深度")
+    parser.add_argument(
+        "--handoff", action="store_true",
+        help="问题取自 @c 转过来的那句需求（集成脚本用；@c 判定不是一条命令能办的事时）",
+    )
     args = parser.parse_args(argv)
 
     session_id = term.current_session()
@@ -1551,7 +1555,14 @@ def term_run_command(argv: list[str]) -> int:
             file=sys.stderr,
         )
         return 2
-    question = compose_prompt(args.question, read_piped_stdin())
+    if args.handoff:
+        question = term.take_handoff(session_id)
+        if not question:
+            print(ui.error("没有 @c 转过来的需求"), file=sys.stderr)
+            return 2
+        print(ui.secondary("这不像一条命令能办的事，转给 @x"), file=sys.stderr)
+    else:
+        question = compose_prompt(args.question, read_piped_stdin())
     if not question and sys.stdin.isatty():
         typed = read_question_line()
         if typed is None:
@@ -1677,13 +1688,13 @@ def term_suggest_command(argv: list[str]) -> int:
     命令打到 stdout（shell 函数接走，放回人的提示符或历史），说明与提示走
     stderr。不进会话、不带工具、不取走 pending：见 term 模块 docstring。
     退出码：0 给了命令；1 模型认为这不是一条命令能办的事（说明照打）；
-    2 用法或配置错；130 被打断。
+    3 同上但带了 --handoff：需求已留给 `term run --handoff`；2 用法或配置错；130 被打断。
     """
     from . import command_check, errors, folder_trust, term
     from .mcp import _redact
 
     flags, words = _leading_flags(
-        argv, ("--model", "--effort", "--shell", "--shell-version"), ("-h", "--help")
+        argv, ("--model", "--effort", "--shell", "--shell-version"), ("-h", "--help", "--handoff")
     )
     parser = argparse.ArgumentParser(
         prog="xiaoyu term command",
@@ -1699,6 +1710,10 @@ def term_suggest_command(argv: list[str]) -> int:
     )
     parser.add_argument("--shell", default="", help="命令要在哪种 shell 里跑（集成脚本会带上）")
     parser.add_argument("--shell-version", default="", help="shell 版本（集成脚本会带上）")
+    parser.add_argument(
+        "--handoff", action="store_true",
+        help=f"不是一条命令能办的事就把需求转给 @x：留下交接、以退出码 {term.HANDOFF_EXIT} 告诉脚本（集成脚本会带上）",
+    )
     args = parser.parse_args(flags)
     if args.help:
         #  stdout 是给 shell 函数接命令用的：帮助打到那里会被放上提示符
@@ -1781,6 +1796,10 @@ def term_suggest_command(argv: list[str]) -> int:
         print(ui.error(f"{exc}，没有可用的命令"), file=sys.stderr)
         return 1
     if not command:
+        #  讲解、多步排查、要总结的事：脚本接得住就原样转给 @x，人不必再敲一遍。
+        #  模型的说明不打——它多半是「这得用 @x」或一句反问，@x 会自己接着问
+        if args.handoff and session_id and term.save_handoff(session_id, compose_prompt([ask], material)):
+            return term.HANDOFF_EXIT
         print(ui.secondary(note or "这不像是一条命令能办的事；要它动手可以用 @x"), file=sys.stderr)
         return 1
     if note:
