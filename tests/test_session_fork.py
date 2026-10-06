@@ -124,7 +124,14 @@ class ResumeByIdE2ETest(ForkE2ETest):
         self.assertEqual(proc.returncode, 0, proc.stderr)
         result = json.loads(proc.stdout.splitlines()[-1])
         resumed = Path(result["session_log"]).read_text(encoding="utf-8")
-        self.assertIn(str(older), resumed)  # resumed_from 指向点名的那份，不是最新的
+        #  resumed_from 指向点名的那份，不是最新的。按事件解析再比路径：JSON 里的
+        #  Windows 路径反斜杠是转义过的，拿裸字符串去正文里找在那边必不中
+        sources = [
+            Path(record["source"])
+            for record in map(json.loads, filter(str.strip, resumed.splitlines()))
+            if record.get("event") == "resumed_from"
+        ]
+        self.assertEqual(sources, [older])
         self.assertIn("第一轮：查清结构", resumed)
         self.assertIn('"继续"', resumed)  # id 之后的词才是指令
 
