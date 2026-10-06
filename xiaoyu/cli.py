@@ -1583,6 +1583,46 @@ def completion_command(argv: list[str]) -> int:
     return 0
 
 
+def confirm_config_change(question: str, rerun: str) -> bool:
+    """改用户个人配置（启动文件、编辑器键绑定）前的确认。
+
+    读不到输入（stdin 不是终端：在 agent 的 bash 工具里、管道里运行）时说清楚
+    为什么没改、该去哪儿运行——这时读输出的往往是模型，一句"没有改动"它看不出
+    原因，会接着去申请沙箱升权或自己动手改文件。刻意不提 --yes：那条路在沙箱里
+    照样写不进去，只会把它引向升权。
+    """
+    try:
+        answer = input(ui.prompt(question)).strip().lower()
+    except EOFError:
+        print()
+        print(ui.warning("没有改动：读不到确认输入（不是在交互终端里运行的）。"))
+        print(ui.secondary(f"这会改用户的个人配置，要用户本人确认：请在自己的终端里运行 {rerun}"))
+        return False
+    except KeyboardInterrupt:
+        print()
+        return False
+    if answer not in ("y", "yes"):
+        print(ui.secondary("没有改动。"))
+        return False
+    return True
+
+
+def report_config_write_error(target: str, exc: OSError, rerun: str) -> None:
+    """写个人配置失败。权限被拒多半是在 agent 的沙箱里跑的：同样指回用户自己的终端。"""
+    print(ui.error(f"  {target}：写入失败 {exc}"), file=sys.stderr)
+    if isinstance(exc, PermissionError):
+        print(
+            ui.secondary(f"  在 agent 会话里运行时，沙箱不让写这些文件：请在自己的终端里运行 {rerun}"),
+            file=sys.stderr,
+        )
+
+
+def _rerun_command(prefix: str, argv: list[str]) -> str:
+    import shlex
+
+    return " ".join([prefix, *(shlex.quote(arg) for arg in argv)])
+
+
 def terminal_setup_command(argv: list[str]) -> int:
     """配 VS Code 系编辑器的 Shift+Enter。
 
@@ -1618,21 +1658,16 @@ def terminal_setup_command(argv: list[str]) -> int:
         return 0
     if args.dry_run:
         return 0
+    rerun = _rerun_command("xiaoyu terminal-setup", argv)
     if not args.yes:
         print(ui.secondary("  会先留一份 .bak 备份；已有的 shift+enter 绑定不会被覆盖。"))
-        try:
-            answer = input(ui.prompt(f"写入这 {len(todo)} 个文件？[y/N] ")).strip().lower()
-        except (EOFError, KeyboardInterrupt):
-            print()
-            return 1
-        if answer not in ("y", "yes"):
-            print(ui.secondary("没有改动。"))
+        if not confirm_config_change(f"写入这 {len(todo)} 个文件？[y/N] ", rerun):
             return 1
     for plan in todo:
         try:
             print(ui.success("  " + editor_setup.apply(plan)))
         except OSError as exc:
-            print(ui.error(f"  {plan.editor.name}：写入失败 {exc}"), file=sys.stderr)
+            report_config_write_error(plan.editor.name, exc, rerun)
             return 1
     print(ui.secondary("重启编辑器（或重开终端面板）后生效。"))
     return 0
