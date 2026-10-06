@@ -115,12 +115,16 @@ class ScriptRenderTest(unittest.TestCase):
     def test_at_c_exists_only_where_the_command_can_be_handed_back(self) -> None:
         zsh, bash = self.render("zsh"), self.render("bash")
         self.assertIn("alias @c='noglob __xiaoyu_term_command'", zsh)
-        self.assertIn('term command --shell zsh --shell-version "$ZSH_VERSION" "$@"', zsh)
+        self.assertIn('term command --handoff --shell zsh --shell-version "$ZSH_VERSION" "$@"', zsh)
         #  -r：不带的话 print 会把命令里的反斜杠当转义吃掉
         self.assertIn('print -rz -- "$cmd"', zsh)
         self.assertIn("@c() {", bash)
-        self.assertIn('term command --shell bash --shell-version "$BASH_VERSION" "$@"', bash)
+        self.assertIn('term command --handoff --shell bash --shell-version "$BASH_VERSION" "$@"', bash)
         self.assertIn('builtin history -s -- "$cmd"', bash)
+        #  不是一条命令能办的事：脚本认得这个退出码，把需求转给 @x
+        self.assertEqual(term.HANDOFF_EXIT, 3)
+        self.assertIn("(( st == 3 )) && { true term run --handoff; return $?; }", self.render("zsh", launcher="true"))
+        self.assertIn("[[ $st == 3 ]] && { true term run --handoff; return $?; }", self.render("bash", launcher="true"))
         for shell in ("zsh", "bash"):
             with self.subTest(shell=shell):
                 #  @c 自己不进 pending
@@ -827,6 +831,28 @@ class TermRunTest(unittest.TestCase):
         self.assertEqual(code, 0, err)
         self.assertEqual(self.sent[0][1], "在吗")
 
+    def test_handoff_takes_the_request_at_c_left(self) -> None:
+        directory = Path(self.tmp.name) / "term"
+        with mock.patch.object(term, "pending_dir", lambda: directory):
+            term.append_pending(self.pending, "ipconfig getifaddr en0", cwd="/w", ts=1)
+            self.assertTrue(term.save_handoff("term-t1", "本机的 ip 是哪块网卡"))
+            #  命令行上的词与管道都不算：问题只取交接
+            with mock.patch.object(cli, "read_piped_stdin", side_effect=AssertionError("不该读管道")):
+                code, err = self.run_term("--handoff", "多余的")
+            self.assertEqual(code, 0, err)
+            self.assertIn("转给 @x", err)
+            prompt = self.sent[0][1]
+            self.assertTrue(prompt.endswith("本机的 ip 是哪块网卡"), prompt)
+            self.assertNotIn("多余的", prompt)
+            #  终端上下文照常带上
+            self.assertIn("$ ipconfig getifaddr en0", prompt)
+            self.assertFalse(term.handoff_path("term-t1").exists())
+            #  交接已被取走（或从没有过）：不去问模型一个空问题
+            code, err = self.run_term("--handoff")
+            self.assertEqual(code, 2)
+            self.assertIn("没有 @c 转过来的需求", err)
+            self.assertEqual(len(self.sent), 1)
+
     def test_config_failure_requeues_commands(self) -> None:
         term.append_pending(self.pending, "ls", cwd="/w", ts=1)
         with mock.patch.object(FakeConfig, "from_env", classmethod(lambda cls, **k: (_ for _ in ()).throw(cli.MissingConfig("没配 key")))):
@@ -1330,6 +1356,34 @@ class TermCommandTest(_TermDirMixin, unittest.TestCase):
         self.assertEqual(term.load_recall("term-c1"), [])
         self.reply = '{"command": ""}'
         self.assertIn("@x", self.run_command("你好")[2])
+
+    def test_declined_with_handoff_leaves_the_request_for_at_x(self) -> None:
+        self.reply = '{"command": "", "note": "这得用 @x"}'
+        code, out, err = self.run_command("--handoff", "本机的", "ip", "是哪块网卡")
+        self.assertEqual((code, out), (term.HANDOFF_EXIT, ""))
+        #  模型的说明不打：@x 会接着做，不该先看到一句「去用 @x」
+        self.assertNotIn("这得用 @x", err)
+        self.assertEqual(term.take_handoff("term-c1"), "本机的 ip 是哪块网卡")
+        self.assertEqual(term.take_handoff("term-c1"), "", "取走即删")
+        #  管道材料一并转过去，排在需求前面（同 @x 自己读管道的顺序）
+        with mock.patch.object(cli, "read_piped_stdin", return_value="ERR 42"):
+            self.assertEqual(self.run_command("--handoff", "这是什么错")[0], term.HANDOFF_EXIT)
+        self.assertEqual(term.take_handoff("term-c1"), "ERR 42\n\n这是什么错")
+
+    def test_handoff_needs_the_flag_and_a_session(self) -> None:
+        self.reply = '{"command": "", "note": "要查哪个端口？"}'
+        #  升级前 eval 的旧脚本不带 --handoff、也不认退出码 3：照旧只打说明
+        self.assertEqual(self.run_command("查端口")[0], 1)
+        self.assertFalse(term.handoff_path("term-c1").exists())
+        with mock.patch.dict(os.environ, {term.SESSION_ENV: ""}):
+            code, _, err = self.run_command("--handoff", "查端口")
+        self.assertEqual(code, 1)
+        self.assertIn("要查哪个端口？", err)
+
+    def test_a_real_command_never_hands_off(self) -> None:
+        code, out, _ = self.run_command("--handoff", "看看")
+        self.assertEqual((code, out), (0, "du -sh *\n"))
+        self.assertFalse(term.handoff_path("term-c1").exists())
 
     def test_unparseable_reply_puts_nothing_on_the_prompt(self) -> None:
         self.reply = "先这样。\n再那样。"
