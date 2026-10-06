@@ -7,7 +7,8 @@
 ## Case 1: 核心模块不得依赖 TUI 库
 
 **Scope**: `xiaoyu/agent.py`、`xiaoyu/render.py`、`xiaoyu/events.py`、
-`xiaoyu/cli.py`、`xiaoyu/scripted.py`、`xiaoyu/wire.py`、`xiaoyu/embedding.py`
+`xiaoyu/cli.py`、`xiaoyu/cli_mcp.py`、`xiaoyu/cli_plugin.py`、`xiaoyu/cli_term.py`、
+`xiaoyu/scripted.py`、`xiaoyu/wire.py`、`xiaoyu/embedding.py`
 
 **Requirements**:
 - 以上文件中不得出现任何对 `rich` 或 `prompt_toolkit` 的 import（顶层或函数内都不行）。

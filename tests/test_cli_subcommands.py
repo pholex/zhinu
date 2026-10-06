@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ast
+import importlib
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -14,7 +15,7 @@ class SubcommandTableTest(unittest.TestCase):
     def test_every_entry_has_a_real_handler(self) -> None:
         for names, handler, usage, summary in cli.SUBCOMMANDS:
             with self.subTest(names=names):
-                self.assertTrue(callable(getattr(cli, handler, None)), handler)
+                self.assertTrue(callable(cli.subcommand_handler(handler)), handler)
                 self.assertTrue(usage.startswith(names[0]))
                 self.assertTrue(summary.strip())
 
@@ -33,9 +34,12 @@ class SubcommandTableTest(unittest.TestCase):
 
     def test_dispatch_goes_through_the_table(self) -> None:
         for names, handler, _, _ in cli.SUBCOMMANDS:
+            #  住在自己模块里的子命令族：patch 要打在函数真正所在的模块上
+            module_name, _, attr = handler.rpartition(".")
+            owner = importlib.import_module(f"xiaoyu.{module_name}") if module_name else cli
             for name in names:
                 with self.subTest(name=name), mock.patch.object(
-                    cli, handler, return_value=42
+                    owner, attr, return_value=42
                 ) as fake:
                     self.assertEqual(cli.main([name, "--flag", "x"]), 42)
                     fake.assert_called_once_with(["--flag", "x"])
