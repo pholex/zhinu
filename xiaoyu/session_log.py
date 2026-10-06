@@ -78,6 +78,10 @@ def check_session_id(raw: str) -> str:
     return name
 
 
+#  终端集成（`@x`）的会话目录名：term.term_sessions_dir 是 sessions_dir() / 它
+TERM_SUBDIR = "term"
+
+
 def _workspace_slug(workspace: str) -> str:
     """工作区路径 → 子目录名（/Users/a/b → -Users-a-b）。
 
@@ -680,6 +684,7 @@ class SessionInfo:
     session_id: str = ""  # `--session-id` 起的名字；匿名会话为空
     title: str = ""  # `xiaoyu sessions rename` 起的显示名（meta.title）；没起过为空
     last: str = ""  # 末条用户/助手消息的摘要（≤ LAST_PREVIEW 字）：这场聊到哪了
+    empty: bool = False  # 头部没有用户消息、尾部也没有正文：开了没说话就退出的那种
 
     @property
     def label(self) -> str:
@@ -698,13 +703,23 @@ _TAIL_WINDOW = 32 * 1024
 _HEAD_SCAN_LINES = 10
 
 
-def list_sessions(limit: int = 20, workspace: str | None = None, *, directory: Path | None = None) -> list[SessionInfo]:
+def list_sessions(
+    limit: int = 20,
+    workspace: str | None = None,
+    *,
+    directory: Path | None = None,
+    include_empty: bool = False,
+) -> list[SessionInfo]:
     """按时间倒序列出历史会话（文件名即时间戳，跨目录按文件名排序仍是时间序）。
 
     会话按工作区分子目录存放；根目录下的平铺文件是分区之前的存量，一并列出。
-    workspace 非空时只扫对应 slug 子目录 + 存量平铺文件，但过滤仍以 meta 里的
-    原始 workspace 为准（slug 转义可能撞名）。每个文件只读头几行——
-    拿 meta + 首条用户消息当标题就够了。
+    workspace 非空时只扫对应 slug 子目录 + 存量平铺文件 + 终端集成的 term/ 目录，
+    过滤一律以 meta 里的原始 workspace 为准（slug 转义可能撞名；term/ 里的会话
+    不按目录分，归到它起头时所在的目录）。每个文件只读头几行——拿 meta + 首条
+    用户消息当标题就够了。
+
+    空会话（开了没说话就退出）默认不列：选中它只会得到「没有可恢复的消息」。
+    按名字找会话的地方传 include_empty=True，免得名字明明存在却找不到。
     """
     directory = directory if directory is not None else sessions_dir()
     if not directory.is_dir():
@@ -712,6 +727,9 @@ def list_sessions(limit: int = 20, workspace: str | None = None, *, directory: P
     candidates = list(directory.glob("*.jsonl"))  # 存量平铺文件
     if workspace:
         candidates += list((directory / _workspace_slug(workspace)).glob("*.jsonl"))
+        #  `@x` 的会话住在 term/（见 term.term_sessions_dir），不按目录分：在这个
+        #  目录里问过的，回到这里也该算它的一份，不必记得加 --all
+        candidates += list((directory / TERM_SUBDIR).glob("*.jsonl"))
     else:
         candidates += list(directory.glob("*/*.jsonl"))
     infos: list[SessionInfo] = []
@@ -720,6 +738,8 @@ def list_sessions(limit: int = 20, workspace: str | None = None, *, directory: P
         if info is None:
             continue
         if workspace and info.workspace != workspace:
+            continue
+        if info.empty and not include_empty:
             continue
         infos.append(info)
         if len(infos) >= limit:
@@ -748,6 +768,7 @@ def _head_info(path: Path) -> SessionInfo | None:
         return None
     if not meta:
         return None
+    last = last_preview(path)
     return SessionInfo(
         path=path,
         started_at=str(meta.get("started_at", "")),
@@ -756,7 +777,9 @@ def _head_info(path: Path) -> SessionInfo | None:
         preview=preview or "（无用户消息）",
         session_id=str(meta.get("session_id", "")),
         title=str(meta.get("title", "") or ""),
-        last=last_preview(path),
+        last=last,
+        #  头部只看前几行，单凭它判空会误伤前面事件多的会话：尾部也没正文才算空
+        empty=not preview and not last,
     )
 
 
@@ -812,7 +835,7 @@ def find_session(ref: str, workspace: str | None = None) -> SessionInfo | None:
         return sessions[index - 1] if 1 <= index <= len(sessions) else None
     scopes = [workspace, None] if workspace else [None]
     for scope in scopes:
-        for info in list_sessions(limit=100_000, workspace=scope):
+        for info in list_sessions(limit=100_000, workspace=scope, include_empty=True):
             if ref in (info.session_id, info.path.name, info.path.stem, str(info.path)):
                 return info
     return None
@@ -1005,6 +1028,9 @@ def usage_digest(workspace: str | None = None) -> UsageDigest:
     candidates = list(directory.glob("*.jsonl"))
     if workspace:
         candidates += list((directory / _workspace_slug(workspace)).glob("*.jsonl"))
+        #  `@x` 的会话住在 term/（见 term.term_sessions_dir），不按目录分：在这个
+        #  目录里问过的，回到这里也该算它的一份，不必记得加 --all
+        candidates += list((directory / TERM_SUBDIR).glob("*.jsonl"))
     else:
         candidates += list(directory.glob("*/*.jsonl"))
     for path in candidates:
