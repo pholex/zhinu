@@ -325,7 +325,10 @@ class AsyncStorageTests(unittest.IsolatedAsyncioTestCase):
     async def test_async_resume_and_parallel_sessions(self):
         with tempfile.TemporaryDirectory() as tmp:
             workspace = Path(tmp).resolve()
-            store = SQLiteSessionStore(workspace / "state.sqlite")
+            # Same slow-disk allowance as the concurrent writer test above: two
+            # sessions committing at once can wait past the default five seconds
+            # on shared Windows CI, and this case checks resume, not admission.
+            store = SQLiteSessionStore(workspace / "state.sqlite", timeout=30)
             def options():
                 return SessionOptions(ModelOptions("test", client=FakeClient([[chunk("ok")]])),
                                       workspace, builtin_tools=(), session_store=store)
