@@ -38,7 +38,7 @@ xiaoyu update                     # 升级
 xiaoyu uninstall                  # 卸载；加 --purge 连配置一起删
 ```
 
-装完跑 `xiaoyu doctor` 体检一遍；`eval "$(xiaoyu completion zsh)"` 开 shell 补全（bash / zsh / fish）。连不上模型时用 `xiaoyu doctor --probe` 真发一条请求排查；报 issue 时用 `xiaoyu doctor --bundle` 打诊断包（含路径与命令历史，分享前看一眼）。
+装完跑 `xiaoyu doctor` 体检一遍；`xiaoyu term install` 把 Tab 补全和终端集成（`@x` / `@c`）一起写进 shell 启动文件（bash / zsh / fish）。连不上模型时用 `xiaoyu doctor --probe` 真发一条请求排查；报 issue 时用 `xiaoyu doctor --bundle` 打诊断包（含路径与命令历史，分享前看一眼）。
 
 ## 配置
 
@@ -88,7 +88,7 @@ xiaoyu mcp add chrome-devtools --scope user npx -y chrome-devtools-mcp@latest
 xiaoyu mcp list                         # 写的就是 .mcp.json / mcp.json
 xiaoyu mcp probe chrome-devtools        # 不经模型直接握手、列工具；--script 按脚本调用并逐步输出 JSON
 
-xiaoyu term install                     # 把终端集成写进 ~/.zshrc 等启动文件（先给你过目再写）：之后在自己的 shell 里
+xiaoyu term install                     # 把终端集成与 Tab 补全写进 ~/.zshrc 等启动文件（先给你过目再写）：之后在自己的 shell 里
 @x 刚才那个报错怎么回事                   # 随时提问，带着刚跑过的命令，续写同一会话；见 docs/terminal-integration.md
 @c 找出大于 100M 的文件，按大小倒序        # 一句话换一条命令，放回你的提示符，回车才执行（zsh / bash）
 ```

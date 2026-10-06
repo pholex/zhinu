@@ -15,14 +15,34 @@ $ @x 那把失败的那个用例单独跑一下
 ## 安装
 
 ```bash
-xiaoyu term install              # 按 $SHELL 认出 zsh / bash / fish，把那一行写进启动文件
+xiaoyu term install              # 按 $SHELL 认出 zsh / bash / fish，把终端集成和 Tab 补全写进启动文件
 xiaoyu term install --natural    # 选项与 term init 相同（--name / --command-not-found / --natural），重跑即改
+xiaoyu term install --no-completion   # 只要 @x / @c，不要 Tab 补全
 xiaoyu term uninstall            # 移除；xiaoyu uninstall 也会顺手收走
 ```
 
-它先打出要写哪个文件、写哪一行，你确认后才动手（`--yes` 跳过确认，`--dry-run` 只看不写），写前留一份 `.bak`。写进去的是首尾带标记的一小段，重跑只替换这一段、不会重复加；文件里已经有你自己手写的 `term init` 那一行就原样不动。bash 在 macOS 上写 `~/.bash_profile`（系统终端开的是登录 shell，不读 `.bashrc`），zsh 认 `$ZDOTDIR`。写完新开一个终端生效，或在当前终端 `source` 一下。`xiaoyu doctor` 会报告接没接上。
+它先打出要写哪个文件、写哪几行，你确认后才动手（`--yes` 跳过确认，`--dry-run` 只看不写），写前留一份 `.bak`。写进去的是首尾带标记的一小段，重跑只替换这一段、不会重复加；文件里已经有你自己手写的 `term init` 那一行就原样不动（缺补全的话会告诉你加哪一行）。写完新开一个终端生效，或在当前终端 `source` 一下。`xiaoyu doctor` 会报告接没接上、补全有没有。
 
-想自己动手，或者用的是 PowerShell（`$PROFILE` 的位置随版本而变，install 不猜），把下面这一行放进启动文件：
+zsh 下写进去的是这三行（bash / fish 没有第一行）：
+
+```zsh
+(( $+functions[compdef] )) || { autoload -Uz compinit && compinit }   # 补全系统没人初始化过才初始化
+eval "$(xiaoyu completion zsh)"                                        # Tab 补全子命令与全局旗标
+eval "$(xiaoyu term init zsh)"                                         # @x / @c 与记命令的钩子
+```
+
+各平台的差别：
+
+| 平台 | 写哪个文件 | 补全 |
+|---|---|---|
+| macOS | zsh：`~/.zshrc`（认 `$ZDOTDIR`）；bash：`~/.bash_profile`（系统终端开登录 shell，不读 `.bashrc`）；fish：`~/.config/fish/config.fish` | 有 |
+| Linux | zsh 同上；bash：`~/.bashrc`；fish 同上 | 有 |
+| Windows · Git Bash | `~/.bashrc`（保留文件原有的换行符，不往里混 CRLF） | 有 |
+| Windows · PowerShell | install 不写：`$PROFILE` 的位置随版本（5.1 / 7）而变，猜错了写了也不生效。照下表手动贴 | 没有 |
+
+`xiaoyu` 不在 PATH 上（venv 没激活、pipx 的 bin 目录不在 PATH）时只写终端集成、不写补全：补全挂在命令名 `xiaoyu` 上，那时敲不出这个命令，也就触发不到。
+
+想自己动手，或者用的是 PowerShell，把下面这一行放进启动文件（补全另加 `eval "$(xiaoyu completion zsh)"`，zsh 要在它前面先 `compinit`）：
 
 | shell | 放进启动文件的那一行 |
 |---|---|

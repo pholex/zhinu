@@ -102,7 +102,7 @@ class UninstallCommandTest(unittest.TestCase):
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
         path = Path(tmp.name) / ".zshrc"
-        path.write_text("alias l=ls\n\n" + shell_setup.block('eval "$(xiaoyu term init zsh)"'), encoding="utf-8")
+        path.write_text("alias l=ls\n\n" + shell_setup.block(['eval "$(xiaoyu term init zsh)"']), encoding="utf-8")
         plan = shell_setup.Plan(path, "remove")
         with mock.patch.object(cli.subprocess, "run", side_effect=self.fake_run()), \
                 mock.patch("xiaoyu.shell_setup.removal_plans", return_value=[plan]):
