@@ -389,7 +389,16 @@ def term_run_command(argv: list[str]) -> int:
         note.append(f"接上 {len(restored)} 条消息")
     #  走 stderr：stdout 可能正被管道接去当结果用
     print(ui.secondary(" · ".join(note)), file=sys.stderr)
-    return run_once(agent, prompt, "text")
+    code = run_once(agent, prompt, "text")
+    if code == 0:
+        #  与交互界面退出时同一行：这个名字 resume 直接认。term 会话与它不同的
+        #  一点要说清——同一终端下一次 @x 本来就接着聊，这行是「换到完整界面」的入口；
+        #  resume 写的是新文件、终端里的 @x 仍续原文件，从那一刻起是两份
+        print(
+            ui.secondary(f"接回本会话：xiaoyu resume {session_id}（同一终端里 @x 直接接着聊）"),
+            file=sys.stderr,
+        )
+    return code
 
 
 #  `@c` 等多久：一条命令的事，模型十几秒不回就是出了问题，不该陪着生成级的长超时

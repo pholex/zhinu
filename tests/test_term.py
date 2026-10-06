@@ -754,6 +754,14 @@ class TermRunTest(unittest.TestCase):
         self.assertEqual(self.opened, ["term-t1"])
         self.assertIn("带上 2 条命令", err)
         self.assertFalse(agent.copy)
+        #  收尾一行给的名字 resume 直接认（见 ResumeByNameE2ETest）
+        self.assertIn("接回本会话：xiaoyu resume term-t1", err)
+
+    def test_no_resume_hint_when_run_fails(self) -> None:
+        with mock.patch.object(cli_term, "run_once", lambda *a, **k: 2):
+            code, err = self.run_term("问")
+        self.assertEqual(code, 2)
+        self.assertNotIn("接回本会话", err)
 
     def test_no_new_commands_means_bare_question(self) -> None:
         code, err = self.run_term("在吗")

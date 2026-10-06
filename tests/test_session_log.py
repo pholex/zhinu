@@ -1115,6 +1115,21 @@ class TitleExportTest(SessionDirTestCase):
         self.assertIsNone(find_by_id("20990101-000000-1"))
         self.assertIsNone(find_by_id("job-7"))  # 名字走 find_session，不归它管
 
+    def test_find_by_name_locates_named_sessions_without_scanning(self):
+        from xiaoyu.session_log import TERM_SUBDIR, find_by_name, sessions_dir
+
+        log = self._session("job-7")
+        self.assertEqual(find_by_name("job-7").path, log.path)
+        self.assertEqual(find_by_name("job-7.jsonl").path, log.path)
+        #  终端集成的会话住在 term/ 子目录，同样按名字找得到
+        term = sessions_dir() / TERM_SUBDIR
+        term.mkdir(parents=True, exist_ok=True)
+        term_log = SessionLog.create("m", "/ws/t", term, session_id="term-ab12cd34")
+        self.assertEqual(find_by_name("term-ab12cd34").path, term_log.path)
+        #  不是合法会话名的词（中文指令、空串）与没叫这个名字的都回 None
+        for word in ("继续跑测试", "", "term-nope", "20261006-101500-12345"):
+            self.assertIsNone(find_by_name(word), word)
+
     def test_repl_exit_prints_resume_command_only_after_talking(self):
         import contextlib
         import io

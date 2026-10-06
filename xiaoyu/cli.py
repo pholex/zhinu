@@ -23,6 +23,7 @@ from . import (
 )
 from .agent import Agent
 from .banner import build_banner
+from .term import SESSION_PREFIX as TERM_SESSION_PREFIX
 from .session_log import (
     LoadedMessages,
     SessionInfo,
@@ -32,6 +33,7 @@ from .session_log import (
     export_markdown,
     export_messages,
     find_by_id,
+    find_by_name,
     find_session,
     install_exit_logging,
     list_sessions,
@@ -1209,7 +1211,7 @@ def resume_command(argv: list[str]) -> int:
     parser.add_argument(
         "index",
         nargs="?",
-        help="列表里的序号，或开场横幅给的会话 id；两者都不是就当指令（此时默认恢复最近会话）",
+        help="列表里的序号、开场横幅给的会话 id，或具名会话的名字（--session-id 起的、终端集成的 term-…）；都不是就当指令（此时默认恢复最近会话）",
     )
     parser.add_argument(
         "prompt",
@@ -1267,6 +1269,16 @@ def resume_command(argv: list[str]) -> int:
             print(ui.error(f"找不到会话 {args.index}"), file=sys.stderr)
             return 2
         words = list(args.prompt)
+    elif index is None and args.index is not None:
+        #  具名会话的名字（`--session-id`、终端集成的 `term-…`）也算点名：`@x` 收尾那行
+        #  给的就是它。名字找不到时，`term-` 开头的一定是在点名（没人拿它当指令开头），
+        #  报错；别的词仍当指令的第一个词——「resume fix the bug」不该因为没叫 fix 的会话
+        #  就被拒
+        if (by_id := find_by_name(args.index)) is not None:
+            words = list(args.prompt)
+        elif args.index.startswith(TERM_SESSION_PREFIX):
+            print(ui.error(f"找不到会话 {args.index}"), file=sys.stderr)
+            return 2
     #  `-p` 的值不参与序号消歧：写在 -p 后面的一定是指令，哪怕它是纯数字
     if args.prompt_opt:
         words = [args.prompt_opt, *words]
