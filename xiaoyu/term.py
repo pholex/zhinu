@@ -865,10 +865,28 @@ __xiaoyu_term_precmd() {
 __xiaoyu_term_ask() { @@LAUNCHER@@ term run "$@"; }
 alias @xiaoyu='noglob __xiaoyu_term_ask'
 alias @x='noglob __xiaoyu_term_ask'
+__xiaoyu_term_shadowed() {
+  local w prev=';'
+  local -a words seen
+  for w in ${(z)1}; do
+    if [[ $prev == (';'|'|'|'||'|'&&'|'&'|'|&'|'&!'|'&|') && -n ${aliases[$w]-} && ${seen[(Ie)$w]} -eq 0 ]]; then
+      words=(${(z)aliases[$w]})
+      while [[ ${words[1]-} == (noglob|nocorrect|command|builtin|exec) ]]; do shift words; done
+      if [[ ${words[1]-} != $w ]]; then
+        seen+=$w
+        print -ru2 -- "注意：$w 在你的 shell 里是别名（→ ${aliases[$w]}），回车会按别名跑；要原生命令请改成 command $w"
+      fi
+    fi
+    prev=$w
+  done
+  return 0
+}
 __xiaoyu_term_command() {
   local cmd
   cmd=$(@@LAUNCHER@@ term command --shell zsh --shell-version "$ZSH_VERSION" "$@") || return $?
-  [[ -n $cmd ]] && print -rz -- "$cmd"
+  [[ -n $cmd ]] || return 0
+  __xiaoyu_term_shadowed "$cmd"
+  print -rz -- "$cmd"
   return 0
 }
 alias @c='noglob __xiaoyu_term_command'
@@ -935,10 +953,38 @@ __xiaoyu_term_debug() {
 }
 @xiaoyu() { @@LAUNCHER@@ term run "$@"; }
 @x() { @@LAUNCHER@@ term run "$@"; }
+__xiaoyu_term_shadowed() {
+  local w prev=';' def shown first seen=' ' q="'\\''"
+  local -a words
+  IFS=$' \t\n' read -r -d '' -a words <<< "$1"
+  for w in "${words[@]}"; do
+    case $prev in
+      ';'|'|'|'||'|'&&'|'&'|'|&'|*';')
+        case $w in *[=\'\"\$\\/]*) ;; *)
+          if [[ $seen != *" $w "* ]] && def=$(builtin alias -- "$w" 2>/dev/null); then
+            def=${def#*=}; def=${def#\'}; def=${def%\'}
+            def=${def//"$q"/\'}; shown=$def
+            first=${def%%[[:space:]]*}
+            while [[ $first == command || $first == builtin || $first == exec ]]; do
+              def=${def#"$first"}; def=${def#"${def%%[![:space:]]*}"}
+              first=${def%%[[:space:]]*}
+            done
+            if [[ $first != "$w" ]]; then
+              seen+="$w "
+              printf '注意：%s 在你的 shell 里是别名（→ %s），回车会按别名跑；要原生命令请改成 command %s\n' "$w" "$shown" "$w" >&2
+            fi
+          fi ;;
+        esac ;;
+    esac
+    prev=$w
+  done
+  return 0
+}
 @c() {
   local cmd
   cmd=$(@@LAUNCHER@@ term command --shell bash --shell-version "$BASH_VERSION" "$@") || return $?
   [[ -n $cmd ]] || return 0
+  __xiaoyu_term_shadowed "$cmd"
   builtin history -s -- "$cmd"
   printf '%s\n' "$cmd"
   printf '%s\n' '已放进历史，按 ↑ 取用' >&2
