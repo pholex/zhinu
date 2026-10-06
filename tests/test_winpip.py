@@ -80,6 +80,20 @@ class WinPipTest(unittest.TestCase):
         )
         self.assertIn("0.30.1 → 0.31.0", output)
 
+    def test_space_separated_spec_becomes_separate_pip_args(self):
+        """本体之外还要带上 SDK：一个 spec 参数里空格分隔，pip 拿到的是独立 argv。"""
+        with mock.patch.object(_winpip, "_wait_for_exit"), \
+                mock.patch.object(
+                    _winpip.subprocess, "run",
+                    return_value=SimpleNamespace(returncode=0, stdout=""),
+                ) as run:
+            _run(["1", "2", "uninstall", "xiaoyu-agent xiaoyu-agent-sdk", "0.30.1"])
+
+        self.assertEqual(
+            run.call_args_list[0].args[0],
+            [sys.executable, "-m", "pip", "uninstall", "-y", "xiaoyu-agent", "xiaoyu-agent-sdk"],
+        )
+
     def test_uninstall_uses_yes_flag(self):
         with mock.patch.object(_winpip, "_wait_for_exit"), \
                 mock.patch.object(

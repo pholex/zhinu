@@ -5,7 +5,8 @@
 2. terminal-setup 写入的编辑器键绑定在卸载时一并移除；
 3. pip 不存在（pipx/uv tool 环境）时收尾照做、包本体给出替代命令并返回 1；
 4. pip uninstall 作为独立 argv 由本解释器执行，失败返回 1；
-5. --dry-run 只打计划，什么都不动。
+5. --dry-run 只打计划，什么都不动；
+6. 装了嵌入 SDK 时一并卸掉，不留一个导入即坏的 SDK。
 """
 
 from __future__ import annotations
@@ -43,6 +44,8 @@ class UninstallCommandTest(unittest.TestCase):
             #  真跑会去敲 macOS Keychain（security 子进程），测试里一律断开
             ("xiaoyu.cli._hint_keychain_leftover", {}),
             ("xiaoyu.editor_setup.removal_plans", {"return_value": []}),
+            #  开发环境常以可编辑方式装着 SDK，默认按没装算，单测里再显式打开
+            ("xiaoyu.cli._sdk_installed", {"return_value": False}),
         ):
             patcher = mock.patch(target, **kwargs)
             patcher.start()
@@ -127,6 +130,14 @@ class UninstallCommandTest(unittest.TestCase):
             code, output = _run(["--yes"])
         self.assertEqual(code, 1)
         self.assertIn("卸载失败", output)
+
+    def test_sdk_uninstalled_alongside_when_installed(self) -> None:
+        with mock.patch.object(cli.subprocess, "run", side_effect=self.fake_run()), \
+                mock.patch.object(cli, "_sdk_installed", return_value=True):
+            code, output = _run(["--yes"])
+        self.assertEqual(code, 0)
+        self.assertIn(UNINSTALL_ARGV + ["xiaoyu-agent-sdk"], self.calls)
+        self.assertIn("pip uninstall xiaoyu-agent xiaoyu-agent-sdk", output)
 
     def test_main_dispatches_uninstall(self) -> None:
         with mock.patch.object(cli, "uninstall_command", return_value=0) as command:
