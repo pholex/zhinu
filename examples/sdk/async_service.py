@@ -11,7 +11,7 @@ from common import options, text_chunk
 async def main(demo: bool) -> None:
     config = options(demo, [[text_chunk("Hello "), text_chunk("from Xiaoyu")],
                             [text_chunk("Continued")]], Path.cwd())
-    async with AsyncSession(config) as session:
+    async with await AsyncSession.open(config) as session:
         async with aclosing(session.stream("Say hello")) as events:
             async for event in events:
                 if isinstance(event, TextDelta):

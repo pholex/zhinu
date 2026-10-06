@@ -42,8 +42,8 @@ adapter 由宿主持有，SDK 只关闭每会话 writer；多个会话可共享 
   原始原因在 cause。SDK 不向公开错误正文复制 backend 的错误详情。
 - 契约为同步 I/O，调用可来自不同线程，由 SDK 串行执行；adapter 需自行限定 I/O
   超时。同步 I/O 无法强杀，SDK 的 close timeout 不等于 backend 请求总时限。
-  `AsyncSession` 的构造仍是同步操作，`await AsyncSession.open(...)` 把它放到线程里
-  （当前源码新增，尚未发布）；业务运行与 close 复用已有 worker/线程桥。
+  `AsyncSession` 的构造仍是同步操作，`await AsyncSession.open(...)`（0.66.0 起）把它放到
+  线程里；业务运行与 close 复用已有 worker/线程桥。
 
 日志记录沿用内核格式，包含对话、压缩/清空/回滚 replacement 和其他事件，复用
 现有重放规则。写入失败令会话拒绝后续执行，不返回成功终结；宿主关闭会话后核对

@@ -83,7 +83,7 @@ from contextlib import aclosing
 from xiaoyu_agent_sdk import AsyncSession, RunCompleted, TextDelta
 
 async def handle(options):
-    async with AsyncSession(options) as session:
+    async with await AsyncSession.open(options) as session:
         async with aclosing(session.stream("分析问题")) as events:
             async for event in events:
                 if isinstance(event, TextDelta):
@@ -116,9 +116,9 @@ async def handle(options):
 
 `AsyncSession(options)` 的构造是同步的：打开存储、准备传输与 worker 都在调用线程上
 完成，在事件循环里直接调用会让循环停这么久（慢盘上可达 1 秒）。在服务里创建会话改用
-`async with await AsyncSession.open(options) as session:`（当前源码新增，尚未发布）：
-参数与构造函数相同，同步部分放到线程里做；创建途中被取消立即生效，已经建出来的会话
-会在后台关闭，不留存储锁。`run_async` 内部已改用它。
+`async with await AsyncSession.open(options) as session:`（0.66.0 起）：参数与构造函数
+相同，同步部分放到线程里做；创建途中被取消立即生效，已经建出来的会话会在后台关闭，
+不留存储锁。`run_async` 内部已改用它。
 
 会话拥有 worker、内置工具后台任务、自己创建的 HTTP clients、MCP manager 和本地
 日志锁；业务回调与借用的 client 由宿主提供。`close()` 可重复调用。无法及时结束
@@ -214,7 +214,7 @@ from contextlib import aclosing
 from xiaoyu_agent_sdk import AsyncSession
 
 async def observe(options):
-    async with AsyncSession(options) as session:
+    async with await AsyncSession.open(options) as session:
         async with aclosing(session.watch_notifications()) as changes:
             print(await anext(changes))  # 初始待通知快照
             session.notify("后台报告已生成", key="report-ready")

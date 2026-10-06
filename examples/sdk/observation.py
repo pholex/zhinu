@@ -16,7 +16,7 @@ async def main() -> None:
     with tempfile.TemporaryDirectory() as temporary:
         config = options(args.demo, [[text_chunk("Initial response.")],
                          [text_chunk("Background result acknowledged.")]], Path(temporary).resolve())
-        async with AsyncSession(config) as session:
+        async with await AsyncSession.open(config) as session:
             async with aclosing(session.watch_notifications()) as changes:
                 print("Initial pending:", await anext(changes))
                 await asyncio.to_thread(session.notify, "The background report is ready.", "report-ready")
