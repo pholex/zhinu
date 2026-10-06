@@ -1,7 +1,13 @@
 # SDK examples
 
-先按 [SDK 指南](../../docs/sdk.md) 安装两个本地包。所有业务代码仅使用
-`xiaoyu_agent_sdk` 公开入口。以下命令无需 API 凭据：
+先安装 SDK（会按同版本自动带上 `xiaoyu-agent`），再在仓库根目录运行示例。
+从源码开发时的可编辑安装方式见 [SDK 指南](../../docs/sdk.md)。
+
+```sh
+pip install xiaoyu-agent-sdk
+```
+
+所有业务代码仅使用 `xiaoyu_agent_sdk` 公开入口。以下命令无需 API 凭据：
 
 ```sh
 python examples/sdk/sync.py --demo
