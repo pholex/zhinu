@@ -30,7 +30,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
-from xiaoyu import cli, term
+from xiaoyu import cli, cli_term, term
 
 ROOT = Path(__file__).resolve().parent.parent
 
@@ -705,19 +705,19 @@ class TermRunTest(unittest.TestCase):
         self.sent: list[tuple] = []
         FakeConfig.calls = []
         patches = [
-            mock.patch.object(cli, "resolve_folder_trust", return_value=SimpleNamespace(trusted=True)),
-            mock.patch.object(cli, "load_dotenv", return_value=[]),
-            mock.patch.object(cli, "_warn_env_problems", lambda: None),
-            mock.patch.object(cli, "read_piped_stdin", return_value=""),
+            mock.patch.object(cli_term, "resolve_folder_trust", return_value=SimpleNamespace(trusted=True)),
+            mock.patch.object(cli_term, "load_dotenv", return_value=[]),
+            mock.patch.object(cli_term, "_warn_env_problems", lambda: None),
+            mock.patch.object(cli_term, "read_piped_stdin", return_value=""),
             #  从终端跑测试时 stdin 是 tty：钉成不是，免得「不带问题」那条去等人输入
             mock.patch.object(sys, "stdin", io.StringIO()),
-            mock.patch.object(cli, "Config", FakeConfig),
-            mock.patch.object(cli.Permissions, "load", classmethod(lambda cls, *a, **k: object())),
-            mock.patch.object(cli, "oneshot_frontend", return_value=(None, None)),
-            mock.patch.object(cli, "build_toolbox", return_value=None),
-            mock.patch.object(cli, "Agent", StubAgent),
-            mock.patch.object(cli, "install_exit_logging", lambda log: None),
-            mock.patch.object(cli, "run_once", lambda agent, prompt, fmt="text", schema=None: self.sent.append((agent, prompt, fmt)) or 0),
+            mock.patch.object(cli_term, "Config", FakeConfig),
+            mock.patch.object(cli_term.Permissions, "load", classmethod(lambda cls, *a, **k: object())),
+            mock.patch.object(cli_term, "oneshot_frontend", return_value=(None, None)),
+            mock.patch.object(cli_term, "build_toolbox", return_value=None),
+            mock.patch.object(cli_term, "Agent", StubAgent),
+            mock.patch.object(cli_term, "install_exit_logging", lambda log: None),
+            mock.patch.object(cli_term, "run_once", lambda agent, prompt, fmt="text", schema=None: self.sent.append((agent, prompt, fmt)) or 0),
         ]
         for patcher in patches:
             patcher.start()
@@ -729,7 +729,7 @@ class TermRunTest(unittest.TestCase):
             self.opened.append(session_id)
             return SimpleNamespace(path=Path(self.tmp.name) / "s.jsonl", event=lambda *a, **k: None), self.restored
 
-        patcher = mock.patch.object(cli, "open_term_session", open_term_session)
+        patcher = mock.patch.object(cli_term, "open_term_session", open_term_session)
         patcher.start()
         self.addCleanup(patcher.stop)
 
@@ -837,7 +837,7 @@ class TermRunTest(unittest.TestCase):
             term.append_pending(self.pending, "ipconfig getifaddr en0", cwd="/w", ts=1)
             self.assertTrue(term.save_handoff("term-t1", "本机的 ip 是哪块网卡"))
             #  命令行上的词与管道都不算：问题只取交接
-            with mock.patch.object(cli, "read_piped_stdin", side_effect=AssertionError("不该读管道")):
+            with mock.patch.object(cli_term, "read_piped_stdin", side_effect=AssertionError("不该读管道")):
                 code, err = self.run_term("--handoff", "多余的")
             self.assertEqual(code, 0, err)
             self.assertIn("转给 @x", err)
@@ -855,7 +855,7 @@ class TermRunTest(unittest.TestCase):
 
     def test_config_failure_requeues_commands(self) -> None:
         term.append_pending(self.pending, "ls", cwd="/w", ts=1)
-        with mock.patch.object(FakeConfig, "from_env", classmethod(lambda cls, **k: (_ for _ in ()).throw(cli.MissingConfig("没配 key")))):
+        with mock.patch.object(FakeConfig, "from_env", classmethod(lambda cls, **k: (_ for _ in ()).throw(cli_term.MissingConfig("没配 key")))):
             code, err = self.run_term("问")
         self.assertEqual(code, 2)
         self.assertIn("没配 key", err)
@@ -1192,30 +1192,30 @@ class CommandReplyTest(unittest.TestCase):
     def test_aux_model_with_low_effort_by_default(self) -> None:
         client = _FakeClient(['{"command": "ls"}'])
         self.registry(client, ("aux-model", "main-model"))
-        self.assertEqual(cli.term_command_reply(self.CONFIG, self.MESSAGES, None, None), '{"command": "ls"}')
+        self.assertEqual(cli_term.term_command_reply(self.CONFIG, self.MESSAGES, None, None), '{"command": "ls"}')
         self.assertEqual(
             client.requests,
-            [{"model": "aux-model", "messages": self.MESSAGES, "reasoning_effort": cli.TERM_COMMAND_EFFORT}],
+            [{"model": "aux-model", "messages": self.MESSAGES, "reasoning_effort": cli_term.TERM_COMMAND_EFFORT}],
         )
 
     def test_default_effort_is_dropped_when_the_endpoint_rejects_it(self) -> None:
         client = _FakeClient([RuntimeError("400 unknown parameter reasoning_effort"), "ls"])
         self.registry(client, ("aux-model",))
-        self.assertEqual(cli.term_command_reply(self.CONFIG, self.MESSAGES, None, None), "ls")
+        self.assertEqual(cli_term.term_command_reply(self.CONFIG, self.MESSAGES, None, None), "ls")
         self.assertNotIn("reasoning_effort", client.requests[1])
 
     def test_explicit_effort_failure_is_reported_not_retried(self) -> None:
         client = _FakeClient([RuntimeError("400 bad effort")])
         self.registry(client, ("aux-model",))
         with self.assertRaises(RuntimeError):
-            cli.term_command_reply(self.CONFIG, self.MESSAGES, None, "high")
+            cli_term.term_command_reply(self.CONFIG, self.MESSAGES, None, "high")
         self.assertEqual(len(client.requests), 1)
         self.assertEqual(client.requests[0]["reasoning_effort"], "high")
 
     def test_falls_back_to_main_model_when_aux_has_no_provider(self) -> None:
         client = _FakeClient(["ls"])
         resolved = self.registry(client, ("main-model",))
-        cli.term_command_reply(self.CONFIG, self.MESSAGES, None, None)
+        cli_term.term_command_reply(self.CONFIG, self.MESSAGES, None, None)
         self.assertEqual(resolved, ["aux-model", "main-model"])
         self.assertEqual(client.requests[0]["model"], "main-model")
 
@@ -1224,15 +1224,15 @@ class CommandReplyTest(unittest.TestCase):
 
         client = _FakeClient(["ls"])
         self.registry(client, ("aux-model", "main-model", "picked"))
-        cli.term_command_reply(self.CONFIG, self.MESSAGES, "picked", None)
+        cli_term.term_command_reply(self.CONFIG, self.MESSAGES, "picked", None)
         self.assertEqual(client.requests[0]["model"], "picked")
         with self.assertRaises(providers.UnknownModel):
-            cli.term_command_reply(self.CONFIG, self.MESSAGES, "没这个", None)
+            cli_term.term_command_reply(self.CONFIG, self.MESSAGES, "没这个", None)
 
     def test_empty_content_is_an_empty_reply(self) -> None:
         client = _FakeClient([None])
         self.registry(client, ("aux-model",))
-        self.assertEqual(cli.term_command_reply(self.CONFIG, self.MESSAGES, None, None), "")
+        self.assertEqual(cli_term.term_command_reply(self.CONFIG, self.MESSAGES, None, None), "")
 
 
 class _CommandConfig:
@@ -1282,12 +1282,12 @@ class TermCommandTest(_TermDirMixin, unittest.TestCase):
 
         patches = [
             mock.patch.object(folder_trust, "evaluate", evaluate),
-            mock.patch.object(cli, "load_dotenv", lambda **kwargs: self.dotenv.append(kwargs) or []),
-            mock.patch.object(cli, "_warn_env_problems", lambda: None),
-            mock.patch.object(cli, "read_piped_stdin", return_value=""),
+            mock.patch.object(cli_term, "load_dotenv", lambda **kwargs: self.dotenv.append(kwargs) or []),
+            mock.patch.object(cli_term, "_warn_env_problems", lambda: None),
+            mock.patch.object(cli_term, "read_piped_stdin", return_value=""),
             mock.patch.object(sys, "stdin", io.StringIO()),
-            mock.patch.object(cli, "Config", _CommandConfig),
-            mock.patch.object(cli, "term_command_reply", reply),
+            mock.patch.object(cli_term, "Config", _CommandConfig),
+            mock.patch.object(cli_term, "term_command_reply", reply),
         ]
         for patcher in patches:
             patcher.start()
@@ -1366,7 +1366,7 @@ class TermCommandTest(_TermDirMixin, unittest.TestCase):
         self.assertEqual(term.take_handoff("term-c1"), "本机的 ip 是哪块网卡")
         self.assertEqual(term.take_handoff("term-c1"), "", "取走即删")
         #  管道材料一并转过去，排在需求前面（同 @x 自己读管道的顺序）
-        with mock.patch.object(cli, "read_piped_stdin", return_value="ERR 42"):
+        with mock.patch.object(cli_term, "read_piped_stdin", return_value="ERR 42"):
             self.assertEqual(self.run_command("--handoff", "这是什么错")[0], term.HANDOFF_EXIT)
         self.assertEqual(term.take_handoff("term-c1"), "ERR 42\n\n这是什么错")
 
@@ -1416,7 +1416,7 @@ class TermCommandTest(_TermDirMixin, unittest.TestCase):
             self.assertEqual(self.run_command()[0], 130)
 
     def test_piped_input_is_material_or_the_request_itself(self) -> None:
-        with mock.patch.object(cli, "read_piped_stdin", return_value="1.2.3.4 GET /"):
+        with mock.patch.object(cli_term, "read_piped_stdin", return_value="1.2.3.4 GET /"):
             self.run_command("提取", "IP")
             self.run_command()
         with_ask, alone = self.requests[0][0][-1]["content"], self.requests[1][0][-1]["content"]
@@ -1436,7 +1436,7 @@ class TermCommandTest(_TermDirMixin, unittest.TestCase):
         self.assertNotIn(fake_key, err)
 
     def test_config_errors_and_interrupt(self) -> None:
-        self.reply = cli.MissingConfig("没配 key")
+        self.reply = cli_term.MissingConfig("没配 key")
         code, _, err = self.run_command("x")
         self.assertEqual(code, 2)
         self.assertIn("没配 key", err)
@@ -1469,7 +1469,7 @@ class TermCommandTest(_TermDirMixin, unittest.TestCase):
 
     def test_request_gets_a_short_timeout(self) -> None:
         self.run_command("x")
-        self.assertEqual(self.requests[0][3].request_timeout, cli.TERM_COMMAND_TIMEOUT)
+        self.assertEqual(self.requests[0][3].request_timeout, cli_term.TERM_COMMAND_TIMEOUT)
 
 
 class TermInfoAndLogTest(unittest.TestCase):

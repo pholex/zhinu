@@ -15,7 +15,7 @@ from pathlib import Path
 from unittest import mock
 
 from tests.test_mcp import FAKE_SERVER
-from xiaoyu import cli, mcp, render
+from xiaoyu import cli_mcp, mcp, render
 from xiaoyu.config import Config
 from xiaoyu.events import ToolProgress
 from xiaoyu.tools import Toolbox
@@ -383,14 +383,14 @@ class ProbeCommandTest(_ServerCase):
             }}),
             encoding="utf-8",
         )
-        patcher = mock.patch.object(cli.Path, "cwd", staticmethod(lambda: self.workspace))
+        patcher = mock.patch.object(cli_mcp.Path, "cwd", staticmethod(lambda: self.workspace))
         patcher.start()
         self.addCleanup(patcher.stop)
 
     def run_probe(self, *argv: str) -> tuple[int, str, str]:
         out, err = io.StringIO(), io.StringIO()
         with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
-            code = cli.mcp_command(["probe", *argv])
+            code = cli_mcp.mcp_command(["probe", *argv])
         return code, out.getvalue(), err.getvalue()
 
     def test_named_server_shows_handshake_tools_and_hidden_marks(self):
@@ -459,7 +459,7 @@ class ProbeCommandTest(_ServerCase):
         self.assertIn("工作目录不存在", err)
 
     def test_unknown_name_and_bad_script_exit_2(self):
-        with mock.patch.object(cli.shutil, "which", lambda _: None):
+        with mock.patch.object(cli_mcp.shutil, "which", lambda _: None):
             code, _, err = self.run_probe("ghost")
         self.assertEqual(code, 2)
         self.assertIn("ghost", err)

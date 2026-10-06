@@ -5,40 +5,41 @@ from __future__ import annotations
 import contextlib
 import io
 import json
+import os
 import tempfile
 import unittest
 from pathlib import Path
 from unittest import mock
 
-from xiaoyu import cli, mcp
+from xiaoyu import cli_mcp, mcp
 
 
 class SplitCommandTest(unittest.TestCase):
     """选项段与启动命令段的切分——argparse 自己做不到的那一步。"""
 
     def test_flags_before_command(self):
-        head, rest = cli.split_mcp_command(
+        head, rest = cli_mcp.split_mcp_command(
             ["chrome-devtools", "--scope", "user", "npx", "-y", "pkg@latest"]
         )
         self.assertEqual(head, ["chrome-devtools", "--scope", "user"])
         self.assertEqual(rest, ["npx", "-y", "pkg@latest"])
 
     def test_equals_form_does_not_eat_next_token(self):
-        head, rest = cli.split_mcp_command(["a", "--scope=user", "npx", "pkg"])
+        head, rest = cli_mcp.split_mcp_command(["a", "--scope=user", "npx", "pkg"])
         self.assertEqual(head, ["a", "--scope=user"])
         self.assertEqual(rest, ["npx", "pkg"])
 
     def test_double_dash_separator(self):
-        head, rest = cli.split_mcp_command(["a", "--", "--weird-bin", "--flag"])
+        head, rest = cli_mcp.split_mcp_command(["a", "--", "--weird-bin", "--flag"])
         self.assertEqual(head, ["a"])
         self.assertEqual(rest, ["--weird-bin", "--flag"])
 
     def test_no_command(self):
-        self.assertEqual(cli.split_mcp_command(["a", "-f"]), (["a", "-f"], []))
+        self.assertEqual(cli_mcp.split_mcp_command(["a", "-f"]), (["a", "-f"], []))
 
     def test_value_taking_flags_do_not_swallow_the_url(self):
         """--url/-H 也吃值：漏登记的话 URL 会被当成启动命令切走。"""
-        head, rest = cli.split_mcp_command(
+        head, rest = cli_mcp.split_mcp_command(
             ["gw", "--url", "https://example.com/mcp", "-H", "Authorization: Bearer x"]
         )
         self.assertEqual(
@@ -47,7 +48,7 @@ class SplitCommandTest(unittest.TestCase):
         self.assertEqual(rest, [])
 
     def test_unknown_flag_left_for_argparse(self):
-        head, rest = cli.split_mcp_command(["a", "--typo", "npx"])
+        head, rest = cli_mcp.split_mcp_command(["a", "--typo", "npx"])
         self.assertEqual(head, ["a", "--typo"])
         self.assertEqual(rest, ["npx"])
 
@@ -62,9 +63,9 @@ class McpCommandTest(unittest.TestCase):
         self.user_dir = root / "userconf"
         for patcher in (
             mock.patch.object(mcp, "user_config_dir", lambda: self.user_dir),
-            mock.patch.object(cli.Path, "cwd", staticmethod(lambda: self.workspace)),
+            mock.patch.object(cli_mcp.Path, "cwd", staticmethod(lambda: self.workspace)),
             #  which 的结果只影响一行提示，钉死免得受运行机器 PATH 影响
-            mock.patch.object(cli.shutil, "which", lambda _: "/usr/bin/fake"),
+            mock.patch.object(cli_mcp.shutil, "which", lambda _: "/usr/bin/fake"),
         ):
             patcher.start()
             self.addCleanup(patcher.stop)
@@ -72,7 +73,7 @@ class McpCommandTest(unittest.TestCase):
     def run_cli(self, *argv: str) -> tuple[int, str]:
         out = io.StringIO()
         with contextlib.redirect_stdout(out), contextlib.redirect_stderr(out):
-            code = cli.mcp_command(list(argv))
+            code = cli_mcp.mcp_command(list(argv))
         return code, out.getvalue()
 
     def project_file(self) -> dict:
@@ -99,7 +100,7 @@ class McpCommandTest(unittest.TestCase):
     def test_added_entry_is_loadable(self):
         """写出来的东西读得回来——写入侧和运行期解析侧对齐。"""
         self.run_cli("add", "fs", "-e", "TOKEN=${env:GH_TOKEN}", "--timeout", "30", "npx", "pkg")
-        with mock.patch.dict(cli.os.environ, {"GH_TOKEN": "s3cret"}):
+        with mock.patch.dict(os.environ, {"GH_TOKEN": "s3cret"}):
             specs = mcp.load_server_specs(self.workspace)
         self.assertEqual(len(specs), 1)
         self.assertEqual(specs[0].name, "fs")

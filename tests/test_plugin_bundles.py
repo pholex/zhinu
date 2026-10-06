@@ -18,7 +18,7 @@ import unittest
 from pathlib import Path, PureWindowsPath
 from unittest import mock
 
-from xiaoyu import cli, plugins
+from xiaoyu import cli_plugin, plugins
 
 
 class TtyStringIO(io.StringIO):
@@ -94,7 +94,7 @@ class IsolatedConfigTest(unittest.TestCase):
         stream = TtyStringIO if tty else io.StringIO
         out, err = stream(), stream()
         with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
-            code = cli.plugin_command(argv)
+            code = cli_plugin.plugin_command(argv)
         return code, out.getvalue(), err.getvalue()
 
     def user_mcp(self) -> dict:
@@ -492,7 +492,7 @@ class InstallTest(IsolatedConfigTest):
 
     def test_interactive_confirmation_installs_mcp(self):
         src = make_bundle(self.root / "src")
-        with mock.patch.object(cli.sys.stdin, "isatty", return_value=True), mock.patch(
+        with mock.patch.object(cli_plugin.sys.stdin, "isatty", return_value=True), mock.patch(
             "builtins.input", return_value="y"
         ):
             self.assertEqual(self.run_cli(["add", str(src)], tty=True)[0], 0)
@@ -501,7 +501,7 @@ class InstallTest(IsolatedConfigTest):
     def test_interactive_refusal_keeps_mcp_out(self):
         """回车（默认 N）就是不装：技能照留，MCP 一条不写。"""
         src = make_bundle(self.root / "src")
-        with mock.patch.object(cli.sys.stdin, "isatty", return_value=True), mock.patch(
+        with mock.patch.object(cli_plugin.sys.stdin, "isatty", return_value=True), mock.patch(
             "builtins.input", return_value=""
         ):
             self.assertEqual(self.run_cli(["add", str(src)], tty=True)[0], 0)
