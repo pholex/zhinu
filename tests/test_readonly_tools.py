@@ -326,3 +326,69 @@ class TestExploreToolShape(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+@unittest.skipIf(os.name == "nt", "用例用 sh 脚本伪装搜索后端")
+class TestGrepBackendBounds(ReadonlyToolsTestCase):
+    """grep 后端的输出与时长有界：伪装一个 rg，吐超量输出 / 干等，都得被收住。"""
+
+    def _fake_rg(self, body: str) -> None:
+        script = self.root / "fake-rg"
+        script.write_text("#!/bin/sh\n" + body + "\n", encoding="utf-8")
+        script.chmod(0o755)
+        patcher = mock.patch(
+            "xiaoyu.tools.sandbox.host_which",
+            side_effect=lambda name: str(script) if name == "rg" else None,
+        )
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def test_oversized_output_is_cut_with_a_hint(self) -> None:
+        #  有界的大输出：yes 由 head 截在 300 KB，绝不会无限
+        self._fake_rg("yes 'pkg/core.py:1:fetch_user padding padding padding' | head -c 300000")
+        with mock.patch("xiaoyu.tools._GREP_STDOUT_CAP", 100_000):
+            result = self.box.run("grep", {"pattern": "fetch_user", "max_matches": 5})
+        self.assertIn("结果过多", result)
+        self.assertIn("收窄", result)
+        self.assertIn("pkg/core.py:1:fetch_user", result)
+        self.assertLess(len(result), 5000)
+
+    def test_timeout_kills_the_backend(self) -> None:
+        import time
+
+        self._fake_rg("sleep 20; echo pkg/core.py:1:late")
+        started = time.monotonic()
+        with mock.patch("xiaoyu.tools._GREP_TIMEOUT", 0.5):
+            result = self.box.run("grep", {"pattern": "fetch_user"})
+        self.assertIn("搜索超时", result)
+        self.assertNotIn("late", result)
+        self.assertLess(time.monotonic() - started, 10)
+
+    def test_backend_error_still_reported(self) -> None:
+        self._fake_rg("echo boom >&2; exit 2")
+        result = self.box.run("grep", {"pattern": "fetch_user"})
+        self.assertIn("搜索失败", result)
+        self.assertIn("boom", result)
+
+    def test_ripgrep_gets_max_filesize(self) -> None:
+        self._fake_rg('printf "%s\\n" "$@" > "$(dirname "$0")/argv.txt"')
+        self.box.run("grep", {"pattern": "fetch_user"})
+        argv = (self.root / "argv.txt").read_text(encoding="utf-8").split("\n")
+        self.assertIn("--max-filesize", argv)
+        self.assertEqual(argv[argv.index("--max-filesize") + 1], str(1024 * 1024))
+
+
+class TestPythonFallbackSkipsHugeFiles(ReadonlyToolsTestCase):
+    def test_file_over_cap_is_skipped(self) -> None:
+        from xiaoyu import tools
+
+        (self.root / "huge.log").write_text(
+            "fetch_user\n" + "x" * (tools._GREP_MAX_FILESIZE + 10), encoding="utf-8"
+        )
+        for target in ("xiaoyu.sandbox.shutil.which", "xiaoyu.tools._locate_grep"):
+            patcher = mock.patch(target, return_value=None)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        result = self.box.run("grep", {"pattern": "fetch_user"})
+        self.assertIn("pkg/core.py", result)
+        self.assertNotIn("huge.log", result)

@@ -542,7 +542,8 @@ plan 模式按内核规则退回先前模式，auto／default 保持；生命周
 `completed`、`partial`、`conflict`、`failed`、`unavailable` 或 `noop`；文件冲突时
 保留文件和对话，由宿主决定如何处理。结果分别给出 `conversation_rewound`、
 `files_rewound`、`restored_files`、`removed_files`、`conflicts`、`skipped_files` 和
-`uncertain_files`。文件恢复失败时保守地将所有目标列为 uncertain，需核对后重试。
+`uncertain_files`；对话真的回退时 `prompt_text` 带回被截掉那一轮的用户原话（媒体部件
+只取文本），宿主可拿它预填下一次输入。文件恢复失败时保守地将所有目标列为 uncertain，需核对后重试。
 超过快照大小上限、对话已压缩等情况可得到 partial；不要只凭调用返回宣称全部回滚。
 仅内核记录的编辑工具有文件快照，bash/业务工具/外部系统的副作用不受其保护。
 重启后文件快照不可恢复，`checkpoints()` 为空，不存在的点返回 `unavailable`。

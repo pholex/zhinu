@@ -107,6 +107,29 @@ GATEWAY_KEY_ENVS = ("XIAOYU_API_KEY", "LITELLM_API_KEY")
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
 
+def project_root(workspace: Path) -> Path:
+    """最近的含 .git 的祖先目录；没有就是工作区自己（层链的上界）。"""
+    for candidate in (workspace, *workspace.parents):
+        if (candidate / ".git").exists():
+            return candidate
+    return workspace
+
+
+def project_levels(workspace: Path) -> list[Path]:
+    """git 根 → 工作区的目录层链（root 在前、workspace 在后，至少一层）。
+
+    "仓库级"的东西（项目指令文件、工作区自带的技能）按这条链逐层找：monorepo 的
+    子目录里开会话，仓库根上放的那份也该算数。工作区不在 git 仓里时只有它自己
+    一层。项目指令与技能目录共用这一份算法，两边对"仓库级"的理解不会各走各的。
+    """
+    root = project_root(workspace)
+    levels = [root]
+    if workspace != root:
+        for part in workspace.relative_to(root).parts:
+            levels.append(levels[-1] / part)
+    return levels
+
+
 def home_dir() -> Path | None:
     """`Path.home()` 的可失败版本：推不出用户主目录时返回 None 而不是抛。
 
@@ -191,6 +214,7 @@ def save_user_env(values: dict[str, str]) -> Path:
 #  忽略"的那几个；其余数值项在 from_env 里自己钳到合法区间，不算写错
 _NUMERIC_ENV: dict[str, tuple[type, float | None, float | None, str]] = {
     "XIAOYU_CONTEXT_LIMIT": (int, 1_000, None, "单位是 token，至少 1000"),
+    "XIAOYU_MAX_OUTPUT_TOKENS": (int, 1, None, "单位是 token，正整数"),
     "XIAOYU_KEEP_RECENT": (int, 1, None, "至少保留 1 条"),
     "XIAOYU_COMPACT_AT": (float, 0.05, 1.0, "是占窗口的比例，取 0.05~1（0.7 即 70%）"),
     "XIAOYU_BUDGET_TOKENS": (int, 0, None, "不能为负"),
@@ -200,6 +224,8 @@ _NUMERIC_ENV: dict[str, tuple[type, float | None, float | None, str]] = {
     "XIAOYU_QIXIANG_CONCURRENCY": (int, None, None, ""),
     "XIAOYU_QIXIANG_TIMEOUT": (int, None, None, ""),
     "XIAOYU_CHENSHU_MAX_WORKERS": (int, None, None, ""),
+    "XIAOYU_MAX_IMAGES_PER_REQUEST": (int, 0, None, "不能为负（0 = 不限）"),
+    "XIAOYU_FIRST_CHUNK_TIMEOUT": (float, 0, None, "单位是秒，不能为负（0 = 关）"),
 }
 
 
@@ -422,6 +448,11 @@ class Config:
     #  上面这个 override 是不是探测（Models API）写进来的：True = 可被后续探测更新，
     #  False = 用户显式设的（XIAOYU_CONTEXT_LIMIT / --）绝不被探测覆盖
     context_limit_probed: bool = False
+    #  单次请求输出 token 上限的显式覆写（XIAOYU_MAX_OUTPUT_TOKENS）；None = 沿用
+    #  传输层常量（流式 64K / 同步 16K，见 responses.STREAM_MAX_TOKENS）。本地小模型
+    #  与中转站常限输出上限，超了直接 400，这是给它们的逃生口。三条协议在出网口
+    #  各自翻译成 max_tokens / max_output_tokens；同步请求取 min(设值, 常量)
+    max_output_tokens: int | None = None
     #  追加到内置 system prompt 末尾的自定义内容；None = 不追加，行为不变。
     #  供宿主进程把 xiaoyu 当执行引擎嵌入时注入身份/人格，
     #  不是项目指令——项目级规范走 AGENTS.md 那条路。
@@ -460,6 +491,12 @@ class Config:
     read_streak_block: int = 5
     #  单次模型请求超时（秒）。eval 横向扫模型时会调小，避免某个模型卡死拖垮整轮。
     request_timeout: float = 600.0
+    #  每次请求最多带几张图（出网投影，历史不改；0 = 不限）。见 media.cap_images
+    max_images_per_request: int = 20
+    #  首 chunk 看门狗（秒）：从请求发出到收到第一个流事件的等待上限，超过就按瞬时
+    #  错误走重试/降级；0 = 关。request_timeout 的 read 超时是逐次读计的，兼任
+    #  "等首 token"要等满 10 分钟才判死。见 providers.first_chunk_timeout
+    first_chunk_timeout: float = 300.0
     #  注入给 bash 工具的额外环境变量。
     #  eval 用它设 PIP_REQUIRE_VIRTUALENV：无人值守 + 全放行时，
     #  模型可能 pip install 到系统 Python 里去（已经真实发生过一次）。
@@ -485,6 +522,9 @@ class Config:
     #  bash 硬红线（rm -rf / 、mkfs、dd of=/dev/…）：默认任何模式都拦，包括 --yolo。
     #  关掉是给镜像烧录、磁盘格式化这类内部运维任务用的。来源 XIAOYU_HARDLINE=0。
     hardline: bool = True
+    #  grep / list_files 不碰 .env、私钥、.ssh 等敏感文件（它们免确认，是沙箱明确不挡
+    #  的凭据外泄路）。关掉是给确实要在凭据目录里搜的隔离环境用的。来源 XIAOYU_SEARCH_SENSITIVE=0。
+    search_sensitive: bool = True
     #  --yolo 之上再放开两处 bypass-immune 的必问（退出 plan、沙箱升权）。单独开
     #  没有意义：不带 --yolo 时它们本来就走常规确认。来源 --unattended / XIAOYU_UNATTENDED=1。
     unattended: bool = False
@@ -547,6 +587,8 @@ class Config:
             cfg.fallback_models = [name.strip() for name in raw.split(",") if name.strip()]
         if (limit := env_number("XIAOYU_CONTEXT_LIMIT")) is not None:
             cfg.context_limit = int(limit)
+        if (cap := env_number("XIAOYU_MAX_OUTPUT_TOKENS")) is not None:
+            cfg.max_output_tokens = int(cap)
         if rounds := os.environ.get("XIAOYU_EXPLORE_ITERATIONS"):
             with contextlib.suppress(ValueError):
                 cfg.explore_iterations = max(1, min(int(rounds), 100))
@@ -564,6 +606,10 @@ class Config:
             cfg.server_compaction = flag.strip().lower() not in ("0", "false", "no", "off")
         if (ratio := env_number("XIAOYU_COMPACT_AT")) is not None:
             cfg.compact_at = float(ratio)
+        if (cap := env_number("XIAOYU_MAX_IMAGES_PER_REQUEST")) is not None:
+            cfg.max_images_per_request = int(cap)
+        if (wait := env_number("XIAOYU_FIRST_CHUNK_TIMEOUT")) is not None:
+            cfg.first_chunk_timeout = float(wait)
         if (flag := os.environ.get("XIAOYU_ENABLE_EXPLORE")) is not None:
             cfg.enable_explore = flag.strip().lower() not in ("0", "false", "no", "off")
         if (flag := os.environ.get("XIAOYU_ENABLE_SKILLS")) is not None:
@@ -616,6 +662,8 @@ class Config:
             cfg.sandbox_network = flag.strip().lower() not in ("0", "false", "no", "off")
         if (flag := os.environ.get("XIAOYU_HARDLINE")) is not None:
             cfg.hardline = flag.strip().lower() not in ("0", "false", "no", "off")
+        if (flag := os.environ.get("XIAOYU_SEARCH_SENSITIVE")) is not None:
+            cfg.search_sensitive = flag.strip().lower() not in ("0", "false", "no", "off")
         #  "放松防线"类开关：未设置 = 关，必须显式打开
         cfg.unattended = os.environ.get("XIAOYU_UNATTENDED", "").strip().lower() in _ON_VALUES
         cfg.mcp_trust_changes = (
@@ -623,6 +671,13 @@ class Config:
         )
         for key, value in overrides.items():
             if value is not None:
+                setattr(cfg, key, value)
+        if cfg.unguarded:
+            #  无护栏预设在这里按表落地：各启动入口只需把 unguarded 传进来，新加
+            #  一层护栏不必再去每个入口补一个关键字参数（漏补就是预设下悄悄没关）
+            from . import guardrails
+
+            for key, value in guardrails.overrides().items():
                 setattr(cfg, key, value)
         #  yolo 默认不收信（理由见 enable_peers 字段注释）。必须放在 overrides
         #  之后：auto_approve 是 --yolo 经 overrides 进来的，前面读还是 False。

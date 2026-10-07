@@ -35,7 +35,10 @@ from .session_log import (
     find_by_id,
     find_by_name,
     find_session,
+    session_info,
     install_exit_logging,
+    last_mode,
+    last_model,
     list_sessions,
     load_messages,
     load_system_prompt,
@@ -86,7 +89,9 @@ SLASH_COMMANDS: dict[str, str] = {
     "/allow": "持久允许，如 /allow bash(git *)、/allow write_file",
     "/deny": "持久拒绝（任何模式下都拦，包括 --yolo）",
     "/resume": "切到本工作区的历史会话（当前对话被清空；/resume <序号> 直接选）",
-    "/rewind": "回滚到某轮开始前（对话和/或文件；/undo 同义）",
+    "/rewind": "回滚到某轮开始前（对话和/或文件；/undo 同义）。回退对话后那一轮的原话预填回输入行，可改可直接回车",
+    "/copy": "把最后一条回复复制到剪贴板（没有剪贴板命令时经终端 OSC 52）",
+    "/export": "把本会话导出成 Markdown（/export [路径]，默认写到工作区 xiaoyu-session-<id>.md）",
     "/clear": "清空对话历史（保留 system prompt）",
     "/exit": "退出",
     "/quit": "退出",
@@ -368,7 +373,7 @@ def add_guardrail_flags(parser: argparse.ArgumentParser) -> None:
         dest="unguarded",
         action="store_true",
         help=f"无护栏预设：放开端侧全部可关护栏（等价 --yolo --no-sandbox --unattended "
-        f"XIAOYU_HARDLINE=0 XIAOYU_MCP_TRUST_CHANGES=1 并跳过工作区信任门）。"
+        f"XIAOYU_HARDLINE=0 XIAOYU_MCP_TRUST_CHANGES=1 XIAOYU_SEARCH_SENSITIVE=0 并跳过工作区信任门）。"
         f"只在环境变量 {guardrails.CONSENT_ENV}=1 时生效——由沙箱编排脚本注入，不读 .env",
     )
 
@@ -520,7 +525,17 @@ def config_command(argv: list[str]) -> int:
         "免去 pip/pipx 安装后到处找 .env。不带参数进交互向导。",
     )
     parser.add_argument("--show", action="store_true", help="显示当前生效配置与来源（key 永不回显）")
+    parser.add_argument(
+        "--json",
+        action="store_true",
+        help="与 --show 连用：机器可读 JSON（默认模型、各模型路由与能力、功能开关；密钥只给有无）",
+    )
     parser.add_argument("--path", action="store_true", help="打印用户级配置文件路径")
+    parser.add_argument(
+        "--no-probe",
+        action="store_true",
+        help="向导落盘前不对主模型发探测请求（默认发一条最小请求验证端点与 key，花一点点 token）",
+    )
     parser.add_argument(
         "--set",
         dest="pairs",
@@ -544,8 +559,11 @@ def config_command(argv: list[str]) -> int:
         print(ui.success(f"已写入 {save_user_env(values)}"))
         return 0
     if args.show:
-        return show_config()
-    return config_wizard()
+        return show_config_json() if args.json else show_config()
+    if args.json:
+        print(ui.error("--json 只与 --show 连用"), file=sys.stderr)
+        return 2
+    return config_wizard(probe=not args.no_probe)
 
 
 def show_config() -> int:
@@ -573,8 +591,70 @@ def show_config() -> int:
         print(ui.heading("生效的 provider") + ui.secondary("（按优先级，同名模型先出现者赢）"))
         for index, provider in enumerate(registry.providers, start=1):
             scope = "、".join(provider.models) if provider.models else "任意模型名（转发）"
-            print(f"  {index}. {provider.display}  {ui.secondary(scope)}")
+            line = f"  {index}. {provider.display}  {ui.secondary(scope)}"
+            if provider.headers:
+                #  只露名字：值可能是令牌
+                line += ui.secondary(f"  · 自定义 header：{', '.join(provider.header_names)}")
+            print(line)
     print(ui.secondary(f"用户级配置文件：{user_env_path()}"))
+    return 0
+
+
+def config_snapshot(cfg: Config, registry: providers.Registry) -> dict[str, Any]:
+    """`config --show --json` 的正文。路由与能力全部来自 Registry.snapshot /
+    route_info（与 describe 同一数据源），这里只拼上 Config 侧的默认模型与开关。
+    密钥值在任何字段里都不出现；base_url 过一遍脱敏（URL 里可能嵌账号密码）。"""
+    import dataclasses
+
+    from . import diagnostics
+
+    def clean(info: dict[str, Any]) -> dict[str, Any]:
+        if "base_url" in info:
+            info["base_url"] = diagnostics.redact_value("XIAOYU_BASE_URL", info["base_url"])
+        return info
+
+    snap = registry.snapshot()
+    for key in ("providers", "models", "wildcards"):
+        snap[key] = [clean(item) for item in snap[key]]
+    #  功能开关：Config 里所有 enable_* 布尔，外加两个同性质的开关；字段名即键名，
+    #  新加开关自动进清单
+    features = {
+        f.name: getattr(cfg, f.name)
+        for f in dataclasses.fields(cfg)
+        if (f.name.startswith("enable_") or f.name in ("mcp_tool_search", "server_compaction"))
+        and isinstance(getattr(cfg, f.name), bool)
+    }
+    return {
+        "default_model": cfg.model,
+        "summary_model": cfg.summary_model,
+        "explore_model": cfg.explore_model,
+        "fallback_models": list(cfg.fallback_models),
+        "effort": cfg.effort,
+        "context_limit": cfg.context_limit,
+        "max_output_tokens": getattr(cfg, "max_output_tokens", None),
+        "mode": cfg.mode,
+        "routes": {
+            "default": clean(registry.route_info(cfg.model)),
+            "summary": clean(registry.route_info(cfg.summary_model or cfg.model)),
+            "explore": clean(registry.route_info(cfg.explore_model or cfg.model)),
+            "fallback": [clean(registry.route_info(name)) for name in cfg.fallback_models],
+        },
+        "features": features,
+        **snap,
+        "user_env_path": str(user_env_path()),
+    }
+
+
+def show_config_json() -> int:
+    """`config --show --json`：给脚本/宿主读的生效配置。stdout 只出 JSON。"""
+    load_dotenv()
+    cfg = Config.from_env()
+    try:
+        registry = providers.build(cfg)
+    except MissingConfig as exc:
+        print(json.dumps({"error": str(exc), "user_env_path": str(user_env_path())}, ensure_ascii=False, indent=2))
+        return 1
+    print(json.dumps(config_snapshot(cfg, registry), ensure_ascii=False, indent=2))
     return 0
 
 
@@ -599,7 +679,51 @@ def _dotenv_source(name: str, loaded: list[Path]) -> str | None:
     return None
 
 
-def config_wizard() -> int:
+def probe_wizard_values(values: dict[str, str]) -> Any:
+    """拿向导刚收的答案（尚未落盘）对主模型发一条最小请求，返回 diagnostics.Check。
+
+    答案临时叠在环境变量上再走 Config.from_env → providers.build 那条正式装配
+    路径：探的就是落盘后真正会生效的那条路由，而不是另一套"向导专用"的拼装。
+    探完原样恢复环境——向导之后不该留下任何没落盘的变量。
+    """
+    from . import diagnostics
+
+    saved = {name: os.environ.get(name) for name in values}
+    os.environ.update(values)
+    try:
+        return diagnostics.probe_model(Config.from_env())
+    finally:
+        for name, value in saved.items():
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value
+
+
+def _confirm_save_after_failed_probe(check: Any) -> bool:
+    """探测失败：把分类后的原因摆出来，问要不要照样保存。
+
+    失败不一定是配置错（端点临时不通、限流、模型名在网关上拼错一个字母……），
+    所以不直接拒绝落盘；但默认答案是 N——"保存了一份跑不通的配置"比
+    "再填一遍"贵得多，用户要到第一轮对话才撞上。没法问（stdin 不是终端）
+    时按保存处理并出声：无人值守的脚本不该被一个问句卡死。
+    """
+    print(ui.error(f"探测失败：{check.summary}"))
+    for line in check.details:
+        print(ui.secondary(f"  {line}"))
+    if check.remedy:
+        print(ui.secondary(f"  建议：{check.remedy}"))
+    if not sys.stdin.isatty():
+        print(ui.warning("非交互环境，无法确认：按保存处理（之后可用 xiaoyu doctor --probe 复查）"))
+        return True
+    try:
+        answer = input("仍要保存吗？[y/N]: ").strip().lower()
+    except EOFError:
+        answer = ""
+    return answer in ("y", "yes")
+
+
+def config_wizard(probe: bool = True) -> int:
     if not sys.stdin.isatty():
         print(
             ui.error("交互向导需要终端；非交互环境请用 xiaoyu config --set KEY=VALUE"),
@@ -698,6 +822,19 @@ def config_wizard() -> int:
             prompt = f"网关 API key（留空 = 不改，之后也可用{sources} 提供）"
         if key := ask_key(prompt):
             values["XIAOYU_API_KEY"] = key
+    if probe:
+        #  落盘前先验一次：key 贴错一位、端点少个 /v1、模型名在网关上不存在，
+        #  这些都是"保存成功"之后第一轮对话才炸的错。一条最小请求就能当场抓住，
+        #  代价是一点点 token。--no-probe 跳过（离线填配置、或端点暂时不通）
+        print(ui.secondary(f"正在对 {values['XIAOYU_MODEL']} 发一条最小请求验证（--no-probe 可跳过）…"))
+        check = probe_wizard_values(values)
+        if check.status == "fail":
+            if not _confirm_save_after_failed_probe(check):
+                print(ui.warning("未保存。改好后再跑一次 xiaoyu config，或用 --no-probe 直接写入。"))
+                return 1
+        else:
+            paint = ui.success if check.status == "ok" else ui.warning
+            print(paint(f"探测通过：{check.summary}"))
     path = save_user_env(values)
     print(ui.success(f"已写入 {path}"))
     print(ui.secondary("注意：环境变量和当前目录 .env 里的同名项会优先于这份配置。"))
@@ -1201,8 +1338,10 @@ def send_command(argv: list[str]) -> int:
 def resume_command(argv: list[str]) -> int:
     """`xiaoyu resume`：从会话日志恢复历史对话继续聊。
 
-    模型/端点等配置照常从环境读取（会话里记录的模型只作展示）；
-    恢复的消息会重新写入新的会话文件，让每个文件都自包含、可再次 resume。
+    端点等配置照常从环境读取；模型与交互模式默认**跟随旧会话最后生效的那份**
+    （/model、下拉框、粘性降级、plan 进出都有留痕）——续的是同一场对话，上下文是
+    按那个模型长的；与 ACP session/load、`@x` 接回同一口径。`--model` / `--mode`
+    显式给了才覆盖。恢复的消息会重新写入新的会话文件，让每个文件都自包含、可再次 resume。
     """
     parser = argparse.ArgumentParser(
         prog="xiaoyu resume",
@@ -1237,6 +1376,11 @@ def resume_command(argv: list[str]) -> int:
     )
     parser.add_argument("--yolo", action="store_true", help="不再逐个确认写文件和执行命令")
     parser.add_argument("--no-tui", dest="no_tui", action="store_true", help="用明文 REPL")
+    parser.add_argument(
+        "--model",
+        default=None,
+        help="换个模型接着聊；默认跟随旧会话最后生效的模型（没留痕时用配置默认）",
+    )
     add_guardrail_flags(parser)
     add_system_prompt_flags(parser)
     add_prompt_flag(parser)
@@ -1393,6 +1537,13 @@ def resume_command(argv: list[str]) -> int:
             append_system_prompt=args.append_system_prompt,
             workspace_trusted=trust.trusted,
         )
+        #  模型跟随旧会话最后生效的那个（与 ACP session/load、term 同一纪律）：
+        #  在建 SessionLog 之前覆盖，新文件 meta 记下的就是跟随后的模型。
+        #  --model 显式给了以它为准；旧文件读不出来保持配置默认
+        if args.model:
+            config.model = args.model
+        elif recorded := last_model(chosen.path):
+            config.model = recorded
         permissions = Permissions.load(config.workspace, include_workspace=trust.trusted)
         if prompt:
             approver, sink = oneshot_frontend(permissions, args.output_format)
@@ -1418,6 +1569,10 @@ def resume_command(argv: list[str]) -> int:
 
     #  接回上下文并复制进新会话文件（新文件自包含，可再次 resume）
     agent.restore(loaded, source=str(chosen.path))
+    #  交互模式同一纪律：历史里可能带着 plan 进出的说明，模式不跟上，模型以为
+    #  还在规划态而关卡全开（或反过来）。--mode 显式给了以它为准
+    if args.mode is None and (follow_mode := last_mode(chosen.path)):
+        agent.adopt_mode(follow_mode)
 
     if vanished := vanished_tools(loaded, agent.toolbox.names()):
         print(
@@ -2287,11 +2442,14 @@ def text_ask_questions(questions: list[dict[str, Any]]) -> dict[str, str]:
     attention.waiting(attention.WAITING_INPUT)
     answers: dict[str, str] = {}
     total = len(questions)
-    for number, item in enumerate(questions, start=1):
-        answer = ask_one_text(item, position=f"{number}/{total}" if total > 1 else "")
-        if answer is None:
-            break
-        answers[item["question"]] = answer
+    try:
+        for number, item in enumerate(questions, start=1):
+            answer = ask_one_text(item, position=f"{number}/{total}" if total > 1 else "")
+            if answer is None:
+                break
+            answers[item["question"]] = answer
+    finally:
+        attention.running()
     return answers
 
 
@@ -2814,13 +2972,34 @@ def terminate_background_commands(agent: Agent) -> list[dict[str, Any]]:
     ]
 
 
-def turn_stats_line(agent: Any) -> str:
-    """`--stats` 开着时本轮的计时一行；没开或本轮没请求返回空串。
-    getattr 兜底：测试里的替身 agent 没有这两个属性。"""
-    if not getattr(agent, "show_stats", False):
-        return ""
+#  交互前端轮末默认那行简版耗时的开关与门槛：短轮次刷这一行只是噪音，
+#  等了半分钟的人才想知道"刚才到底花了多久、模型吐得快不快"
+TURN_SUMMARY_ENV = "XIAOYU_TURN_SUMMARY"
+TURN_SUMMARY_MIN_MS = 5000
+
+
+def turn_summary_enabled() -> bool:
+    return os.environ.get(TURN_SUMMARY_ENV, "1").strip().lower() not in ("0", "false", "no", "off")
+
+
+def turn_stats_line(agent: Any, interactive: bool = False) -> str:
+    """轮末的计时一行；本轮没请求返回空串。
+
+    `--stats` 开着打全版（耗时 / 首 token / tok/s / 请求数）。交互前端
+    （interactive=True）没开 --stats 也默认打简版（耗时与 tok/s），但只在本轮
+    耗时 ≥ 5s 时打，XIAOYU_TURN_SUMMARY=0 关掉；-p 单发与 json 输出不传
+    interactive，行为不变。getattr 兜底：测试里的替身 agent 没有这两个属性。
+    """
     stats = getattr(agent, "turn_stats", None)
-    return stats.summary() if stats is not None else ""
+    if stats is None:
+        return ""
+    if getattr(agent, "show_stats", False):
+        return stats.summary()
+    if not interactive or not turn_summary_enabled():
+        return ""
+    if stats.duration_ms < TURN_SUMMARY_MIN_MS:
+        return ""
+    return stats.brief()
 
 
 def run_once(
@@ -3065,8 +3244,8 @@ def background_status(agent: Agent) -> str:
 
 
 def repl(agent: Agent) -> int:
-    #  窗口标题随会话走，任何退出路径都还原（与 TUI 同一纪律）
-    attention.set_title(agent.config.workspace)
+    #  窗口标题随会话走（具名会话用名字），任何退出路径都还原（与 TUI 同一纪律）
+    attention.set_title(agent.config.workspace, session=attention.session_label(agent.session_log))
     try:
         return _repl_loop(agent)
     finally:
@@ -3104,6 +3283,9 @@ def _repl_loop(agent: Agent) -> int:
             if expanded is None:
                 if handle_slash(agent, action.args):
                     return 0
+                #  /rewind 回收的原话：明文 REPL 填不进输入行，打出来供复制
+                for text in agent.drain_steers():
+                    print(ui.secondary(f"  上一轮原话：{text}"))
                 continue
             if not expanded:
                 continue
@@ -3115,6 +3297,7 @@ def _repl_loop(agent: Agent) -> int:
             _repl_memo(agent, action.args)
             continue
 
+        attention.running()
         try:
             agent.send(action.args)
         except KeyboardInterrupt:
@@ -3126,7 +3309,7 @@ def _repl_loop(agent: Agent) -> int:
             print(ui.error(f"\n请求失败：{type(exc).__name__}: {exc}"))
         if note := background_status(agent):
             print(ui.secondary(note))
-        if stats := turn_stats_line(agent):
+        if stats := turn_stats_line(agent, interactive=True):
             print(ui.secondary(f"  {stats}"))
         #  一轮收尾 = 回到"等人"：铃（opt-in）+ 状态钩子
         attention.waiting(attention.WAITING_INPUT)
@@ -3189,10 +3372,15 @@ def _rewind_flow(agent: Agent, rest: list[str]) -> None:
             if not conversation:
                 return
 
-    result = agent.rewind_to(index, conversation=conversation, files=files)
-    print(ui.success(f"  {result}"))
+    result = agent.rewind_result(index, conversation, files, check_conflicts=False)
+    print(ui.success(f"  {result.summary}"))
     if conversation:
         print(ui.secondary("  （屏幕上方的旧输出只是显示残留，模型已不记得被截掉的轮次）"))
+    if result.conversation_rewound and result.prompt_text:
+        #  被回退那一轮的原话走"没赶上本轮的插话"同一条预填通道：前端在命令
+        #  结束后取走——TUI 填进输入行（可改可直接回车，不自动提交），明文
+        #  REPL 没有预填能力，只把原话打出来供复制
+        agent.steer(result.prompt_text)
 
 
 #  技能的显式入口前缀：/skill:<名字>。与内建命令撞名的技能只能从这里进
@@ -3206,16 +3394,18 @@ def skill_shadowed(name: str) -> bool:
     return f"/{name}" in _BUILTIN_SLASH
 
 
-def skill_prompt(agent: Agent, line: str) -> str | None:
-    """`/<技能名> 参数…` → 展开成本轮提示文本。
+def skill_invocation(agent: Agent, line: str) -> tuple[str, str] | None:
+    """`/<技能名> 参数…` / `/skill:<技能名> 参数…` → (技能名, 参数串)。
 
-    返回 None = 这行不是技能调用（内建命令或没这个技能），交给 handle_slash；
-    返回空串 = 是技能调用但展开失败（已打印原因），本轮不发。
+    返回 None = 这行不是技能调用（不以斜杠开头、内建命令、或没这个技能）。
     名字空间规则：内建命令 > 技能——`/help` 永远是帮助，同名技能要写
-    `/skill:help`。`/skill:` 前缀下找不到也报错而不是回落到内建，用户既然
-    写了前缀就是明确要技能。
+    `/skill:help`。`/skill:` 前缀下找不到也当技能调用（随后展开时报错）而不是
+    回落到内建，用户既然写了前缀就是明确要技能。TUI / 明文 REPL / ACP 三个
+    前端共用这一个判定，斜杠名字空间不会按前端漂移。
     """
     head, _, rest = line.strip().partition(" ")
+    if not head.startswith("/"):
+        return None
     explicit = head.startswith(SKILL_SLASH_PREFIX)
     name = head[len(SKILL_SLASH_PREFIX):] if explicit else head[1:]
     if not name or (not explicit and (head in _BUILTIN_SLASH or not agent.skills)):
@@ -3223,15 +3413,64 @@ def skill_prompt(agent: Agent, line: str) -> str | None:
     if not explicit and not any(skill.name == name for skill in agent.skills):
         #  不是已知技能：当作敲错的内建命令报"未知命令"，别为每个错字重扫磁盘
         return None
-    arguments = rest.strip()
+    return name, rest.strip()
+
+
+def skill_invocation_prompt(name: str, loaded: str) -> str:
+    """点名调用的技能 → 发给模型的提示文本。模型看到的就是 skill 工具加载的那份
+    （目录头 + 支持文件 + 正文），外加一句"这是用户点名要执行的"：和模型自己按
+    索引挑技能加载是两种语气。"""
+    return f"按下面这个技能的说明执行（用户以 /{name} 直接调用）：\n\n{loaded}"
+
+
+def skill_prompt(agent: Agent, line: str) -> str | None:
+    """`/<技能名> 参数…` → 展开成本轮提示文本（REPL / TUI 前端）。
+
+    返回 None = 这行不是技能调用（内建命令或没这个技能），交给 handle_slash；
+    返回空串 = 是技能调用但展开失败（已打印原因），本轮不发。
+    """
+    invocation = skill_invocation(agent, line)
+    if invocation is None:
+        return None
+    name, arguments = invocation
     result = agent._load_skill(name, arguments)  # noqa: SLF001 - 同包的前端入口
     if result.startswith("ERROR:"):
         print(ui.error(f"  {result}"))
         return ""
     print(ui.secondary(f"  已展开技能 {name}" + (f"（参数：{arguments}）" if arguments else "")))
-    #  模型看到的就是 skill 工具加载的那份（目录头 + 支持文件 + 正文），外加
-    #  一句"这是用户点名要执行的"：和模型自己按索引挑技能加载是两种语气
-    return f"按下面这个技能的说明执行（用户以 /{name} 直接调用）：\n\n{result}"
+    return skill_invocation_prompt(name, result)
+
+
+def _slash_export(agent: Agent, where: str) -> None:
+    """/export [路径]：当前会话文件 → Markdown（与 `xiaoyu sessions export` 同一个转写）。
+
+    默认落在工作区 `xiaoyu-session-<id>.md`，id 即会话文件名（开场横幅那个）；
+    给的是目录就写进目录里。延迟落盘的空壳会话盘上还没有文件，如实说没内容。
+    """
+    log = getattr(agent, "session_log", None)
+    path = getattr(log, "path", None)
+    if path is None or not Path(path).is_file():
+        print(ui.secondary("  本会话还没有记录可导出"))
+        return
+    info = session_info(Path(path))
+    if info is None:
+        print(ui.error(f"  读不出会话文件头部：{path}"))
+        return
+    default_name = f"xiaoyu-session-{Path(path).stem}.md"
+    target = Path(where).expanduser() if where else Path(default_name)
+    if not target.is_absolute():
+        target = Path(agent.config.workspace) / target
+    if target.is_dir():
+        target = target / default_name
+    if target.is_symlink():
+        print(ui.error(f"  输出路径是符号链接，拒绝写入：{target}"))
+        return
+    try:
+        target.write_text(export_markdown(info), encoding="utf-8")
+    except (OSError, ValueError) as exc:
+        print(ui.error(f"  导出失败：{exc}"))
+        return
+    print(ui.success(f"  已导出到 {target}"))
 
 
 def handle_slash(agent: Agent, line: str, select: Any = None) -> bool:
@@ -3480,6 +3719,19 @@ def handle_slash(agent: Agent, line: str, select: Any = None) -> bool:
                     print(ui.warning(f"  这条规则可能不会命中：{hint}"))
     elif command == "/resume":
         slash_resume(agent, rest, select)
+    elif command == "/copy":
+        text = agent.last_assistant_text()
+        if not text:
+            print(ui.secondary("  还没有可复制的回复"))
+        elif tool := media.copy_text(text):
+            print(ui.secondary(f"  已复制最后一条回复到剪贴板（{tool}，{len(text)} 字）"))
+        elif attention.copy_via_terminal(text):
+            #  SSH / 容器里没有本机剪贴板命令，OSC 52 交给终端宿主写（终端得允许）
+            print(ui.secondary(f"  本机没有剪贴板命令，已经 OSC 52 交给终端（{len(text)} 字；终端需允许写剪贴板）"))
+        else:
+            print(ui.warning("  复制失败：没有 pbcopy / wl-copy / xclip / clip.exe，当前也不是终端"))
+    elif command == "/export":
+        _slash_export(agent, " ".join(rest))
     elif command == "/clear":
         agent.reset()
         print(ui.secondary("对话已清空"))
@@ -3569,6 +3821,9 @@ def make_confirm(permissions: Permissions):
         except (EOFError, KeyboardInterrupt):
             print()
             return False
+        finally:
+            #  答完就回到运行中：标题上的"等审批"不能留到下一次等人
+            attention.running()
 
         verdict = interpret_confirm_answer(answer)
         if verdict is GRANT_SESSION:

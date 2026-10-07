@@ -29,7 +29,7 @@ import httpx2
 
 from . import netproxy
 from .config import GATEWAY_KEY_ENVS, Config, MissingConfig, find_api_key
-from .responses import ANTHROPIC, RESPONSES, WILDCARD
+from .responses import ANTHROPIC, CHAT, RESPONSES, WILDCARD
 from .responses import wrap as wrap_transport
 from .scripted import SCRIPTED_ENV, SCRIPTED_PROVIDER
 from .textcalls import TEXT as TEXT_TOOLS
@@ -121,14 +121,35 @@ def request_timeout(seconds: float) -> httpx2.Timeout:
     return httpx2.Timeout(seconds, connect=min(_CONNECT_TIMEOUT, seconds))
 
 
-def _discover_models(base_url: str, api_key: str, label: str) -> tuple[str, ...]:
+def first_chunk_timeout(base: httpx2.Timeout, seconds: float) -> httpx2.Timeout | None:
+    """首 chunk 看门狗要用的请求级超时；用不着（关着、或不比 read 更紧）返回 None。
+
+    **为什么是收紧 read 而不是另起一个计时器**：等首 token 的那段时间，进程阻塞在
+    一次 socket 读上，能打断它的只有这次读自己的超时——不起线程就没有第二只手。
+    httpx2 的 read 超时在流开始时取值一次、整条流沿用，所以做不到"首 chunk 一个数、
+    之后另一个数"：看门狗生效时，流内两个 chunk 之间的等待上限也跟着收到这个数
+    （默认 300s；生成中途停 5 分钟一个字不吐的流本来也活不过来）。不收紧的情况
+    （看门狗关着、或 request_timeout 本来就更短）一个字节都不改。
+    """
+    read = base.read
+    if seconds <= 0 or read is None or seconds >= read:
+        return None
+    return httpx2.Timeout(
+        connect=base.connect, read=seconds, write=base.write, pool=base.pool
+    )
+
+
+def _discover_models(
+    base_url: str, api_key: str, label: str, headers: tuple[tuple[str, str], ...] = ()
+) -> tuple[str, ...]:
     """探端点 /v1/models，返回它当前 serve 的 model id（去重排序）。失败/空 → 空
     元组：调用方据此**跳过注册**，绝不退化成通配（通配的具名 provider 会把一切
     模型名都吃掉、劫持网关路由）。失败只出声不抛——启动不该因端点没起来而崩。"""
     client = None
     try:
         client = _openai_class()(
-            base_url=base_url, api_key=api_key, http_client=netproxy.http_client()
+            base_url=base_url, api_key=api_key, http_client=netproxy.http_client(),
+            **({"default_headers": dict(headers)} if headers else {}),
         )
         page = client.with_options(timeout=_DISCOVER_TIMEOUT).models.list()
         #  清单在关连接之前取完：翻页是迭代时才发的请求
@@ -190,6 +211,9 @@ class Preset:
     #  非空即"区域型" preset：key_envs 里的 key 是可选的第二种鉴权，key 与区域变量
     #  任一存在即注册；向导与 doctor 两样都问/报
     region_env: str = ""
+    #  这家端点单次请求收得下的图片张数上限（0 = 不知道/不限）。只写实测过的；
+    #  出网投影取它与 XIAOYU_MAX_IMAGES_PER_REQUEST 两者中较小的（见 media.cap_images）
+    max_images: int = 0
 
 
 #  ⚠️ 只内置能确认的厂商。猜错的代价是用户配好了却 404——这类数据宁可缺也不能错
@@ -434,6 +458,11 @@ class Provider:
     response_cache: bool = False
     #  非空 = 请求走 AWS 凭证链签名的 Bedrock client（见 Registry._build_client）
     aws_region: str = ""
+    #  随每个请求附带的自定义 HTTP header（名, 值）对。三条协议的 SDK client 都收
+    #  default_headers；值可能是令牌，展示面（config --show / doctor）只露名字
+    headers: tuple[tuple[str, str], ...] = ()
+    #  单次请求图片张数上限（0 = 不限）。见 Preset 同名字段
+    max_images: int = 0
 
     @property
     def wildcard(self) -> bool:
@@ -448,6 +477,59 @@ class Provider:
     @property
     def display(self) -> str:
         return self.label or self.name
+
+    @property
+    def header_names(self) -> tuple[str, ...]:
+        """自定义 header 的名字清单（展示用，值永不出）。"""
+        return tuple(name for name, _ in self.headers)
+
+    def protocol_for(self, model: str) -> str:
+        """这个型号在这家走哪条 wire protocol。与 responses.Transport.protocol_for
+        同一规则（Messages 优先于 Responses，其余 chat）；放在这里是为了不构造
+        client 也能回答——config --show 这类展示面不该为了报协议而 import SDK。"""
+        if WILDCARD in self.anthropic_models or model in self.anthropic_models:
+            return ANTHROPIC
+        if WILDCARD in self.responses_models or model in self.responses_models:
+            return RESPONSES
+        return CHAT
+
+
+#  自定义 header 的写法：`Name=value;Name2=value2`。分隔符选分号而非逗号——
+#  header 值里逗号常见（Accept、q 权重），分号在 header 值里反而极少单独出现。
+#  值里允许再出现 `=`（只按第一个切），值可写 ${env:VAR} 引用环境变量/Keychain，
+#  令牌不必明文进配置
+_HEADER_SEP = ";"
+
+
+def parse_provider_headers(raw: str, label: str = "") -> tuple[tuple[str, str], ...]:
+    """解析 `XIAOYU_PROVIDER_<NAME>_HEADERS`。顺序保留；坏段出声跳过而不是整条作废。
+
+    ${env:VAR}（也认 ${VAR}）复用 MCP 配置同一套展开：优先环境变量，其次 macOS
+    Keychain 同名条目（这是用户亲手写的声明，和 .mcp.json 的 env 块同一信任档）。
+    引用没兑现的 header **整个丢掉**并出声——把 `${env:TOKEN}` 字面量当凭据发上游，
+    上游回的 401 完全不会指向这里。
+    """
+    if not raw or not raw.strip():
+        return ()
+    from .mcp import _expand
+
+    tag = label or "XIAOYU_PROVIDER_*_HEADERS"
+    pairs: list[tuple[str, str]] = []
+    for segment in raw.split(_HEADER_SEP):
+        segment = segment.strip()
+        if not segment:
+            continue
+        name, sep, value = segment.partition("=")
+        name = name.strip()
+        if not sep or not name:
+            print(f"[{tag}：`{segment[:40]}` 不是 Name=value 形式，已忽略]", file=sys.stderr)
+            continue
+        expanded = _expand(value.strip(), keychain=True)
+        if "${" in expanded:
+            print(f"[{tag}：header {name} 引用的变量未设置，该 header 已忽略]", file=sys.stderr)
+            continue
+        pairs.append((name, expanded))
+    return tuple(pairs)
 
 
 @dataclass(frozen=True)
@@ -505,11 +587,15 @@ class Registry:
         clients: dict[str, Any] | None = None,
         *,
         inherit_environment: bool = True,
+        max_output_tokens: int | None = None,
     ) -> None:
         if not providers:
             raise MissingConfig(NO_PROVIDER_HINT)
         self.providers = providers
         self.inherit_environment = inherit_environment
+        #  单次输出 token 上限覆写（Config.max_output_tokens）：交给每家的传输层，
+        #  在唯一出网口按协议翻译（见 responses._Completions._dispatch）
+        self.max_output_tokens = max_output_tokens
         #  配置给的是一个秒数，出网用的是摊开的四段超时（建连短、读写长）
         self._timeout = request_timeout(timeout)
         #  预置 client（测试注入假 client 用）；其余按需惰性构造并缓存。
@@ -645,6 +731,11 @@ class Registry:
             pass
         return route.qualified
 
+    def max_images(self, route: Route) -> int:
+        """这条路由单次请求收得下几张图；不知道返回 0（由调用方按全局上限处理）。"""
+        provider = self.get(route.provider)
+        return max(provider.max_images, 0) if provider is not None else 0
+
     def cache_bypass(self, route: Route) -> dict[str, Any] | None:
         """这条路由重发时用来绕开响应缓存的 extra_body；端点没有这项能力返回 None。
 
@@ -696,10 +787,11 @@ class Registry:
             def factory(p: Provider = provider, t: httpx2.Timeout = self._timeout) -> Any:
                 from . import messages
 
+                headers = dict(p.headers) or None
                 if p.aws_region:
                     key = None if p.api_key == IAM_PLACEHOLDER_KEY else p.api_key
-                    return messages.bedrock_client(p.aws_region, t, api_key=key)
-                return messages.client(p.base_url, p.api_key, t)
+                    return messages.bedrock_client(p.aws_region, t, api_key=key, headers=headers)
+                return messages.client(p.base_url, p.api_key, t, headers=headers)
 
         #  snapshot 录制（XIAOYU_SNAPSHOT_RECORD）包在最外侧：录到的
         #  是传输层抹平协议差异之后、内核实际消费的 chunk 面
@@ -714,6 +806,8 @@ class Registry:
                     max_retries=0,
                     #  代理判定收口在 netproxy：回环直连、坏代理变量降级不炸
                     http_client=netproxy.http_client(),
+                    #  自定义 header 只在声明了才传：没声明时构造参数与从前一个字节不差
+                    **({"default_headers": dict(provider.headers)} if provider.headers else {}),
                 ),
                 provider.responses_models,
                 provider.anthropic_models,
@@ -721,6 +815,7 @@ class Registry:
                 provider=name,
                 text_tool_models=provider.text_tool_models,
                 signature_models=provider.signature_models,
+                max_output_tokens=self.max_output_tokens,
             )
         )
 
@@ -872,6 +967,75 @@ class Registry:
         provider = self.get(name)
         return provider.display if provider else name
 
+    def route_info(self, model: str) -> dict[str, Any]:
+        """一个模型名在这张表上的路由画像（机器可读；`config --show --json` 与
+        describe 同一数据源：归属问 resolve，能力问 provider 声明）。
+
+        密钥**只给布尔**：有没有、是哪种鉴权形态（key / 本机免 key / AWS 凭证链），
+        值不出现。解析不了的名字返回带 error 的条目，不抛——这是展示面。
+        """
+        from .config import context_window
+
+        try:
+            route = self.resolve(model)
+        except UnknownModel as exc:
+            return {"model": model, "error": str(exc)}
+        provider = self.get(route.provider)
+        if provider is None:  # pragma: no cover - resolve 返回的 provider 一定在表里
+            return {"model": model, "error": f"未注册的 provider：{route.provider}"}
+        if provider.api_key == IAM_PLACEHOLDER_KEY:
+            auth = "aws-iam"
+        elif provider.api_key == LOCAL_PLACEHOLDER_KEY:
+            auth = "local-no-key"
+        else:
+            auth = "key"
+        return {
+            "model": route.model,
+            "qualified": route.qualified,
+            "provider": provider.name,
+            "provider_label": provider.display,
+            "protocol": provider.protocol_for(route.model),
+            "base_url": provider.base_url,
+            "has_key": auth == "key",
+            "auth": auth,
+            "vision": self.sees_images(model),
+            "tools": "text" if WILDCARD in provider.text_tool_models or route.model in provider.text_tool_models else "native",
+            "context_limit": context_window(route.model),
+            "effort_levels": list(accepted_efforts(provider.name, route.model)),
+            "headers": list(provider.header_names),
+        }
+
+    def snapshot(self) -> dict[str, Any]:
+        """整张表的机器可读快照：显式声明的模型逐个给路由画像，通配 provider 单列。
+        数据源与 describe 完全相同（listing / wildcards），只是形态不同。"""
+        models = []
+        for entry in self.listing():
+            info = self.route_info(entry.model)
+            info["backups"] = [
+                {"provider": name, "provider_label": self._display(name)} for name in entry.backups
+            ]
+            models.append(info)
+        return {
+            "providers": [
+                {
+                    "name": provider.name,
+                    "label": provider.display,
+                    "base_url": provider.base_url,
+                    "models": list(provider.models),
+                    "wildcard": provider.wildcard,
+                    "protocol": provider.protocol_for(""),
+                    "headers": list(provider.header_names),
+                    "aws_region": provider.aws_region,
+                }
+                for provider in self.providers
+            ],
+            "models": models,
+            "wildcards": [
+                {"provider": provider.name, "provider_label": provider.display, "base_url": provider.base_url}
+                for provider in self.wildcards
+            ],
+        }
+
 
 @dataclass(frozen=True)
 class Listing:
@@ -912,7 +1076,9 @@ def build(config: Config) -> Registry:
     for name in _order():
         if (provider := _make(name, config)) is not None:
             providers.append(provider)
-    return Registry(providers, timeout=config.request_timeout)
+    return Registry(
+        providers, timeout=config.request_timeout, max_output_tokens=config.max_output_tokens
+    )
 
 
 def _order() -> list[str]:
@@ -1061,6 +1227,7 @@ def _make(name: str, config: Config) -> Provider | None:
                 preset.text_tool_models,
                 preset.signature_models,
                 aws_region=region,
+                max_images=preset.max_images,
             )
         key = find_api_key(preset.key_envs)
         if not key:
@@ -1076,6 +1243,7 @@ def _make(name: str, config: Config) -> Provider | None:
             preset.anthropic_models,
             preset.text_tool_models,
             preset.signature_models,
+            max_images=preset.max_images,
         )
 
     #  通用兜底：XIAOYU_PROVIDER_<NAME>_{BASE_URL,API_KEY,MODELS,PROTOCOL,VISION,TOOLS,SIGNATURES}
@@ -1086,6 +1254,11 @@ def _make(name: str, config: Config) -> Provider | None:
     key = _key_or_local((f"{_GENERIC_PREFIX}{upper}_API_KEY",), base_url)
     if not key:
         return None
+    #  HEADERS=Name=value;Name2=${env:VAR}：中转站要求的额外鉴权头 / 站点标识头等。
+    #  三条协议的 client 都带上（见 Registry._build_client），/v1/models 探测那只也带
+    headers = parse_provider_headers(
+        os.environ.get(f"{_GENERIC_PREFIX}{upper}_HEADERS", ""), f"XIAOYU_PROVIDER_{upper}_HEADERS"
+    )
     raw_models = os.environ.get(f"{_GENERIC_PREFIX}{upper}_MODELS", "")
     if raw_models.strip().lower() == DISCOVER_SENTINEL:
         #  auto 只对本机端点开：远端仍守"启动不探测"——远端探测有挂起/往返代价，
@@ -1097,7 +1270,7 @@ def _make(name: str, config: Config) -> Provider | None:
                 file=sys.stderr,
             )
             return None
-        models = _discover_models(base_url, key, f"XIAOYU_PROVIDER_{upper}")
+        models = _discover_models(base_url, key, f"XIAOYU_PROVIDER_{upper}", headers=headers)
         if not models:
             #  探测失败/空：跳过而非退化成通配（通配会劫持网关）
             return None
@@ -1141,4 +1314,5 @@ def _make(name: str, config: Config) -> Provider | None:
         speaks_anthropic,
         text_tools,
         signatures,
+        headers=headers,
     )

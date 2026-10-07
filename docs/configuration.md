@@ -5,11 +5,15 @@ README 只给最小可跑配置，这里是全量。
 ## 配置文件与优先级
 
 ```bash
-xiaoyu config             # 交互向导：直连 key / 网关端点 / 模型
+xiaoyu config             # 交互向导：直连 key / 网关端点 / 模型；落盘前先对主模型发一条最小请求验证
+xiaoyu config --no-probe  # 向导不探测、直接写入（离线填配置、端点暂时不通时用）
 xiaoyu config --show      # 看生效配置与每项来源（key 永不回显）
+xiaoyu config --show --json   # 机器可读：默认模型、各模型路由（provider / 协议 / base_url / 有无 key / 视觉与工具能力 / 上下文上限 / effort 档位）、功能开关；密钥值不出现
 xiaoyu config --path      # 打印用户级配置文件路径
 xiaoyu config --set XIAOYU_MODEL=deepseek-flash   # 非交互写入，可重复
 ```
+
+向导问完之后、写文件之前，默认按你刚填的配置对主模型发一条最小请求（与 `xiaoyu doctor --probe` 同一条路径，花一点点 token）：通过就显示耗时并保存；失败则显示分类后的原因（鉴权、端点不通、模型名不存在……）并问「仍要保存吗？[y/N]」，默认不保存。key 贴错一位、端点少个 `/v1`、模型名在网关上拼错，这些都在这一步被抓住，而不是等第一轮对话才炸。
 
 用户级 `.env` 的位置：macOS / Linux 在 `~/.config/xiaoyu/.env`（跟随 `$XDG_CONFIG_HOME`），Windows 在 `%APPDATA%\xiaoyu\.env`。也可以手动在任意工作目录放 `.env`（零依赖自解析）。行格式 `KEY=值`，整行与行尾的 `# 注释` 都认（行尾注释要与值隔一个空白；值里紧挨着的 `#` 和引号里的 `#` 是内容）。
 
@@ -101,11 +105,14 @@ XIAOYU_API_KEY=<key>
 |---|---|---|
 | `XIAOYU_EFFORT` | 不传 | 推理深度 `low / medium / high / xhigh / max`（OpenAI 线另有 `none / minimal`）。同一个名字出内核，按协议翻译成 `reasoning_effort` / `reasoning.effort` / `output_config.effort`；你给自己点名的模型配的取值原样发，上游不认会 400；换到降级链上的模型、或由子 agent 继承过去时，对实测过档位范围的型号就近换成它认的一档并提示（没实测过的型号不改）。命令行 `--effort`，会话里 `/effort`，子 agent 可在 spec 里单独声明 |
 | `XIAOYU_CONTEXT_LIMIT` | 按模型查表 | 上下文上限（token）覆写 |
+| `XIAOYU_MAX_OUTPUT_TOKENS` | 不传（Claude 原生协议用内置常量：流式 64000 / 同步 16000） | 单次请求输出 token 上限覆写（正整数）。本地小模型、中转站常限输出上限，超了直接 400。按协议翻译：chat `max_tokens`、Responses `max_output_tokens`、Anthropic `max_tokens`；摘要/收尾这类同步请求取 min(设值, 16000) |
 | `XIAOYU_COMPACT_AT` | `0.7` | 用量占到这个比例时触发回收/压缩；取 0.05~1 的比例，写成 `70` 这类整数会被忽略并在启动时提示。用量到压缩阈值的 50% / 80% 时模型各收到一次余量提示（operator 通道，不碰 system prompt），让它在压缩前合并读取、先把结论落下来；压缩/回滚后按现状重定基线 |
 | `XIAOYU_BUDGET_TOKENS` | 不限 | 本会话 token 软预算（prompt+completion 累计，≥5000 才生效）：模型按 50/80/95% 收到倒计时（operator 通道），到线前一步优雅收尾交代现场，而不是被硬闸中途砍断；直连支持型号（Opus 5/4.8/4.7/Fable/Mythos/Sonnet 5）另附 Anthropic 原生 `task_budget`（服务端倒计时）。命令行 `--budget-tokens` |
 | `XIAOYU_TURN_EXTENSION` | `1.0` | 撞 `max_iterations` 时允许模型调 `extend_turns` 申请追加轮数，总追加量 ≤ `max_iterations ×` 此系数；`0` = 不许延期（撞顶即收尾）。理由展示给用户、可审计。轮数用到上限的 50% / 80% 时模型各收到一次「轮数 N/M」提示（每轮各一次） |
 | `XIAOYU_SERVER_COMPACTION` | `1` | 直连 Claude（opus-4.6+/sonnet-4.6+/5 系）时把压缩交给服务端（模型自己写摘要，`compaction` 块下轮回传，服务端忽略块前历史）；本地摘要压缩降为兜底。设 `0` 回纯本地压缩 |
 | `XIAOYU_KEEP_RECENT` | `8` | 压缩时至少保留最近几条消息 |
+| `XIAOYU_FIRST_CHUNK_TIMEOUT` | `300` | 首 chunk 看门狗（秒）：请求发出后等第一个流事件超过它就中止本次尝试、按瞬时错误走既有重试/降级链，报错点名"首 chunk 等待超过 300s（XIAOYU_FIRST_CHUNK_TIMEOUT）"；`0` = 关。实现是收紧这次请求的读超时（等首 token 时进程阻塞在一次 socket 读上，不起线程就只有它能打断），所以看门狗生效时流内两个 chunk 之间的等待上限也是这个数；比单次请求超时（600s）长时不生效 |
+| `XIAOYU_MAX_IMAGES_PER_REQUEST` | `20` | 每次请求最多发出去几张图（`0` = 不限）：只投影发出去的副本——更早的图换成一行"[图片已省略：第 N 张…]"占位，历史与会话文件照旧带图，`/compact` 或用户重贴随时能回来。内置厂商若声明了更小的张数上限，按较小的算。用户贴的图刻意不老化，没有这一层，贴图多的长会话会撞端点的张数上限（400 且每次重发同样 400） |
 | `XIAOYU_EXPLORE_ITERATIONS` | `12` | `explore` 子 agent 单次检索的工具调用轮数上限（1–100；主 agent 的 50 轮不受影响） |
 | `XIAOYU_QIXIANG_CONCURRENCY` | `4` | 七襄批量委托的并发上限（1–16） |
 | `XIAOYU_QIXIANG_TIMEOUT` | `0` | 七襄单项任务墙钟超时（秒，从实际启动起算；`0` = 不限时） |
@@ -116,7 +123,7 @@ XIAOYU_API_KEY=<key>
 | 变量 | 说明 |
 |---|---|
 | `XIAOYU_ENABLE_EXPLORE` | `explore` 检索子 agent |
-| `XIAOYU_ENABLE_SKILLS` | 扫描 `~/.agents/skills/`、工作区自带的 `.xiaoyu/skills/` 与 `.agents/skills/`、已装插件包下的 SKILL.md |
+| `XIAOYU_ENABLE_SKILLS` | 扫描 `~/.agents/skills/`、工作区自带的 `.xiaoyu/skills/` 与 `.agents/skills/`（按 git 根 → 工作区逐层找，越靠近工作区优先；工作区不在 git 仓里只看它自己；与仓库级 `.mcp.json` 同受信任门）、已装插件包下的 SKILL.md |
 | `XIAOYU_SKILLS_DISABLED` | 停用清单（不是开关）：逗号分隔的技能名，可通配，如 `lark-*,remotion-*,aws-core:*`。按带插件前缀的全名或目录名匹配。技能库是几家客户端共用的，要给索引腾预算时在这里点名，不必去删文件；`/skills` 会列出被停用的 |
 | `XIAOYU_SKILLS_DIR` | 覆盖技能扫描目录（`os.pathsep` 分隔）：给了就只认它、不混默认目录，工作区自带的也不扫（宿主指定技能库 / 测试隔离用） |
 | `XIAOYU_ENABLE_WEB_SEARCH` | `web_search` 工具 |
@@ -133,9 +140,10 @@ XIAOYU_API_KEY=<key>
 | `XIAOYU_UPDATE_CHECK` | 新版本提示（默认开）：交互式启动时每 24 小时至多查一次 PyPI，有新版在横幅后提一行；`-p`、`--wire`、serve、ACP、嵌入宿主不查。请求只带版本号，没有身份标识；同一个新版本每 24 小时至多提一次。`0` = 关 |
 | `XIAOYU_FOLDER_TRUST` | 工作区信任门（默认开，见[安全](security.md)；只认真实环境变量与用户级 `.env`） |
 | `XIAOYU_HARDLINE` | bash 硬红线（`rm -rf /`、`mkfs`、`dd of=/dev/…`，默认开、任何模式都拦）；`0` = 关，给隔离环境里的镜像烧录 / 格式化用（见[安全](security.md)） |
+| `XIAOYU_SEARCH_SENSITIVE` | 搜索工具的敏感文件过滤（默认开）：`grep` / `list_files` 不把 `.env`、私钥、`.ssh/`、`.aws/credentials` 等读进上下文，起点是这类路径直接拒绝；`0` = 关，给隔离环境里确实要在凭据目录里搜的任务用（见[安全](security.md)） |
 | `XIAOYU_UNATTENDED` | **默认关**，`1` = 开：`--yolo` 下仍必问的三项（`exit_plan_mode`、沙箱升权、写可执行配置）也不再问；等价命令行 `--unattended` |
 | `XIAOYU_UNGUARDED` | `--unguarded` 无护栏预设的**环境同意**：只认真实环境变量、不读 `.env`，由容器 / VM 编排脚本注入；没有它 `--unguarded` 报错退出（见[安全](security.md)） |
-| `XIAOYU_ENABLE_HOOKS` | 用户级 `hooks.toml` 生命周期钩子（PreToolUse / PostToolUse / UserPromptSubmit / Stop；退出码 2 = 拦截，其它失败 fail-open 放行）。样本：[examples/hooks/adversary](../examples/hooks/adversary/)——bash 命令交给另一次 `xiaoyu -p` 做二审 |
+| `XIAOYU_ENABLE_HOOKS` | 用户级 `hooks.toml` 生命周期钩子（工具前后 / 用户输入 / 收尾 / 会话起止 / 子 agent 起止 / 压缩前后，见下文事件表；退出码 2 = 拦截，其它失败 fail-open 放行）。样本：[examples/hooks/adversary](../examples/hooks/adversary/)——bash 命令交给另一次 `xiaoyu -p` 做二审 |
 | `XIAOYU_ENABLE_AGENTS` | 声明式 subagent（`agents/*.toml`）与七襄并行织造模式（见[多 agent 协同](multi-agent.md)） |
 | `XIAOYU_ENABLE_CHENSHU` | 宸枢统筹织造模式（见[多 agent 协同](multi-agent.md)） |
 | `XIAOYU_SUBAGENT_MAX_DEPTH` | 子 agent 嵌套深度上限（默认 `1` = 不套娃）；设 2/3 显式放开有界嵌套 |
@@ -215,8 +223,9 @@ XIAOYU_BEDROCK_REGION=us-east-1
 | `XIAOYU_SANDBOX_NETWORK` | 开 | 沙箱内是否允许联网（`0` = 断网） |
 | `XIAOYU_SANDBOX_WRITABLE` | — | 追加可写根目录，冒号分隔 |
 | `XIAOYU_THEME` | `auto` | `dark` / `light` 跳过终端背景色探测 |
-| `XIAOYU_BELL` | 关 | `1` = 一轮结束 / 等审批时往终端写响铃（BEL），终端翻译成提示音、Dock 弹跳或标签高亮；只对真终端写，管道里不写 |
-| `XIAOYU_TITLE` | 开 | 交互模式把窗口标题设成「xiaoyu · 目录名」，退出时还原（认标题栈的终端精确还原，其余清空）；`0` = 关 |
+| `XIAOYU_TURN_SUMMARY` | 开 | 交互模式每轮结束打一行简版耗时（耗时 · 输出 tok/s），只在该轮耗时 ≥ 5s 时打；`0` = 关。`--stats` 的全版（含首 token、请求数）不受此影响，`-p` 与 json 输出也不打 |
+| `XIAOYU_BELL` | 关 | 一轮结束 / 等审批时往终端写通知。`1` / `bel` = 响铃（BEL），终端翻译成提示音、Dock 弹跳或标签高亮；`osc9`（iTerm2 / WezTerm / ghostty）、`osc777`（rxvt 一路）、`osc99`（kitty）= 带文案的桌面通知转义序列，文案含状态与会话名/目录名；`auto` 按 `TERM_PROGRAM` / `KITTY_WINDOW_ID` 挑一种，认不出退回 BEL。tmux 里自动用 DCS 透传。只对真终端写，管道里不写 |
+| `XIAOYU_TITLE` | 开 | 交互模式把窗口标题设成「<状态> · <会话名或目录名> · xiaoyu」，状态随会话走（就绪 / 运行中 / 等审批 / 等输入），具名会话（`--session-id`、`term-…`）用名字；退出时还原（认标题栈的终端精确还原，其余清空）；`0` = 关 |
 | `XIAOYU_STATUS_HOOK` | — | 状态变成"等人"时后台跑的命令，状态串作最后一个参数（`waiting_input` / `waiting_approval`），也放进环境变量 `XIAOYU_STATUS`。给系统通知用，如 macOS：`osascript -e 'display notification "小羽在等你"'`；超时（10s）与失败静默。只在 TUI / 明文 REPL 生效 |
 | `XIAOYU_BROWSER_CDP` | — | 接管以 `--remote-debugging-port` 起的本机 Chrome（要登录态时用） |
 | `XIAOYU_BROWSER_HEADED` | 无头 | 有头模式启动浏览器 |
@@ -265,7 +274,7 @@ xiaoyu --system-prompt-file ~/prompts/writer.md
 
   边界刻意收得窄，宁可少剥不错剥：`<!--` 要在行首（前面只许空白）、`-->` 之后到行尾只许空白才算；行内夹着的 `a <!-- b --> c` 不动；代码围栏（` ``` ` / `~~~`）里的不动，那是给模型看的示例。`<!--` 没闭合时**不剥**并在启动时警告行号——否则漏写一个 `-->`，后半份提示词就悄悄没了。只有两个 `-file` 旗标认注释，`--system-prompt` / `--append-system-prompt` 给的文本原样使用；
 - 正文里还留着 `{{…}}` 形态的占位符时，启动会提醒一句（多半是模板没填完）；只提醒，不改内容；
-- 自定义提示词**全文记进会话文件**：`xiaoyu resume` 和 `--session-id` 续写时不必再给旗标，沿用原来那份；重新给了就以新给的为准。存全文而不是路径，是为了文件挪走、改过之后旧会话仍能原样接回；
+- 自定义提示词**全文记进会话文件**：`xiaoyu resume` 和 `--session-id` 续写时不必再给旗标，沿用原来那份；重新给了就以新给的为准。模型与交互模式同一纪律：`xiaoyu resume` 默认跟随旧会话最后生效的模型与模式（`/model`、降级链、plan 进出都有留痕；与 ACP `session/load`、`@x` 接回同口径），`--model` / `--mode` 显式给了才覆盖。存全文而不是路径，是为了文件挪走、改过之后旧会话仍能原样接回；
 - 提示词常驻每一轮请求，长度直接计入上下文与费用；`/context` 里它单列为"自定义身份"一行；
 - 库层嵌入对应 `Config(system_prompt=...)`，ACP（`xiaoyu acp`）同样认这组旗标。`xiaoyu serve` 的 agent 对象目前只有 `append_system_prompt`。
 
@@ -406,6 +415,8 @@ server 的**结果**默认包进 `<untrusted_content>` 回灌（里面的指令�
 外加一句"用户点名要执行"）。斜杠名字空间里**内建命令优先**：技能叫 `help` 也遮不住 `/help`，
 要写 `/skill:help`；`/skills` 列表会标出撞名的技能，TUI 补全里技能也列在内建命令之后
 （撞名的以 `/skill:` 形态出现）。`/skill:` 前缀下找不到技能报错，不回落到内建命令。
+ACP 客户端（Zed 等）建会话时收到的命令菜单里也列出技能（描述带 `[Skill]` 标记，撞名的同样是
+`skill:<名>`），选中后附参数即按同一规则展开；装了新技能重开会话即可见。
 
 ## 生命周期钩子（hooks.toml）
 
@@ -436,11 +447,24 @@ hook 是辅助护栏，deny 规则才是硬闸。`on_failure = "block"` 反过�
 | `Stop` | 模型想收尾时；拦截 → 理由作为消息顶回去续跑一步（每轮一次） | `last_text` |
 | `SessionStart` | 会话首轮之前一次（接回历史之后；子 agent 不触发）；拦截 → 拒绝启动 | `model`、`session` |
 | `SessionEnd` | 会话正常收尾一次，结果不影响退出 | `model`、`session` |
+| `SubagentStart` | 主会话委托子 agent 之前；拦截 → 这次委托不执行，模型收到委托失败自行改道 | `agent` |
+| `SubagentEnd` | 子 agent 收工之后的通知；拦截只在委托结果里留一条附注 | `agent`、`failed` |
+| `BeforeCompact` | 要压缩上下文之前；拦截 → 不压缩、本次压缩以异常中止（上下文已超窗时这一轮无法继续，只给「压缩前必须先归档」之类的硬需求用） | `context_tokens`、`forced` |
+| `AfterCompact` | 压缩完成之后的通知 | `changed`、`method`（`microcompact` / `summary`） |
 
 同一次工具调用的 `PreToolUse` / `PostToolUse` / `ToolFailed` 带**同一个 `call_id`**，外部钩子
-靠它把"要跑什么"和"跑出了什么"对上（并行工具调用下光靠工具名对不上）。`SessionStart` 放行时，
-钩子 stdout 的**首个非空行**（上限 2000 字符）作为一次性消息注入历史——给宿主注入环境说明用
-（当前分支、值班提示……）；它走的是"harness 放进来、内容不可信"的通道，不是权威指令。
+靠它把"要跑什么"和"跑出了什么"对上（并行工具调用下光靠工具名对不上）。
+
+放行钩子的 stdout 有两种去处：
+
+- **纯文本**：首个非空行（上限 2000 字符）作为一次性消息注入历史。只有两个事件消费它——
+  `SessionStart` 注入在首轮之前（给宿主注入环境说明：当前分支、值班提示……），
+  `UserPromptSubmit` 紧跟本轮用户输入之后（按这一轮输入查个工单号、附上当前 git 状态……）；
+  其它事件的 stdout 没去处。它走的是"harness 放进来、内容不可信"的通道，不是权威指令。
+- **一个 JSON 对象且含 `systemMessage` 键**：那段文本**只**作为提示显示给用户，不进历史、
+  不进模型，所有事件都认；其余键忽略。stdout 整体是 JSON 对象时首行规则不再生效——
+  钩子想对用户说一句「已记录到审计日志」，不该同时把这句喂给模型。
+
 挂在工具事件上的钩子在子 agent 里照样触发（工作目录换成它的）；会话类事件不带下去。
 事件名与 payload 形状和 SDK 进程内 hook（见 [sdk-platform](sdk-platform.md)）一致。
 
@@ -456,7 +480,10 @@ XIAOYU_PROVIDER_MINIMAX_PROTOCOL=responses                   # 默认 chat；可
 XIAOYU_PROVIDER_MINIMAX_VISION=*                             # 声明视觉能力，默认不发图
 XIAOYU_PROVIDER_MINIMAX_TOOLS=text                           # 默认 native；端点不会 function calling 时设 text
 XIAOYU_PROVIDER_MINIMAX_SIGNATURES=*                         # 工具调用重放需带回 thought_signature 的型号（Gemini 系端点用；仅 chat 协议生效，配上 PROTOCOL=responses/anthropic 会出声忽略）
+XIAOYU_PROVIDER_MINIMAX_HEADERS=X-Title=xiaoyu;Authorization=Bearer ${env:RELAY_TOKEN}   # 随每个请求附带的自定义 header，分号分隔
 ```
+
+`_HEADERS`：中转站要求的额外头（站点标识、`Authorization: Bearer` 这类与 SDK 默认鉴权形态不同的头……）。格式 `Name=value;Name2=value2`，分号分隔，值里允许再出现 `=`；值可写 `${env:VAR}`（也认 `${VAR}`）引用环境变量或 macOS Keychain 同名条目，令牌不必明文进配置——引用没兑现的那个 header 会被出声丢掉，不会把 `${env:…}` 字面量发上游。三条协议（chat / responses / anthropic）的 client 都带上，SDK 把它们合并在自家鉴权头之后，所以能盖过默认的 `x-api-key` 形态。`config --show` 与 `doctor` 只显示 header 的**名字**，值永不出现。
 
 本机端点免 key 的规则同网关：`_BASE_URL` 指向 `localhost` 时 `_API_KEY` 可省略（显式给了则以给的为准）。
 

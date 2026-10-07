@@ -23,7 +23,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from . import fsguard, plugins, tokens
-from .config import home_dir, user_config_dir
+from .config import home_dir, project_levels, user_config_dir
 from .invisible import strip_invisible
 
 #  插件命名空间与技能名之间的分隔符（`<插件>:<技能>`，业界通行形态）
@@ -51,7 +51,7 @@ class SkillSource:
     project: bool = False
 
 
-#  工作区里放技能的位置（相对工作区根）：小羽自己的目录在前，跨客户端约定的在后
+#  工作区里放技能的位置（相对层链上的每一层）：小羽自己的目录在前，跨客户端约定的在后
 PROJECT_SKILL_DIRS = ((".xiaoyu", "skills"), (".agents", "skills"))
 
 
@@ -71,8 +71,19 @@ def skill_dirs() -> list[Path]:
 
 
 def project_skill_dirs(workspace: Path) -> list[Path]:
-    """工作区自带技能的目录（存在与否不论）。"""
-    return [workspace.joinpath(*parts) for parts in PROJECT_SKILL_DIRS]
+    """工作区自带技能的目录（存在与否不论），靠前者优先。
+
+    按 git 根 → 工作区的层链逐层给（与项目指令文件同一条链，见
+    config.project_levels），**越靠近工作区越靠前**：monorepo 的子目录里开会话，
+    仓库根放的技能也该可用，但子包自己的同名技能更贴近当前活，该胜出。工作区
+    不在 git 仓里时只有它自己一层。这些目录全部跟着工作区的信任门走——上层目录
+    与工作区同属一个仓库，没有理由另设一道门。
+    """
+    return [
+        level.joinpath(*parts)
+        for level in reversed(project_levels(workspace))
+        for parts in PROJECT_SKILL_DIRS
+    ]
 
 
 def has_project_skills(workspace: Path) -> bool:

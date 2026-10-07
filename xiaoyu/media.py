@@ -314,6 +314,57 @@ def has_image(messages: list[dict[str, Any]]) -> bool:
     return any(images_of(message.get("content")) for message in messages)
 
 
+#  每次请求最多发出去几张图（出网投影，不改历史）。为什么要有这一层：工具截图
+#  有老化（compaction.age_tool_images），用户贴的图刻意永不老化——它们是用户
+#  的原话。但各家端点对单请求图片张数有硬上限（普遍 20~100 张），贴图多的长
+#  会话迟早撞上，撞上是 400 且每次重发同样 400，会话就此卡死。所以出网副本里
+#  只带最新 N 张，更早的换成一行占位；历史与会话文件照旧带图，/compact 之后
+#  或用户重贴随时能回来
+DEFAULT_MAX_IMAGES_PER_REQUEST = 20
+
+
+def cap_images(messages: list[dict[str, Any]], limit: int) -> tuple[list[dict[str, Any]], int]:
+    """出网副本里只保留最新 limit 张图，更早的换成占位文本。返回 (新列表, 省略张数)。
+
+    limit <= 0 = 不限。未超限原样返回同一个列表（不拷贝）——调用方据此知道
+    发出去的就是历史本身。只换部件、不删消息：tool_calls 配对与角色交替不受影响。
+    与 age_tool_images 的区别：那是改历史（截图循环的老化），这里只改发送副本。
+    """
+    if limit <= 0:
+        return messages, 0
+    positions = [
+        (index, offset)
+        for index, message in enumerate(messages)
+        if is_parts(message.get("content"))
+        for offset, part in enumerate(message["content"])
+        if isinstance(part, dict) and part.get("type") == IMAGE_PART
+    ]
+    total = len(positions)
+    if total <= limit:
+        return messages, 0
+    doomed = {position: ordinal for ordinal, position in enumerate(positions[: total - limit], 1)}
+    touched = {index for index, _ in doomed}
+    result: list[dict[str, Any]] = []
+    for index, message in enumerate(messages):
+        if index not in touched:
+            result.append(message)
+            continue
+        parts: list[dict[str, Any]] = []
+        for offset, part in enumerate(message["content"]):
+            ordinal = doomed.get((index, offset))
+            if ordinal is None:
+                parts.append(part)
+            else:
+                parts.append(
+                    text_part(
+                        f"[图片已省略：第 {ordinal} 张（共 {total} 张，每次请求最多发送最新 "
+                        f"{limit} 张），如需请让用户重贴]"
+                    )
+                )
+        result.append({**message, "content": parts})
+    return result, len(doomed)
+
+
 # ---------- 落盘缓存 ----------
 
 
@@ -586,6 +637,47 @@ def _osascript_files() -> tuple[Path, ...]:
             if line.strip() and path.is_file():
                 paths.append(path)
     return tuple(paths)
+
+
+#  往系统剪贴板写文本的命令，按平台挑第一个在 PATH 上的：(可执行名, argv)。
+#  Linux 上 Wayland 优先于 X11（两个都装的桌面上 xclip 常连不上），clip.exe
+#  兜 WSL（Windows 的 System32 在 PATH 里）。没有可用命令时由调用方退回 OSC 52
+_COPY_COMMANDS: dict[str, tuple[tuple[str, list[str]], ...]] = {
+    "darwin": (("pbcopy", ["pbcopy"]),),
+    "win32": (("clip", ["clip"]),),
+    "linux": (
+        ("wl-copy", ["wl-copy"]),
+        ("xclip", ["xclip", "-selection", "clipboard"]),
+        ("clip.exe", ["clip.exe"]),
+    ),
+}
+
+
+def copy_text(text: str) -> str:
+    """把文本写进系统剪贴板，返回用到的命令名；没有可用命令或写失败返回空串。
+
+    失败不抛：复制是顺手的事，调用方按返回值决定要不要退回终端的 OSC 52。
+    Windows 的 clip 按控制台代码页解码 stdin，按本机首选编码喂它；其余平台 UTF-8。
+    """
+    candidates = _COPY_COMMANDS.get(sys.platform, _COPY_COMMANDS["linux"])
+    if sys.platform == "win32":
+        import locale
+
+        data = text.encode(locale.getpreferredencoding(False) or "utf-8", errors="replace")
+    else:
+        data = text.encode("utf-8")
+    for name, argv in candidates:
+        if name == "wl-copy" and not os.environ.get("WAYLAND_DISPLAY"):
+            continue
+        if shutil.which(name) is None:
+            continue
+        try:
+            proc = subprocess.run(argv, input=data, capture_output=True, timeout=10)
+        except (OSError, subprocess.SubprocessError):
+            continue
+        if proc.returncode == 0:
+            return name
+    return ""
 
 
 def _windows_clipboard() -> Clip:

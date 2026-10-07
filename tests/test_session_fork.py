@@ -111,6 +111,39 @@ class ForkE2ETest(E2ECase):
         self.assertIn("超出范围", proc.stderr)
 
 
+class ResumeFollowsModelE2ETest(ForkE2ETest):
+    """`xiaoyu resume` 跟随旧会话最后生效的模型（与 ACP session/load、term 同口径）；
+    `--model` 显式给了才覆盖。"""
+
+    def _plant_switched_session(self) -> Path:
+        path = self._plant_session()
+        with path.open("a", encoding="utf-8") as handle:
+            #  /model 切换的留痕：最后写的说了算
+            handle.write(json.dumps({"event": "model", "model": "backup-model"}) + "\n")
+        return path
+
+    def test_resume_follows_last_model_of_session(self):
+        self._plant_switched_session()
+        proc = self._run_resume("text: 接上了\n", ["--last", "继续", "--output-format", "stream-json"])
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        result = json.loads(proc.stdout.splitlines()[-1])
+        self.assertEqual(result["model"], "backup-model")
+        #  新会话文件的 meta 记的也是跟随后的模型，再次 resume 仍跟得上
+        resumed = Path(result["session_log"]).read_text(encoding="utf-8")
+        meta = json.loads(resumed.splitlines()[0])
+        self.assertEqual(meta["model"], "backup-model")
+
+    def test_explicit_model_flag_overrides_recorded_model(self):
+        self._plant_switched_session()
+        proc = self._run_resume(
+            "text: 换了\n",
+            ["--last", "--model", "other-model", "继续", "--output-format", "stream-json"],
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        result = json.loads(proc.stdout.splitlines()[-1])
+        self.assertEqual(result["model"], "other-model")
+
+
 class ResumeByIdE2ETest(ForkE2ETest):
     """开场横幅给的会话 id（文件名）能直接点名接回，不被当成指令的第一个词。"""
 

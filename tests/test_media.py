@@ -427,6 +427,110 @@ class CompactionTest(unittest.TestCase):
         self.assertNotIn("image_url", compaction.render([parts_message()]))
 
 
+class CapImagesTest(unittest.TestCase):
+    """出网投影：每次请求最多带最新 N 张图，历史不动。"""
+
+    def _history(self, count: int) -> list[dict]:
+        return [{"role": "system", "content": "s"}] + [
+            parts_message(f"第 {i} 条") for i in range(1, count + 1)
+        ]
+
+    def test_keeps_newest_and_placeholders_older(self):
+        messages = self._history(4)
+        out, omitted = media.cap_images(messages, 2)
+        self.assertEqual(omitted, 2)
+        #  最新两张还在
+        self.assertEqual(len(media.images_of(out[3]["content"])), 1)
+        self.assertEqual(len(media.images_of(out[4]["content"])), 1)
+        #  更早的换成占位文本，且能看出是第几张
+        for index, ordinal in ((1, 1), (2, 2)):
+            self.assertEqual(media.images_of(out[index]["content"]), [])
+            text = media.text_of(out[index]["content"])
+            self.assertIn("图片已省略", text)
+            self.assertIn(f"第 {ordinal} 张", text)
+        #  条数不变（锚点下标靠它），正文文字还在
+        self.assertEqual(len(out), len(messages))
+        self.assertIn("第 1 条", media.text_of(out[1]["content"]))
+
+    def test_original_history_untouched(self):
+        messages = self._history(3)
+        snapshot = json.dumps(messages, ensure_ascii=False, sort_keys=True)
+        media.cap_images(messages, 1)
+        self.assertEqual(json.dumps(messages, ensure_ascii=False, sort_keys=True), snapshot)
+
+    def test_under_limit_or_unlimited_returns_same_list(self):
+        messages = self._history(3)
+        self.assertIs(media.cap_images(messages, 3)[0], messages)
+        self.assertIs(media.cap_images(messages, 0)[0], messages)
+
+    def test_agent_projects_outgoing_only(self):
+        """agent 层：发出去的副本被投影，self.messages 与会话历史照旧带图。"""
+        from xiaoyu.agent import Agent
+        from xiaoyu.config import Config
+        from xiaoyu.tools import Toolbox
+
+        from .test_agent_paths import FakeClient, chunk, usage_chunk
+
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        config = Config(
+            base_url="http://unused",
+            model="main-model",
+            workspace=Path(tmp.name).resolve(),
+            enable_skills=False,
+            enable_agents=False,
+            enable_hooks=False,
+            enable_plugins=False,
+            enable_mcp=False,
+            max_images_per_request=2,
+        )
+        client = FakeClient([[chunk(content="看到了"), usage_chunk(100, 5)]])
+        registry = providers.Registry(
+            [providers.Provider("gateway", "", "", (), "网关", (), ("*",))],
+            clients={"gateway": client},
+        )
+        agent = Agent(config, Toolbox(config), registry=registry)
+        for i in range(3):
+            agent.messages.append(parts_message(f"图 {i}"))
+            agent.messages.append({"role": "assistant", "content": "嗯"})
+        notices: list[str] = []
+        agent.emit = lambda event: notices.append(getattr(event, "text", ""))  # type: ignore[method-assign]
+        agent._stream_once(agent._main_route())
+        sent = client.completions.calls[-1]["messages"]
+        sent_images = sum(len(media.images_of(m.get("content"))) for m in sent)
+        self.assertEqual(sent_images, 2)
+        kept = sum(len(media.images_of(m.get("content"))) for m in agent.messages)
+        self.assertEqual(kept, 3, "历史里的图不能被投影改掉")
+        self.assertTrue(any("本次未发送" in text for text in notices))
+
+    def test_provider_cap_wins_when_smaller(self):
+        from xiaoyu.agent import Agent
+        from xiaoyu.config import Config
+        from xiaoyu.tools import Toolbox
+
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        config = Config(
+            base_url="http://unused", model="main-model", workspace=Path(tmp.name).resolve(),
+            enable_skills=False, enable_agents=False, enable_hooks=False, enable_plugins=False,
+            enable_mcp=False, max_images_per_request=20,
+        )
+        registry = providers.Registry(
+            [providers.Provider("gateway", "", "", (), "网关", (), ("*",), max_images=5)],
+            clients={"gateway": mock.MagicMock()},
+        )
+        agent = Agent(config, Toolbox(config), registry=registry)
+        self.assertEqual(agent._image_cap(agent._main_route()), 5)
+        config.max_images_per_request = 0
+        self.assertEqual(agent._image_cap(agent._main_route()), 5)
+        registry = providers.Registry(
+            [providers.Provider("gateway", "", "", (), "网关", (), ("*",))],
+            clients={"gateway": mock.MagicMock()},
+        )
+        agent.registry = registry
+        self.assertEqual(agent._image_cap(agent._main_route()), 0)
+
+
 class SessionLogTest(unittest.TestCase):
     def test_preview_is_readable(self):
         text = media.text_of(parts_message("截图看看")["content"])

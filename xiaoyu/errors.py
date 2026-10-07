@@ -95,6 +95,23 @@ class StreamFailed(RuntimeError):
     """
 
 
+class FirstChunkTimeout(RuntimeError):
+    """请求发出后等第一个流事件超过了 XIAOYU_FIRST_CHUNK_TIMEOUT（agent._stream_once 抛）。
+
+    与普通读超时同属瞬时错误（重试/降级链照走），单独成类只为报错点名是哪个设置
+    触发的——"等了 5 分钟一个字没来"和"生成到一半断了"排查方向完全不同。
+    """
+
+
+def is_timeout(exc: BaseException) -> bool:
+    """这次请求是不是超时（httpx2 的超时、或 SDK 包装后的 APITimeoutError）。"""
+    if isinstance(exc, httpx2.TimeoutException):
+        return True
+    if type(exc).__name__ == "APITimeoutError":
+        return True
+    return isinstance(exc.__cause__, httpx2.TimeoutException)
+
+
 @dataclass(frozen=True)
 class Verdict:
     kind: str  # 取值必须在 ALL_KINDS 里
@@ -368,6 +385,20 @@ def _quota_worded_throttle(text: str) -> bool:
     return _says_wait(text) and any(marker in text for marker in _SHARED_QUOTA_WORDING)
 
 
+def _image_rejected(text: str, status: int | None) -> bool:
+    """请求因图片张数/体积被端点拒绝（400 "too many images" / "image … exceeds … limit"）。
+
+    只认请求错误（400/422）或没有状态码的转写：带图的请求重发多少次都是同一个
+    拒绝，判 transient 会白烧重试预算；判 fatal 又得把"怎么办"说清楚——压缩或
+    减少图片，而不是换模型。
+    """
+    if status is not None and status not in (400, 413, 422):
+        return False
+    if "image" not in text:
+        return False
+    return "too many" in text or "limit" in text or "exceed" in text
+
+
 def _is_quota(exc: Exception, text: str, status: int | None) -> bool:
     #  402 Payment Required 无论文案都是额度问题
     if status == 402:
@@ -404,6 +435,9 @@ def classify(exc: Exception) -> Verdict:
     if isinstance(exc, StreamTruncated):
         #  先于文本判定：断流描述里的措辞不该撞上任何 marker
         return Verdict("transient", True, False, "流在工具参数写到一半时断开")
+    if isinstance(exc, FirstChunkTimeout):
+        #  先于文本判定：报错原文已点名触发的设置，原样交给用户
+        return Verdict("transient", True, False, str(exc))
     text = str(exc).lower()
     status = _status_code(exc)
 
@@ -467,6 +501,13 @@ def classify(exc: Exception) -> Verdict:
         or any(marker in text for marker in _TRANSIENT_MARKERS)
     ):
         return Verdict("transient", True, False, f"网络/服务端瞬时错误（{type(exc).__name__}）")
+
+    if _image_rejected(text, status):
+        return Verdict(
+            "fatal", False, False,
+            "请求里的图片超过端点限制（张数或体积）；/compact 回收旧图、减少图片后重发，"
+            "或调低 XIAOYU_MAX_IMAGES_PER_REQUEST",
+        )
 
     if isinstance(exc, StreamFailed):
         #  流跑起来了才炸、且措辞没落进上面任何一类：兜底成 transient（理由见类注释）

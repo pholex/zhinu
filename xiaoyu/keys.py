@@ -87,7 +87,7 @@ BINDINGS: tuple[Binding, ...] = (
         INPUT, keys=(("c-v",), ("escape", "v")), hint="贴图", tip=True,
     ),
     Binding(
-        "input.recall", "Esc Esc", "取回上一条发过的消息（改口重发）",
+        "input.recall", "Esc Esc", "取回上一条发过的消息，或刚被 Ctrl-C 清掉的输入（改口重发）",
         INPUT, keys=(("escape", "escape"),), hint="取回上一条", tip=True,
     ),
     Binding(
@@ -106,7 +106,10 @@ BINDINGS: tuple[Binding, ...] = (
         "input.editor", "Ctrl-X Ctrl-E",
         "把当前输入拉进 $EDITOR 编辑（默认 vi）", INPUT, tip=True,
     ),
-    Binding("app.exit", "Ctrl-C ×2", "退出（单次只提示，防误触）", INPUT, hint="退出"),
+    Binding(
+        "app.exit", "Ctrl-C ×2", "退出（单次只清空输入行并提示，防误触；清掉的内容 Esc Esc 可取回）",
+        INPUT, hint="退出",
+    ),
     Binding("app.eof", "Ctrl-D", "立即退出", INPUT),
     #  ---------- 输入行前缀 ----------
     Binding("prefix.slash", "/", "斜杠命令，带一行说明的补全", PREFIX),

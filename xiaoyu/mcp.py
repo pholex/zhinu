@@ -22,7 +22,9 @@
   名字就追加该二元组的 12 位 sha256 哈希，不同工具永不塌缩同名。连接顺序、
   重连、re-sync 都不影响命名——权限规则（/allow）和会话历史里的名字跨代有效。
   同 server 列出重名工具 → 整个列表判非法（整代拒绝）；跨 server 撞名 →
-  后到的一代整体回滚，绝不注册部分集合。
+  后到的一代整体回滚，绝不注册部分集合。两处"撞名"都按 NFKC + casefold 折叠
+  后比较（`Tool` / `tool` / 全角 `ｔｏｏｌ` 算同一个名）：同形异码的名字对模型
+  和看 /allow 规则的人都是一个名，放两个进去就是影蔽——只改判定，不改注册名。
 - **代际事务**：工具集变更（重连 / tools/list_changed）先在注册表外
   fetch+build 新一代，失败保留上一代原样继续服务；成功才整体 swap（原位替换 +
   删除 + 追加，顺序稳定）。代际间指纹变化的工具走 rug-pull 隔离（见 mcp_guard），
@@ -83,6 +85,7 @@ import subprocess
 import sys
 import threading
 import time
+import unicodedata
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -913,6 +916,24 @@ def public_tool_name(server: str, tool: str) -> str:
     return normalized[: _NAME_CAP - _NAME_HASH_LEN - 1] + "_" + digest
 
 
+def fold_name(name: str) -> str:
+    """撞名判定用的折叠形：NFKC 归一（全角→半角、组合字符合并）再 casefold。
+
+    只用于比较，注册名仍是 public_tool_name 的确定性结果。
+    """
+    return unicodedata.normalize("NFKC", name).casefold()
+
+
+def conflict_key(server: str, tool: str) -> str:
+    """(server, 原名) 的撞名判定键：折叠后再走同一套确定性命名。
+
+    折叠在命名**之前**：全角字符经消毒会变成下划线加哈希，折叠消毒后的名字
+    已经分不出 `ｔｏｏｌ` 和 `tool` 本是同一个词。server 名自带 __ 的干净拼接
+    （a__b/c 与 a/b__c）照旧在这一步撞上。
+    """
+    return public_tool_name(fold_name(server), fold_name(tool))
+
+
 #  一个工具声明（连同它的 inputSchema）的容器嵌套上限。真实 schema 十几层到头；
 #  成百上千层的只会出自坏掉或恶意的 server——指纹、归一、落盘缓存都要递归走
 #  一遍这棵树，放进来就是在启动线程里栈溢出
@@ -947,11 +968,16 @@ def declared_violation(declared: list[dict[str, Any]]) -> str | None:
     server 已经不可信，悄悄少一个工具继续用，用户连出过事都不知道。
     返回原因文本；合法返回 None。
     """
-    names = [str(item.get("name", "")) for item in declared]
-    duplicates = {name for name in names if names.count(name) > 1}
+    by_fold: dict[str, list[str]] = {}
+    for item in declared:
+        raw = str(item.get("name", ""))
+        by_fold.setdefault(fold_name(raw), []).append(raw)
+    duplicates = [group for group in by_fold.values() if len(group) > 1]
     if duplicates:
-        shown = ", ".join(sorted(duplicates)[:3])
-        return f"server 在 tools/list 里重复列出同名工具（{shown}），整个工具列表判非法"
+        #  原始名都列出来：同形异码的两个名在终端上可能长得一模一样，只给一个
+        #  用户看不出撞在哪
+        shown = ", ".join(" / ".join(group[:3]) for group in duplicates[:3])
+        return f"server 在 tools/list 里重复列出同名（或同形）工具（{shown}），整个工具列表判非法"
     for item in declared:
         if _nested_beyond(item, _DECLARATION_DEPTH_CAP):
             return (
@@ -2990,15 +3016,19 @@ class McpManager:
         new_decls = {str(item.get("name", "")): item for item in admitted}
         #  跨 server 冲突预检：确定性命名下冲突只可能是别的 server 占了
         #  本 server 的命名空间（如 a__b/c 与 a/b__c）——整代拒绝，大声报错
-        owned = {tool.name for tool in self._tools if tool.server != name}
+        #  判定按折叠形（见 conflict_key）：大小写 / 全角 / 组合字符的同形名也算撞
+        owned = {
+            conflict_key(tool.server, tool.raw_name): tool
+            for tool in self._tools if tool.server != name
+        }
         conflicts = sorted(
-            public_name
+            f"{public_tool_name(name, raw)}（{name} 的 {raw}）≈ {other.name}（{other.server} 的 {other.raw_name}）"
             for raw in new_decls
-            if (public_name := public_tool_name(name, raw)) in owned
+            if (other := owned.get(conflict_key(name, raw))) is not None
         )
         if conflicts:
             return (
-                f"命名空间冲突：{', '.join(conflicts[:3])} 已被其它 server 注册，"
+                f"命名空间冲突：{'；'.join(conflicts[:3])} 已被其它 server 注册，"
                 "本代整体回滚（保留上一代），不注册部分集合"
             )
         #  对齐现役代：其它 server 的工具原样保留；本 server 的按新一代裁决——

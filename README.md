@@ -43,7 +43,7 @@ xiaoyu uninstall                  # 卸载；加 --purge 连配置一起删
 ## 配置
 
 ```bash
-xiaoyu config             # 交互向导
+xiaoyu config             # 交互向导（落盘前先对主模型发一条最小请求验证，--no-probe 跳过）
 xiaoyu config --show      # 看生效配置与来源（key 永不回显）
 ```
 
@@ -94,7 +94,9 @@ xiaoyu term install                     # 把终端集成与 Tab 补全写进 ~/
 @c 找出大于 100M 的文件，按大小倒序        # 一句话换一条命令，放回你的提示符，回车才执行（zsh / bash）
 ```
 
-REPL 里：`/help` `/tools` `/skills` `/model` `/search` `/effort` `/mode` `/usage` `/context` `/compact` `/clear` `/exit` `/tasks` `/plan` `/goal` `/perm` `/allow` `/deny` `/resume` `/rewind` `/mcp` `/quit`
+REPL 里：`/help` `/tools` `/skills` `/model` `/search` `/effort` `/mode` `/usage` `/context` `/compact` `/copy` `/export` `/clear` `/exit` `/tasks` `/plan` `/goal` `/perm` `/allow` `/deny` `/resume` `/rewind` `/mcp` `/quit`
+
+第一次用，想先看它怎么干活：[examples/first-task](examples/first-task/)——一个带着一个失败测试的小项目，照 README 跑一遍，五分钟。
 
 无人值守时没人按确认键：先用 `/allow` 配规则，或 `--mode auto`、`--yolo`。放进 CI 跑见 [docs/ci.md](docs/ci.md)（附 GitHub Actions 样本）。
 

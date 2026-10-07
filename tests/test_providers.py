@@ -939,6 +939,95 @@ class TestRetryBudgetAndPreferredProbe(TestCrossProviderFallback):
         self.assertIsNone(agent._preferred_model)
 
 
+class TestCustomHeaders(ProviderTestCase):
+    """XIAOYU_PROVIDER_<NAME>_HEADERS：中转站要求的额外头（鉴权形态、站点标识）。
+    以前只能改代码；三条协议的 client 都要带上，展示面只露名字。"""
+
+    def test_parse_keeps_order_allows_equals_in_value_and_skips_bad_segments(self) -> None:
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            got = providers.parse_provider_headers(
+                " X-Title = xiaoyu ; Authorization=Bearer a=b=c;;no-equals; =novalue ", "T"
+            )
+        self.assertEqual(got, (("X-Title", "xiaoyu"), ("Authorization", "Bearer a=b=c")))
+        self.assertIn("no-equals", err.getvalue())
+        self.assertEqual(providers.parse_provider_headers("", "T"), ())
+
+    def test_env_reference_is_expanded_and_unresolved_header_is_dropped_loudly(self) -> None:
+        err = io.StringIO()
+        with isolated_env({"RELAY_TOKEN": "tok-" + "123"}), contextlib.redirect_stderr(err):
+            got = providers.parse_provider_headers(
+                "Authorization=Bearer ${env:RELAY_TOKEN};X-Missing=${env:NOT_SET_ANYWHERE};X-Plain=${RELAY_TOKEN}",
+                "T",
+            )
+        self.assertEqual(got, (("Authorization", "Bearer tok-123"), ("X-Plain", "tok-123")))
+        self.assertIn("X-Missing", err.getvalue(), "引用没兑现要出声，不能把 ${...} 字面量发上游")
+        self.assertNotIn("tok-123", err.getvalue())
+
+    def _registry(self, **extra: str) -> Registry:
+        env = {
+            "XIAOYU_PROVIDER_RELAY_BASE_URL": "https://relay.example/v1",
+            "XIAOYU_PROVIDER_RELAY_API_KEY": "k",
+            "XIAOYU_PROVIDER_RELAY_MODELS": "m",
+            "XIAOYU_PROVIDER_RELAY_HEADERS": "Authorization=Bearer ${env:RELAY_TOKEN};X-Title=xiaoyu",
+            "RELAY_TOKEN": "secret-" + "token",
+            **extra,
+        }
+        with isolated_env(env):
+            return providers.build(config(base_url=""))
+
+    def test_generic_provider_records_headers_and_exposes_only_names(self) -> None:
+        provider = self._registry().get("relay")
+        assert provider is not None
+        self.assertEqual(dict(provider.headers), {"Authorization": "Bearer secret-token", "X-Title": "xiaoyu"})
+        self.assertEqual(provider.header_names, ("Authorization", "X-Title"))
+        self.assertNotIn("secret-token", repr(provider.header_names))
+
+    def test_chat_and_responses_clients_get_default_headers(self) -> None:
+        for protocol in ("", "responses"):
+            with self.subTest(protocol or "chat"):
+                registry = self._registry(XIAOYU_PROVIDER_RELAY_PROTOCOL=protocol)
+                with mock.patch("xiaoyu.providers.OpenAI") as fake:
+                    fake.side_effect = lambda **kw: object()
+                    client = registry.client("relay")
+                self.assertEqual(
+                    fake.call_args.kwargs["default_headers"],
+                    {"Authorization": "Bearer secret-token", "X-Title": "xiaoyu"},
+                )
+                self.assertEqual(client.protocol_for("m"), protocol or "chat")
+
+    def test_anthropic_client_gets_default_headers(self) -> None:
+        registry = self._registry(XIAOYU_PROVIDER_RELAY_PROTOCOL="anthropic")
+        with mock.patch("xiaoyu.providers.OpenAI", side_effect=lambda **kw: object()), mock.patch(
+            "anthropic.Anthropic", side_effect=lambda **kw: object()
+        ) as fake:
+            registry.client("relay").anthropic_client()
+        self.assertEqual(
+            fake.call_args.kwargs["default_headers"],
+            {"Authorization": "Bearer secret-token", "X-Title": "xiaoyu"},
+        )
+
+    def test_no_headers_means_argument_is_not_passed(self) -> None:
+        """没声明就不传：构造参数与从前一个字节不差（显式 None 也是一种改变）。"""
+        with isolated_env({"DEEPSEEK_API_KEY": "ds"}):
+            registry = providers.build(config(base_url=""))
+        with mock.patch("xiaoyu.providers.OpenAI") as fake:
+            fake.side_effect = lambda **kw: object()
+            registry.client("deepseek")
+        self.assertNotIn("default_headers", fake.call_args.kwargs)
+
+    def test_provider_protocol_for_matches_transport(self) -> None:
+        chat = Provider("a", "https://u", "k", ("m",))
+        self.assertEqual(chat.protocol_for("m"), "chat")
+        self.assertEqual(
+            Provider("a", "https://u", "k", ("m",), responses_models=("*",)).protocol_for("m"), "responses"
+        )
+        self.assertEqual(
+            Provider("a", "https://u", "k", ("m",), responses_models=("*",), anthropic_models=("m",)).protocol_for("m"),
+            "anthropic",
+        )
+
+
 class TestRouteAndClients(ProviderTestCase):
     ENV = {"XIAOYU_API_KEY": "gw", "DEEPSEEK_API_KEY": "ds"}
 

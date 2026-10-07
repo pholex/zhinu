@@ -1653,7 +1653,7 @@ class EndToEndTest(unittest.TestCase):
         with self.assertRaises(mcp.McpError) as ctx:
             server.bootstrap()
         self.assertIn("cursor", str(ctx.exception))
-        self.assertNotIn("重复列出同名工具", str(ctx.exception))
+        self.assertNotIn("重复列出同名", str(ctx.exception))
 
     def test_call_roundtrip(self):
         manager = self.make_manager()
@@ -2667,6 +2667,33 @@ class NamespaceConflictTest(unittest.TestCase):
         self.assertIn("命名空间冲突", error)
         #  整代回滚：连没撞名的 innocent 也不注册，绝不留部分集合
         self.assertEqual([t.name for t in manager.ready_tools()], ["mcp__a__b__c"])
+
+    def test_lookalike_names_collide_after_folding(self):
+        """Tool / tool / 全角 ｔｏｏｌ 折叠后是同一个名：跨 server 判冲突，同 server 判非法。"""
+        manager = mcp.McpManager([])
+        first = mcp.McpServer(mcp.ServerSpec(name="a__b", command="x"), log_path=self.log)
+        second = mcp.McpServer(mcp.ServerSpec(name="a", command="x"), log_path=self.log)
+        schema = {"type": "object", "properties": {}}
+        self.assertIsNone(self.swap(manager, "a__b", first, [{"name": "Tool", "inputSchema": schema}]))
+        #  跨 server：a/b__tool 与 a__b/Tool 折叠后是同一个全限定名
+        for lookalike in ("b__tool", "b__ｔｏｏｌ", "B__TOOL"):
+            error = self.swap(manager, "a", second, [{"name": lookalike, "inputSchema": schema}])
+            self.assertIn("命名空间冲突", error, lookalike)
+            #  两个原始名都在报错里
+            self.assertIn("a__b 的 Tool", error)
+            self.assertIn(f"a 的 {lookalike}", error)
+            self.assertEqual([t.name for t in manager.ready_tools()], ["mcp__a__b__Tool"])
+        #  不同形的名字照常注册（注册名不折叠，大小写原样）
+        self.assertIsNone(self.swap(manager, "a", second, [{"name": "Other", "inputSchema": schema}]))
+        self.assertEqual(sorted(t.name for t in manager.ready_tools()), ["mcp__a__Other", "mcp__a__b__Tool"])
+        #  同 server 列表内的同形名：整个列表判非法，报错给出原始名
+        violation = mcp.declared_violation(
+            [{"name": "Tool", "inputSchema": schema}, {"name": "tool", "inputSchema": schema},
+             {"name": "ｔｏｏｌ", "inputSchema": schema}]
+        )
+        self.assertIsNotNone(violation)
+        self.assertIn("Tool / tool / ｔｏｏｌ", violation)
+        self.assertIsNone(mcp.declared_violation([{"name": "Tool"}, {"name": "other"}]))
 
 
 class ShutdownOwnershipTest(unittest.TestCase):

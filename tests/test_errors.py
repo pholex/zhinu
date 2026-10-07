@@ -49,6 +49,23 @@ class ClassifyTest(unittest.TestCase):
         verdict = classify(RuntimeError("Provider said: rate limit exceeded"))
         self.assertEqual(verdict.kind, "rate_limit")
 
+    def test_image_limit_400_is_fatal_with_compact_hint(self):
+        """带图请求被端点按张数拒绝：重发多少次都一样，要告诉用户怎么办而不是烧重试预算。"""
+        for message in (
+            "Too many images in request: maximum 20 allowed",
+            "invalid_request_error: image count exceeds the limit",
+        ):
+            exc = openai.BadRequestError(message, response=_response(400), body=None)
+            verdict = classify(exc)
+            self.assertEqual(verdict.kind, "fatal", message)
+            self.assertFalse(verdict.retryable)
+            self.assertFalse(verdict.should_compact)
+            self.assertIn("/compact", verdict.hint)
+            self.assertIn("图片", verdict.hint)
+        #  普通 400 不被这条吃掉
+        plain = openai.BadRequestError("bad json", response=_response(400), body=None)
+        self.assertNotIn("图片", classify(plain).hint)
+
     def test_timeout_and_connection_are_transient(self):
         for exc in (
             openai.APITimeoutError(request=httpx2.Request("POST", "http://unused")),
@@ -403,6 +420,82 @@ class RecoveryLoopTest(AgentTestCase):
             agent.send("hi")
         fake_compact.assert_any_call(force=True)
         self.assertEqual(agent.last_assistant_text(), "ok")
+
+
+class FirstChunkWatchdogTest(AgentTestCase):
+    """首 chunk 看门狗：等首个流事件超时按瞬时错误走，报错点名设置；首 chunk 之后不改判。"""
+
+    @staticmethod
+    def _timeout_error():
+        return openai.APITimeoutError(request=httpx2.Request("POST", "http://unused"))
+
+    def test_timeout_before_first_chunk_names_the_setting(self):
+        from xiaoyu.errors import FirstChunkTimeout
+
+        agent = self.build([self._timeout_error()])
+        self.config.first_chunk_timeout = 42
+        with self.assertRaises(FirstChunkTimeout) as caught:
+            with contextlib.redirect_stdout(io.StringIO()):
+                agent._stream_once(agent._main_route())
+        self.assertIn("首 chunk 等待超过 42s", str(caught.exception))
+        self.assertIn("XIAOYU_FIRST_CHUNK_TIMEOUT", str(caught.exception))
+        #  这次请求的 read 超时被收紧到看门狗的数；建连超时不动
+        sent = self.client.completions.calls[-1]["timeout"]
+        self.assertEqual(sent.read, 42)
+        self.assertEqual(sent.connect, 15)
+        verdict = classify(caught.exception)
+        self.assertEqual(verdict.kind, "transient")
+        self.assertTrue(verdict.retryable)
+
+    def test_retry_chain_treats_it_as_transient(self):
+        script = [self._timeout_error(), [chunk(content="来了"), usage_chunk(100, 10)]]
+        agent = self.build(script)
+        with mock.patch("xiaoyu.agent.Agent._sleep"), contextlib.redirect_stdout(io.StringIO()):
+            agent.send("hi")
+        self.assertEqual(agent.last_assistant_text(), "来了")
+
+    def test_timeout_after_first_chunk_is_a_plain_read_timeout(self):
+        from xiaoyu.errors import FirstChunkTimeout
+
+        def late_stall():
+            yield chunk(content="开头")
+            raise httpx2.ReadTimeout("stalled mid-stream")
+
+        agent = self.build([late_stall()])
+        with self.assertRaises(httpx2.ReadTimeout) as caught:
+            with contextlib.redirect_stdout(io.StringIO()):
+                agent._stream_once(agent._main_route())
+        self.assertNotIsInstance(caught.exception, FirstChunkTimeout)
+
+    def test_disabled_or_not_tighter_leaves_request_untouched(self):
+        from xiaoyu.errors import FirstChunkTimeout
+
+        for value in (0, 600, 900):
+            agent = self.build([self._timeout_error()])
+            self.config.first_chunk_timeout = value
+            with self.assertRaises(openai.APITimeoutError) as caught:
+                with contextlib.redirect_stdout(io.StringIO()):
+                    agent._stream_once(agent._main_route())
+            self.assertNotIsInstance(caught.exception, FirstChunkTimeout)
+            self.assertNotIn("timeout", self.client.completions.calls[-1], value)
+
+    def test_host_configured_shorter_timeout_is_not_loosened(self):
+        """宿主（SDK / 测试）把 request_timeout 配得比看门狗还短：请求不该被反向放宽。"""
+        agent = self.build([self._timeout_error()])
+        self.config.request_timeout = 0.05
+        self.config.first_chunk_timeout = 300
+        with self.assertRaises(openai.APITimeoutError):
+            with contextlib.redirect_stdout(io.StringIO()):
+                agent._stream_once(agent._main_route())
+        self.assertNotIn("timeout", self.client.completions.calls[-1])
+
+    def test_env_parsed(self):
+        from xiaoyu.config import Config
+
+        with mock.patch.dict("os.environ", {"XIAOYU_FIRST_CHUNK_TIMEOUT": "0"}):
+            self.assertEqual(Config.from_env().first_chunk_timeout, 0)
+        with mock.patch.dict("os.environ", {"XIAOYU_FIRST_CHUNK_TIMEOUT": "-3"}):
+            self.assertEqual(Config.from_env().first_chunk_timeout, 300.0)
 
 
 def switch_notices(agent):

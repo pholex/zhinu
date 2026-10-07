@@ -700,6 +700,10 @@ def redact_value(name: str, value: str) -> str:
     upper = name.upper()
     if any(marker in upper for marker in _SECRET_NAME_MARKERS):
         return "[REDACTED]" if value else ""
+    if upper.startswith("XIAOYU_PROVIDER_") and upper.endswith("_HEADERS"):
+        #  自定义 header 的值多半是令牌：只留名字，值一律不进诊断包
+        names = [segment.partition("=")[0].strip() for segment in value.split(";")]
+        return "[names: " + ", ".join(n for n in names if n) + "]"
     return _redact(value)
 
 
@@ -724,7 +728,13 @@ def effective_config() -> dict[str, Any]:
         result["providers_error"] = f"{type(exc).__name__}: {exc}"
     else:
         result["providers"] = [
-            {"name": provider.name, "display": provider.display, "models": list(provider.models)}
+            {
+                "name": provider.name,
+                "display": provider.display,
+                "models": list(provider.models),
+                #  自定义 header 只报名字（值可能是令牌）
+                "headers": list(provider.header_names),
+            }
             for provider in registry.providers
         ]
     return result

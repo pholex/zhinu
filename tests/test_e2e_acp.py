@@ -1210,6 +1210,65 @@ class CommandTest(AcpCase):
         advert, _ = second.read_until(self.is_commands_update)
         self.assertTrue(advert["params"]["update"]["availableCommands"])
 
+    def _skills_env(self, script: str) -> dict[str, str]:
+        """带一个工作区外技能目录的隔离环境：`greet`（普通名）与 `usage`（与内建撞名）。"""
+        skills_dir = Path(self.tmp) / "skills"
+        for name, body in (("greet", "跟 $ARGUMENTS 打招呼"), ("usage", "撞名技能")):
+            (skills_dir / name).mkdir(parents=True)
+            (skills_dir / name / "SKILL.md").write_text(
+                f"---\nname: {name}\ndescription: 技能 {name}\n---\n\n{body}\n", encoding="utf-8"
+            )
+        env = self.scripted_env(script)
+        env.update({"XIAOYU_ENABLE_SKILLS": "1", "XIAOYU_SKILLS_DIR": str(skills_dir)})
+        return env
+
+    def test_skills_are_advertised_as_commands(self):
+        acp = self.start_acp("text: ok\n", env=self._skills_env("text: ok\n"))
+        acp.send(
+            {"jsonrpc": "2.0", "id": "init", "method": "initialize",
+             "params": {"protocolVersion": 1}}
+        )
+        acp.read_until(self.is_response("init"))
+        acp.send(
+            {"jsonrpc": "2.0", "id": "new", "method": "session/new",
+             "params": {"cwd": str(self.workspace)}}
+        )
+        acp.read_until(self.is_response("new"))
+        advert, _ = acp.read_until(self.is_commands_update)
+        commands = {c["name"]: c for c in advert["params"]["update"]["availableCommands"]}
+        #  普通名直接下发，描述带 [Skill] 标记与可带参数的提示
+        self.assertIn("greet", commands)
+        self.assertTrue(commands["greet"]["description"].startswith("[Skill]"))
+        self.assertIn("技能 greet", commands["greet"]["description"])
+        self.assertTrue(commands["greet"]["input"]["hint"])
+        #  与内建撞名的技能挂在 skill: 前缀下，内建 usage 仍是内建
+        self.assertIn("skill:usage", commands)
+        self.assertFalse(commands["usage"]["description"].startswith("[Skill]"))
+
+    def test_skill_command_expands_into_the_prompt(self):
+        acp = self.start_acp("text: 你好\n", env=self._skills_env("text: 你好\n"))
+        session_id = self.new_session(acp)
+        self.prompt(acp, session_id, "/greet 小明")
+        response, messages = acp.read_until(self.is_response("p1"))
+        self.assertEqual(response["result"]["stopReason"], "end_turn")
+        self.assertIn("你好", self.text_chunks(messages))
+        #  会话文件里本轮的用户消息是展开后的技能正文（参数已填），不是裸 "/greet 小明"
+        acp.close()
+        session_files = list((Path(self.tmp) / "config").rglob("*.jsonl"))
+        self.assertTrue(session_files)
+        text = "\n".join(f.read_text(encoding="utf-8") for f in session_files)
+        self.assertIn("用户以 /greet 直接调用", text)
+        self.assertIn("跟 小明 打招呼", text)
+
+    def test_unknown_skill_under_prefix_reports_error_without_model(self):
+        acp = self.start_acp("text: 不该用到\n", env=self._skills_env("text: 不该用到\n"))
+        session_id = self.new_session(acp)
+        self.prompt(acp, session_id, "/skill:nope")
+        response, messages = acp.read_until(self.is_response("p1"))
+        self.assertEqual(response["result"]["stopReason"], "end_turn")
+        self.assertIn("ERROR:", self.text_chunks(messages))
+        self.assertNotIn("不该用到", self.text_chunks(messages))
+
     def test_usage_command_answers_without_model(self):
         acp = self.start_acp("text: 模型的话\n")
         session_id = self.new_session(acp)

@@ -336,6 +336,56 @@ class AgentRewindTest(unittest.TestCase):
         result = agent.rewind_to(1, conversation=True, files=True)
         self.assertIn("已被压缩合并", result)
 
+    def test_rewound_turn_prompt_is_handed_back_for_prefill(self):
+        """对话回退后，被截掉那一轮的原话经 RewindResult.prompt_text 交给前端预填。"""
+        agent = self.make_agent()
+        self.turn(agent, "第一件事")
+        #  带图片的一轮：媒体部件只取文本
+        content = [{"type": "text", "text": "看这张图改一下"}, {"type": "image_url", "image_url": {"url": "data:x"}}]
+        from xiaoyu import media
+
+        agent.toolbox.rewind.begin(media.text_of(content))  # 与 send() 开点的写法一致
+        agent.messages.append({"role": "user", "content": content})
+        agent.messages.append({"role": "assistant", "content": "改了"})
+        agent.toolbox.rewind.finish()
+        self.turn(agent, "第三件事")
+        result = agent.rewind_result(2, conversation=True, files=False, check_conflicts=False)
+        self.assertTrue(result.conversation_rewound)
+        self.assertEqual(result.prompt_text, "看这张图改一下")
+        #  只回文件不回对话：没有原话可预填
+        self.turn(agent, "第四件事")
+        result = agent.rewind_result(3, conversation=False, files=True, check_conflicts=False)
+        self.assertFalse(result.conversation_rewound)
+        self.assertEqual(result.prompt_text, "")
+        #  压缩后对话回不去（退化成只回文件）：同样不给原话
+        agent.messages = [agent.messages[0], {"role": "user", "content": "[摘要]"}]
+        result = agent.rewind_result(1, conversation=True, files=True, check_conflicts=False)
+        self.assertFalse(result.conversation_rewound)
+        self.assertEqual(result.prompt_text, "")
+
+    def test_slash_rewind_prefills_the_original_wording(self):
+        """/rewind 流程：回退对话 → 原话进预填通道（drain_steers）；仅文件 → 不预填。"""
+        import contextlib
+        import io
+        from unittest import mock
+
+        from xiaoyu.cli import _rewind_flow
+
+        agent = self.make_agent()
+        self.turn(agent, "第一件事")
+        self.turn(agent, "第二件事")
+        self.turn(agent, "第三件事")
+        #  仅文件（scope 3）：不预填
+        with mock.patch("builtins.input", side_effect=["3"]), contextlib.redirect_stdout(io.StringIO()):
+            _rewind_flow(agent, ["3"])
+        self.assertEqual(agent.drain_steers(), [])
+        #  仅对话（scope 2）：第二轮原话预填，可改可直接回车
+        with mock.patch("builtins.input", side_effect=["2"]), contextlib.redirect_stdout(io.StringIO()):
+            _rewind_flow(agent, ["2"])
+        self.assertEqual(agent.drain_steers(), ["第二件事"])
+        texts = [m.get("content") for m in agent.messages if m.get("role") == "user"]
+        self.assertEqual(texts, ["第一件事"])
+
     def test_unknown_point(self):
         agent = self.make_agent()
         self.assertIn("没有编号为 9", agent.rewind_to(9))

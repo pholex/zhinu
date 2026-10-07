@@ -16,8 +16,9 @@
 逐字节一致：基础色跟随用户自己配的终端调色板，是终端主题该有的样子。浅色表
 才改用 256 色绝对色号——白底上必须压深，不能听凭调色板。
 
-模式选择：`XIAOYU_THEME=dark|light|auto`，默认 auto。auto 当前解析为 dark；
-探测终端真实背景色（OSC 11）之后调 `set_mode()` 即可让 auto 名副其实。
+模式选择：`XIAOYU_THEME=dark|light|auto`，默认 auto。auto 起始落在 dark，
+进交互前端前由 terminal.autodetect() 用 OSC 11 问一次终端背景色、按亮度调
+`set_mode()` 落到真实的深浅；问不到（非 tty、不支持、Windows）就保持 dark。
 """
 
 from __future__ import annotations
@@ -183,7 +184,8 @@ _GRADIENTS: dict[Mode, tuple[int, ...]] = {"dark": _DARK_GRADIENT, "light": _LIG
 
 
 def _initial_mode() -> Mode:
-    #  auto 暂时落到 dark：探测背景色之前没有依据，而深色终端是压倒性多数
+    #  auto 起始落到 dark：探测背景色（terminal.autodetect）之前没有依据，
+    #  而深色终端是压倒性多数；探到浅色再 set_mode 切过去
     requested = os.environ.get("XIAOYU_THEME", "auto").strip().lower()
     return "light" if requested == "light" else "dark"
 

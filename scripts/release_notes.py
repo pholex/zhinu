@@ -4,9 +4,15 @@
     python scripts/release_notes.py                 # 版本取 xiaoyu.__version__，起点取最近 tag
     python scripts/release_notes.py --since v0.59.0 --version 0.61.0
     python scripts/release_notes.py --no-model      # 只分组，不调模型
+    python scripts/release_notes.py --validation self_test.json   # 附「本版验证」一节
 
 输出到 docs/releases/<版本>.md（已存在则覆盖）。release.yml 在 PyPI 发布成功后
 拿这个文件建 GitHub Release；文件不存在就退回 --generate-notes。
+
+「本版验证」一节固定在文末，内容来自 tests_ai/self_test.md 跑出的记录文件
+（`--output-format json` 的收尾对象：顶层 `model`，`output` 里 total / passed /
+skipped / items，可再加一个 `platform` 字段；形态见 self_test.md 顶部）。这一节
+不经模型润色——它是事实，不是文案。没给文件或文件读不了，节里写「未附自测记录」。
 
 模型不可用（没 key、超时、输出不合法、xiaoyu 起不来）时**退化为纯分组列表**，
 不报错——发版流程不该被润色这一步卡住。分组列表本身就是合格的发版说明。
@@ -158,9 +164,62 @@ def polish(plain: str, model: str | None, timeout: float) -> str | None:
     return notes.strip() + "\n"
 
 
-def render_document(version: str, since: str, body: str, today: dt.date | None = None) -> str:
+VALIDATION_TITLE = "## 本版验证"
+NO_VALIDATION = "未附自测记录"
+
+
+def load_validation(path: Path | None) -> dict | None:
+    """读自测记录；没给、读不了、形态不对都返回 None（调用方写「未附自测记录」）。
+
+    认两种形态：xiaoyu 收尾对象原样（`output` 里是清单）、或清单本身在顶层。"""
+    if path is None:
+        return None
+    try:
+        data = json.loads(path.read_text(encoding="utf-8", errors="replace"))
+    except (OSError, ValueError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    output = data.get("output") if isinstance(data.get("output"), dict) else data
+    if not isinstance(output.get("total"), int) or not isinstance(output.get("passed"), int):
+        return None
+    items = output.get("items") if isinstance(output.get("items"), list) else []
+    return {
+        "model": data.get("model") or output.get("model") or "",
+        "platform": data.get("platform") or output.get("platform") or "",
+        "total": output["total"],
+        "passed": output["passed"],
+        "skipped": output.get("skipped") if isinstance(output.get("skipped"), int) else 0,
+        "items": [item for item in items if isinstance(item, dict)],
+    }
+
+
+def render_validation(record: dict | None) -> str:
+    """「本版验证」一节：模型 / 平台 / N/M 项通过 / 未通过与未跑的项（带证据）。"""
+    lines = [VALIDATION_TITLE, ""]
+    if record is None:
+        lines.append(f"- {NO_VALIDATION}")
+        return "\n".join(lines) + "\n"
+    lines.append(f"- 模型：{record['model'] or '未记录'}")
+    lines.append(f"- 平台：{record['platform'] or '未记录'}")
+    counted = record["total"] - record["skipped"]
+    lines.append(f"- 第一人称自测（tests_ai/self_test.md）：{record['passed']}/{counted} 项通过"
+                 + (f"，{record['skipped']} 项未跑" if record["skipped"] else ""))
+    for status, label in (("fail", "未通过"), ("skip", "未跑")):
+        picked = [item for item in record["items"] if item.get("status") == status]
+        if picked:
+            lines.append(f"- {label}：" + "；".join(
+                f"{item.get('id', '?')}（{item.get('evidence', '')}）" if item.get("evidence") else str(item.get("id", "?"))
+                for item in picked
+            ))
+    return "\n".join(lines) + "\n"
+
+
+def render_document(version: str, since: str, body: str, today: dt.date | None = None,
+                    validation: dict | None = None) -> str:
     today = today or dt.date.today()
-    return f"# {version}（{today.isoformat()}）\n\n自 {since} 以来的变化。\n\n{body}"
+    head = f"# {version}（{today.isoformat()}）\n\n自 {since} 以来的变化。\n\n{body}"
+    return head.rstrip("\n") + "\n\n" + render_validation(validation)
 
 
 def current_version(repo: Path = REPO) -> str:
@@ -187,6 +246,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--no-model", action="store_true", help="不润色，只输出分组列表")
     parser.add_argument("--timeout", type=float, default=180.0, help="润色时限（秒）")
     parser.add_argument("--out", help="输出路径（默认 docs/releases/<版本>.md）")
+    parser.add_argument("--validation", help="self_test.md 跑出的记录文件（JSON），生成「本版验证」一节")
     args = parser.parse_args(argv)
 
     version = args.version or current_version()
@@ -199,7 +259,10 @@ def main(argv: list[str] | None = None) -> int:
     body = None if args.no_model else polish(plain, args.model, args.timeout)
     out = Path(args.out) if args.out else REPO / "docs" / "releases" / f"{version}.md"
     out.parent.mkdir(parents=True, exist_ok=True)
-    out.write_text(render_document(version, since, body or plain), encoding="utf-8")
+    validation = load_validation(Path(args.validation)) if args.validation else None
+    if args.validation and validation is None:
+        print(f"[release_notes] 自测记录 {args.validation} 读不了或形态不对，节里写「{NO_VALIDATION}」", file=sys.stderr)
+    out.write_text(render_document(version, since, body or plain, validation=validation), encoding="utf-8")
     print(f"{'润色' if body else '分组列表'} → {out}（{len(commits)} 个提交，自 {since}）")
     return 0
 

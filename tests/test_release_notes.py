@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import datetime as dt
 import importlib.util
+import json
 import os
 import subprocess
 import sys
@@ -53,6 +54,64 @@ class RenderTest(unittest.TestCase):
     def test_document_header(self):
         doc = release_notes.render_document("0.61.0", "v0.60.0", "## 修复\n\n- x\n", today=dt.date(2026, 10, 2))
         self.assertTrue(doc.startswith("# 0.61.0（2026-10-02）\n\n自 v0.60.0 以来的变化。\n\n## 修复"))
+
+    def test_document_ends_with_validation_section_even_without_record(self):
+        doc = release_notes.render_document("0.61.0", "v0.60.0", "## 修复\n\n- x\n", today=dt.date(2026, 10, 2))
+        self.assertTrue(doc.endswith("## 修复\n\n- x\n\n## 本版验证\n\n- 未附自测记录\n"), doc)
+
+
+class ValidationSectionTest(unittest.TestCase):
+    """「本版验证」：吃 self_test.md 的收尾对象，缺文件 / 形态不对都退化为「未附自测记录」。"""
+
+    RECORD = {
+        "result": "done", "model": "deepseek-flash", "platform": "Darwin arm64",
+        "output": {
+            "total": 18, "passed": 16, "skipped": 1, "rate": 16 / 17,
+            "items": [
+                {"id": "P1-1", "status": "pass", "evidence": "工具返回成功"},
+                {"id": "P5-1", "status": "skip", "evidence": "无 mcp.json"},
+                {"id": "P6-3", "status": "fail", "evidence": "输出含 ESCAPED"},
+            ],
+        },
+    }
+
+    def _write(self, data) -> Path:
+        self.tmp = tempfile.TemporaryDirectory(prefix="release-validation-")
+        self.addCleanup(self.tmp.cleanup)
+        path = Path(self.tmp.name) / "self_test.json"
+        path.write_text(data if isinstance(data, str) else json.dumps(data, ensure_ascii=False), encoding="utf-8")
+        return path
+
+    def test_loads_result_object_and_bare_listing(self):
+        record = release_notes.load_validation(self._write(self.RECORD))
+        self.assertEqual((record["model"], record["platform"], record["total"], record["passed"], record["skipped"]),
+                         ("deepseek-flash", "Darwin arm64", 18, 16, 1))
+        bare = release_notes.load_validation(self._write(self.RECORD["output"]))
+        self.assertEqual((bare["model"], bare["total"], len(bare["items"])), ("", 18, 3))
+
+    def test_missing_or_malformed_record_is_none(self):
+        self.assertIsNone(release_notes.load_validation(None))
+        self.assertIsNone(release_notes.load_validation(Path(tempfile.gettempdir()) / "no-such-self-test.json"))
+        self.assertIsNone(release_notes.load_validation(self._write("not json")))
+        self.assertIsNone(release_notes.load_validation(self._write({"output": {"total": "18"}})))
+        self.assertIsNone(release_notes.load_validation(self._write([1, 2])))
+
+    def test_section_lists_counts_failures_and_skips(self):
+        text = release_notes.render_validation(release_notes.load_validation(self._write(self.RECORD)))
+        self.assertEqual(
+            text,
+            "## 本版验证\n\n- 模型：deepseek-flash\n- 平台：Darwin arm64\n"
+            "- 第一人称自测（tests_ai/self_test.md）：16/17 项通过，1 项未跑\n"
+            "- 未通过：P6-3（输出含 ESCAPED）\n- 未跑：P5-1（无 mcp.json）\n",
+        )
+
+    def test_section_without_record(self):
+        self.assertEqual(release_notes.render_validation(None), "## 本版验证\n\n- 未附自测记录\n")
+        text = release_notes.render_validation(release_notes.load_validation(self._write(
+            {"output": {"total": 3, "passed": 3, "skipped": 0, "items": []}})))
+        self.assertIn("- 模型：未记录\n- 平台：未记录\n", text)
+        self.assertIn("3/3 项通过\n", text)
+        self.assertNotIn("未通过", text)
 
 
 class GitAndFallbackTest(unittest.TestCase):

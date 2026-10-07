@@ -5,9 +5,12 @@ from __future__ import annotations
 
 import contextlib
 import io
+import os
 import types
 import unittest
+from unittest import mock
 
+from xiaoyu import cli
 from xiaoyu.agent import TurnStats
 from xiaoyu.cli import turn_stats_line
 from xiaoyu.events import RequestEnded, UIEvent
@@ -86,7 +89,49 @@ class RequestEndedFieldsTest(AgentTestCase):
         self.assertIn("首 token", line)
 
 
+class InteractiveTurnSummaryTest(unittest.TestCase):
+    """交互前端轮末默认那行简版：≥ 5s 才打、可关、--stats 仍是全版、非交互不打。"""
+
+    def _agent(self, duration_ms: int, show_stats: bool = False):
+        stats = TurnStats()
+        stats.record(duration_ms=duration_ms, ttft_ms=1000, completion_tokens=200)
+        return mock.Mock(turn_stats=stats, show_stats=show_stats)
+
+    def test_brief_line_after_five_seconds(self) -> None:
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop(cli.TURN_SUMMARY_ENV, None)
+            line = turn_stats_line(self._agent(6000), interactive=True)
+        self.assertEqual(line, "耗时 6.0s · 输出 40 tok/s")
+        self.assertNotIn("首 token", line)
+
+    def test_short_turn_prints_nothing(self) -> None:
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop(cli.TURN_SUMMARY_ENV, None)
+            self.assertEqual(turn_stats_line(self._agent(4999), interactive=True), "")
+
+    def test_env_switch_off(self) -> None:
+        with mock.patch.dict(os.environ, {cli.TURN_SUMMARY_ENV: "0"}):
+            self.assertEqual(turn_stats_line(self._agent(60000), interactive=True), "")
+
+    def test_non_interactive_unchanged(self) -> None:
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop(cli.TURN_SUMMARY_ENV, None)
+            self.assertEqual(turn_stats_line(self._agent(60000)), "")
+
+    def test_stats_flag_still_prints_the_full_line_even_when_short(self) -> None:
+        with mock.patch.dict(os.environ, {cli.TURN_SUMMARY_ENV: "0"}):
+            line = turn_stats_line(self._agent(300, show_stats=True), interactive=True)
+        self.assertIn("首 token", line)
+        self.assertIn("耗时 0.3s", line)
+
+
 class TurnStatsTest(unittest.TestCase):
+    def test_brief_shape(self) -> None:
+        stats = TurnStats()
+        self.assertEqual(stats.brief(), "")
+        stats.record(duration_ms=2500, ttft_ms=500, completion_tokens=100)
+        self.assertEqual(stats.brief(), "耗时 2.5s · 输出 50 tok/s")
+
     def test_summary_shape(self) -> None:
         stats = TurnStats()
         self.assertEqual(stats.summary(), "")

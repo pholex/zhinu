@@ -508,6 +508,55 @@ class TestChatPassthrough(unittest.TestCase):
         self.assertEqual(sorted(sent), ["messages", "model"])
 
 
+class TestMaxOutputTokens(unittest.TestCase):
+    """XIAOYU_MAX_OUTPUT_TOKENS：本地小模型/中转站限输出上限，超了 400。
+    内核统一用 chat 的 max_tokens 出，三路在出网口各自翻译。"""
+
+    MESSAGES = [{"role": "user", "content": "hi"}]
+
+    def test_chat_gets_max_tokens_stream_full_and_sync_capped(self) -> None:
+        inner = FakeClient(FakeResponses())
+        client = Transport(inner, (), max_output_tokens=20_000)
+        client.chat.completions.create(model="m", messages=self.MESSAGES, stream=True)
+        client.chat.completions.create(model="m", messages=self.MESSAGES)
+        stream_call, sync_call = inner.chat.completions.calls
+        self.assertEqual(stream_call["max_tokens"], 20_000)
+        self.assertEqual(sync_call["max_tokens"], responses.SYNC_MAX_TOKENS, "同步请求取 min(设值, 常量)")
+        self.assertNotIn("max_completion_tokens", stream_call)
+
+    def test_small_cap_applies_to_sync_too(self) -> None:
+        inner = FakeClient(FakeResponses())
+        Transport(inner, (), max_output_tokens=512).chat.completions.create(model="m", messages=self.MESSAGES)
+        self.assertEqual(inner.chat.completions.calls[0]["max_tokens"], 512)
+
+    def test_responses_protocol_translates_to_max_output_tokens(self) -> None:
+        api = FakeResponses(result=SimpleNamespace(id="r", output=[], usage=None, status="completed", incomplete_details=None))
+        client = Transport(FakeClient(api), (responses.WILDCARD,), max_output_tokens=4096)
+        client.chat.completions.create(model="m", messages=self.MESSAGES)
+        sent = api.calls[0]
+        self.assertEqual(sent["max_output_tokens"], 4096)
+        self.assertNotIn("max_tokens", sent)
+
+    def test_unset_means_nothing_is_added(self) -> None:
+        inner = FakeClient(FakeResponses())
+        Transport(inner, ()).chat.completions.create(model="m", messages=self.MESSAGES, stream=True)
+        self.assertNotIn("max_tokens", inner.chat.completions.calls[0])
+
+    def test_explicit_caller_value_wins(self) -> None:
+        inner = FakeClient(FakeResponses())
+        client = Transport(inner, (), max_output_tokens=20_000)
+        client.chat.completions.create(model="m", messages=self.MESSAGES, max_tokens=300)
+        client.chat.completions.create(model="m", messages=self.MESSAGES, max_completion_tokens=301)
+        first, second = inner.chat.completions.calls
+        self.assertEqual(first["max_tokens"], 300)
+        self.assertEqual(second["max_completion_tokens"], 301)
+        self.assertNotIn("max_tokens", second)
+
+    def test_with_options_keeps_the_cap(self) -> None:
+        client = Transport(FakeClient(FakeResponses()), (), max_output_tokens=99)
+        self.assertEqual(client.with_options(timeout=1).max_output_tokens, 99)
+
+
 class TestChatCacheControl(unittest.TestCase):
     """网关下 Claude 后端的 chat 载荷缓存断点：没有断点上游一个 token 都不缓存
     （2026-10-02 对自建 LiteLLM 网关实测）。断点只落在发送副本上。"""
