@@ -96,6 +96,8 @@ xiaoyu term install                     # 把终端集成与 Tab 补全写进 ~/
 
 REPL 里：`/help` `/tools` `/skills` `/model` `/search` `/effort` `/mode` `/usage` `/context` `/compact` `/clear` `/exit` `/tasks` `/plan` `/goal` `/perm` `/allow` `/deny` `/resume` `/rewind` `/mcp` `/quit`
 
+第一次用，想先看它怎么干活：[examples/first-task](examples/first-task/)——一个带着一个失败测试的小项目，照 README 跑一遍，五分钟。
+
 无人值守时没人按确认键：先用 `/allow` 配规则，或 `--mode auto`、`--yolo`。放进 CI 跑见 [docs/ci.md](docs/ci.md)（附 GitHub Actions 样本）。
 
 ## 模式：放手程度你定
