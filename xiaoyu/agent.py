@@ -63,6 +63,7 @@ from .events import (
     RequestEnded,
     RequestStarted,
     SteerAccepted,
+    Suggestions,
     TextDelta,
     TextEnd,
     ToolCompleted,
@@ -1093,6 +1094,12 @@ class Agent:
         #  steer：运行中追加的用户输入，任意线程可入队，
         #  agent 在 step 边界消费。queue.Queue 自带锁，与 interrupt 同一纪律。
         self._steer_queue: queue.Queue[str] = queue.Queue()
+        #  轮末「接着问」建议（见 suggest.py）：默认关，交互前端接线时打开——
+        #  子 agent、serve、ACP、SDK 宿主都不该在背后多发请求。线程只在轮与轮
+        #  之间活着，用轮序号判迟到：用户已开始下一轮时结果直接丢弃
+        self.suggestions_enabled = False
+        self._turn_seq = 0
+        self._suggest_thread: threading.Thread | None = None
         # SDK-owned durable inputs commit at the same safe boundary as steers.
         # True means history changed and a final text response must not end the turn.
         self._on_step_input: Callable[[], bool] | None = None
@@ -2987,6 +2994,67 @@ class Agent:
                 store.finish()
             self._log_usage()
             self._peer_state("idle")
+            #  正常收尾的轮才配建议：中断/报错的轮，用户下一步多半是重来或问原因
+            if failure is None and self.suggestions_enabled:
+                self._start_suggestions()
+
+    # ---------- 轮末「接着问」建议（见 suggest.py） ----------
+
+    def suggest_next(self) -> list[str]:
+        """同步版：用辅助模型从本轮一问一答里提几条下一步；任何失败都返回空列表。
+
+        路由链与摘要同一条（先便宜模型，再主模型兜底），但只要有一条路由
+        成功就停——这是锦上添花的事，不值得为它多打几家。用量照记进总账。
+        """
+        from . import suggest
+
+        user_text = self.last_user_text()
+        answer = self.last_assistant_text()
+        if not user_text.strip() or not answer.strip():
+            return []
+        messages = suggest.build_messages(user_text, answer)
+        try:
+            routes = self.summary_models()
+        except Exception:  # noqa: BLE001 - 路由解析不了就当没有
+            return []
+        for route in routes:
+            try:
+                response = route.client.chat.completions.create(model=route.model, messages=messages)
+            except Exception:  # noqa: BLE001 - 换下一条路由
+                continue
+            if getattr(response, "usage", None):
+                self.usage.add(
+                    route.qualified,
+                    response.usage.prompt_tokens or 0,
+                    response.usage.completion_tokens or 0,
+                )
+            choices = getattr(response, "choices", None) or []
+            content = (choices[0].message.content if choices else "") or ""
+            items = suggest.parse(content)
+            if items:
+                return items
+        return []
+
+    def _start_suggestions(self) -> None:
+        """后台起一条线程算建议，算完以 Suggestions 事件交给前端。
+
+        不在主线程算：那要让提示符多等 1～2 秒，比没有建议还糟。上一轮的线程
+        还没回来就不再起新的——它的结果按轮序号会被丢弃，重复起只是多花钱。
+        """
+        if self._suggest_thread is not None and self._suggest_thread.is_alive():
+            return
+        seq = self._turn_seq
+
+        def worker() -> None:
+            items = self.suggest_next()
+            if not items or seq != self._turn_seq:
+                return
+            if self.session_log:
+                self.session_log.event("suggestions", items=items)
+            self.emit(Suggestions(items=items, turn=seq))
+
+        self._suggest_thread = threading.Thread(target=worker, name="suggest-next", daemon=True)
+        self._suggest_thread.start()
 
     def _log_usage(self) -> None:
         """轮末把**累计**用量快照进会话日志（`usage` 事件）。
@@ -3019,6 +3087,8 @@ class Agent:
         #  turn 开始丢弃上轮残留——前端若想救回来，应在轮间自行 drain_steers。
         self._interrupt_flag.clear()
         self.drain_steers()
+        #  轮序号 +1：上一轮还在路上的「接着问」建议到了也作废
+        self._turn_seq += 1
         #  上一轮半路出事（工具执行中途抛错、宿主没做收尾）留下的悬空调用，
         #  赶在任何新消息入历史之前补齐：此刻补位点就在历史尾部，内存与会话
         #  日志的顺序一致。拖到发请求前才补的话，占位在内存里插回原位、在

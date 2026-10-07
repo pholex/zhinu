@@ -227,6 +227,20 @@ class Notice(UIEvent):
     level: NoticeLevel = "info"
 
 
+@dataclass(frozen=True)
+class Suggestions(UIEvent):
+    """轮末的「接着问」建议（见 suggest.py）：辅助模型从本轮一问一答里提的几条下一步。
+
+    旁路请求、轮结束后才到，所以它不在轮的事件序列里，前端收到时提示符多半
+    已经挂着。turn 是它所属的轮次序号：前端据此丢弃迟到的（用户已开始下一轮）。
+    不认识这个事件的前端静默忽略即可，没有任何不变量依赖它。
+    """
+
+    kind: ClassVar[str] = "turn.suggestions"
+    items: list[str] = field(default_factory=list)
+    turn: int = 0
+
+
 class UISink(Protocol):
     """前端的唯一入口：消费事件流。实现方决定画在哪、怎么画、忽略哪些。"""
 

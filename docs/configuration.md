@@ -223,6 +223,7 @@ XIAOYU_BEDROCK_REGION=us-east-1
 | `XIAOYU_SANDBOX_NETWORK` | 开 | 沙箱内是否允许联网（`0` = 断网） |
 | `XIAOYU_SANDBOX_WRITABLE` | — | 追加可写根目录，冒号分隔 |
 | `XIAOYU_ENABLE_ASKPASS` | 开 | bash 里的 `sudo` 要密码时在界面里向你要（TUI 遮罩输入框 / 明文 REPL 的 getpass），密码只交给 sudo、不记录。只在有人值守的交互模式生效；`0` = 关，sudo 照旧因为没有终端而失败。沙箱里 setuid 程序起不来，所以实际要配合 `danger-full-access` 升权（会问你）或 `XIAOYU_SANDBOX=0` |
+| `XIAOYU_SUGGESTIONS` | 开 | 轮末让辅助模型（`XIAOYU_SUMMARY_MODEL`）从本轮一问一答里提最多 3 条「接着问」：回答下方打一行 ① ② ③，输入行空着时灰字浮现第一条、→ 接受，敲几个字可按前缀选中其它条。后台算、1 到 2 秒后到，你已开始打字就不插话；只预填绝不自动发送。只在交互模式生效，`0` = 关；一次性模式默认不做，`-p --suggestions` 才带（json 的 `suggestions` 字段 / text 的 stderr） |
 | `XIAOYU_THEME` | `auto` | `dark` / `light` 跳过终端背景色探测 |
 | `XIAOYU_TURN_SUMMARY` | 开 | 交互模式每轮结束打一行简版耗时（耗时 · 输出 tok/s），只在该轮耗时 ≥ 5s 时打；`0` = 关。`--stats` 的全版（含首 token、请求数）不受此影响，`-p` 与 json 输出也不打 |
 | `XIAOYU_BELL` | 关 | 一轮结束 / 等审批时往终端写通知。`1` / `bel` = 响铃（BEL），终端翻译成提示音、Dock 弹跳或标签高亮；`osc9`（iTerm2 / WezTerm / ghostty）、`osc777`（rxvt 一路）、`osc99`（kitty）= 带文案的桌面通知转义序列，文案含状态与会话名/目录名；`auto` 按 `TERM_PROGRAM` / `KITTY_WINDOW_ID` 挑一种，认不出退回 BEL。tmux 里自动用 DCS 透传。只对真终端写，管道里不写 |

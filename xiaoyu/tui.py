@@ -78,7 +78,9 @@ from typing import Any, Callable, Iterable, Sequence
 
 from prompt_toolkit import PromptSession
 from prompt_toolkit.application import Application, get_app_or_none, run_in_terminal
-from prompt_toolkit.auto_suggest import AutoSuggestFromHistory
+from prompt_toolkit.application.current import set_app
+from prompt_toolkit.auto_suggest import AutoSuggest, AutoSuggestFromHistory, Suggestion
+from prompt_toolkit.buffer import Buffer
 from prompt_toolkit.completion import CompleteEvent, Completer, Completion
 from prompt_toolkit.document import Document
 from prompt_toolkit.history import FileHistory
@@ -92,7 +94,7 @@ from rich.syntax import Syntax
 from rich.text import Text
 from rich.theme import Theme as RichTheme
 
-from . import attention, command_check, keys, media, modes, theme, ui
+from . import attention, command_check, keys, media, modes, suggest, theme, ui
 from .agent import Agent
 from .config import user_config_dir
 from .events import (
@@ -102,6 +104,7 @@ from .events import (
     RequestEnded,
     RequestStarted,
     SteerAccepted,
+    Suggestions,
     TextDelta,
     TextEnd,
     ToolCompleted,
@@ -870,7 +873,11 @@ class RichSink:
             PlanUpdated: self._plan,
             SteerAccepted: self._steer,
             Notice: self._notice,
+            Suggestions: self._suggestions,
         }
+        #  轮末「接着问」的接手方（Tui 接线）：它知道提示符挂没挂着、怎么喂输入行的
+        #  幽灵建议。没人接手就只打一行
+        self.on_suggestions: Callable[[list[str]], None] | None = None
 
     def emit(self, event: UIEvent) -> None:
         handler = self._handlers.get(type(event))
@@ -1128,6 +1135,37 @@ class RichSink:
     def _notice(self, event: Notice) -> None:
         self._flush_ro_group()
         self.console.print(Text(event.text, style=_NOTICE_STYLES[event.level]))
+
+    def _suggestions(self, event: Suggestions) -> None:
+        if not event.items:
+            return
+        if self.on_suggestions is not None:
+            self.on_suggestions(list(event.items))
+        else:
+            self.console.print(Text(f"  {suggest.render_line(event.items)}", style="text.secondary"))
+
+
+class NextStepSuggest(AutoSuggest):
+    """输入行的幽灵建议：先看轮末「接着问」，再退回历史。
+
+    空行 → 第一条建议整条浮现（→ 接受）；敲了几个字 → 哪条建议以它开头就补那条
+    的剩余（这就是选中第二、三条的方式）；都不中 → 与原来一样按历史补。
+    建议列表由 Tui 持有、按轮更新，这里只拿一个取值函数，不持有状态。
+    """
+
+    def __init__(self, items: Callable[[], list[str]]) -> None:
+        self._items = items
+        self._history = AutoSuggestFromHistory()
+
+    def get_suggestion(self, buffer: Buffer, document: Document) -> Suggestion | None:
+        text = document.text
+        items = self._items()
+        if not text:
+            return Suggestion(items[0]) if items else None
+        for item in items:
+            if item.startswith(text) and item != text:
+                return Suggestion(item[len(text):])
+        return self._history.get_suggestion(buffer, document)
 
 
 #  行首前缀 → 着色 token。只给那一个字符上色，正文保持默认：颜色是在提醒
@@ -1397,6 +1435,47 @@ class Tui:
         self._poller: SteerPoller | None = None
         #  "切进 auto 但沙箱不可用"只提醒一次，别每次按键都刷一行
         self._warned_no_sandbox = False
+        #  轮末「接着问」（见 suggest.py）：本轮的几条建议 + 正挂着的 prompt app
+        #  （后台线程往它的事件循环里投递）。每轮开始清空
+        self._suggestions: list[str] = []
+        self._app: Application | None = None
+        self.sink.on_suggestions = self._on_suggestions
+
+    # ---------- 轮末「接着问」 ----------
+
+    def _prime_prompt(self) -> None:
+        """prompt 刚起来（pre_run）：记住 app 给后台线程投递用；建议已经在手就把
+        幽灵先亮出来——AutoSuggest 只在文本变化时才被问，空行起手得自己点一下。"""
+        app = get_app_or_none()
+        self._app = app
+        if app is not None and self._suggestions and not app.current_buffer.text:
+            app.current_buffer.suggestion = Suggestion(self._suggestions[0])
+
+    def _on_suggestions(self, items: list[str]) -> None:
+        """后台线程送来的「接着问」：打一行弱化文字，再喂给输入行的幽灵建议。
+
+        跨线程纪律：提示符挂着时不能直接往终端写（会打花正在编辑的行），要投到
+        prompt_toolkit 的事件循环里、在 `set_app` 之下 `run_in_terminal`——那个
+        contextvar 在别的线程里是空的。模型已在跑下一轮（poller 活着）就作废。
+        """
+        if self._poller is not None:
+            return
+        self._suggestions = items
+        line = Text(f"  {suggest.render_line(items)}", style="text.secondary")
+        app = self._app
+        if app is None or not app.is_running or app.loop is None:
+            self.console.print(line)
+            return
+
+        def on_loop() -> None:
+            with set_app(app):
+                run_in_terminal(lambda: self.console.print(line))
+                buffer = app.current_buffer
+                if not buffer.text and self._suggestions:
+                    buffer.suggestion = Suggestion(self._suggestions[0])
+                app.invalidate()
+
+        app.loop.call_soon_threadsafe(on_loop)
 
     # ---------- 输入 ----------
 
@@ -1560,9 +1639,10 @@ class Tui:
                 completer=SlashCompleter(self),
                 #  行首前缀着色（! 警告色、/ 强调色、# 弱化）
                 lexer=PrefixLexer(),
-                #  历史幽灵建议：敲到一半，灰字浮现最近一条同前缀的历史，行尾按 →
-                #  （或 Ctrl-E / Ctrl-F）接受。按键由 prompt_toolkit 自带，表里只登记
-                auto_suggest=AutoSuggestFromHistory(),
+                #  幽灵建议：空行浮现轮末「接着问」的第一条，敲到一半按前缀匹配建议或
+                #  最近一条历史，行尾按 →（或 Ctrl-E / Ctrl-F）接受。按键由 prompt_toolkit
+                #  自带，表里只登记
+                auto_suggest=NextStepSuggest(lambda: self._suggestions),
                 key_bindings=self._key_bindings(),
                 multiline=True,
                 #  续行不打标记、只按提示符实际宽度补空格对齐。
@@ -2268,6 +2348,7 @@ class Tui:
                 line = session.prompt(
                     self._prompt_fragments,
                     default=queued,
+                    pre_run=self._prime_prompt,
                 ).strip()
                 queued = ""
             except EOFError:
@@ -2328,6 +2409,8 @@ class Tui:
             line = action.args
             #  Esc-Esc 取回的是用户敲的那行（/deploy prod），不是展开后的几千字
             self._last_input = recall
+            #  上一轮的「接着问」到此作废：新一轮的内容还没出来，旧建议只会误导
+            self._suggestions = []
             self.sink.begin_turn()
             attention.running()
             #  运行期插话（steer）：整行回车即在 step 边界进入本轮。
