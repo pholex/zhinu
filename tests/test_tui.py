@@ -1732,3 +1732,82 @@ class TestStreamStyler(unittest.TestCase):
         self.assertIsNotNone(rendered.get_style_at_offset(console, start).color)
         start = rendered.plain.index("return")
         self.assertIsNotNone(rendered.get_style_at_offset(console, start).color)
+
+
+@unittest.skipUnless(HAS_TUI, "未安装 tui 可选依赖")
+class TestSearchSelect(unittest.TestCase):
+    """会话选择器：敲字过滤、无数字直选、序号沿用原编号、窗口恒高。"""
+
+    OPTIONS = [
+        ("a", "2026-08-09T10:00  deepseek  zhinu  修 calc.py", ""),
+        ("b", "2026-08-10T09:00  gpt  zhinu  写 README", ""),
+        ("c", "2026-08-10T11:00  deepseek  noc  排查 fallback", ""),
+    ]
+
+    def run_select(self, keys_text: str, options=None, visible: int = 10):
+        from prompt_toolkit.application import create_app_session
+        from prompt_toolkit.input.defaults import create_pipe_input
+        from prompt_toolkit.output import DummyOutput
+
+        from xiaoyu.tui import search_select
+
+        with create_pipe_input() as pipe:
+            pipe.send_text(keys_text)
+            with create_app_session(input=pipe, output=DummyOutput()):
+                return search_select("切到哪个会话？", options or self.OPTIONS, visible=visible)
+
+    def test_typing_filters_and_enter_picks_first_match(self) -> None:
+        self.assertEqual(self.run_select("\r"), "a")  # 没过滤：第一项
+        self.assertEqual(self.run_select("noc\r"), "c")
+        self.assertEqual(self.run_select("README\r"), "b")
+        #  空格分词，每个词都要命中；大小写不敏感
+        self.assertEqual(self.run_select("DEEPSEEK 0810\r"), "c")
+
+    def test_digits_are_query_not_shortcuts(self) -> None:
+        """时间戳就是数字：敲 "0810" 是在找 8 月 10 日的会话，不是跳到第 0 项。"""
+        self.assertEqual(self.run_select("0810\r"), "b")
+        self.assertEqual(self.run_select("2\r"), "a")  # 三条都含 "2"，仍是第一项
+
+    def test_arrows_move_within_matches_and_backspace_edits(self) -> None:
+        self.assertEqual(self.run_select("\x1b[B\r"), "b")  # ↓
+        self.assertEqual(self.run_select("deepseek\x1b[B\r"), "c")  # 过滤后 ↓ 只在匹配里走
+        self.assertEqual(self.run_select("\x1b[A\r"), "c")  # ↑ 绕到末尾
+        #  退格改词：noX → no → 命中 noc
+        self.assertEqual(self.run_select("noX\x7f\r"), "c")
+
+    def test_no_match_enter_is_noop_and_esc_cancels(self) -> None:
+        self.assertIsNone(self.run_select("zzz\r\x03"))
+        self.assertIsNone(self.run_select("\x03"))
+        #  删掉不匹配的词之后又能选
+        self.assertEqual(self.run_select("zzz\x7f\x7f\x7f\r"), "a")
+
+    def test_fragments_keep_height_and_original_numbers(self) -> None:
+        """渲染内容：序号沿用原列表编号、窗口外的数量有交代、高度不随匹配数变。"""
+        from prompt_toolkit.application import create_app_session
+        from prompt_toolkit.input.defaults import create_pipe_input
+        from prompt_toolkit.output import DummyOutput
+
+        from xiaoyu import tui as tui_module
+
+        captured: list[list[tuple[str, str]]] = []
+        original = tui_module.FormattedTextControl
+
+        class Spy(original):
+            def __init__(self, fragments, **kwargs):
+                captured.append(fragments)
+                super().__init__(fragments, **kwargs)
+
+        many = [(i, f"2026-08-{i:02d}  会话 {i}", "") for i in range(1, 16)]
+        with mock.patch.object(tui_module, "FormattedTextControl", Spy):
+            with create_pipe_input() as pipe:
+                pipe.send_text("\x03")
+                with create_app_session(input=pipe, output=DummyOutput()):
+                    tui_module.search_select("标题", many, visible=5)
+        text_all = "".join(t for _s, t in captured[0]())
+        self.assertIn("  1. 2026-08-01", text_all)
+        self.assertIn("还有 10 个", text_all)
+        self.assertNotIn(" 6. ", text_all)
+        self.assertIn("输入文字 过滤", text_all)
+        self.assertNotIn("Tab", text_all)
+        #  不同匹配数下行数一致（标题 + 过滤行 + visible + 提示）
+        self.assertEqual(text_all.count("\n"), 5 + 2)

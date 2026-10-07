@@ -850,8 +850,9 @@ def inline_select(
         if shortcut:
             bindings.add(shortcut)(bind_choice(value))
 
-    #  提示行不承诺没有效果的键：无附言语义剔 Tab、无全文可看剔 Ctrl-O
-    exclude = ["menu.toggle"] if amend else ["menu.amend", "menu.toggle"]
+    #  提示行不承诺没有效果的键：无附言语义剔 Tab、无全文可看剔 Ctrl-O、
+    #  敲字过滤只属于会话选择器（search_select）
+    exclude = ["menu.toggle", "menu.filter"] if amend else ["menu.amend", "menu.toggle", "menu.filter"]
     if expand is None:
         exclude.append("menu.expand")
     hint = keys.menu_hint(exclude=tuple(exclude))
@@ -874,6 +875,113 @@ def inline_select(
     window = Window(
         FormattedTextControl(fragments, focusable=True, show_cursor=False),
         height=len(options) + 2,
+        always_hide_cursor=True,
+    )
+    application: Application = Application(
+        layout=Layout(window),
+        key_bindings=bindings,
+        full_screen=False,
+        erase_when_done=True,
+        style=Style.from_dict(theme.ptk_style()),
+    )
+    return application.run()
+
+
+def search_select(
+    title: str, options: list[tuple[Any, str, str]], visible: int = 10
+) -> Any:
+    """带过滤的行内单选（会话选择器用）：敲字即按词过滤，↑↓ 选、Enter 定、Esc 取消。
+
+    与 inline_select 同一套菜单键（表驱动，底部提示同源），差别只在"敲字"：
+    - 所有可打印字符进过滤串（空格分词、每个词都命中才显示，不分大小写），
+      Backspace 删字；过滤规则在 ui.matches_query，明文 REPL 的编号输入同一条；
+    - 因此**没有数字直选**——会话列表里时间戳、序号都是数字，敲 "0809" 是在找
+      8 月 9 日的会话而不是跳到第 0 项。行前的序号沿用原列表的编号，过滤后不变，
+      `/resume <序号>` 照旧有效；
+    - 只显示 `visible` 行，更多的说"还有 N 个，继续输入缩小范围"，选中项超出
+      窗口时整窗跟着滚；高度恒定，不随匹配数跳。
+    options 每项 (返回值, 标签, 快捷键)，快捷键在这里忽略（字母都进过滤串）。
+    """
+    from prompt_toolkit.keys import Keys
+
+    query = ""
+    selected = 0
+    numbered = [(index + 1, value, label) for index, (value, label, _shortcut) in enumerate(options)]
+
+    def matches() -> list[tuple[int, Any, str]]:
+        return [item for item in numbered if ui.matches_query(item[2], query)]
+
+    def _move(delta: int) -> None:
+        nonlocal selected
+        count = len(matches())
+        if count:
+            selected = (min(selected, count - 1) + delta) % count
+
+    def _accept(event: Any) -> None:
+        found = matches()
+        if found:
+            event.app.exit(result=found[min(selected, len(found) - 1)][1])
+
+    def _cancel(event: Any) -> None:
+        event.app.exit(result=None)
+
+    def _typed(text: str) -> None:
+        nonlocal query, selected
+        if text and text.isprintable():
+            query += text
+            selected = 0
+
+    def _backspace(event: Any) -> None:
+        nonlocal query, selected
+        query = query[:-1]
+        selected = 0
+
+    bindings = _register(
+        {
+            "menu.up": lambda event: _move(-1),
+            "menu.down": lambda event: _move(1),
+            "menu.accept": _accept,
+            "menu.amend": _accept,  # 纯单选，Tab 等同 Enter
+            "menu.toggle": lambda event: _typed(" "),  # 空格是过滤串的分词符
+            "menu.expand": lambda event: None,
+            "menu.cancel": _cancel,
+        },
+        keys.MENU,
+    )
+    bindings.add("backspace")(_backspace)
+    #  其余单键一律当输入（Keys.Any 排在精确绑定之后，不会抢走 ↑↓ / Enter / Esc）
+    bindings.add(Keys.Any)(lambda event: _typed(event.data))
+
+    hint = keys.menu_hint(exclude=("menu.amend", "menu.toggle", "menu.expand"))
+
+    def fragments() -> list[tuple[str, str]]:
+        rows: list[tuple[str, str]] = [
+            ("class:menu-title", f"  {title}\n"),
+            ("", f"  过滤：{query}"),
+            ("class:menu-hint", "▏\n"),
+        ]
+        found = matches()
+        current = min(selected, max(len(found) - 1, 0))
+        start = max(0, current - visible + 1)
+        shown = found[start : start + visible]
+        for offset, (number, _value, label) in enumerate(shown):
+            if start + offset == current:
+                rows.append(("class:menu-selected", f"  ❯ {number:>2}. {label}\n"))
+            else:
+                rows.append(("", f"    {number:>2}. {label}\n"))
+        if not found:
+            rows.append(("class:menu-hint", "    （没有匹配项，Backspace 删字）\n"))
+        #  补空行把高度撑恒定：匹配数变了菜单不跳
+        for _ in range(visible - len(shown) - (0 if found else 1)):
+            rows.append(("", "\n"))
+        hidden = len(found) - len(shown)
+        more = f"…还有 {hidden} 个，继续输入缩小范围 · " if hidden else ""
+        rows.append(("class:menu-hint", f"    {more}{hint}"))
+        return rows
+
+    window = Window(
+        FormattedTextControl(fragments, focusable=True, show_cursor=False),
+        height=visible + 3,
         always_hide_cursor=True,
     )
     application: Application = Application(
@@ -960,7 +1068,9 @@ def question_select(
         bindings.add(str(index + 1))(bind_digit(index))
 
     exclude = (
-        ("menu.amend", "menu.expand") if multi else ("menu.amend", "menu.toggle", "menu.expand")
+        ("menu.amend", "menu.expand", "menu.filter")
+        if multi
+        else ("menu.amend", "menu.toggle", "menu.expand", "menu.filter")
     )
     hint = keys.menu_hint(exclude=exclude)
 
@@ -2689,8 +2799,8 @@ class Tui:
                 #  不是技能的才交给内建命令表
                 expanded = skill_prompt(agent, action.args)
                 if expanded is None:
-                    #  /resume 这类需要列表选择的命令用行内菜单（纯单选，无附言）
-                    if handle_slash(agent, action.args, select=lambda t, o: inline_select(t, o, amend=False)):
+                    #  /resume 这类需要列表选择的命令用带过滤的行内菜单（纯单选，无附言）
+                    if handle_slash(agent, action.args, select=search_select):
                         return 0
                     #  /rewind 把被回退那一轮的原话放进了插话队列：取出来预填进
                     #  下一轮输入行（与"没赶上本轮的插话"同一条路），不自动提交

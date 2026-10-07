@@ -88,7 +88,7 @@ SLASH_COMMANDS: dict[str, str] = {
     "/perm": "查看权限规则与会话授权",
     "/allow": "持久允许，如 /allow bash(git *)、/allow write_file",
     "/deny": "持久拒绝（任何模式下都拦，包括 --yolo）",
-    "/resume": "切到本工作区的历史会话（当前对话被清空；/resume <序号> 直接选）",
+    "/resume": "切到本工作区的历史会话（当前对话被清空；菜单里敲字过滤，/resume <序号> 直接选）",
     "/rewind": "回滚到某轮开始前（对话和/或文件；/undo 同义）。回退对话后那一轮的原话预填回输入行，可改可直接回车",
     "/copy": "把最后一条回复复制到剪贴板（没有剪贴板命令时经终端 OSC 52）",
     "/export": "把本会话导出成 Markdown（/export [路径]，默认写到工作区 xiaoyu-session-<id>.md）",
@@ -882,10 +882,15 @@ def resume_hint(agent: Agent) -> str:
     return f"接回本会话：xiaoyu resume {log.path.stem}" if log is not None else ""
 
 
+def _session_fields(info: SessionInfo) -> str:
+    """会话一行的全部可读字段（时间、模型、目录、名字、正文）：菜单标签与过滤都从它来。"""
+    place = Path(info.workspace).name or info.workspace
+    return f"{info.started_at}  {info.model}  {place}  {_named(info)}{_session_text(info)}"
+
+
 def _session_label(info: SessionInfo) -> str:
     """会话在行内菜单里的一行标签（截到终端宽度，长了菜单高度就不准了）。"""
-    place = Path(info.workspace).name or info.workspace
-    return ui.fit(f"{info.started_at}  {info.model}  {place}  {_named(info)}{_session_text(info)}", 12)
+    return ui.fit(_session_fields(info), 12)
 
 
 def _session_text(info: SessionInfo) -> str:
@@ -921,20 +926,29 @@ def choose_session(
             if isinstance(value, tuple):  # 通用件的 Tab 形态兜底：当普通确认
                 value = value[1]
             return sessions[value] if isinstance(value, int) else None
-    for number, info in enumerate(sessions, start=1):
-        place = Path(info.workspace).name or info.workspace
-        print(
-            f"  {number:>2}. {info.started_at}  {ui.secondary(info.model)}  "
-            f"{ui.secondary(place)}  {_named(info)}{_session_text(info)}"
-        )
-    try:
-        answer = input(ui.prompt("恢复哪个？（序号，回车取消）: ")).strip()
-    except (EOFError, KeyboardInterrupt):
-        print()
-        return None
-    if not answer or not answer.isdigit() or not 1 <= int(answer) <= len(sessions):
-        return None
-    return sessions[int(answer) - 1]
+    #  编号输入也能过滤：敲的不是数字就当过滤词，按词缩小列表再问（序号沿用原列表
+    #  的编号，过滤后不变）；没命中提示一句再问；回车取消。与行内菜单同一条规则
+    numbered = list(enumerate(sessions, start=1))
+    shown = numbered
+    while True:
+        for number, info in shown:
+            place = Path(info.workspace).name or info.workspace
+            print(
+                f"  {number:>2}. {info.started_at}  {ui.secondary(info.model)}  "
+                f"{ui.secondary(place)}  {_named(info)}{_session_text(info)}"
+            )
+        try:
+            answer = input(ui.prompt("恢复哪个？（序号；输入文字可过滤；回车取消）: ")).strip()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            return None
+        if not answer:
+            return None
+        if answer.isdigit():
+            return sessions[int(answer) - 1] if 1 <= int(answer) <= len(sessions) else None
+        shown = [(n, info) for n, info in numbered if ui.matches_query(_session_fields(info), answer)]
+        if not shown:
+            print(ui.secondary("  没有匹配的会话，换个词试试（回车取消）"))
 
 
 def _tui_select() -> Any:
@@ -943,12 +957,12 @@ def _tui_select() -> Any:
         return None
     try:
         from . import terminal
-        from .tui import inline_select
+        from .tui import search_select
     except ImportError:
         return None
     #  菜单配色跟终端深浅走；make_frontend 稍后会再探一次，代价是有界的（150ms 超时）
     terminal.autodetect()
-    return lambda title, options: inline_select(title, options, amend=False)
+    return search_select
 
 
 def replay_recent(agent: Agent, loaded: list[dict[str, Any]]) -> None:
@@ -969,8 +983,9 @@ def replay_recent(agent: Agent, loaded: list[dict[str, Any]]) -> None:
         print(ui.secondary(f"上次说到：{ui.fit(tail, 6)}"))
 
 
-#  /resume 行内菜单最多列几个：数字直选与行内高度都到 9 为止，更早的用子命令
-_SLASH_RESUME_LIMIT = 9
+#  /resume 最多列几个：行内菜单带过滤、只显示一窗（search_select），列多也翻得动；
+#  编号输入那条路会整列打出来，30 行是一屏能扫完的量。更早的用子命令 xiaoyu resume
+_SLASH_RESUME_LIMIT = 30
 
 
 def slash_resume(agent: Agent, rest: list[str], select: Any = None) -> None:
@@ -981,9 +996,10 @@ def slash_resume(agent: Agent, rest: list[str], select: Any = None) -> None:
     跨工作区接上下文十有八九是接错；要跨就退出用 `xiaoyu resume --all`。
     """
     current = agent.session_log.path if agent.session_log else None
+    #  多取一个：当前会话文件要剔掉，剔完仍要凑够上限
     sessions = [
         info
-        for info in list_sessions(workspace=str(agent.config.workspace))
+        for info in list_sessions(workspace=str(agent.config.workspace), limit=_SLASH_RESUME_LIMIT + 1)
         if info.path != current
     ][:_SLASH_RESUME_LIMIT]
     if not sessions:
@@ -1351,7 +1367,7 @@ def resume_command(argv: list[str]) -> int:
     """
     parser = argparse.ArgumentParser(
         prog="xiaoyu resume",
-        description="恢复历史会话。默认列出当前工作区的最近会话供选择。",
+        description="恢复历史会话。默认列出当前工作区的最近会话供选择（列表里敲字即可过滤）。",
     )
     parser.add_argument(
         "index",

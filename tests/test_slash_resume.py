@@ -194,10 +194,39 @@ class TestChooseSession(SlashResumeTestCase):
 
     def test_numbered_input_paths(self) -> None:
         sessions = self.sessions()
-        for answer, expected in (("1", sessions[0]), ("", None), ("99", None), ("x", None)):
+        for answer, expected in (("1", sessions[0]), ("", None), ("99", None)):
             with mock.patch("builtins.input", return_value=answer):
                 with contextlib.redirect_stdout(io.StringIO()):
                     self.assertIs(choose_session(sessions), expected)
+
+    def test_numbered_input_filters_by_words(self) -> None:
+        """编号输入敲的不是数字 = 过滤词：按词缩小列表再问，序号沿用原编号；
+        没命中提示再问；回车取消。"""
+        sessions = self.sessions()
+        answers = iter(["没有这个词", "旧", "2"])
+        buffer = io.StringIO()
+        with mock.patch("builtins.input", side_effect=lambda _prompt: next(answers)):
+            with contextlib.redirect_stdout(buffer):
+                chosen = choose_session(sessions)
+        self.assertIs(chosen, sessions[1])
+        out = buffer.getvalue()
+        self.assertIn("没有匹配的会话", out)
+        #  过滤后重新打印的列表里只剩第二个会话，且编号仍是 2
+        tail = out.split("没有匹配的会话", 1)[1]
+        self.assertIn(" 2. ", tail)
+        self.assertNotIn(" 1. ", tail)
+        #  没命中后回车：取消
+        with mock.patch("builtins.input", side_effect=["x", ""]):
+            with contextlib.redirect_stdout(io.StringIO()):
+                self.assertIsNone(choose_session(sessions))
+
+    def test_matches_query_rule(self) -> None:
+        from xiaoyu import ui
+
+        self.assertTrue(ui.matches_query("2026-08-09 deepseek 旧任务", ""))
+        self.assertTrue(ui.matches_query("2026-08-09 deepseek 旧任务", "0809 DEEP"))
+        self.assertFalse(ui.matches_query("2026-08-09 deepseek 旧任务", "0810"))
+        self.assertFalse(ui.matches_query("abc", "a c d"))
 
 
 if __name__ == "__main__":

@@ -145,6 +145,13 @@ BINDINGS: tuple[Binding, ...] = (
         "menu.cancel", "Esc", "取消（等同拒绝）",
         MENU, keys=(("escape",), ("c-c",)), hint="取消",
     ),
+    #  会话选择器里敲字即过滤：按 Keys.Any 动态注册（不是固定键），本表只登记。
+    #  确认框 / 提问面板敲字无效，它们的提示行要把这条剔掉
+    Binding(
+        "menu.filter", "输入文字",
+        "过滤列表（仅会话选择器）：空格分词、每个词都命中才显示，序号保持原列表的；Backspace 删字",
+        MENU, hint="过滤",
+    ),
     #  数字/首字母按选项动态注册（选项数量不固定），本表只登记。菜单键里唯一
     #  标 tip 的一个：menu_hint 里放不下它，除了轮播没有别的发现路径
     Binding("menu.digit", "1…9 / 首字母", "确认菜单里直接选中对应项", MENU, tip=True),

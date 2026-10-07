@@ -295,3 +295,20 @@ def escalation_notice(args: object) -> list[str]:
 def fit(value: object, reserve: int = 0, width: int | None = None) -> str:
     """按终端实际宽度压成一行（`preview` 的自适应版）。"""
     return preview(value, budget(reserve, width))
+
+
+def matches_query(text: str, query: str) -> bool:
+    """列表过滤的唯一规则（会话选择器与明文 REPL 的编号输入共用）：
+    query 按空白切词，每个词都（不分大小写）出现在 text 里才算命中；空 query 全命中。
+    词也拿掉标点后再比一次：时间戳显示成 2026-08-09T10:00，人敲的是 0809 / 1000。
+    不做模糊子序列——猜测式匹配在时间戳和文件名上只会添乱。"""
+    haystack = text.casefold()
+    compact = "".join(ch for ch in haystack if ch.isalnum())
+
+    def hit(token: str) -> bool:
+        if token in haystack:
+            return True
+        bare = "".join(ch for ch in token if ch.isalnum())
+        return bool(bare) and bare in compact
+
+    return all(hit(token.casefold()) for token in query.split())
