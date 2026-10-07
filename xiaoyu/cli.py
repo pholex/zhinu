@@ -2840,13 +2840,34 @@ def terminate_background_commands(agent: Agent) -> list[dict[str, Any]]:
     ]
 
 
-def turn_stats_line(agent: Any) -> str:
-    """`--stats` 开着时本轮的计时一行；没开或本轮没请求返回空串。
-    getattr 兜底：测试里的替身 agent 没有这两个属性。"""
-    if not getattr(agent, "show_stats", False):
-        return ""
+#  交互前端轮末默认那行简版耗时的开关与门槛：短轮次刷这一行只是噪音，
+#  等了半分钟的人才想知道"刚才到底花了多久、模型吐得快不快"
+TURN_SUMMARY_ENV = "XIAOYU_TURN_SUMMARY"
+TURN_SUMMARY_MIN_MS = 5000
+
+
+def turn_summary_enabled() -> bool:
+    return os.environ.get(TURN_SUMMARY_ENV, "1").strip().lower() not in ("0", "false", "no", "off")
+
+
+def turn_stats_line(agent: Any, interactive: bool = False) -> str:
+    """轮末的计时一行；本轮没请求返回空串。
+
+    `--stats` 开着打全版（耗时 / 首 token / tok/s / 请求数）。交互前端
+    （interactive=True）没开 --stats 也默认打简版（耗时与 tok/s），但只在本轮
+    耗时 ≥ 5s 时打，XIAOYU_TURN_SUMMARY=0 关掉；-p 单发与 json 输出不传
+    interactive，行为不变。getattr 兜底：测试里的替身 agent 没有这两个属性。
+    """
     stats = getattr(agent, "turn_stats", None)
-    return stats.summary() if stats is not None else ""
+    if stats is None:
+        return ""
+    if getattr(agent, "show_stats", False):
+        return stats.summary()
+    if not interactive or not turn_summary_enabled():
+        return ""
+    if stats.duration_ms < TURN_SUMMARY_MIN_MS:
+        return ""
+    return stats.brief()
 
 
 def run_once(
@@ -3153,7 +3174,7 @@ def _repl_loop(agent: Agent) -> int:
             print(ui.error(f"\n请求失败：{type(exc).__name__}: {exc}"))
         if note := background_status(agent):
             print(ui.secondary(note))
-        if stats := turn_stats_line(agent):
+        if stats := turn_stats_line(agent, interactive=True):
             print(ui.secondary(f"  {stats}"))
         #  一轮收尾 = 回到"等人"：铃（opt-in）+ 状态钩子
         attention.waiting(attention.WAITING_INPUT)

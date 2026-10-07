@@ -942,6 +942,16 @@ class TurnStats:
             parts.append(f"{self.requests} 次请求")
         return " · ".join(parts)
 
+    def brief(self) -> str:
+        """简版（交互前端轮末默认那行）：只有耗时与吐字速率。首 token、请求数
+        是调性能时才关心的数字，留给 --stats 的全版。"""
+        if not self.requests:
+            return ""
+        parts = [f"耗时 {self.duration_ms / 1000:.1f}s"]
+        if self.completion_tokens and self.generation_ms > 0:
+            parts.append(f"输出 {self.completion_tokens * 1000 / self.generation_ms:.0f} tok/s")
+        return " · ".join(parts)
+
 
 #  进程级仪表：serve /diagnostics 与 doctor 读它回答"现在有几轮在跑"
 _TURNS_ACTIVE = diagnostics.Gauge("core.turns.active")

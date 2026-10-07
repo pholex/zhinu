@@ -2285,7 +2285,7 @@ class Tui:
                 self.console.print(Text(note, style="text.secondary"))
             from .cli import turn_stats_line
 
-            if stats := turn_stats_line(agent):
+            if stats := turn_stats_line(agent, interactive=True):
                 self.console.print(Text(f"  {stats}", style="text.secondary"))
             self._print_expand_hint()
             #  一轮收尾 = 回到"等人"：铃（opt-in）+ 状态钩子，把切去别处的人叫回来
