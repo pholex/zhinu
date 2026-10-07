@@ -89,7 +89,7 @@
   },
   {
     "function": {
-      "description": "在工作区里按正则搜索文本，返回 路径:行号: 内容。找符号定义、找调用点、找配置项都用它。可用 glob 限定文件类型（如 *.py）。这是只读操作。",
+      "description": "在工作区里按正则搜索文本，返回 路径:行号: 内容。找符号定义、找调用点、找配置项都用它。可用 glob 限定文件类型（如 *.py）。这是只读操作；.env、私钥、.ssh 这类敏感文件不进结果，要看用 read_file。",
       "name": "grep",
       "parameters": {
         "properties": {
@@ -120,7 +120,7 @@
   },
   {
     "function": {
-      "description": "列出工作区里的文件（可用 glob 过滤，如 **/*.py）。摸清项目结构时用它，比 bash ls 更干净：自动跳过 .git、node_modules、__pycache__ 等噪声目录。这是只读操作。",
+      "description": "列出工作区里的文件（可用 glob 过滤，如 **/*.py）。摸清项目结构时用它，比 bash ls 更干净：自动跳过 .git、node_modules、__pycache__ 等噪声目录，也不列 .env、私钥等敏感文件。这是只读操作。",
       "name": "list_files",
       "parameters": {
         "properties": {
