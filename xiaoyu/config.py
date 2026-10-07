@@ -201,6 +201,7 @@ _NUMERIC_ENV: dict[str, tuple[type, float | None, float | None, str]] = {
     "XIAOYU_QIXIANG_TIMEOUT": (int, None, None, ""),
     "XIAOYU_CHENSHU_MAX_WORKERS": (int, None, None, ""),
     "XIAOYU_MAX_IMAGES_PER_REQUEST": (int, 0, None, "不能为负（0 = 不限）"),
+    "XIAOYU_FIRST_CHUNK_TIMEOUT": (float, 0, None, "单位是秒，不能为负（0 = 关）"),
 }
 
 
@@ -463,6 +464,10 @@ class Config:
     request_timeout: float = 600.0
     #  每次请求最多带几张图（出网投影，历史不改；0 = 不限）。见 media.cap_images
     max_images_per_request: int = 20
+    #  首 chunk 看门狗（秒）：从请求发出到收到第一个流事件的等待上限，超过就按瞬时
+    #  错误走重试/降级；0 = 关。request_timeout 的 read 超时是逐次读计的，兼任
+    #  "等首 token"要等满 10 分钟才判死。见 providers.first_chunk_timeout
+    first_chunk_timeout: float = 300.0
     #  注入给 bash 工具的额外环境变量。
     #  eval 用它设 PIP_REQUIRE_VIRTUALENV：无人值守 + 全放行时，
     #  模型可能 pip install 到系统 Python 里去（已经真实发生过一次）。
@@ -569,6 +574,8 @@ class Config:
             cfg.compact_at = float(ratio)
         if (cap := env_number("XIAOYU_MAX_IMAGES_PER_REQUEST")) is not None:
             cfg.max_images_per_request = int(cap)
+        if (wait := env_number("XIAOYU_FIRST_CHUNK_TIMEOUT")) is not None:
+            cfg.first_chunk_timeout = float(wait)
         if (flag := os.environ.get("XIAOYU_ENABLE_EXPLORE")) is not None:
             cfg.enable_explore = flag.strip().lower() not in ("0", "false", "no", "off")
         if (flag := os.environ.get("XIAOYU_ENABLE_SKILLS")) is not None:

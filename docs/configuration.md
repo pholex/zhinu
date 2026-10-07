@@ -106,6 +106,7 @@ XIAOYU_API_KEY=<key>
 | `XIAOYU_TURN_EXTENSION` | `1.0` | 撞 `max_iterations` 时允许模型调 `extend_turns` 申请追加轮数，总追加量 ≤ `max_iterations ×` 此系数；`0` = 不许延期（撞顶即收尾）。理由展示给用户、可审计。轮数用到上限的 50% / 80% 时模型各收到一次「轮数 N/M」提示（每轮各一次） |
 | `XIAOYU_SERVER_COMPACTION` | `1` | 直连 Claude（opus-4.6+/sonnet-4.6+/5 系）时把压缩交给服务端（模型自己写摘要，`compaction` 块下轮回传，服务端忽略块前历史）；本地摘要压缩降为兜底。设 `0` 回纯本地压缩 |
 | `XIAOYU_KEEP_RECENT` | `8` | 压缩时至少保留最近几条消息 |
+| `XIAOYU_FIRST_CHUNK_TIMEOUT` | `300` | 首 chunk 看门狗（秒）：请求发出后等第一个流事件超过它就中止本次尝试、按瞬时错误走既有重试/降级链，报错点名"首 chunk 等待超过 300s（XIAOYU_FIRST_CHUNK_TIMEOUT）"；`0` = 关。实现是收紧这次请求的读超时（等首 token 时进程阻塞在一次 socket 读上，不起线程就只有它能打断），所以看门狗生效时流内两个 chunk 之间的等待上限也是这个数；比单次请求超时（600s）长时不生效 |
 | `XIAOYU_MAX_IMAGES_PER_REQUEST` | `20` | 每次请求最多发出去几张图（`0` = 不限）：只投影发出去的副本——更早的图换成一行"[图片已省略：第 N 张…]"占位，历史与会话文件照旧带图，`/compact` 或用户重贴随时能回来。内置厂商若声明了更小的张数上限，按较小的算。用户贴的图刻意不老化，没有这一层，贴图多的长会话会撞端点的张数上限（400 且每次重发同样 400） |
 | `XIAOYU_EXPLORE_ITERATIONS` | `12` | `explore` 子 agent 单次检索的工具调用轮数上限（1–100；主 agent 的 50 轮不受影响） |
 | `XIAOYU_QIXIANG_CONCURRENCY` | `4` | 七襄批量委托的并发上限（1–16） |

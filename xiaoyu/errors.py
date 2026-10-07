@@ -95,6 +95,23 @@ class StreamFailed(RuntimeError):
     """
 
 
+class FirstChunkTimeout(RuntimeError):
+    """请求发出后等第一个流事件超过了 XIAOYU_FIRST_CHUNK_TIMEOUT（agent._stream_once 抛）。
+
+    与普通读超时同属瞬时错误（重试/降级链照走），单独成类只为报错点名是哪个设置
+    触发的——"等了 5 分钟一个字没来"和"生成到一半断了"排查方向完全不同。
+    """
+
+
+def is_timeout(exc: BaseException) -> bool:
+    """这次请求是不是超时（httpx2 的超时、或 SDK 包装后的 APITimeoutError）。"""
+    if isinstance(exc, httpx2.TimeoutException):
+        return True
+    if type(exc).__name__ == "APITimeoutError":
+        return True
+    return isinstance(exc.__cause__, httpx2.TimeoutException)
+
+
 @dataclass(frozen=True)
 class Verdict:
     kind: str  # 取值必须在 ALL_KINDS 里
@@ -418,6 +435,9 @@ def classify(exc: Exception) -> Verdict:
     if isinstance(exc, StreamTruncated):
         #  先于文本判定：断流描述里的措辞不该撞上任何 marker
         return Verdict("transient", True, False, "流在工具参数写到一半时断开")
+    if isinstance(exc, FirstChunkTimeout):
+        #  先于文本判定：报错原文已点名触发的设置，原样交给用户
+        return Verdict("transient", True, False, str(exc))
     text = str(exc).lower()
     status = _status_code(exc)
 

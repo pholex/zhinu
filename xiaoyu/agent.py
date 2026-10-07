@@ -54,7 +54,7 @@ from .compaction import (
 )
 from .config import EFFORT_LEVELS, Config
 from .errors import Interrupted, classify
-from .providers import Registry, Route, UnknownModel
+from .providers import Registry, Route, UnknownModel, first_chunk_timeout, request_timeout
 from .permissions import Permissions, call_identity
 from .rewind import RewindResult
 from .events import (
@@ -4689,6 +4689,16 @@ class Agent:
             request[COMPACTION_KEY] = {
                 "trigger": int(self.config.compact_at * self.config.context_limit),
             }
+        #  首 chunk 看门狗：收紧这次请求的 read 超时（三条协议的 SDK 都认请求级
+        #  timeout 参数；为什么是收紧 read 见 providers.first_chunk_timeout）。
+        #  基准取 config.request_timeout 而不是 registry 的：宿主注入的 client
+        #  （SDK / 测试）自带超时，registry 那份只是出厂值，按它算会把宿主配的
+        #  更短超时反向放宽。超时落在首 chunk 之前才算看门狗触发，之后的仍是普通读超时
+        watchdog = first_chunk_timeout(
+            request_timeout(self.config.request_timeout), self.config.first_chunk_timeout
+        )
+        if watchdog is not None:
+            request["timeout"] = watchdog
         if bypass_cache and (body := self._cache_bypass_body(route)) is not None:
             #  只在空补全重发时绕开网关响应缓存：首发照常可命中——正常回复被缓存
             #  是省钱的，给每个请求都关掉读取等于白白放弃命中率、改变成本面。
@@ -4738,6 +4748,18 @@ class Agent:
                         "content": "".join(content_parts) + "\n[回答在此处被用户中断]",
                     }
                 )
+            raise
+        except Exception as exc:
+            if watchdog is not None and self._first_chunk_at is None and errors.is_timeout(exc):
+                #  一个流事件都没等到就超时，且是看门狗收紧的那个数在管：点名它。
+                #  分类仍是瞬时错误，重试 / 降级链照走
+                failure: Exception = errors.FirstChunkTimeout(
+                    f"{route.qualified} 首 chunk 等待超过 {self.config.first_chunk_timeout:.0f}s"
+                    "（XIAOYU_FIRST_CHUNK_TIMEOUT）"
+                )
+                self._request_failure = failure
+                raise failure from exc
+            self._request_failure = exc
             raise
         except BaseException as exc:
             self._request_failure = exc

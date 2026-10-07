@@ -121,6 +121,24 @@ def request_timeout(seconds: float) -> httpx2.Timeout:
     return httpx2.Timeout(seconds, connect=min(_CONNECT_TIMEOUT, seconds))
 
 
+def first_chunk_timeout(base: httpx2.Timeout, seconds: float) -> httpx2.Timeout | None:
+    """首 chunk 看门狗要用的请求级超时；用不着（关着、或不比 read 更紧）返回 None。
+
+    **为什么是收紧 read 而不是另起一个计时器**：等首 token 的那段时间，进程阻塞在
+    一次 socket 读上，能打断它的只有这次读自己的超时——不起线程就没有第二只手。
+    httpx2 的 read 超时在流开始时取值一次、整条流沿用，所以做不到"首 chunk 一个数、
+    之后另一个数"：看门狗生效时，流内两个 chunk 之间的等待上限也跟着收到这个数
+    （默认 300s；生成中途停 5 分钟一个字不吐的流本来也活不过来）。不收紧的情况
+    （看门狗关着、或 request_timeout 本来就更短）一个字节都不改。
+    """
+    read = base.read
+    if seconds <= 0 or read is None or seconds >= read:
+        return None
+    return httpx2.Timeout(
+        connect=base.connect, read=seconds, write=base.write, pool=base.pool
+    )
+
+
 def _discover_models(base_url: str, api_key: str, label: str) -> tuple[str, ...]:
     """探端点 /v1/models，返回它当前 serve 的 model id（去重排序）。失败/空 → 空
     元组：调用方据此**跳过注册**，绝不退化成通配（通配的具名 provider 会把一切
