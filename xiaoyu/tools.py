@@ -454,17 +454,22 @@ def _unreadable_file_error(target: Path, shown: str, size_cap: bool = True) -> s
     阻塞、读设备读不到头，stat 跟随符号链接，链接指向 FIFO 同样拦下。
     size_cap=False 只查类型（覆盖写不整读原文）。
     """
-    try:
-        info = os.stat(target)
-    except OSError as exc:
-        return f"ERROR: 读取失败 {shown}: {exc}"
-    kind = fsguard.non_regular_kind(info.st_mode)
-    if kind is not None:
+    def refuse(kind: str) -> str:
         return (
             f"ERROR: {shown} 是{kind}，不是普通文件，已拒绝读取——读它可能永久阻塞"
             "等待数据，或读出没有尽头的内容。确需查看请用 bash 并加超时与字节上限"
             f"（如 timeout 5 head -c 4096 {shown}）。"
         )
+
+    #  Windows 的设备藏在名字里（NUL.txt、CON），stat 报的是普通文件：先按名字判
+    if kind := fsguard.reserved_device_kind(target):
+        return refuse(kind)
+    try:
+        info = os.stat(target)
+    except OSError as exc:
+        return f"ERROR: 读取失败 {shown}: {exc}"
+    if kind := fsguard.non_regular_kind(info.st_mode):
+        return refuse(kind)
     if size_cap and info.st_size > _READ_MAX_BYTES:
         return (
             f"ERROR: {shown} 有 {info.st_size / 1048576:.1f} MiB，超过整读上限 "
