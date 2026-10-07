@@ -523,6 +523,32 @@ class TestTuiFrontend(AgentTestCase):
         minus = next(row for row in rows if row[0][1].startswith("-"))
         self.assertEqual(minus, [("diff.removed", "-alpha beta gamma")])
 
+    def test_diff_rows_bounded_on_huge_input(self) -> None:
+        """新旧两边行数之和超上限时不跑 difflib（相似的大文本上是平方级，确认框会
+        卡在算 diff 上）：改按全删 / 全增给出，内容仍完整、cap 仍生效。"""
+        import time
+
+        from xiaoyu import theme
+        from xiaoyu.tui import _DIFF_INPUT_LINES, _diff_rows
+
+        #  两坨彼此相似、只差零星几行的长文本：difflib 的最坏情形
+        old = "\n".join(f"line {i} same" for i in range(_DIFF_INPUT_LINES))
+        new = "\n".join(f"line {i} {'same' if i % 97 else 'diff'}" for i in range(_DIFF_INPUT_LINES))
+        started = time.monotonic()
+        rows = _diff_rows(old, new, 80, cap=None)
+        self.assertLess(time.monotonic() - started, 2.0)
+        self.assertIn("未逐行比对", rows[0][0][1])
+        texts = ["".join(t for _s, t in row) for row in rows]
+        self.assertEqual(sum(t.startswith("-") for t in texts), _DIFF_INPUT_LINES)
+        self.assertEqual(sum(t.startswith("+") for t in texts), _DIFF_INPUT_LINES)
+        self.assertLessEqual({s for row in rows for s, _t in row}, set(theme.tokens()))
+        capped = _diff_rows(old, new, 80, cap=10)
+        self.assertEqual(len(capped), 11)
+        self.assertIn("还有", capped[-1][0][1])
+        #  上限之内照旧走配对 diff
+        small = _diff_rows("a\nb", "a\nc", 80)
+        self.assertNotIn("未逐行比对", small[0][0][1])
+
     def test_preview_replace_expand_closure(self) -> None:
         """diff 超限时返回"补打完整 diff"闭包——"还有 N 行"在确认框里
         也得是可兑现的承诺；未截断时返回 None，提示行不许诺空键。"""
@@ -1559,3 +1585,229 @@ class TestNextStepSuggest(unittest.TestCase):
         buffer = self._buffer(["! brew upgrade arp-scan"])
         got = self._suggester(["跑测试"]).get_suggestion(buffer, Document("! brew"))
         self.assertEqual(got.text, " upgrade arp-scan")
+
+
+@unittest.skipUnless(HAS_TUI, "未安装 tui 可选依赖")
+class TestStreamStyler(unittest.TestCase):
+    """流式正文的行级轻渲染：每个字符只打一次；去掉样式码后与原文逐字一致。"""
+
+    _ANSI = __import__("re").compile(r"\x1b\[[0-9;]*m")
+
+    def build(self):
+        from rich.console import Console
+
+        from xiaoyu.tui import RichSink
+
+        buffer = io.StringIO()
+        console = Console(file=buffer, force_terminal=True, soft_wrap=True, highlight=False, width=80)
+        return RichSink(console), buffer
+
+    def stream(self, text: str, chunk: int) -> str:
+        from xiaoyu.events import TextDelta, TextEnd
+
+        sink, buffer = self.build()
+        #  OSC 133 锚点与收尾换行走裸 print，不进 Console 的缓冲
+        with contextlib.redirect_stdout(io.StringIO()):
+            for start in range(0, len(text), chunk):
+                sink.emit(TextDelta(text[start : start + chunk]))
+            sink.emit(TextEnd())
+        return buffer.getvalue()
+
+    SAMPLE = (
+        "# 标题行\n"
+        "先用 `subprocess.run` 跑一下，**注意** 2*3 这种星号不是粗体：\n"
+        "```python\n"
+        'def f():\n    """doc\n    more"""\n    return "s"\n'
+        "```\n"
+        "~~~\n"
+        "no lang here\n"
+        "~~~\n"
+        "\n"
+        "结尾没有换行"
+    )
+
+    def test_plain_text_survives_any_chunking(self) -> None:
+        """分片边界落在哪都不该改变打出去的字符：标记符保留、不丢不重。"""
+        for chunk in (1, 2, 3, 7, 1000):
+            with self.subTest(chunk=chunk):
+                self.assertEqual(self._ANSI.sub("", self.stream(self.SAMPLE, chunk)), self.SAMPLE)
+
+    def test_fenced_code_is_highlighted_and_fences_dimmed(self) -> None:
+        out = self.stream(self.SAMPLE, 5)
+        lines = out.split("\n")
+        code = next(line for line in lines if "return" in line)
+        #  围栏内的行带语法样式码；围栏线本身只弱化
+        self.assertIn("\x1b[", code)
+        self.assertRegex(code, r"\x1b\[[0-9;]*m\s*return")
+        fence = next(line for line in lines if self._ANSI.sub("", line) == "```python")
+        self.assertIn("\x1b[2m", fence)
+        #  多行字符串的续行按字符串着色：着色用的是整块上下文而不是孤立的一行
+        more = next(line for line in lines if "more" in line)
+        self.assertIn("\x1b[", more)
+        #  没有语言名的围栏不炸、原样打出
+        self.assertIn("no lang here", self._ANSI.sub("", out))
+
+    def test_inline_markup_outside_fences(self) -> None:
+        out = self.stream(self.SAMPLE, 4)
+        lines = out.split("\n")
+        heading = lines[0]
+        self.assertIn("\x1b[1m", heading)  # 标题行加粗
+        prose = lines[1]
+        plain = self._ANSI.sub("", prose)
+        self.assertIn("`subprocess.run`", plain)
+        self.assertIn("**注意**", plain)
+        #  行内代码整段着色、粗体整段加粗（分片边界会把一段切成多个片段，按字符查
+        #  样式而不是查样式码的位置）；单个星号（2*3）不触发任何样式切换
+        from rich.console import Console
+        from rich.text import Text
+
+        console = Console(file=io.StringIO(), force_terminal=True)
+        rendered = Text.from_ansi(prose)
+        start = plain.index("subprocess.run")
+        for offset in range(start, start + len("subprocess.run")):
+            self.assertIsNotNone(rendered.get_style_at_offset(console, offset).color)
+        start = plain.index("注意")
+        self.assertTrue(rendered.get_style_at_offset(console, start).bold)
+        start = plain.index("2*3")
+        for offset in range(start, start + 3):
+            style = rendered.get_style_at_offset(console, offset)
+            self.assertFalse(style.bold)
+            self.assertIsNone(style.color)
+
+    def test_unclosed_fence_and_partial_line_flush_on_end(self) -> None:
+        """围栏没闭合 / 末行没换行：TextEnd 要把攒着的东西全打出来。"""
+        text = "```sh\nls -la"
+        self.assertEqual(self._ANSI.sub("", self.stream(text, 3)), text)
+
+    def test_interrupt_flushes_pending_text(self) -> None:
+        from xiaoyu.events import TextDelta
+
+        sink, buffer = self.build()
+        with contextlib.redirect_stdout(io.StringIO()):
+            sink.emit(TextDelta("半行 `co"))
+            sink.interrupt()
+        self.assertEqual(self._ANSI.sub("", buffer.getvalue()), "半行 `co")
+
+    def test_non_terminal_console_prints_raw(self) -> None:
+        """管道 / 非 tty：逐字节直出，连样式码都没有（与 test_delta_streams_to_stdout 同口径）。"""
+        from rich.console import Console
+
+        from xiaoyu.events import TextDelta, TextEnd
+        from xiaoyu.tui import RichSink
+
+        sink = RichSink(Console(file=io.StringIO(), soft_wrap=True, highlight=False))
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            sink.emit(TextDelta("```py\nx = 1\n```"))
+            sink.emit(TextEnd())
+        self.assertEqual(out.getvalue(), "```py\nx = 1\n```\n")
+
+    def test_state_resets_between_text_blocks(self) -> None:
+        """上一段正文以未闭合的围栏结束，下一段正文不能还当自己在代码块里。"""
+        from xiaoyu.events import TextDelta, TextEnd
+
+        sink, buffer = self.build()
+        with contextlib.redirect_stdout(io.StringIO()):
+            sink.emit(TextDelta("```\ncode"))
+            sink.emit(TextEnd())
+            sink.emit(TextDelta("# 新标题\n"))
+            sink.emit(TextEnd())
+        lines = buffer.getvalue().split("\n")
+        heading = next(line for line in lines if "新标题" in line)
+        self.assertIn("\x1b[1m", heading)
+
+    def test_tabs_in_code_keep_tabs_and_colors(self) -> None:
+        """围栏内的 tab 原样打出（Makefile / Go 的 tab 不能变空格），样式按单元格
+        位置映射回原行，tab 后面的 token 仍然着色。"""
+        from rich.console import Console
+        from rich.text import Text
+
+        text = "```go\nfunc main() {\n\t中文 := 1\n\t\treturn \"s\"\n}\n```\n"
+        out = self.stream(text, 6)
+        self.assertEqual(self._ANSI.sub("", out), text)
+        console = Console(file=io.StringIO(), force_terminal=True)
+        line = next(row for row in out.split("\n") if "return" in row)
+        rendered = Text.from_ansi(line)
+        start = rendered.plain.index('"s"')
+        self.assertIsNotNone(rendered.get_style_at_offset(console, start).color)
+        start = rendered.plain.index("return")
+        self.assertIsNotNone(rendered.get_style_at_offset(console, start).color)
+
+
+@unittest.skipUnless(HAS_TUI, "未安装 tui 可选依赖")
+class TestSearchSelect(unittest.TestCase):
+    """会话选择器：敲字过滤、无数字直选、序号沿用原编号、窗口恒高。"""
+
+    OPTIONS = [
+        ("a", "2026-08-09T10:00  deepseek  zhinu  修 calc.py", ""),
+        ("b", "2026-08-10T09:00  gpt  zhinu  写 README", ""),
+        ("c", "2026-08-10T11:00  deepseek  noc  排查 fallback", ""),
+    ]
+
+    def run_select(self, keys_text: str, options=None, visible: int = 10):
+        from prompt_toolkit.application import create_app_session
+        from prompt_toolkit.input.defaults import create_pipe_input
+        from prompt_toolkit.output import DummyOutput
+
+        from xiaoyu.tui import search_select
+
+        with create_pipe_input() as pipe:
+            pipe.send_text(keys_text)
+            with create_app_session(input=pipe, output=DummyOutput()):
+                return search_select("切到哪个会话？", options or self.OPTIONS, visible=visible)
+
+    def test_typing_filters_and_enter_picks_first_match(self) -> None:
+        self.assertEqual(self.run_select("\r"), "a")  # 没过滤：第一项
+        self.assertEqual(self.run_select("noc\r"), "c")
+        self.assertEqual(self.run_select("README\r"), "b")
+        #  空格分词，每个词都要命中；大小写不敏感
+        self.assertEqual(self.run_select("DEEPSEEK 0810\r"), "c")
+
+    def test_digits_are_query_not_shortcuts(self) -> None:
+        """时间戳就是数字：敲 "0810" 是在找 8 月 10 日的会话，不是跳到第 0 项。"""
+        self.assertEqual(self.run_select("0810\r"), "b")
+        self.assertEqual(self.run_select("2\r"), "a")  # 三条都含 "2"，仍是第一项
+
+    def test_arrows_move_within_matches_and_backspace_edits(self) -> None:
+        self.assertEqual(self.run_select("\x1b[B\r"), "b")  # ↓
+        self.assertEqual(self.run_select("deepseek\x1b[B\r"), "c")  # 过滤后 ↓ 只在匹配里走
+        self.assertEqual(self.run_select("\x1b[A\r"), "c")  # ↑ 绕到末尾
+        #  退格改词：noX → no → 命中 noc
+        self.assertEqual(self.run_select("noX\x7f\r"), "c")
+
+    def test_no_match_enter_is_noop_and_esc_cancels(self) -> None:
+        self.assertIsNone(self.run_select("zzz\r\x03"))
+        self.assertIsNone(self.run_select("\x03"))
+        #  删掉不匹配的词之后又能选
+        self.assertEqual(self.run_select("zzz\x7f\x7f\x7f\r"), "a")
+
+    def test_fragments_keep_height_and_original_numbers(self) -> None:
+        """渲染内容：序号沿用原列表编号、窗口外的数量有交代、高度不随匹配数变。"""
+        from prompt_toolkit.application import create_app_session
+        from prompt_toolkit.input.defaults import create_pipe_input
+        from prompt_toolkit.output import DummyOutput
+
+        from xiaoyu import tui as tui_module
+
+        captured: list[list[tuple[str, str]]] = []
+        original = tui_module.FormattedTextControl
+
+        class Spy(original):
+            def __init__(self, fragments, **kwargs):
+                captured.append(fragments)
+                super().__init__(fragments, **kwargs)
+
+        many = [(i, f"2026-08-{i:02d}  会话 {i}", "") for i in range(1, 16)]
+        with mock.patch.object(tui_module, "FormattedTextControl", Spy):
+            with create_pipe_input() as pipe:
+                pipe.send_text("\x03")
+                with create_app_session(input=pipe, output=DummyOutput()):
+                    tui_module.search_select("标题", many, visible=5)
+        text_all = "".join(t for _s, t in captured[0]())
+        self.assertIn("  1. 2026-08-01", text_all)
+        self.assertIn("还有 10 个", text_all)
+        self.assertNotIn(" 6. ", text_all)
+        self.assertIn("输入文字 过滤", text_all)
+        self.assertNotIn("Tab", text_all)
+        #  不同匹配数下行数一致（标题 + 过滤行 + visible + 提示）
+        self.assertEqual(text_all.count("\n"), 5 + 2)

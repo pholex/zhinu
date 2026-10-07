@@ -127,6 +127,9 @@ _DARK: dict[str, Style] = {
     "text.secondary": Style(dim=True),
     "text.heading": Style(bold=True),
     "text.accent": Style(base="cyan"),
+    #  流式正文的行级轻渲染：行内 `代码` 与 **粗体**（标记符本身走 text.secondary）
+    "text.code": Style(color=215),
+    "text.strong": Style(bold=True),
     #  状态
     "status.success": Style(base="green"),
     "status.warning": Style(base="yellow"),
@@ -159,6 +162,8 @@ _LIGHT: dict[str, Style] = {
     "text.secondary": Style(color=240),
     "text.heading": Style(bold=True),
     "text.accent": Style(color=25),
+    "text.code": Style(color=94),
+    "text.strong": Style(bold=True),
     "status.success": Style(color=28),
     "status.warning": Style(color=130),  # 黄→棕橙：白底上唯一能读的"警告色"
     "status.error": Style(color=124),
