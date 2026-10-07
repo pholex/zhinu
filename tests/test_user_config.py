@@ -11,7 +11,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from xiaoyu import cli, config, providers
+from xiaoyu import cli, config, diagnostics, providers
 
 
 class _FakeWinPath(pathlib.PureWindowsPath):
@@ -119,6 +119,12 @@ class IsolatedConfigTest(unittest.TestCase):
             mock.patch.object(config, "PROJECT_ROOT", Path(self.tmp.name) / "proot"),
             #  向导会按运行时逻辑探测直连 key，不桩掉会真的 shell out 去翻本机 Keychain
             mock.patch.object(config, "_read_from_keychain", lambda *a, **kw: None),
+            #  向导落盘前会对主模型真发一条请求：测试里一律桩成通过，不出网。
+            #  探测行为本身在 WizardProbeTest 里单独盖住
+            mock.patch.object(
+                diagnostics, "probe_model",
+                lambda *a, **kw: diagnostics.Check("probe", "ok", "桩 应答 1 ms"),
+            ),
         ):
             patcher.start()
             self.addCleanup(patcher.stop)
@@ -351,6 +357,84 @@ class ConfigCommandTest(IsolatedConfigTest):
             code = cli.main(["config", "--path"])
         self.assertEqual(code, 0)
         fake.assert_called_once_with(["--path"])
+
+
+
+def _wizard_answers(*tail: str):
+    """各家直连 key 全回车，再接网关端点 / 主模型 / 摘要模型 / 备用链 / 网关 key。"""
+    return iter([""] * _wizard_direct_prompts() + list(tail))
+
+
+class WizardProbeTest(IsolatedConfigTest):
+    """向导落盘前先探测：key 贴错、端点少 /v1 这类错在保存前就该抓住，而不是第一轮对话才炸。"""
+
+    def _run(self, argv: list[str], answers, probe):
+        out = io.StringIO()
+        with mock.patch.object(cli.sys.stdin, "isatty", return_value=True), mock.patch(
+            "builtins.input", side_effect=lambda *_: next(answers)
+        ), mock.patch.object(diagnostics, "probe_model", probe), contextlib.redirect_stdout(out):
+            code = cli.config_command(argv)
+        return code, out.getvalue()
+
+    def test_probe_runs_on_the_model_being_saved_and_reports_timing(self):
+        seen: list[config.Config] = []
+
+        def probe(cfg=None):
+            seen.append(cfg)
+            return diagnostics.Check("probe", "ok", "gateway/main-model 应答 123 ms")
+
+        code, out = self._run([], _wizard_answers("https://gw/v1", "main-model", "", "", "typed-key"), probe)
+        self.assertEqual(code, 0)
+        self.assertEqual(len(seen), 1, "落盘前恰好探一次")
+        self.assertEqual(seen[0].model, "main-model", "探的是向导刚收的主模型，不是环境里的旧值")
+        self.assertEqual(seen[0].base_url, "https://gw/v1")
+        self.assertIn("123 ms", out)
+        self.assertEqual(config._parse_dotenv(self.env_path)["XIAOYU_MODEL"], "main-model")
+        #  答案只是临时叠在环境上探一下，探完必须恢复：向导不该留下没落盘的变量
+        self.assertNotIn("XIAOYU_MODEL", os.environ)
+        self.assertNotIn("XIAOYU_API_KEY", os.environ)
+
+    def test_failed_probe_defaults_to_not_saving(self):
+        probe = lambda cfg=None: diagnostics.Check(  # noqa: E731
+            "probe", "fail", "gateway/m 请求失败（auth，80 ms）", ["401"], remedy="检查 key"
+        )
+        #  末尾那个 "" 是对"仍要保存吗？[y/N]"回车 = N
+        code, out = self._run([], _wizard_answers("https://gw/v1", "m", "", "", "k", ""), probe)
+        self.assertEqual(code, 1)
+        self.assertFalse(self.env_path.exists(), "默认 N：探测失败不落盘")
+        self.assertIn("auth", out)
+        self.assertIn("检查 key", out)
+        self.assertIn("未保存", out)
+
+    def test_failed_probe_can_still_be_saved_on_explicit_yes(self):
+        probe = lambda cfg=None: diagnostics.Check("probe", "fail", "炸了")  # noqa: E731
+        code, _ = self._run([], _wizard_answers("https://gw/v1", "m", "", "", "k", "y"), probe)
+        self.assertEqual(code, 0)
+        self.assertEqual(config._parse_dotenv(self.env_path)["XIAOYU_MODEL"], "m")
+
+    def test_warn_status_still_saves(self):
+        """应答但正文为空只是 warn（有的模型对一句话就回空），不该拦落盘。"""
+        probe = lambda cfg=None: diagnostics.Check("probe", "warn", "gateway/m 应答但正文为空（9 ms）")  # noqa: E731
+        code, out = self._run([], _wizard_answers("https://gw/v1", "m", "", "", "k"), probe)
+        self.assertEqual(code, 0)
+        self.assertTrue(self.env_path.exists())
+        self.assertIn("正文为空", out)
+
+    def test_no_probe_flag_skips_the_request(self):
+        def probe(cfg=None):
+            raise AssertionError("--no-probe 下不许出网")
+
+        code, _ = self._run(["--no-probe"], _wizard_answers("https://gw/v1", "m", "", "", "k"), probe)
+        self.assertEqual(code, 0)
+        self.assertTrue(self.env_path.exists())
+
+    def test_non_tty_confirmation_saves_with_a_warning(self):
+        """问不了（stdin 不是终端）就按保存处理并出声，别让脚本卡在一个问句上。"""
+        check = diagnostics.Check("probe", "fail", "炸了")
+        out = io.StringIO()
+        with mock.patch.object(cli.sys.stdin, "isatty", return_value=False), contextlib.redirect_stdout(out):
+            self.assertTrue(cli._confirm_save_after_failed_probe(check))
+        self.assertIn("按保存处理", out.getvalue())
 
 
 class ContextWindowTest(unittest.TestCase):

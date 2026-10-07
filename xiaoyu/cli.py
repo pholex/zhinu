@@ -524,6 +524,11 @@ def config_command(argv: list[str]) -> int:
     parser.add_argument("--show", action="store_true", help="显示当前生效配置与来源（key 永不回显）")
     parser.add_argument("--path", action="store_true", help="打印用户级配置文件路径")
     parser.add_argument(
+        "--no-probe",
+        action="store_true",
+        help="向导落盘前不对主模型发探测请求（默认发一条最小请求验证端点与 key，花一点点 token）",
+    )
+    parser.add_argument(
         "--set",
         dest="pairs",
         action="append",
@@ -547,7 +552,7 @@ def config_command(argv: list[str]) -> int:
         return 0
     if args.show:
         return show_config()
-    return config_wizard()
+    return config_wizard(probe=not args.no_probe)
 
 
 def show_config() -> int:
@@ -601,7 +606,51 @@ def _dotenv_source(name: str, loaded: list[Path]) -> str | None:
     return None
 
 
-def config_wizard() -> int:
+def probe_wizard_values(values: dict[str, str]) -> Any:
+    """拿向导刚收的答案（尚未落盘）对主模型发一条最小请求，返回 diagnostics.Check。
+
+    答案临时叠在环境变量上再走 Config.from_env → providers.build 那条正式装配
+    路径：探的就是落盘后真正会生效的那条路由，而不是另一套"向导专用"的拼装。
+    探完原样恢复环境——向导之后不该留下任何没落盘的变量。
+    """
+    from . import diagnostics
+
+    saved = {name: os.environ.get(name) for name in values}
+    os.environ.update(values)
+    try:
+        return diagnostics.probe_model(Config.from_env())
+    finally:
+        for name, value in saved.items():
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value
+
+
+def _confirm_save_after_failed_probe(check: Any) -> bool:
+    """探测失败：把分类后的原因摆出来，问要不要照样保存。
+
+    失败不一定是配置错（端点临时不通、限流、模型名在网关上拼错一个字母……），
+    所以不直接拒绝落盘；但默认答案是 N——"保存了一份跑不通的配置"比
+    "再填一遍"贵得多，用户要到第一轮对话才撞上。没法问（stdin 不是终端）
+    时按保存处理并出声：无人值守的脚本不该被一个问句卡死。
+    """
+    print(ui.error(f"探测失败：{check.summary}"))
+    for line in check.details:
+        print(ui.secondary(f"  {line}"))
+    if check.remedy:
+        print(ui.secondary(f"  建议：{check.remedy}"))
+    if not sys.stdin.isatty():
+        print(ui.warning("非交互环境，无法确认：按保存处理（之后可用 xiaoyu doctor --probe 复查）"))
+        return True
+    try:
+        answer = input("仍要保存吗？[y/N]: ").strip().lower()
+    except EOFError:
+        answer = ""
+    return answer in ("y", "yes")
+
+
+def config_wizard(probe: bool = True) -> int:
     if not sys.stdin.isatty():
         print(
             ui.error("交互向导需要终端；非交互环境请用 xiaoyu config --set KEY=VALUE"),
@@ -700,6 +749,19 @@ def config_wizard() -> int:
             prompt = f"网关 API key（留空 = 不改，之后也可用{sources} 提供）"
         if key := ask_key(prompt):
             values["XIAOYU_API_KEY"] = key
+    if probe:
+        #  落盘前先验一次：key 贴错一位、端点少个 /v1、模型名在网关上不存在，
+        #  这些都是"保存成功"之后第一轮对话才炸的错。一条最小请求就能当场抓住，
+        #  代价是一点点 token。--no-probe 跳过（离线填配置、或端点暂时不通）
+        print(ui.secondary(f"正在对 {values['XIAOYU_MODEL']} 发一条最小请求验证（--no-probe 可跳过）…"))
+        check = probe_wizard_values(values)
+        if check.status == "fail":
+            if not _confirm_save_after_failed_probe(check):
+                print(ui.warning("未保存。改好后再跑一次 xiaoyu config，或用 --no-probe 直接写入。"))
+                return 1
+        else:
+            paint = ui.success if check.status == "ok" else ui.warning
+            print(paint(f"探测通过：{check.summary}"))
     path = save_user_env(values)
     print(ui.success(f"已写入 {path}"))
     print(ui.secondary("注意：环境变量和当前目录 .env 里的同名项会优先于这份配置。"))

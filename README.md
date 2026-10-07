@@ -43,7 +43,7 @@ xiaoyu uninstall                  # 卸载；加 --purge 连配置一起删
 ## 配置
 
 ```bash
-xiaoyu config             # 交互向导
+xiaoyu config             # 交互向导（落盘前先对主模型发一条最小请求验证，--no-probe 跳过）
 xiaoyu config --show      # 看生效配置与来源（key 永不回显）
 ```
 

@@ -5,11 +5,14 @@ README 只给最小可跑配置，这里是全量。
 ## 配置文件与优先级
 
 ```bash
-xiaoyu config             # 交互向导：直连 key / 网关端点 / 模型
+xiaoyu config             # 交互向导：直连 key / 网关端点 / 模型；落盘前先对主模型发一条最小请求验证
+xiaoyu config --no-probe  # 向导不探测、直接写入（离线填配置、端点暂时不通时用）
 xiaoyu config --show      # 看生效配置与每项来源（key 永不回显）
 xiaoyu config --path      # 打印用户级配置文件路径
 xiaoyu config --set XIAOYU_MODEL=deepseek-flash   # 非交互写入，可重复
 ```
+
+向导问完之后、写文件之前，默认按你刚填的配置对主模型发一条最小请求（与 `xiaoyu doctor --probe` 同一条路径，花一点点 token）：通过就显示耗时并保存；失败则显示分类后的原因（鉴权、端点不通、模型名不存在……）并问「仍要保存吗？[y/N]」，默认不保存。key 贴错一位、端点少个 `/v1`、模型名在网关上拼错，这些都在这一步被抓住，而不是等第一轮对话才炸。
 
 用户级 `.env` 的位置：macOS / Linux 在 `~/.config/xiaoyu/.env`（跟随 `$XDG_CONFIG_HOME`），Windows 在 `%APPDATA%\xiaoyu\.env`。也可以手动在任意工作目录放 `.env`（零依赖自解析）。行格式 `KEY=值`，整行与行尾的 `# 注释` 都认（行尾注释要与值隔一个空白；值里紧挨着的 `#` 和引号里的 `#` 是内容）。
 
