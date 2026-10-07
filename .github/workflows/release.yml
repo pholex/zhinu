@@ -85,7 +85,15 @@ jobs:
           packages-dir: upload/sdk/
       - run: python scripts/sdk_release.py wait dist/sdk-release --package sdk
       - run: python -m venv /tmp/released-sdk
-      - run: /tmp/released-sdk/bin/python -m pip install "xiaoyu-agent-sdk==${GITHUB_REF_NAME#v}"
+      #  上面的 wait 已等到 /simple/ 列出新版，但 CDN 各节点刷新有先后，pip 仍可能撞上旧页面：
+      #  隔 15 秒重试，最多 6 次（约一分半）
+      - run: |
+          for attempt in 1 2 3 4 5 6; do
+            /tmp/released-sdk/bin/python -m pip install --no-cache-dir "xiaoyu-agent-sdk==${GITHUB_REF_NAME#v}" && exit 0
+            echo "::warning::第 $attempt 次装不到 xiaoyu-agent-sdk==${GITHUB_REF_NAME#v}，15 秒后重试"
+            sleep 15
+          done
+          exit 1
       - run: /tmp/released-sdk/bin/python -m pip check
       - run: /tmp/released-sdk/bin/python -I tests/sdk_wheel_smoke.py
       - name: GitHub Release（docs/releases/<版本>.md 存在就用它，否则自动生成说明）

@@ -1,5 +1,7 @@
 """Artifact corruption and partial publication must fail or resume explicitly."""
+import contextlib
 import hashlib
+import io
 import json
 import tempfile
 import unittest
@@ -8,7 +10,7 @@ from pathlib import Path
 from unittest.mock import patch
 from urllib.error import HTTPError
 
-from scripts.sdk_release import index_files, missing_files, verify
+from scripts.sdk_release import index_files, main, missing_files, simple_index_files, verify
 from scripts.build_sdk import verify_wheel
 
 
@@ -94,6 +96,43 @@ class ReleaseTests(unittest.TestCase):
         with patch("urllib.request.urlopen", side_effect=HTTPError("url", 403, "forbidden", {}, None)):
             with self.assertRaises(HTTPError):
                 index_files("xiaoyu-agent", "0.58.0")
+        with patch("urllib.request.urlopen", side_effect=HTTPError("url", 404, "missing", {}, None)):
+            self.assertEqual(simple_index_files("xiaoyu-agent", "0.58.0"), {})
+
+    def test_simple_index_keeps_only_the_wanted_version(self):
+        page = {"files": [
+            {"filename": "xiaoyu_agent-0.57.0-py3-none-any.whl", "hashes": {"sha256": "old"}},
+            {"filename": "xiaoyu_agent-0.58.0-py3-none-any.whl", "hashes": {"sha256": "new"}},
+            {"filename": "xiaoyu_agent-0.58.01-py3-none-any.whl", "hashes": {"sha256": "x"}},
+        ]}
+        response = io.BytesIO(json.dumps(page).encode())
+        with patch("urllib.request.urlopen", return_value=response):
+            self.assertEqual(simple_index_files("xiaoyu-agent", "0.58.0"),
+                             {"xiaoyu_agent-0.58.0-py3-none-any.whl": "new"})
+
+    def test_wait_holds_until_the_simple_index_lists_the_upload(self):
+        name = "xiaoyu_agent-0.58.0-py3-none-any.whl"
+        published = {name: self.manifest["files"]["kernel/" + name]}
+        # JSON API already has it; /simple/ (what pip reads) lags behind for two polls.
+        simple = iter([{}, {}, published])
+        argv = ["sdk_release.py", "wait", str(self.root), "--package", "kernel"]
+        with patch("sys.argv", argv), \
+                patch("scripts.sdk_release.index_files", return_value=published), \
+                patch("scripts.sdk_release.simple_index_files", side_effect=lambda *_: next(simple)) as lagging, \
+                patch("time.sleep"):
+            main()
+        self.assertEqual(lagging.call_count, 3)
+
+    def test_stage_ignores_the_simple_index(self):
+        argv = ["sdk_release.py", "stage", str(self.root), "--package", "kernel",
+                "--destination", str(self.root / "upload")]
+        with patch("sys.argv", argv), patch.dict("os.environ", {"GITHUB_OUTPUT": ""}), \
+                patch("scripts.sdk_release.index_files", return_value={}), \
+                patch("scripts.sdk_release.simple_index_files") as simple, \
+                contextlib.redirect_stdout(io.StringIO()):
+            main()
+        simple.assert_not_called()
+        self.assertEqual(len(list((self.root / "upload").iterdir())), 1)
 
 
 class WheelContentsTests(unittest.TestCase):

@@ -61,6 +61,27 @@ def index_files(project: str, version: str) -> dict[str, str]:
     return {item["filename"]: item["digests"]["sha256"] for item in data["urls"]}
 
 
+def simple_index_files(project: str, version: str) -> dict[str, str]:
+    """What pip sees: the /simple/ page is cached by the CDN separately from the JSON API,
+    so a version can show up in JSON well before ``pip install ==version`` finds it."""
+    request = urllib.request.Request(
+        f"https://pypi.org/simple/{project}/",
+        headers={"User-Agent": "xiaoyu-sdk-release", "Cache-Control": "max-age=0",
+                 "Accept": "application/vnd.pypi.simple.v1+json"},
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=20) as response:
+            data = json.load(response)
+    except urllib.error.HTTPError as exc:
+        exc.close()
+        if exc.code == 404:
+            return {}
+        raise
+    prefix = f"{project.replace('-', '_')}-{version}-"
+    return {item["filename"]: item["hashes"].get("sha256", "")
+            for item in data["files"] if item["filename"].startswith(prefix)}
+
+
 def missing_files(manifest: dict, group: str, remote: dict[str, str]) -> list[str]:
     expected = {Path(name).name: digest for name, digest in manifest["files"].items()
                 if name.startswith(group + "/")}
@@ -87,12 +108,17 @@ def main() -> None:
     if not args.package:
         parser.error("--package is required for stage/wait")
     deadline = time.monotonic() + args.timeout
+    project = PROJECTS[args.package]
     while True:
-        missing = missing_files(manifest, args.package, index_files(PROJECTS[args.package], manifest["version"]))
+        missing = missing_files(manifest, args.package, index_files(project, manifest["version"]))
+        if args.action == "wait" and not missing:
+            # Stage decides uploads from the JSON API alone; wait also needs the index pip reads.
+            missing = missing_files(manifest, args.package, simple_index_files(project, manifest["version"]))
         if args.action != "wait" or not missing:
             break
         if time.monotonic() >= deadline:
-            raise TimeoutError("Uploaded package is not yet available with the expected digests")
+            raise TimeoutError("Uploaded package is not yet available on the JSON API and /simple/ index "
+                               "with the expected digests")
         time.sleep(min(5, max(0, deadline - time.monotonic())))
     if args.action == "stage":
         if not args.destination:
