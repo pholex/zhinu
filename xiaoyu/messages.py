@@ -58,16 +58,18 @@ from .responses import (
     Message,
     NonStreamChoice,
     PromptTokenDetails,
+    STREAM_MAX_TOKENS,
+    SYNC_MAX_TOKENS,
     Usage,
     _text_chunk,
     _tool_chunk,
 )
 
-#  Messages 协议 max_tokens 必填，而内核从不传（chat 侧可省略）。
-#  流式给大：Claude 5 线 thinking 默认开启且计入 max_tokens，余量要留足；
-#  非流式（_summarize）给小：SDK 对超大的非流式请求有 ~10 分钟护栏会直接拒
-_STREAM_MAX_TOKENS = 64_000
-_SYNC_MAX_TOKENS = 16_000
+#  Messages 协议 max_tokens 必填，而内核默认不传（chat 侧可省略）：没给就用
+#  传输层的常量（流式大、同步小，理由见 responses.STREAM_MAX_TOKENS）。用户设了
+#  XIAOYU_MAX_OUTPUT_TOKENS 时由 _Completions._dispatch 以 max_tokens 传进来
+_STREAM_MAX_TOKENS = STREAM_MAX_TOKENS
+_SYNC_MAX_TOKENS = SYNC_MAX_TOKENS
 
 #  chat 参数名 → Messages 参数名。没列出的原样透传：宁可上游 400 也不静默丢
 _PARAM_ALIASES = {"max_completion_tokens": "max_tokens"}

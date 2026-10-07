@@ -105,6 +105,7 @@ XIAOYU_API_KEY=<key>
 |---|---|---|
 | `XIAOYU_EFFORT` | 不传 | 推理深度 `low / medium / high / xhigh / max`（OpenAI 线另有 `none / minimal`）。同一个名字出内核，按协议翻译成 `reasoning_effort` / `reasoning.effort` / `output_config.effort`；你给自己点名的模型配的取值原样发，上游不认会 400；换到降级链上的模型、或由子 agent 继承过去时，对实测过档位范围的型号就近换成它认的一档并提示（没实测过的型号不改）。命令行 `--effort`，会话里 `/effort`，子 agent 可在 spec 里单独声明 |
 | `XIAOYU_CONTEXT_LIMIT` | 按模型查表 | 上下文上限（token）覆写 |
+| `XIAOYU_MAX_OUTPUT_TOKENS` | 不传（Claude 原生协议用内置常量：流式 64000 / 同步 16000） | 单次请求输出 token 上限覆写（正整数）。本地小模型、中转站常限输出上限，超了直接 400。按协议翻译：chat `max_tokens`、Responses `max_output_tokens`、Anthropic `max_tokens`；摘要/收尾这类同步请求取 min(设值, 16000) |
 | `XIAOYU_COMPACT_AT` | `0.7` | 用量占到这个比例时触发回收/压缩；取 0.05~1 的比例，写成 `70` 这类整数会被忽略并在启动时提示。用量到压缩阈值的 50% / 80% 时模型各收到一次余量提示（operator 通道，不碰 system prompt），让它在压缩前合并读取、先把结论落下来；压缩/回滚后按现状重定基线 |
 | `XIAOYU_BUDGET_TOKENS` | 不限 | 本会话 token 软预算（prompt+completion 累计，≥5000 才生效）：模型按 50/80/95% 收到倒计时（operator 通道），到线前一步优雅收尾交代现场，而不是被硬闸中途砍断；直连支持型号（Opus 5/4.8/4.7/Fable/Mythos/Sonnet 5）另附 Anthropic 原生 `task_budget`（服务端倒计时）。命令行 `--budget-tokens` |
 | `XIAOYU_TURN_EXTENSION` | `1.0` | 撞 `max_iterations` 时允许模型调 `extend_turns` 申请追加轮数，总追加量 ≤ `max_iterations ×` 此系数；`0` = 不许延期（撞顶即收尾）。理由展示给用户、可审计。轮数用到上限的 50% / 80% 时模型各收到一次「轮数 N/M」提示（每轮各一次） |

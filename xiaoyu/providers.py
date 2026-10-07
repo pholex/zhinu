@@ -564,11 +564,15 @@ class Registry:
         clients: dict[str, Any] | None = None,
         *,
         inherit_environment: bool = True,
+        max_output_tokens: int | None = None,
     ) -> None:
         if not providers:
             raise MissingConfig(NO_PROVIDER_HINT)
         self.providers = providers
         self.inherit_environment = inherit_environment
+        #  单次输出 token 上限覆写（Config.max_output_tokens）：交给每家的传输层，
+        #  在唯一出网口按协议翻译（见 responses._Completions._dispatch）
+        self.max_output_tokens = max_output_tokens
         #  配置给的是一个秒数，出网用的是摊开的四段超时（建连短、读写长）
         self._timeout = request_timeout(timeout)
         #  预置 client（测试注入假 client 用）；其余按需惰性构造并缓存。
@@ -783,6 +787,7 @@ class Registry:
                 provider=name,
                 text_tool_models=provider.text_tool_models,
                 signature_models=provider.signature_models,
+                max_output_tokens=self.max_output_tokens,
             )
         )
 
@@ -1042,7 +1047,9 @@ def build(config: Config) -> Registry:
     for name in _order():
         if (provider := _make(name, config)) is not None:
             providers.append(provider)
-    return Registry(providers, timeout=config.request_timeout)
+    return Registry(
+        providers, timeout=config.request_timeout, max_output_tokens=config.max_output_tokens
+    )
 
 
 def _order() -> list[str]:

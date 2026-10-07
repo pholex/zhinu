@@ -44,6 +44,14 @@ CHAT = "chat"
 RESPONSES = "responses"
 ANTHROPIC = "anthropic"
 
+#  输出 token 上限的默认值。Messages 协议 max_tokens 必填（chat / Responses 可省，
+#  上游按自家默认），所以三条协议里只有它默认就带。流式给大：Claude 5 线
+#  thinking 默认开启且计入 max_tokens，余量要留足；非流式（摘要/收尾）给小：
+#  SDK 对超大的非流式请求有 ~10 分钟护栏会直接拒。用户设了
+#  XIAOYU_MAX_OUTPUT_TOKENS 时三条协议都带上（见 _Completions._dispatch）
+STREAM_MAX_TOKENS = 64_000
+SYNC_MAX_TOKENS = 16_000
+
 #  "整家都说 Responses" 的写法。协议是**按型号**声明的，因为同一家常常只有部分
 #  型号开了这条路——deepseek 就是 v4-flash 通、v4-pro 明确回"稍后开放"，
 #  而 v4-pro 恰恰是默认主模型，按家切会当场切死。
@@ -726,9 +734,13 @@ class _Completions:
         provider: str = "",
         text_tools: Any = None,
         signs_tools: Any = None,
+        max_output_tokens: int | None = None,
     ) -> None:
         self._inner = inner
         self._speaks_responses = speaks_responses
+        #  用户显式设的单次输出上限（Config.max_output_tokens）。None = 不干预：
+        #  chat / Responses 不传、Messages 用常量，与从前一个字节不差
+        self._max_output_tokens = max_output_tokens
         self._speaks_anthropic = speaks_anthropic
         #  型号 → 是否走文本工具协议（见 textcalls.py）。None = 全部原生
         self._text_tools = text_tools or (lambda _model: False)
@@ -781,6 +793,15 @@ class _Completions:
         #  只有 Responses 一路用得上，先摘出来，别漏成另两路的未知参数
         extra = dict(extra)
         cache_key = extra.pop(CACHE_KEY, None)
+        if self._max_output_tokens and not any(
+            key in extra for key in ("max_tokens", "max_completion_tokens")
+        ):
+            #  统一用 chat 的名字出内核，三路各自翻译：chat 原样 max_tokens、
+            #  Responses 经 _PARAM_ALIASES 成 max_output_tokens、Messages 的
+            #  to_request 摘走当 max_tokens。调用方显式给了的不碰；同步请求
+            #  （摘要/收尾）取 min(设值, 常量)——上限是"最多"，不是"至少"
+            cap = self._max_output_tokens
+            extra["max_tokens"] = cap if stream else min(cap, SYNC_MAX_TOKENS)
         if self._speaks_anthropic(model):
             #  ⚠️ 和 Responses 一路同理，**不能**先 strip_private：`_reasoning`
             #  正是 to_request 要消费的东西。净化是结构性的——逐块重建，
@@ -850,6 +871,7 @@ class _Chat:
         provider: str = "",
         text_tools: Any = None,
         signs_tools: Any = None,
+        max_output_tokens: int | None = None,
     ) -> None:
         self.completions = _Completions(
             inner,
@@ -859,6 +881,7 @@ class _Chat:
             provider,
             text_tools,
             signs_tools,
+            max_output_tokens,
         )
 
 
@@ -886,9 +909,12 @@ class Transport:
         provider: str = "",
         text_tool_models: tuple[str, ...] = (),
         signature_models: tuple[str, ...] = (),
+        max_output_tokens: int | None = None,
     ) -> None:
         self._inner = inner
         self.responses_models = tuple(responses_models)
+        #  单次输出 token 上限覆写（XIAOYU_MAX_OUTPUT_TOKENS）；None = 不干预
+        self.max_output_tokens = max_output_tokens
         self.anthropic_models = tuple(anthropic_models)
         #  走文本工具协议的型号（`*` = 整家）。与 wire protocol 正交：它说的是
         #  "这个型号不会 function calling"，不是"说哪种协议"。见 textcalls.py
@@ -910,6 +936,7 @@ class Transport:
             provider,
             self.uses_text_tools,
             self.signs_tools,
+            max_output_tokens,
         )
 
     def uses_text_tools(self, model: str) -> bool:
@@ -959,6 +986,7 @@ class Transport:
             provider=self._provider,
             text_tool_models=self.text_tool_models,
             signature_models=self.signature_models,
+            max_output_tokens=self.max_output_tokens,
         )
 
     def __getattr__(self, name: str) -> Any:
@@ -973,6 +1001,7 @@ def wrap(
     provider: str = "",
     text_tool_models: tuple[str, ...] = (),
     signature_models: tuple[str, ...] = (),
+    max_output_tokens: int | None = None,
 ) -> Transport:
     return Transport(
         client,
@@ -982,4 +1011,5 @@ def wrap(
         provider,
         text_tool_models,
         signature_models,
+        max_output_tokens,
     )

@@ -547,6 +547,33 @@ class ContextWindowTest(unittest.TestCase):
         self.assertEqual(cfg.context_limit, 70_000)
 
 
+class MaxOutputTokensEnvTest(unittest.TestCase):
+    def test_unset_is_none(self) -> None:
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("XIAOYU_MAX_OUTPUT_TOKENS", None)
+            self.assertIsNone(config.Config.from_env().max_output_tokens)
+
+    def test_positive_integer_is_taken(self) -> None:
+        with mock.patch.dict(os.environ, {"XIAOYU_MAX_OUTPUT_TOKENS": "4096"}):
+            self.assertEqual(config.Config.from_env().max_output_tokens, 4096)
+
+    def test_zero_and_garbage_are_ignored_and_named(self) -> None:
+        for bad in ("0", "-5", "abc", "1.5"):
+            with self.subTest(bad), mock.patch.dict(os.environ, {"XIAOYU_MAX_OUTPUT_TOKENS": bad}):
+                self.assertIsNone(config.Config.from_env().max_output_tokens)
+                self.assertTrue(any("XIAOYU_MAX_OUTPUT_TOKENS" in p for p in config.env_problems()))
+
+    def test_registry_hands_cap_to_transport(self) -> None:
+        with mock.patch.dict(os.environ, {"DEEPSEEK_API_KEY": "ds", "XIAOYU_MAX_OUTPUT_TOKENS": "2048"}), mock.patch(
+            "xiaoyu.config._read_from_keychain", return_value=None
+        ):
+            cfg = config.Config.from_env()
+            registry = providers.build(cfg)
+            self.assertEqual(registry.max_output_tokens, 2048)
+            with mock.patch("xiaoyu.providers.OpenAI", side_effect=lambda **kw: object()):
+                self.assertEqual(registry.client("deepseek").max_output_tokens, 2048)
+
+
 class ExploreIterationsEnvTest(unittest.TestCase):
     """explore 子 agent 的轮次上限（默认 12）要能临时放宽——大仓库上 12 轮不够用。"""
 
