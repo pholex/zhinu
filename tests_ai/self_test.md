@@ -16,7 +16,15 @@ xiaoyu -p "$(cat /path/to/zhinu/tests_ai/self_test.md)" --yolo \
     --output-format json --output-schema "$schema" > self_test.json
 jq '.output | {total, passed, skipped, rate}' self_test.json
 jq -e '.output.rate >= 0.8' self_test.json       # 阈值：通过率 ≥ 80%（skip 不计入分母）
+#  给发版说明附「本版验证」一节：补上平台字段，再把文件交给 release_notes.py
+jq --arg platform "$(uname -sm)" '. + {platform: $platform}' self_test.json > self_test.record.json
+python /path/to/zhinu/scripts/release_notes.py --validation "$ws/self_test.record.json"
 ```
+
+记录文件就是 `--output-format json` 的收尾对象：顶层 `model`（模型）、可选 `platform`
+（平台，上面那行 jq 补的）、`output` 里是 schema 规定的 `total` / `passed` / `skipped` /
+`rate` / `items[]`（每项 `id` / `status` / `evidence`）。`release_notes.py --validation` 只读
+这几个字段，缺文件时发版说明里写「未附自测记录」。
 
 `--yolo` 是必须的：清单里有写文件和跑命令，无人值守下没人按确认。沙箱保持默认开
 （phase 6 要靠它）。换模型加 `--model`。
