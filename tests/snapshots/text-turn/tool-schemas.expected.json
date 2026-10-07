@@ -145,7 +145,7 @@
   },
   {
     "function": {
-      "description": "在工作区目录下执行 shell 命令，返回合并后的 stdout/stderr 和退出码。命令已经在工作区根目录下执行，不需要自己 cd 过去。用它来查找文件、跑测试、跑构建、查 git 状态。需要用户在浏览器完成的交互式认证命令（OAuth device flow、登录扫码）不要阻塞干等：先用能立即返回的方式发起并拿到授权链接，把链接展示给用户，等用户确认完成后再查状态。长时间运行的命令（dev server、长构建、部署后的收敛等待）用 run_in_background=true：立即返回 task id，完成时会在后续工具结果里收到通知——不要轮询、不要 sleep 干等，也不要在命令末尾自己加 &。{{shell_note}}",
+      "description": "在工作区目录下执行 shell 命令，返回合并后的 stdout/stderr 和退出码。命令已经在工作区根目录下执行，不需要自己 cd 过去。用它来查找文件、跑测试、跑构建、查 git 状态。需要用户在浏览器完成的交互式认证命令（OAuth device flow、登录扫码）不要阻塞干等：先用能立即返回的方式发起并拿到授权链接，把链接展示给用户，等用户确认完成后再查状态。长时间运行的命令（dev server、长构建、部署后的收敛等待）用 run_in_background=true：立即返回 task id，完成时会在后续工具结果里收到通知——不要轮询、不要 sleep 干等，也不要在命令末尾自己加 &。需要 root 的命令直接写 sudo：有人值守时密码由用户在界面里输入，你看不到也不需要知道；绝不要向用户索要密码、把密码写进命令或用 -S / echo 管道喂给 sudo。{{shell_note}}",
       "name": "bash",
       "parameters": {
         "properties": {

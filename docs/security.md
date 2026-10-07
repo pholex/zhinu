@@ -31,6 +31,8 @@ auto 档**放行的依据是沙箱，不是信任**。所以沙箱不可用时�
 
 沙箱本体（macOS Seatbelt / Linux bubblewrap，默认开启）只允许写工作区、临时目录和构建缓存：家目录文件删不掉、`~/.zshrc` 覆写不了。
 
+`sudo` 在沙箱里起不来（setuid 程序被 Seatbelt 拒绝执行，bubblewrap 的用户命名空间里它不是 root），所以一条要 root 的命令实际要走两道门：模型按 `danger-full-access` 升权（必问你，`--yolo` 也问），批准后 sudo 真的要密码时小羽在界面里向你要——TUI 是遮罩输入框，明文 REPL 走 getpass。密码经 sudo 自己的 askpass 机制只交给 sudo：不落盘、不进会话记录、不出现在工具输出里，模型从头到尾看不到；取消就让这次 sudo 失败。无人值守（`-p`、serve、ACP）没有人可问，sudo 照旧因为没有终端而失败。`XIAOYU_ENABLE_ASKPASS=0` 关掉这条通道。小羽刻意不做"替你保存密码再喂给 sudo"：那要求小羽持有密码，任何一处外流都等于整机 root。
+
 小羽自己在沙箱外跑的程序（搜索用的 `rg` / `grep`、宿主侧的 `git`）只在沙箱写不进去的 `PATH` 目录里找、按绝对路径起——在项目里激活了 venv 再启动时 `PATH` 打头就是工作区里的目录，不这样的话往里放一个同名程序，下一次搜索就替它在沙箱外执行了。你自己配置的命令（MCP server、hooks）不受此限，照你的 `PATH` 解析。
 
 工作区里有一处例外：`.mcp.json` 与 `.xiaoyu/` 在沙箱内只读——它们是小羽下次启动时会执行或据以放权的配置，不该被一条免确认的命令顺手改掉。要改就用 `write_file` / `str_replace`（会问你）。已知边界：Linux 上 bubblewrap 只压得住**已存在**的路径，凭空新建的 `.mcp.json` 挡不住；`.env` 与 `.git/` 里的 hooks、config 沙箱内照常可写（`cp .env.example .env`、`git push -u` 这些日常动作要用）。这两处由工作区信任门兜底：配置内容变了，下次启动会重新问你。

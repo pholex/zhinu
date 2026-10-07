@@ -32,7 +32,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Collection
 
-from . import browser, fsguard, mcp, media, sandbox, tempdirs
+from . import askpass, browser, command_check, fsguard, mcp, media, sandbox, tempdirs
 from .background import (
     MONITOR_DEFAULT_TIMEOUT,
     OUTPUT_READ_BYTES,
@@ -336,6 +336,7 @@ def _wait_bounded(
     pipes: list[_BoundedPipe],
     deadline: float,
     stop_requested: Callable[[], bool] | None = None,
+    service: Callable[[], float] | None = None,
 ) -> bool:
     """等进程退出、两路管道读完，不超过 deadline；超时返回 False。
 
@@ -346,18 +347,26 @@ def _wait_bounded(
     给了 stop_requested 就切成小片等，每片问一次；有人叫停就抛 Interrupted
     （调用方的收尾分支负责整树杀）。宿主的 interrupt() 不是信号，不会自己
     打断一个阻塞着的 wait——不问的话，一条跑半小时的命令要跑完才停得下来。
+
+    给了 service 也切片：每片调一次，让等待期间要本进程出面的事（sudo 的
+    askpass helper 连上来要密码）有机会被处理。它返回花掉的秒数，原样加回
+    deadline——那段时间是人在敲密码，不该算进命令的超时。
     """
 
     def step(wait_once: Callable[[float], bool]) -> bool:
         """反复等到成功或超时。wait_once(秒) 返回"等到了吗"。"""
+        nonlocal deadline
         while True:
             remaining = deadline - time.monotonic()
-            if stop_requested is None:
+            if stop_requested is None and service is None:
                 return wait_once(max(0.0, remaining))
             if wait_once(max(0.0, min(_STOP_POLL_SECONDS, remaining))):
                 return True
-            if stop_requested():
+            if stop_requested is not None and stop_requested():
                 raise Interrupted("宿主请求打断")
+            if service is not None and (spent := service()) > 0:
+                deadline += spent
+                continue
             if remaining <= 0:
                 return False
 
@@ -1437,6 +1446,11 @@ class Toolbox:
         #  "有没有人叫停"：Agent 接线时注入（interrupt_requested）。没有 Agent 的
         #  用法（测试、直接拿 Toolbox 跑工具）保持 None，等待照旧一口气等到底
         self.stop_requested: Callable[[], bool] | None = None
+        #  sudo 要密码时向用户要（见 askpass.py）：交互前端接线时注入；无人值守、
+        #  子 agent、直接拿 Toolbox 跑工具的用法保持 None = 不装通道，sudo 照旧
+        #  因为没有终端而失败
+        self.secret_prompt: askpass.SecretPrompt | None = None
+        self._askpass_bridge: askpass.AskpassBridge | None = None
         # Host text processing runs before recall persistence and output clipping.
         self.result_transform: Callable[[str, dict[str, Any], str], str] | None = None
         self._tools: dict[str, Tool] = {}
@@ -2195,6 +2209,9 @@ class Toolbox:
                     "长时间运行的命令（dev server、长构建、部署后的收敛等待）用 "
                     "run_in_background=true：立即返回 task id，完成时会在后续工具结果里"
                     "收到通知——不要轮询、不要 sleep 干等，也不要在命令末尾自己加 &。"
+                    "需要 root 的命令直接写 sudo：有人值守时密码由用户在界面里输入，"
+                    "你看不到也不需要知道；绝不要向用户索要密码、把密码写进命令或用 "
+                    "-S / echo 管道喂给 sudo。"
                     + _platform_shell_note()
                     + self._sandbox_note()
                 ),
@@ -2434,6 +2451,21 @@ class Toolbox:
             "确需更高权限时用最窄档位的 sandbox_permissions + justification "
             "原样重试那一条命令（需用户批准，仅该次调用生效）。"
         )
+
+    def _askpass_bridge_for(self, command: str) -> askpass.AskpassBridge | None:
+        """这条前台命令要不要装 sudo 的密码通道；要就返回（惰性建一次、全程复用）。
+
+        三个条件缺一不可：有前端能问人（secret_prompt）、开关没关、命令里认得出
+        提权入口。识别用的是与审批同一个 `privileged_command`——它认不出的写法
+        本来也进不了免确认通道，这里漏装只是 sudo 照旧失败，不是安全问题。
+        """
+        if self.secret_prompt is None or not self.config.enable_askpass:
+            return None
+        if not command_check.privileged_command(command):
+            return None
+        if self._askpass_bridge is None:
+            self._askpass_bridge = askpass.AskpassBridge.create()
+        return self._askpass_bridge
 
     def _escalation_modes(self) -> list[str]:
         """当前沙箱配置下可申请的升权档位（从窄到宽；未套沙箱时为空）。
@@ -3090,6 +3122,18 @@ class Toolbox:
         #  字节模式读管道，解码带 GBK 兜底（见 _decode_output）。
         started = time.monotonic()
         hardening = _subprocess_hardening()
+        env = _hardened_env(self.config.extra_env)
+        #  命令里有提权入口且有人值守：装上 sudo 的密码通道（见 askpass.py）。
+        #  只在这种调用上装——DISPLAY 这个副作用不该落到每条普通命令上
+        bridge = self._askpass_bridge_for(command)
+        service: Callable[[], float] | None = None
+        if bridge is not None:
+            env = bridge.env(env)
+            prompt_fn = self.secret_prompt
+
+            def service(prompt_fn=prompt_fn, command=command) -> float:
+                return bridge.service(lambda text: prompt_fn(text, command))
+
         try:
             proc = subprocess.Popen(
                 argv,
@@ -3100,7 +3144,7 @@ class Toolbox:
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 cwd=str(self.config.workspace),
-                env=_hardened_env(self.config.extra_env),
+                env=env,
                 **hardening,
             )
         except OSError as exc:
@@ -3112,7 +3156,9 @@ class Toolbox:
         pipes = [_BoundedPipe(proc.stdout), _BoundedPipe(proc.stderr)]
         _register_foreground(proc)
         try:
-            if not _wait_bounded(proc, pipes, started + limit, self.stop_requested):
+            #  没装密码通道就保持原来的调用形状：等待循环的替身（测试）只认四个参数
+            extra = {"service": service} if service is not None else {}
+            if not _wait_bounded(proc, pipes, started + limit, self.stop_requested, **extra):
                 raise subprocess.TimeoutExpired(argv, limit)
             stdout_raw, stderr_raw = pipes[0].value(), pipes[1].value()
         except KeyboardInterrupt:
