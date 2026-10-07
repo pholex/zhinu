@@ -240,6 +240,54 @@ class AgentIntegrationTest(AgentTestCase):
         self.assertEqual(len(agent.messages), before)  # 未入历史
         self.assertEqual(self.client.completions.calls, [])  # 未调模型
 
+    def test_userpromptsubmit_first_line_follows_the_user_input(self):
+        from xiaoyu import media
+        from xiaoyu.session_log import turn_starts
+
+        say = self._cmd(
+            "say.py",
+            "import sys, json\n"
+            "prompt = json.loads(sys.stdin.read())['prompt']\n"
+            "sys.stdout.write('\\n工单 T-42（来自：' + prompt + '）\\n第二行不要\\n')\n",
+        )
+        engine = self._engine([Hook("UserPromptSubmit", say)])
+        agent = self.build([text_turn("好")], hook_engine=engine)
+        before = len(agent.messages)
+        agent.send("修这个")
+        self.assertEqual(agent.messages[before]["content"], "修这个")
+        injected = agent.messages[before + 1]
+        self.assertEqual(injected["content"], "[UserPromptSubmit hook] 工单 T-42（来自：修这个）")
+        self.assertTrue(injected.get(media.INJECTED_KEY))
+        #  附加上下文不是用户原话：轮首仍只有那一条真实输入
+        starts = turn_starts(agent.messages)
+        self.assertEqual([agent.messages[i]["content"] for i in starts], ["修这个"])
+        #  模型看到了它
+        sent = self.client.completions.calls[-1]["messages"]
+        self.assertTrue(any("工单 T-42" in str(m.get("content")) for m in sent))
+
+    def test_json_system_message_is_shown_but_never_enters_history(self):
+        from xiaoyu.events import Notice
+
+        say = self._cmd(
+            "sysmsg.py",
+            "import sys, json\nsys.stdout.write(json.dumps({'systemMessage': '审计已记', 'x': 1}))\n",
+        )
+        shown: list = []
+
+        class Sink:
+            def emit(self, event):
+                shown.append(event)
+
+        engine = self._engine([Hook("UserPromptSubmit", say), Hook("Stop", say)])
+        agent = self.build([text_turn("好")], hook_engine=engine, sink=Sink())
+        agent.send("干活")
+        notices = [e for e in shown if isinstance(e, Notice) and "审计已记" in e.text]
+        self.assertEqual(len(notices), 2, [getattr(e, "text", e) for e in shown])
+        self.assertEqual(notices[0].text, "[UserPromptSubmit hook] 审计已记")
+        self.assertEqual(notices[1].text, "[Stop hook] 审计已记")
+        self.assertFalse(any("审计已记" in str(m.get("content")) for m in agent.messages))
+        self.assertFalse(any("systemMessage" in str(m.get("content")) for m in agent.messages))
+
     def test_stop_block_forces_one_more_round_only(self):
         engine = self._engine([Hook("Stop", self._cmd("b.py", BLOCK_BODY))])
         agent = self.build(
@@ -344,7 +392,7 @@ class OnFailureAndNewEventsTest(unittest.TestCase):
         fired: set[str] = set()
         for source in package.glob("*.py"):
             text = source.read_text(encoding="utf-8", errors="replace")
-            fired.update(re.findall(r'\.fire\(\s*"([A-Za-z]+)"', text))
+            fired.update(re.findall(r'fire\w*\(\s*"([A-Za-z]+)"', text))
         self.assertTrue(fired, "没扫到任何 fire 调用——正则或目录不对")
         self.assertEqual(sorted(fired - set(hooks_module.EVENTS)), [], f"内核触发但 EVENTS 没列：{fired}")
         for name in ("SubagentStart", "SubagentEnd", "BeforeCompact", "AfterCompact"):
@@ -389,6 +437,31 @@ class OnFailureAndNewEventsTest(unittest.TestCase):
         clipped = first_line("x" * (OUTPUT_LINE_CAP + 50))
         self.assertLess(len(clipped), OUTPUT_LINE_CAP + 20)
         self.assertTrue(clipped.endswith("（已截断）"))
+
+    def test_json_system_message_goes_to_notice_not_output(self):
+        from xiaoyu.hooks import parse_stdout
+
+        self.assertEqual(parse_stdout("branch: main\n"), ("branch: main", ""))
+        #  JSON 对象：systemMessage 只给用户，首行不再当上下文
+        self.assertEqual(
+            parse_stdout('{"systemMessage": " 已记录到审计日志 ", "other": 1}\n'),
+            ("", "已记录到审计日志"),
+        )
+        #  JSON 对象但没有 systemMessage：两边都没有（不把 JSON 原文喂给模型）
+        self.assertEqual(parse_stdout('{"decision": "ok"}'), ("", ""))
+        self.assertEqual(parse_stdout('{"systemMessage": ""}'), ("", ""))
+        #  坏 JSON / 数组按首行规则
+        self.assertEqual(parse_stdout("{not json"), ("{not json", ""))
+        self.assertEqual(parse_stdout('["x"]'), ('["x"]', ""))
+
+        say = _script_cmd(
+            self.tmp, "sysmsg.py",
+            "import sys, json\nsys.stdout.write(json.dumps({'systemMessage': '审计已记'}))\n",
+        )
+        plain = _script_cmd(self.tmp, "plain.py", "import sys\nsys.stdout.write('ctx line\\n')\n")
+        engine = self.engine([Hook("Stop", say), Hook("Stop", plain)])
+        decision = engine.fire("Stop", {"last_text": "x"})
+        self.assertEqual(decision, Decision(blocked=False, output="ctx line", notice="审计已记"))
 
     def test_for_tools_also_carries_toolfailed(self):
         engine = self.engine(

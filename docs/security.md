@@ -124,6 +124,9 @@ xiaoyu --no-network          # 或 XIAOYU_SANDBOX_NETWORK=0，断掉沙箱内的
   装上的 server 读得到。
 - npx / uvx 包启动前查 **OSV 恶意包库**。
 - 内联攻击脚本形状的配置**拒绝启动**。
+- 工具名**撞名按折叠形判**：同 server 列表里或跨 server 之间，名字经 NFKC 归一 + 大小写折叠后
+  相同（`Tool` / `tool` / 全角 `ｔｏｏｌ`）就算同一个名——同 server 整个列表判非法、跨 server
+  后到的一代整体回滚，报错列出撞上的两个原始名。注册名不折叠，只有判定折叠。
 - 工具描述 / schema 变更**自动隔离**（防 rug-pull）。隔离时直接摊出相对上次批准的差异
   （描述逐行 diff、参数增删改），`/mcp diff [server]` 看全部，核对后 `/mcp approve [server]`
   恢复（不给名字 = 一键批准全部）。来源可信又跟着 `@latest` 走的 server（每次上游发版都得

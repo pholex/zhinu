@@ -52,7 +52,7 @@ from .compaction import (
     microcompact,
     plan_from_history,
 )
-from .config import EFFORT_LEVELS, Config
+from .config import EFFORT_LEVELS, Config, project_levels
 from .errors import Interrupted, classify
 from .providers import Registry, Route, UnknownModel
 from .permissions import Permissions, call_identity
@@ -623,14 +623,6 @@ def phantom_claims(text: str) -> list[str]:
     return found
 
 
-def _find_project_root(workspace: Path) -> Path:
-    """最近的含 .git 的祖先目录；没有就是工作区自己（层链的上界）。"""
-    for candidate in (workspace, *workspace.parents):
-        if (candidate / ".git").exists():
-            return candidate
-    return workspace
-
-
 def collect_project_docs(
     workspace: Path, names: tuple[str, ...], cap: int
 ) -> list[tuple[str, str]]:
@@ -639,11 +631,8 @@ def collect_project_docs(
     每层只认 names 里首个命中的非空文件；预算 cap 按 leaf-first 分配——
     从最深层往上分，分完为止，浅层文件被截断或整个丢弃时都有显式标注。
     """
-    root = _find_project_root(workspace)
-    levels = [root]
-    if workspace != root:
-        for part in workspace.relative_to(root).parts:
-            levels.append(levels[-1] / part)
+    #  层链与工作区技能目录（skills.project_skill_dirs）同源，见 config.project_levels
+    levels = project_levels(workspace)
 
     found: list[tuple[str, str]] = []
     for level in levels:
@@ -2818,7 +2807,19 @@ class Agent:
                     notes.append("对话没有回滚（文件回不去时对话也不动；修好后重试即可）")
                 return RewindResult(index, "failed", skipped_files=skipped,
                                     uncertain_files=tuple(targets), summary="；".join(notes))
+        prompt_text = ""
         if conversation:
+            #  截掉区间的第一条真实用户消息就是定位用的那条（found 即它的下标）。
+            #  只取文本部件：图片不会跟着预填回输入行，"[图片]" 占位填回去是假话
+            content = self.messages[found].get("content")
+            if isinstance(content, list):
+                prompt_text = "".join(
+                    str(part.get("text") or "")
+                    for part in content
+                    if isinstance(part, dict) and part.get("type") == media.TEXT_PART
+                ).strip()
+            else:
+                prompt_text = media.text_of(content).strip()
             self.messages = self.messages[:found]
             self._history_rewritten()
             self.plan = plan_from_history(self.messages)
@@ -2838,6 +2839,7 @@ class Agent:
             restored_files=tuple(path for path, before in targets.items() if before is not None),
             removed_files=tuple(path for path, before in targets.items() if before is None),
             skipped_files=skipped, summary="；".join(notes) if notes else "什么也没做。",
+            prompt_text=prompt_text,
         )
 
     def drop_from(self, start: int, reason: str) -> int:
@@ -2881,6 +2883,18 @@ class Agent:
         log_path = getattr(self.session_log, "path", None) if self.session_log is not None else None
         return {"model": self.config.model, "session": str(log_path) if log_path else ""}
 
+    def _fire_hook(self, event: str, payload: dict[str, Any], **kwargs: Any) -> Any:
+        """所有钩子触发点的唯一出口：顺手把 systemMessage 显示给用户。
+
+        钩子 stdout 以 JSON 对象给出 `systemMessage` 时，那段文本只是说给用户听的
+        （"已记录到审计日志"），不进历史、不进模型——所以在这里统一发 Notice，
+        各触发点不必各自记得消费 Decision.notice。
+        """
+        decision = self.hook_engine.fire(event, payload, **kwargs)
+        if notice := getattr(decision, "notice", ""):
+            self.emit(Notice(f"[{event} hook] {notice}", "info"))
+        return decision
+
     def begin_session(self) -> Any:
         """会话首轮之前触发一次 SessionStart；返回 None 表示没有这类钩子。
 
@@ -2894,7 +2908,7 @@ class Agent:
         if self.hook_engine is None or not self.hook_engine.has("SessionStart"):
             self._session_started = True
             return None
-        decision = self.hook_engine.fire("SessionStart", self._session_payload())
+        decision = self._fire_hook("SessionStart", self._session_payload())
         if decision.blocked:
             self.emit(Notice(f"[SessionStart hook 拒绝启动：{decision.reason}]", "warn"))
             return decision
@@ -2915,7 +2929,7 @@ class Agent:
             return
         self._session_ended = True
         if self.hook_engine.has("SessionEnd"):
-            self.hook_engine.fire("SessionEnd", self._session_payload())
+            self._fire_hook("SessionEnd", self._session_payload())
 
     # ---------- 主循环 ----------
 
@@ -3013,15 +3027,23 @@ class Agent:
         if self.hook_engine is not None and self.hook_engine.has("UserPromptSubmit"):
             from .hooks import clip
 
-            decision = self.hook_engine.fire(
+            decision = self._fire_hook(
                 "UserPromptSubmit", {"prompt": clip(media.text_of(user_input))}
             )
             if decision.blocked:
                 self.emit(Notice(f"[hook 拦截了本轮输入：{decision.reason}]", "warn"))
                 return
+            prompt_context = getattr(decision, "output", "")
+        else:
+            prompt_context = ""
         if self._on_turn_input is not None:
             self._on_turn_input()
         self._record({"role": "user", "content": user_input})
+        #  放行钩子 stdout 的首行作为本轮附加上下文，紧跟用户输入：与 SessionStart
+        #  同一通道（harness 放进来、内容不可信），排在输入之后是为了让轮次定位
+        #  （turn_starts / rewind 按用户原话找轮首）不受影响
+        if prompt_context:
+            self._record_injected(f"[UserPromptSubmit hook] {prompt_context}")
 
         nudged_empty = False
         #  产物对账护栏每轮只追问一次：模型坚持己见也不会造出死循环
@@ -3171,7 +3193,7 @@ class Agent:
                         from .hooks import clip
 
                         stop_checked = True
-                        decision = self.hook_engine.fire(
+                        decision = self._fire_hook(
                             "Stop", {"last_text": clip(media.text_of(message.get("content")))}
                         )
                         if decision.blocked:
@@ -3740,7 +3762,7 @@ class Agent:
             return None
 
         if self.hook_engine is not None and self.hook_engine.has("BeforeCompact"):
-            decision = self.hook_engine.fire("BeforeCompact", {"context_tokens": estimated, "forced": force})
+            decision = self._fire_hook("BeforeCompact", {"context_tokens": estimated, "forced": force})
             if decision.blocked:
                 raise RuntimeError("BeforeCompact hook blocked compaction")
         self.messages, cleared, saved_chars = microcompact(
@@ -3760,7 +3782,7 @@ class Agent:
                 )
             if not force and not self.compactor.should_compact(after_micro):
                 if self.hook_engine is not None and self.hook_engine.has("AfterCompact"):
-                    self.hook_engine.fire("AfterCompact", {"changed": True, "method": "microcompact"})
+                    self._fire_hook("AfterCompact", {"changed": True, "method": "microcompact"})
                 #  清完就降到阈值以下：这轮不必花钱做摘要了
                 return f"microcompact：清理 {cleared} 条旧工具输出，估算 {estimated} → {after_micro} tok"
             estimated = after_micro
@@ -3792,7 +3814,7 @@ class Agent:
                 self.session_log.event("compact", note=note)
             self.session_log.event("compact_end", ok=changed)
         if self.hook_engine is not None and self.hook_engine.has("AfterCompact"):
-            self.hook_engine.fire("AfterCompact", {"changed": changed, "method": "summary"})
+            self._fire_hook("AfterCompact", {"changed": changed, "method": "summary"})
         return note
 
     def _shrink_after_overflow(self) -> bool:
@@ -5481,7 +5503,7 @@ class Agent:
         #  PreToolUse hook：在审批之后、执行之前——审批改写过的参数也在
         #  hook 眼前（宿主 seatbelt 包装后的命令才是真正要跑的东西）
         if self.hook_engine is not None and self.hook_engine.has("PreToolUse"):
-            decision = self.hook_engine.fire(
+            decision = self._fire_hook(
                 #  call_id 在 Pre / Post / ToolFailed 三处同值：外部钩子靠它把
                 #  "要跑什么"和"跑出了什么"对上（并行工具调用下光靠工具名对不上）
                 "PreToolUse", {"tool": name, "args": args, "call_id": call.get("id", "")},
@@ -5591,7 +5613,7 @@ class Agent:
         if self.hook_engine is not None and self.hook_engine.has("PostToolUse"):
             from .hooks import clip
 
-            decision = self.hook_engine.fire(
+            decision = self._fire_hook(
                 "PostToolUse",
                 {"tool": name, "args": args, "ok": ok, "output": clip(output), "call_id": call_id},
                 tool_name=name,
@@ -5604,7 +5626,7 @@ class Agent:
 
             #  失败通知带上参数与错误文本：只给工具名的话钩子什么也做不了
             #  （发告警至少得说清哪条命令、错在哪）；通知在动作之后，结果不看
-            self.hook_engine.fire(
+            self._fire_hook(
                 "ToolFailed",
                 {"tool": name, "args": args, "ok": False, "output": clip(output), "call_id": call_id},
                 tool_name=name,

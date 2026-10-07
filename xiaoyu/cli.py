@@ -88,7 +88,7 @@ SLASH_COMMANDS: dict[str, str] = {
     "/allow": "持久允许，如 /allow bash(git *)、/allow write_file",
     "/deny": "持久拒绝（任何模式下都拦，包括 --yolo）",
     "/resume": "切到本工作区的历史会话（当前对话被清空；/resume <序号> 直接选）",
-    "/rewind": "回滚到某轮开始前（对话和/或文件；/undo 同义）",
+    "/rewind": "回滚到某轮开始前（对话和/或文件；/undo 同义）。回退对话后那一轮的原话预填回输入行，可改可直接回车",
     "/clear": "清空对话历史（保留 system prompt）",
     "/exit": "退出",
     "/quit": "退出",
@@ -3124,6 +3124,9 @@ def _repl_loop(agent: Agent) -> int:
             if expanded is None:
                 if handle_slash(agent, action.args):
                     return 0
+                #  /rewind 回收的原话：明文 REPL 填不进输入行，打出来供复制
+                for text in agent.drain_steers():
+                    print(ui.secondary(f"  上一轮原话：{text}"))
                 continue
             if not expanded:
                 continue
@@ -3209,10 +3212,15 @@ def _rewind_flow(agent: Agent, rest: list[str]) -> None:
             if not conversation:
                 return
 
-    result = agent.rewind_to(index, conversation=conversation, files=files)
-    print(ui.success(f"  {result}"))
+    result = agent.rewind_result(index, conversation, files, check_conflicts=False)
+    print(ui.success(f"  {result.summary}"))
     if conversation:
         print(ui.secondary("  （屏幕上方的旧输出只是显示残留，模型已不记得被截掉的轮次）"))
+    if result.conversation_rewound and result.prompt_text:
+        #  被回退那一轮的原话走"没赶上本轮的插话"同一条预填通道：前端在命令
+        #  结束后取走——TUI 填进输入行（可改可直接回车，不自动提交），明文
+        #  REPL 没有预填能力，只把原话打出来供复制
+        agent.steer(result.prompt_text)
 
 
 #  技能的显式入口前缀：/skill:<名字>。与内建命令撞名的技能只能从这里进

@@ -35,7 +35,10 @@
 - PostToolUse  block → 工具已执行，理由作为附注拼进 tool result（模型看得到）
 - ToolFailed   通知：工具结果判成失败（ERROR:）之后触发，带 call_id / args / output；
                发生在动作之后，block 没有意义，退出码只决定要不要打 warn
-- UserPromptSubmit block → 本轮不发给模型，理由打给用户
+- UserPromptSubmit block → 本轮不发给模型，理由打给用户；放行时 stdout 的**首个非空行**
+               作为本轮的附加上下文紧跟用户输入注入历史（与 SessionStart 同一通道：
+               harness 放进来、内容不可信，受 OUTPUT_LINE_CAP）——给"按本轮输入
+               查个工单号 / 附上当前 git 状态"这类每轮都变的补充用
 - Stop         block → 模型想收尾时被顶回去，理由作为 user 消息续跑一步
                （每轮只顶一次，防 hook 永远不放行造成死循环）
 - SessionStart 会话首轮之前触发一次（子 agent 不触发）：block → 拒绝启动，理由打给
@@ -49,6 +52,14 @@
                本次压缩以异常中止——与 SDK 进程内 hook 同义；上下文已超窗时这一轮
                无法继续，所以只给"压缩前必须先归档"之类的硬需求用
 - AfterCompact 压缩完成之后的通知（带是否真的改写了历史、用的是哪一层），退出码只决定要不要打 warn
+
+放行钩子 stdout 的两种去处：
+- 纯文本：首个非空行作为上下文进历史，只有 SessionStart / UserPromptSubmit 消费，
+  其它事件的 stdout 没去处、照旧忽略；
+- 一个 JSON 对象且含 `systemMessage` 键：该文本**只**作为提示显示给用户（Notice），
+  不进历史、不进模型，所有事件都认；其余键忽略。JSON 形态优先于首行规则——
+  stdout 整体是 JSON 对象时，它的首行不再当上下文（钩子想给用户看一句"已记录到
+  审计日志"，不该同时把这句喂给模型）。
 
 事件名表 EVENTS 必须覆盖内核实际触发的每一个名字（tests/test_hooks.py 对着源码
 扫 `fire("…")` 字面量核对），少一个就是"文档承诺的事件 hooks.toml 挂不上"。
@@ -110,8 +121,12 @@ class Decision:
     blocked: bool
     reason: str = ""
     #  放行钩子（退出码 0）stdout 的首个非空行，多个钩子按换行拼接。只有
-    #  SessionStart 消费它（注入历史）；别的事件的 stdout 没有去处，照旧忽略
+    #  SessionStart / UserPromptSubmit 消费它（注入历史）；别的事件的 stdout
+    #  没有去处，照旧忽略
     output: str = ""
+    #  stdout 是 JSON 对象且带 systemMessage 时的那段文本：只给用户看（Notice），
+    #  不进历史。多个钩子按换行拼接。所有事件都认
+    notice: str = ""
 
 
 def hooks_path() -> Path:
@@ -238,6 +253,7 @@ class HookEngine:
         """
         reasons: list[str] = []
         outputs: list[str] = []
+        notices: list[str] = []
         body = json.dumps(
             {"event": event, "workspace": str(self.workspace), **payload},
             ensure_ascii=False,
@@ -273,9 +289,18 @@ class HookEngine:
                 reasons.append(clip_reason(reason))
             elif proc.returncode != 0:
                 self._failed(hook, f"退出码 {proc.returncode}（既非 0 放行也非 2 拦截）", reasons)
-            elif line := first_line(proc.stdout):
-                outputs.append(line)
-        return Decision(blocked=bool(reasons), reason="；".join(reasons), output="\n".join(outputs))
+            else:
+                line, note = parse_stdout(proc.stdout)
+                if line:
+                    outputs.append(line)
+                if note:
+                    notices.append(note)
+        return Decision(
+            blocked=bool(reasons),
+            reason="；".join(reasons),
+            output="\n".join(outputs),
+            notice="\n".join(notices),
+        )
 
     def _failed(self, hook: Hook, what: str, reasons: list[str]) -> None:
         """钩子自己坏了：默认放行并告警；on_failure = block 的改记一条拦截理由。
@@ -319,6 +344,36 @@ def first_line(text: str) -> str:
     """stdout 的首个非空行（截到 OUTPUT_LINE_CAP）；全空返回空串。"""
     for line in text.splitlines():
         if line.strip():
-            line = line.strip()
-            return line if len(line) <= OUTPUT_LINE_CAP else line[:OUTPUT_LINE_CAP] + "…（已截断）"
+            return _cap_line(line.strip())
     return ""
+
+
+def _cap_line(line: str) -> str:
+    return line if len(line) <= OUTPUT_LINE_CAP else line[:OUTPUT_LINE_CAP] + "…（已截断）"
+
+
+#  钩子 stdout 里"只给用户看"的那个键
+SYSTEM_MESSAGE_KEY = "systemMessage"
+
+
+def parse_stdout(text: str) -> tuple[str, str]:
+    """放行钩子的 stdout → (进历史的首行, 只给用户看的提示)。
+
+    整段 stdout 是一个 JSON 对象时走结构化形态：取 `systemMessage`（非字符串
+    按 str 处理、空的当没有），**不再**取首行——否则一段 `{"systemMessage": …}`
+    会原样进历史，钩子想说给用户的话反倒喂给了模型。不是 JSON 对象（纯文本、
+    JSON 数组、坏 JSON）就按首行规则。
+    """
+    stripped = text.strip()
+    if stripped.startswith("{"):
+        try:
+            data = json.loads(stripped)
+        except ValueError:
+            data = None
+        if isinstance(data, dict):
+            note = data.get(SYSTEM_MESSAGE_KEY)
+            if note is None:
+                return "", ""
+            note = str(note).strip()
+            return "", _cap_line(note) if note else ""
+    return first_line(text), ""

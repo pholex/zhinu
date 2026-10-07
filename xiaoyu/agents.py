@@ -1088,9 +1088,17 @@ def execute_delegation(
     failure = ""
     failure_kind = ""
     lifecycle = guards.hooks() if guards.hooks is not None else None
+
+    def fire_lifecycle(event: str, payload: dict[str, Any]) -> Any:
+        #  与 Agent._fire_hook 同一约定：钩子给用户的 systemMessage 只显示不进历史
+        decision = lifecycle.fire(event, payload)
+        if notice := getattr(decision, "notice", ""):
+            sink.emit(Notice(f"[{event} hook] {notice}", "info"))
+        return decision
+
     try:
         if lifecycle is not None and lifecycle.has("SubagentStart"):
-            decision = lifecycle.fire("SubagentStart", {"agent": spec.name})
+            decision = fire_lifecycle("SubagentStart", {"agent": spec.name})
             if decision.blocked:
                 raise RuntimeError("SubagentStart hook blocked execution")
         sub_agent.send(relocation + task)
@@ -1119,7 +1127,7 @@ def execute_delegation(
         if on_settled is not None:
             on_settled(sub_agent)
         if lifecycle is not None and lifecycle.has("SubagentEnd"):
-            decision = lifecycle.fire("SubagentEnd", {"agent": spec.name, "failed": bool(failure)})
+            decision = fire_lifecycle("SubagentEnd", {"agent": spec.name, "failed": bool(failure)})
             if decision.blocked:
                 notes.append("SubagentEnd hook failed or blocked")
     answer = fresh_answer()
