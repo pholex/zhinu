@@ -101,6 +101,10 @@ BINDINGS: tuple[Binding, ...] = (
     ),
     #  以下由 prompt_toolkit 或 REPL 循环实现，本表只登记，不注册
     Binding("history.previous", "↑ / ↓", "历史回退：视觉行 → 逻辑行 → 上一条", INPUT),
+    Binding(
+        "history.suggest", "→",
+        "接受灰字浮现的历史建议（光标在行尾时；Ctrl-E / Ctrl-F 同效）", INPUT, tip=True,
+    ),
     Binding("history.search", "Ctrl-R", "反向搜索输入历史", INPUT, tip=True),
     Binding(
         "input.editor", "Ctrl-X Ctrl-E",
