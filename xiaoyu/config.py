@@ -485,6 +485,9 @@ class Config:
     #  bash 硬红线（rm -rf / 、mkfs、dd of=/dev/…）：默认任何模式都拦，包括 --yolo。
     #  关掉是给镜像烧录、磁盘格式化这类内部运维任务用的。来源 XIAOYU_HARDLINE=0。
     hardline: bool = True
+    #  grep / list_files 不碰 .env、私钥、.ssh 等敏感文件（它们免确认，是沙箱明确不挡
+    #  的凭据外泄路）。关掉是给确实要在凭据目录里搜的隔离环境用的。来源 XIAOYU_SEARCH_SENSITIVE=0。
+    search_sensitive: bool = True
     #  --yolo 之上再放开两处 bypass-immune 的必问（退出 plan、沙箱升权）。单独开
     #  没有意义：不带 --yolo 时它们本来就走常规确认。来源 --unattended / XIAOYU_UNATTENDED=1。
     unattended: bool = False
@@ -616,6 +619,8 @@ class Config:
             cfg.sandbox_network = flag.strip().lower() not in ("0", "false", "no", "off")
         if (flag := os.environ.get("XIAOYU_HARDLINE")) is not None:
             cfg.hardline = flag.strip().lower() not in ("0", "false", "no", "off")
+        if (flag := os.environ.get("XIAOYU_SEARCH_SENSITIVE")) is not None:
+            cfg.search_sensitive = flag.strip().lower() not in ("0", "false", "no", "off")
         #  "放松防线"类开关：未设置 = 关，必须显式打开
         cfg.unattended = os.environ.get("XIAOYU_UNATTENDED", "").strip().lower() in _ON_VALUES
         cfg.mcp_trust_changes = (
@@ -623,6 +628,13 @@ class Config:
         )
         for key, value in overrides.items():
             if value is not None:
+                setattr(cfg, key, value)
+        if cfg.unguarded:
+            #  无护栏预设在这里按表落地：各启动入口只需把 unguarded 传进来，新加
+            #  一层护栏不必再去每个入口补一个关键字参数（漏补就是预设下悄悄没关）
+            from . import guardrails
+
+            for key, value in guardrails.overrides().items():
                 setattr(cfg, key, value)
         #  yolo 默认不收信（理由见 enable_peers 字段注释）。必须放在 overrides
         #  之后：auto_approve 是 --yolo 经 overrides 进来的，前面读还是 False。

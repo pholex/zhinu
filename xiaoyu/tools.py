@@ -1152,6 +1152,63 @@ _SKIP_DIRS = {
     ".idea",
 }
 
+#  搜索类工具（grep / list_files）不碰的敏感文件：它们免确认、只读，正是沙箱明确
+#  不挡的那条凭据外泄路（docs/security.md「沙箱不解决凭据外泄」）——模型一条
+#  grep "KEY" 就能把 .env、私钥读进上下文，用户连确认框都见不到。read_file 不在
+#  此列：它走审批，用户看得见。目录按路径里任一级匹配、文件按名字匹配（fnmatch）。
+#  开关 XIAOYU_SEARCH_SENSITIVE=0（guardrails.py 表里的一层，--unguarded 预设跟随）。
+_SENSITIVE_DIRS = frozenset({".ssh", ".gnupg", ".git"})
+_SENSITIVE_NAMES: tuple[str, ...] = (
+    ".env",
+    ".env.*",
+    "*.pem",
+    "*.key",
+    "*.p12",
+    "*.pfx",
+    "id_rsa*",
+    "id_dsa*",
+    "id_ecdsa*",
+    "id_ed25519*",
+    ".netrc",
+    ".pgpass",
+)
+#  (父目录名, 文件名)：名字本身不特殊、放在特定目录下才是凭据
+_SENSITIVE_PAIRS = frozenset({(".aws", "credentials"), (".docker", "config.json")})
+
+
+def sensitive_reason(path: Path) -> str | None:
+    """路径是不是搜索类工具该跳过的敏感文件；是则返回给人看的理由，否则 None。
+
+    只看名字与路径成分，不读内容、不 stat：几万条 grep 结果逐条过一遍也得是
+    零开销的。".env.example" 这类模板会被 ".env.*" 一起挡下——宁可多跳一个
+    示例文件（read_file 照样读得到），不可漏一个 ".env.production"。
+    """
+    parts = path.parts
+    for part in parts:
+        if part in _SENSITIVE_DIRS:
+            return f"位于 {part}/ 之下"
+    name = path.name
+    if any(fnmatch.fnmatchcase(name, pattern) for pattern in _SENSITIVE_NAMES):
+        return "凭据 / 密钥类文件名"
+    if len(parts) >= 2 and (parts[-2], name) in _SENSITIVE_PAIRS:
+        return f"{parts[-2]}/{name} 是凭据文件"
+    return None
+
+
+#  grep 后端输出的 "路径:行号:内容"：取路径用。懒匹配到第一个 ":数字:"，Windows
+#  盘符 "C:\\x\\y.py:12:" 里的 "C:" 后面不是数字，不会被截在那
+_GREP_LINE_PATH = re.compile(r"^(.+?):\d+:")
+
+
+def _sensitive_skip_note(files: int) -> str:
+    """结果末尾那行说明：跳过了多少个敏感文件、想看怎么办。"""
+    if not files:
+        return ""
+    return (
+        f"\n[已跳过 {files} 个敏感文件（.env / 私钥 / .ssh 等不进搜索结果）；"
+        "确需查看请用 read_file 逐个读取（会经确认）]"
+    )
+
 
 def _locate_grep() -> str | None:
     """找一个能用的 grep：先看 PATH，Windows 上再探一次 Git for Windows 自带的。
@@ -1899,7 +1956,8 @@ class Toolbox:
                 description=(
                     "在工作区里按正则搜索文本，返回 路径:行号: 内容。"
                     "找符号定义、找调用点、找配置项都用它。"
-                    "可用 glob 限定文件类型（如 *.py）。这是只读操作。"
+                    "可用 glob 限定文件类型（如 *.py）。这是只读操作；"
+                    ".env、私钥、.ssh 这类敏感文件不进结果，要看用 read_file。"
                 ),
                 parameters={
                     "type": "object",
@@ -1957,7 +2015,8 @@ class Toolbox:
                 description=(
                     "列出工作区里的文件（可用 glob 过滤，如 **/*.py）。"
                     "摸清项目结构时用它，比 bash ls 更干净：自动跳过 .git、"
-                    "node_modules、__pycache__ 等噪声目录。这是只读操作。"
+                    "node_modules、__pycache__ 等噪声目录，也不列 .env、私钥等敏感文件。"
+                    "这是只读操作。"
                 ),
                 parameters={
                     "type": "object",
@@ -2510,6 +2569,8 @@ class Toolbox:
         target, _ = self._resolve(path)
         if not target.exists():
             return f"ERROR: 路径不存在：{path}"
+        if refused := self._sensitive_root_error(target, path):
+            return refused
 
         #  绝对路径起：rg 不经沙箱、不经确认，不能让 PATH 上工作区里的同名程序顶替
         #  三个后端搜的范围要一样，否则同一个问题在不同机器上答案不同：
@@ -2617,37 +2678,55 @@ class Toolbox:
     def _grep_output(self, lines: list[str], pattern: str, max_matches: int) -> str:
         """把 路径:行号:内容 的原始行整理成给模型看的结果：路径转成工作区相对、
         分隔符统一正斜杠（Windows 的反斜杠会让模型在后续工具调用里混用两种）。"""
-        if not lines:
-            return f"没有匹配：{pattern}"
-
         root = str(self.config.workspace)
-        shown = []
-        for line in lines[:max_matches]:
+        kept: list[str] = []
+        skipped_files: set[str] = set()
+        for line in lines:
             for prefix in (root + os.sep, root + "/"):
                 if line.startswith(prefix):
                     line = line[len(prefix):]
                     break
+            #  敏感文件的匹配行整条剔除：留着哪怕一行，.env 里那个值就进上下文了。
+            #  只认 "路径:行号:" 形态；搜单个文件时后端不打路径，那种情况起点
+            #  本身已在 _sensitive_root_error 里判过
+            if self.config.search_sensitive and (found := _GREP_LINE_PATH.match(line)):
+                if sensitive_reason(Path(found.group(1))):
+                    skipped_files.add(found.group(1))
+                    continue
+            kept.append(line)
+        skip_note = _sensitive_skip_note(len(skipped_files))
+        if not kept:
+            return f"没有匹配：{pattern}" + skip_note
+
+        shown = []
+        for line in kept[:max_matches]:
             head, sep, rest = line.partition(":")
             if sep:
                 line = head.replace("\\", "/") + sep + rest
             shown.append(line[:300])
         note = (
-            f"\n... 还有 {len(lines) - max_matches} 条未显示，请缩小范围"
-            if len(lines) > max_matches
+            f"\n... 还有 {len(kept) - max_matches} 条未显示，请缩小范围"
+            if len(kept) > max_matches
             else ""
         )
-        return f"{len(lines)} 条匹配：\n" + "\n".join(shown) + note
+        return f"{len(kept)} 条匹配：\n" + "\n".join(shown) + note + skip_note
 
     def _list_files(self, pattern: str = "**/*", path: str = ".", limit: int = 300) -> str:
         target, _ = self._resolve(path)
         if not target.is_dir():
             return f"ERROR: 不是目录：{path}"
+        if refused := self._sensitive_root_error(target, path):
+            return refused
 
         found: list[str] = []
+        skipped = 0
         for item in sorted(target.glob(pattern)):
             if not item.is_file():
                 continue
             if _SKIP_DIRS & set(item.parts):
+                continue
+            if self.config.search_sensitive and sensitive_reason(item):
+                skipped += 1
                 continue
             try:
                 #  统一正斜杠：输出给模型的路径不随平台漂移（Windows 反斜杠会让
@@ -2656,10 +2735,26 @@ class Toolbox:
             except ValueError:
                 found.append(str(item))
 
+        skip_note = _sensitive_skip_note(skipped)
         if not found:
-            return f"没有匹配 {pattern} 的文件"
+            return f"没有匹配 {pattern} 的文件" + skip_note
         note = f"\n... 共 {len(found)} 个，只列出前 {limit} 个" if len(found) > limit else ""
-        return f"{len(found)} 个文件：\n" + "\n".join(found[:limit]) + note
+        return f"{len(found)} 个文件：\n" + "\n".join(found[:limit]) + note + skip_note
+
+    def _sensitive_root_error(self, target: Path, shown: str) -> str | None:
+        """搜索起点本身就是敏感路径（path=~/.ssh、path=.env）时拒绝整个请求。
+
+        结果里逐条剔除挡的是"顺带搜到"，起点直指敏感目录是"专门去搜"——同样
+        不该免确认放行。"""
+        if not self.config.search_sensitive:
+            return None
+        reason = sensitive_reason(target)
+        if reason is None:
+            return None
+        return (
+            f"ERROR: {shown} 是敏感路径（{reason}），grep / list_files 不进去搜。"
+            "确需查看请用 read_file 读具体文件（会经确认）。"
+        )
 
     def _command_argv(self, command: str, escalation: str | None = None) -> list[str]:
         """命令 → 实际执行的 argv（平台 shell + 需要时套沙箱）。

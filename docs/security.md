@@ -56,6 +56,8 @@ auto 档**放行的依据是沙箱，不是信任**。所以沙箱不可用时�
 
 例外只有小羽自己的密钥：用户级 `.env`、用户级 `mcp.json`、`XIAOYU_ENV_FILE` 指的那份在沙箱内读不到（子进程环境里这些密钥本来就被剥掉了）。要看配置用 `read_file`，会问你。
 
+**免确认的搜索工具（`grep` / `list_files`）不碰敏感文件**：`.env`、`.env.*`、`*.pem` / `*.key` / `*.p12`、`id_rsa*` / `id_ed25519*` 等私钥、`.netrc`、`.aws/credentials`，以及 `.ssh/`、`.gnupg/`、`.git/` 之下的一切。命中的匹配行与文件名整条剔除，结果末尾说明跳过了几个；搜索起点本身就是这类路径（`path=~/.ssh`）直接拒绝。这堵的是"模型一条 `grep KEY` 就把私钥读进上下文、你连确认框都见不到"这条路；`read_file` 不在此列——它走审批，你看得见。`bash cat ~/.ssh/id_rsa` 这条路仍只由沙箱与确认档管（见上）。开关 `XIAOYU_SEARCH_SENSITIVE=0`，给确实要在凭据目录里搜的隔离环境用。
+
 沙箱挡的是"写坏你的磁盘"，不是"把你的密钥传出去"。介意的话：
 
 ```bash
@@ -151,6 +153,7 @@ xiaoyu --no-network          # 或 XIAOYU_SANDBOX_NETWORK=0，断掉沙箱内的
 | 层 | 单独关掉 | 适用场景 |
 |---|---|---|
 | bash 硬红线（`rm -rf /`、`mkfs`、`dd of=/dev/…`） | `XIAOYU_HARDLINE=0`（默认开，与 `XIAOYU_SANDBOX` 同形态） | 隔离环境里做镜像烧录、格式化 |
+| 搜索工具的敏感文件过滤（`grep` / `list_files` 不碰 `.env`、私钥、`.ssh/`） | `XIAOYU_SEARCH_SENSITIVE=0`（默认开） | 隔离环境里确实要在凭据目录里搜 |
 | `--yolo` 下仍必问的三项（`exit_plan_mode`、沙箱升权、写可执行配置） | `--unattended`（或 `XIAOYU_UNATTENDED=1`） | 无人值守：没人按键，卡住等于任务死掉 |
 | 某个 MCP server 的结果不套 `<untrusted_content>` | 该 server 声明里 `"trustContent": true` | 内网 runbook / 工单系统——你就是想让模型照它说的做 |
 | 逐条审批 / 沙箱 / 工作区信任门 / MCP 变更隔离 | `--yolo` / `--no-sandbox` / `--trust` / `XIAOYU_MCP_TRUST_CHANGES=1` | 原有开关，不变 |
@@ -159,7 +162,7 @@ xiaoyu --no-network          # 或 XIAOYU_SANDBOX_NETWORK=0，断掉沙箱内的
 
 ### `--unguarded`：无护栏预设
 
-一次放开上表全部层（等价 `--yolo --no-sandbox --unattended XIAOYU_HARDLINE=0 XIAOYU_MCP_TRUST_CHANGES=1`，并跳过工作区信任门——本次放行，不记入信任表）。名字刻意叫"无护栏"而不是 advance / pro：读启动命令的人一眼要看出它做了什么。
+一次放开上表全部层（等价 `--yolo --no-sandbox --unattended XIAOYU_HARDLINE=0 XIAOYU_SEARCH_SENSITIVE=0 XIAOYU_MCP_TRUST_CHANGES=1`，并跳过工作区信任门——本次放行，不记入信任表）。名字刻意叫"无护栏"而不是 advance / pro：读启动命令的人一眼要看出它做了什么。
 
 它**只在环境变量 `XIAOYU_UNGUARDED=1` 存在时生效**，否则报错退出、不静默降级。这个变量应由容器 / VM 的编排脚本注入，只认真实环境变量、不读任何 `.env`：工作区 `.env` 能被仓库带进来，用户级 `.env` 会被"上次设过"遗忘——两种都不是"这次运行确实在沙箱里"的证据。"安全沙箱"是你和环境之间的契约，不是口头承诺。
 
