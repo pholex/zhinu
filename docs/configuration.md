@@ -215,7 +215,7 @@ XIAOYU_BEDROCK_REGION=us-east-1
 | `XIAOYU_SANDBOX_NETWORK` | 开 | 沙箱内是否允许联网（`0` = 断网） |
 | `XIAOYU_SANDBOX_WRITABLE` | — | 追加可写根目录，冒号分隔 |
 | `XIAOYU_THEME` | `auto` | `dark` / `light` 跳过终端背景色探测 |
-| `XIAOYU_BELL` | 关 | `1` = 一轮结束 / 等审批时往终端写响铃（BEL），终端翻译成提示音、Dock 弹跳或标签高亮；只对真终端写，管道里不写 |
+| `XIAOYU_BELL` | 关 | 一轮结束 / 等审批时往终端写通知。`1` / `bel` = 响铃（BEL），终端翻译成提示音、Dock 弹跳或标签高亮；`osc9`（iTerm2 / WezTerm / ghostty）、`osc777`（rxvt 一路）、`osc99`（kitty）= 带文案的桌面通知转义序列，文案含状态与会话名/目录名；`auto` 按 `TERM_PROGRAM` / `KITTY_WINDOW_ID` 挑一种，认不出退回 BEL。tmux 里自动用 DCS 透传。只对真终端写，管道里不写 |
 | `XIAOYU_TITLE` | 开 | 交互模式把窗口标题设成「<状态> · <会话名或目录名> · xiaoyu」，状态随会话走（就绪 / 运行中 / 等审批 / 等输入），具名会话（`--session-id`、`term-…`）用名字；退出时还原（认标题栈的终端精确还原，其余清空）；`0` = 关 |
 | `XIAOYU_STATUS_HOOK` | — | 状态变成"等人"时后台跑的命令，状态串作最后一个参数（`waiting_input` / `waiting_approval`），也放进环境变量 `XIAOYU_STATUS`。给系统通知用，如 macOS：`osascript -e 'display notification "小羽在等你"'`；超时（10s）与失败静默。只在 TUI / 明文 REPL 生效 |
 | `XIAOYU_BROWSER_CDP` | — | 接管以 `--remote-debugging-port` 起的本机 Chrome（要登录态时用） |

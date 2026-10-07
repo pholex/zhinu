@@ -42,6 +42,76 @@ class BellTest(unittest.TestCase):
         self.assertEqual(stream.getvalue(), "")
 
 
+class NotificationChannelTest(unittest.TestCase):
+    """XIAOYU_BELL 的各取值：生成的字节序列、auto 的终端判定、tmux 透传。"""
+
+    def tearDown(self) -> None:
+        attention.clear_title(io.StringIO())
+
+    def _env(self, **extra: str) -> dict[str, str]:
+        base = {attention.TITLE_ENV: "0"}
+        base.update(extra)
+        return base
+
+    def _ring(self, value: str, state: str = attention.WAITING_INPUT, **extra: str) -> str:
+        stream = _Tty()
+        with mock.patch.dict(os.environ, self._env(**{attention.BELL_ENV: value, **extra}), clear=False):
+            os.environ.pop("TMUX", None)
+            for name in ("TERM_PROGRAM", "KITTY_WINDOW_ID", "TERM"):
+                os.environ.pop(name, None)
+            os.environ.update(extra)
+            attention.set_title(Path("/work/zhinu"), stream)
+            attention.ring(stream, state)
+        return stream.getvalue()
+
+    def test_bel_aliases(self) -> None:
+        self.assertEqual(self._ring("1"), "\x07")
+        self.assertEqual(self._ring("bel"), "\x07")
+        self.assertEqual(self._ring("true"), "\x07")
+
+    def test_off_values(self) -> None:
+        for value in ("", "0", "off", "no"):
+            self.assertEqual(self._ring(value), "", value)
+
+    def test_osc9_carries_state_and_name(self) -> None:
+        self.assertEqual(self._ring("osc9", attention.WAITING_APPROVAL), "\x1b]9;小羽 · zhinu · 等审批\x07")
+
+    def test_osc777_splits_title_and_body(self) -> None:
+        self.assertEqual(self._ring("osc777"), "\x1b]777;notify;小羽 · zhinu;等输入\x07")
+
+    def test_osc99_sends_title_then_body(self) -> None:
+        self.assertEqual(
+            self._ring("osc99"),
+            "\x1b]99;i=xiaoyu:d=0;小羽 · zhinu\x1b\\\x1b]99;i=xiaoyu:d=1:p=body;等输入\x1b\\",
+        )
+
+    def test_auto_picks_by_terminal(self) -> None:
+        self.assertTrue(self._ring("auto", KITTY_WINDOW_ID="3").startswith("\x1b]99;"))
+        self.assertTrue(self._ring("auto", TERM="xterm-kitty").startswith("\x1b]99;"))
+        self.assertTrue(self._ring("auto", TERM_PROGRAM="iTerm.app").startswith("\x1b]9;"))
+        self.assertTrue(self._ring("auto", TERM_PROGRAM="WezTerm").startswith("\x1b]9;"))
+        self.assertTrue(self._ring("auto", TERM_PROGRAM="ghostty").startswith("\x1b]9;"))
+        self.assertEqual(self._ring("auto", TERM_PROGRAM="Apple_Terminal"), "\x07")
+        self.assertEqual(self._ring("auto"), "\x07")
+
+    def test_unknown_value_still_rings(self) -> None:
+        self.assertEqual(self._ring("ding"), "\x07")
+
+    def test_tmux_wraps_in_dcs_and_doubles_esc(self) -> None:
+        out = self._ring("osc9", TMUX="/tmp/tmux-501/default,1,0")
+        self.assertEqual(out, "\x1bPtmux;\x1b\x1b]9;小羽 · zhinu · 等输入\x07\x1b\\")
+        #  BEL 不是 ESC 序列，tmux 本来就透传，不包
+        self.assertEqual(self._ring("bel", TMUX="/tmp/tmux-501/default,1,0"), "\x07")
+
+    def test_name_in_notification_is_sanitized(self) -> None:
+        stream = _Tty()
+        with mock.patch.dict(os.environ, self._env(**{attention.BELL_ENV: "osc9"}), clear=False):
+            os.environ.pop("TMUX", None)
+            attention.set_title(Path("/work/evil\x1b]0;x\x07dir"), stream)
+            attention.ring(stream, attention.WAITING_INPUT)
+        self.assertEqual(stream.getvalue(), "\x1b]9;小羽 · evildir · 等输入\x07")
+
+
 class TitleTest(unittest.TestCase):
     def tearDown(self) -> None:
         #  模块记着"当前会话名"，用例之间别串
