@@ -36,6 +36,8 @@ from .session_log import (
     find_by_name,
     find_session,
     install_exit_logging,
+    last_mode,
+    last_model,
     list_sessions,
     load_messages,
     load_system_prompt,
@@ -1201,8 +1203,10 @@ def send_command(argv: list[str]) -> int:
 def resume_command(argv: list[str]) -> int:
     """`xiaoyu resume`：从会话日志恢复历史对话继续聊。
 
-    模型/端点等配置照常从环境读取（会话里记录的模型只作展示）；
-    恢复的消息会重新写入新的会话文件，让每个文件都自包含、可再次 resume。
+    端点等配置照常从环境读取；模型与交互模式默认**跟随旧会话最后生效的那份**
+    （/model、下拉框、粘性降级、plan 进出都有留痕）——续的是同一场对话，上下文是
+    按那个模型长的；与 ACP session/load、`@x` 接回同一口径。`--model` / `--mode`
+    显式给了才覆盖。恢复的消息会重新写入新的会话文件，让每个文件都自包含、可再次 resume。
     """
     parser = argparse.ArgumentParser(
         prog="xiaoyu resume",
@@ -1237,6 +1241,11 @@ def resume_command(argv: list[str]) -> int:
     )
     parser.add_argument("--yolo", action="store_true", help="不再逐个确认写文件和执行命令")
     parser.add_argument("--no-tui", dest="no_tui", action="store_true", help="用明文 REPL")
+    parser.add_argument(
+        "--model",
+        default=None,
+        help="换个模型接着聊；默认跟随旧会话最后生效的模型（没留痕时用配置默认）",
+    )
     add_guardrail_flags(parser)
     add_system_prompt_flags(parser)
     add_prompt_flag(parser)
@@ -1393,6 +1402,13 @@ def resume_command(argv: list[str]) -> int:
             append_system_prompt=args.append_system_prompt,
             workspace_trusted=trust.trusted,
         )
+        #  模型跟随旧会话最后生效的那个（与 ACP session/load、term 同一纪律）：
+        #  在建 SessionLog 之前覆盖，新文件 meta 记下的就是跟随后的模型。
+        #  --model 显式给了以它为准；旧文件读不出来保持配置默认
+        if args.model:
+            config.model = args.model
+        elif recorded := last_model(chosen.path):
+            config.model = recorded
         permissions = Permissions.load(config.workspace, include_workspace=trust.trusted)
         if prompt:
             approver, sink = oneshot_frontend(permissions, args.output_format)
@@ -1418,6 +1434,10 @@ def resume_command(argv: list[str]) -> int:
 
     #  接回上下文并复制进新会话文件（新文件自包含，可再次 resume）
     agent.restore(loaded, source=str(chosen.path))
+    #  交互模式同一纪律：历史里可能带着 plan 进出的说明，模式不跟上，模型以为
+    #  还在规划态而关卡全开（或反过来）。--mode 显式给了以它为准
+    if args.mode is None and (follow_mode := last_mode(chosen.path)):
+        agent.adopt_mode(follow_mode)
 
     if vanished := vanished_tools(loaded, agent.toolbox.names()):
         print(
@@ -3206,16 +3226,18 @@ def skill_shadowed(name: str) -> bool:
     return f"/{name}" in _BUILTIN_SLASH
 
 
-def skill_prompt(agent: Agent, line: str) -> str | None:
-    """`/<技能名> 参数…` → 展开成本轮提示文本。
+def skill_invocation(agent: Agent, line: str) -> tuple[str, str] | None:
+    """`/<技能名> 参数…` / `/skill:<技能名> 参数…` → (技能名, 参数串)。
 
-    返回 None = 这行不是技能调用（内建命令或没这个技能），交给 handle_slash；
-    返回空串 = 是技能调用但展开失败（已打印原因），本轮不发。
+    返回 None = 这行不是技能调用（不以斜杠开头、内建命令、或没这个技能）。
     名字空间规则：内建命令 > 技能——`/help` 永远是帮助，同名技能要写
-    `/skill:help`。`/skill:` 前缀下找不到也报错而不是回落到内建，用户既然
-    写了前缀就是明确要技能。
+    `/skill:help`。`/skill:` 前缀下找不到也当技能调用（随后展开时报错）而不是
+    回落到内建，用户既然写了前缀就是明确要技能。TUI / 明文 REPL / ACP 三个
+    前端共用这一个判定，斜杠名字空间不会按前端漂移。
     """
     head, _, rest = line.strip().partition(" ")
+    if not head.startswith("/"):
+        return None
     explicit = head.startswith(SKILL_SLASH_PREFIX)
     name = head[len(SKILL_SLASH_PREFIX):] if explicit else head[1:]
     if not name or (not explicit and (head in _BUILTIN_SLASH or not agent.skills)):
@@ -3223,15 +3245,32 @@ def skill_prompt(agent: Agent, line: str) -> str | None:
     if not explicit and not any(skill.name == name for skill in agent.skills):
         #  不是已知技能：当作敲错的内建命令报"未知命令"，别为每个错字重扫磁盘
         return None
-    arguments = rest.strip()
+    return name, rest.strip()
+
+
+def skill_invocation_prompt(name: str, loaded: str) -> str:
+    """点名调用的技能 → 发给模型的提示文本。模型看到的就是 skill 工具加载的那份
+    （目录头 + 支持文件 + 正文），外加一句"这是用户点名要执行的"：和模型自己按
+    索引挑技能加载是两种语气。"""
+    return f"按下面这个技能的说明执行（用户以 /{name} 直接调用）：\n\n{loaded}"
+
+
+def skill_prompt(agent: Agent, line: str) -> str | None:
+    """`/<技能名> 参数…` → 展开成本轮提示文本（REPL / TUI 前端）。
+
+    返回 None = 这行不是技能调用（内建命令或没这个技能），交给 handle_slash；
+    返回空串 = 是技能调用但展开失败（已打印原因），本轮不发。
+    """
+    invocation = skill_invocation(agent, line)
+    if invocation is None:
+        return None
+    name, arguments = invocation
     result = agent._load_skill(name, arguments)  # noqa: SLF001 - 同包的前端入口
     if result.startswith("ERROR:"):
         print(ui.error(f"  {result}"))
         return ""
     print(ui.secondary(f"  已展开技能 {name}" + (f"（参数：{arguments}）" if arguments else "")))
-    #  模型看到的就是 skill 工具加载的那份（目录头 + 支持文件 + 正文），外加
-    #  一句"这是用户点名要执行的"：和模型自己按索引挑技能加载是两种语气
-    return f"按下面这个技能的说明执行（用户以 /{name} 直接调用）：\n\n{result}"
+    return skill_invocation_prompt(name, result)
 
 
 def handle_slash(agent: Agent, line: str, select: Any = None) -> bool:
