@@ -1817,6 +1817,38 @@ class Tui:
             if self._poller is not None:
                 self._poller.resume()
 
+    def secret_prompt(self, prompt: str, command: str) -> str | None:
+        """sudo 要密码（askpass 通道，见 askpass.py）：遮罩输入一行。
+
+        与 ask 同一纪律：停插话线程、收 spinner。密码只回给 sudo，不回显、不进
+        会话记录、不打进 scrollback；Esc / Ctrl-C / EOF = 取消，这次 sudo 失败。
+        """
+        if self._poller is not None:
+            self._poller.pause()
+        self.sink._stop_status()  # noqa: SLF001 - 同模块前端搭档
+        attention.waiting(attention.WAITING_INPUT)
+        try:
+            self.console.print(
+                Text(
+                    f"sudo 要密码（{prompt or 'Password:'}），正在跑：{ui.strip_controls(command)[:120]}"
+                    "——密码只交给 sudo，不记录；Esc 取消",
+                    style="text.secondary",
+                )
+            )
+            if self._confirm_session is None:
+                self._confirm_session = PromptSession()
+            try:
+                return self._confirm_session.prompt(
+                    [(theme.ptk("menu.title"), "  密码：")], is_password=True
+                )
+            except (EOFError, KeyboardInterrupt):
+                print()
+                return None
+        finally:
+            attention.running()
+            if self._poller is not None:
+                self._poller.resume()
+
     def _confirm_inner(self, name: str, args: dict[str, Any]) -> bool | str | tuple[bool, str]:
         #  预览被截断时拿到"补打全文"闭包，挂到菜单的 Ctrl-O 上——
         #  "还有 N 行"在确认框里同样得是可兑现的承诺，不能逼人盲批

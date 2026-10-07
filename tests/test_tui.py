@@ -1440,14 +1440,15 @@ class TestMakeFrontend(AgentTestCase):
         from xiaoyu.permissions import Permissions
 
         #  单测环境 stdin/stdout 不是 tty，应直接选明文 REPL 且不给提示
-        approver, sink, repl_fn, note, asker = make_frontend(Permissions(self.root))
+        approver, sink, repl_fn, note, asker, secret = make_frontend(Permissions(self.root))
         self.assertIsNone(sink)
         self.assertIs(repl_fn, repl)
         self.assertIsNone(note)
-        #  明文 REPL 也有人在：提问通道是编号问答，不是 None
-        from xiaoyu.cli import text_ask_questions
+        #  明文 REPL 也有人在：提问通道是编号问答，不是 None；sudo 密码通道同理
+        from xiaoyu.cli import text_ask_questions, text_secret_prompt
 
         self.assertIs(asker, text_ask_questions)
+        self.assertIs(secret, text_secret_prompt)
 
     def test_no_tui_flag_forces_plain(self) -> None:
         from xiaoyu.permissions import Permissions
@@ -1455,7 +1456,7 @@ class TestMakeFrontend(AgentTestCase):
         with mock.patch("sys.stdin") as fake_in, mock.patch("sys.stdout") as fake_out:
             fake_in.isatty.return_value = True
             fake_out.isatty.return_value = True
-            approver, sink, repl_fn, note, asker = make_frontend(
+            approver, sink, repl_fn, note, asker, _secret = make_frontend(
                 Permissions(self.root), no_tui=True
             )
         self.assertIsNone(sink)
@@ -1469,9 +1470,10 @@ class TestMakeFrontend(AgentTestCase):
         with mock.patch("sys.stdin") as fake_in, mock.patch("sys.stdout") as fake_out:
             fake_in.isatty.return_value = True
             fake_out.isatty.return_value = True
-            approver, sink, repl_fn, note, asker = make_frontend(Permissions(self.root))
+            approver, sink, repl_fn, note, asker, secret = make_frontend(Permissions(self.root))
         self.assertIsInstance(sink, RichSink)
         self.assertIsNone(note)
+        self.assertEqual(secret.__name__, "secret_prompt")
         #  approver / repl / asker 来自同一个 Tui 实例
         self.assertEqual(approver.__self__, repl_fn.__self__)
         self.assertEqual(asker.__self__, repl_fn.__self__)

@@ -98,6 +98,8 @@ class E2ECase(unittest.TestCase):
             "XIAOYU_ENABLE_BROWSER": "0",
             #  沙箱可用性因机器而异（bwrap/Seatbelt），e2e 断言的不是沙箱
             "XIAOYU_SANDBOX": "0",
+            #  sudo 密码通道只在交互前端生效，e2e 没有前端；关掉以免哪天漂移
+            "XIAOYU_ENABLE_ASKPASS": "0",
             #  出厂起始档是 auto（工作区内改文件免确认），e2e 断言的是权限线协议，
             #  钉在确认档让每次写文件都走一遍 permission 请求；起始档本身由
             #  test_modes / test_user_config 锁

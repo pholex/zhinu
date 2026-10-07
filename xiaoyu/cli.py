@@ -1547,9 +1547,11 @@ def resume_command(argv: list[str]) -> int:
         permissions = Permissions.load(config.workspace, include_workspace=trust.trusted)
         if prompt:
             approver, sink = oneshot_frontend(permissions, args.output_format)
-            repl_fn, note, asker = repl, None, None
+            repl_fn, note, asker, secret_prompt = repl, None, None, None
         else:
-            approver, sink, repl_fn, note, asker = make_frontend(permissions, args.no_tui)
+            approver, sink, repl_fn, note, asker, secret_prompt = make_frontend(
+                permissions, args.no_tui
+            )
         peer = register_peer(config, interactive=not prompt)
         agent = Agent(
             config,
@@ -1561,6 +1563,7 @@ def resume_command(argv: list[str]) -> int:
             asker=asker,
             peer=peer,
         )
+        agent.toolbox.secret_prompt = secret_prompt
     except MissingConfig as exc:
         print(ui.error(str(exc)), file=sys.stderr)
         return 2
@@ -2355,17 +2358,19 @@ def _hint_keychain_leftover() -> None:
 
 
 def make_frontend(permissions: Permissions, no_tui: bool = False):
-    """选择交互前端，返回 (approver, sink, repl_fn, note, asker)。
+    """选择交互前端，返回 (approver, sink, repl_fn, note, asker, secret_prompt)。
 
     TUI 条件：未被 --no-tui 禁用 + stdin/stdout 都是真实终端 + 装了可选依赖
     （prompt_toolkit/rich）。任一不满足退回明文 REPL——sink=None 表示用
     Agent 默认的 PlainSink。note 是给用户的一行提示（当前仅"可装 TUI"）。
     asker 是 ask_user 工具的提问通道：TUI 走行内面板，明文 REPL 走编号问答
     ——交互前端总有人在，提问永远可用；headless 才是 None（工具不进 schemas）。
+    secret_prompt 是 sudo 要密码时的通道（见 askpass.py）：TUI 走遮罩输入框，
+    明文 REPL 走 getpass；同样只有 headless 是 None。
     """
     interactive = sys.stdin.isatty() and sys.stdout.isatty()
     if no_tui or not interactive:
-        return make_confirm(permissions), None, repl, None, text_ask_questions
+        return make_confirm(permissions), None, repl, None, text_ask_questions, text_secret_prompt
     #  探背景色定深浅配色。必须赶在建 Tui 之前——RichSink 构造时就把主题挂到
     #  Console 上了；也赶在横幅之前，那是全程唯一"用户还没开始打字"的窗口
     #  （探测要临时切 raw 模式读回答，抢跑的按键会被吃掉几个字符）
@@ -2380,9 +2385,10 @@ def make_frontend(permissions: Permissions, no_tui: bool = False):
             repl,
             f"提示：{envprobe.install_hint('xiaoyu-agent[tui]')} 可获得补全/历史/粘贴折叠",
             text_ask_questions,
+            text_secret_prompt,
         )
     front = tui.Tui(permissions)
-    return front.confirm, front.sink, front.run, None, front.ask
+    return front.confirm, front.sink, front.run, None, front.ask, front.secret_prompt
 
 
 def compose_prompt(arg_words: list[str], piped: str) -> str:
@@ -2435,6 +2441,31 @@ def ask_one_text(item: dict[str, Any], position: str = "") -> str | None:
         picked = [labels[int(token) - 1] for token in tokens]
         return ", ".join(picked if multi else picked[:1])
     return answer
+
+
+def text_secret_prompt(prompt: str, command: str) -> str | None:
+    """明文 REPL 的 sudo 密码通道（见 askpass.py）：getpass 直接读终端、不回显。
+
+    密码只回给 sudo，不进会话记录；Ctrl-C / EOF = 取消，这次 sudo 失败。
+    """
+    import getpass
+
+    attention.waiting(attention.WAITING_INPUT)
+    try:
+        print(
+            ui.secondary(
+                f"sudo 要密码（{prompt or 'Password:'}），正在跑：{ui.strip_controls(command)[:120]}"
+                "——密码只交给 sudo，不记录；Ctrl-C 取消"
+            ),
+            file=sys.stderr,
+        )
+        try:
+            return getpass.getpass("  密码：")
+        except (EOFError, KeyboardInterrupt):
+            print(file=sys.stderr)
+            return None
+    finally:
+        attention.running()
 
 
 def text_ask_questions(questions: list[dict[str, Any]]) -> dict[str, str]:
@@ -2750,9 +2781,11 @@ def main(argv: list[str] | None = None) -> int:
         #  一次性模式不进 TUI：输出常被管道/重定向接走，格式由 --output-format 决定
         if prompt:
             approver, sink = oneshot_frontend(permissions, args.output_format)
-            repl_fn, note, asker = repl, None, None
+            repl_fn, note, asker, secret_prompt = repl, None, None, None
         else:
-            approver, sink, repl_fn, note, asker = make_frontend(permissions, args.no_tui)
+            approver, sink, repl_fn, note, asker, secret_prompt = make_frontend(
+                permissions, args.no_tui
+            )
         try:
             session_log, restored = open_session(config, args.session_id)
         except (ValueError, SessionLockedError) as exc:
@@ -2770,6 +2803,8 @@ def main(argv: list[str] | None = None) -> int:
             asker=asker,
             peer=peer,
         )
+        #  sudo 的密码通道只接在主 agent 的工具箱上：子 agent 没有前端可问
+        agent.toolbox.secret_prompt = secret_prompt
     except MissingConfig as exc:
         print(ui.error(str(exc)), file=sys.stderr)
         return 2
