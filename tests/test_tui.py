@@ -1811,3 +1811,108 @@ class TestSearchSelect(unittest.TestCase):
         self.assertNotIn("Tab", text_all)
         #  不同匹配数下行数一致（标题 + 过滤行 + visible + 提示）
         self.assertEqual(text_all.count("\n"), 5 + 2)
+
+
+@unittest.skipUnless(HAS_TUI, "未安装 tui 可选依赖")
+class TestEditDiffOnCompletion(AgentTestCase):
+    """没经确认框预览就放行的编辑（auto / --yolo / allow 规则）：完成行带 +N −M，
+    diff 折叠进留底（Ctrl-O 回放带红绿）或 detail 下直接展开。"""
+
+    def make_sink(self):
+        from rich.console import Console
+
+        from xiaoyu.tui import RichSink
+
+        buffer = io.StringIO()
+        sink = RichSink(Console(file=buffer, soft_wrap=True, highlight=False, width=100))
+        sink.workspace = self.root
+        sink.begin_turn()
+        return sink, buffer
+
+    def test_str_replace_counts_and_folded_diff(self) -> None:
+        from xiaoyu.events import ToolCompleted, ToolPending
+
+        sink, buffer = self.make_sink()
+        sink.emit(ToolPending("str_replace", {"path": "calc.py", "old_str": "a\nfoo = 1\nb", "new_str": "a\nfoo = 2\nb"}))
+        sink.emit(ToolCompleted("str_replace", output="已替换 calc.py 第 2 行处的内容\n改动后该处上下文：\nfoo = 2", ok=True, seconds=0.0))
+        out = buffer.getvalue()
+        self.assertIn("⎿ 已替换 calc.py", out)
+        self.assertIn("+1 −1", out)
+        #  diff 顶掉了"改动后上下文"那几行：未展开时都不在屏上
+        self.assertNotIn("改动后该处上下文", out)
+        self.assertEqual(len(sink.folded), 1)
+        anchor, rows = sink.folded[0]
+        self.assertIn("+1 −1", anchor)
+        styles = {style for row in rows for style, _t in row}
+        self.assertIn("diff.added", styles)
+        self.assertIn("diff.removed", styles)
+        sink.replay_folded()
+        out = buffer.getvalue()
+        self.assertIn("-foo = 1", out)
+        self.assertIn("+foo = 2", out)
+
+    def test_write_file_reads_previous_content_from_workspace(self) -> None:
+        from xiaoyu.events import ToolCompleted, ToolPending
+
+        (self.root / "notes.md").write_text("one\ntwo\n", encoding="utf-8")
+        sink, buffer = self.make_sink()
+        #  相对路径按工作区解析，改前内容在工具动手之前读到
+        sink.emit(ToolPending("write_file", {"path": "notes.md", "content": "one\nthree\nfour\n"}))
+        sink.emit(ToolCompleted("write_file", output="已覆盖 notes.md：15 字符 / 3 行", ok=True, seconds=0.0))
+        self.assertIn("+2 −1", buffer.getvalue())
+        #  新建文件：全是 +，没有假的 "-" 空行
+        sink2, buffer2 = self.make_sink()
+        sink2.emit(ToolPending("write_file", {"path": "brand_new.txt", "content": "x\ny"}))
+        sink2.emit(ToolCompleted("write_file", output="已创建 brand_new.txt：3 字符 / 2 行", ok=True, seconds=0.0))
+        self.assertIn("+2 −0", buffer2.getvalue())
+
+    def test_previewed_in_confirm_box_is_not_repeated(self) -> None:
+        """确认框已把 diff 打进 scrollback 的，完成行不再补一份。"""
+        from xiaoyu.events import ToolCompleted, ToolPending
+
+        sink, buffer = self.make_sink()
+        sink.emit(ToolPending("str_replace", {"path": "calc.py", "old_str": "x = 1", "new_str": "x = 2"}))
+        sink.note_previewed()
+        sink.emit(ToolCompleted("str_replace", output="已替换 calc.py 第 1 行处的内容\n上下文", ok=True, seconds=0.0))
+        out = buffer.getvalue()
+        self.assertNotIn("−", out)
+        self.assertEqual(sink.folded[0][1], ["上下文"])
+
+    def test_detail_mode_expands_diff_and_failure_has_no_counts(self) -> None:
+        from xiaoyu.events import ToolCompleted, ToolPending
+
+        sink, buffer = self.make_sink()
+        sink.detail = True
+        sink.emit(ToolPending("str_replace", {"path": "calc.py", "old_str": "x = 1", "new_str": "x = 2"}))
+        sink.emit(ToolCompleted("str_replace", output="已替换 calc.py 第 1 行处的内容", ok=True, seconds=0.0))
+        out = buffer.getvalue()
+        self.assertIn("+1 −1", out)
+        self.assertIn("+x = 2", out)
+        self.assertEqual(sink.folded, [])
+        #  失败：没有改动，不报计数；快照用完即清，下一个工具不受影响
+        sink2, buffer2 = self.make_sink()
+        sink2.emit(ToolPending("str_replace", {"path": "calc.py", "old_str": "x = 1", "new_str": "x = 2"}))
+        sink2.emit(ToolCompleted("str_replace", output="ERROR: 文件不存在", ok=False, seconds=0.0))
+        self.assertNotIn("−", buffer2.getvalue())
+        self.assertIsNone(sink2._edit)
+
+    def test_confirm_flow_marks_preview(self) -> None:
+        """走确认框的编辑：预览打过之后 sink 的快照被清，完成行不重复。"""
+        from xiaoyu.events import ToolPending
+        from xiaoyu.tui import Tui
+        from xiaoyu.permissions import Permissions
+        from rich.console import Console
+
+        tui = Tui(Permissions(self.root), console=Console(file=io.StringIO(), soft_wrap=True))
+        tui.agent = self.build([])
+        tui.sink.emit(ToolPending("str_replace", {"path": "calc.py", "old_str": "x = 1", "new_str": "x = 2"}))
+        self.assertIsNotNone(tui.sink._edit)
+        with mock.patch.object(tui, "_inline_select", return_value="once"):
+            tui.confirm("str_replace", {"path": "calc.py", "old_str": "x = 1", "new_str": "x = 2"})
+        self.assertIsNone(tui.sink._edit)
+
+    def test_diff_rows_treat_empty_side_as_absent(self) -> None:
+        from xiaoyu.tui import _diff_counts, _diff_rows
+
+        self.assertEqual(_diff_counts(_diff_rows("", "a\nb", 80)), (2, 0))
+        self.assertEqual(_diff_counts(_diff_rows("a\nb", "", 80)), (0, 2))

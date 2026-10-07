@@ -29,6 +29,9 @@ ImportError，cli 捕获后自动退回明文 REPL。
 工具与确认框的细节打磨：
 - 连续只读工具（read_file/grep/list_files）折叠成一行汇总，结果统一 ⎿ 缩进，
   终态按 成功绿/失败红/拒绝黄 着色；detail 模式（Ctrl-O）成功输出不再截断；
+- 没经确认框预览就放行的编辑（auto / --yolo / allow 规则）：完成行带 +N −M，
+  diff 当作这次调用的详情折叠进留底（Ctrl-O 回放带红绿）。write_file 的改前内容
+  在 pending 时读磁盘（工具动手之前）；确认框预览过的不重复补；
 - 确认框：问句带宾语（"要修改 foo.py 吗？"）、「总是允许」的规则写入前可编辑、
   Tab = 批准并附言（附言随 tool result 回灌模型）、diff 预览加配对行词级高亮
   （变化占比超 40% 回退整行红绿）；
@@ -142,6 +145,23 @@ _DIFF_CAP = 40
 _CONFIRM_CHROME = 12
 #  diff 比对的输入上限（新旧两边行数之和）：超过就不跑 difflib，见 _diff_rows
 _DIFF_INPUT_LINES = 1500
+#  write_file 覆盖已有文件时为了算 diff 读原文的体积上限：再大就只报新内容行数
+_EDIT_SNAPSHOT_CAP = 2 * 1024 * 1024
+#  完成行上补 diff 的工具：没经确认框预览（auto / --yolo / allow 规则放行）时，
+#  这是用户看到"改了什么"的唯一机会
+_EDIT_TOOLS = ("write_file", "str_replace")
+
+
+def _diff_counts(rows: list[list[tuple[str, str]]]) -> tuple[int, int]:
+    """diff 行里的 +N / −M（按行首记号数，词级高亮行的首片段同样带记号）。"""
+    added = removed = 0
+    for row in rows:
+        first = row[0][1] if row else ""
+        if first.startswith("+"):
+            added += 1
+        elif first.startswith("-"):
+            removed += 1
+    return added, removed
 
 
 def _word_fragments(old: str, new: str) -> tuple[list[tuple[str, str]], list[tuple[str, str]]]:
@@ -180,7 +200,10 @@ def _diff_rows(
     """
     rows: list[list[tuple[str, str]]] = []
     inner = max(width - 1, 20)
-    old_lines, new_lines = old.split("\n"), new.split("\n")
+    #  空串是"没有这一侧"（新建文件 / 整段删除），不是"一行空行"——否则新建文件
+    #  会多出一行假的 "-"，计数也跟着错一
+    old_lines = old.split("\n") if old else []
+    new_lines = new.split("\n") if new else []
     if len(old_lines) + len(new_lines) > _DIFF_INPUT_LINES:
         #  有界：difflib 在两坨几千行且彼此相似的文本上是平方级的，确认框会卡在
         #  "算 diff"上没有任何回显。改动这么大时逐行比对也没人看得过来——
@@ -1235,10 +1258,17 @@ class RichSink:
         #  被折叠内容的留底：(锚点行, 正文行)。inline 模式改不了已打出的
         #  scrollback，但可以往后补打——Ctrl-O 开详情时回放这份留底，
         #  "还有 N 行"才不是一句永远兑现不了的空话
-        self.folded: list[tuple[str, list[str]]] = []
+        #  正文行是 str，或 (样式, 文本) 片段序列（编辑工具的 diff 行要带红绿）
+        self.folded: list[tuple[str, list[Any]]] = []
         #  折叠组内只读调用的参数预览（顺序执行，pending→completed 严格配对，
         #  单格暂存即可）：回放时锚点行要能自报家门
         self._pending_ro = ""
+        #  编辑类工具 pending 时拍的快照 (路径, 改前, 改后)：完成时据此算 +N −M 与 diff。
+        #  write_file 的"改前"要在工具动手之前读磁盘，所以必须在 pending 时取。
+        #  确认框已经把 diff 预览打进 scrollback 的，note_previewed 会清掉它，不重复补
+        self._edit: tuple[str, str, str] | None = None
+        #  相对路径按工作区解析（Tui.run 回填）；没有就按当前目录
+        self.workspace: Path | None = None
         #  超时上限（Tui.run 拿到 agent 后回填）：spinner 跑久了要报预算，
         #  "还剩多少"才是用户判断该不该继续等的依据
         self.bash_timeout: int | None = None
@@ -1290,8 +1320,13 @@ class RichSink:
         """中断/异常路径的清扫：spinner 若还在转就停掉，折叠组落盘，避免悬空。"""
         self._stop_status()
         self._preparing_request = False
+        self._edit = None
         self._flush_text()
         self._flush_ro_group()
+
+    def note_previewed(self) -> None:
+        """确认框已把这次编辑的预览（diff / 新内容）打进 scrollback：完成行不再补。"""
+        self._edit = None
 
     def _flush_text(self) -> None:
         """把行级渲染器攒着的半行打出去（TextEnd / 中断都要调：没有换行的末行
@@ -1406,6 +1441,7 @@ class RichSink:
             )
             return
         self._flush_ro_group()
+        self._edit = self._edit_snapshot(event.name, event.args) if event.name in _EDIT_TOOLS else None
         #  "● 工具名 " 之后才是参数预览，预算要把这一截先扣掉
         preview = args_preview(
             event.name, event.args, len(self.indent) + len(event.name) + 3, self.console.width
@@ -1416,6 +1452,27 @@ class RichSink:
                 (f" {preview}", "text.secondary"),
             )
         )
+
+    def _edit_snapshot(self, name: str, args: dict[str, Any]) -> tuple[str, str, str] | None:
+        """编辑动手之前记下 (路径, 改前, 改后)。str_replace 两边都在参数里；
+        write_file 的改前要读磁盘——读不到（不存在 = 新建）按空处理，太大或不是
+        普通文件就放弃 diff（完成行照旧，只是没有 +N −M）。"""
+        path = str(args.get("path", ""))
+        if name == "str_replace":
+            return (path, str(args.get("old_str", "")), str(args.get("new_str", "")))
+        content = str(args.get("content", ""))
+        target = Path(path).expanduser()
+        if not target.is_absolute():
+            target = (self.workspace or Path.cwd()) / target
+        try:
+            if not target.exists():
+                return (path, "", content)
+            if not target.is_file() or target.stat().st_size > _EDIT_SNAPSHOT_CAP:
+                return None
+            previous = target.read_bytes().decode("utf-8", errors="replace")
+        except OSError:
+            return None
+        return (path, previous, content)
 
     def _tool_purpose(self, event: ToolPurpose) -> None:
         self._flush_ro_group()
@@ -1459,22 +1516,33 @@ class RichSink:
         self._flush_ro_group()
         lines = event.output.split("\n")
         duration = f" · {event.seconds:.1f}s" if event.seconds >= 0.05 else ""
+        edit, self._edit = self._edit, None
         if event.ok:
+            #  没经确认框预览就放行的编辑：完成行带 +N −M，diff 当作这次调用的详情
+            #  （折叠进留底 / detail 下直接展开），顶掉工具输出里"改动后上下文"那几行——
+            #  那是给模型看的，用户看 diff 更直接
+            diff_rows: list[list[tuple[str, str]]] = []
+            counts = ""
+            if edit is not None and event.name in _EDIT_TOOLS:
+                diff_rows = _diff_rows(edit[1], edit[2], self._budget(4), cap=None)
+                added, removed = _diff_counts(diff_rows)
+                counts = f" · +{added} −{removed}"
             head = Text()
             head.append(f"{self.indent}  ")
             head.append("⎿ ", style="status.success")
             #  预算扣掉 "  ⎿ " 与耗时后缀，摘要才真的是一行
-            summary = ui.preview(lines[0], self._budget(4 + len(duration)))
-            head.append(f"{summary}{duration}", style="text.secondary")
+            summary = ui.preview(lines[0], self._budget(4 + len(duration) + len(counts)))
+            head.append(f"{summary}{counts}{duration}", style="text.secondary")
+            rest: list[Any] = diff_rows if diff_rows else lines[1:]
             #  还有内容被折叠时说清藏了多少（…+N 行）；
             #  「怎么看」不在这里重复，攒到一轮收尾统一提一次
-            if len(lines) > 1 and not self.detail:
-                head.append(f" · 还有 {len(lines) - 1} 行", style="text.secondary")
+            if rest and not self.detail:
+                head.append(f" · 还有 {len(rest)} 行", style="text.secondary")
                 self.truncated = True
-                self.folded.append((f"⎿ {summary}{duration}", lines[1:]))
+                self.folded.append((f"⎿ {summary}{counts}{duration}", rest))
             self.console.print(head)
             if self.detail and self.verbose:
-                self._expand(lines[1:], None)
+                self._expand(rest, None)
         else:
             #  出错自动展开：错误详情是用户必须看的，不该藏在折叠行后面
             first = ui.preview(lines[0], self._budget(4 + len(duration)))
@@ -1496,22 +1564,25 @@ class RichSink:
             self.console.print(Text(f"{self.indent}  {anchor}", style="text.secondary"))
             budget = self._budget(4)
             for row in rows[: self._REPLAY_LINES]:
-                self.console.print(
-                    Text(f"{self.indent}    {ui.preview(row, budget)}", style="text.secondary")
-                )
+                self.console.print(self._folded_row(row, budget))
             if len(rows) > self._REPLAY_LINES:
                 hidden = len(rows) - self._REPLAY_LINES
                 self.console.print(
                     Text(f"{self.indent}    …还有 {hidden} 行", style="text.secondary")
                 )
 
-    def _expand(self, rows: list[str], cap: int | None) -> None:
+    def _folded_row(self, row: Any, budget: int) -> Text:
+        """留底里的一行：普通输出是 str（弱化显示），diff 行是 (样式, 文本) 片段序列
+        （已按宽度截过，红绿原样）。"""
+        if isinstance(row, str):
+            return Text(f"{self.indent}    {ui.preview(row, budget)}", style="text.secondary")
+        return Text.assemble((f"{self.indent}    ", ""), *[(text, style) for style, text in row])
+
+    def _expand(self, rows: list[Any], cap: int | None) -> None:
         shown = rows if cap is None else rows[:cap]
         budget = self._budget(4)
         for row in shown:
-            self.console.print(
-                Text(f"{self.indent}    {ui.preview(row, budget)}", style="text.secondary")
-            )
+            self.console.print(self._folded_row(row, budget))
         if len(rows) > len(shown):
             self.truncated = True
             self.console.print(
@@ -1520,6 +1591,7 @@ class RichSink:
 
     def _tool_denied(self, event: ToolDenied) -> None:
         self._stop_status()
+        self._edit = None
         self._flush_ro_group()
         word = "命中 deny 规则被拦截" if event.by == "rule" else "被用户拒绝"
         self.console.print(Text(f"{self.indent}  ⨯ {event.name} {word}，未执行", style="status.warning"))
@@ -2387,12 +2459,14 @@ class Tui:
         shown = render.clean_value(args)
         if name == "write_file":
             expand = self._preview_write(str(shown.get("path", "")), str(shown.get("content", "")))
+            self.sink.note_previewed()
         elif name == "str_replace":
             expand = self._preview_replace(
                 str(shown.get("path", "")),
                 str(shown.get("old_str", "")),
                 str(shown.get("new_str", "")),
             )
+            self.sink.note_previewed()
         elif name == "bash":
             #  升权申请先于命令风险点名：按下"允许"批的是"这次不套沙箱"，
             #  而不只是这条命令本身，用户得在按键前看到
@@ -2726,6 +2800,7 @@ class Tui:
         self.agent = agent
         self.sink.bash_timeout = agent.config.bash_timeout
         self.sink.request_timeout = int(agent.config.request_timeout)
+        self.sink.workspace = Path(agent.config.workspace)
         if agent.config.unguarded:
             from . import guardrails
 
