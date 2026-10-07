@@ -268,6 +268,55 @@ class TestTuiFrontend(AgentTestCase):
         document = Document(text, cursor_position=len(text))
         return [item.text for item in completer.get_completions(document, None)]
 
+    def test_ctrl_c_keeps_the_cleared_draft_for_recall(self) -> None:
+        """单次 Ctrl-C 清掉的半截输入存进 Esc-Esc 的取回槽，不加新键。"""
+        agent = self.build([])
+        tui = self.make_tui(agent)
+
+        class _Buffer:
+            text = "  写到一半的话  "
+
+        class _Session:
+            default_buffer = _Buffer()
+            calls = 0
+
+            def prompt(self, *args, **kwargs):
+                self.calls += 1
+                if self.calls == 1:
+                    raise KeyboardInterrupt
+                raise EOFError
+
+        session = _Session()
+        with mock.patch.object(tui, "_input_session", return_value=session), mock.patch(
+            "builtins.print"
+        ):
+            self.assertEqual(tui._run_loop(agent), 0)
+        self.assertEqual(tui._last_input, "写到一半的话")
+        self.assertIn("Esc Esc 可取回", tui.console.file.getvalue())
+
+    def test_ctrl_c_on_an_empty_line_does_not_touch_recall(self) -> None:
+        agent = self.build([])
+        tui = self.make_tui(agent)
+        tui._last_input = "上一条"
+
+        class _Buffer:
+            text = ""
+
+        class _Session:
+            default_buffer = _Buffer()
+            calls = 0
+
+            def prompt(self, *args, **kwargs):
+                self.calls += 1
+                raise KeyboardInterrupt if self.calls == 1 else EOFError
+
+        with mock.patch.object(tui, "_input_session", return_value=_Session()), mock.patch(
+            "builtins.print"
+        ):
+            tui._run_loop(agent)
+        self.assertEqual(tui._last_input, "上一条")
+        self.assertNotIn("可取回", tui.console.file.getvalue())
+
     def test_slash_command_completion(self) -> None:
         tui = self.make_tui()
         self.assertIn("/model", self.completions(tui, "/mo"))

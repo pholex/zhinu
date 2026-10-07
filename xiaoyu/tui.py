@@ -2210,7 +2210,15 @@ class Tui:
                     print()
                     return 0
                 last_interrupt = now
-                self.console.print(Text("  再按一次 Ctrl-C 退出", style="text.secondary"))
+                #  Ctrl-C 清掉的半截输入先存进 Esc-Esc 的取回槽：误按一下不该让敲了
+                #  一半的话凭空消失，也不为此加新键。prompt_toolkit 要到下一次
+                #  prompt() 才重置 buffer，此刻正文还在
+                draft = session.default_buffer.text.strip()
+                hint = "  再按一次 Ctrl-C 退出"
+                if draft:
+                    self._last_input = draft
+                    hint += "（刚才的输入 Esc Esc 可取回）"
+                self.console.print(Text(hint, style="text.secondary"))
                 continue
 
             #  提交路由单点在 keys.classify_input：TUI 与明文 REPL 同一张表
