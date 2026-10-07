@@ -135,7 +135,7 @@ XIAOYU_API_KEY=<key>
 | `XIAOYU_HARDLINE` | bash 硬红线（`rm -rf /`、`mkfs`、`dd of=/dev/…`，默认开、任何模式都拦）；`0` = 关，给隔离环境里的镜像烧录 / 格式化用（见[安全](security.md)） |
 | `XIAOYU_UNATTENDED` | **默认关**，`1` = 开：`--yolo` 下仍必问的三项（`exit_plan_mode`、沙箱升权、写可执行配置）也不再问；等价命令行 `--unattended` |
 | `XIAOYU_UNGUARDED` | `--unguarded` 无护栏预设的**环境同意**：只认真实环境变量、不读 `.env`，由容器 / VM 编排脚本注入；没有它 `--unguarded` 报错退出（见[安全](security.md)） |
-| `XIAOYU_ENABLE_HOOKS` | 用户级 `hooks.toml` 生命周期钩子（PreToolUse / PostToolUse / UserPromptSubmit / Stop；退出码 2 = 拦截，其它失败 fail-open 放行）。样本：[examples/hooks/adversary](../examples/hooks/adversary/)——bash 命令交给另一次 `xiaoyu -p` 做二审 |
+| `XIAOYU_ENABLE_HOOKS` | 用户级 `hooks.toml` 生命周期钩子（工具前后 / 用户输入 / 收尾 / 会话起止 / 子 agent 起止 / 压缩前后，见下文事件表；退出码 2 = 拦截，其它失败 fail-open 放行）。样本：[examples/hooks/adversary](../examples/hooks/adversary/)——bash 命令交给另一次 `xiaoyu -p` 做二审 |
 | `XIAOYU_ENABLE_AGENTS` | 声明式 subagent（`agents/*.toml`）与七襄并行织造模式（见[多 agent 协同](multi-agent.md)） |
 | `XIAOYU_ENABLE_CHENSHU` | 宸枢统筹织造模式（见[多 agent 协同](multi-agent.md)） |
 | `XIAOYU_SUBAGENT_MAX_DEPTH` | 子 agent 嵌套深度上限（默认 `1` = 不套娃）；设 2/3 显式放开有界嵌套 |
@@ -265,7 +265,7 @@ xiaoyu --system-prompt-file ~/prompts/writer.md
 
   边界刻意收得窄，宁可少剥不错剥：`<!--` 要在行首（前面只许空白）、`-->` 之后到行尾只许空白才算；行内夹着的 `a <!-- b --> c` 不动；代码围栏（` ``` ` / `~~~`）里的不动，那是给模型看的示例。`<!--` 没闭合时**不剥**并在启动时警告行号——否则漏写一个 `-->`，后半份提示词就悄悄没了。只有两个 `-file` 旗标认注释，`--system-prompt` / `--append-system-prompt` 给的文本原样使用；
 - 正文里还留着 `{{…}}` 形态的占位符时，启动会提醒一句（多半是模板没填完）；只提醒，不改内容；
-- 自定义提示词**全文记进会话文件**：`xiaoyu resume` 和 `--session-id` 续写时不必再给旗标，沿用原来那份；重新给了就以新给的为准。存全文而不是路径，是为了文件挪走、改过之后旧会话仍能原样接回；
+- 自定义提示词**全文记进会话文件**：`xiaoyu resume` 和 `--session-id` 续写时不必再给旗标，沿用原来那份；重新给了就以新给的为准。模型与交互模式同一纪律：`xiaoyu resume` 默认跟随旧会话最后生效的模型与模式（`/model`、降级链、plan 进出都有留痕；与 ACP `session/load`、`@x` 接回同口径），`--model` / `--mode` 显式给了才覆盖。存全文而不是路径，是为了文件挪走、改过之后旧会话仍能原样接回；
 - 提示词常驻每一轮请求，长度直接计入上下文与费用；`/context` 里它单列为"自定义身份"一行；
 - 库层嵌入对应 `Config(system_prompt=...)`，ACP（`xiaoyu acp`）同样认这组旗标。`xiaoyu serve` 的 agent 对象目前只有 `append_system_prompt`。
 
@@ -406,6 +406,8 @@ server 的**结果**默认包进 `<untrusted_content>` 回灌（里面的指令�
 外加一句"用户点名要执行"）。斜杠名字空间里**内建命令优先**：技能叫 `help` 也遮不住 `/help`，
 要写 `/skill:help`；`/skills` 列表会标出撞名的技能，TUI 补全里技能也列在内建命令之后
 （撞名的以 `/skill:` 形态出现）。`/skill:` 前缀下找不到技能报错，不回落到内建命令。
+ACP 客户端（Zed 等）建会话时收到的命令菜单里也列出技能（描述带 `[Skill]` 标记，撞名的同样是
+`skill:<名>`），选中后附参数即按同一规则展开；装了新技能重开会话即可见。
 
 ## 生命周期钩子（hooks.toml）
 
@@ -436,6 +438,10 @@ hook 是辅助护栏，deny 规则才是硬闸。`on_failure = "block"` 反过�
 | `Stop` | 模型想收尾时；拦截 → 理由作为消息顶回去续跑一步（每轮一次） | `last_text` |
 | `SessionStart` | 会话首轮之前一次（接回历史之后；子 agent 不触发）；拦截 → 拒绝启动 | `model`、`session` |
 | `SessionEnd` | 会话正常收尾一次，结果不影响退出 | `model`、`session` |
+| `SubagentStart` | 主会话委托子 agent 之前；拦截 → 这次委托不执行，模型收到委托失败自行改道 | `agent` |
+| `SubagentEnd` | 子 agent 收工之后的通知；拦截只在委托结果里留一条附注 | `agent`、`failed` |
+| `BeforeCompact` | 要压缩上下文之前；拦截 → 不压缩、本次压缩以异常中止（上下文已超窗时这一轮无法继续，只给「压缩前必须先归档」之类的硬需求用） | `context_tokens`、`forced` |
+| `AfterCompact` | 压缩完成之后的通知 | `changed`、`method`（`microcompact` / `summary`） |
 
 同一次工具调用的 `PreToolUse` / `PostToolUse` / `ToolFailed` 带**同一个 `call_id`**，外部钩子
 靠它把"要跑什么"和"跑出了什么"对上（并行工具调用下光靠工具名对不上）。`SessionStart` 放行时，

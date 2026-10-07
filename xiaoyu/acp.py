@@ -502,11 +502,21 @@ _ACP_COMMANDS: tuple[AcpCommand, ...] = (
 )
 
 
-def available_commands() -> list[dict[str, Any]]:
-    """available_commands_update 的载荷。描述从 cli.SLASH_COMMANDS 取
-    （懒 import：cli 只在 acp_main 里懒 import 本模块，运行期必已加载；
-    键缺失直接 KeyError——两张表脱节该在测试里炸出来，不静默降级）。"""
-    from .cli import SLASH_COMMANDS
+#  技能命令在 client 菜单里的标记：与内建命令同列，用户得一眼分出哪些是自己的技能
+SKILL_COMMAND_TAG = "[Skill]"
+
+
+def available_commands(agent: "Agent | None" = None) -> list[dict[str, Any]]:
+    """available_commands_update 的载荷：内建命令 + 该会话可用的技能。
+
+    内建描述从 cli.SLASH_COMMANDS 取（懒 import：cli 只在 acp_main 里懒 import
+    本模块，运行期必已加载；键缺失直接 KeyError——两张表脱节该在测试里炸出来，
+    不静默降级）。技能照 REPL 的 `/<技能名>` 名字空间下发：内建永远优先，与内建
+    撞名的技能挂在 `skill:<名>` 下（与 cli.SKILL_SLASH_PREFIX 同一规则）；描述
+    带 [Skill] 标记，input.hint 提示可带参数。技能列表按会话取——装了新技能
+    重开会话即可见。
+    """
+    from .cli import SLASH_COMMANDS, skill_shadowed
 
     entries: list[dict[str, Any]] = []
     for command in _ACP_COMMANDS:
@@ -517,7 +527,30 @@ def available_commands() -> list[dict[str, Any]]:
         if command.hint:
             entry["input"] = {"hint": command.hint}
         entries.append(entry)
+    for skill in getattr(agent, "skills", None) or []:
+        name = f"skill:{skill.name}" if skill_shadowed(skill.name) else skill.name
+        description = skill.description or str(skill.path)
+        entries.append(
+            {
+                "name": name,
+                "description": f"{SKILL_COMMAND_TAG} {description}",
+                "input": {"hint": "参数（可选；正文里的 $ARGUMENTS / $1 用它填）"},
+            }
+        )
     return entries
+
+
+def _skill_prompt(agent: Agent, text: str) -> str | None:
+    """prompt 文本是 `/<技能名> …` 时展开成提示；不是技能调用回 None，
+    展开失败回 `ERROR:` 开头的说明（调用方原样回给 client）。"""
+    from .cli import skill_invocation, skill_invocation_prompt
+
+    invocation = skill_invocation(agent, text)
+    if invocation is None:
+        return None
+    name, arguments = invocation
+    loaded = agent._load_skill(name, arguments)  # noqa: SLF001 - 同包的前端入口
+    return loaded if loaded.startswith("ERROR:") else skill_invocation_prompt(name, loaded)
 
 
 def match_command(text: str) -> tuple[AcpCommand, str] | None:
@@ -1561,7 +1594,7 @@ class AcpServer:
                 "modes": mode_state(session.agent),
             },
         )
-        self._advertise_commands(session_id)
+        self._advertise_commands(session_id, session.agent)
 
     def _handle_load_session(self, req_id: Any, params: dict[str, Any]) -> None:
         workspace = self._workspace_from(req_id, params)
@@ -1606,7 +1639,7 @@ class AcpServer:
                 "modes": mode_state(session.agent),
             },
         )
-        self._advertise_commands(session_id)
+        self._advertise_commands(session_id, session.agent)
 
     def _client_servers(self, params: dict[str, Any]) -> "list[mcp.ServerSpec]":
         """client 随 session/new、session/load 下发的 mcpServers。
@@ -1619,16 +1652,16 @@ class AcpServer:
             print(f"acp：client 下发的 MCP server 跳过 —— {note}", file=sys.stderr)
         return specs
 
-    def _advertise_commands(self, session_id: str) -> None:
+    def _advertise_commands(self, session_id: str, agent: Agent) -> None:
         """session 建好后广告斜杠命令（notification，跟在回包之后）。
-        命令集是静态的，每 session 广告一次即可。"""
+        内建命令集是静态的，技能按该会话的 Agent 取；每 session 广告一次。"""
         self._notify(
             "session/update",
             {
                 "sessionId": session_id,
                 "update": {
                     "sessionUpdate": "available_commands_update",
-                    "availableCommands": available_commands(),
+                    "availableCommands": available_commands(agent),
                 },
             },
         )
@@ -1774,6 +1807,14 @@ class AcpServer:
                 command, args = matched
                 output = command.run(agent, args)
                 session.sink.emit(TextDelta(output if output.strip() else "（无输出）"))
+            elif isinstance(content, str) and (skill := _skill_prompt(agent, content)) is not None:
+                #  `/<技能名> 参数`：与 REPL 同一名字空间，展开后当本轮用户输入发给
+                #  模型（进历史）。展开失败只回错误文本，不进模型
+                if skill.startswith("ERROR:"):
+                    session.sink.emit(TextDelta(skill))
+                else:
+                    agent.send(skill)
+                    stop_reason = _STOP_REASONS.get(str(getattr(agent, "last_stop", "")), "end_turn")
             else:
                 agent.send(_degrade_images(session, content))
                 #  怎么停的如实报：撞轮数上限、预算用尽都不是"模型说完了"
