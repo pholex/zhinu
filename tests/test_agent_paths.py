@@ -1178,6 +1178,59 @@ class TestRepairHistory(AgentTestCase):
         )
 
 
+class NoToolsReplyTest(AgentTestCase):
+    """无工具请求（收尾/摘要）收到 tool_calls：当场剥掉，不留悬空调用。"""
+
+    def _call(self):
+        return call_fragment(0, "c1", "bash", '{"command": "ls"}')
+
+    def _notices(self, agent):
+        seen: list[str] = []
+        original = agent.emit
+
+        def spy(event):
+            seen.append(getattr(event, "text", ""))
+            return original(event)
+
+        agent.emit = spy  # type: ignore[method-assign]
+        return seen
+
+    def test_text_with_tool_calls_keeps_only_text(self) -> None:
+        script = [[chunk(content="收尾说明"), chunk(tool_calls=[self._call()]), usage_chunk(100, 10)]]
+        agent = self.build(script)
+        notices = self._notices(agent)
+        with contextlib.redirect_stdout(io.StringIO()):
+            message = agent._stream_once(agent._main_route(), with_tools=False)
+        self.assertEqual(message["content"], "收尾说明")
+        self.assertNotIn("tool_calls", message)
+        self.assertTrue(any("已忽略" in text and "bash" in text for text in notices))
+
+    def test_empty_text_with_tool_calls_gets_fixed_note(self) -> None:
+        from xiaoyu.agent import NO_TOOLS_TOOL_CALL_NOTE
+
+        script = [[chunk(tool_calls=[self._call()]), usage_chunk(100, 10)]]
+        agent = self.build(script)
+        with contextlib.redirect_stdout(io.StringIO()):
+            message = agent._stream_once(agent._main_route(), with_tools=False)
+        self.assertEqual(message["content"], NO_TOOLS_TOOL_CALL_NOTE)
+        self.assertNotIn("tool_calls", message)
+        #  入历史后没有悬空调用：_repair_history 无事可做
+        agent._record_reply(message)
+        before = list(agent.messages)
+        agent._repair_history()
+        self.assertEqual(agent.messages, before)
+        self.assertFalse(any(m.get("role") == "tool" for m in agent.messages))
+        self.assertFalse(any(m.get("tool_calls") for m in agent.messages))
+
+    def test_with_tools_request_still_records_tool_calls(self) -> None:
+        """对照：带工具的请求不受影响。"""
+        script = [[chunk(tool_calls=[self._call()]), usage_chunk(100, 10)]]
+        agent = self.build(script)
+        with contextlib.redirect_stdout(io.StringIO()):
+            message = agent._stream_once(agent._main_route(), with_tools=True)
+        self.assertEqual(len(message["tool_calls"]), 1)
+
+
 class TestTokenAnchor(AgentTestCase):
     """token 记账：服务端 usage 锚点 + 只估算其后新增。"""
 

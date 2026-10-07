@@ -54,7 +54,7 @@ from .compaction import (
 )
 from .config import EFFORT_LEVELS, Config, project_levels
 from .errors import Interrupted, classify
-from .providers import Registry, Route, UnknownModel
+from .providers import Registry, Route, UnknownModel, first_chunk_timeout, request_timeout
 from .permissions import Permissions, call_identity
 from .rewind import RewindResult
 from .events import (
@@ -341,6 +341,11 @@ WRAPUP_INSTRUCTION = """已达到本轮工具调用次数上限，请立刻停�
 3. 建议用户下一步怎么做（继续让你做？手动处理？换个思路？）"""
 
 #  token 软预算到线前的收尾指令：与轮数上限同一精神——交代现场，不静默截断
+#  无工具的收尾请求（with_tools=False）里模型仍回了 tool_calls 且没有正文时，
+#  入历史的固定正文：没有这句，用户这轮看不到任何交代，而 tool_calls 若照记
+#  又得靠下轮 _repair_history 补一条"已放弃"的假结果
+NO_TOOLS_TOOL_CALL_NOTE = "（模型在无工具的收尾请求里尝试调用工具，已忽略）"
+
 BUDGET_WRAPUP_INSTRUCTION = """本会话的 token 预算即将用尽，请立刻停止操作，不要再调用任何工具。
 直接用几句话总结：
 1. 已经完成了什么（具体到文件/改动）
@@ -1222,6 +1227,8 @@ class Agent:
         self._logged_baseline: dict[str, Any] | None = None
         #  发请求时的消息条数，usage 到达时用来落锚
         self._request_len = 0
+        #  上一次出网投影省略的图片张数：只在张数变化时提示一次，不每个请求唠叨
+        self._images_omitted_noticed = 0
         #  上一次真出了回复的路由 (provider, model)：下一次请求换了路由就给新模型补一句
         #  交代（见 _route_switch_note）。None = 本进程还没出过回复
         self._last_route: tuple[str, str] | None = None
@@ -4626,6 +4633,11 @@ class Agent:
             return None
         return self.registry.cache_bypass(route)
 
+    def _image_cap(self, route: Route) -> int:
+        """这次请求最多带几张图：全局上限与这家端点声明的上限取较小的非零值；0 = 不限。"""
+        caps = [cap for cap in (self.config.max_images_per_request, self.registry.max_images(route)) if cap > 0]
+        return min(caps) if caps else 0
+
     def _route_switch_note(self, route: Route) -> str:
         """这次请求的路由与上一次出回复的不同 → 给新模型的交代；相同返回空串。
 
@@ -4660,6 +4672,20 @@ class Agent:
         if switch_note:
             outgoing = [*self.messages, {"role": "user", "content": switch_note, OPERATOR_KEY: True}]
         self._request_len = len(outgoing)
+        #  图片张数投影：只作用于发出去的副本，历史与会话文件照旧带图（见 media.cap_images）。
+        #  条数不变，锚点下标仍对得上
+        outgoing, omitted = media.cap_images(outgoing, self._image_cap(route))
+        if omitted != self._images_omitted_noticed:
+            self._images_omitted_noticed = omitted
+            if omitted:
+                self.emit(
+                    Notice(
+                        f"[历史里的图片超过单次请求上限，较早的 {omitted} 张本次未发送"
+                        "（历史未改；/compact 可回收，或减少图片；"
+                        "XIAOYU_MAX_IMAGES_PER_REQUEST 可调，0 = 不限）]",
+                        "warn",
+                    )
+                )
 
         def settle() -> None:
             if switch_note:
@@ -4695,6 +4721,16 @@ class Agent:
             request[COMPACTION_KEY] = {
                 "trigger": int(self.config.compact_at * self.config.context_limit),
             }
+        #  首 chunk 看门狗：收紧这次请求的 read 超时（三条协议的 SDK 都认请求级
+        #  timeout 参数；为什么是收紧 read 见 providers.first_chunk_timeout）。
+        #  基准取 config.request_timeout 而不是 registry 的：宿主注入的 client
+        #  （SDK / 测试）自带超时，registry 那份只是出厂值，按它算会把宿主配的
+        #  更短超时反向放宽。超时落在首 chunk 之前才算看门狗触发，之后的仍是普通读超时
+        watchdog = first_chunk_timeout(
+            request_timeout(self.config.request_timeout), self.config.first_chunk_timeout
+        )
+        if watchdog is not None:
+            request["timeout"] = watchdog
         if bypass_cache and (body := self._cache_bypass_body(route)) is not None:
             #  只在空补全重发时绕开网关响应缓存：首发照常可命中——正常回复被缓存
             #  是省钱的，给每个请求都关掉读取等于白白放弃命中率、改变成本面。
@@ -4744,6 +4780,18 @@ class Agent:
                         "content": "".join(content_parts) + "\n[回答在此处被用户中断]",
                     }
                 )
+            raise
+        except Exception as exc:
+            if watchdog is not None and self._first_chunk_at is None and errors.is_timeout(exc):
+                #  一个流事件都没等到就超时，且是看门狗收紧的那个数在管：点名它。
+                #  分类仍是瞬时错误，重试 / 降级链照走
+                failure: Exception = errors.FirstChunkTimeout(
+                    f"{route.qualified} 首 chunk 等待超过 {self.config.first_chunk_timeout:.0f}s"
+                    "（XIAOYU_FIRST_CHUNK_TIMEOUT）"
+                )
+                self._request_failure = failure
+                raise failure from exc
+            self._request_failure = exc
             raise
         except BaseException as exc:
             self._request_failure = exc
@@ -4805,6 +4853,22 @@ class Agent:
             #  接下来怎么办（自动续写 / 到此为止）由轮循环说，这里只报事实
             self.emit(Notice(marker, "warn"))
 
+        if not with_tools and pending:
+            #  收尾/摘要这类"只许说话"的请求没带 tools，模型却回了 tool_calls：
+            #  不能执行（这一步本来就不许干活），照记入历史又会留下悬空调用、
+            #  靠下轮 _repair_history 补"已放弃"的假结果，用户这轮什么都看不到。
+            #  当场剥掉：正文留着，没正文就补一句固定交代，让这轮有个可见的收尾
+            names = ", ".join(
+                pending[index]["function"]["name"] or "?" for index in sorted(pending)
+            )
+            self.emit(
+                Notice(f"[模型在无工具的收尾请求里尝试调用工具（{names}），已忽略]", "warn")
+            )
+            if self.session_log:
+                self.session_log.event("tool_calls_without_tools", names=names)
+            pending = {}
+            if not text.strip():
+                text = NO_TOOLS_TOOL_CALL_NOTE
         if text or pending:
             #  空补全不算出了回复：它会被原地重发，交代留给真出内容的那次
             settle()
