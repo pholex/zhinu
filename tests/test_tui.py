@@ -1516,3 +1516,46 @@ class TestPrefixLexer(unittest.TestCase):
 
     def test_only_first_line_is_examined(self) -> None:
         self.assertEqual(self._fragments("第一行\n! 第二行", lineno=1), [("", "! 第二行")])
+
+
+@unittest.skipUnless(HAS_TUI, "未安装 tui 可选依赖")
+class TestNextStepSuggest(unittest.TestCase):
+    """输入行幽灵建议：空行给「接着问」第一条，敲字按前缀选，都不中退回历史。"""
+
+    def _suggester(self, items: list[str]):
+        from xiaoyu.tui import NextStepSuggest
+
+        return NextStepSuggest(lambda: items)
+
+    def _buffer(self, history: list[str]):
+        from prompt_toolkit.buffer import Buffer
+        from prompt_toolkit.history import InMemoryHistory
+
+        memory = InMemoryHistory()
+        for line in history:
+            memory.append_string(line)
+        return Buffer(history=memory)
+
+    def test_empty_line_shows_first_suggestion(self) -> None:
+        from prompt_toolkit.document import Document
+
+        buffer = self._buffer(["! ls"])
+        got = self._suggester(["跑测试", "提交"]).get_suggestion(buffer, Document(""))
+        self.assertEqual(got.text, "跑测试")
+        self.assertIsNone(self._suggester([]).get_suggestion(buffer, Document("")))
+
+    def test_prefix_picks_a_later_suggestion(self) -> None:
+        from prompt_toolkit.document import Document
+
+        buffer = self._buffer([])
+        got = self._suggester(["跑测试", "提交到 main"]).get_suggestion(buffer, Document("提交"))
+        self.assertEqual(got.text, "到 main")
+        #  已经敲完整条：没有剩余可补，别给一个空建议
+        self.assertIsNone(self._suggester(["提交"]).get_suggestion(buffer, Document("提交")))
+
+    def test_falls_back_to_history(self) -> None:
+        from prompt_toolkit.document import Document
+
+        buffer = self._buffer(["! brew upgrade arp-scan"])
+        got = self._suggester(["跑测试"]).get_suggestion(buffer, Document("! brew"))
+        self.assertEqual(got.text, " upgrade arp-scan")

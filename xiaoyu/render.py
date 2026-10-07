@@ -24,6 +24,7 @@ from .events import (
     RequestStarted,
     RequestEnded,
     SteerAccepted,
+    Suggestions,
     TextDelta,
     TextEnd,
     ToolCompleted,
@@ -32,6 +33,7 @@ from .events import (
     ToolPurpose,
     UIEvent,
 )
+from .suggest import render_line as _suggestions_line
 
 #  兼容再导出：sink 协议与事件定义住在 events.py，历史引用路径仍可用
 from .events import NoticeLevel, UISink  # noqa: F401
@@ -180,12 +182,22 @@ class PlainSink:
             PlanUpdated: self._plan,
             SteerAccepted: self._steer,
             Notice: self._notice,
+            Suggestions: self._suggestions,
         }
 
     def emit(self, event: UIEvent) -> None:
         handler = self._handlers.get(type(event))
         if handler is not None:
             handler(sanitize_event(event))
+
+    def _suggestions(self, event: Suggestions) -> None:
+        """轮末「接着问」一行。明文前端没有输入行可喂幽灵建议，打出来就是全部。
+
+        事件来自后台线程、多半在 input() 挂着时到：明文 REPL 本来就是缺 TUI 依赖时的
+        退路，这一行插在提示符后面可以接受，总好过没有。
+        """
+        if self.verbose and event.items:
+            print(ui.secondary(f"{self.indent}  {_suggestions_line(event.items)}"))
 
     def _request_started(self, event: RequestStarted) -> None:
         """等模型时给一行提示——但只在有人盯着终端看的时候。

@@ -432,6 +432,9 @@ class Config:
     #  bash 里的 sudo 要密码时，是否在界面里向用户要（askpass 通道，见 askpass.py）。
     #  只在有人值守的交互前端生效；关掉 = sudo 照旧因为没有终端而失败。
     enable_askpass: bool = True
+    #  轮末用辅助模型提几条「接着问」建议（见 suggest.py）。只在交互前端生效：
+    #  一次性模式没有下一问，白花一次请求（要的话 -p 加 --suggestions）。
+    suggestions: bool = True
     #  是否登记进本机会话表、并接收其它会话投来的消息（见 peers.py）。
     #  只在交互模式生效。**--yolo 下默认关闭**：无人值守 + 可被本机任意进程
     #  投喂指令，两者叠加才是真风险；要开就显式 XIAOYU_ENABLE_PEERS=1。
@@ -663,6 +666,8 @@ class Config:
             cfg.sandbox = flag.strip().lower() not in ("0", "false", "no", "off")
         if (flag := os.environ.get("XIAOYU_SANDBOX_NETWORK")) is not None:
             cfg.sandbox_network = flag.strip().lower() not in ("0", "false", "no", "off")
+        if (flag := os.environ.get("XIAOYU_SUGGESTIONS")) is not None:
+            cfg.suggestions = flag.strip().lower() not in ("0", "false", "no", "off")
         if (flag := os.environ.get("XIAOYU_ENABLE_ASKPASS")) is not None:
             cfg.enable_askpass = flag.strip().lower() not in ("0", "false", "no", "off")
         if (flag := os.environ.get("XIAOYU_HARDLINE")) is not None:

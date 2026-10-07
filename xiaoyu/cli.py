@@ -507,6 +507,12 @@ def add_output_format(parser: argparse.ArgumentParser) -> None:
         "结果放在 json/stream-json 收尾对象的 output 字段，text 模式单独打印一行 JSON。"
         "只用于一次性模式",
     )
+    parser.add_argument(
+        "--suggestions",
+        action="store_true",
+        help="一次性模式也要「接着问」建议（辅助模型多发一次请求）：json/stream-json 放进"
+        "收尾对象的 suggestions 字段，text 模式打到 stderr。交互模式默认就有，不用加",
+    )
 
 
 _CONFIG_VARS = (
@@ -1564,6 +1570,9 @@ def resume_command(argv: list[str]) -> int:
             peer=peer,
         )
         agent.toolbox.secret_prompt = secret_prompt
+        #  轮末「接着问」：交互前端默认开；一次性模式只在 --suggestions 时同步算进结果
+        agent.suggestions_enabled = config.suggestions and not prompt
+        agent.suggest_in_result = bool(prompt and args.suggestions)
     except MissingConfig as exc:
         print(ui.error(str(exc)), file=sys.stderr)
         return 2
@@ -2805,6 +2814,9 @@ def main(argv: list[str] | None = None) -> int:
         )
         #  sudo 的密码通道只接在主 agent 的工具箱上：子 agent 没有前端可问
         agent.toolbox.secret_prompt = secret_prompt
+        #  轮末「接着问」：交互前端默认开；一次性模式只在 --suggestions 时同步算进结果
+        agent.suggestions_enabled = config.suggestions and not prompt
+        agent.suggest_in_result = bool(prompt and args.suggestions)
     except MissingConfig as exc:
         print(ui.error(str(exc)), file=sys.stderr)
         return 2
@@ -3093,10 +3105,19 @@ def _run_once(
         error = "模型没有按 --output-schema 给出结构化结果"
 
     terminated = terminate_background_commands(agent)
+    #  --suggestions：一次性模式同步算（没有下一个提示符可以等它后台到）
+    suggested = (
+        agent.suggest_next() if getattr(agent, "suggest_in_result", False) and not error else []
+    )
 
     if output_format == "text":
         if output_schema is not None and agent.structured_output is not None:
             print(json.dumps(agent.structured_output, ensure_ascii=False), flush=True)
+        if suggested:
+            from .suggest import render_line
+
+            #  走 stderr：stdout 可能正被管道接去当结果用
+            print(ui.secondary(render_line(suggested)), file=sys.stderr)
         if error:
             #  走 stderr：stdout 可能正被管道接去当结果用
             print(ui.error(f"[{error}]"), file=sys.stderr)
@@ -3128,6 +3149,8 @@ def _run_once(
     }
     if output_schema is not None:
         payload["output"] = agent.structured_output
+    if getattr(agent, "suggest_in_result", False):
+        payload["suggestions"] = suggested
     if getattr(agent, "show_stats", False):
         #  --stats 的结构化形态：与 text 那一行同源的数字，不另算
         stats = agent.turn_stats
