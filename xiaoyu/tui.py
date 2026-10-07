@@ -1472,7 +1472,9 @@ class RichSink:
             previous = target.read_bytes().decode("utf-8", errors="replace")
         except OSError:
             return None
-        return (path, previous, content)
+        #  只比内容不比换行符：工具覆盖时沿用原文件的换行（CRLF 文件写回仍是 CRLF），
+        #  模型给的 content 却是 \n——不归一化的话 Windows 上每一行都算改过
+        return (path, previous.replace("\r\n", "\n").replace("\r", "\n"), content)
 
     def _tool_purpose(self, event: ToolPurpose) -> None:
         self._flush_ro_group()
