@@ -373,7 +373,7 @@ def add_guardrail_flags(parser: argparse.ArgumentParser) -> None:
         dest="unguarded",
         action="store_true",
         help=f"无护栏预设：放开端侧全部可关护栏（等价 --yolo --no-sandbox --unattended "
-        f"XIAOYU_HARDLINE=0 XIAOYU_MCP_TRUST_CHANGES=1 并跳过工作区信任门）。"
+        f"XIAOYU_HARDLINE=0 XIAOYU_MCP_TRUST_CHANGES=1 XIAOYU_SEARCH_SENSITIVE=0 并跳过工作区信任门）。"
         f"只在环境变量 {guardrails.CONSENT_ENV}=1 时生效——由沙箱编排脚本注入，不读 .env",
     )
 
