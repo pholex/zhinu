@@ -108,7 +108,8 @@ class TagTest(unittest.TestCase):
                    "GIT_COMMITTER_EMAIL": "t@x", "HOME": tmp, "GIT_CONFIG_GLOBAL": os.devnull}
 
             def git(*args):
-                return subprocess.run(["git", "-C", tmp, *args], check=True, capture_output=True, text=True, env=env)
+                return subprocess.run(["git", "-C", tmp, *args], check=True, capture_output=True, text=True,
+                                      encoding="utf-8", errors="replace", env=env)
 
             git("init", "-q", "-b", "main")
             (repo / "f").write_text("0", encoding="utf-8")
