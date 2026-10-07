@@ -89,6 +89,7 @@ SLASH_COMMANDS: dict[str, str] = {
     "/deny": "持久拒绝（任何模式下都拦，包括 --yolo）",
     "/resume": "切到本工作区的历史会话（当前对话被清空；/resume <序号> 直接选）",
     "/rewind": "回滚到某轮开始前（对话和/或文件；/undo 同义）",
+    "/copy": "把最后一条回复复制到剪贴板（没有剪贴板命令时经终端 OSC 52）",
     "/clear": "清空对话历史（保留 system prompt）",
     "/exit": "退出",
     "/quit": "退出",
@@ -3523,6 +3524,17 @@ def handle_slash(agent: Agent, line: str, select: Any = None) -> bool:
                     print(ui.warning(f"  这条规则可能不会命中：{hint}"))
     elif command == "/resume":
         slash_resume(agent, rest, select)
+    elif command == "/copy":
+        text = agent.last_assistant_text()
+        if not text:
+            print(ui.secondary("  还没有可复制的回复"))
+        elif tool := media.copy_text(text):
+            print(ui.secondary(f"  已复制最后一条回复到剪贴板（{tool}，{len(text)} 字）"))
+        elif attention.copy_via_terminal(text):
+            #  SSH / 容器里没有本机剪贴板命令，OSC 52 交给终端宿主写（终端得允许）
+            print(ui.secondary(f"  本机没有剪贴板命令，已经 OSC 52 交给终端（{len(text)} 字；终端需允许写剪贴板）"))
+        else:
+            print(ui.warning("  复制失败：没有 pbcopy / wl-copy / xclip / clip.exe，当前也不是终端"))
     elif command == "/clear":
         agent.reset()
         print(ui.secondary("对话已清空"))

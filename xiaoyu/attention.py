@@ -32,6 +32,7 @@ inline 架构没有常驻状态栏可以闪，只能借终端和系统自己的�
 
 from __future__ import annotations
 
+import base64
 import contextlib
 import os
 import shlex
@@ -305,3 +306,21 @@ def waiting(state: str, stream: TextIO | None = None) -> None:
 def running(stream: TextIO | None = None) -> None:
     """状态切回"运行中"（一轮开始、审批或提问回答之后）：只改标题，不响不叫。"""
     update_title(RUNNING, stream)
+
+
+# ---------- OSC 52：往终端剪贴板写文本 ----------
+
+
+def osc52_sequence(text: str) -> str:
+    """OSC 52 把文本写进终端宿主的剪贴板（base64），本机没有剪贴板命令或在
+    SSH 里时唯一能用的通道；tmux 里同样要透传。"""
+    payload = base64.b64encode(text.encode("utf-8")).decode("ascii")
+    return tmux_passthrough(f"\x1b]52;c;{payload}{_ST}")
+
+
+def copy_via_terminal(text: str, stream: TextIO | None = None) -> bool:
+    """用 OSC 52 复制；stdout 不是终端返回 False（序列进管道只会污染输出）。"""
+    if _stream(stream) is None:
+        return False
+    _write(osc52_sequence(text), stream)
+    return True

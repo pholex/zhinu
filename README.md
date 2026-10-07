@@ -94,7 +94,7 @@ xiaoyu term install                     # 把终端集成与 Tab 补全写进 ~/
 @c 找出大于 100M 的文件，按大小倒序        # 一句话换一条命令，放回你的提示符，回车才执行（zsh / bash）
 ```
 
-REPL 里：`/help` `/tools` `/skills` `/model` `/search` `/effort` `/mode` `/usage` `/context` `/compact` `/clear` `/exit` `/tasks` `/plan` `/goal` `/perm` `/allow` `/deny` `/resume` `/rewind` `/mcp` `/quit`
+REPL 里：`/help` `/tools` `/skills` `/model` `/search` `/effort` `/mode` `/usage` `/context` `/compact` `/copy` `/clear` `/exit` `/tasks` `/plan` `/goal` `/perm` `/allow` `/deny` `/resume` `/rewind` `/mcp` `/quit`
 
 无人值守时没人按确认键：先用 `/allow` 配规则，或 `--mode auto`、`--yolo`。放进 CI 跑见 [docs/ci.md](docs/ci.md)（附 GitHub Actions 样本）。
 
