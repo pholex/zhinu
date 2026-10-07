@@ -35,6 +35,7 @@ from typing import Any, Callable, Collection
 from . import browser, fsguard, mcp, media, sandbox, tempdirs
 from .background import (
     MONITOR_DEFAULT_TIMEOUT,
+    OUTPUT_READ_BYTES,
     TERM_GRACE_SECONDS as _TERM_GRACE_SECONDS,
     TaskManager,
     kill_tree as _kill_tree,
@@ -453,17 +454,22 @@ def _unreadable_file_error(target: Path, shown: str, size_cap: bool = True) -> s
     阻塞、读设备读不到头，stat 跟随符号链接，链接指向 FIFO 同样拦下。
     size_cap=False 只查类型（覆盖写不整读原文）。
     """
-    try:
-        info = os.stat(target)
-    except OSError as exc:
-        return f"ERROR: 读取失败 {shown}: {exc}"
-    kind = fsguard.non_regular_kind(info.st_mode)
-    if kind is not None:
+    def refuse(kind: str) -> str:
         return (
             f"ERROR: {shown} 是{kind}，不是普通文件，已拒绝读取——读它可能永久阻塞"
             "等待数据，或读出没有尽头的内容。确需查看请用 bash 并加超时与字节上限"
             f"（如 timeout 5 head -c 4096 {shown}）。"
         )
+
+    #  Windows 的设备藏在名字里（NUL.txt、CON），stat 报的是普通文件：先按名字判
+    if kind := fsguard.reserved_device_kind(target):
+        return refuse(kind)
+    try:
+        info = os.stat(target)
+    except OSError as exc:
+        return f"ERROR: 读取失败 {shown}: {exc}"
+    if kind := fsguard.non_regular_kind(info.st_mode):
+        return refuse(kind)
     if size_cap and info.st_size > _READ_MAX_BYTES:
         return (
             f"ERROR: {shown} 有 {info.st_size / 1048576:.1f} MiB，超过整读上限 "
@@ -474,6 +480,42 @@ def _unreadable_file_error(target: Path, shown: str, size_cap: bool = True) -> s
 
 
 _SNIFF_BYTES = 8192
+
+#  read_file 单行显示上限（字符）。总量由 _bound_output 管，但 minified JS、单行
+#  JSON、一行几万字符的日志能一行就吃掉整段预算：截断显示、说明还剩多少，要看
+#  整行就单读那一行（limit=1 不截，整行再超长由 _bound_output 落盘可召回）。
+_READ_LINE_CAP = 2000
+
+
+def _clip_long_lines(
+    lines: list[str], first_number: int, cap: int = _READ_LINE_CAP
+) -> tuple[list[str], list[int]]:
+    """把超过 cap 的行截成前 cap 字符 + 说明；返回 (新行, 被截行的行号)。"""
+    clipped: list[int] = []
+    shown: list[str] = []
+    for index, line in enumerate(lines):
+        if len(line) > cap:
+            number = first_number + index
+            clipped.append(number)
+            line = line[:cap] + (
+                f"…（本行还有 {len(line) - cap} 字符未显示；"
+                f"要看整行用 offset={number} limit=1）"
+            )
+        shown.append(line)
+    return shown, clipped
+
+
+def _ranges_without(start: int, end: int, holes: list[int]) -> tuple[tuple[int, int], ...]:
+    """[start, end] 去掉 holes 里的行号后剩下的闭区间：截断显示的行不算读过。"""
+    ranges: list[tuple[int, int]] = []
+    cursor = start
+    for hole in holes:
+        if hole > cursor:
+            ranges.append((cursor, hole - 1))
+        cursor = hole + 1
+    if cursor <= end:
+        ranges.append((cursor, end))
+    return tuple(ranges)
 
 
 def _binary_file_error(target: Path, shown: str) -> str | None:
@@ -1152,6 +1194,63 @@ _SKIP_DIRS = {
     ".idea",
 }
 
+#  搜索类工具（grep / list_files）不碰的敏感文件：它们免确认、只读，正是沙箱明确
+#  不挡的那条凭据外泄路（docs/security.md「沙箱不解决凭据外泄」）——模型一条
+#  grep "KEY" 就能把 .env、私钥读进上下文，用户连确认框都见不到。read_file 不在
+#  此列：它走审批，用户看得见。目录按路径里任一级匹配、文件按名字匹配（fnmatch）。
+#  开关 XIAOYU_SEARCH_SENSITIVE=0（guardrails.py 表里的一层，--unguarded 预设跟随）。
+_SENSITIVE_DIRS = frozenset({".ssh", ".gnupg", ".git"})
+_SENSITIVE_NAMES: tuple[str, ...] = (
+    ".env",
+    ".env.*",
+    "*.pem",
+    "*.key",
+    "*.p12",
+    "*.pfx",
+    "id_rsa*",
+    "id_dsa*",
+    "id_ecdsa*",
+    "id_ed25519*",
+    ".netrc",
+    ".pgpass",
+)
+#  (父目录名, 文件名)：名字本身不特殊、放在特定目录下才是凭据
+_SENSITIVE_PAIRS = frozenset({(".aws", "credentials"), (".docker", "config.json")})
+
+
+def sensitive_reason(path: Path) -> str | None:
+    """路径是不是搜索类工具该跳过的敏感文件；是则返回给人看的理由，否则 None。
+
+    只看名字与路径成分，不读内容、不 stat：几万条 grep 结果逐条过一遍也得是
+    零开销的。".env.example" 这类模板会被 ".env.*" 一起挡下——宁可多跳一个
+    示例文件（read_file 照样读得到），不可漏一个 ".env.production"。
+    """
+    parts = path.parts
+    for part in parts:
+        if part in _SENSITIVE_DIRS:
+            return f"位于 {part}/ 之下"
+    name = path.name
+    if any(fnmatch.fnmatchcase(name, pattern) for pattern in _SENSITIVE_NAMES):
+        return "凭据 / 密钥类文件名"
+    if len(parts) >= 2 and (parts[-2], name) in _SENSITIVE_PAIRS:
+        return f"{parts[-2]}/{name} 是凭据文件"
+    return None
+
+
+#  grep 后端输出的 "路径:行号:内容"：取路径用。懒匹配到第一个 ":数字:"，Windows
+#  盘符 "C:\\x\\y.py:12:" 里的 "C:" 后面不是数字，不会被截在那
+_GREP_LINE_PATH = re.compile(r"^(.+?):\d+:")
+
+
+def _sensitive_skip_note(files: int) -> str:
+    """结果末尾那行说明：跳过了多少个敏感文件、想看怎么办。"""
+    if not files:
+        return ""
+    return (
+        f"\n[已跳过 {files} 个敏感文件（.env / 私钥 / .ssh 等不进搜索结果）；"
+        "确需查看请用 read_file 逐个读取（会经确认）]"
+    )
+
 
 def _locate_grep() -> str | None:
     """找一个能用的 grep：先看 PATH，Windows 上再探一次 Git for Windows 自带的。
@@ -1195,6 +1294,109 @@ def _locate_grep() -> str | None:
             if os.path.isfile(candidate):
                 return candidate
     return None
+
+
+#  grep 后端的三道界：单文件体积（rg --max-filesize；纯 Python 兜底同值；GNU grep
+#  没有等价选项，接受——它本来就是没装 rg 时的次选）、stdout 总量、总时长。
+#  原先 capture_output 把结果整份读进内存、只有 60s 一道界：一个宽泛 pattern 打在
+#  大仓库上能吐几百 MB，进程还没超时内存先爆。
+_GREP_MAX_FILESIZE = 1024 * 1024
+_GREP_STDOUT_CAP = 8 * 1024 * 1024
+_GREP_STDERR_CAP = 64 * 1024
+_GREP_TIMEOUT = 60.0
+
+
+@dataclass
+class _BoundedRun:
+    """有界运行的结果：stdout 最多 cap 字节；overflow / timed_out 说明为何提前收场。"""
+
+    stdout: bytes
+    stderr: bytes
+    returncode: int | None
+    overflow: bool = False
+    timed_out: bool = False
+
+
+def _drain(stream: Any, cap: int, keep_draining: bool) -> tuple[bytes, bool]:
+    """从管道读到 EOF 或超过 cap：keep_draining=True 时超过上限后继续读但不再保留
+    （stderr：让子进程写得出去），False 时直接停（stdout：调用方随后杀进程）。"""
+    chunks: list[bytes] = []
+    total = 0
+    overflow = False
+    while True:
+        data = stream.read(65536)
+        if not data:
+            break
+        if overflow:
+            continue
+        if total + len(data) > cap:
+            chunks.append(data[: cap - total])
+            overflow = True
+            if not keep_draining:
+                break
+            continue
+        chunks.append(data)
+        total += len(data)
+    return b"".join(chunks), overflow
+
+
+def _run_bounded(
+    command: list[str],
+    *,
+    cwd: str,
+    env: dict[str, str],
+    cap: int | None = None,
+    timeout: float | None = None,
+) -> _BoundedRun:
+    """起子进程、stdout 只保留前 cap 字节、到时限就整树杀掉。
+
+    读管道的线程只做搬运；超过上限或超时都由这边杀进程（先 SIGTERM 给一点宽限
+    再 SIGKILL，与后台任务同一把 kill_tree），管道随即 EOF、读线程自然收工。
+    OSError（找不到可执行文件等）原样抛给调用方决定兜底。
+    """
+    #  上限在调用时取模块量（不写成默认参数）：测试要能把它们调小
+    cap = _GREP_STDOUT_CAP if cap is None else cap
+    timeout = _GREP_TIMEOUT if timeout is None else timeout
+    proc = subprocess.Popen(
+        command,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        cwd=cwd,
+        env=env,
+        **_subprocess_hardening(),
+    )
+    _mark_group_leader(proc)
+    out: dict[str, Any] = {}
+
+    def read_stdout() -> None:
+        out["stdout"] = _drain(proc.stdout, cap, keep_draining=False)
+
+    def read_stderr() -> None:
+        out["stderr"] = _drain(proc.stderr, _GREP_STDERR_CAP, keep_draining=True)
+
+    threads = [
+        threading.Thread(target=read_stdout, name="grep-stdout", daemon=True),
+        threading.Thread(target=read_stderr, name="grep-stderr", daemon=True),
+    ]
+    for thread in threads:
+        thread.start()
+    threads[0].join(timeout)
+    timed_out = threads[0].is_alive()
+    overflow = bool(out.get("stdout", (b"", False))[1])
+    if timed_out or overflow or proc.poll() is None:
+        if timed_out or overflow:
+            _kill_tree(proc, grace=_TERM_GRACE_SECONDS)
+        with contextlib.suppress(Exception):
+            proc.wait(timeout=_TERM_GRACE_SECONDS + 5)
+    for thread in threads:
+        thread.join(timeout=5)
+    for stream in (proc.stdout, proc.stderr):
+        with contextlib.suppress(OSError):
+            stream.close()
+    stdout, _ = out.get("stdout", (b"", False))
+    stderr, _ = out.get("stderr", (b"", False))
+    return _BoundedRun(stdout, stderr, proc.returncode, overflow=overflow, timed_out=timed_out)
 
 
 def _glob_matches(item: Path, root: Path, glob: str) -> bool:
@@ -1242,6 +1444,9 @@ class Toolbox:
         #  注入（agent.__init__ 里 tasks.notify = self.notify）；受限子集
         #  （explore 的 READONLY）没有 bash，这张表闲置无害。
         self.tasks = TaskManager()
+        #  task_output 上一次对各任务的查询形态 (偏移, 状态, next_offset)：再查一遍
+        #  完全一样时提醒模型别原地轮询
+        self._task_output_seen: dict[str, tuple[int | None, str, int]] = {}
         #  文件快照（/rewind）：write_file / str_replace 改前把原内容记进当前轮
         #  的快照点；轮次边界由 Agent.send 划（begin/finish）。
         self.rewind = RewindStore()
@@ -1899,7 +2104,8 @@ class Toolbox:
                 description=(
                     "在工作区里按正则搜索文本，返回 路径:行号: 内容。"
                     "找符号定义、找调用点、找配置项都用它。"
-                    "可用 glob 限定文件类型（如 *.py）。这是只读操作。"
+                    "可用 glob 限定文件类型（如 *.py）。这是只读操作；"
+                    ".env、私钥、.ssh 这类敏感文件不进结果，要看用 read_file。"
                 ),
                 parameters={
                     "type": "object",
@@ -1957,7 +2163,8 @@ class Toolbox:
                 description=(
                     "列出工作区里的文件（可用 glob 过滤，如 **/*.py）。"
                     "摸清项目结构时用它，比 bash ls 更干净：自动跳过 .git、"
-                    "node_modules、__pycache__ 等噪声目录。这是只读操作。"
+                    "node_modules、__pycache__ 等噪声目录，也不列 .env、私钥等敏感文件。"
+                    "这是只读操作。"
                 ),
                 parameters={
                     "type": "object",
@@ -2050,6 +2257,8 @@ class Toolbox:
                     "默认立即返回快照；要等任务结束就给 timeout（秒），到点仍在跑也会"
                     "返回现状。不要反复轮询——任务完成时你会自动收到通知；"
                     "需要等待就用一次带 timeout 的调用等到位。"
+                    "日志很长时默认只给头尾；要看中段或接着上次往下读，给 offset"
+                    "（字节，取上次返回的 next_offset）与 limit（字节）分段读。"
                 ),
                 parameters={
                     "type": "object",
@@ -2062,6 +2271,19 @@ class Toolbox:
                         "timeout": {
                             "type": "integer",
                             "description": "最多等多少秒（上限 600）；省略或 0 = 立即返回快照",
+                        },
+                        "offset": {
+                            "type": "integer",
+                            "description": (
+                                "从日志的第几个字节起读（0 = 开头）；接着上次读就填"
+                                "上次返回的 next_offset。省略 = 头尾快照"
+                            ),
+                        },
+                        "limit": {
+                            "type": "integer",
+                            "description": (
+                                f"这一段最多读多少字节，默认 {OUTPUT_READ_BYTES}"
+                            ),
                         },
                     },
                     "required": ["task_ids"],
@@ -2274,6 +2496,28 @@ class Toolbox:
 
         limit_chars = self.config.max_tool_output
         if offset is None and limit is None:
+            lines = text.splitlines()
+            clipped_lines, clipped = _clip_long_lines(lines, 1)
+            if clipped:
+                #  截断显示的行模型没看全：按"读过其余各行"记，整体覆盖要先把这
+                #  几行单独读到（limit=1 不截）
+                shown = (
+                    f"{prefix}[{path} 有 {len(clipped)} 行超过 {_READ_LINE_CAP} 字符，"
+                    "已截断显示（行末有说明）；整体覆盖（write_file）前要把这些行"
+                    "用 offset=行号 limit=1 读全]\n" + "\n".join(clipped_lines)
+                )
+                fits = len(shown) <= limit_chars
+                self._mark_read(
+                    target,
+                    seen=_ranges_without(1, len(lines), clipped) if fits else (),
+                    total=len(lines),
+                )
+                if fits:
+                    return shown
+                return shown + (
+                    f"\n[{path} 太长，上面只显示了头尾；没显示的部分用 offset/limit 分段读。"
+                    "整体覆盖（write_file）要把各段都读到，局部修改（str_replace）现在就可以]"
+                )
             shown = f"{prefix}{text}"
             if len(shown) <= limit_chars:
                 self._mark_read(target)
@@ -2291,15 +2535,26 @@ class Toolbox:
         if start > len(lines):
             return f"ERROR: {path} 只有 {len(lines)} 行，offset={start} 超出范围"
         end = len(lines) if limit is None else min(len(lines), start + max(1, limit) - 1)
-        chunk = "\n".join(lines[start - 1 : end])
+        segment = lines[start - 1 : end]
+        clipped: list[int] = []
+        if end > start:
+            #  单读一行（limit=1）是模型专门来看这一行的，不截；多行才截超长行
+            segment, clipped = _clip_long_lines(segment, start)
+        chunk = "\n".join(segment)
         note = (
             f"{prefix}[{path} 第 {start}-{end} 行，共 {len(lines)} 行；"
             "这是部分内容：局部修改（str_replace）可以直接做，"
             "整体覆盖（write_file）要把全部行都读到]\n"
         )
+        if clipped:
+            note += (
+                f"[其中 {len(clipped)} 行超过 {_READ_LINE_CAP} 字符已截断显示，"
+                "要看整行用 offset=行号 limit=1]\n"
+            )
         #  这一段自己也装不下的话，模型同样只看见头尾——不计入已读范围
         fits = len(note) + len(chunk) <= limit_chars
-        self._mark_read(target, seen=((start, end),) if fits else (), total=len(lines))
+        seen = _ranges_without(start, end, clipped) if fits else ()
+        self._mark_read(target, seen=seen, total=len(lines))
         return note + chunk
 
     def _write_file(self, path: str, content: str) -> str:
@@ -2510,6 +2765,8 @@ class Toolbox:
         target, _ = self._resolve(path)
         if not target.exists():
             return f"ERROR: 路径不存在：{path}"
+        if refused := self._sensitive_root_error(target, path):
+            return refused
 
         #  绝对路径起：rg 不经沙箱、不经确认，不能让 PATH 上工作区里的同名程序顶替
         #  三个后端搜的范围要一样，否则同一个问题在不同机器上答案不同：
@@ -2520,7 +2777,8 @@ class Toolbox:
         if rg := sandbox.host_which("rg"):
             command = [
                 rg, "--line-number", "--no-heading", "--color", "never",
-                "--hidden", "--no-config", "-e", pattern,
+                "--hidden", "--no-config", "--max-filesize", str(_GREP_MAX_FILESIZE),
+                "-e", pattern,
             ]
             for skip in sorted(_SKIP_DIRS):
                 command += ["--glob", f"!{skip}/**"]
@@ -2538,30 +2796,29 @@ class Toolbox:
             return self._grep_python(pattern, target, glob, max_matches)
 
         try:
-            result = subprocess.run(
-                command,
-                capture_output=True,
-                text=True,
-                #  Windows 默认 locale 编码（GBK/cp1252）解不了 UTF-8 输出，必须显式指定
-                encoding="utf-8",
-                errors="replace",
-                timeout=60,
-                cwd=str(self.config.workspace),
-                env=_hardened_env(),
-                **_subprocess_hardening(),
-            )
-        except subprocess.TimeoutExpired:
-            return f"ERROR: 搜索超时：{pattern}"
+            result = _run_bounded(command, cwd=str(self.config.workspace), env=_hardened_env())
         except OSError:
             #  which 说有、真跑起来却没有（PATH 里挂着失效的 shim 等），照样兜底，
             #  别把一个可恢复的环境问题变成模型眼里的死路
             return self._grep_python(pattern, target, glob, max_matches)
+        if result.timed_out:
+            return f"ERROR: 搜索超时（{_GREP_TIMEOUT:.0f}s）：{pattern}，请缩小 path 或 glob 范围"
 
-        #  grep/rg 没匹配到时退出码是 1，这不是错误
-        if result.returncode not in (0, 1):
-            return f"ERROR: 搜索失败（exit {result.returncode}）：{result.stderr.strip()[:200]}"
+        #  Windows 默认 locale 编码（GBK/cp1252）解不了 UTF-8 输出，必须显式按 UTF-8 解
+        stdout = result.stdout.decode("utf-8", errors="replace")
+        #  grep/rg 没匹配到时退出码是 1，这不是错误；被我们杀掉的（溢出）另说
+        if not result.overflow and result.returncode not in (0, 1):
+            stderr = result.stderr.decode("utf-8", errors="replace")
+            return f"ERROR: 搜索失败（exit {result.returncode}）：{stderr.strip()[:200]}"
 
-        lines = [line for line in result.stdout.splitlines() if line.strip()]
+        lines = [line for line in stdout.splitlines() if line.strip()]
+        if result.overflow:
+            #  最后一行多半被截在半截，丢掉；总数不可知，提示收窄而不是报个假数
+            lines = lines[:-1]
+            return self._grep_output(lines, pattern, max_matches) + (
+                f"\n[结果过多：输出超过 {_GREP_STDOUT_CAP // 1048576} MiB 已中止搜索，"
+                "以上只是开头一部分、总数不可知；请收窄 pattern 或 path / glob]"
+            )
         return self._grep_output(lines, pattern, max_matches)
 
     def _grep_python(
@@ -2573,8 +2830,9 @@ class Toolbox:
     ) -> str:
         """没有 rg / grep 时的纯 Python 搜索，输出格式与它们保持一致。
 
-        只求"能用"不求快：跳过 _SKIP_DIRS、二进制和超大文件，并留一个整体时间
-        预算，免得在大仓库上把一轮工具调用耗死。
+        只求"能用"不求快：跳过 _SKIP_DIRS、二进制和超大文件（与 rg 的
+        --max-filesize 同一上限），并留一个整体时间预算，免得在大仓库上把一轮
+        工具调用耗死。
         """
         try:
             regex = re.compile(pattern)
@@ -2594,7 +2852,7 @@ class Toolbox:
             if glob and not _glob_matches(item, target, glob):
                 continue
             try:
-                if item.stat().st_size > 2_000_000:
+                if item.stat().st_size > _GREP_MAX_FILESIZE:
                     continue
                 with item.open("rb") as raw:
                     if b"\0" in raw.read(4096):
@@ -2617,37 +2875,55 @@ class Toolbox:
     def _grep_output(self, lines: list[str], pattern: str, max_matches: int) -> str:
         """把 路径:行号:内容 的原始行整理成给模型看的结果：路径转成工作区相对、
         分隔符统一正斜杠（Windows 的反斜杠会让模型在后续工具调用里混用两种）。"""
-        if not lines:
-            return f"没有匹配：{pattern}"
-
         root = str(self.config.workspace)
-        shown = []
-        for line in lines[:max_matches]:
+        kept: list[str] = []
+        skipped_files: set[str] = set()
+        for line in lines:
             for prefix in (root + os.sep, root + "/"):
                 if line.startswith(prefix):
                     line = line[len(prefix):]
                     break
+            #  敏感文件的匹配行整条剔除：留着哪怕一行，.env 里那个值就进上下文了。
+            #  只认 "路径:行号:" 形态；搜单个文件时后端不打路径，那种情况起点
+            #  本身已在 _sensitive_root_error 里判过
+            if self.config.search_sensitive and (found := _GREP_LINE_PATH.match(line)):
+                if sensitive_reason(Path(found.group(1))):
+                    skipped_files.add(found.group(1))
+                    continue
+            kept.append(line)
+        skip_note = _sensitive_skip_note(len(skipped_files))
+        if not kept:
+            return f"没有匹配：{pattern}" + skip_note
+
+        shown = []
+        for line in kept[:max_matches]:
             head, sep, rest = line.partition(":")
             if sep:
                 line = head.replace("\\", "/") + sep + rest
             shown.append(line[:300])
         note = (
-            f"\n... 还有 {len(lines) - max_matches} 条未显示，请缩小范围"
-            if len(lines) > max_matches
+            f"\n... 还有 {len(kept) - max_matches} 条未显示，请缩小范围"
+            if len(kept) > max_matches
             else ""
         )
-        return f"{len(lines)} 条匹配：\n" + "\n".join(shown) + note
+        return f"{len(kept)} 条匹配：\n" + "\n".join(shown) + note + skip_note
 
     def _list_files(self, pattern: str = "**/*", path: str = ".", limit: int = 300) -> str:
         target, _ = self._resolve(path)
         if not target.is_dir():
             return f"ERROR: 不是目录：{path}"
+        if refused := self._sensitive_root_error(target, path):
+            return refused
 
         found: list[str] = []
+        skipped = 0
         for item in sorted(target.glob(pattern)):
             if not item.is_file():
                 continue
             if _SKIP_DIRS & set(item.parts):
+                continue
+            if self.config.search_sensitive and sensitive_reason(item):
+                skipped += 1
                 continue
             try:
                 #  统一正斜杠：输出给模型的路径不随平台漂移（Windows 反斜杠会让
@@ -2656,10 +2932,26 @@ class Toolbox:
             except ValueError:
                 found.append(str(item))
 
+        skip_note = _sensitive_skip_note(skipped)
         if not found:
-            return f"没有匹配 {pattern} 的文件"
+            return f"没有匹配 {pattern} 的文件" + skip_note
         note = f"\n... 共 {len(found)} 个，只列出前 {limit} 个" if len(found) > limit else ""
-        return f"{len(found)} 个文件：\n" + "\n".join(found[:limit]) + note
+        return f"{len(found)} 个文件：\n" + "\n".join(found[:limit]) + note + skip_note
+
+    def _sensitive_root_error(self, target: Path, shown: str) -> str | None:
+        """搜索起点本身就是敏感路径（path=~/.ssh、path=.env）时拒绝整个请求。
+
+        结果里逐条剔除挡的是"顺带搜到"，起点直指敏感目录是"专门去搜"——同样
+        不该免确认放行。"""
+        if not self.config.search_sensitive:
+            return None
+        reason = sensitive_reason(target)
+        if reason is None:
+            return None
+        return (
+            f"ERROR: {shown} 是敏感路径（{reason}），grep / list_files 不进去搜。"
+            "确需查看请用 read_file 读具体文件（会经确认）。"
+        )
 
     def _command_argv(self, command: str, escalation: str | None = None) -> list[str]:
         """命令 → 实际执行的 argv（平台 shell + 需要时套沙箱）。
@@ -2919,8 +3211,19 @@ class Toolbox:
             if self.stop_requested():
                 raise Interrupted("宿主请求打断")
 
-    def _task_output(self, task_ids: Any, timeout: int | None = None) -> str:
-        """后台任务快照 / 有界等待。宽进：单个 id 裸字符串也收（模型常这么写）。"""
+    def _task_output(
+        self,
+        task_ids: Any,
+        timeout: int | None = None,
+        offset: int | None = None,
+        limit: int | None = None,
+    ) -> str:
+        """后台任务快照 / 有界等待 / 按字节分段续读。宽进：单个 id 裸字符串也收。
+
+        不给 offset / limit 是原来的头尾快照；给了任一个就按字节切片，并回
+        next_offset 供下一段接着读。同一任务、同一偏移、状态与 next_offset 都
+        和上次一样时提醒一句——那是在原地重查，看多少遍都是同一份内容。
+        """
         if isinstance(task_ids, str):
             task_ids = [task_ids]
         if not isinstance(task_ids, list) or not task_ids:
@@ -2931,6 +3234,9 @@ class Toolbox:
             if text and text not in ids:
                 ids.append(text)
         wait = min(max(int(timeout or 0), 0), 600)
+        sliced = offset is not None or limit is not None
+        start = max(int(offset or 0), 0)
+        span = max(int(limit or OUTPUT_READ_BYTES), 1)
         deadline = time.monotonic() + wait
         sections: list[str] = []
         for task_id in ids:
@@ -2949,7 +3255,27 @@ class Toolbox:
                 head += f"（已运行 {task.elapsed():.0f}s）"
                 if wait:
                     head += "——等待已到上限，不必再调；任务完成时会自动通知你"
-            sections.append(f"{head}\n输出：\n{self.tasks.output_of(task)}")
+            if sliced:
+                body, next_offset, size = self.tasks.output_slice(task, start, span)
+                tail = f"[字节 {start}-{next_offset}，日志共 {size} 字节；next_offset={next_offset}"
+                tail += "，已到末尾]" if next_offset >= size else "，接着读就填这个 offset]"
+                body = body if body.strip() else "（这一段没有内容）"
+            else:
+                body = self.tasks.output_of(task)
+                try:
+                    next_offset = task.log_path.stat().st_size
+                except OSError:
+                    next_offset = -1
+                tail = ""
+            #  原地重查：同一任务、同一偏移、状态没变、日志也没长
+            seen = (start if sliced else None, status, next_offset)
+            if self._task_output_seen.get(task_id) == seen:
+                tail += (
+                    "\n[内容与上次查询相同，别立刻重查：任务完成会自动通知你；"
+                    "要等就用一次带 timeout 的 task_output，长期盯着用 monitor]"
+                )
+            self._task_output_seen[task_id] = seen
+            sections.append(f"{head}\n输出：\n{body}{tail}")
         return "\n\n".join(sections)
 
     def _kill_task(self, task_id: str) -> str:

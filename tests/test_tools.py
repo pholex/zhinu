@@ -1601,3 +1601,49 @@ class TestEncodingSafeEdits(ToolboxTestCase):
         self.assertEqual(
             target.read_bytes().decode("gbk").replace("\r\n", "\n"), "def f():\n    return '世界'\n"
         )
+
+
+class TestReadLongLines(ToolboxTestCase):
+    """超长单行截断显示：minified JS / 单行 JSON 不能一行吃掉整段上下文。"""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.long = "x" * (tools._READ_LINE_CAP + 500)
+        self.minified = self.root / "bundle.js"
+        self.minified.write_text(f"head\n{self.long}\ntail\n", encoding="utf-8")
+
+    def test_whole_read_clips_and_explains(self) -> None:
+        result = self.box.run("read_file", {"path": "bundle.js"})
+        self.assertNotIn(self.long, result)
+        self.assertIn("x" * tools._READ_LINE_CAP + "…", result)
+        self.assertIn("本行还有 500 字符", result)
+        self.assertIn("offset=2 limit=1", result)
+        self.assertIn("head\n", result)
+        self.assertIn("\ntail", result)
+
+    def test_clipped_line_blocks_overwrite_until_read_in_full(self) -> None:
+        self.box.run("read_file", {"path": "bundle.js"})
+        blocked = self.box.run("write_file", {"path": "bundle.js", "content": "x\n"})
+        self.assertIn("只读过一部分", blocked)
+        #  单读那一行不截断，读完就凑齐了全文
+        single = self.box.run("read_file", {"path": "bundle.js", "offset": 2, "limit": 1})
+        self.assertIn(self.long, single)
+        self.assertNotIn("已截断", single)
+        result = self.box.run("write_file", {"path": "bundle.js", "content": "x\n"})
+        self.assertIn("已覆盖", result)
+
+    def test_ranged_read_clips_too(self) -> None:
+        result = self.box.run("read_file", {"path": "bundle.js", "offset": 1, "limit": 3})
+        self.assertNotIn(self.long, result)
+        self.assertIn("已截断显示", result)
+
+    def test_short_lines_untouched(self) -> None:
+        result = self.box.run("read_file", {"path": "calc.py"})
+        self.assertEqual(result, SAMPLE)
+        self.assertNotIn("截断", result)
+
+    def test_empty_file_says_so(self) -> None:
+        (self.root / "empty.txt").write_text("", encoding="utf-8")
+        result = self.box.run("read_file", {"path": "empty.txt"})
+        self.assertIn("文件为空", result)
+        self.assertNotEqual(result.strip(), "")

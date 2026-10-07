@@ -624,8 +624,9 @@ class TaskManager:
                     data = (
                         head
                         + (
-                            f"\n…（中间省略 {omitted} 字节；完整日志在 {task.log_path}，"
-                            "用 grep / tail 取需要的部分）…\n"
+                            f"\n…（中间省略 {omitted} 字节；中段用 task_output 的 "
+                            f"offset={half}、limit 按字节分段续读，或 grep / tail "
+                            f"完整日志 {task.log_path}）…\n"
                         ).encode("utf-8")
                         + tail
                     )
@@ -633,6 +634,25 @@ class TaskManager:
             return f"（日志读取失败：{exc}）"
         text = data.decode("utf-8", errors="replace")
         return text if text.strip() else "（暂无输出）"
+
+    def output_slice(
+        self, task: BackgroundTask, offset: int, limit: int
+    ) -> tuple[str, int, int]:
+        """从字节 offset 起读最多 limit 字节，返回 (文本, next_offset, 日志总字节数)。
+
+        头尾各一段的 output_of 看不到中段、再查也只是同一份内容；分段读让模型
+        按 next_offset 接着往下读，拼起来就是全文。偏移只推进到完整 UTF-8 字符
+        边界（与 monitor 的 _read_new 同一条路），尾部半个字留给下一段；任务已
+        结束且这一段读到了文件末尾时才照有损解码交出——后半截再也等不来了。
+        """
+        try:
+            size = task.log_path.stat().st_size
+        except OSError as exc:
+            return f"（日志读取失败：{exc}）", offset, 0
+        offset = min(max(offset, 0), size)
+        flush = task.done.is_set() and offset + limit >= size
+        text, next_offset = self._read_new(task.log_path, offset, flush=flush, chunk=limit)
+        return text, next_offset, size
 
     def still_running_line(self) -> str:
         """轮次结束后的状态行；没有在跑的返回空串。"""

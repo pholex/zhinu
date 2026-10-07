@@ -7,7 +7,9 @@ exists / is_dir 挡不住特殊文件：读 FIFO 会一直阻塞到有人写入�
 
 放在不依赖任何内核模块的最底层：tools / rewind / media / 配置加载都要用，
 谁都能导入而不绕出循环依赖。Windows 上没有 FIFO / 设备节点这类文件，
-S_ISREG 对普通文件照常成立，行为不变。
+S_ISREG 对普通文件照常成立；它的设备藏在**名字**里——CON / NUL / COM1 这些
+保留名在任何目录下、带任何扩展名（`NUL.txt`）都指向设备，stat 还把它们报成
+普通文件，所以另有一道按名字的闸（reserved_device_kind），只在 Windows 生效。
 
 `write_atomic` 是状态文件落盘的唯一写法（tests/test_atomic_writes.py 的哨兵
 禁止在别处手写"临时文件 + 改名"）。各处自己写的时候，每一份都漏过点什么：
@@ -20,6 +22,7 @@ from __future__ import annotations
 import contextlib
 import errno
 import os
+import re
 import stat
 import time
 import uuid
@@ -48,11 +51,42 @@ def non_regular_kind(mode: int) -> str | None:
     return next((name for test, name in _SPECIAL_FILE_KINDS if test(mode)), "非普通文件")
 
 
+#  Windows 保留设备名：基名（第一个点之前、去掉尾部空格）命中即是设备，不分大小写，
+#  扩展名随便（NUL.txt、con.log 照样是设备）。COM0 / LPT0 不保留，故 1-9。
+_WINDOWS_RESERVED = re.compile(r"^(CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])$", re.IGNORECASE)
+
+
+def windows_reserved_name(name: str) -> str | None:
+    """文件名是不是 Windows 保留设备名；是则返回大写的设备名，否则 None。
+
+    纯字符串判定、不看平台：判定逻辑在哪都能测，"只在 Windows 生效"由
+    reserved_device_kind 把关。
+    """
+    base = name.split(".", 1)[0].rstrip(" ")
+    found = _WINDOWS_RESERVED.match(base)
+    return found.group(1).upper() if found else None
+
+
+def reserved_device_kind(path: Path) -> str | None:
+    """Windows 上按名字认出的设备（给人看的类别名）；其它平台或普通名字返回 None。
+
+    读 CON 会等终端输入、读 NUL 读不到东西、COM1 挂在串口上——和 FIFO / 设备
+    节点是同一类问题，但 st_mode 看不出来，只能按名字。
+    """
+    if os.name != "nt":
+        return None
+    device = windows_reserved_name(path.name)
+    return f"Windows 保留设备名（{device}）" if device else None
+
+
 def require_regular(path: Path) -> os.stat_result:
     """stat（跟随链接）并确认是普通文件，返回 stat 结果供调用方顺手查体积。
 
     不存在等 stat 失败原样抛 OSError；非普通文件抛 NotRegularFile。
     """
+    kind = reserved_device_kind(path)
+    if kind is not None:
+        raise NotRegularFile(path, kind)
     info = os.stat(path)
     kind = non_regular_kind(info.st_mode)
     if kind is not None:

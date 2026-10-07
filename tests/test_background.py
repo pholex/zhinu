@@ -492,3 +492,74 @@ class ShutdownOwnershipTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+@unittest.skipUnless(POSIX, "用例依赖 POSIX shell")
+class TaskOutputSliceTest(unittest.TestCase):
+    """task_output 按字节 offset / limit 分段续读：拼起来等于全文，原地重查有提醒。"""
+
+    def setUp(self):
+        import tempfile
+
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        config = Config(
+            base_url="x", model="x", workspace=Path(self.tmp.name).resolve(),
+            enable_plugins=False, sandbox=False,
+        )
+        self.toolbox = Toolbox(config)
+        self.addCleanup(self.toolbox.tasks.shutdown)
+
+    def _finished_task(self, command: str):
+        self.toolbox.run("bash", {"command": command, "run_in_background": True})
+        task = self.toolbox.tasks.get("task-1")
+        self.assertTrue(wait_until(task.done.is_set))
+        return task
+
+    def test_slices_concatenate_to_the_whole_log(self):
+        #  中文夹杂：切片边界落在多字节字符中间时不能切出 �。日志内容直接写进
+        #  文件——经 shell 转一手的话取决于它的 locale，不是这里要验的
+        task = self._finished_task("true")
+        whole = "".join(f"第{i}行-中文内容\n" for i in range(1, 11))
+        task.log_path.write_bytes(whole.encode("utf-8"))
+        pieces: list[str] = []
+        offset = 0
+        for _ in range(100):
+            text, next_offset, size = self.toolbox.tasks.output_slice(task, offset, 7)
+            pieces.append(text)
+            self.assertNotIn("�", text)
+            if next_offset >= size:
+                break
+            self.assertGreater(next_offset, offset)
+            offset = next_offset
+        self.assertEqual("".join(pieces), whole)
+
+    def test_tool_reports_next_offset_and_end(self):
+        task = self._finished_task("printf 'abcdefghij'")
+        first = self.toolbox.run("task_output", {"task_ids": ["task-1"], "offset": 0, "limit": 4})
+        self.assertIn("abcd", first)
+        self.assertNotIn("efgh", first)
+        self.assertIn("next_offset=4", first)
+        second = self.toolbox.run("task_output", {"task_ids": "task-1", "offset": 4, "limit": 100})
+        self.assertIn("efghij", second)
+        self.assertIn("next_offset=10", second)
+        self.assertIn("已到末尾", second)
+        #  无参调用保持头尾快照的旧行为：全文、不带切片注脚
+        plain = self.toolbox.run("task_output", {"task_ids": ["task-1"]})
+        self.assertIn("abcdefghij", plain)
+        self.assertNotIn("next_offset=", plain)
+        self.assertNotIn("内容与上次查询相同", plain)
+
+    def test_repeat_query_at_same_offset_is_flagged(self):
+        self._finished_task("echo once")
+        first = self.toolbox.run("task_output", {"task_ids": ["task-1"], "offset": 0})
+        self.assertNotIn("内容与上次查询相同", first)
+        again = self.toolbox.run("task_output", {"task_ids": ["task-1"], "offset": 0})
+        self.assertIn("内容与上次查询相同", again)
+        #  换了偏移就不是原地重查
+        moved = self.toolbox.run("task_output", {"task_ids": ["task-1"], "offset": 2})
+        self.assertNotIn("内容与上次查询相同", moved)
+        #  无参快照同样认得出重复
+        self.toolbox.run("task_output", {"task_ids": ["task-1"]})
+        plain_again = self.toolbox.run("task_output", {"task_ids": ["task-1"]})
+        self.assertIn("内容与上次查询相同", plain_again)
