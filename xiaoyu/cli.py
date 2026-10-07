@@ -35,6 +35,7 @@ from .session_log import (
     find_by_id,
     find_by_name,
     find_session,
+    session_info,
     install_exit_logging,
     last_mode,
     last_model,
@@ -89,6 +90,8 @@ SLASH_COMMANDS: dict[str, str] = {
     "/deny": "持久拒绝（任何模式下都拦，包括 --yolo）",
     "/resume": "切到本工作区的历史会话（当前对话被清空；/resume <序号> 直接选）",
     "/rewind": "回滚到某轮开始前（对话和/或文件；/undo 同义）。回退对话后那一轮的原话预填回输入行，可改可直接回车",
+    "/copy": "把最后一条回复复制到剪贴板（没有剪贴板命令时经终端 OSC 52）",
+    "/export": "把本会话导出成 Markdown（/export [路径]，默认写到工作区 xiaoyu-session-<id>.md）",
     "/clear": "清空对话历史（保留 system prompt）",
     "/exit": "退出",
     "/quit": "退出",
@@ -2307,11 +2310,14 @@ def text_ask_questions(questions: list[dict[str, Any]]) -> dict[str, str]:
     attention.waiting(attention.WAITING_INPUT)
     answers: dict[str, str] = {}
     total = len(questions)
-    for number, item in enumerate(questions, start=1):
-        answer = ask_one_text(item, position=f"{number}/{total}" if total > 1 else "")
-        if answer is None:
-            break
-        answers[item["question"]] = answer
+    try:
+        for number, item in enumerate(questions, start=1):
+            answer = ask_one_text(item, position=f"{number}/{total}" if total > 1 else "")
+            if answer is None:
+                break
+            answers[item["question"]] = answer
+    finally:
+        attention.running()
     return answers
 
 
@@ -2834,13 +2840,34 @@ def terminate_background_commands(agent: Agent) -> list[dict[str, Any]]:
     ]
 
 
-def turn_stats_line(agent: Any) -> str:
-    """`--stats` 开着时本轮的计时一行；没开或本轮没请求返回空串。
-    getattr 兜底：测试里的替身 agent 没有这两个属性。"""
-    if not getattr(agent, "show_stats", False):
-        return ""
+#  交互前端轮末默认那行简版耗时的开关与门槛：短轮次刷这一行只是噪音，
+#  等了半分钟的人才想知道"刚才到底花了多久、模型吐得快不快"
+TURN_SUMMARY_ENV = "XIAOYU_TURN_SUMMARY"
+TURN_SUMMARY_MIN_MS = 5000
+
+
+def turn_summary_enabled() -> bool:
+    return os.environ.get(TURN_SUMMARY_ENV, "1").strip().lower() not in ("0", "false", "no", "off")
+
+
+def turn_stats_line(agent: Any, interactive: bool = False) -> str:
+    """轮末的计时一行；本轮没请求返回空串。
+
+    `--stats` 开着打全版（耗时 / 首 token / tok/s / 请求数）。交互前端
+    （interactive=True）没开 --stats 也默认打简版（耗时与 tok/s），但只在本轮
+    耗时 ≥ 5s 时打，XIAOYU_TURN_SUMMARY=0 关掉；-p 单发与 json 输出不传
+    interactive，行为不变。getattr 兜底：测试里的替身 agent 没有这两个属性。
+    """
     stats = getattr(agent, "turn_stats", None)
-    return stats.summary() if stats is not None else ""
+    if stats is None:
+        return ""
+    if getattr(agent, "show_stats", False):
+        return stats.summary()
+    if not interactive or not turn_summary_enabled():
+        return ""
+    if stats.duration_ms < TURN_SUMMARY_MIN_MS:
+        return ""
+    return stats.brief()
 
 
 def run_once(
@@ -3085,8 +3112,8 @@ def background_status(agent: Agent) -> str:
 
 
 def repl(agent: Agent) -> int:
-    #  窗口标题随会话走，任何退出路径都还原（与 TUI 同一纪律）
-    attention.set_title(agent.config.workspace)
+    #  窗口标题随会话走（具名会话用名字），任何退出路径都还原（与 TUI 同一纪律）
+    attention.set_title(agent.config.workspace, session=attention.session_label(agent.session_log))
     try:
         return _repl_loop(agent)
     finally:
@@ -3138,6 +3165,7 @@ def _repl_loop(agent: Agent) -> int:
             _repl_memo(agent, action.args)
             continue
 
+        attention.running()
         try:
             agent.send(action.args)
         except KeyboardInterrupt:
@@ -3149,7 +3177,7 @@ def _repl_loop(agent: Agent) -> int:
             print(ui.error(f"\n请求失败：{type(exc).__name__}: {exc}"))
         if note := background_status(agent):
             print(ui.secondary(note))
-        if stats := turn_stats_line(agent):
+        if stats := turn_stats_line(agent, interactive=True):
             print(ui.secondary(f"  {stats}"))
         #  一轮收尾 = 回到"等人"：铃（opt-in）+ 状态钩子
         attention.waiting(attention.WAITING_INPUT)
@@ -3279,6 +3307,38 @@ def skill_prompt(agent: Agent, line: str) -> str | None:
         return ""
     print(ui.secondary(f"  已展开技能 {name}" + (f"（参数：{arguments}）" if arguments else "")))
     return skill_invocation_prompt(name, result)
+
+
+def _slash_export(agent: Agent, where: str) -> None:
+    """/export [路径]：当前会话文件 → Markdown（与 `xiaoyu sessions export` 同一个转写）。
+
+    默认落在工作区 `xiaoyu-session-<id>.md`，id 即会话文件名（开场横幅那个）；
+    给的是目录就写进目录里。延迟落盘的空壳会话盘上还没有文件，如实说没内容。
+    """
+    log = getattr(agent, "session_log", None)
+    path = getattr(log, "path", None)
+    if path is None or not Path(path).is_file():
+        print(ui.secondary("  本会话还没有记录可导出"))
+        return
+    info = session_info(Path(path))
+    if info is None:
+        print(ui.error(f"  读不出会话文件头部：{path}"))
+        return
+    default_name = f"xiaoyu-session-{Path(path).stem}.md"
+    target = Path(where).expanduser() if where else Path(default_name)
+    if not target.is_absolute():
+        target = Path(agent.config.workspace) / target
+    if target.is_dir():
+        target = target / default_name
+    if target.is_symlink():
+        print(ui.error(f"  输出路径是符号链接，拒绝写入：{target}"))
+        return
+    try:
+        target.write_text(export_markdown(info), encoding="utf-8")
+    except (OSError, ValueError) as exc:
+        print(ui.error(f"  导出失败：{exc}"))
+        return
+    print(ui.success(f"  已导出到 {target}"))
 
 
 def handle_slash(agent: Agent, line: str, select: Any = None) -> bool:
@@ -3527,6 +3587,19 @@ def handle_slash(agent: Agent, line: str, select: Any = None) -> bool:
                     print(ui.warning(f"  这条规则可能不会命中：{hint}"))
     elif command == "/resume":
         slash_resume(agent, rest, select)
+    elif command == "/copy":
+        text = agent.last_assistant_text()
+        if not text:
+            print(ui.secondary("  还没有可复制的回复"))
+        elif tool := media.copy_text(text):
+            print(ui.secondary(f"  已复制最后一条回复到剪贴板（{tool}，{len(text)} 字）"))
+        elif attention.copy_via_terminal(text):
+            #  SSH / 容器里没有本机剪贴板命令，OSC 52 交给终端宿主写（终端得允许）
+            print(ui.secondary(f"  本机没有剪贴板命令，已经 OSC 52 交给终端（{len(text)} 字；终端需允许写剪贴板）"))
+        else:
+            print(ui.warning("  复制失败：没有 pbcopy / wl-copy / xclip / clip.exe，当前也不是终端"))
+    elif command == "/export":
+        _slash_export(agent, " ".join(rest))
     elif command == "/clear":
         agent.reset()
         print(ui.secondary("对话已清空"))
@@ -3616,6 +3689,9 @@ def make_confirm(permissions: Permissions):
         except (EOFError, KeyboardInterrupt):
             print()
             return False
+        finally:
+            #  答完就回到运行中：标题上的"等审批"不能留到下一次等人
+            attention.running()
 
         verdict = interpret_confirm_answer(answer)
         if verdict is GRANT_SESSION:

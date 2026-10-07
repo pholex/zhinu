@@ -1794,6 +1794,8 @@ class Tui:
         try:
             return self._confirm_inner(name, args)
         finally:
+            #  答完就回到运行中：标题上的"等审批"不能留到下一次等人
+            attention.running()
             if self._poller is not None:
                 self._poller.resume()
 
@@ -1811,6 +1813,7 @@ class Tui:
         try:
             return ask_questions(questions, self.console)
         finally:
+            attention.running()
             if self._poller is not None:
                 self._poller.resume()
 
@@ -2146,8 +2149,9 @@ class Tui:
         """交互循环。与明文 repl 的差异：Ctrl-C 需在 2 秒内按两次才退出
         （单次防误触），Ctrl-D 仍即刻退出；多出 @ 文件补全与 Ctrl-O 等按键
         （! / # 前缀两个前端已对齐，路由同走 keys.classify_input）。"""
-        #  窗口标题随会话走，退出时还原——任何退出路径（Ctrl-D、/exit、异常）都要还
-        attention.set_title(agent.config.workspace)
+        #  窗口标题随会话走（具名会话用名字），退出时还原——任何退出路径
+        #  （Ctrl-D、/exit、异常）都要还
+        attention.set_title(agent.config.workspace, session=attention.session_label(agent.session_log))
         try:
             return self._run_loop(agent)
         finally:
@@ -2206,7 +2210,15 @@ class Tui:
                     print()
                     return 0
                 last_interrupt = now
-                self.console.print(Text("  再按一次 Ctrl-C 退出", style="text.secondary"))
+                #  Ctrl-C 清掉的半截输入先存进 Esc-Esc 的取回槽：误按一下不该让敲了
+                #  一半的话凭空消失，也不为此加新键。prompt_toolkit 要到下一次
+                #  prompt() 才重置 buffer，此刻正文还在
+                draft = session.default_buffer.text.strip()
+                hint = "  再按一次 Ctrl-C 退出"
+                if draft:
+                    self._last_input = draft
+                    hint += "（刚才的输入 Esc Esc 可取回）"
+                self.console.print(Text(hint, style="text.secondary"))
                 continue
 
             #  提交路由单点在 keys.classify_input：TUI 与明文 REPL 同一张表
@@ -2248,6 +2260,7 @@ class Tui:
             #  Esc-Esc 取回的是用户敲的那行（/deploy prod），不是展开后的几千字
             self._last_input = recall
             self.sink.begin_turn()
+            attention.running()
             #  运行期插话（steer）：整行回车即在 step 边界进入本轮。
             #  poller 起不来（Windows/非 tty）时自动退回旧的"收尾预填"体验
             self._poller = SteerPoller(agent)
@@ -2279,7 +2292,7 @@ class Tui:
                 self.console.print(Text(note, style="text.secondary"))
             from .cli import turn_stats_line
 
-            if stats := turn_stats_line(agent):
+            if stats := turn_stats_line(agent, interactive=True):
                 self.console.print(Text(f"  {stats}", style="text.secondary"))
             self._print_expand_hint()
             #  一轮收尾 = 回到"等人"：铃（opt-in）+ 状态钩子，把切去别处的人叫回来

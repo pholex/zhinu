@@ -588,6 +588,47 @@ def _osascript_files() -> tuple[Path, ...]:
     return tuple(paths)
 
 
+#  往系统剪贴板写文本的命令，按平台挑第一个在 PATH 上的：(可执行名, argv)。
+#  Linux 上 Wayland 优先于 X11（两个都装的桌面上 xclip 常连不上），clip.exe
+#  兜 WSL（Windows 的 System32 在 PATH 里）。没有可用命令时由调用方退回 OSC 52
+_COPY_COMMANDS: dict[str, tuple[tuple[str, list[str]], ...]] = {
+    "darwin": (("pbcopy", ["pbcopy"]),),
+    "win32": (("clip", ["clip"]),),
+    "linux": (
+        ("wl-copy", ["wl-copy"]),
+        ("xclip", ["xclip", "-selection", "clipboard"]),
+        ("clip.exe", ["clip.exe"]),
+    ),
+}
+
+
+def copy_text(text: str) -> str:
+    """把文本写进系统剪贴板，返回用到的命令名；没有可用命令或写失败返回空串。
+
+    失败不抛：复制是顺手的事，调用方按返回值决定要不要退回终端的 OSC 52。
+    Windows 的 clip 按控制台代码页解码 stdin，按本机首选编码喂它；其余平台 UTF-8。
+    """
+    candidates = _COPY_COMMANDS.get(sys.platform, _COPY_COMMANDS["linux"])
+    if sys.platform == "win32":
+        import locale
+
+        data = text.encode(locale.getpreferredencoding(False) or "utf-8", errors="replace")
+    else:
+        data = text.encode("utf-8")
+    for name, argv in candidates:
+        if name == "wl-copy" and not os.environ.get("WAYLAND_DISPLAY"):
+            continue
+        if shutil.which(name) is None:
+            continue
+        try:
+            proc = subprocess.run(argv, input=data, capture_output=True, timeout=10)
+        except (OSError, subprocess.SubprocessError):
+            continue
+        if proc.returncode == 0:
+            return name
+    return ""
+
+
 def _windows_clipboard() -> Clip:
     #  一次 PowerShell 调用两件事：位图存成临时 PNG（Get-Clipboard 给的是 .NET
     #  Bitmap 对象，没有直接拿字节的路子），文件清单直接打到 stdout
