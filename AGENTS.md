@@ -56,6 +56,39 @@ id 精确到文件，在哪个目录跑都找得到；记录可能含用户隐�
 - 新护栏先问能不能关、怎么关（`xiaoyu/guardrails.py` 一张表）；硬红线那层刻意无开关。
 - 改了 `.github/workflows/`：action 一律钉 commit SHA 并注释版本号。
 
+## 单一事实源
+
+下面这些东西各只在一处声明，别处都从它渲染或与它对账；改之前先找到那一处，
+再看最后一列有没有测试替你拦漂移（写「无」的要靠自己核对）。
+
+| 关注点 | 声明在哪 | 谁消费 | 哪个测试拦 |
+|---|---|---|---|
+| 护栏开关层（`--unguarded` 能关哪几层、怎么单独关） | `xiaoyu/guardrails.py` 的 `LAYERS` / `KEPT` | `cli.py` 解析与横幅（`guardrails.notice`）；`docs/security.md`「放开护栏」 | `tests/test_guardrails.py::TableTest`（每层是 `Config` 字段且关值≠出厂值、横幅列全 `KEPT`）；文档一节无对账 |
+| 公开 API | `xiaoyu/__init__.py` 的 `_EXPORTS` / `__all__` ↔ `docs/embedding.md`「公开面清单」 | 嵌入宿主、SDK | `tests/test_public_api.py::TestDocContract`（**双向**：漏写文档或表里多出没承诺的名字都失败） |
+| 运行期依赖数、wheel 体积上限 | `pyproject.toml` 的 `dependencies` ↔ `tests/wheel_smoke.py` 的 `RUNTIME_DEPENDENCY_COUNT` / `WHEEL_SIZE_CAP` | `pip install xiaoyu-agent` 的用户 | `tests/wheel_smoke.py` 第 0 步（CI build job 调，本地 `scripts/verify.py`） |
+| 命令 wrapper 与透传运行器名单 | `xiaoyu/command_check.py` 的 `WRAPPER_NAMES` / `RUNNER_SUBCOMMANDS` / `RUNNER_HEADS` | `permissions.py`（授权范围、allow 规则按内层命令判、会话授权探针） | `tests/test_command_check.py`（运行器剥开、注入看穿）、`tests/test_permissions.py`（runner 规则按内层命令判）；本机下游 channels 仓另有回归 |
+| 按键表 | `xiaoyu/keys.py` 的 `BINDINGS` | `tui.py` 按表注册按键、首屏速览 `hint_line`、轮播 `tips`、菜单提示；`cli.py` 的 `/keys` 打 `help_text` | `tests/test_keys.py`（注册只能来自表、`/keys` 覆盖每个 `show` 项、速览行覆盖前缀） |
+| hooks 事件表 | `xiaoyu/hooks.py` 的 `EVENTS`（带工具名的子集 `TOOL_EVENTS`） | `hooks.toml` 的准入校验；`docs/configuration.md`「生命周期钩子」事件表 | `tests/test_hooks.py::test_events_table_covers_every_event_the_kernel_fires`（扫源码里每个 `fire("X")` 字面量）；文档表无对账 |
+| 斜杠命令 | `xiaoyu/cli.py` 的 `SLASH_COMMANDS` | `/help`、TUI 补全、ACP `available_commands_update`（`acp.py` 只列名字、描述从这里取，缺键直接 KeyError） | `tests/test_goal.py`（登记即出现在 /help 与补全）、`tests/test_e2e_acp.py`（广告载荷） |
+| 环境变量与开关 | `docs/configuration.md`「变量总表」；读取点散在 `xiaoyu/config.py` 等处 | 用户、`xiaoyu doctor` 的提示 | **无**——加变量时自己对一遍表，并在测试隔离（`tests/test_e2e_scripted.py` 的 `env_for`、`tests/wheel_smoke.py` 的 `clean_env`）里把新开关关掉 |
+| 发版说明 | `docs/releases/<版本>.md`，由 `scripts/release_notes.py` 生成 | `release.yml` 的 `gh release create`（文件不存在退回自动生成） | `tests/test_release_notes.py`（分组与退化路径）；`scripts/release.py --dry-run` 查文件在不在 |
+
+常见改动的食谱：
+
+- **加一个 env 开关**：在 `config.py` 照现有 `XIAOYU_ENABLE_*` 的读法加读取 →
+  `docs/configuration.md` 变量总表加一行 → 若它是一层护栏，登记到 `guardrails.LAYERS`
+  → 测试隔离里关掉它（上表「环境变量」一行）。
+- **加一个公开名**：`xiaoyu/__init__.py` 的 `_EXPORTS` 加一项（懒导出，别在顶层急切
+  import）→ `docs/embedding.md`「公开面清单」加同名一行 → 跑 `tests.test_public_api`。
+- **加一个运行期依赖**：先问能不能不加；要加就在 `pyproject.toml` 精确锁版本 →
+  `tests/wheel_smoke.py` 的 `RUNTIME_DEPENDENCY_COUNT` 同步 +1 → commit 正文写为什么
+  不得不加。可选能力走 `optional-dependencies` 的 extra，不动计数。
+- **加一个 hook 事件**：`hooks.py` 的 `EVENTS` 加名字（带工具名就同时进 `TOOL_EVENTS`）
+  → 内核里 `engine.fire("新事件", payload)` → `docs/configuration.md` 事件表加一行
+  （时机、拦截语义、payload 字段）→ `tests/test_hooks.py` 补用例。
+- **加一个斜杠命令**：`cli.py` 的 `SLASH_COMMANDS` 加键值 → `handle_slash` 实现 →
+  要给 ACP 客户端用就进 `acp.py` 的 `_ACP_COMMANDS` → README「用」一节的 REPL 行补上。
+
 ## 发版
 
 见 `docs/internal/DEVELOPMENT.md`「发版」。要点：改 `xiaoyu/__init__.py` 的
