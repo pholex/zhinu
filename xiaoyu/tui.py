@@ -1794,6 +1794,8 @@ class Tui:
         try:
             return self._confirm_inner(name, args)
         finally:
+            #  答完就回到运行中：标题上的"等审批"不能留到下一次等人
+            attention.running()
             if self._poller is not None:
                 self._poller.resume()
 
@@ -1811,6 +1813,7 @@ class Tui:
         try:
             return ask_questions(questions, self.console)
         finally:
+            attention.running()
             if self._poller is not None:
                 self._poller.resume()
 
@@ -2146,8 +2149,9 @@ class Tui:
         """交互循环。与明文 repl 的差异：Ctrl-C 需在 2 秒内按两次才退出
         （单次防误触），Ctrl-D 仍即刻退出；多出 @ 文件补全与 Ctrl-O 等按键
         （! / # 前缀两个前端已对齐，路由同走 keys.classify_input）。"""
-        #  窗口标题随会话走，退出时还原——任何退出路径（Ctrl-D、/exit、异常）都要还
-        attention.set_title(agent.config.workspace)
+        #  窗口标题随会话走（具名会话用名字），退出时还原——任何退出路径
+        #  （Ctrl-D、/exit、异常）都要还
+        attention.set_title(agent.config.workspace, session=attention.session_label(agent.session_log))
         try:
             return self._run_loop(agent)
         finally:
@@ -2241,6 +2245,7 @@ class Tui:
             #  Esc-Esc 取回的是用户敲的那行（/deploy prod），不是展开后的几千字
             self._last_input = recall
             self.sink.begin_turn()
+            attention.running()
             #  运行期插话（steer）：整行回车即在 step 边界进入本轮。
             #  poller 起不来（Windows/非 tty）时自动退回旧的"收尾预填"体验
             self._poller = SteerPoller(agent)

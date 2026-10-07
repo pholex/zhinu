@@ -162,13 +162,19 @@ def lock_path(path: Path) -> Path:
     return path.with_name(path.name + ".lock")
 
 
-def _session_label(path: Path) -> str:
-    """报错里用的会话称呼：命名会话取名字，匿名会话取文件名。
+def named_session(path: Path) -> str:
+    """会话文件对应的名字（`--session-id` / 终端集成起的）；匿名会话返回空串。
 
     文件名是 <时间戳>-<pid>[-id-<名字>]，前两段不含 `-id-`，第一次出现就是分隔符。
+    窗口标题、报错称呼都从这里取名字，不各自拆文件名。
     """
     _, mark, name = path.stem.partition(_NAMED_MARK)
-    return name if mark else path.name
+    return name if mark else ""
+
+
+def _session_label(path: Path) -> str:
+    """报错里用的会话称呼：命名会话取名字，匿名会话取文件名。"""
+    return named_session(path) or path.name
 
 
 class SessionLockedError(RuntimeError):

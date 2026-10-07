@@ -43,10 +43,25 @@ class BellTest(unittest.TestCase):
 
 
 class TitleTest(unittest.TestCase):
+    def tearDown(self) -> None:
+        #  模块记着"当前会话名"，用例之间别串
+        attention.clear_title(io.StringIO())
+
     def test_title_strips_control_sequences_from_directory_name(self) -> None:
         text = attention.title_text(Path("/tmp/proj\x1b]0;evil\x07\nname"))
-        self.assertEqual(text, "xiaoyu · proj name")
+        self.assertEqual(text, "就绪 · proj name · xiaoyu")
         self.assertNotIn("\x1b", text)
+
+    def test_title_has_state_then_name_then_app(self) -> None:
+        self.assertEqual(
+            attention.title_text(Path("/work/zhinu"), attention.WAITING_APPROVAL),
+            "等审批 · zhinu · xiaoyu",
+        )
+        #  具名会话用名字而不是目录名；名字同样去控制字符
+        self.assertEqual(
+            attention.title_text(Path("/work/zhinu"), attention.RUNNING, "deploy\x1b[31m"),
+            "运行中 · deploy · xiaoyu",
+        )
 
     def test_set_pushes_then_sets_and_clear_restores(self) -> None:
         stream = _Tty()
@@ -55,8 +70,43 @@ class TitleTest(unittest.TestCase):
             attention.clear_title(stream)
         out = stream.getvalue()
         #  先 push 旧标题，再 OSC 0 设新标题；退出先清空（不认标题栈的终端）再 pop
-        self.assertTrue(out.startswith("\x1b[22;0t\x1b]0;xiaoyu · zhinu\x07"))
+        self.assertTrue(out.startswith("\x1b[22;0t\x1b]0;就绪 · zhinu · xiaoyu\x07"))
         self.assertTrue(out.endswith("\x1b]0;\x07\x1b[23;0t"))
+
+    def test_state_changes_only_rewrite_the_title_without_pushing_again(self) -> None:
+        stream = _Tty()
+        with mock.patch.dict(os.environ, {attention.TITLE_ENV: "1"}):
+            os.environ.pop(attention.BELL_ENV, None)
+            os.environ.pop(attention.HOOK_ENV, None)
+            attention.set_title(Path("/work/zhinu"), stream, session="deploy")
+            attention.running(stream)
+            attention.waiting(attention.WAITING_APPROVAL, stream)
+            attention.waiting(attention.WAITING_INPUT, stream)
+            attention.clear_title(stream)
+        out = stream.getvalue()
+        self.assertEqual(out.count("\x1b[22;0t"), 1)  # 标题栈只 push 一次
+        self.assertEqual(out.count("\x1b[23;0t"), 1)  # 退出 pop 一次，配平
+        self.assertIn("\x1b]0;就绪 · deploy · xiaoyu\x07", out)
+        self.assertIn("\x1b]0;运行中 · deploy · xiaoyu\x07", out)
+        self.assertIn("\x1b]0;等审批 · deploy · xiaoyu\x07", out)
+        self.assertIn("\x1b]0;等输入 · deploy · xiaoyu\x07", out)
+
+    def test_state_change_without_a_title_writes_nothing(self) -> None:
+        """没进交互前端（没 set_title）就没有标题可改：-p 等路径一个字节不写。"""
+        stream = _Tty()
+        with mock.patch.dict(os.environ, {attention.TITLE_ENV: "1"}):
+            os.environ.pop(attention.BELL_ENV, None)
+            os.environ.pop(attention.HOOK_ENV, None)
+            attention.running(stream)
+            attention.waiting(attention.WAITING_INPUT, stream)
+        self.assertEqual(stream.getvalue(), "")
+
+    def test_session_label_reads_the_named_session(self) -> None:
+        named = mock.Mock(path=Path("/s/20260101-120000-42-id-deploy.jsonl"))
+        anonymous = mock.Mock(path=Path("/s/20260101-120000-42.jsonl"))
+        self.assertEqual(attention.session_label(named), "deploy")
+        self.assertEqual(attention.session_label(anonymous), "")
+        self.assertEqual(attention.session_label(None), "")
 
     def test_disabled_by_env(self) -> None:
         stream = _Tty()

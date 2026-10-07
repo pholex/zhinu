@@ -2307,11 +2307,14 @@ def text_ask_questions(questions: list[dict[str, Any]]) -> dict[str, str]:
     attention.waiting(attention.WAITING_INPUT)
     answers: dict[str, str] = {}
     total = len(questions)
-    for number, item in enumerate(questions, start=1):
-        answer = ask_one_text(item, position=f"{number}/{total}" if total > 1 else "")
-        if answer is None:
-            break
-        answers[item["question"]] = answer
+    try:
+        for number, item in enumerate(questions, start=1):
+            answer = ask_one_text(item, position=f"{number}/{total}" if total > 1 else "")
+            if answer is None:
+                break
+            answers[item["question"]] = answer
+    finally:
+        attention.running()
     return answers
 
 
@@ -3085,8 +3088,8 @@ def background_status(agent: Agent) -> str:
 
 
 def repl(agent: Agent) -> int:
-    #  窗口标题随会话走，任何退出路径都还原（与 TUI 同一纪律）
-    attention.set_title(agent.config.workspace)
+    #  窗口标题随会话走（具名会话用名字），任何退出路径都还原（与 TUI 同一纪律）
+    attention.set_title(agent.config.workspace, session=attention.session_label(agent.session_log))
     try:
         return _repl_loop(agent)
     finally:
@@ -3135,6 +3138,7 @@ def _repl_loop(agent: Agent) -> int:
             _repl_memo(agent, action.args)
             continue
 
+        attention.running()
         try:
             agent.send(action.args)
         except KeyboardInterrupt:
@@ -3608,6 +3612,9 @@ def make_confirm(permissions: Permissions):
         except (EOFError, KeyboardInterrupt):
             print()
             return False
+        finally:
+            #  答完就回到运行中：标题上的"等审批"不能留到下一次等人
+            attention.running()
 
         verdict = interpret_confirm_answer(answer)
         if verdict is GRANT_SESSION:
