@@ -750,7 +750,12 @@ def _usage(raw: Any) -> Usage | None:
 # ---------- client 工厂 ----------
 
 
-def client(base_url: str, api_key: str, timeout: float | httpx2.Timeout) -> Any:
+def client(
+    base_url: str,
+    api_key: str,
+    timeout: float | httpx2.Timeout,
+    headers: dict[str, str] | None = None,
+) -> Any:
     """构造 anthropic SDK client。Transport 首次遇到 Messages 协议请求才调用
     （懒构造：不用 Claude 直连的进程不付 import 和连接池成本）。
 
@@ -758,6 +763,10 @@ def client(base_url: str, api_key: str, timeout: float | httpx2.Timeout) -> Any:
     自己拼 `/v1/messages`——不剥掉尾部 /v1 会打到 /v1/v1/messages。
 
     max_retries=0 沿用全仓公约：重试全部收归 agent._stream_with_recovery 一层。
+
+    headers：Provider 声明的自定义 header（XIAOYU_PROVIDER_<NAME>_HEADERS）。SDK 把
+    default_headers 合并在自家鉴权头之后，所以 `Authorization=Bearer …` 这类中转站
+    要求的头能盖过默认的 x-api-key 形态。
     """
     import anthropic
 
@@ -770,6 +779,7 @@ def client(base_url: str, api_key: str, timeout: float | httpx2.Timeout) -> Any:
         timeout=timeout,
         max_retries=0,
         http_client=netproxy.http_client("anthropic"),
+        **({"default_headers": dict(headers)} if headers else {}),
     )
 
 
@@ -782,7 +792,10 @@ BEDROCK_EXTRA_HINT = (
 
 
 def bedrock_client(
-    region: str, timeout: float | httpx2.Timeout, api_key: str | None = None
+    region: str,
+    timeout: float | httpx2.Timeout,
+    api_key: str | None = None,
+    headers: dict[str, str] | None = None,
 ) -> Any:
     """构造 Bedrock client（同 SDK 的 AnthropicBedrock）。
 
@@ -809,4 +822,5 @@ def bedrock_client(
         timeout=timeout,
         max_retries=0,
         http_client=netproxy.http_client("anthropic"),
+        **({"default_headers": dict(headers)} if headers else {}),
     )

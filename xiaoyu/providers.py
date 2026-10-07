@@ -29,7 +29,7 @@ import httpx2
 
 from . import netproxy
 from .config import GATEWAY_KEY_ENVS, Config, MissingConfig, find_api_key
-from .responses import ANTHROPIC, RESPONSES, WILDCARD
+from .responses import ANTHROPIC, CHAT, RESPONSES, WILDCARD
 from .responses import wrap as wrap_transport
 from .scripted import SCRIPTED_ENV, SCRIPTED_PROVIDER
 from .textcalls import TEXT as TEXT_TOOLS
@@ -121,14 +121,17 @@ def request_timeout(seconds: float) -> httpx2.Timeout:
     return httpx2.Timeout(seconds, connect=min(_CONNECT_TIMEOUT, seconds))
 
 
-def _discover_models(base_url: str, api_key: str, label: str) -> tuple[str, ...]:
+def _discover_models(
+    base_url: str, api_key: str, label: str, headers: tuple[tuple[str, str], ...] = ()
+) -> tuple[str, ...]:
     """探端点 /v1/models，返回它当前 serve 的 model id（去重排序）。失败/空 → 空
     元组：调用方据此**跳过注册**，绝不退化成通配（通配的具名 provider 会把一切
     模型名都吃掉、劫持网关路由）。失败只出声不抛——启动不该因端点没起来而崩。"""
     client = None
     try:
         client = _openai_class()(
-            base_url=base_url, api_key=api_key, http_client=netproxy.http_client()
+            base_url=base_url, api_key=api_key, http_client=netproxy.http_client(),
+            **({"default_headers": dict(headers)} if headers else {}),
         )
         page = client.with_options(timeout=_DISCOVER_TIMEOUT).models.list()
         #  清单在关连接之前取完：翻页是迭代时才发的请求
@@ -434,6 +437,9 @@ class Provider:
     response_cache: bool = False
     #  非空 = 请求走 AWS 凭证链签名的 Bedrock client（见 Registry._build_client）
     aws_region: str = ""
+    #  随每个请求附带的自定义 HTTP header（名, 值）对。三条协议的 SDK client 都收
+    #  default_headers；值可能是令牌，展示面（config --show / doctor）只露名字
+    headers: tuple[tuple[str, str], ...] = ()
 
     @property
     def wildcard(self) -> bool:
@@ -448,6 +454,59 @@ class Provider:
     @property
     def display(self) -> str:
         return self.label or self.name
+
+    @property
+    def header_names(self) -> tuple[str, ...]:
+        """自定义 header 的名字清单（展示用，值永不出）。"""
+        return tuple(name for name, _ in self.headers)
+
+    def protocol_for(self, model: str) -> str:
+        """这个型号在这家走哪条 wire protocol。与 responses.Transport.protocol_for
+        同一规则（Messages 优先于 Responses，其余 chat）；放在这里是为了不构造
+        client 也能回答——config --show 这类展示面不该为了报协议而 import SDK。"""
+        if WILDCARD in self.anthropic_models or model in self.anthropic_models:
+            return ANTHROPIC
+        if WILDCARD in self.responses_models or model in self.responses_models:
+            return RESPONSES
+        return CHAT
+
+
+#  自定义 header 的写法：`Name=value;Name2=value2`。分隔符选分号而非逗号——
+#  header 值里逗号常见（Accept、q 权重），分号在 header 值里反而极少单独出现。
+#  值里允许再出现 `=`（只按第一个切），值可写 ${env:VAR} 引用环境变量/Keychain，
+#  令牌不必明文进配置
+_HEADER_SEP = ";"
+
+
+def parse_provider_headers(raw: str, label: str = "") -> tuple[tuple[str, str], ...]:
+    """解析 `XIAOYU_PROVIDER_<NAME>_HEADERS`。顺序保留；坏段出声跳过而不是整条作废。
+
+    ${env:VAR}（也认 ${VAR}）复用 MCP 配置同一套展开：优先环境变量，其次 macOS
+    Keychain 同名条目（这是用户亲手写的声明，和 .mcp.json 的 env 块同一信任档）。
+    引用没兑现的 header **整个丢掉**并出声——把 `${env:TOKEN}` 字面量当凭据发上游，
+    上游回的 401 完全不会指向这里。
+    """
+    if not raw or not raw.strip():
+        return ()
+    from .mcp import _expand
+
+    tag = label or "XIAOYU_PROVIDER_*_HEADERS"
+    pairs: list[tuple[str, str]] = []
+    for segment in raw.split(_HEADER_SEP):
+        segment = segment.strip()
+        if not segment:
+            continue
+        name, sep, value = segment.partition("=")
+        name = name.strip()
+        if not sep or not name:
+            print(f"[{tag}：`{segment[:40]}` 不是 Name=value 形式，已忽略]", file=sys.stderr)
+            continue
+        expanded = _expand(value.strip(), keychain=True)
+        if "${" in expanded:
+            print(f"[{tag}：header {name} 引用的变量未设置，该 header 已忽略]", file=sys.stderr)
+            continue
+        pairs.append((name, expanded))
+    return tuple(pairs)
 
 
 @dataclass(frozen=True)
@@ -696,10 +755,11 @@ class Registry:
             def factory(p: Provider = provider, t: httpx2.Timeout = self._timeout) -> Any:
                 from . import messages
 
+                headers = dict(p.headers) or None
                 if p.aws_region:
                     key = None if p.api_key == IAM_PLACEHOLDER_KEY else p.api_key
-                    return messages.bedrock_client(p.aws_region, t, api_key=key)
-                return messages.client(p.base_url, p.api_key, t)
+                    return messages.bedrock_client(p.aws_region, t, api_key=key, headers=headers)
+                return messages.client(p.base_url, p.api_key, t, headers=headers)
 
         #  snapshot 录制（XIAOYU_SNAPSHOT_RECORD）包在最外侧：录到的
         #  是传输层抹平协议差异之后、内核实际消费的 chunk 面
@@ -714,6 +774,8 @@ class Registry:
                     max_retries=0,
                     #  代理判定收口在 netproxy：回环直连、坏代理变量降级不炸
                     http_client=netproxy.http_client(),
+                    #  自定义 header 只在声明了才传：没声明时构造参数与从前一个字节不差
+                    **({"default_headers": dict(provider.headers)} if provider.headers else {}),
                 ),
                 provider.responses_models,
                 provider.anthropic_models,
@@ -1097,7 +1159,12 @@ def _make(name: str, config: Config) -> Provider | None:
                 file=sys.stderr,
             )
             return None
-        models = _discover_models(base_url, key, f"XIAOYU_PROVIDER_{upper}")
+        models = _discover_models(
+            base_url, key, f"XIAOYU_PROVIDER_{upper}",
+            headers=parse_provider_headers(
+                os.environ.get(f"{_GENERIC_PREFIX}{upper}_HEADERS", ""), f"XIAOYU_PROVIDER_{upper}_HEADERS"
+            ),
+        )
         if not models:
             #  探测失败/空：跳过而非退化成通配（通配会劫持网关）
             return None
@@ -1130,6 +1197,11 @@ def _make(name: str, config: Config) -> Provider | None:
             file=sys.stderr,
         )
         signatures = ()
+    #  HEADERS=Name=value;Name2=${env:VAR}：中转站要求的额外鉴权头 / 站点标识头等。
+    #  三条协议的 client 都带上（见 Registry._build_client）
+    headers = parse_provider_headers(
+        os.environ.get(f"{_GENERIC_PREFIX}{upper}_HEADERS", ""), f"XIAOYU_PROVIDER_{upper}_HEADERS"
+    )
     return Provider(
         name,
         base_url,
@@ -1141,4 +1213,5 @@ def _make(name: str, config: Config) -> Provider | None:
         speaks_anthropic,
         text_tools,
         signatures,
+        headers=headers,
     )

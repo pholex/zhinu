@@ -228,6 +228,22 @@ class ConfigCommandTest(IsolatedConfigTest):
         self.assertIn("已设置", out)
         self.assertIn("m1", out)
 
+    def test_show_lists_custom_header_names_but_never_values(self):
+        with mock.patch.dict(
+            os.environ,
+            {
+                "XIAOYU_PROVIDER_RELAY_BASE_URL": "https://relay.example/v1",
+                "XIAOYU_PROVIDER_RELAY_API_KEY": "k",
+                "XIAOYU_PROVIDER_RELAY_MODELS": "m",
+                "XIAOYU_PROVIDER_RELAY_HEADERS": "Authorization=Bearer top-secret;X-Title=xiaoyu",
+            },
+        ):
+            code, out = self.run_cmd(["--show"])
+        self.assertEqual(code, 0)
+        self.assertIn("Authorization", out)
+        self.assertIn("X-Title", out)
+        self.assertNotIn("top-secret", out)
+
     def test_wizard_refuses_without_tty(self):
         err = io.StringIO()
         with mock.patch.object(cli.sys.stdin, "isatty", return_value=False), contextlib.redirect_stderr(err):

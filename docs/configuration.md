@@ -465,7 +465,10 @@ XIAOYU_PROVIDER_MINIMAX_PROTOCOL=responses                   # 默认 chat；可
 XIAOYU_PROVIDER_MINIMAX_VISION=*                             # 声明视觉能力，默认不发图
 XIAOYU_PROVIDER_MINIMAX_TOOLS=text                           # 默认 native；端点不会 function calling 时设 text
 XIAOYU_PROVIDER_MINIMAX_SIGNATURES=*                         # 工具调用重放需带回 thought_signature 的型号（Gemini 系端点用；仅 chat 协议生效，配上 PROTOCOL=responses/anthropic 会出声忽略）
+XIAOYU_PROVIDER_MINIMAX_HEADERS=X-Title=xiaoyu;Authorization=Bearer ${env:RELAY_TOKEN}   # 随每个请求附带的自定义 header，分号分隔
 ```
+
+`_HEADERS`：中转站要求的额外头（站点标识、`Authorization: Bearer` 这类与 SDK 默认鉴权形态不同的头……）。格式 `Name=value;Name2=value2`，分号分隔，值里允许再出现 `=`；值可写 `${env:VAR}`（也认 `${VAR}`）引用环境变量或 macOS Keychain 同名条目，令牌不必明文进配置——引用没兑现的那个 header 会被出声丢掉，不会把 `${env:…}` 字面量发上游。三条协议（chat / responses / anthropic）的 client 都带上，SDK 把它们合并在自家鉴权头之后，所以能盖过默认的 `x-api-key` 形态。`config --show` 与 `doctor` 只显示 header 的**名字**，值永不出现。
 
 本机端点免 key 的规则同网关：`_BASE_URL` 指向 `localhost` 时 `_API_KEY` 可省略（显式给了则以给的为准）。
 

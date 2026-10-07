@@ -580,7 +580,11 @@ def show_config() -> int:
         print(ui.heading("生效的 provider") + ui.secondary("（按优先级，同名模型先出现者赢）"))
         for index, provider in enumerate(registry.providers, start=1):
             scope = "、".join(provider.models) if provider.models else "任意模型名（转发）"
-            print(f"  {index}. {provider.display}  {ui.secondary(scope)}")
+            line = f"  {index}. {provider.display}  {ui.secondary(scope)}"
+            if provider.headers:
+                #  只露名字：值可能是令牌
+                line += ui.secondary(f"  · 自定义 header：{', '.join(provider.header_names)}")
+            print(line)
     print(ui.secondary(f"用户级配置文件：{user_env_path()}"))
     return 0
 
