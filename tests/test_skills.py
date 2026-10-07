@@ -445,6 +445,37 @@ class ProjectSkillsTest(unittest.TestCase):
         self.assertEqual(sorted(found), ["a", "b"])
         self.assertTrue(all(item.project for item in found.values()))
 
+    def test_repo_root_skills_are_visible_from_a_subdirectory_workspace(self):
+        """monorepo 子目录里开会话：仓库根的技能可见，子目录同名的优先。"""
+        (self.workspace / ".git").mkdir()
+        sub = self.workspace / "packages" / "web"
+        sub.mkdir(parents=True)
+        root_only = write_skill(self.workspace / ".agents" / "skills", "lint", "name: lint\ndescription: 根")
+        write_skill(self.workspace / ".xiaoyu" / "skills", "deploy", "name: deploy\ndescription: 根的")
+        near = write_skill(sub / ".agents" / "skills", "deploy", "name: deploy\ndescription: 子包的")
+        #  中间层也算一层
+        mid = write_skill(self.workspace / "packages" / ".xiaoyu" / "skills", "fmt", "name: fmt\ndescription: 中")
+        self.assertEqual(
+            skills.project_skill_dirs(sub),
+            [sub / ".xiaoyu" / "skills", sub / ".agents" / "skills",
+             sub.parent / ".xiaoyu" / "skills", sub.parent / ".agents" / "skills",
+             self.workspace / ".xiaoyu" / "skills", self.workspace / ".agents" / "skills"],
+        )
+        with contextlib.redirect_stderr(io.StringIO()):
+            found = {item.name: item for item in skills.scan_skills(sub)}
+        self.assertEqual(sorted(found), ["deploy", "fmt", "lint"])
+        self.assertEqual(found["deploy"].path, near)
+        self.assertEqual(found["lint"].path, root_only)
+        self.assertEqual(found["fmt"].path, mid)
+        self.assertTrue(all(item.project for item in found.values()))
+        self.assertTrue(skills.has_project_skills(sub))
+        #  不在 git 仓里：只看工作区自己，上层不算
+        loose = Path(self.tmp.name) / "loose" / "inner"
+        loose.mkdir(parents=True)
+        write_skill(loose.parent / ".agents" / "skills", "x", "name: x\ndescription: 上层")
+        self.assertEqual(skills.project_skill_dirs(loose), [loose / ".xiaoyu" / "skills", loose / ".agents" / "skills"])
+        self.assertEqual(self.names(loose), [])
+
     def test_no_workspace_means_no_project_skills(self):
         write_skill(self.workspace / ".agents" / "skills", "b", "name: b\ndescription: 乙")
         self.assertEqual(self.names(None), [])

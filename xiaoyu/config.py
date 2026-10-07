@@ -107,6 +107,29 @@ GATEWAY_KEY_ENVS = ("XIAOYU_API_KEY", "LITELLM_API_KEY")
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
 
+def project_root(workspace: Path) -> Path:
+    """最近的含 .git 的祖先目录；没有就是工作区自己（层链的上界）。"""
+    for candidate in (workspace, *workspace.parents):
+        if (candidate / ".git").exists():
+            return candidate
+    return workspace
+
+
+def project_levels(workspace: Path) -> list[Path]:
+    """git 根 → 工作区的目录层链（root 在前、workspace 在后，至少一层）。
+
+    "仓库级"的东西（项目指令文件、工作区自带的技能）按这条链逐层找：monorepo 的
+    子目录里开会话，仓库根上放的那份也该算数。工作区不在 git 仓里时只有它自己
+    一层。项目指令与技能目录共用这一份算法，两边对"仓库级"的理解不会各走各的。
+    """
+    root = project_root(workspace)
+    levels = [root]
+    if workspace != root:
+        for part in workspace.relative_to(root).parts:
+            levels.append(levels[-1] / part)
+    return levels
+
+
 def home_dir() -> Path | None:
     """`Path.home()` 的可失败版本：推不出用户主目录时返回 None 而不是抛。
 

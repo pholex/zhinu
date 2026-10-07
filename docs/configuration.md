@@ -116,7 +116,7 @@ XIAOYU_API_KEY=<key>
 | 变量 | 说明 |
 |---|---|
 | `XIAOYU_ENABLE_EXPLORE` | `explore` 检索子 agent |
-| `XIAOYU_ENABLE_SKILLS` | 扫描 `~/.agents/skills/`、工作区自带的 `.xiaoyu/skills/` 与 `.agents/skills/`、已装插件包下的 SKILL.md |
+| `XIAOYU_ENABLE_SKILLS` | 扫描 `~/.agents/skills/`、工作区自带的 `.xiaoyu/skills/` 与 `.agents/skills/`（按 git 根 → 工作区逐层找，越靠近工作区优先；工作区不在 git 仓里只看它自己；与仓库级 `.mcp.json` 同受信任门）、已装插件包下的 SKILL.md |
 | `XIAOYU_SKILLS_DISABLED` | 停用清单（不是开关）：逗号分隔的技能名，可通配，如 `lark-*,remotion-*,aws-core:*`。按带插件前缀的全名或目录名匹配。技能库是几家客户端共用的，要给索引腾预算时在这里点名，不必去删文件；`/skills` 会列出被停用的 |
 | `XIAOYU_SKILLS_DIR` | 覆盖技能扫描目录（`os.pathsep` 分隔）：给了就只认它、不混默认目录，工作区自带的也不扫（宿主指定技能库 / 测试隔离用） |
 | `XIAOYU_ENABLE_WEB_SEARCH` | `web_search` 工具 |

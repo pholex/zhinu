@@ -27,7 +27,7 @@ description: 部署上线前的检查清单与回滚步骤。当用户提到部�
 ```
 
 - 扫描目录（前者优先，同名去重）：`~/.agents/skills/`（跨客户端规范库，**推荐**）、
-  配置目录 `skills/`、工作区自带的 `.xiaoyu/skills/` 与 `.agents/skills/`。
+  配置目录 `skills/`、工作区自带的 `.xiaoyu/skills/` 与 `.agents/skills/`（git 根 → 工作区逐层，越近越优先）。
 - 要随仓库给团队共享的技能放工作区那两个目录之一，提交进仓库即可。同名时你自己
   装的那份胜出（仓库顶不掉你已有的技能）；工作区没过信任门时整类不加载。
 - frontmatter 只认 `---` 块里平铺的 `key: value`（零依赖解析），`name` 和

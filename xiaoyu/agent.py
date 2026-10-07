@@ -52,7 +52,7 @@ from .compaction import (
     microcompact,
     plan_from_history,
 )
-from .config import EFFORT_LEVELS, Config
+from .config import EFFORT_LEVELS, Config, project_levels
 from .errors import Interrupted, classify
 from .providers import Registry, Route, UnknownModel
 from .permissions import Permissions, call_identity
@@ -623,14 +623,6 @@ def phantom_claims(text: str) -> list[str]:
     return found
 
 
-def _find_project_root(workspace: Path) -> Path:
-    """最近的含 .git 的祖先目录；没有就是工作区自己（层链的上界）。"""
-    for candidate in (workspace, *workspace.parents):
-        if (candidate / ".git").exists():
-            return candidate
-    return workspace
-
-
 def collect_project_docs(
     workspace: Path, names: tuple[str, ...], cap: int
 ) -> list[tuple[str, str]]:
@@ -639,11 +631,8 @@ def collect_project_docs(
     每层只认 names 里首个命中的非空文件；预算 cap 按 leaf-first 分配——
     从最深层往上分，分完为止，浅层文件被截断或整个丢弃时都有显式标注。
     """
-    root = _find_project_root(workspace)
-    levels = [root]
-    if workspace != root:
-        for part in workspace.relative_to(root).parts:
-            levels.append(levels[-1] / part)
+    #  层链与工作区技能目录（skills.project_skill_dirs）同源，见 config.project_levels
+    levels = project_levels(workspace)
 
     found: list[tuple[str, str]] = []
     for level in levels:
