@@ -1291,6 +1291,109 @@ def _locate_grep() -> str | None:
     return None
 
 
+#  grep 后端的三道界：单文件体积（rg --max-filesize；纯 Python 兜底同值；GNU grep
+#  没有等价选项，接受——它本来就是没装 rg 时的次选）、stdout 总量、总时长。
+#  原先 capture_output 把结果整份读进内存、只有 60s 一道界：一个宽泛 pattern 打在
+#  大仓库上能吐几百 MB，进程还没超时内存先爆。
+_GREP_MAX_FILESIZE = 1024 * 1024
+_GREP_STDOUT_CAP = 8 * 1024 * 1024
+_GREP_STDERR_CAP = 64 * 1024
+_GREP_TIMEOUT = 60.0
+
+
+@dataclass
+class _BoundedRun:
+    """有界运行的结果：stdout 最多 cap 字节；overflow / timed_out 说明为何提前收场。"""
+
+    stdout: bytes
+    stderr: bytes
+    returncode: int | None
+    overflow: bool = False
+    timed_out: bool = False
+
+
+def _drain(stream: Any, cap: int, keep_draining: bool) -> tuple[bytes, bool]:
+    """从管道读到 EOF 或超过 cap：keep_draining=True 时超过上限后继续读但不再保留
+    （stderr：让子进程写得出去），False 时直接停（stdout：调用方随后杀进程）。"""
+    chunks: list[bytes] = []
+    total = 0
+    overflow = False
+    while True:
+        data = stream.read(65536)
+        if not data:
+            break
+        if overflow:
+            continue
+        if total + len(data) > cap:
+            chunks.append(data[: cap - total])
+            overflow = True
+            if not keep_draining:
+                break
+            continue
+        chunks.append(data)
+        total += len(data)
+    return b"".join(chunks), overflow
+
+
+def _run_bounded(
+    command: list[str],
+    *,
+    cwd: str,
+    env: dict[str, str],
+    cap: int | None = None,
+    timeout: float | None = None,
+) -> _BoundedRun:
+    """起子进程、stdout 只保留前 cap 字节、到时限就整树杀掉。
+
+    读管道的线程只做搬运；超过上限或超时都由这边杀进程（先 SIGTERM 给一点宽限
+    再 SIGKILL，与后台任务同一把 kill_tree），管道随即 EOF、读线程自然收工。
+    OSError（找不到可执行文件等）原样抛给调用方决定兜底。
+    """
+    #  上限在调用时取模块量（不写成默认参数）：测试要能把它们调小
+    cap = _GREP_STDOUT_CAP if cap is None else cap
+    timeout = _GREP_TIMEOUT if timeout is None else timeout
+    proc = subprocess.Popen(
+        command,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        cwd=cwd,
+        env=env,
+        **_subprocess_hardening(),
+    )
+    _mark_group_leader(proc)
+    out: dict[str, Any] = {}
+
+    def read_stdout() -> None:
+        out["stdout"] = _drain(proc.stdout, cap, keep_draining=False)
+
+    def read_stderr() -> None:
+        out["stderr"] = _drain(proc.stderr, _GREP_STDERR_CAP, keep_draining=True)
+
+    threads = [
+        threading.Thread(target=read_stdout, name="grep-stdout", daemon=True),
+        threading.Thread(target=read_stderr, name="grep-stderr", daemon=True),
+    ]
+    for thread in threads:
+        thread.start()
+    threads[0].join(timeout)
+    timed_out = threads[0].is_alive()
+    overflow = bool(out.get("stdout", (b"", False))[1])
+    if timed_out or overflow or proc.poll() is None:
+        if timed_out or overflow:
+            _kill_tree(proc, grace=_TERM_GRACE_SECONDS)
+        with contextlib.suppress(Exception):
+            proc.wait(timeout=_TERM_GRACE_SECONDS + 5)
+    for thread in threads:
+        thread.join(timeout=5)
+    for stream in (proc.stdout, proc.stderr):
+        with contextlib.suppress(OSError):
+            stream.close()
+    stdout, _ = out.get("stdout", (b"", False))
+    stderr, _ = out.get("stderr", (b"", False))
+    return _BoundedRun(stdout, stderr, proc.returncode, overflow=overflow, timed_out=timed_out)
+
+
 def _glob_matches(item: Path, root: Path, glob: str) -> bool:
     """纯 Python 搜索里的 glob 过滤，语义对齐 rg --glob：不含 / 的模式匹配文件名
     （任意层级都算），含 / 的模式匹配相对搜索起点的路径。"""
@@ -2669,7 +2772,8 @@ class Toolbox:
         if rg := sandbox.host_which("rg"):
             command = [
                 rg, "--line-number", "--no-heading", "--color", "never",
-                "--hidden", "--no-config", "-e", pattern,
+                "--hidden", "--no-config", "--max-filesize", str(_GREP_MAX_FILESIZE),
+                "-e", pattern,
             ]
             for skip in sorted(_SKIP_DIRS):
                 command += ["--glob", f"!{skip}/**"]
@@ -2687,30 +2791,29 @@ class Toolbox:
             return self._grep_python(pattern, target, glob, max_matches)
 
         try:
-            result = subprocess.run(
-                command,
-                capture_output=True,
-                text=True,
-                #  Windows 默认 locale 编码（GBK/cp1252）解不了 UTF-8 输出，必须显式指定
-                encoding="utf-8",
-                errors="replace",
-                timeout=60,
-                cwd=str(self.config.workspace),
-                env=_hardened_env(),
-                **_subprocess_hardening(),
-            )
-        except subprocess.TimeoutExpired:
-            return f"ERROR: 搜索超时：{pattern}"
+            result = _run_bounded(command, cwd=str(self.config.workspace), env=_hardened_env())
         except OSError:
             #  which 说有、真跑起来却没有（PATH 里挂着失效的 shim 等），照样兜底，
             #  别把一个可恢复的环境问题变成模型眼里的死路
             return self._grep_python(pattern, target, glob, max_matches)
+        if result.timed_out:
+            return f"ERROR: 搜索超时（{_GREP_TIMEOUT:.0f}s）：{pattern}，请缩小 path 或 glob 范围"
 
-        #  grep/rg 没匹配到时退出码是 1，这不是错误
-        if result.returncode not in (0, 1):
-            return f"ERROR: 搜索失败（exit {result.returncode}）：{result.stderr.strip()[:200]}"
+        #  Windows 默认 locale 编码（GBK/cp1252）解不了 UTF-8 输出，必须显式按 UTF-8 解
+        stdout = result.stdout.decode("utf-8", errors="replace")
+        #  grep/rg 没匹配到时退出码是 1，这不是错误；被我们杀掉的（溢出）另说
+        if not result.overflow and result.returncode not in (0, 1):
+            stderr = result.stderr.decode("utf-8", errors="replace")
+            return f"ERROR: 搜索失败（exit {result.returncode}）：{stderr.strip()[:200]}"
 
-        lines = [line for line in result.stdout.splitlines() if line.strip()]
+        lines = [line for line in stdout.splitlines() if line.strip()]
+        if result.overflow:
+            #  最后一行多半被截在半截，丢掉；总数不可知，提示收窄而不是报个假数
+            lines = lines[:-1]
+            return self._grep_output(lines, pattern, max_matches) + (
+                f"\n[结果过多：输出超过 {_GREP_STDOUT_CAP // 1048576} MiB 已中止搜索，"
+                "以上只是开头一部分、总数不可知；请收窄 pattern 或 path / glob]"
+            )
         return self._grep_output(lines, pattern, max_matches)
 
     def _grep_python(
@@ -2722,8 +2825,9 @@ class Toolbox:
     ) -> str:
         """没有 rg / grep 时的纯 Python 搜索，输出格式与它们保持一致。
 
-        只求"能用"不求快：跳过 _SKIP_DIRS、二进制和超大文件，并留一个整体时间
-        预算，免得在大仓库上把一轮工具调用耗死。
+        只求"能用"不求快：跳过 _SKIP_DIRS、二进制和超大文件（与 rg 的
+        --max-filesize 同一上限），并留一个整体时间预算，免得在大仓库上把一轮
+        工具调用耗死。
         """
         try:
             regex = re.compile(pattern)
@@ -2743,7 +2847,7 @@ class Toolbox:
             if glob and not _glob_matches(item, target, glob):
                 continue
             try:
-                if item.stat().st_size > 2_000_000:
+                if item.stat().st_size > _GREP_MAX_FILESIZE:
                     continue
                 with item.open("rb") as raw:
                     if b"\0" in raw.read(4096):
