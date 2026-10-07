@@ -78,6 +78,7 @@ from typing import Any, Callable, Iterable, Sequence
 
 from prompt_toolkit import PromptSession
 from prompt_toolkit.application import Application, get_app_or_none, run_in_terminal
+from prompt_toolkit.auto_suggest import AutoSuggestFromHistory
 from prompt_toolkit.completion import CompleteEvent, Completer, Completion
 from prompt_toolkit.document import Document
 from prompt_toolkit.history import FileHistory
@@ -1559,6 +1560,9 @@ class Tui:
                 completer=SlashCompleter(self),
                 #  行首前缀着色（! 警告色、/ 强调色、# 弱化）
                 lexer=PrefixLexer(),
+                #  历史幽灵建议：敲到一半，灰字浮现最近一条同前缀的历史，行尾按 →
+                #  （或 Ctrl-E / Ctrl-F）接受。按键由 prompt_toolkit 自带，表里只登记
+                auto_suggest=AutoSuggestFromHistory(),
                 key_bindings=self._key_bindings(),
                 multiline=True,
                 #  续行不打标记、只按提示符实际宽度补空格对齐。

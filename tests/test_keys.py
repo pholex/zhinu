@@ -65,7 +65,7 @@ class TestBindingTable(unittest.TestCase):
         不教（Ctrl-X Ctrl-E / Ctrl-R 不是菜单键，1…9 被 menu_hint 省略）。
         从轮播里掉出去 = 该功能对用户不存在。"""
         rotation = "\n".join(keys.tips())
-        for label in ("Alt-Enter", "Ctrl-X Ctrl-E", "Ctrl-R", "1…9"):
+        for label in ("Alt-Enter", "Ctrl-X Ctrl-E", "Ctrl-R", "1…9", "→"):
             self.assertIn(label, rotation)
 
     def test_tips_skip_what_the_menu_already_teaches(self) -> None:
