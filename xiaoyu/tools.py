@@ -35,6 +35,7 @@ from typing import Any, Callable, Collection
 from . import browser, fsguard, mcp, media, sandbox, tempdirs
 from .background import (
     MONITOR_DEFAULT_TIMEOUT,
+    OUTPUT_READ_BYTES,
     TERM_GRACE_SECONDS as _TERM_GRACE_SECONDS,
     TaskManager,
     kill_tree as _kill_tree,
@@ -1299,6 +1300,9 @@ class Toolbox:
         #  注入（agent.__init__ 里 tasks.notify = self.notify）；受限子集
         #  （explore 的 READONLY）没有 bash，这张表闲置无害。
         self.tasks = TaskManager()
+        #  task_output 上一次对各任务的查询形态 (偏移, 状态, next_offset)：再查一遍
+        #  完全一样时提醒模型别原地轮询
+        self._task_output_seen: dict[str, tuple[int | None, str, int]] = {}
         #  文件快照（/rewind）：write_file / str_replace 改前把原内容记进当前轮
         #  的快照点；轮次边界由 Agent.send 划（begin/finish）。
         self.rewind = RewindStore()
@@ -2109,6 +2113,8 @@ class Toolbox:
                     "默认立即返回快照；要等任务结束就给 timeout（秒），到点仍在跑也会"
                     "返回现状。不要反复轮询——任务完成时你会自动收到通知；"
                     "需要等待就用一次带 timeout 的调用等到位。"
+                    "日志很长时默认只给头尾；要看中段或接着上次往下读，给 offset"
+                    "（字节，取上次返回的 next_offset）与 limit（字节）分段读。"
                 ),
                 parameters={
                     "type": "object",
@@ -2121,6 +2127,19 @@ class Toolbox:
                         "timeout": {
                             "type": "integer",
                             "description": "最多等多少秒（上限 600）；省略或 0 = 立即返回快照",
+                        },
+                        "offset": {
+                            "type": "integer",
+                            "description": (
+                                "从日志的第几个字节起读（0 = 开头）；接着上次读就填"
+                                "上次返回的 next_offset。省略 = 头尾快照"
+                            ),
+                        },
+                        "limit": {
+                            "type": "integer",
+                            "description": (
+                                f"这一段最多读多少字节，默认 {OUTPUT_READ_BYTES}"
+                            ),
                         },
                     },
                     "required": ["task_ids"],
@@ -3014,8 +3033,19 @@ class Toolbox:
             if self.stop_requested():
                 raise Interrupted("宿主请求打断")
 
-    def _task_output(self, task_ids: Any, timeout: int | None = None) -> str:
-        """后台任务快照 / 有界等待。宽进：单个 id 裸字符串也收（模型常这么写）。"""
+    def _task_output(
+        self,
+        task_ids: Any,
+        timeout: int | None = None,
+        offset: int | None = None,
+        limit: int | None = None,
+    ) -> str:
+        """后台任务快照 / 有界等待 / 按字节分段续读。宽进：单个 id 裸字符串也收。
+
+        不给 offset / limit 是原来的头尾快照；给了任一个就按字节切片，并回
+        next_offset 供下一段接着读。同一任务、同一偏移、状态与 next_offset 都
+        和上次一样时提醒一句——那是在原地重查，看多少遍都是同一份内容。
+        """
         if isinstance(task_ids, str):
             task_ids = [task_ids]
         if not isinstance(task_ids, list) or not task_ids:
@@ -3026,6 +3056,9 @@ class Toolbox:
             if text and text not in ids:
                 ids.append(text)
         wait = min(max(int(timeout or 0), 0), 600)
+        sliced = offset is not None or limit is not None
+        start = max(int(offset or 0), 0)
+        span = max(int(limit or OUTPUT_READ_BYTES), 1)
         deadline = time.monotonic() + wait
         sections: list[str] = []
         for task_id in ids:
@@ -3044,7 +3077,27 @@ class Toolbox:
                 head += f"（已运行 {task.elapsed():.0f}s）"
                 if wait:
                     head += "——等待已到上限，不必再调；任务完成时会自动通知你"
-            sections.append(f"{head}\n输出：\n{self.tasks.output_of(task)}")
+            if sliced:
+                body, next_offset, size = self.tasks.output_slice(task, start, span)
+                tail = f"[字节 {start}-{next_offset}，日志共 {size} 字节；next_offset={next_offset}"
+                tail += "，已到末尾]" if next_offset >= size else "，接着读就填这个 offset]"
+                body = body if body.strip() else "（这一段没有内容）"
+            else:
+                body = self.tasks.output_of(task)
+                try:
+                    next_offset = task.log_path.stat().st_size
+                except OSError:
+                    next_offset = -1
+                tail = ""
+            #  原地重查：同一任务、同一偏移、状态没变、日志也没长
+            seen = (start if sliced else None, status, next_offset)
+            if self._task_output_seen.get(task_id) == seen:
+                tail += (
+                    "\n[内容与上次查询相同，别立刻重查：任务完成会自动通知你；"
+                    "要等就用一次带 timeout 的 task_output，长期盯着用 monitor]"
+                )
+            self._task_output_seen[task_id] = seen
+            sections.append(f"{head}\n输出：\n{body}{tail}")
         return "\n\n".join(sections)
 
     def _kill_task(self, task_id: str) -> str:
