@@ -476,6 +476,42 @@ def _unreadable_file_error(target: Path, shown: str, size_cap: bool = True) -> s
 
 _SNIFF_BYTES = 8192
 
+#  read_file 单行显示上限（字符）。总量由 _bound_output 管，但 minified JS、单行
+#  JSON、一行几万字符的日志能一行就吃掉整段预算：截断显示、说明还剩多少，要看
+#  整行就单读那一行（limit=1 不截，整行再超长由 _bound_output 落盘可召回）。
+_READ_LINE_CAP = 2000
+
+
+def _clip_long_lines(
+    lines: list[str], first_number: int, cap: int = _READ_LINE_CAP
+) -> tuple[list[str], list[int]]:
+    """把超过 cap 的行截成前 cap 字符 + 说明；返回 (新行, 被截行的行号)。"""
+    clipped: list[int] = []
+    shown: list[str] = []
+    for index, line in enumerate(lines):
+        if len(line) > cap:
+            number = first_number + index
+            clipped.append(number)
+            line = line[:cap] + (
+                f"…（本行还有 {len(line) - cap} 字符未显示；"
+                f"要看整行用 offset={number} limit=1）"
+            )
+        shown.append(line)
+    return shown, clipped
+
+
+def _ranges_without(start: int, end: int, holes: list[int]) -> tuple[tuple[int, int], ...]:
+    """[start, end] 去掉 holes 里的行号后剩下的闭区间：截断显示的行不算读过。"""
+    ranges: list[tuple[int, int]] = []
+    cursor = start
+    for hole in holes:
+        if hole > cursor:
+            ranges.append((cursor, hole - 1))
+        cursor = hole + 1
+    if cursor <= end:
+        ranges.append((cursor, end))
+    return tuple(ranges)
+
 
 def _binary_file_error(target: Path, shown: str) -> str | None:
     """文本工具读到二进制文件：拒读并指路；是文本返回 None。
@@ -2352,6 +2388,28 @@ class Toolbox:
 
         limit_chars = self.config.max_tool_output
         if offset is None and limit is None:
+            lines = text.splitlines()
+            clipped_lines, clipped = _clip_long_lines(lines, 1)
+            if clipped:
+                #  截断显示的行模型没看全：按"读过其余各行"记，整体覆盖要先把这
+                #  几行单独读到（limit=1 不截）
+                shown = (
+                    f"{prefix}[{path} 有 {len(clipped)} 行超过 {_READ_LINE_CAP} 字符，"
+                    "已截断显示（行末有说明）；整体覆盖（write_file）前要把这些行"
+                    "用 offset=行号 limit=1 读全]\n" + "\n".join(clipped_lines)
+                )
+                fits = len(shown) <= limit_chars
+                self._mark_read(
+                    target,
+                    seen=_ranges_without(1, len(lines), clipped) if fits else (),
+                    total=len(lines),
+                )
+                if fits:
+                    return shown
+                return shown + (
+                    f"\n[{path} 太长，上面只显示了头尾；没显示的部分用 offset/limit 分段读。"
+                    "整体覆盖（write_file）要把各段都读到，局部修改（str_replace）现在就可以]"
+                )
             shown = f"{prefix}{text}"
             if len(shown) <= limit_chars:
                 self._mark_read(target)
@@ -2369,15 +2427,26 @@ class Toolbox:
         if start > len(lines):
             return f"ERROR: {path} 只有 {len(lines)} 行，offset={start} 超出范围"
         end = len(lines) if limit is None else min(len(lines), start + max(1, limit) - 1)
-        chunk = "\n".join(lines[start - 1 : end])
+        segment = lines[start - 1 : end]
+        clipped: list[int] = []
+        if end > start:
+            #  单读一行（limit=1）是模型专门来看这一行的，不截；多行才截超长行
+            segment, clipped = _clip_long_lines(segment, start)
+        chunk = "\n".join(segment)
         note = (
             f"{prefix}[{path} 第 {start}-{end} 行，共 {len(lines)} 行；"
             "这是部分内容：局部修改（str_replace）可以直接做，"
             "整体覆盖（write_file）要把全部行都读到]\n"
         )
+        if clipped:
+            note += (
+                f"[其中 {len(clipped)} 行超过 {_READ_LINE_CAP} 字符已截断显示，"
+                "要看整行用 offset=行号 limit=1]\n"
+            )
         #  这一段自己也装不下的话，模型同样只看见头尾——不计入已读范围
         fits = len(note) + len(chunk) <= limit_chars
-        self._mark_read(target, seen=((start, end),) if fits else (), total=len(lines))
+        seen = _ranges_without(start, end, clipped) if fits else ()
+        self._mark_read(target, seen=seen, total=len(lines))
         return note + chunk
 
     def _write_file(self, path: str, content: str) -> str:
