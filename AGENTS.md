@@ -95,7 +95,8 @@ id 精确到文件，在哪个目录跑都找得到；记录可能含用户隐�
 ## 发版
 
 见 `docs/internal/DEVELOPMENT.md`「发版」。要点：改 `xiaoyu/__init__.py` 的
-`__version__` → 跑 `tests_ai/self_test.md` 与 `scripts/release_notes.py` → 推 main 等 CI
+`__version__` → 跑 `tests_ai/self_test.md` 与 `scripts/release_notes.py`（自测记录用
+`--validation self_test.record.json` 附进「本版验证」一节）→ 推 main 等 CI
 绿 → 打 `vX.Y.Z` tag，其余自动。打 tag 前跑 `scripts/release.py --dry-run`：在 main、
 工作树干净、HEAD 已推、版本号大于所有本地 tag 与 PyPI 已发布版本、发版说明文件存在、
 公开文档没有「尚未发布」、main 最近一次 CI 绿；全过后不带 `--dry-run` 即在本地打带注释
