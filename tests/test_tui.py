@@ -1481,3 +1481,38 @@ class TestMakeFrontend(AgentTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+@unittest.skipUnless(HAS_TUI, "未安装 tui 可选依赖")
+class TestPrefixLexer(unittest.TestCase):
+    """输入行只给行首前缀上色，判定与提交路由同一函数。"""
+
+    def _fragments(self, text: str, lineno: int = 0):
+        from prompt_toolkit.document import Document
+
+        from xiaoyu.tui import PrefixLexer
+
+        return PrefixLexer().lex_document(Document(text))(lineno)
+
+    def test_prefixes_take_their_token_color(self) -> None:
+        from xiaoyu import theme
+
+        for text, token in (
+            ("! brew upgrade", "status.warning"),
+            ("/help", "text.accent"),
+            ("# 测试统一跑 unittest", "text.secondary"),
+            ("!", "status.warning"),  # 只敲了前缀：颜色先亮
+        ):
+            with self.subTest(text=text):
+                fragments = self._fragments(text)
+                self.assertEqual(fragments[0], (theme.ptk(token), text[0]))
+                self.assertEqual("".join(piece for _style, piece in fragments), text)
+                self.assertTrue(all(style == "" for style, _piece in fragments[1:]))
+
+    def test_non_prefix_text_stays_default(self) -> None:
+        for text in ("echo a ! b", "/Users/me/简历.pdf 看看", "/etc/hosts 是什么", "普通一句话"):
+            with self.subTest(text=text):
+                self.assertEqual(self._fragments(text), [("", text)])
+
+    def test_only_first_line_is_examined(self) -> None:
+        self.assertEqual(self._fragments("第一行\n! 第二行", lineno=1), [("", "! 第二行")])
