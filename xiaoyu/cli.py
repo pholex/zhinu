@@ -522,6 +522,11 @@ def config_command(argv: list[str]) -> int:
         "免去 pip/pipx 安装后到处找 .env。不带参数进交互向导。",
     )
     parser.add_argument("--show", action="store_true", help="显示当前生效配置与来源（key 永不回显）")
+    parser.add_argument(
+        "--json",
+        action="store_true",
+        help="与 --show 连用：机器可读 JSON（默认模型、各模型路由与能力、功能开关；密钥只给有无）",
+    )
     parser.add_argument("--path", action="store_true", help="打印用户级配置文件路径")
     parser.add_argument(
         "--no-probe",
@@ -551,7 +556,10 @@ def config_command(argv: list[str]) -> int:
         print(ui.success(f"已写入 {save_user_env(values)}"))
         return 0
     if args.show:
-        return show_config()
+        return show_config_json() if args.json else show_config()
+    if args.json:
+        print(ui.error("--json 只与 --show 连用"), file=sys.stderr)
+        return 2
     return config_wizard(probe=not args.no_probe)
 
 
@@ -586,6 +594,64 @@ def show_config() -> int:
                 line += ui.secondary(f"  · 自定义 header：{', '.join(provider.header_names)}")
             print(line)
     print(ui.secondary(f"用户级配置文件：{user_env_path()}"))
+    return 0
+
+
+def config_snapshot(cfg: Config, registry: providers.Registry) -> dict[str, Any]:
+    """`config --show --json` 的正文。路由与能力全部来自 Registry.snapshot /
+    route_info（与 describe 同一数据源），这里只拼上 Config 侧的默认模型与开关。
+    密钥值在任何字段里都不出现；base_url 过一遍脱敏（URL 里可能嵌账号密码）。"""
+    import dataclasses
+
+    from . import diagnostics
+
+    def clean(info: dict[str, Any]) -> dict[str, Any]:
+        if "base_url" in info:
+            info["base_url"] = diagnostics.redact_value("XIAOYU_BASE_URL", info["base_url"])
+        return info
+
+    snap = registry.snapshot()
+    for key in ("providers", "models", "wildcards"):
+        snap[key] = [clean(item) for item in snap[key]]
+    #  功能开关：Config 里所有 enable_* 布尔，外加两个同性质的开关；字段名即键名，
+    #  新加开关自动进清单
+    features = {
+        f.name: getattr(cfg, f.name)
+        for f in dataclasses.fields(cfg)
+        if (f.name.startswith("enable_") or f.name in ("mcp_tool_search", "server_compaction"))
+        and isinstance(getattr(cfg, f.name), bool)
+    }
+    return {
+        "default_model": cfg.model,
+        "summary_model": cfg.summary_model,
+        "explore_model": cfg.explore_model,
+        "fallback_models": list(cfg.fallback_models),
+        "effort": cfg.effort,
+        "context_limit": cfg.context_limit,
+        "max_output_tokens": getattr(cfg, "max_output_tokens", None),
+        "mode": cfg.mode,
+        "routes": {
+            "default": clean(registry.route_info(cfg.model)),
+            "summary": clean(registry.route_info(cfg.summary_model or cfg.model)),
+            "explore": clean(registry.route_info(cfg.explore_model or cfg.model)),
+            "fallback": [clean(registry.route_info(name)) for name in cfg.fallback_models],
+        },
+        "features": features,
+        **snap,
+        "user_env_path": str(user_env_path()),
+    }
+
+
+def show_config_json() -> int:
+    """`config --show --json`：给脚本/宿主读的生效配置。stdout 只出 JSON。"""
+    load_dotenv()
+    cfg = Config.from_env()
+    try:
+        registry = providers.build(cfg)
+    except MissingConfig as exc:
+        print(json.dumps({"error": str(exc), "user_env_path": str(user_env_path())}, ensure_ascii=False, indent=2))
+        return 1
+    print(json.dumps(config_snapshot(cfg, registry), ensure_ascii=False, indent=2))
     return 0
 
 

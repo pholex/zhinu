@@ -934,6 +934,74 @@ class Registry:
         provider = self.get(name)
         return provider.display if provider else name
 
+    def route_info(self, model: str) -> dict[str, Any]:
+        """一个模型名在这张表上的路由画像（机器可读；`config --show --json` 与
+        describe 同一数据源：归属问 resolve，能力问 provider 声明）。
+
+        密钥**只给布尔**：有没有、是哪种鉴权形态（key / 本机免 key / AWS 凭证链），
+        值不出现。解析不了的名字返回带 error 的条目，不抛——这是展示面。
+        """
+        from .config import context_window
+
+        try:
+            route = self.resolve(model)
+        except UnknownModel as exc:
+            return {"model": model, "error": str(exc)}
+        provider = self.get(route.provider)
+        assert provider is not None  # resolve 返回的 provider 一定在表里
+        if provider.api_key == IAM_PLACEHOLDER_KEY:
+            auth = "aws-iam"
+        elif provider.api_key == LOCAL_PLACEHOLDER_KEY:
+            auth = "local-no-key"
+        else:
+            auth = "key"
+        return {
+            "model": route.model,
+            "qualified": route.qualified,
+            "provider": provider.name,
+            "provider_label": provider.display,
+            "protocol": provider.protocol_for(route.model),
+            "base_url": provider.base_url,
+            "has_key": auth == "key",
+            "auth": auth,
+            "vision": self.sees_images(model),
+            "tools": "text" if WILDCARD in provider.text_tool_models or route.model in provider.text_tool_models else "native",
+            "context_limit": context_window(route.model),
+            "effort_levels": list(accepted_efforts(provider.name, route.model)),
+            "headers": list(provider.header_names),
+        }
+
+    def snapshot(self) -> dict[str, Any]:
+        """整张表的机器可读快照：显式声明的模型逐个给路由画像，通配 provider 单列。
+        数据源与 describe 完全相同（listing / wildcards），只是形态不同。"""
+        models = []
+        for entry in self.listing():
+            info = self.route_info(entry.model)
+            info["backups"] = [
+                {"provider": name, "provider_label": self._display(name)} for name in entry.backups
+            ]
+            models.append(info)
+        return {
+            "providers": [
+                {
+                    "name": provider.name,
+                    "label": provider.display,
+                    "base_url": provider.base_url,
+                    "models": list(provider.models),
+                    "wildcard": provider.wildcard,
+                    "protocol": provider.protocol_for(""),
+                    "headers": list(provider.header_names),
+                    "aws_region": provider.aws_region,
+                }
+                for provider in self.providers
+            ],
+            "models": models,
+            "wildcards": [
+                {"provider": provider.name, "provider_label": provider.display, "base_url": provider.base_url}
+                for provider in self.wildcards
+            ],
+        }
+
 
 @dataclass(frozen=True)
 class Listing:

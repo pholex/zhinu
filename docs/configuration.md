@@ -8,6 +8,7 @@ README 只给最小可跑配置，这里是全量。
 xiaoyu config             # 交互向导：直连 key / 网关端点 / 模型；落盘前先对主模型发一条最小请求验证
 xiaoyu config --no-probe  # 向导不探测、直接写入（离线填配置、端点暂时不通时用）
 xiaoyu config --show      # 看生效配置与每项来源（key 永不回显）
+xiaoyu config --show --json   # 机器可读：默认模型、各模型路由（provider / 协议 / base_url / 有无 key / 视觉与工具能力 / 上下文上限 / effort 档位）、功能开关；密钥值不出现
 xiaoyu config --path      # 打印用户级配置文件路径
 xiaoyu config --set XIAOYU_MODEL=deepseek-flash   # 非交互写入，可重复
 ```

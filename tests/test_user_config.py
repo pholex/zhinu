@@ -244,6 +244,57 @@ class ConfigCommandTest(IsolatedConfigTest):
         self.assertIn("X-Title", out)
         self.assertNotIn("top-secret", out)
 
+    def test_show_json_is_machine_readable_and_never_contains_secrets(self):
+        import json
+
+        config.save_user_env({"XIAOYU_API_KEY": "sk-super-secret", "XIAOYU_MODEL": "m"})
+        with mock.patch.dict(
+            os.environ,
+            {
+                "XIAOYU_BASE_URL": "https://gw.example/v1",
+                "XIAOYU_PROVIDER_RELAY_BASE_URL": "https://relay.example/v1",
+                "XIAOYU_PROVIDER_RELAY_API_KEY": "relay-secret",
+                "XIAOYU_PROVIDER_RELAY_MODELS": "m",
+                "XIAOYU_PROVIDER_RELAY_PROTOCOL": "anthropic",
+                "XIAOYU_PROVIDER_RELAY_HEADERS": "Authorization=Bearer top-secret",
+                "XIAOYU_ENABLE_MCP": "0",
+            },
+        ):
+            code, out = self.run_cmd(["--show", "--json"])
+        self.assertEqual(code, 0)
+        data = json.loads(out)
+        for secret in ("sk-super-secret", "relay-secret", "top-secret"):
+            self.assertNotIn(secret, out, "密钥值在 JSON 里任何字段都不许出现")
+        self.assertEqual(data["default_model"], "m")
+        default = data["routes"]["default"]
+        self.assertEqual(default["provider"], "relay")
+        self.assertEqual(default["protocol"], "anthropic")
+        self.assertTrue(default["has_key"])
+        self.assertEqual(default["headers"], ["Authorization"])
+        self.assertIsInstance(default["context_limit"], int)
+        self.assertIs(data["features"]["enable_mcp"], False)
+        self.assertIs(data["features"]["enable_skills"], True)
+        #  显式声明的模型与通配 provider 和 describe 同一数据源：relay/m 在 models，网关在 wildcards
+        self.assertEqual([entry["model"] for entry in data["models"]], ["m"])
+        self.assertEqual(data["models"][0]["backups"][0]["provider"], "gateway")
+        self.assertEqual([w["provider"] for w in data["wildcards"]], ["gateway"])
+
+    def test_show_json_without_any_provider_reports_error_as_json(self):
+        import json
+
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            code, out = self.run_cmd(["--show", "--json"])
+        self.assertEqual(code, 1)
+        self.assertIn("error", json.loads(out))
+
+    def test_json_requires_show(self):
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            code, _ = self.run_cmd(["--json"])
+        self.assertEqual(code, 2)
+        self.assertIn("--show", err.getvalue())
+
     def test_wizard_refuses_without_tty(self):
         err = io.StringIO()
         with mock.patch.object(cli.sys.stdin, "isatty", return_value=False), contextlib.redirect_stderr(err):
