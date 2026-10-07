@@ -1,0 +1,37 @@
+# gitleaks 配置（.github/workflows/secrets.yml 扫全历史与 sdist 时用；本地装了 gitleaks 也可
+# `gitleaks git -c .gitleaks.toml .`）。
+#
+# 规则全部继承内置默认集。放行只许「路径 AND 整行正则」同时命中——按路径整个放行一个
+# 文件，等于那个文件以后真写进密钥也没人拦；只按正则放行，又会把别处同形状的真密钥一起
+# 漏掉。每一条都要写清楚放行的是哪几个字面量、为什么它们不是密钥。
+#
+# 测试里的假密钥本就该用拼接写法（"sk-" + "…"），扫描器看不到成串的字面量；下面这几条是
+# 脱敏逻辑自身的夹具——它们测的就是"这种形状要被遮掉"，拼开就测不到了。
+
+title = "xiaoyu"
+
+[extend]
+useDefault = true
+
+#  ⚠️ 必须带 targetRules：没有它的「全局」allowlist 把 paths 当成预过滤——命中路径的文件整个
+#  跳过、根本不看 condition（实测 8.30.1：只写 paths + AND，同文件里另插一个 AKIA 键也放行）。
+#  挂到具体规则上的 allowlist 才真正按 AND 要求路径与整行正则同时命中。
+[[allowlists]]
+description = "终端集成的脱敏测试：夹具里的假 token / 假口令，断言的正是它们被遮掉"
+targetRules = ["curl-auth-header", "curl-auth-user", "generic-api-key"]
+condition = "AND"
+regexTarget = "line"
+paths = ['''(^|/)tests/test_term\.py$''']
+regexes = [
+  '''Authorization: Bearer (abc123def|tok123456|abcdef123456)\b''',
+  '''AWS_SECRET_ACCESS_KEY=wJalrXUtnFEMI/K7MDENG"''',
+  '''curl -u bob:pw123 http://h''',
+]
+
+[[allowlists]]
+description = "SDK 结果转换测试：用来验证「私有字段不出现在转换结果里」的占位串"
+targetRules = ["generic-api-key"]
+condition = "AND"
+regexTarget = "line"
+paths = ['''(^|/)tests/test_sdk_result_transforms\.py$''']
+regexes = ['''SECRET = "private-result-318527"''']
