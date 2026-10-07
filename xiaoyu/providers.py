@@ -190,6 +190,9 @@ class Preset:
     #  非空即"区域型" preset：key_envs 里的 key 是可选的第二种鉴权，key 与区域变量
     #  任一存在即注册；向导与 doctor 两样都问/报
     region_env: str = ""
+    #  这家端点单次请求收得下的图片张数上限（0 = 不知道/不限）。只写实测过的；
+    #  出网投影取它与 XIAOYU_MAX_IMAGES_PER_REQUEST 两者中较小的（见 media.cap_images）
+    max_images: int = 0
 
 
 #  ⚠️ 只内置能确认的厂商。猜错的代价是用户配好了却 404——这类数据宁可缺也不能错
@@ -434,6 +437,8 @@ class Provider:
     response_cache: bool = False
     #  非空 = 请求走 AWS 凭证链签名的 Bedrock client（见 Registry._build_client）
     aws_region: str = ""
+    #  单次请求图片张数上限（0 = 不限）。见 Preset 同名字段
+    max_images: int = 0
 
     @property
     def wildcard(self) -> bool:
@@ -644,6 +649,11 @@ class Registry:
         except UnknownModel:
             pass
         return route.qualified
+
+    def max_images(self, route: Route) -> int:
+        """这条路由单次请求收得下几张图；不知道返回 0（由调用方按全局上限处理）。"""
+        provider = self.get(route.provider)
+        return max(provider.max_images, 0) if provider is not None else 0
 
     def cache_bypass(self, route: Route) -> dict[str, Any] | None:
         """这条路由重发时用来绕开响应缓存的 extra_body；端点没有这项能力返回 None。
@@ -1061,6 +1071,7 @@ def _make(name: str, config: Config) -> Provider | None:
                 preset.text_tool_models,
                 preset.signature_models,
                 aws_region=region,
+                max_images=preset.max_images,
             )
         key = find_api_key(preset.key_envs)
         if not key:
@@ -1076,6 +1087,7 @@ def _make(name: str, config: Config) -> Provider | None:
             preset.anthropic_models,
             preset.text_tool_models,
             preset.signature_models,
+            max_images=preset.max_images,
         )
 
     #  通用兜底：XIAOYU_PROVIDER_<NAME>_{BASE_URL,API_KEY,MODELS,PROTOCOL,VISION,TOOLS,SIGNATURES}

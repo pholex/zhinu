@@ -1223,6 +1223,8 @@ class Agent:
         self._logged_baseline: dict[str, Any] | None = None
         #  发请求时的消息条数，usage 到达时用来落锚
         self._request_len = 0
+        #  上一次出网投影省略的图片张数：只在张数变化时提示一次，不每个请求唠叨
+        self._images_omitted_noticed = 0
         #  上一次真出了回复的路由 (provider, model)：下一次请求换了路由就给新模型补一句
         #  交代（见 _route_switch_note）。None = 本进程还没出过回复
         self._last_route: tuple[str, str] | None = None
@@ -4594,6 +4596,11 @@ class Agent:
             return None
         return self.registry.cache_bypass(route)
 
+    def _image_cap(self, route: Route) -> int:
+        """这次请求最多带几张图：全局上限与这家端点声明的上限取较小的非零值；0 = 不限。"""
+        caps = [cap for cap in (self.config.max_images_per_request, self.registry.max_images(route)) if cap > 0]
+        return min(caps) if caps else 0
+
     def _route_switch_note(self, route: Route) -> str:
         """这次请求的路由与上一次出回复的不同 → 给新模型的交代；相同返回空串。
 
@@ -4628,6 +4635,20 @@ class Agent:
         if switch_note:
             outgoing = [*self.messages, {"role": "user", "content": switch_note, OPERATOR_KEY: True}]
         self._request_len = len(outgoing)
+        #  图片张数投影：只作用于发出去的副本，历史与会话文件照旧带图（见 media.cap_images）。
+        #  条数不变，锚点下标仍对得上
+        outgoing, omitted = media.cap_images(outgoing, self._image_cap(route))
+        if omitted != self._images_omitted_noticed:
+            self._images_omitted_noticed = omitted
+            if omitted:
+                self.emit(
+                    Notice(
+                        f"[历史里的图片超过单次请求上限，较早的 {omitted} 张本次未发送"
+                        "（历史未改；/compact 可回收，或减少图片；"
+                        "XIAOYU_MAX_IMAGES_PER_REQUEST 可调，0 = 不限）]",
+                        "warn",
+                    )
+                )
 
         def settle() -> None:
             if switch_note:

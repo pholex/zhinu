@@ -200,6 +200,7 @@ _NUMERIC_ENV: dict[str, tuple[type, float | None, float | None, str]] = {
     "XIAOYU_QIXIANG_CONCURRENCY": (int, None, None, ""),
     "XIAOYU_QIXIANG_TIMEOUT": (int, None, None, ""),
     "XIAOYU_CHENSHU_MAX_WORKERS": (int, None, None, ""),
+    "XIAOYU_MAX_IMAGES_PER_REQUEST": (int, 0, None, "不能为负（0 = 不限）"),
 }
 
 
@@ -460,6 +461,8 @@ class Config:
     read_streak_block: int = 5
     #  单次模型请求超时（秒）。eval 横向扫模型时会调小，避免某个模型卡死拖垮整轮。
     request_timeout: float = 600.0
+    #  每次请求最多带几张图（出网投影，历史不改；0 = 不限）。见 media.cap_images
+    max_images_per_request: int = 20
     #  注入给 bash 工具的额外环境变量。
     #  eval 用它设 PIP_REQUIRE_VIRTUALENV：无人值守 + 全放行时，
     #  模型可能 pip install 到系统 Python 里去（已经真实发生过一次）。
@@ -564,6 +567,8 @@ class Config:
             cfg.server_compaction = flag.strip().lower() not in ("0", "false", "no", "off")
         if (ratio := env_number("XIAOYU_COMPACT_AT")) is not None:
             cfg.compact_at = float(ratio)
+        if (cap := env_number("XIAOYU_MAX_IMAGES_PER_REQUEST")) is not None:
+            cfg.max_images_per_request = int(cap)
         if (flag := os.environ.get("XIAOYU_ENABLE_EXPLORE")) is not None:
             cfg.enable_explore = flag.strip().lower() not in ("0", "false", "no", "off")
         if (flag := os.environ.get("XIAOYU_ENABLE_SKILLS")) is not None:

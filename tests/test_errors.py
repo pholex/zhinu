@@ -49,6 +49,23 @@ class ClassifyTest(unittest.TestCase):
         verdict = classify(RuntimeError("Provider said: rate limit exceeded"))
         self.assertEqual(verdict.kind, "rate_limit")
 
+    def test_image_limit_400_is_fatal_with_compact_hint(self):
+        """带图请求被端点按张数拒绝：重发多少次都一样，要告诉用户怎么办而不是烧重试预算。"""
+        for message in (
+            "Too many images in request: maximum 20 allowed",
+            "invalid_request_error: image count exceeds the limit",
+        ):
+            exc = openai.BadRequestError(message, response=_response(400), body=None)
+            verdict = classify(exc)
+            self.assertEqual(verdict.kind, "fatal", message)
+            self.assertFalse(verdict.retryable)
+            self.assertFalse(verdict.should_compact)
+            self.assertIn("/compact", verdict.hint)
+            self.assertIn("图片", verdict.hint)
+        #  普通 400 不被这条吃掉
+        plain = openai.BadRequestError("bad json", response=_response(400), body=None)
+        self.assertNotIn("图片", classify(plain).hint)
+
     def test_timeout_and_connection_are_transient(self):
         for exc in (
             openai.APITimeoutError(request=httpx2.Request("POST", "http://unused")),

@@ -368,6 +368,20 @@ def _quota_worded_throttle(text: str) -> bool:
     return _says_wait(text) and any(marker in text for marker in _SHARED_QUOTA_WORDING)
 
 
+def _image_rejected(text: str, status: int | None) -> bool:
+    """请求因图片张数/体积被端点拒绝（400 "too many images" / "image … exceeds … limit"）。
+
+    只认请求错误（400/422）或没有状态码的转写：带图的请求重发多少次都是同一个
+    拒绝，判 transient 会白烧重试预算；判 fatal 又得把"怎么办"说清楚——压缩或
+    减少图片，而不是换模型。
+    """
+    if status is not None and status not in (400, 413, 422):
+        return False
+    if "image" not in text:
+        return False
+    return "too many" in text or "limit" in text or "exceed" in text
+
+
 def _is_quota(exc: Exception, text: str, status: int | None) -> bool:
     #  402 Payment Required 无论文案都是额度问题
     if status == 402:
@@ -467,6 +481,13 @@ def classify(exc: Exception) -> Verdict:
         or any(marker in text for marker in _TRANSIENT_MARKERS)
     ):
         return Verdict("transient", True, False, f"网络/服务端瞬时错误（{type(exc).__name__}）")
+
+    if _image_rejected(text, status):
+        return Verdict(
+            "fatal", False, False,
+            "请求里的图片超过端点限制（张数或体积）；/compact 回收旧图、减少图片后重发，"
+            "或调低 XIAOYU_MAX_IMAGES_PER_REQUEST",
+        )
 
     if isinstance(exc, StreamFailed):
         #  流跑起来了才炸、且措辞没落进上面任何一类：兜底成 transient（理由见类注释）
