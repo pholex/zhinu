@@ -341,6 +341,11 @@ WRAPUP_INSTRUCTION = """已达到本轮工具调用次数上限，请立刻停�
 3. 建议用户下一步怎么做（继续让你做？手动处理？换个思路？）"""
 
 #  token 软预算到线前的收尾指令：与轮数上限同一精神——交代现场，不静默截断
+#  无工具的收尾请求（with_tools=False）里模型仍回了 tool_calls 且没有正文时，
+#  入历史的固定正文：没有这句，用户这轮看不到任何交代，而 tool_calls 若照记
+#  又得靠下轮 _repair_history 补一条"已放弃"的假结果
+NO_TOOLS_TOOL_CALL_NOTE = "（模型在无工具的收尾请求里尝试调用工具，已忽略）"
+
 BUDGET_WRAPUP_INSTRUCTION = """本会话的 token 预算即将用尽，请立刻停止操作，不要再调用任何工具。
 直接用几句话总结：
 1. 已经完成了什么（具体到文件/改动）
@@ -4794,6 +4799,22 @@ class Agent:
             #  接下来怎么办（自动续写 / 到此为止）由轮循环说，这里只报事实
             self.emit(Notice(marker, "warn"))
 
+        if not with_tools and pending:
+            #  收尾/摘要这类"只许说话"的请求没带 tools，模型却回了 tool_calls：
+            #  不能执行（这一步本来就不许干活），照记入历史又会留下悬空调用、
+            #  靠下轮 _repair_history 补"已放弃"的假结果，用户这轮什么都看不到。
+            #  当场剥掉：正文留着，没正文就补一句固定交代，让这轮有个可见的收尾
+            names = ", ".join(
+                pending[index]["function"]["name"] or "?" for index in sorted(pending)
+            )
+            self.emit(
+                Notice(f"[模型在无工具的收尾请求里尝试调用工具（{names}），已忽略]", "warn")
+            )
+            if self.session_log:
+                self.session_log.event("tool_calls_without_tools", names=names)
+            pending = {}
+            if not text.strip():
+                text = NO_TOOLS_TOOL_CALL_NOTE
         if text or pending:
             #  空补全不算出了回复：它会被原地重发，交代留给真出内容的那次
             settle()
