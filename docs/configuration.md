@@ -5,11 +5,15 @@ README 只给最小可跑配置，这里是全量。
 ## 配置文件与优先级
 
 ```bash
-xiaoyu config             # 交互向导：直连 key / 网关端点 / 模型
+xiaoyu config             # 交互向导：直连 key / 网关端点 / 模型；落盘前先对主模型发一条最小请求验证
+xiaoyu config --no-probe  # 向导不探测、直接写入（离线填配置、端点暂时不通时用）
 xiaoyu config --show      # 看生效配置与每项来源（key 永不回显）
+xiaoyu config --show --json   # 机器可读：默认模型、各模型路由（provider / 协议 / base_url / 有无 key / 视觉与工具能力 / 上下文上限 / effort 档位）、功能开关；密钥值不出现
 xiaoyu config --path      # 打印用户级配置文件路径
 xiaoyu config --set XIAOYU_MODEL=deepseek-flash   # 非交互写入，可重复
 ```
+
+向导问完之后、写文件之前，默认按你刚填的配置对主模型发一条最小请求（与 `xiaoyu doctor --probe` 同一条路径，花一点点 token）：通过就显示耗时并保存；失败则显示分类后的原因（鉴权、端点不通、模型名不存在……）并问「仍要保存吗？[y/N]」，默认不保存。key 贴错一位、端点少个 `/v1`、模型名在网关上拼错，这些都在这一步被抓住，而不是等第一轮对话才炸。
 
 用户级 `.env` 的位置：macOS / Linux 在 `~/.config/xiaoyu/.env`（跟随 `$XDG_CONFIG_HOME`），Windows 在 `%APPDATA%\xiaoyu\.env`。也可以手动在任意工作目录放 `.env`（零依赖自解析）。行格式 `KEY=值`，整行与行尾的 `# 注释` 都认（行尾注释要与值隔一个空白；值里紧挨着的 `#` 和引号里的 `#` 是内容）。
 
@@ -101,6 +105,7 @@ XIAOYU_API_KEY=<key>
 |---|---|---|
 | `XIAOYU_EFFORT` | 不传 | 推理深度 `low / medium / high / xhigh / max`（OpenAI 线另有 `none / minimal`）。同一个名字出内核，按协议翻译成 `reasoning_effort` / `reasoning.effort` / `output_config.effort`；你给自己点名的模型配的取值原样发，上游不认会 400；换到降级链上的模型、或由子 agent 继承过去时，对实测过档位范围的型号就近换成它认的一档并提示（没实测过的型号不改）。命令行 `--effort`，会话里 `/effort`，子 agent 可在 spec 里单独声明 |
 | `XIAOYU_CONTEXT_LIMIT` | 按模型查表 | 上下文上限（token）覆写 |
+| `XIAOYU_MAX_OUTPUT_TOKENS` | 不传（Claude 原生协议用内置常量：流式 64000 / 同步 16000） | 单次请求输出 token 上限覆写（正整数）。本地小模型、中转站常限输出上限，超了直接 400。按协议翻译：chat `max_tokens`、Responses `max_output_tokens`、Anthropic `max_tokens`；摘要/收尾这类同步请求取 min(设值, 16000) |
 | `XIAOYU_COMPACT_AT` | `0.7` | 用量占到这个比例时触发回收/压缩；取 0.05~1 的比例，写成 `70` 这类整数会被忽略并在启动时提示。用量到压缩阈值的 50% / 80% 时模型各收到一次余量提示（operator 通道，不碰 system prompt），让它在压缩前合并读取、先把结论落下来；压缩/回滚后按现状重定基线 |
 | `XIAOYU_BUDGET_TOKENS` | 不限 | 本会话 token 软预算（prompt+completion 累计，≥5000 才生效）：模型按 50/80/95% 收到倒计时（operator 通道），到线前一步优雅收尾交代现场，而不是被硬闸中途砍断；直连支持型号（Opus 5/4.8/4.7/Fable/Mythos/Sonnet 5）另附 Anthropic 原生 `task_budget`（服务端倒计时）。命令行 `--budget-tokens` |
 | `XIAOYU_TURN_EXTENSION` | `1.0` | 撞 `max_iterations` 时允许模型调 `extend_turns` 申请追加轮数，总追加量 ≤ `max_iterations ×` 此系数；`0` = 不许延期（撞顶即收尾）。理由展示给用户、可审计。轮数用到上限的 50% / 80% 时模型各收到一次「轮数 N/M」提示（每轮各一次） |
@@ -472,7 +477,10 @@ XIAOYU_PROVIDER_MINIMAX_PROTOCOL=responses                   # 默认 chat；可
 XIAOYU_PROVIDER_MINIMAX_VISION=*                             # 声明视觉能力，默认不发图
 XIAOYU_PROVIDER_MINIMAX_TOOLS=text                           # 默认 native；端点不会 function calling 时设 text
 XIAOYU_PROVIDER_MINIMAX_SIGNATURES=*                         # 工具调用重放需带回 thought_signature 的型号（Gemini 系端点用；仅 chat 协议生效，配上 PROTOCOL=responses/anthropic 会出声忽略）
+XIAOYU_PROVIDER_MINIMAX_HEADERS=X-Title=xiaoyu;Authorization=Bearer ${env:RELAY_TOKEN}   # 随每个请求附带的自定义 header，分号分隔
 ```
+
+`_HEADERS`：中转站要求的额外头（站点标识、`Authorization: Bearer` 这类与 SDK 默认鉴权形态不同的头……）。格式 `Name=value;Name2=value2`，分号分隔，值里允许再出现 `=`；值可写 `${env:VAR}`（也认 `${VAR}`）引用环境变量或 macOS Keychain 同名条目，令牌不必明文进配置——引用没兑现的那个 header 会被出声丢掉，不会把 `${env:…}` 字面量发上游。三条协议（chat / responses / anthropic）的 client 都带上，SDK 把它们合并在自家鉴权头之后，所以能盖过默认的 `x-api-key` 形态。`config --show` 与 `doctor` 只显示 header 的**名字**，值永不出现。
 
 本机端点免 key 的规则同网关：`_BASE_URL` 指向 `localhost` 时 `_API_KEY` 可省略（显式给了则以给的为准）。
 

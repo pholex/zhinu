@@ -214,6 +214,7 @@ def save_user_env(values: dict[str, str]) -> Path:
 #  忽略"的那几个；其余数值项在 from_env 里自己钳到合法区间，不算写错
 _NUMERIC_ENV: dict[str, tuple[type, float | None, float | None, str]] = {
     "XIAOYU_CONTEXT_LIMIT": (int, 1_000, None, "单位是 token，至少 1000"),
+    "XIAOYU_MAX_OUTPUT_TOKENS": (int, 1, None, "单位是 token，正整数"),
     "XIAOYU_KEEP_RECENT": (int, 1, None, "至少保留 1 条"),
     "XIAOYU_COMPACT_AT": (float, 0.05, 1.0, "是占窗口的比例，取 0.05~1（0.7 即 70%）"),
     "XIAOYU_BUDGET_TOKENS": (int, 0, None, "不能为负"),
@@ -445,6 +446,11 @@ class Config:
     #  上面这个 override 是不是探测（Models API）写进来的：True = 可被后续探测更新，
     #  False = 用户显式设的（XIAOYU_CONTEXT_LIMIT / --）绝不被探测覆盖
     context_limit_probed: bool = False
+    #  单次请求输出 token 上限的显式覆写（XIAOYU_MAX_OUTPUT_TOKENS）；None = 沿用
+    #  传输层常量（流式 64K / 同步 16K，见 responses.STREAM_MAX_TOKENS）。本地小模型
+    #  与中转站常限输出上限，超了直接 400，这是给它们的逃生口。三条协议在出网口
+    #  各自翻译成 max_tokens / max_output_tokens；同步请求取 min(设值, 常量)
+    max_output_tokens: int | None = None
     #  追加到内置 system prompt 末尾的自定义内容；None = 不追加，行为不变。
     #  供宿主进程把 xiaoyu 当执行引擎嵌入时注入身份/人格，
     #  不是项目指令——项目级规范走 AGENTS.md 那条路。
@@ -570,6 +576,8 @@ class Config:
             cfg.fallback_models = [name.strip() for name in raw.split(",") if name.strip()]
         if (limit := env_number("XIAOYU_CONTEXT_LIMIT")) is not None:
             cfg.context_limit = int(limit)
+        if (cap := env_number("XIAOYU_MAX_OUTPUT_TOKENS")) is not None:
+            cfg.max_output_tokens = int(cap)
         if rounds := os.environ.get("XIAOYU_EXPLORE_ITERATIONS"):
             with contextlib.suppress(ValueError):
                 cfg.explore_iterations = max(1, min(int(rounds), 100))

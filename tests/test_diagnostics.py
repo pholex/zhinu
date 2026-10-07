@@ -411,6 +411,15 @@ class BundleTest(unittest.TestCase):
         self.addCleanup(self.tmp.cleanup)
         self.root = Path(self.tmp.name)
 
+    def test_provider_headers_keep_only_names(self) -> None:
+        """自定义 header 的值多半是令牌：诊断包里只留名字。"""
+        got = diagnostics.redact_value(
+            "XIAOYU_PROVIDER_RELAY_HEADERS", "Authorization=Bearer top-secret;X-Title=xiaoyu"
+        )
+        self.assertNotIn("top-secret", got)
+        self.assertIn("Authorization", got)
+        self.assertIn("X-Title", got)
+
     def test_redact_value_by_name_and_by_pattern(self) -> None:
         self.assertEqual(diagnostics.redact_value("XIAOYU_API_KEY", "abc"), "[REDACTED]")
         self.assertEqual(diagnostics.redact_value("XIAOYU_SERVE_TOKEN", "abc"), "[REDACTED]")

@@ -385,6 +385,42 @@ class TestRequestTranslation(unittest.TestCase):
         self.assertEqual(pick({"type": "none"}), {"type": "none"})
 
 
+class TestMaxOutputTokensOverride(unittest.TestCase):
+    """XIAOYU_MAX_OUTPUT_TOKENS 在 Messages 一路顶掉内置常量；没设时常量照旧。"""
+
+    MESSAGES = [{"role": "user", "content": "hi"}]
+
+    def _result(self) -> SimpleNamespace:
+        return SimpleNamespace(
+            id="msg", model="m", role="assistant", content=[], stop_reason="end_turn", usage=None
+        )
+
+    def test_override_replaces_constants(self) -> None:
+        api = FakeMessagesAPI(result=self._result())
+        transport = Transport(FakeInner(), (), (responses.WILDCARD,), lambda: FakeAnthropicClient(api), max_output_tokens=8_000)
+        transport.chat.completions.create(model="m", messages=self.MESSAGES, stream=True)
+        transport.chat.completions.create(model="m", messages=self.MESSAGES)
+        stream_call, sync_call = api.calls
+        self.assertEqual(stream_call["max_tokens"], 8_000)
+        self.assertEqual(sync_call["max_tokens"], 8_000, "设值小于同步常量时同步请求也按设值")
+
+    def test_sync_is_capped_by_constant(self) -> None:
+        api = FakeMessagesAPI(result=self._result())
+        transport = Transport(FakeInner(), (), (responses.WILDCARD,), lambda: FakeAnthropicClient(api), max_output_tokens=100_000)
+        transport.chat.completions.create(model="m", messages=self.MESSAGES, stream=True)
+        transport.chat.completions.create(model="m", messages=self.MESSAGES)
+        self.assertEqual(api.calls[0]["max_tokens"], 100_000)
+        self.assertEqual(api.calls[1]["max_tokens"], msgs._SYNC_MAX_TOKENS)
+
+    def test_unset_keeps_constants(self) -> None:
+        api = FakeMessagesAPI(result=self._result())
+        transport, _ = anthropic_transport(api)
+        transport.chat.completions.create(model="m", messages=self.MESSAGES, stream=True)
+        transport.chat.completions.create(model="m", messages=self.MESSAGES)
+        self.assertEqual(api.calls[0]["max_tokens"], msgs._STREAM_MAX_TOKENS)
+        self.assertEqual(api.calls[1]["max_tokens"], msgs._SYNC_MAX_TOKENS)
+
+
 class TestStreamTranslation(unittest.TestCase):
     def collect(self, events: list[Any]) -> tuple[str, dict[int, dict[str, Any]], Any]:
         """按 agent._consume_stream 的原样攒法消费，保证断言的是内核真实读法。"""

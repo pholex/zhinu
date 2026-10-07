@@ -11,7 +11,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from xiaoyu import cli, config, providers
+from xiaoyu import cli, config, diagnostics, providers
 
 
 class _FakeWinPath(pathlib.PureWindowsPath):
@@ -119,6 +119,12 @@ class IsolatedConfigTest(unittest.TestCase):
             mock.patch.object(config, "PROJECT_ROOT", Path(self.tmp.name) / "proot"),
             #  向导会按运行时逻辑探测直连 key，不桩掉会真的 shell out 去翻本机 Keychain
             mock.patch.object(config, "_read_from_keychain", lambda *a, **kw: None),
+            #  向导落盘前会对主模型真发一条请求：测试里一律桩成通过，不出网。
+            #  探测行为本身在 WizardProbeTest 里单独盖住
+            mock.patch.object(
+                diagnostics, "probe_model",
+                lambda *a, **kw: diagnostics.Check("probe", "ok", "桩 应答 1 ms"),
+            ),
         ):
             patcher.start()
             self.addCleanup(patcher.stop)
@@ -221,6 +227,73 @@ class ConfigCommandTest(IsolatedConfigTest):
         self.assertNotIn("sk-super-secret", out)
         self.assertIn("已设置", out)
         self.assertIn("m1", out)
+
+    def test_show_lists_custom_header_names_but_never_values(self):
+        with mock.patch.dict(
+            os.environ,
+            {
+                "XIAOYU_PROVIDER_RELAY_BASE_URL": "https://relay.example/v1",
+                "XIAOYU_PROVIDER_RELAY_API_KEY": "k",
+                "XIAOYU_PROVIDER_RELAY_MODELS": "m",
+                "XIAOYU_PROVIDER_RELAY_HEADERS": "Authorization=Bearer top-secret;X-Title=xiaoyu",
+            },
+        ):
+            code, out = self.run_cmd(["--show"])
+        self.assertEqual(code, 0)
+        self.assertIn("Authorization", out)
+        self.assertIn("X-Title", out)
+        self.assertNotIn("top-secret", out)
+
+    def test_show_json_is_machine_readable_and_never_contains_secrets(self):
+        import json
+
+        config.save_user_env({"XIAOYU_API_KEY": "sk-super-secret", "XIAOYU_MODEL": "m"})
+        with mock.patch.dict(
+            os.environ,
+            {
+                "XIAOYU_BASE_URL": "https://gw.example/v1",
+                "XIAOYU_PROVIDER_RELAY_BASE_URL": "https://relay.example/v1",
+                "XIAOYU_PROVIDER_RELAY_API_KEY": "relay-secret",
+                "XIAOYU_PROVIDER_RELAY_MODELS": "m",
+                "XIAOYU_PROVIDER_RELAY_PROTOCOL": "anthropic",
+                "XIAOYU_PROVIDER_RELAY_HEADERS": "Authorization=Bearer top-secret",
+                "XIAOYU_ENABLE_MCP": "0",
+            },
+        ):
+            code, out = self.run_cmd(["--show", "--json"])
+        self.assertEqual(code, 0)
+        data = json.loads(out)
+        for secret in ("sk-super-secret", "relay-secret", "top-secret"):
+            self.assertNotIn(secret, out, "密钥值在 JSON 里任何字段都不许出现")
+        self.assertEqual(data["default_model"], "m")
+        default = data["routes"]["default"]
+        self.assertEqual(default["provider"], "relay")
+        self.assertEqual(default["protocol"], "anthropic")
+        self.assertTrue(default["has_key"])
+        self.assertEqual(default["headers"], ["Authorization"])
+        self.assertIsInstance(default["context_limit"], int)
+        self.assertIs(data["features"]["enable_mcp"], False)
+        self.assertIs(data["features"]["enable_skills"], True)
+        #  显式声明的模型与通配 provider 和 describe 同一数据源：relay/m 在 models，网关在 wildcards
+        self.assertEqual([entry["model"] for entry in data["models"]], ["m"])
+        self.assertEqual(data["models"][0]["backups"][0]["provider"], "gateway")
+        self.assertEqual([w["provider"] for w in data["wildcards"]], ["gateway"])
+
+    def test_show_json_without_any_provider_reports_error_as_json(self):
+        import json
+
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            code, out = self.run_cmd(["--show", "--json"])
+        self.assertEqual(code, 1)
+        self.assertIn("error", json.loads(out))
+
+    def test_json_requires_show(self):
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            code, _ = self.run_cmd(["--json"])
+        self.assertEqual(code, 2)
+        self.assertIn("--show", err.getvalue())
 
     def test_wizard_refuses_without_tty(self):
         err = io.StringIO()
@@ -353,6 +426,84 @@ class ConfigCommandTest(IsolatedConfigTest):
         fake.assert_called_once_with(["--path"])
 
 
+
+def _wizard_answers(*tail: str):
+    """各家直连 key 全回车，再接网关端点 / 主模型 / 摘要模型 / 备用链 / 网关 key。"""
+    return iter([""] * _wizard_direct_prompts() + list(tail))
+
+
+class WizardProbeTest(IsolatedConfigTest):
+    """向导落盘前先探测：key 贴错、端点少 /v1 这类错在保存前就该抓住，而不是第一轮对话才炸。"""
+
+    def _run(self, argv: list[str], answers, probe):
+        out = io.StringIO()
+        with mock.patch.object(cli.sys.stdin, "isatty", return_value=True), mock.patch(
+            "builtins.input", side_effect=lambda *_: next(answers)
+        ), mock.patch.object(diagnostics, "probe_model", probe), contextlib.redirect_stdout(out):
+            code = cli.config_command(argv)
+        return code, out.getvalue()
+
+    def test_probe_runs_on_the_model_being_saved_and_reports_timing(self):
+        seen: list[config.Config] = []
+
+        def probe(cfg=None):
+            seen.append(cfg)
+            return diagnostics.Check("probe", "ok", "gateway/main-model 应答 123 ms")
+
+        code, out = self._run([], _wizard_answers("https://gw/v1", "main-model", "", "", "typed-key"), probe)
+        self.assertEqual(code, 0)
+        self.assertEqual(len(seen), 1, "落盘前恰好探一次")
+        self.assertEqual(seen[0].model, "main-model", "探的是向导刚收的主模型，不是环境里的旧值")
+        self.assertEqual(seen[0].base_url, "https://gw/v1")
+        self.assertIn("123 ms", out)
+        self.assertEqual(config._parse_dotenv(self.env_path)["XIAOYU_MODEL"], "main-model")
+        #  答案只是临时叠在环境上探一下，探完必须恢复：向导不该留下没落盘的变量
+        self.assertNotIn("XIAOYU_MODEL", os.environ)
+        self.assertNotIn("XIAOYU_API_KEY", os.environ)
+
+    def test_failed_probe_defaults_to_not_saving(self):
+        probe = lambda cfg=None: diagnostics.Check(  # noqa: E731
+            "probe", "fail", "gateway/m 请求失败（auth，80 ms）", ["401"], remedy="检查 key"
+        )
+        #  末尾那个 "" 是对"仍要保存吗？[y/N]"回车 = N
+        code, out = self._run([], _wizard_answers("https://gw/v1", "m", "", "", "k", ""), probe)
+        self.assertEqual(code, 1)
+        self.assertFalse(self.env_path.exists(), "默认 N：探测失败不落盘")
+        self.assertIn("auth", out)
+        self.assertIn("检查 key", out)
+        self.assertIn("未保存", out)
+
+    def test_failed_probe_can_still_be_saved_on_explicit_yes(self):
+        probe = lambda cfg=None: diagnostics.Check("probe", "fail", "炸了")  # noqa: E731
+        code, _ = self._run([], _wizard_answers("https://gw/v1", "m", "", "", "k", "y"), probe)
+        self.assertEqual(code, 0)
+        self.assertEqual(config._parse_dotenv(self.env_path)["XIAOYU_MODEL"], "m")
+
+    def test_warn_status_still_saves(self):
+        """应答但正文为空只是 warn（有的模型对一句话就回空），不该拦落盘。"""
+        probe = lambda cfg=None: diagnostics.Check("probe", "warn", "gateway/m 应答但正文为空（9 ms）")  # noqa: E731
+        code, out = self._run([], _wizard_answers("https://gw/v1", "m", "", "", "k"), probe)
+        self.assertEqual(code, 0)
+        self.assertTrue(self.env_path.exists())
+        self.assertIn("正文为空", out)
+
+    def test_no_probe_flag_skips_the_request(self):
+        def probe(cfg=None):
+            raise AssertionError("--no-probe 下不许出网")
+
+        code, _ = self._run(["--no-probe"], _wizard_answers("https://gw/v1", "m", "", "", "k"), probe)
+        self.assertEqual(code, 0)
+        self.assertTrue(self.env_path.exists())
+
+    def test_non_tty_confirmation_saves_with_a_warning(self):
+        """问不了（stdin 不是终端）就按保存处理并出声，别让脚本卡在一个问句上。"""
+        check = diagnostics.Check("probe", "fail", "炸了")
+        out = io.StringIO()
+        with mock.patch.object(cli.sys.stdin, "isatty", return_value=False), contextlib.redirect_stdout(out):
+            self.assertTrue(cli._confirm_save_after_failed_probe(check))
+        self.assertIn("按保存处理", out.getvalue())
+
+
 class ContextWindowTest(unittest.TestCase):
     """上下文上限跟随当前模型查表：显式覆写 > 已知模型表 > 保守兜底。"""
 
@@ -394,6 +545,33 @@ class ContextWindowTest(unittest.TestCase):
         with mock.patch.dict(os.environ, {"XIAOYU_CONTEXT_LIMIT": "70000"}, clear=True):
             cfg = config.Config.from_env(workspace=Path.cwd())
         self.assertEqual(cfg.context_limit, 70_000)
+
+
+class MaxOutputTokensEnvTest(unittest.TestCase):
+    def test_unset_is_none(self) -> None:
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("XIAOYU_MAX_OUTPUT_TOKENS", None)
+            self.assertIsNone(config.Config.from_env().max_output_tokens)
+
+    def test_positive_integer_is_taken(self) -> None:
+        with mock.patch.dict(os.environ, {"XIAOYU_MAX_OUTPUT_TOKENS": "4096"}):
+            self.assertEqual(config.Config.from_env().max_output_tokens, 4096)
+
+    def test_zero_and_garbage_are_ignored_and_named(self) -> None:
+        for bad in ("0", "-5", "abc", "1.5"):
+            with self.subTest(bad), mock.patch.dict(os.environ, {"XIAOYU_MAX_OUTPUT_TOKENS": bad}):
+                self.assertIsNone(config.Config.from_env().max_output_tokens)
+                self.assertTrue(any("XIAOYU_MAX_OUTPUT_TOKENS" in p for p in config.env_problems()))
+
+    def test_registry_hands_cap_to_transport(self) -> None:
+        with mock.patch.dict(os.environ, {"DEEPSEEK_API_KEY": "ds", "XIAOYU_MAX_OUTPUT_TOKENS": "2048"}), mock.patch(
+            "xiaoyu.config._read_from_keychain", return_value=None
+        ):
+            cfg = config.Config.from_env()
+            registry = providers.build(cfg)
+            self.assertEqual(registry.max_output_tokens, 2048)
+            with mock.patch("xiaoyu.providers.OpenAI", side_effect=lambda **kw: object()):
+                self.assertEqual(registry.client("deepseek").max_output_tokens, 2048)
 
 
 class ExploreIterationsEnvTest(unittest.TestCase):
