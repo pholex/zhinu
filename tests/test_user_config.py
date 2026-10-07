@@ -139,7 +139,13 @@ class IsolatedConfigTest(unittest.TestCase):
             #  会让向导"已检测到"分支莫名其妙地生效
             *(env for preset in providers.PRESETS.values() for env in preset.key_envs),
             "LITELLM_API_KEY",
+            #  Bedrock 光靠区域就能激活（IAM 凭证链，不需要 key），不在 key_envs 里；
+            #  开发机 .env 被别的测试加载进环境后，它的内置模型会混进 config --show
+            providers.BEDROCK_REGION_ENV,
         ):
+            os.environ.pop(name, None)
+        #  通用 provider（XIAOYU_PROVIDER_<NAME>_*）同理：名字不固定，按前缀清
+        for name in [key for key in os.environ if key.startswith("XIAOYU_PROVIDER_")]:
             os.environ.pop(name, None)
 
     @property
