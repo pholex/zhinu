@@ -953,7 +953,8 @@ class Registry:
         except UnknownModel as exc:
             return {"model": model, "error": str(exc)}
         provider = self.get(route.provider)
-        assert provider is not None  # resolve 返回的 provider 一定在表里
+        if provider is None:  # pragma: no cover - resolve 返回的 provider 一定在表里
+            return {"model": model, "error": f"未注册的 provider：{route.provider}"}
         if provider.api_key == IAM_PLACEHOLDER_KEY:
             auth = "aws-iam"
         elif provider.api_key == LOCAL_PLACEHOLDER_KEY:
@@ -1223,6 +1224,11 @@ def _make(name: str, config: Config) -> Provider | None:
     key = _key_or_local((f"{_GENERIC_PREFIX}{upper}_API_KEY",), base_url)
     if not key:
         return None
+    #  HEADERS=Name=value;Name2=${env:VAR}：中转站要求的额外鉴权头 / 站点标识头等。
+    #  三条协议的 client 都带上（见 Registry._build_client），/v1/models 探测那只也带
+    headers = parse_provider_headers(
+        os.environ.get(f"{_GENERIC_PREFIX}{upper}_HEADERS", ""), f"XIAOYU_PROVIDER_{upper}_HEADERS"
+    )
     raw_models = os.environ.get(f"{_GENERIC_PREFIX}{upper}_MODELS", "")
     if raw_models.strip().lower() == DISCOVER_SENTINEL:
         #  auto 只对本机端点开：远端仍守"启动不探测"——远端探测有挂起/往返代价，
@@ -1234,12 +1240,7 @@ def _make(name: str, config: Config) -> Provider | None:
                 file=sys.stderr,
             )
             return None
-        models = _discover_models(
-            base_url, key, f"XIAOYU_PROVIDER_{upper}",
-            headers=parse_provider_headers(
-                os.environ.get(f"{_GENERIC_PREFIX}{upper}_HEADERS", ""), f"XIAOYU_PROVIDER_{upper}_HEADERS"
-            ),
-        )
+        models = _discover_models(base_url, key, f"XIAOYU_PROVIDER_{upper}", headers=headers)
         if not models:
             #  探测失败/空：跳过而非退化成通配（通配会劫持网关）
             return None
@@ -1272,11 +1273,6 @@ def _make(name: str, config: Config) -> Provider | None:
             file=sys.stderr,
         )
         signatures = ()
-    #  HEADERS=Name=value;Name2=${env:VAR}：中转站要求的额外鉴权头 / 站点标识头等。
-    #  三条协议的 client 都带上（见 Registry._build_client）
-    headers = parse_provider_headers(
-        os.environ.get(f"{_GENERIC_PREFIX}{upper}_HEADERS", ""), f"XIAOYU_PROVIDER_{upper}_HEADERS"
-    )
     return Provider(
         name,
         base_url,
