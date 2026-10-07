@@ -53,6 +53,10 @@ class RewindResult:
     skipped_files: tuple[str, ...] = ()
     uncertain_files: tuple[str, ...] = ()
     summary: str = ""
+    #  被截掉区间里第一条真实用户消息的文本（媒体部件只取文本）；只在对话真的
+    #  回退了才有。前端拿它预填下一轮输入行：回退多半是为了换个说法重来，
+    #  原话填回去改两个字就能发，不必凭记忆重敲
+    prompt_text: str = ""
 
 
 @dataclass

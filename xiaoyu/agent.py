@@ -2807,7 +2807,19 @@ class Agent:
                     notes.append("对话没有回滚（文件回不去时对话也不动；修好后重试即可）")
                 return RewindResult(index, "failed", skipped_files=skipped,
                                     uncertain_files=tuple(targets), summary="；".join(notes))
+        prompt_text = ""
         if conversation:
+            #  截掉区间的第一条真实用户消息就是定位用的那条（found 即它的下标）。
+            #  只取文本部件：图片不会跟着预填回输入行，"[图片]" 占位填回去是假话
+            content = self.messages[found].get("content")
+            if isinstance(content, list):
+                prompt_text = "".join(
+                    str(part.get("text") or "")
+                    for part in content
+                    if isinstance(part, dict) and part.get("type") == media.TEXT_PART
+                ).strip()
+            else:
+                prompt_text = media.text_of(content).strip()
             self.messages = self.messages[:found]
             self._history_rewritten()
             self.plan = plan_from_history(self.messages)
@@ -2827,6 +2839,7 @@ class Agent:
             restored_files=tuple(path for path, before in targets.items() if before is not None),
             removed_files=tuple(path for path, before in targets.items() if before is None),
             skipped_files=skipped, summary="；".join(notes) if notes else "什么也没做。",
+            prompt_text=prompt_text,
         )
 
     def drop_from(self, start: int, reason: str) -> int:

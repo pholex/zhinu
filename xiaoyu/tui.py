@@ -2226,6 +2226,13 @@ class Tui:
                     #  /resume 这类需要列表选择的命令用行内菜单（纯单选，无附言）
                     if handle_slash(agent, action.args, select=lambda t, o: inline_select(t, o, amend=False)):
                         return 0
+                    #  /rewind 把被回退那一轮的原话放进了插话队列：取出来预填进
+                    #  下一轮输入行（与"没赶上本轮的插话"同一条路），不自动提交
+                    queued = "\n".join(agent.drain_steers()).strip()
+                    if queued:
+                        self.console.print(
+                            Text("  （已把该轮原话填回输入行，可改可直接回车发送）", style="text.secondary")
+                        )
                     continue
                 if not expanded:
                     continue
