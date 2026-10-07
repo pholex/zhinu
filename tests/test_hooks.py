@@ -313,18 +313,42 @@ class OnFailureAndNewEventsTest(unittest.TestCase):
             #  非 PreToolUse 上的 block：照常加载但归零并点名
             '[[hooks]]\nevent = "Stop"\ncommand = "true"\non_failure = "block"\n'
             #  不认识的取值：按 allow 并点名
-            '[[hooks]]\nevent = "PreToolUse"\ncommand = "true"\non_failure = "maybe"\n',
+            '[[hooks]]\nevent = "PreToolUse"\ncommand = "true"\non_failure = "maybe"\n'
+            #  子 agent 与压缩两对事件：内核早就在触发，hooks.toml 也得挂得上
+            '[[hooks]]\nevent = "SubagentStart"\ncommand = "true"\n'
+            '[[hooks]]\nevent = "SubagentEnd"\ncommand = "true"\n'
+            '[[hooks]]\nevent = "BeforeCompact"\ncommand = "true"\n'
+            '[[hooks]]\nevent = "AfterCompact"\ncommand = "true"\n',
             encoding="utf-8",
         )
         hooks, problems = load_hooks(path)
         self.assertEqual(
             [(h.event, h.on_failure) for h in hooks],
             [("PreToolUse", "block"), ("SessionStart", "allow"), ("SessionEnd", "allow"),
-             ("ToolFailed", "allow"), ("Stop", "allow"), ("PreToolUse", "allow")],
+             ("ToolFailed", "allow"), ("Stop", "allow"), ("PreToolUse", "allow"),
+             ("SubagentStart", "allow"), ("SubagentEnd", "allow"),
+             ("BeforeCompact", "allow"), ("AfterCompact", "allow")],
         )
         self.assertEqual(len(problems), 2, problems)
         self.assertTrue(any("只对 PreToolUse 生效" in p for p in problems), problems)
         self.assertTrue(any("maybe" in p for p in problems), problems)
+
+    def test_events_table_covers_every_event_the_kernel_fires(self):
+        """EVENTS 是 hooks.toml 的准入表：内核 `fire("X", …)` 的每个字面量都得在表里，
+        否则文档承诺的事件用户挂不上（曾漏掉 Subagent*/​*Compact 四个）。"""
+        import re
+
+        from xiaoyu import hooks as hooks_module
+
+        package = Path(hooks_module.__file__).parent
+        fired: set[str] = set()
+        for source in package.glob("*.py"):
+            text = source.read_text(encoding="utf-8", errors="replace")
+            fired.update(re.findall(r'\.fire\(\s*"([A-Za-z]+)"', text))
+        self.assertTrue(fired, "没扫到任何 fire 调用——正则或目录不对")
+        self.assertEqual(sorted(fired - set(hooks_module.EVENTS)), [], f"内核触发但 EVENTS 没列：{fired}")
+        for name in ("SubagentStart", "SubagentEnd", "BeforeCompact", "AfterCompact"):
+            self.assertIn(name, hooks_module.EVENTS)
 
     def test_on_failure_block_turns_crash_and_timeout_into_denial(self):
         crash = _script_cmd(self.tmp, "crash.py", "import sys\nsys.exit(1)\n")

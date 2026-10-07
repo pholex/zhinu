@@ -5,7 +5,8 @@
     #  <用户配置目录>/hooks.toml
     [[hooks]]
     event = "PreToolUse"        # PreToolUse | PostToolUse | ToolFailed | UserPromptSubmit
-                                # | Stop | SessionStart | SessionEnd
+                                # | Stop | SessionStart | SessionEnd | SubagentStart
+                                # | SubagentEnd | BeforeCompact | AfterCompact
     matcher = "bash"            # 正则匹配工具名（只对工具类事件有意义，可省）
     command = "python ~/bin/check.py"
     timeout = 10                # 秒，缺省 30，上限 600
@@ -41,6 +42,16 @@
                用户；放行时 stdout 的**首个非空行**作为一次性消息注入历史（给宿主
                注入环境说明用：当前分支、值班提示……），受长度上限
 - SessionEnd   会话正常收尾时触发一次，结果不影响退出
+- SubagentStart 主会话委托子 agent 之前（带 agent 名）：block → 这次委托不执行，
+               模型收到"委托失败"的结果自行改道
+- SubagentEnd  子 agent 收工之后的通知（带 agent 名与是否失败），block 只在结果里留一条附注
+- BeforeCompact 要压缩上下文之前（带估算 token 数与是否强制）：block → 不压缩，
+               本次压缩以异常中止——与 SDK 进程内 hook 同义；上下文已超窗时这一轮
+               无法继续，所以只给"压缩前必须先归档"之类的硬需求用
+- AfterCompact 压缩完成之后的通知（带是否真的改写了历史、用的是哪一层），退出码只决定要不要打 warn
+
+事件名表 EVENTS 必须覆盖内核实际触发的每一个名字（tests/test_hooks.py 对着源码
+扫 `fire("…")` 字面量核对），少一个就是"文档承诺的事件 hooks.toml 挂不上"。
 """
 
 from __future__ import annotations
@@ -59,6 +70,7 @@ from .config import user_config_dir
 EVENTS = (
     "PreToolUse", "PostToolUse", "ToolFailed", "UserPromptSubmit", "Stop",
     "SessionStart", "SessionEnd",
+    "SubagentStart", "SubagentEnd", "BeforeCompact", "AfterCompact",
 )
 #  带工具名、matcher 对其有意义的事件；也是子 agent 会带下去的那几个
 TOOL_EVENTS = ("PreToolUse", "PostToolUse", "ToolFailed")

@@ -108,7 +108,9 @@ def run(path: str) -> str:
 ```toml
 # 配置目录 hooks.toml
 [[hooks]]
-event = "PreToolUse"      # PreToolUse | PostToolUse | UserPromptSubmit | Stop
+event = "PreToolUse"      # PreToolUse | PostToolUse | ToolFailed | UserPromptSubmit | Stop
+                          # | SessionStart | SessionEnd | SubagentStart | SubagentEnd
+                          # | BeforeCompact | AfterCompact
 matcher = "bash"          # 正则匹配工具名（仅 *ToolUse 有意义，可省）
 command = "python ~/bin/check.py"
 timeout = 10              # 秒，缺省 30
