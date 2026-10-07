@@ -118,6 +118,9 @@ timeout = 10              # 秒，缺省 30
 
 - stdin 收 JSON（event / tool / args / output / prompt 视事件而定）；
   **退出码 2 = block**（stderr 为理由），0 = 放行，其余 = fail-open 放行。
+- 放行时的 stdout：纯文本取首个非空行注入历史（只 SessionStart 在首轮前、
+  UserPromptSubmit 紧跟本轮输入消费，内容按不可信处理）；整段是 JSON 对象且含
+  `systemMessage` 时，那段文本只显示给用户、不进历史，所有事件都认。
 - `XIAOYU_ENABLE_HOOKS=0` 一键关闭。
 
 ## 插件包（一条命令装齐技能 + MCP）
