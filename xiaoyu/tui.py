@@ -84,6 +84,7 @@ from prompt_toolkit.history import FileHistory
 from prompt_toolkit.key_binding import KeyBindings
 from prompt_toolkit.layout import Layout, Window
 from prompt_toolkit.layout.controls import FormattedTextControl
+from prompt_toolkit.lexers import Lexer
 from prompt_toolkit.styles import Style
 from rich.console import Console
 from rich.syntax import Syntax
@@ -1128,6 +1129,36 @@ class RichSink:
         self.console.print(Text(event.text, style=_NOTICE_STYLES[event.level]))
 
 
+#  行首前缀 → 着色 token。只给那一个字符上色，正文保持默认：颜色是在提醒
+#  "这一行不是发给模型的"，`!` 用警告色——它绕过模型直接执行。
+_PREFIX_TOKENS = {"shell": "status.warning", "slash": "text.accent", "memo": "text.secondary"}
+
+
+class PrefixLexer(Lexer):
+    """输入行的着色：行首的 `!` / `/` / `#` 按 keys.classify_input 的判定上色。
+
+    判定复用提交路由那一个函数，着色与行为永远一致：`/Users/…` 这种路径形态
+    不算命令，也就不上色；敲了前缀还没敲正文（"用法"提示那一态）同样上色，
+    人一眼知道这个字符已经被认成了前缀。只看第一行，续行与正文中间的符号不动。
+    """
+
+    def lex_document(self, document: Document) -> Callable[[int], list[tuple[str, str]]]:
+        lines = document.lines
+
+        def get_line(lineno: int) -> list[tuple[str, str]]:
+            text = lines[lineno] if lineno < len(lines) else ""
+            if lineno == 0 and text[:1] in ("!", "/", "#"):
+                kind = keys.classify_input(text).kind
+                if kind == "usage":
+                    #  前缀对了还没敲正文：按首字符归类，颜色先亮起来
+                    kind = {"!": "shell", "#": "memo"}.get(text[0], "slash")
+                if (token := _PREFIX_TOKENS.get(kind)) is not None:
+                    return [(theme.ptk(token), text[:1]), ("", text[1:])]
+            return [("", text)]
+
+        return get_line
+
+
 class SlashCompleter(Completer):
     """输入行补全：/ 补命令（带一行说明），@ 模糊补工作区文件路径，
     /model 的第二个词补降级链里的模型名。"""
@@ -1526,6 +1557,8 @@ class Tui:
             self._session = PromptSession(
                 history=DedupedHistory(str(history_file)),
                 completer=SlashCompleter(self),
+                #  行首前缀着色（! 警告色、/ 强调色、# 弱化）
+                lexer=PrefixLexer(),
                 key_bindings=self._key_bindings(),
                 multiline=True,
                 #  续行不打标记、只按提示符实际宽度补空格对齐。
