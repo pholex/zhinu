@@ -47,7 +47,10 @@ class ReadGateTest(unittest.TestCase):
     def test_read_gate_refuses_reserved_name_on_windows(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             target = Path(tmp) / "NUL.txt"
-            target.write_text("not a device here", encoding="utf-8")
+            #  真 Windows 上这个名字就是设备，写它会写进 NUL：名字闸在 stat 之前，
+            #  文件不必存在；只在别的平台造出同名普通文件做对照
+            if os.name != "nt":
+                target.write_text("not a device here", encoding="utf-8")
             with mock.patch("os.name", "nt"):
                 error = _unreadable_file_error(target, "NUL.txt")
                 with self.assertRaises(fsguard.NotRegularFile) as caught:
@@ -56,5 +59,7 @@ class ReadGateTest(unittest.TestCase):
             self.assertIn("Windows 保留设备名", error)
             self.assertIn("NUL", error)
             self.assertIn("保留设备名", caught.exception.kind)
-            #  非 Windows：同名文件就是普通文件
-            self.assertIsNone(_unreadable_file_error(target, "NUL.txt"))
+            if os.name != "nt":
+                #  非 Windows：同名文件就是普通文件
+                with mock.patch("os.name", "posix"):
+                    self.assertIsNone(_unreadable_file_error(target, "NUL.txt"))

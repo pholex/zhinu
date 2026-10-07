@@ -112,6 +112,10 @@ class TagTest(unittest.TestCase):
                                       encoding="utf-8", errors="replace", env=env)
 
             git("init", "-q", "-b", "main")
+            #  create_tag 自己调 git、不带上面那份 env：身份写进仓库本地配置，
+            #  CI runner 没有全局身份也打得出带注释的 tag
+            git("config", "user.name", "t")
+            git("config", "user.email", "t@x")
             (repo / "f").write_text("0", encoding="utf-8")
             git("add", "f")
             git("commit", "-q", "-m", "chore: 起点")
