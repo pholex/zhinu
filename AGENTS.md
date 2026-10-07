@@ -21,6 +21,9 @@
   不进 CI**；只在本机按需跑。
 - `tests/wheel_smoke.py` 不是 unittest 用例：要先 `python -m build`，CI 的 build job 调它。
 - 改了会话 / 工具 / 权限相关代码，跑一遍全量；只改文档可以不跑。
+- 提交前想把 CI 那一套在本地过一遍：`.venv/bin/python scripts/verify.py`（与 ci.yml 同序：
+  全量单测 → build → twine → wheel 冒烟 → pip-audit → 密钥扫描；`--list` 看计划、
+  `--only <step>` 只跑一步，缺工具的步骤 SKIP 并告诉你怎么装）。
 
 ## 分析用户的会话
 
