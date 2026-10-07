@@ -35,6 +35,7 @@ from .session_log import (
     find_by_id,
     find_by_name,
     find_session,
+    session_info,
     install_exit_logging,
     last_mode,
     last_model,
@@ -90,6 +91,7 @@ SLASH_COMMANDS: dict[str, str] = {
     "/resume": "切到本工作区的历史会话（当前对话被清空；/resume <序号> 直接选）",
     "/rewind": "回滚到某轮开始前（对话和/或文件；/undo 同义）",
     "/copy": "把最后一条回复复制到剪贴板（没有剪贴板命令时经终端 OSC 52）",
+    "/export": "把本会话导出成 Markdown（/export [路径]，默认写到工作区 xiaoyu-session-<id>.md）",
     "/clear": "清空对话历史（保留 system prompt）",
     "/exit": "退出",
     "/quit": "退出",
@@ -3278,6 +3280,38 @@ def skill_prompt(agent: Agent, line: str) -> str | None:
     return skill_invocation_prompt(name, result)
 
 
+def _slash_export(agent: Agent, where: str) -> None:
+    """/export [路径]：当前会话文件 → Markdown（与 `xiaoyu sessions export` 同一个转写）。
+
+    默认落在工作区 `xiaoyu-session-<id>.md`，id 即会话文件名（开场横幅那个）；
+    给的是目录就写进目录里。延迟落盘的空壳会话盘上还没有文件，如实说没内容。
+    """
+    log = getattr(agent, "session_log", None)
+    path = getattr(log, "path", None)
+    if path is None or not Path(path).is_file():
+        print(ui.secondary("  本会话还没有记录可导出"))
+        return
+    info = session_info(Path(path))
+    if info is None:
+        print(ui.error(f"  读不出会话文件头部：{path}"))
+        return
+    default_name = f"xiaoyu-session-{Path(path).stem}.md"
+    target = Path(where).expanduser() if where else Path(default_name)
+    if not target.is_absolute():
+        target = Path(agent.config.workspace) / target
+    if target.is_dir():
+        target = target / default_name
+    if target.is_symlink():
+        print(ui.error(f"  输出路径是符号链接，拒绝写入：{target}"))
+        return
+    try:
+        target.write_text(export_markdown(info), encoding="utf-8")
+    except (OSError, ValueError) as exc:
+        print(ui.error(f"  导出失败：{exc}"))
+        return
+    print(ui.success(f"  已导出到 {target}"))
+
+
 def handle_slash(agent: Agent, line: str, select: Any = None) -> bool:
     """处理斜杠命令。返回 True 表示应该退出。
 
@@ -3535,6 +3569,8 @@ def handle_slash(agent: Agent, line: str, select: Any = None) -> bool:
             print(ui.secondary(f"  本机没有剪贴板命令，已经 OSC 52 交给终端（{len(text)} 字；终端需允许写剪贴板）"))
         else:
             print(ui.warning("  复制失败：没有 pbcopy / wl-copy / xclip / clip.exe，当前也不是终端"))
+    elif command == "/export":
+        _slash_export(agent, " ".join(rest))
     elif command == "/clear":
         agent.reset()
         print(ui.secondary("对话已清空"))

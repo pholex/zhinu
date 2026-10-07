@@ -753,6 +753,12 @@ def list_sessions(
     return infos
 
 
+def session_info(path: Path) -> SessionInfo | None:
+    """一个已知路径的会话文件 → SessionInfo（给 /export 这类手里已有文件的调用方）；
+    不是会话文件或读不到返回 None。"""
+    return _head_info(path)
+
+
 def _head_info(path: Path) -> SessionInfo | None:
     meta: dict[str, Any] = {}
     preview = ""

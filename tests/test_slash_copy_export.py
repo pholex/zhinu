@@ -137,5 +137,55 @@ class SlashCopyTest(AgentTestCase):
         self.assertIn("复制失败", out)
 
 
+class SlashExportTest(AgentTestCase):
+    def _log(self, name: str = "20260101-120000-42"):
+        from xiaoyu.session_log import SESSION_FORMAT, SessionLog
+
+        log = SessionLog(self.root / "sessions" / f"{name}.jsonl")
+        self.addCleanup(log.release)
+        log.event(
+            "meta", format=SESSION_FORMAT, version="0", model="m",
+            workspace=str(self.root), started_at="2026-01-01T12:00:00",
+        )
+        log.append({"role": "user", "content": "改一下 calc.py"})
+        log.append({"role": "assistant", "content": "好的，已完成。"})
+        return log
+
+    def test_registered(self) -> None:
+        self.assertIn("/export", SLASH_COMMANDS)
+
+    def test_default_target_is_workspace_file_named_by_session_id(self) -> None:
+        log = self._log()
+        agent = self.build([], session_log=log)
+        out = _slash(agent, "/export")
+        target = self.root / "xiaoyu-session-20260101-120000-42.md"
+        self.assertIn(str(target), out)
+        text = target.read_text(encoding="utf-8")
+        self.assertIn("改一下 calc.py", text)
+        self.assertIn("好的，已完成。", text)
+        self.assertIn("## 小羽", text)
+
+    def test_explicit_path_and_directory(self) -> None:
+        log = self._log()
+        agent = self.build([], session_log=log)
+        #  相对路径落在工作区；带空格的路径整段算作路径
+        out = _slash(agent, "/export 会话 记录.md")
+        self.assertTrue((self.root / "会话 记录.md").is_file(), out)
+        (self.root / "dir").mkdir()
+        _slash(agent, "/export dir")
+        self.assertTrue((self.root / "dir" / "xiaoyu-session-20260101-120000-42.md").is_file())
+
+    def test_missing_directory_reports_instead_of_raising(self) -> None:
+        agent = self.build([], session_log=self._log())
+        out = _slash(agent, "/export nowhere/x.md")
+        self.assertIn("导出失败", out)
+
+    def test_without_session_file_says_nothing_to_export(self) -> None:
+        agent = self.build([])
+        out = _slash(agent, "/export")
+        self.assertIn("还没有记录", out)
+        self.assertFalse(list(self.root.glob("xiaoyu-session-*.md")))
+
+
 if __name__ == "__main__":
     unittest.main()
