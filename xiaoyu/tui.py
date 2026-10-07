@@ -13,8 +13,10 @@ ImportError，cli 捕获后自动退回明文 REPL。
   Ctrl-O 开详情时回放上一轮被折叠的输出——"还有 N 行"是可兑现的承诺。
 - **agent 保持全同步**：流式输出发生在没有 prompt 挂起的时刻，
   不需要 patch_stdout、不需要线程（rich Status 自带的刷新线程只画活区一行）。
-- **流式正文按纯文本直出**：inline 模式做 markdown 重绘会污染 scrollback，
-  已滚出屏幕的内容也无法和最终渲染保持一致——宁可朴素，不做花活。
+- **流式正文不重绘，只做行级轻渲染**：inline 模式做 markdown 重绘会污染
+  scrollback，已滚出屏幕的内容也无法和最终渲染保持一致。所以每个字符只打一次：
+  代码围栏内按行语法着色，围栏外只给行内 `代码`、**粗体**、# 标题变色，
+  标记符保留原样只弱化——复制出去的文本与模型原文逐字一致（_StreamStyler）。
 
 核心交互三块：
 1. 工具调用渐进式披露：pending 一行锚点 → running 活区 spinner →
@@ -138,6 +140,8 @@ _NOTICE_STYLES: dict[str, str] = {
 _DIFF_CAP = 40
 #  确认框里 diff 之外的固定开销（标题、上下框线、选项菜单）
 _CONFIRM_CHROME = 12
+#  diff 比对的输入上限（新旧两边行数之和）：超过就不跑 difflib，见 _diff_rows
+_DIFF_INPUT_LINES = 1500
 
 
 def _word_fragments(old: str, new: str) -> tuple[list[tuple[str, str]], list[tuple[str, str]]]:
@@ -176,9 +180,23 @@ def _diff_rows(
     """
     rows: list[list[tuple[str, str]]] = []
     inner = max(width - 1, 20)
+    old_lines, new_lines = old.split("\n"), new.split("\n")
+    if len(old_lines) + len(new_lines) > _DIFF_INPUT_LINES:
+        #  有界：difflib 在两坨几千行且彼此相似的文本上是平方级的，确认框会卡在
+        #  "算 diff"上没有任何回显。改动这么大时逐行比对也没人看得过来——
+        #  直接按"全删 / 全增"给出，仍然完整、仍然可用 Ctrl-O 看全文，只是不配对
+        rows.append(
+            [("text.secondary", f"改动过大（删 {len(old_lines)} 行、增 {len(new_lines)} 行），未逐行比对")]
+        )
+        rows.extend([("diff.removed", f"-{ui.preview(line, inner)}")] for line in old_lines)
+        rows.extend([("diff.added", f"+{ui.preview(line, inner)}")] for line in new_lines)
+        if cap is not None and len(rows) > cap:
+            remainder = len(rows) - cap
+            rows = rows[:cap] + [[("text.secondary", f"…还有 {remainder} 行")]]
+        return rows
     raw = [
         line
-        for line in difflib.unified_diff(old.split("\n"), new.split("\n"), n=2, lineterm="")
+        for line in difflib.unified_diff(old_lines, new_lines, n=2, lineterm="")
         if not line.startswith(("---", "+++"))
     ]
     index = 0
@@ -301,6 +319,272 @@ _RO_TOOLS = {"read_file": "读文件", "grep": "搜索", "list_files": "列目�
 
 #  标记 Console 已挂过语义主题，避免子 agent 共用 Console 时重复入栈
 _THEMED = "_xiaoyu_themed"
+
+
+def _syntax_theme() -> str:
+    """代码着色用的 pygments 主题跟随深浅模式：monokai 的亮字在白底上发灰。"""
+    return "monokai" if theme.mode() == "dark" else "default"
+
+
+def _restyle_tabs(line: str, row: Text) -> Text | None:
+    """把着色结果套回原行。rich 的 Syntax.highlight 会把 tab 展成空格（按单元格
+    位置对齐、tab 宽 4），而正文要逐字一致地打出去——Makefile / Go 里的 tab 换成
+    空格就不是原文了。没有 tab 时直接用着色行；有 tab 就把样式区间按单元格
+    位置映射回原行。映射对不上（rich 换了算法）返回 None，调用方退回明文。"""
+    if "\t" not in line:
+        return row if row.plain == line else None
+    from rich.cells import cell_len
+
+    #  expanded[i] = 原行第 i 个字符在展开后的起始下标；末尾补一个终点
+    expanded: list[int] = []
+    cell = 0
+    cursor = 0
+    for ch in line:
+        expanded.append(cursor)
+        if ch == "\t":
+            width = 1
+            remainder = (cell + 1) % _TAB_SIZE
+            if remainder:
+                width += _TAB_SIZE - remainder
+            cell += width
+            cursor += width
+        else:
+            cell += cell_len(ch)
+            cursor += 1
+    expanded.append(cursor)
+    if cursor != len(row.plain):
+        return None
+    #  展开后的下标 → 原行下标（tab 展出来的那几格都算回那个 tab）
+    back = [0] * (cursor + 1)
+    for original, start in enumerate(expanded[:-1]):
+        for offset in range(start, expanded[original + 1]):
+            back[offset] = original
+    back[cursor] = len(line)
+    out = Text(line)
+    for span in row.spans:
+        out.stylize(span.style, back[span.start], back[min(span.end, cursor)])
+    return out
+
+
+#  rich Syntax 展开 tab 的宽度（它的默认值），_restyle_tabs 据此反推位置
+_TAB_SIZE = 4
+
+
+class _StreamStyler:
+    """流式正文的行级轻渲染：每个字符只打一次、不重绘，scrollback 上永远稳定。
+
+    做的事（刻意少）：
+    - 代码围栏（``` / ~~~）内按行语法着色。着色拿整块已到的行做上下文（多行
+      字符串、块注释跨行时颜色才对），上限 _CODE_CONTEXT 行滑动窗口，成本有界；
+    - 围栏外：行内 `代码` 着 text.code、**粗体** 着 text.strong、# 标题整行
+      text.heading。标记符（反引号、星号、井号）**保留并弱化**而不是删掉——流式下
+      删了标记、后面发现没配对就改不回来；保留则复制出去的文本与模型原文逐字一致。
+
+    不做：列表符替换、链接、表格、斜体（单星 / 下划线在中文与代码路径里误伤太多）、
+    跨行的行内标记（换行即重置行内状态）。
+
+    缓冲只在三处短暂发生：行首定性（最多攒到看清是不是围栏 / 标题，通常 1–3 个
+    字符）、反引号 / 星号串的末尾（分片可能把标记切成两半）、围栏内攒到换行
+    （代码行短，为的是整行一起着色）。其余字符到了就打，流式手感与裸 print 一致。
+    """
+
+    _FENCE = re.compile(r"^ {0,3}(`{3,}|~{3,})[ \t]*([\w+#.-]*)")
+    #  行首还可能长成围栏 / 标题的前缀：再等几个字符
+    _MAYBE_FENCE = re.compile(r"^ {0,3}[`~]{1,2}$")
+    _HEADING = re.compile(r"^ {0,3}#{1,6} ")
+    _MAYBE_HEADING = re.compile(r"^ {0,3}#{1,6}$")
+    _CODE_CONTEXT = 200
+
+    def __init__(self, console: Console) -> None:
+        self.console = console
+        self._pending = ""
+        #  None = 行首未定性；"prose" / "heading" 两种行；围栏内看 _fence
+        self._kind: str | None = None
+        self._fence: str | None = None  # 围栏标记（``` 或 ~~~，可更长）
+        self._syntax: Syntax | None = None
+        self._code_lines: list[str] = []
+        self._span = 0  # 行内代码打开时的反引号数，0 = 没打开
+        self._strong = False
+
+    # ---------- 入口 ----------
+
+    def feed(self, text: str) -> None:
+        self._pending += text
+        self._drain(final=False)
+
+    def finish(self) -> None:
+        """正文结束 / 中断：把攒着的半行按当前状态打出去，并复位。"""
+        self._drain(final=True)
+        self._pending = ""
+        self._kind = None
+        self._fence = None
+        self._syntax = None
+        self._code_lines = []
+        self._span = 0
+        self._strong = False
+
+    # ---------- 状态机 ----------
+
+    def _drain(self, final: bool) -> None:
+        while self._pending:
+            newline = self._pending.find("\n")
+            if self._fence is not None:
+                if newline < 0 and not final:
+                    return
+                line, self._pending = self._split(newline)
+                self._code_line(line, complete=newline >= 0)
+                continue
+            if self._kind is None:
+                if not self._classify(newline, final):
+                    return
+                continue  # 定性后重新取行：围栏行已整行吃掉，prose / heading 走下面
+            head = self._pending if newline < 0 else self._pending[:newline]
+            complete = newline >= 0 or final
+            if self._kind == "heading":
+                self._emit(head, "text.heading")
+                consumed = len(head)
+            else:
+                consumed = self._prose(head, complete)
+            if newline < 0:
+                self._pending = head[consumed:]
+                return
+            self._pending = self._pending[newline + 1 :]
+            self._emit("\n")
+            self._kind = None
+            self._span = 0
+            self._strong = False
+
+    def _split(self, newline: int) -> tuple[str, str]:
+        if newline < 0:
+            return self._pending, ""
+        return self._pending[:newline], self._pending[newline + 1 :]
+
+    def _classify(self, newline: int, final: bool) -> bool:
+        """行首定性。返回 False 表示还看不出来、要等更多字符。"""
+        head = self._pending if newline < 0 else self._pending[:newline]
+        whole = newline >= 0 or final
+        match = self._FENCE.match(head)
+        if match is not None:
+            if not whole:
+                return False  # 围栏行要整行（语言名在后面）
+            self._emit(head, "text.secondary")
+            self._emit("\n")
+            self._pending = "" if newline < 0 else self._pending[newline + 1 :]
+            self._open_fence(match.group(1), match.group(2))
+            return True
+        if not whole and (self._MAYBE_FENCE.match(head) or self._MAYBE_HEADING.match(head)):
+            return False
+        self._kind = "heading" if self._HEADING.match(head) else "prose"
+        return True
+
+    def _open_fence(self, marker: str, lang: str) -> None:
+        self._fence = marker
+        self._code_lines = []
+        self._kind = None
+        try:
+            self._syntax = Syntax("", lang or "text", theme=_syntax_theme(), background_color="default")
+        except Exception:  # noqa: BLE001 - 认不得的语言名退回明文，不能因样式而炸
+            self._syntax = None
+
+    def _code_line(self, line: str, complete: bool) -> None:
+        assert self._fence is not None
+        closing = re.fullmatch(
+            r" {0,3}" + re.escape(self._fence[0]) + "{" + str(len(self._fence)) + r",}[ \t]*", line
+        )
+        if complete and closing is not None:
+            self._emit(line, "text.secondary")
+            self._emit("\n")
+            self._fence = None
+            self._syntax = None
+            self._code_lines = []
+            return
+        self._code_lines.append(line)
+        if len(self._code_lines) > self._CODE_CONTEXT:
+            del self._code_lines[: -self._CODE_CONTEXT]
+        row: Text | None = None
+        if self._syntax is not None:
+            try:
+                rows = self._syntax.highlight("\n".join(self._code_lines)).split("\n")
+                index = len(self._code_lines) - 1
+                if index < len(rows):
+                    row = _restyle_tabs(line, rows[index])
+            except Exception:  # noqa: BLE001 - 着色失败退回明文
+                row = None
+        self._write(row if row is not None else Text(line))
+        if complete:
+            self._emit("\n")
+
+    def _prose(self, head: str, complete: bool) -> int:
+        """围栏外的一行：边流边变色。返回消费了多少字符——行末的反引号 / 星号串
+        可能被分片切成两半，没看到串尾（且行没完）就留给下一片。"""
+        i, n = 0, len(head)
+        while i < n:
+            ch = head[i]
+            if ch == "`":
+                j = i
+                while j < n and head[j] == "`":
+                    j += 1
+                if j == n and not complete:
+                    break
+                run = j - i
+                if self._span == 0:
+                    self._span = run
+                    self._emit(head[i:j], "text.secondary")
+                elif self._span == run:
+                    self._span = 0
+                    self._emit(head[i:j], "text.secondary")
+                else:
+                    self._emit(head[i:j], "text.code")
+                i = j
+                continue
+            if ch == "*" and self._span == 0:
+                if i + 1 == n and not complete:
+                    break
+                if head[i + 1 : i + 2] == "*":
+                    self._strong = not self._strong
+                    self._emit("**", "text.secondary")
+                    i += 2
+                    continue
+            j = i + 1
+            while j < n and head[j] not in "`*":
+                j += 1
+            if self._span:
+                style = "text.code"
+            elif self._strong:
+                style = "text.strong"
+            else:
+                style = ""
+            self._emit(head[i:j], style)
+            i = j
+        return i
+
+    def _emit(self, text: str, style: str = "") -> None:
+        if not text:
+            return
+        fragment = Text(text)
+        if style:
+            #  以 span 而不是 Text(style=) 挂样式：Text.render 没有 span 时走快路径，
+            #  基础样式会被整个略过
+            fragment.stylize(style)
+        self._write(fragment)
+
+    def _write(self, text: Text) -> None:
+        """把带样式的片段原样写到终端。不走 console.print：rich 渲染时会把 tab
+        展成空格（Makefile / Go 的 tab 变空格就不是原文了），这里只借它把样式
+        片段编成 ANSI 码，字符本身一个不动。旧式 Windows 控制台不认 ANSI 码，
+        仍交给 rich 自己翻译（那里 tab 展开是可接受的代价）。"""
+        if self.console.legacy_windows:
+            self.console.print(text, end="", soft_wrap=True)
+            return
+        color_system = self.console._color_system  # noqa: SLF001 - rich 没有公开的枚举取法
+        parts = [
+            segment.style.render(segment.text, color_system=color_system)
+            if segment.style and color_system is not None
+            else segment.text
+            for segment in text.render(self.console, end="")
+        ]
+        self.console.file.write("".join(parts))
+        self.console.file.flush()
 
 
 class NoticeCapture:
@@ -858,6 +1142,9 @@ class RichSink:
         #  当前正文块是否已打开 OSC 133 锚点（TextEnd 负责收束配对），
         #  语义与 PlainSink 对齐，见 render.OSC133_TEXT_START 的注释
         self._osc133_open = False
+        #  流式正文的行级轻渲染器：只在真终端上起用（管道 / 测试的 StringIO
+        #  仍是逐字节直出），TextEnd 与中断路径负责把它手里的半行冲出去
+        self._styler: _StreamStyler | None = None
         self._handlers = {
             RequestStarted: self._request_started,
             RequestEnded: self._request_ended,
@@ -893,7 +1180,14 @@ class RichSink:
         """中断/异常路径的清扫：spinner 若还在转就停掉，折叠组落盘，避免悬空。"""
         self._stop_status()
         self._preparing_request = False
+        self._flush_text()
         self._flush_ro_group()
+
+    def _flush_text(self) -> None:
+        """把行级渲染器攒着的半行打出去（TextEnd / 中断都要调：没有换行的末行
+        不能跟着中断一起消失）。"""
+        if self._styler is not None:
+            self._styler.finish()
 
     def begin_turn(self) -> None:
         """一轮开始：清掉上一轮的折叠标记与留底（收尾的 Ctrl-O 提示据此判断）。"""
@@ -972,12 +1266,20 @@ class RichSink:
             #  正文块起点的零宽锚点：终端把每段回复当可导航的"提示块"
             print(end=render.OSC133_TEXT_START)
             self._osc133_open = True
-        #  流式分片直出，绕过 rich（它按行工作，逐分片 print 会插换行）
+        if self.console.is_terminal:
+            #  真终端：行级轻渲染（代码围栏着色、行内代码/粗体/标题变色），
+            #  每个字符仍只打一次，不重绘
+            if self._styler is None:
+                self._styler = _StreamStyler(self.console)
+            self._styler.feed(event.text)
+            return
+        #  非终端：流式分片直出，绕过 rich（它按行工作，逐分片 print 会插换行）
         print(event.text, end="", flush=True)
 
     def _text_end(self, event: TextEnd) -> None:
         self._flush_ro_group()
         if self.verbose:
+            self._flush_text()
             if self._osc133_open:
                 print(end=render.OSC133_TEXT_END)
                 self._osc133_open = False
@@ -2212,7 +2514,9 @@ class Tui:
     def _print_code(self, path: str, text: str) -> None:
         try:
             lexer = Syntax.guess_lexer(path, code=text)
-            block = Syntax(text, lexer, background_color="default", word_wrap=True)
+            block = Syntax(
+                text, lexer, theme=_syntax_theme(), background_color="default", word_wrap=True
+            )
             self.console.print(block, no_wrap=False)
         except Exception:  # noqa: BLE001 - 高亮失败退回明文，预览不能因样式而炸
             for row in text.split("\n"):
