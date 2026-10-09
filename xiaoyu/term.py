@@ -830,8 +830,10 @@ def render_script(
     """
     if shell not in SHELLS:
         raise ValueError(f"不支持的 shell：{shell}（可选 {', '.join(SHELLS)}）")
-    if natural and shell not in _NATURAL:
-        raise ValueError(f"--natural 目前只支持 {' / '.join(_NATURAL)}（{shell} 里请照常写 @c）")
+    #  --natural 只有 zsh 有（包的是 zle 的回车键），别的 shell 静默忽略、不报错：
+    #  照着别的平台抄来的那一行带着它也能装上；想要整行转走用 --command-not-found
+    if shell not in _NATURAL:
+        natural = False
     directory = pending_dir() if directory is None else directory
     launcher = default_launcher(shell) if launcher is None else launcher
     template = _TEMPLATES[shell]

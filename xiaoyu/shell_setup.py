@@ -107,7 +107,8 @@ def integration_lines(
         args += ["--name", quote(name)]
     if command_not_found:
         args.append("--command-not-found")
-    if natural:
+    #  --natural 只有 zsh 有；别的 shell 静默丢掉，不往启动文件里写一个无效的开关
+    if natural and shell == "zsh":
         args.append("--natural")
     lines.append(_run_line(shell, " ".join(args)))
     return lines, notes

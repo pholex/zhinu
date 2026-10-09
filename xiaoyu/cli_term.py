@@ -160,16 +160,9 @@ def term_install_command(argv: list[str]) -> int:
     shell = args.shell or shell_setup.detect_shell()
     if shell is None:
         if _on_windows():
-            print(ui.error("Windows 上 install 只管 Git Bash：xiaoyu term install bash"), file=sys.stderr)
-            print(
-                ui.secondary("PowerShell 请照 docs/terminal-integration.md 把那一行贴进 $PROFILE（没有 Tab 补全）。"),
-                file=sys.stderr,
-            )
+            _print_powershell_guidance(args)
         else:
             print(ui.error("认不出你用的 shell，请写明：xiaoyu term install zsh|bash|fish"), file=sys.stderr)
-        return 2
-    if args.natural and shell not in term._NATURAL:
-        print(ui.error(f"--natural 目前只支持 {' / '.join(term._NATURAL)}（{shell} 里请照常写 @c）"), file=sys.stderr)
         return 2
     lines, notes = shell_setup.integration_lines(
         shell,
@@ -243,6 +236,36 @@ def term_uninstall_command(argv: list[str]) -> int:
             return 1
     print(ui.secondary("已打开的终端里 @x / @c 与 Tab 补全仍在，关掉重开后消失。"))
     return 0
+
+
+def _print_powershell_guidance(args: argparse.Namespace) -> None:
+    """Windows 上认不出 shell：指 Git Bash，并把 PowerShell 要贴的命令原样打出来。
+
+    pip 装的用户本地没有 docs/，不能只叫人去翻文档。$PROFILE 的位置随 5.1 / 7
+    而变，install 从 Python 里看不出用户开的是哪一个，所以让他在自己的
+    PowerShell 里跑——那里的 $PROFILE 就是对的。--natural 在 PowerShell 上
+    没有对应物，静默忽略。
+    """
+    from . import term
+
+    init = f"{term.default_launcher('powershell')} term init powershell"
+    if args.name:
+        init += f" --name {term._ps_quote(args.name)}"
+    if args.command_not_found:
+        init += " --command-not-found"
+    line = f"Invoke-Expression ({init} | Out-String)"
+    print(ui.error("Windows 上 install 只管 Git Bash：xiaoyu term install bash"), file=sys.stderr)
+    print(ui.secondary("PowerShell 请在 PowerShell 里依次执行（没有 Tab 补全，命令名是 x，不是 @x）："), file=sys.stderr)
+    for cmd in (
+        "if (!(Test-Path $PROFILE)) { New-Item -ItemType File -Path $PROFILE -Force | Out-Null }",
+        f"Add-Content $PROFILE {term._ps_quote(line)}",
+        ". $PROFILE",
+    ):
+        print(f"    {cmd}", file=sys.stderr)
+    print(
+        ui.secondary("  . $PROFILE 报「禁止运行脚本」时，先执行：Set-ExecutionPolicy -Scope CurrentUser RemoteSigned"),
+        file=sys.stderr,
+    )
 
 
 def _on_windows() -> bool:

@@ -185,7 +185,7 @@ eval "$(xiaoyu term init zsh --natural)"
 
 **它包了一层回车键**（zsh 的 `accept-line`），这是默认不开的原因。原来的 `accept-line` 留在调用链上：先于它或后于它包回车键的别的东西照常被调到（按两种先后顺序测过），但没有拿真实的第三方插件逐个验证——开了之后回车行为不对，先关掉它排查。当前终端里立刻停：`zle -A __xiaoyu_term_natural_next accept-line`。
 
-bash / fish / PowerShell 没有这个开关（`term init bash --natural` 会直接报错）：bash 没有在 shell 解析之前拿到整行的干净办法。
+bash / fish / PowerShell 没有这个开关，带上也静默忽略、不报错（照抄带着它的那一行也能装上）：bash 没有在 shell 解析之前拿到整行的干净办法。想直接敲一句话就转给小羽，用 `--command-not-found`（找不到命令时兜底，以真实命令开头的句子转不走）。
 
 ## 具名会话
 

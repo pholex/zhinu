@@ -264,11 +264,13 @@ class TestCommand(unittest.TestCase):
         self.assertIn("在自己的终端里运行 xiaoyu term uninstall", out)
         self.assertIn("term init", _read(self.path))
 
-    def test_natural_rejected_for_bash(self) -> None:
+    def test_natural_silently_dropped_for_bash(self) -> None:
         code, out = self.run_cmd(["install", "bash", "--natural", "--yes"])
-        self.assertEqual(code, 2)
-        self.assertIn("--natural", out)
-        self.assertFalse(self.path.exists())
+        self.assertEqual(code, 0)
+        self.assertNotIn("只支持 zsh", out)
+        #  不往启动文件里写一个对 bash 无效的开关
+        self.assertIn("term init bash", _read(self.path))
+        self.assertNotIn("--natural", _read(self.path))
 
     def test_unknown_shell_asks_to_name_it(self) -> None:
         with mock.patch.dict(os.environ, {"SHELL": ""}), mock.patch.object(cli_term, "_on_windows", return_value=False):
@@ -282,6 +284,20 @@ class TestCommand(unittest.TestCase):
         self.assertEqual(code, 2)
         self.assertIn("term install bash", out)
         self.assertIn("PowerShell", out)
+        #  pip 装的没有 docs/：要贴的命令与执行策略提醒直接打出来，不叫人翻文档
+        self.assertNotIn("docs/", out)
+        self.assertIn("term init powershell | Out-String)", out)
+        self.assertIn("Add-Content $PROFILE", out)
+        self.assertIn("Set-ExecutionPolicy -Scope CurrentUser RemoteSigned", out)
+
+    def test_windows_guidance_carries_options_and_ignores_natural(self) -> None:
+        with mock.patch.dict(os.environ, {"SHELL": ""}), mock.patch.object(cli_term, "_on_windows", return_value=True):
+            code, out = self.run_cmd(["install", "--natural", "--command-not-found", "--name", "o'k"])
+        self.assertEqual(code, 2)
+        #  --name 按 PowerShell 单引号规则转义，再整体套进 Add-Content 的单引号里
+        self.assertIn("--name ''o''''k'' --command-not-found | Out-String)", out)
+        self.assertNotIn("只支持 zsh", out)
+        self.assertFalse(self.path.exists())
 
 
 if __name__ == "__main__":
