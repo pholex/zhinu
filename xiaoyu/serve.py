@@ -264,9 +264,15 @@ class _Pending:
     created_at: float
     done: threading.Event = field(default_factory=threading.Event)
     verdict: Any = None
-    #  HTTP 侧回的字面决定（allow / deny）：permission.resolved 事件照这个报，
-    #  消费方 UI 才分得清"放行"与"拒绝"；超时没人回则是 "timeout"
+    #  HTTP 侧回的字面决定（allow / allow_session / deny）：permission.resolved 事件
+    #  照这个报，消费方 UI 才分得清"放行"与"拒绝"；超时没人回则是 "timeout"
     decision: str = ""
+    #  「本会话都允许」这一档的范围文案（工具名 / bash 命令键），由服务端按这次
+    #  调用推导、随挂起项下发——客户端只能选档，带不进自定义范围；None = 推不出，
+    #  没有这个选项。判据与 TUI / ACP 确认框同一处（Permissions.session_grant_label）
+    session_scope: str | None = None
+    #  答了 allow_session 后真正落下的范围，permission.resolved 事件随 decision 一起报
+    granted: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -275,6 +281,7 @@ class _Pending:
             "args": self.args,
             "created_at": self.created_at,
             "waiting_seconds": round(time.time() - self.created_at, 3),
+            "session_scope": self.session_scope,
         }
 
 
@@ -605,10 +612,12 @@ class _Session:
         self.detail = "waiting_for_approval"
         self.publish("permission.requested", **request.to_dict())
 
-    def mark_resolved(self, request_id: str, decision: str) -> None:
+    def mark_resolved(self, request_id: str, decision: str, granted: str | None = None) -> None:
         if self.busy:
             self.detail = "working"
-        self.publish("permission.resolved", request_id=request_id, decision=decision)
+        #  granted 只在 allow_session 时带：侧栏据此刷新"已放开哪些"的清单
+        extra = {"granted": granted} if granted else {}
+        self.publish("permission.resolved", request_id=request_id, decision=decision, **extra)
 
 
 class _HttpApprover:
@@ -629,7 +638,13 @@ class _HttpApprover:
             return Deny("会话尚未就绪，已自动拒绝")
         if session.cfg.approval == "allow_all":
             return True
-        request = _Pending(id=uuid.uuid4().hex[:12], name=name, args=args, created_at=time.time())
+        request = _Pending(
+            id=uuid.uuid4().hex[:12],
+            name=name,
+            args=args,
+            created_at=time.time(),
+            session_scope=session.agent.permissions.session_grant_label(name, args),
+        )
         #  先落进 pending 再通知：GET /permissions 与事件谁先到都能看到这一条
         session.add_pending(request)
         loop.call_soon_threadsafe(session.mark_waiting, request)
@@ -647,7 +662,9 @@ class _HttpApprover:
                 "（只会再超时一次）。请在回复里说明你需要哪个工具、想做什么，"
                 "把决定留给编排侧。"
             )
-        loop.call_soon_threadsafe(session.mark_resolved, request.id, request.decision or "resolved")
+        loop.call_soon_threadsafe(
+            session.mark_resolved, request.id, request.decision or "resolved", request.granted
+        )
         return request.verdict
 
 
@@ -2006,15 +2023,24 @@ def create_app(cfg: ServeConfig):  # noqa: C901 - 路由表天然长，拆开反
     )
     async def permissions_list(session_id: str) -> dict[str, Any]:
         session = pick(session_id)
-        return {"pending": [item.to_dict() for item in session.snapshot_pending()]}
+        permissions = session.agent.permissions
+        return {
+            "pending": [item.to_dict() for item in session.snapshot_pending()],
+            #  已放开哪些：会话授权可经 DELETE …/granted/{name} 收回；持久规则只读，
+            #  改它请改规则文件（HTTP 面刻意不开写规则的口）
+            "granted": permissions.session_grants(),
+            "rules": [str(rule) for rule in permissions.rules],
+        }
 
     @app.post(
         "/session/{session_id}/permissions",
         summary="回一个审批决定",
         operation_id="respond_permission",
         description=(
-            "decision=allow 放行；deny 拒绝（reason 会原文回灌给模型，等于改指令）；"
-            "updated_args 非空时整体替换本次调用参数再执行（宿主'包一层再放行'的通道）。"
+            "decision=allow 放行；allow_session 放行且本会话内同范围（挂起项的 session_scope）"
+            "不再问——范围由服务端按这次调用推导，退出会话即失效；deny 拒绝（reason 会原文"
+            "回灌给模型，等于改指令）；updated_args 非空时整体替换本次调用参数再执行"
+            "（宿主'包一层再放行'的通道，不能与 allow_session 同用）。"
         ),
         tags=["approval"],
         dependencies=guard,
@@ -2022,7 +2048,7 @@ def create_app(cfg: ServeConfig):  # noqa: C901 - 路由表天然长，拆开反
     async def permissions_respond(
         session_id: str,
         request_id: str = Body(embed=True),
-        decision: str = Body(embed=True, description="allow | deny"),
+        decision: str = Body(embed=True, description="allow | allow_session | deny"),
         reason: str = Body(default="", embed=True),
         updated_args: dict[str, Any] | None = Body(default=None, embed=True),
     ) -> dict[str, Any]:
@@ -2030,14 +2056,51 @@ def create_app(cfg: ServeConfig):  # noqa: C901 - 路由表天然长，拆开反
         request = session.take_pending(request_id)
         if request is None:
             raise HTTPException(status_code=404, detail=f"没有挂起的审批 {request_id!r}（可能已超时）")
-        if decision not in ("allow", "deny"):
-            raise HTTPException(status_code=400, detail="decision 只能是 allow 或 deny")
+        if decision not in ("allow", "allow_session", "deny"):
+            raise HTTPException(status_code=400, detail="decision 只能是 allow、allow_session 或 deny")
+        if decision == "allow_session":
+            if updated_args is not None:
+                raise HTTPException(
+                    status_code=400,
+                    detail="allow_session 不能与 updated_args 同用：会话授权按原调用推导范围，"
+                    "改写后的调用请用 allow",
+                )
+            #  范围只能由服务端从挂起的这次调用推导（与 TUI / ACP 确认框同一判据）：
+            #  持 token 的客户端放得开的，只有模型真实尝试过、且推得出范围的那一类调用，
+            #  这是它与"建个 allow_all 的 agent"那种绕过的本质区别
+            granted = session.agent.permissions.grant_session_call(request.name, request.args)
+            if granted is None:
+                raise HTTPException(
+                    status_code=400, detail="这次调用推不出会话授权范围，只能 allow 或 deny"
+                )
+            request.granted = granted
         request.decision = decision
         request.verdict = (
-            Allow(note=reason, updated_args=updated_args) if decision == "allow" else Deny(reason)
+            Deny(reason) if decision == "deny" else Allow(note=reason, updated_args=updated_args)
         )
         request.done.set()
-        return {"request_id": request_id, "decision": decision}
+        result: dict[str, Any] = {"request_id": request_id, "decision": decision}
+        if request.granted:
+            result["granted"] = request.granted
+        return result
+
+    @app.delete(
+        "/session/{session_id}/permissions/granted/{name:path}",
+        summary="收回一条会话授权",
+        operation_id="revoke_session_grant",
+        description=(
+            "name 是 GET /permissions 返回的 granted.tools 里的工具名或 granted.commands 里的"
+            "命令键。只收会话授权；持久规则不经 HTTP 改。"
+        ),
+        tags=["approval"],
+        dependencies=guard,
+        status_code=204,
+    )
+    async def permissions_revoke(session_id: str, name: str):
+        session = pick(session_id)
+        if not session.agent.permissions.revoke_session(name):
+            raise HTTPException(status_code=404, detail=f"没有这条会话授权 {name!r}")
+        return Response(status_code=204)
 
     @app.post(
         "/session/{session_id}/budget",

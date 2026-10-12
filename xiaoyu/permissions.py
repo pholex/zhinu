@@ -985,6 +985,21 @@ class Permissions:
             self.session_allowed.add(name)
         return label
 
+    def revoke_session(self, name: str) -> bool:
+        """收回一条会话授权：工具名（session_allowed）或命令键（session_commands）。
+        没有这条返回 False。给能"展示已放开哪些"的前端配一个可收回的口。"""
+        if name in self.session_allowed:
+            self.session_allowed.discard(name)
+            return True
+        if name in self.session_commands:
+            self.session_commands.discard(name)
+            return True
+        return False
+
+    def session_grants(self) -> dict[str, list[str]]:
+        """会话授权的快照，给只读面（serve 的 GET /permissions）用。"""
+        return {"tools": sorted(self.session_allowed), "commands": sorted(self.session_commands)}
+
     def add_persistent(self, rule: Rule) -> Path:
         """把规则追加到用户级规则文件并立即生效。
 

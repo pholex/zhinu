@@ -96,7 +96,11 @@ v2（追加在 v1 之后，顺序即注册顺序；旧扩展不声明就不注�
   导航前稳定），`click` / `type` 只认 ref，不认选择器——选择器让模型猜，猜错就点错地方
 - 只读 / 不改变页面状态的（tabs / read_page / screenshot / scroll / hover / find / wait）默认免审批；
   七件写类（open / navigate / click / type / key / back / close）默认 `requires_approval`，
-  走既有 `/permissions` 回路。用户想免确认，`--mode auto` 配 `/allow browser_click` 之类规则
+  走既有 `/permissions` 回路。一轮里反复填字、点按钮不想每次都点放行：审批卡片上答
+  `allow_session`（挂起项带 `session_scope`，如 `browser_type`），本会话内这个工具不再问，
+  会话结束即失效，`GET /permissions` 的 `granted` 能看、`DELETE …/granted/{name}` 能收回。
+  站点维度不在这里收：扩展侧按站点授权（逐站点 origin）已经是一道闸，有效范围 = 本会话 ×
+  该工具 × 已授权站点。想跨会话长期免确认，才用 `--mode auto` 配 `/allow browser_click` 之类规则
 - 扩展对 `chrome://` / 扩展页 / 无权限站点一律回 `ok:false`，说明原因；不要静默做半截
 - 站点权限要提前拿：`permissions.request` 需要用户手势，agent 调用时没有手势可用。
   扩展要么在用户打开「浏览器桥」开关那一下把 `<all_urls>` 申请下来，要么让用户逐个站点点授权
