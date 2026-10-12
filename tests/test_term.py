@@ -150,20 +150,20 @@ class ScriptRenderTest(unittest.TestCase):
         both = self.render("zsh", natural=True, command_not_found=True)
         self.assertIn("command_not_found_handler", both)
         self.assertIn("__xiaoyu_term_accept_line", both)
+        #  别的 shell 静默忽略：脚本与不带 --natural 时一字不差
         for shell in ("bash", "fish", "powershell"):
             with self.subTest(shell=shell):
-                with self.assertRaisesRegex(ValueError, "只支持 zsh"):
-                    self.render(shell, natural=True)
+                self.assertEqual(self.render(shell, natural=True), self.render(shell))
 
-    def test_init_refuses_natural_outside_zsh_and_leaves_nothing_behind(self) -> None:
+    def test_init_ignores_natural_outside_zsh(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             directory = Path(tmp) / "term"
             out, err = io.StringIO(), io.StringIO()
             with mock.patch.object(term, "pending_dir", lambda: directory), \
                     contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
-                self.assertEqual(cli.main(["term", "init", "bash", "--natural"]), 2)
-                self.assertEqual((out.getvalue(), directory.exists()), ("", False))
-                self.assertIn("只支持 zsh", err.getvalue())
+                self.assertEqual(cli.main(["term", "init", "bash", "--natural", "--launcher", "xiaoyu"]), 0)
+                self.assertEqual(err.getvalue(), "")
+                self.assertNotIn("accept-line", out.getvalue())
                 self.assertEqual(cli.main(["term", "init", "zsh", "--natural", "--launcher", "xiaoyu"]), 0)
             self.assertIn("__xiaoyu_term_accept_line", out.getvalue())
             self.assertTrue(directory.is_dir())
