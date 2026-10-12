@@ -237,6 +237,41 @@ class TestCalls(BrowserCase):
         #  扩展那边一帧 call 都不该收到：关连接时若有未读帧会在这里冒出来
         ws.__exit__(None, None, None)
 
+    def test_allow_session_lets_the_next_write_call_through_without_asking(self):
+        #  侧栏卡片的"本会话都允许"：第一次 browser_type 答 allow_session，第二次直达扩展，
+        #  整轮只有一条 permission.requested。读类工具本来免审，与此无关
+        self.start(
+            'tool_call: {"name": "browser_type", "arguments": {"ref": "e2", "text": "第一段"}}\n---\n'
+            'tool_call: {"name": "browser_type", "arguments": {"ref": "e2", "text": "第二段"}}\n---\n'
+            "text: 完\n"
+        )
+        session_id = self.new_session()
+        ws = self.connect(session_id, supports=["browser_type"])
+        self.assertEqual(ws.receive_json()["type"], "hello.ok")
+        self.client.post(f"/session/{session_id}/prompt_async", json={"text": "输入"}, headers=self.headers())
+        state = _ts.TestBasics._wait_for(self, session_id, "waiting_for_approval")
+        request = state["pending_approvals"][0]
+        self.assertEqual(request["tool"], "browser_type")
+        self.assertEqual(request["session_scope"], "browser_type")
+        response = self.client.post(
+            f"/session/{session_id}/permissions",
+            json={"request_id": request["request_id"], "decision": "allow_session"},
+            headers=self.headers(),
+        )
+        self.assertEqual(response.status_code, 200, response.text)
+        for text in ("第一段", "第二段"):
+            call = ws.receive_json()
+            self.assertEqual(call["tool"], "browser_type")
+            self.assertEqual(call["args"]["text"], text)
+            ws.send_json({"type": "result", "id": call["id"], "ok": True, "content": "已输入"})
+        _ts.TestBasics._wait_for(self, session_id, "finished")
+        kinds = [e["kind"] for e in self.events(session_id)]
+        self.assertEqual(kinds.count("permission.requested"), 1)
+        self.assertEqual(kinds.count("tool.completed"), 2)
+        granted = self.client.get(f"/session/{session_id}/permissions", headers=self.headers()).json()["granted"]
+        self.assertEqual(granted["tools"], ["browser_type"])
+        ws.__exit__(None, None, None)
+
     def test_timeout_is_a_tool_error_and_late_result_is_ignored(self):
         self.start('tool_call: {"name": "browser_tabs", "arguments": {}}\n---\ntext: 完\n', browser_timeout=1.0)
         session_id = self.new_session()

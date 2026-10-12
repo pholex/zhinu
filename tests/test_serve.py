@@ -359,6 +359,82 @@ class TestApproval(ServeCase):
         self.assertIn("tool.denied", self.kinds(session_id))
         self.assertFalse((self.root / "新文件.txt").exists())
 
+    def test_allow_session_skips_the_next_approval_and_is_revocable(self):
+        #  两次写文件：第一次答 allow_session，第二次必须不再挂起（闸在 core 的
+        #  session_allowed，连 approver 都不该再被调）；之后能看到、能收回
+        self.start(
+            'tool_call: {"name": "write_file", "arguments": {"path": "一.txt", "content": "1\\n"}}\n'
+            "---\n"
+            'tool_call: {"name": "write_file", "arguments": {"path": "二.txt", "content": "2\\n"}}\n'
+            "---\n"
+            "text: 收工\n"
+        )
+        session_id = self.new_session()
+        self.client.post(
+            f"/session/{session_id}/prompt_async", json={"text": "建两个文件"}, headers=self.headers()
+        )
+        state = TestBasics._wait_for(self, session_id, "waiting_for_approval")
+        request = state["pending_approvals"][0]
+        #  范围由服务端推导并随挂起项下发：客户端据此决定要不要画"本会话都允许"按钮
+        self.assertEqual(request["session_scope"], "write_file")
+        response = self.client.post(
+            f"/session/{session_id}/permissions",
+            json={"request_id": request["request_id"], "decision": "allow_session"},
+            headers=self.headers(),
+        )
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.json()["granted"], "write_file")
+        TestBasics._wait_for(self, session_id, "finished")
+        self.assertTrue((self.root / "一.txt").exists())
+        self.assertTrue((self.root / "二.txt").exists())
+        events = self.events(session_id, limit=2000)
+        self.assertEqual(sum(1 for e in events if e["kind"] == "permission.requested"), 1)
+        resolved = [e for e in events if e["kind"] == "permission.resolved"]
+        self.assertEqual([(e["decision"], e.get("granted")) for e in resolved], [("allow_session", "write_file")])
+
+        listing = self.client.get(f"/session/{session_id}/permissions", headers=self.headers()).json()
+        self.assertEqual(listing["granted"], {"tools": ["write_file"], "commands": []})
+        self.assertIsInstance(listing["rules"], list)
+        gone = self.client.delete(
+            f"/session/{session_id}/permissions/granted/write_file", headers=self.headers()
+        )
+        self.assertEqual(gone.status_code, 204, gone.text)
+        listing = self.client.get(f"/session/{session_id}/permissions", headers=self.headers()).json()
+        self.assertEqual(listing["granted"], {"tools": [], "commands": []})
+        self.assertEqual(
+            self.client.delete(
+                f"/session/{session_id}/permissions/granted/write_file", headers=self.headers()
+            ).status_code,
+            404,
+        )
+
+    def test_allow_session_rejects_updated_args(self):
+        #  会话授权的范围按原调用推导；改写过的调用只能 allow——两者同给是 400，
+        #  且挂起项还在（没被这次失败的请求消费掉）
+        self.start(self.SCRIPT)
+        session_id = self.new_session()
+        self.client.post(
+            f"/session/{session_id}/prompt_async", json={"text": "建个文件"}, headers=self.headers()
+        )
+        state = TestBasics._wait_for(self, session_id, "waiting_for_approval")
+        request_id = state["pending_approvals"][0]["request_id"]
+        response = self.client.post(
+            f"/session/{session_id}/permissions",
+            json={"request_id": request_id, "decision": "allow_session", "updated_args": {"path": "x"}},
+            headers=self.headers(),
+        )
+        self.assertEqual(response.status_code, 400, response.text)
+        self.assertEqual(
+            self.client.get(f"/session/{session_id}/permissions", headers=self.headers()).json()["granted"],
+            {"tools": [], "commands": []},
+        )
+        self.client.post(
+            f"/session/{session_id}/permissions",
+            json={"request_id": request_id, "decision": "deny", "reason": "算了"},
+            headers=self.headers(),
+        )
+        TestBasics._wait_for(self, session_id, "finished")
+
     def test_timeout_denies_rather_than_hangs(self):
         #  fail closed：没人回决定时必须变成拒绝，不能永远挂着，也不能放行
         self.start(self.SCRIPT)

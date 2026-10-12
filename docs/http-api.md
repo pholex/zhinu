@@ -131,13 +131,36 @@ curl -X POST $BASE/session/$SID/permissions -H "$AUTH" -H 'content-type: applica
 
 # 3. 或者拒绝——reason 会原文回灌给模型，等于改指令
   -d '{"request_id":"...","decision":"deny","reason":"别动这个文件"}'
+
+# 4. 或者放行并且本会话内同范围不再问（TUI 确认框答 a 的那一档）
+  -d '{"request_id":"...","decision":"allow_session"}'
 ```
 
 `updated_args` 非空时整体替换本次调用参数再执行——"批准但改写"的通道
-（典型用法：把命令包一层再放行）。
+（典型用法：把命令包一层再放行）。它不能与 `allow_session` 同用（`400`）：会话授权的
+范围按原调用推导，改写过的调用只能 `allow`。
 
-事件流里对应两条：`permission.requested`（字段同 `pending_approvals` 里的一项）与
-`permission.resolved`（`request_id` + `decision`：`allow` / `deny` / `timeout`）。
+**会话内放行**（`allow_session`）：范围**由服务端推导**、随挂起项的 `session_scope` 字段
+下发——非命令类工具是工具名（`write_file`、`browser_type`），`bash` 是命令键（`git status`
+这种头，与 TUI 的会话授权同一口径）；`session_scope` 为 `null` 的调用推不出范围，只能
+`allow` / `deny`（回 `allow_session` 是 `400`）。客户端只能选档，带不进自定义范围：持
+token 的一方放得开的，只有模型真实尝试过、且范围推得出的那一类调用。授权随会话消失。
+响应多一个 `granted` 字段（落下的范围）。
+
+已放开哪些、怎么收回：
+
+```bash
+curl -s $BASE/session/$SID/permissions -H "$AUTH"
+# → {"pending": [...], "granted": {"tools": ["browser_type"], "commands": ["git status"]}, "rules": ["allow write_file(src/*)", ...]}
+curl -X DELETE $BASE/session/$SID/permissions/granted/browser_type -H "$AUTH"   # 204；没有这条是 404
+```
+
+`granted` 是本会话的授权（可经 `DELETE` 收回）；`rules` 是持久规则的只读视图，改它请改规则
+文件——HTTP 面刻意不开写持久规则的口。
+
+事件流里对应两条：`permission.requested`（字段同 `pending_approvals` 里的一项，含
+`session_scope`）与 `permission.resolved`（`request_id` + `decision`：`allow` /
+`allow_session` / `deny` / `timeout`；`allow_session` 时另带 `granted`）。
 
 **超时按拒绝处理**（`--approval-timeout`，默认 300 秒）。这是 fail closed：
 安全闸门宁可多拦一次，不能在没人应答时静默放行。
@@ -467,7 +490,8 @@ xiaoyu serve --host 0.0.0.0 --token "$TOKEN" --tls-cert fullchain.pem --tls-key 
 | GET | `/session/{id}/status` | 状态机（含 `pending_approvals`、`pending_notifications`） |
 | GET | `/session/{id}/events` | 拉事件（游标 + long-poll） |
 | GET | `/session/{id}/events/stream` | 同一份事件流的 SSE |
-| GET · POST | `/session/{id}/permissions` | 挂起的审批 · 回决定 |
+| GET · POST | `/session/{id}/permissions` | 挂起的审批与已放开的范围 · 回决定（`allow` / `allow_session` / `deny`） |
+| DELETE | `/session/{id}/permissions/granted/{name}` | 收回一条会话授权 |
 | POST | `/session/{id}/budget` | 改/撤预算（`budget_reached` 后的出路） |
 | POST | `/session/{id}/abort` | 打断这一轮（不杀会话） |
 | POST | `/session/{id}/steer` | 向进行中的一轮插话（会话空闲时 `409`） |
