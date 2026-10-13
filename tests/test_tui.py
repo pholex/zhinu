@@ -1602,9 +1602,10 @@ class TestStreamStyler(unittest.TestCase):
         #  legacy_windows=False：这组测的是 ANSI 直写那条路。Windows CI 的 runner 没有
         #  VT 控制台，rich 会判成旧式控制台走 console.print 回退（tab 被展开），
         #  那是刻意保留的退路，不是这里要验的行为
+        #  颜色能力由夹具声明，不继承运行器的 TERM=dumb / NO_COLOR。
         console = Console(
             file=buffer, force_terminal=True, soft_wrap=True, highlight=False, width=80,
-            legacy_windows=False,
+            legacy_windows=False, color_system="truecolor", no_color=False,
         )
         return RichSink(console), buffer
 
