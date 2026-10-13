@@ -785,6 +785,20 @@ class TestCors(ServeCase):
         self.assertEqual(response.status_code, 200, response.text)
         self.assertEqual(response.headers["access-control-allow-origin"], self.EXT)
 
+    def test_private_network_does_not_bypass_request_header_allowlist(self):
+        client = self.start("text: 无所谓\n")
+        response = client.options(
+            "/session",
+            headers={
+                "Origin": self.EXT,
+                "Access-Control-Request-Method": "POST",
+                "Access-Control-Request-Headers": "x-not-allowed",
+                "Access-Control-Request-Private-Network": "true",
+            },
+        )
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("headers", response.text)
+
     def test_other_origin_gets_nothing(self):
         client = self.start("text: 无所谓\n", cors_origins=(self.EXT,))
         response = client.options(
