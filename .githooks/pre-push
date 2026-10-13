@@ -25,6 +25,14 @@ if [ "$only_tags" = 1 ]; then
     exit 0
 fi
 
+#  Git 在 linked worktree 的钩子中设置 GIT_DIR 等变量。测试会另建临时仓库，
+#  不能让其 git 命令继承这里的仓库指针，否则临时提交会写进当前真实分支。
+for git_env_name in $(git rev-parse --local-env-vars); do
+    unset "$git_env_name"
+done
+#  子进程即便切到临时目录，也应测试这份源码而不是别处的可编辑安装。
+export PYTHONPATH="$PWD${PYTHONPATH:+:$PYTHONPATH}"
+
 if [ -x .venv/bin/python ]; then
     PY=.venv/bin/python
 else
