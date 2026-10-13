@@ -271,6 +271,32 @@ class CommandKeyGrantTest(unittest.TestCase):
         perms.grant_session_call("bash", {"command": "npm run build"})
         self.assertEqual(perms.decide("bash", {"command": "npm run deploy"}), "ask")
 
+    def test_session_scope_tiers(self):
+        #  粗档位：浏览器桥一族按前缀一次放开；档位只认 session_grant_options 给出的，
+        #  推不出细档就没有粗档，别的工具族不受牵连
+        perms = self.perms()
+        self.assertEqual(
+            perms.session_grant_options("browser_click", {"ref": "e1"}),
+            [("browser_click", "browser_click"), ("browser:*", "本会话全部浏览器操作")],
+        )
+        self.assertEqual(perms.session_grant_options("write_file", {"path": "a"}), [("write_file", "write_file")])
+        self.assertEqual(perms.session_grant_options("bash", {"command": ""}), [])
+        #  选了不在表里的档位：不记、返回 None
+        self.assertIsNone(perms.grant_session_scope("write_file", {"path": "a"}, "browser:*"))
+        self.assertIsNone(perms.grant_session_scope("browser_click", {"ref": "e1"}, "write:*"))
+        self.assertEqual(perms.session_grants(), {"tools": [], "commands": []})
+        #  细档走原来的 grant_session_call
+        self.assertEqual(perms.grant_session_scope("write_file", {"path": "a"}, "write_file"), "write_file")
+        self.assertEqual(perms.decide("write_file", {"path": "b"}), "allow")
+        #  粗档：同族全放，异族照问；能看、能收回
+        self.assertEqual(perms.grant_session_scope("browser_click", {"ref": "e1"}, "browser:*"), "browser:*")
+        self.assertEqual(perms.decide("browser_click", {"ref": "e9"}), "allow")
+        self.assertEqual(perms.decide("browser_type", {"ref": "e9", "text": "x"}), "allow")
+        self.assertEqual(perms.decide("bash", {"command": "ls"}), "ask")
+        self.assertEqual(perms.session_grants()["tools"], ["browser:*", "write_file"])
+        self.assertTrue(perms.revoke_session("browser:*"))
+        self.assertEqual(perms.decide("browser_click", {"ref": "e9"}), "ask")
+
     def test_git_status_grant_is_narrow(self):
         perms = self.perms()
         self.assertEqual(perms.grant_session_call("bash", {"command": "git status"}), "git status")

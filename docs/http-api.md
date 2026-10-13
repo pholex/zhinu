@@ -134,6 +134,9 @@ curl -X POST $BASE/session/$SID/permissions -H "$AUTH" -H 'content-type: applica
 
 # 4. 或者放行并且本会话内同范围不再问（TUI 确认框答 a 的那一档）
   -d '{"request_id":"...","decision":"allow_session"}'
+
+# 5. 同上，但选挂起项 session_scopes 里更粗的一档（一次放开本会话全部浏览器写操作）
+  -d '{"request_id":"...","decision":"allow_session","scope":"browser:*"}'
 ```
 
 `updated_args` 非空时整体替换本次调用参数再执行——"批准但改写"的通道
@@ -147,6 +150,13 @@ curl -X POST $BASE/session/$SID/permissions -H "$AUTH" -H 'content-type: applica
 token 的一方放得开的，只有模型真实尝试过、且范围推得出的那一类调用。授权随会话消失。
 响应多一个 `granted` 字段（落下的范围）。
 
+**选更粗的档位**：挂起项另带 `session_scopes`，细到粗列出可选档位，每项 `{scope, label}`，
+首项就是 `session_scope`。目前只有浏览器桥一族有第二档——`browser:*`（文案「本会话全部
+浏览器操作」），一次放开七件写类工具，省得 open / navigate / click / type / key / back / close
+各点一次。`allow_session` 带 `scope` 选档，不带即首项；`scope` 不在这次下发的档位里是
+`400`，挂起项不消费。只认 `session_scope` 的老客户端照旧工作。粗档位落下后 `granted.tools`
+里记的就是 `browser:*`，`DELETE …/granted/browser:*` 收回。
+
 已放开哪些、怎么收回：
 
 ```bash
@@ -159,7 +169,7 @@ curl -X DELETE $BASE/session/$SID/permissions/granted/browser_type -H "$AUTH"   
 文件——HTTP 面刻意不开写持久规则的口。
 
 事件流里对应两条：`permission.requested`（字段同 `pending_approvals` 里的一项，含
-`session_scope`）与 `permission.resolved`（`request_id` + `decision`：`allow` /
+`session_scope` 与 `session_scopes`）与 `permission.resolved`（`request_id` + `decision`：`allow` /
 `allow_session` / `deny` / `timeout`；`allow_session` 时另带 `granted`）。
 
 **超时按拒绝处理**（`--approval-timeout`，默认 300 秒）。这是 fail closed：
