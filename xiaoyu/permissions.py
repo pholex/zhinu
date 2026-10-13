@@ -506,6 +506,9 @@ def suggest_allow_rule(name: str, args: dict, workspace: Path) -> Rule | None:
        在这里就被拦下，不会出现"界面提供了选项、落盘时才报错"。
     """
     name, args = call_identity(name, args)
+    #  升权只批本次；普通 allow 规则无法兑现「总是允许」的承诺。
+    if name == "bash" and str(args.get("sandbox_permissions") or "").strip():
+        return None
     if name != "bash":
         path = args.get("path")
         if isinstance(path, str) and path:
@@ -1009,6 +1012,9 @@ class Permissions:
         """确认框"本会话允许"选项的文案主体；None = 这次调用推不出会话授权范围，
         选项不该出现。一处定义，三个前端（TUI / 明文 / ACP）同用。"""
         name, args = call_identity(name, args)
+        #  沙箱升权必须逐次确认，不提供无法兑现的会话授权选项。
+        if name == "bash" and str(args.get("sandbox_permissions") or "").strip():
+            return None
         if name != "bash":
             return name
         keys = command_keys(str(args.get("command", "")))

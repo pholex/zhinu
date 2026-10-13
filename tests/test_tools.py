@@ -1503,6 +1503,21 @@ class TestSandboxEscalation(unittest.TestCase):
             wrap.assert_not_called()
             self.assertIn("true", " ".join(argv))
 
+    def test_top_logging_is_direct_argv_but_other_forms_keep_sandbox(self) -> None:
+        with (
+            mock.patch("xiaoyu.tools.sandbox.available", return_value=True),
+            mock.patch("xiaoyu.sandbox.sys.platform", "darwin"),
+        ):
+            box = self.build()
+            with mock.patch("xiaoyu.tools.sandbox.wrap", return_value=["sandboxed"]) as wrap:
+                self.assertEqual(
+                    box._command_argv("top -l 1 -n 10 -o mem"),
+                    ["/usr/bin/top", "-l", "1", "-n", "10", "-o", "mem"],
+                )
+                wrap.assert_not_called()
+                for command in ("top", "top -l 0", "top -l 1; touch x", "top -l 1 > out"):
+                    self.assertEqual(box._command_argv(command), ["sandboxed"])
+
     def test_allow_network_wraps_with_network(self) -> None:
         """allow-network = 仍套沙箱但放行网络。"""
         with mock.patch("xiaoyu.tools.sandbox.available", return_value=True):

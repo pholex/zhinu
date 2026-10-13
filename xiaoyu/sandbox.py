@@ -1,7 +1,8 @@
 """bash 命令沙箱：macOS Seatbelt + Linux bubblewrap。
 
 给 bash 工具执行的命令套一层内核级强制访问控制，包一层即可，策略对
-**所有子孙进程**生效（模型跑的 `npm install` 里再启动的进程也跑不出去），
+子孙进程生效（模型跑的 `npm install` 里再启动的进程也跑不出去；macOS
+只读系统程序 `/bin/ps` 的精确执行例外见策略），
 无需 root、无需容器：
 
 - macOS：`/usr/bin/sandbox-exec -p <策略>`（Seatbelt 策略语言）
@@ -38,6 +39,7 @@ unprivileged user namespace 的发行版）时 `available()` 返回 False，调�
 from __future__ import annotations
 
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -63,6 +65,9 @@ _POLICY_HEADER = """(version 1)
 
 ; 子进程继承本策略
 (allow process-exec)
+; macOS 的系统 ps 带 setuid，不能继承 Seatbelt；仅此只读程序允许脱离沙箱。
+; 精确指向受系统保护的文件：shell、管道和重定向仍继承策略，sudo/top 不在例外内。
+(allow process-exec (with no-sandbox) (literal "/bin/ps"))
 (allow process-fork)
 (allow signal (target same-sandbox))
 (allow process-info* (target same-sandbox))
@@ -103,11 +108,68 @@ _POLICY_HEADER = """(version 1)
 _NETWORK_ALLOW = """
 ; 网络放行（XIAOYU_SANDBOX_NETWORK=0 可关掉这一段）
 (allow network*)
+; 系统路由探测程序带 setuid；仅在已允许联网时给精确执行例外。
+(allow process-exec (with no-sandbox)
+  (literal "/usr/sbin/traceroute")
+  (literal "/usr/sbin/traceroute6"))
 """
 
 _NETWORK_DENY = """
 ; 网络已断：策略里不出现 network 放行即为全禁
 """
+
+
+def host_query_argv(command: str) -> list[str] | None:
+    """macOS top 的有限次日志采样：验证完整 argv 后直接启动系统程序。
+
+    top 带 setuid 但交互态能发信号，不能给它全局 no-sandbox 例外。这里只认
+    一条纯字面量命令、正数 -l 与已知查询参数；不执行 shell，不接受管道、
+    重定向、包装器或插值。失败退回正常沙箱，不扩大权限。
+    """
+    if sys.platform != "darwin":
+        return None
+    from . import bash_ast
+
+    commands = bash_ast.parse_plain_commands(command)
+    if not commands or len(commands) != 1:
+        return None
+    argv = commands[0]
+    if argv[0] not in ("top", "/usr/bin/top"):
+        return None
+    flags = {"-a", "-d", "-e", "-F", "-f", "-h", "-R", "-r", "-S", "-u"}
+    values = {
+        "-l": r"[0-9]+", "-n": r"[0-9]+", "-ncols": r"[0-9]+",
+        "-i": r"[0-9]+", "-pid": r"[0-9]+", "-s": r"[0-9]+(?:\.[0-9]+)?",
+        "-c": r"[aden]", "-o": r"[+-]?[a-z_]+", "-O": r"[+-]?[a-z_]+",
+        "-stats": r"[a-z_]+(?:,[a-z_]+)*", "-user": r"[a-zA-Z0-9_.-]+",
+        "-U": r"[a-zA-Z0-9_.-]+",
+    }
+    #  归一化后直接作为 argv 传给 top，绝不重新拼 shell 字符串。
+    result = ["/usr/bin/top"]
+    logging = False
+    index = 1
+    while index < len(argv):
+        option = argv[index]
+        index += 1
+        if option in flags:
+            result.append(option)
+            continue
+        if attached := re.fullmatch(r"(-[lnis])([0-9]+(?:\.[0-9]+)?)", option):
+            option, value = attached.groups()
+        elif option in values and index < len(argv):
+            value = argv[index]
+            index += 1
+        else:
+            return None
+        if not re.fullmatch(values[option], value):
+            return None
+        if option == "-l":
+            #  top -l 0 是无限采样；重复选项也不能把有限次改回无限次。
+            if len(value) > 10 or not 0 < int(value) <= 2_147_483_647:
+                return None
+            logging = True
+        result.extend((option, value))
+    return result if logging else None
 
 
 def policy_text(

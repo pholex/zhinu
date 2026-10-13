@@ -320,6 +320,21 @@ class CommandKeyGrantTest(unittest.TestCase):
         self.assertEqual(perms.session_commands, set())
         self.assertEqual(perms.decide("bash", {"command": "bash -c 'ls'"}), "ask")
 
+    def test_escalation_never_offers_reusable_grants(self):
+        from xiaoyu.permissions import suggest_allow_rule, suggest_deny_rule
+
+        perms = self.perms()
+        for tier in ("danger-full-access", "allow-network"):
+            with self.subTest(tier=tier):
+                args = {"command": "ps -ax", "sandbox_permissions": tier}
+                self.assertIsNone(perms.session_grant_label("bash", args))
+                self.assertEqual(perms.session_grant_options("bash", args), [])
+                self.assertIsNone(perms.grant_session_call("bash", args))
+                self.assertIsNone(suggest_allow_rule("bash", args, perms.workspace))
+                self.assertIsNotNone(suggest_deny_rule("bash", args, perms.workspace))
+                self.assertEqual(perms.session_commands, set())
+        self.assertEqual(perms.session_grant_label("bash", {"command": "ps -ax"}), "ps")
+
     def test_dangerous_not_granted_even_after_key(self):
         perms = self.perms()
         perms.grant_session_call("bash", {"command": "rm x"})

@@ -79,6 +79,43 @@ class BwrapArgsTest(unittest.TestCase):
         self.assertEqual(args[index + 1], "ALL")
 
 
+class HostQueryTest(unittest.TestCase):
+    def test_top_logging_uses_literal_system_argv(self):
+        with mock.patch.object(sandbox.sys, "platform", "darwin"):
+            self.assertEqual(
+                sandbox.host_query_argv("top -l 1 -n 10 -o mem -stats 'pid,command,mem'"),
+                ["/usr/bin/top", "-l", "1", "-n", "10", "-o", "mem", "-stats", "pid,command,mem"],
+            )
+            self.assertEqual(
+                sandbox.host_query_argv("/usr/bin/top -l2 -s0.1 -n5 -F"),
+                ["/usr/bin/top", "-l", "2", "-s", "0.1", "-n", "5", "-F"],
+            )
+
+    def test_unknown_or_interactive_top_stays_sandboxed(self):
+        commands = (
+            "top", "top -n 10", "top -l 0", "top -l -1", "top -l 1 -l 0",
+            "top -l 4294967296", "top -l 1 --unknown", "top -l 1 -o", "top -l 1 -stats -l",
+            "./top -l 1", "/tmp/top -l 1", "env top -l 1", "sudo top -l 1",
+            "top -l 1 | head", "top -l 1; touch x", "top -l 1 && top", "top -l 1 &",
+            "top -l 1 > out", "top -l 1 2>/dev/null", "top -l $(echo 1)", "top -l $N",
+            "top -l 1 -user '$(touch x)'", "F=1 top -l 1", "top -l 1 < input",
+            "top -l 1\ntop", "top -l 1 || bash", "top -l 1 # comment", "ps -ax",
+        )
+        with mock.patch.object(sandbox.sys, "platform", "darwin"):
+            for command in commands:
+                with self.subTest(command=command):
+                    self.assertIsNone(sandbox.host_query_argv(command))
+
+    def test_linux_and_missing_parser_keep_existing_sandbox(self):
+        with mock.patch.object(sandbox.sys, "platform", "linux"):
+            self.assertIsNone(sandbox.host_query_argv("top -l 1"))
+        with (
+            mock.patch.object(sandbox.sys, "platform", "darwin"),
+            mock.patch("xiaoyu.bash_ast._get_parser", return_value=None),
+        ):
+            self.assertIsNone(sandbox.host_query_argv("top -l 1"))
+
+
 def home_probe(stem: str) -> Path:
     """家目录里的探针路径（沙箱挡的就是往这里写，探针只能放这）。
 
@@ -429,6 +466,91 @@ class RealSandboxTest(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stdout.strip(), "hi")
 
+    @unittest.skipUnless(sys.platform == "darwin", "macOS 系统 ps 的 setuid 例外")
+    def test_ps_can_query_host_process_memory(self):
+        #  父进程在沙箱外；只看到沙箱自身的进程不能算查询整机成功。
+        result = self.run_in_sandbox(f"/bin/ps -p {os.getpid()} -o pid=,rss=")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        pid, rss = result.stdout.split()
+        self.assertEqual(int(pid), os.getpid())
+        self.assertGreater(int(rss), 0)
+        result = self.run_in_sandbox(
+            "set -o pipefail; ps -axo pid=,rss=,comm= | sort -k2 -nr | sed -n '1,10p'"
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        rows = result.stdout.splitlines()
+        self.assertEqual(len(rows), 10)
+        memory = [int(row.split()[1]) for row in rows]
+        self.assertEqual(memory, sorted(memory, reverse=True))
+
+    @unittest.skipUnless(sys.platform == "darwin", "macOS 系统 ps 的 setuid 例外")
+    def test_ps_exception_does_not_free_shell_or_other_programs(self):
+        victim = home_probe("xiaoyu_ps_should_not_write")
+        self.addCleanup(lambda: victim.exists() and victim.unlink())
+        import shlex
+
+        target = shlex.quote(str(victim))
+        #  分别覆盖 shell 重定向、下游命令、后续命令、工作区里的同名程序。
+        fake_ps = self.ws / "ps"
+        fake_ps.write_text(f"#!/bin/bash\necho escaped > {target}\n", encoding="utf-8")
+        fake_ps.chmod(0o755)
+        for command in (
+            f"/bin/ps -p $$ > {target}",
+            f"/bin/ps -p $$ | /usr/bin/tee {target}",
+            f"/bin/ps -p $$; echo escaped > {target}",
+            "./ps",
+            f"/bin/ps -p $$; /bin/kill -0 {os.getpid()}",
+            "/usr/bin/sudo -n /usr/bin/true",
+        ):
+            with self.subTest(command=command):
+                result = self.run_in_sandbox(command)
+                self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertTrue(sandbox.looks_denied(result.stderr), result.stderr)
+                self.assertFalse(victim.exists())
+
+    @unittest.skipUnless(sys.platform == "darwin", "macOS 常用诊断命令")
+    def test_common_readonly_diagnostics(self):
+        commands = (
+            "ls -ld .", "stat -f %z .", "find . -maxdepth 1 -type d",
+            "df -h /", "du -s .", "uname -a", "id", "whoami", "hostname",
+            "sw_vers", "uptime", "vm_stat", "sysctl hw.memsize", "iostat -c 1",
+            "netstat -an", f"lsof -p {os.getpid()}", "ifconfig -a", "scutil --dns",
+            "system_profiler -listDataTypes", "diskutil list",
+        )
+        for command in commands:
+            with self.subTest(command=command):
+                result = self.run_in_sandbox(command)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertTrue(result.stdout.strip(), command)
+
+    @unittest.skipUnless(sys.platform == "darwin", "macOS 网络诊断程序")
+    def test_network_diagnostics_respect_network_switch(self):
+        #  只探测回环地址，验证发包能力而不依赖公网、DNS 或网关状态。
+        commands = (
+            "/sbin/ping -n -c 1 -t 1 127.0.0.1",
+            "/usr/sbin/traceroute -n -m 1 -w 1 127.0.0.1",
+            "/usr/sbin/traceroute6 -n -m 1 -w 1 ::1",
+        )
+        for command in commands:
+            with self.subTest(command=command):
+                allowed = self.run_in_sandbox(command)
+                self.assertEqual(allowed.returncode, 0, allowed.stderr)
+                blocked = self.run_in_sandbox(command, network=False)
+                self.assertNotEqual(blocked.returncode, 0)
+                self.assertTrue(sandbox.looks_denied(blocked.stderr), blocked.stderr)
+
+    @unittest.skipUnless(sys.platform == "darwin", "macOS 路由探测的 setuid 例外")
+    def test_traceroute_exception_keeps_output_writes_sandboxed(self):
+        import shlex
+
+        victim = home_probe("xiaoyu_traceroute_should_not_write")
+        self.addCleanup(lambda: victim.exists() and victim.unlink())
+        command = "/usr/sbin/traceroute -n -m 1 -w 1 127.0.0.1"
+        for suffix in (f"> {shlex.quote(str(victim))}", f"| tee {shlex.quote(str(victim))}"):
+            result = self.run_in_sandbox(f"{command} {suffix}")
+            self.assertNotEqual(result.returncode, 0)
+            self.assertFalse(victim.exists())
+
     def test_write_outside_workspace_denied(self):
         """沙箱的全部价值所在：工作区之外写不了。
 
@@ -572,6 +694,44 @@ class BashToolIntegrationTest(unittest.TestCase):
         self.addCleanup(lambda: victim.exists() and victim.unlink())
         box.run("bash", {"command": f"echo ok > {victim}"})
         self.assertTrue(victim.exists())
+
+    @unittest.skipUnless(sys.platform == "darwin", "macOS 系统 ps 的 setuid 例外")
+    def test_auto_process_query_never_calls_approver(self):
+        import contextlib
+        import io
+        import json
+
+        from xiaoyu.agent import Agent
+        from xiaoyu.providers import Registry
+        from .test_agent_paths import FakeClient, call_fragment, chunk
+
+        self.config.mode = "auto"
+        self.config.auto_approve = False
+        commands = [
+            "ps -axo pid=,rss=,comm= | sort -k2 -nr | head -10",
+            "top -l 1 -n 10 -o mem -stats pid,command,mem",
+        ]
+        client = FakeClient([
+            *[
+                [chunk(tool_calls=[call_fragment(0, f"query{i}", "bash", json.dumps({"command": command}))])]
+                for i, command in enumerate(commands)
+            ],
+            [chunk(content="查询完成")],
+        ])
+        approver = mock.Mock(return_value=False)
+        agent = Agent(
+            self.config, Toolbox(self.config), registry=Registry.for_client(client), approver=approver,
+        )
+        with contextlib.redirect_stdout(io.StringIO()):
+            agent.send("本机内存占用前十的进程")
+        approver.assert_not_called()
+        results = [m["content"] for m in agent.messages if m["role"] == "tool"]
+        self.assertEqual(len(results), len(commands))
+        for result in results:
+            self.assertIn("exit_status: 0", result)
+            self.assertNotIn("Operation not permitted", result)
+            self.assertNotIn("沙箱提示", result)
+        self.assertIn("PhysMem:", results[1])
 
     def test_bash_description_mentions_sandbox(self):
         box = Toolbox(self.config)

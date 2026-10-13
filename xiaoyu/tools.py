@@ -2996,6 +2996,9 @@ class Toolbox:
         if escalation == "danger-full-access":
             return argv
         if sandbox.enabled(self.config.sandbox):
+            #  只读宿主查询按完整参数校验，直接 exec 系统程序，不把 shell 带出沙箱。
+            if query := sandbox.host_query_argv(command):
+                return query
             allow_network = self.config.sandbox_network or escalation == "allow-network"
             argv = sandbox.wrap(argv, self.config.workspace, allow_network)
         return argv
@@ -3113,10 +3116,11 @@ class Toolbox:
             )
         limit = timeout or self.config.bash_timeout
         #  macOS 上套 Seatbelt 沙箱：写权限收到工作区+临时目录+构建缓存，
-        #  其余路径只读。策略对所有子孙进程生效，模型再怎么套壳也跑不出去。
+        #  其余路径只读。系统只读查询有精确执行例外，其余子孙进程继承策略。
         #  升权本次生效：danger-full-access 不套沙箱；allow-network 套但放网。
         sandboxed = sandbox.enabled(self.config.sandbox) and escalation != "danger-full-access"
         argv = self._command_argv(command, escalation)
+        sandboxed = sandboxed and argv[0] != "/usr/bin/top"
         #  自建 Popen 而不用 subprocess.run：run 超时后只杀直接子进程，然后无限期
         #  等管道关闭——孙进程握着管道时"超时"根本不生效。这里超时整树杀。
         #  字节模式读管道，解码带 GBK 兜底（见 _decode_output）。

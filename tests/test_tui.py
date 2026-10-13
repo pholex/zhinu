@@ -1000,6 +1000,34 @@ class TestTuiFrontend(AgentTestCase):
             "要升权执行这条命令吗？",
         )
 
+    def test_escalation_only_offers_one_time_approval(self) -> None:
+        tui = self.make_tui()
+        args = {"command": "ps -ax", "sandbox_permissions": "danger-full-access"}
+        with mock.patch.object(tui, "_inline_select", return_value="once") as select:
+            self.assertIs(tui.confirm("bash", args), True)
+        options = {item[0] for item in select.call_args.args[1]}
+        self.assertEqual(options, {"once", "deny", "never"})
+
+    def test_escalation_text_fallback_does_not_grant_session(self) -> None:
+        tui = self.make_tui()
+        tui._confirm_session = mock.Mock()
+        tui._confirm_session.prompt.return_value = "a"
+        args = {"command": "ps -ax", "sandbox_permissions": "danger-full-access"}
+        with mock.patch.object(tui, "_inline_select", side_effect=RuntimeError("no menu")):
+            self.assertIs(tui.confirm("bash", args), True)
+        prompt = tui._confirm_session.prompt.call_args.args[0][0][1]
+        self.assertIn("升权执行", prompt)
+        self.assertNotIn("本会话都允许", prompt)
+        self.assertEqual(tui.permissions.session_commands, set())
+
+    def test_text_fallback_remembers_ordinary_session_grant(self) -> None:
+        tui = self.make_tui()
+        tui._confirm_session = mock.Mock()
+        tui._confirm_session.prompt.return_value = "a"
+        with mock.patch.object(tui, "_inline_select", side_effect=RuntimeError("no menu")):
+            self.assertIs(tui.confirm("bash", {"command": "ps -ax"}), True)
+        self.assertEqual(tui.permissions.session_commands, {"ps"})
+
     def test_confirm_deny_with_reason_returns_text(self) -> None:
         """拒绝即改指令：用户给的一句话原文回灌模型。"""
         tui = self.make_tui()

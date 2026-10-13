@@ -31,6 +31,35 @@ auto 档**放行的依据是沙箱，不是信任**。所以沙箱不可用时�
 
 沙箱本体（macOS Seatbelt / Linux bubblewrap，默认开启）只允许写工作区、临时目录和构建缓存：家目录文件删不掉、`~/.zshrc` 覆写不了。
 
+macOS 的系统 `/bin/ps` 是只读进程查询程序，但带 setuid，无法继承 Seatbelt。
+策略只对这个受系统保护的绝对路径允许脱离沙箱执行，使 auto 档下查询进程、按内存
+排序无需提权确认；外层 shell、管道的其他命令和输出重定向仍在沙箱内。
+系统 `traceroute` / `traceroute6` 的同类例外只在允许联网时启用，`--no-network`
+仍会阻止探测。`ping`、`df`、`du`、`vm_stat`、`iostat`、`netstat`、`lsof` 等
+继续在沙箱内运行，不需要额外例外。
+
+`top` 的交互态能发信号，不按程序名整体放开。单条 `top -l 1 -n 10 -o mem`
+这类命令在完整字面量参数校验后直接执行系统 `/usr/bin/top`：必须指定正数的
+`-l` 采样次数，只接受已知查询参数，不执行 shell，不接受管道、重定向、包装器
+或插值。交互态、无限采样及复杂写法仍走原有沙箱与审批；`sudo` 和工作区里
+同名的程序不在例外内。Linux 保持原有进程命名空间隔离。
+其他沙箱升权仍只批准本次，确认框不提供「本会话允许」或「总是允许」选项。
+
+macOS 常用诊断的回归范围（auto 档、无额外 `ask` / `deny` 规则）：
+
+| 用途 | 已验证的查询用法 | 行为 |
+|---|---|---|
+| 文件与磁盘 | `ls -ld .`、`stat -f %z .`、`find . -maxdepth 1 -type d`、`df -h /`、`du -s .`、`diskutil list` | 沙箱内执行 |
+| 系统身份与版本 | `uname -a`、`id`、`whoami`、`hostname`、`sw_vers`、`system_profiler -listDataTypes` | 沙箱内执行 |
+| 负载与内存 | `uptime`、`vm_stat`、`sysctl hw.memsize`、`iostat -c 1` | 沙箱内执行 |
+| 进程排序 | `ps -axo pid,rss,comm` 配合 `sort` / `head` | 系统 ps 精确执行例外，管道仍受限 |
+| 进程采样 | 单条 `top -l 1 -n 10 -o mem` | 参数校验后直接执行系统 top |
+| 端口与网络配置 | `netstat -an`、`lsof -p PID`、`ifconfig -a`、`scutil --dns` | 沙箱内执行 |
+| 网络探测 | `ping -c 1 HOST`、`traceroute HOST`、`traceroute6 HOST` | 允许联网时免额外确认，断网时仍拦截 |
+
+表里验证的是查询用法，不代表同名工具的全部参数都是只读：例如 `find -exec`、
+`sysctl -w`、`diskutil eraseDisk` 仍受原有审批、沙箱和硬红线约束。
+
 `sudo` 在沙箱里起不来（setuid 程序被 Seatbelt 拒绝执行，bubblewrap 的用户命名空间里它不是 root），所以一条要 root 的命令实际要走两道门：模型按 `danger-full-access` 升权（必问你，`--yolo` 也问），批准后 sudo 真的要密码时小羽在界面里向你要——TUI 是遮罩输入框，明文 REPL 走 getpass。密码经 sudo 自己的 askpass 机制只交给 sudo：不落盘、不进会话记录、不出现在工具输出里，模型从头到尾看不到；取消就让这次 sudo 失败。无人值守（`-p`、serve、ACP）没有人可问，sudo 照旧因为没有终端而失败。`XIAOYU_ENABLE_ASKPASS=0` 关掉这条通道。小羽刻意不做"替你保存密码再喂给 sudo"：那要求小羽持有密码，任何一处外流都等于整机 root。
 
 小羽自己在沙箱外跑的程序（搜索用的 `rg` / `grep`、宿主侧的 `git`）只在沙箱写不进去的 `PATH` 目录里找、按绝对路径起——在项目里激活了 venv 再启动时 `PATH` 打头就是工作区里的目录，不这样的话往里放一个同名程序，下一次搜索就替它在沙箱外执行了。你自己配置的命令（MCP server、hooks）不受此限，照你的 `PATH` 解析。
