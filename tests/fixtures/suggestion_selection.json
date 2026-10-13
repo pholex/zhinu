@@ -1,0 +1,9 @@
+{
+  "inputs": ["2", "2"],
+  "suggestions": ["哪些能安全关掉？", "列出浏览器子进程", "再按 CPU 排前10"],
+  "expected": {
+    "request_users": ["列出浏览器子进程", "2"],
+    "logged_users": ["列出浏览器子进程", "2"],
+    "visible_selection": ["↳ 列出浏览器子进程"]
+  }
+}

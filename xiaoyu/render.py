@@ -165,6 +165,7 @@ class PlainSink:
     def __init__(self, indent: str = "", verbose: bool = True) -> None:
         self.indent = indent
         self.verbose = verbose
+        self.suggestions: list[str] = []
         #  当前正文块是否已打开 OSC 133 锚点（TextEnd 负责收束配对）
         self._osc133_open = False
         self._preparing: dict[int, tuple[str, str, str]] | None = None
@@ -191,12 +192,13 @@ class PlainSink:
             handler(sanitize_event(event))
 
     def _suggestions(self, event: Suggestions) -> None:
-        """轮末「接着问」一行。明文前端没有输入行可喂幽灵建议，打出来就是全部。
+        """轮末「接着问」一行，保留显示过的建议供明文 REPL 按编号选择。
 
         事件来自后台线程、多半在 input() 挂着时到：明文 REPL 本来就是缺 TUI 依赖时的
         退路，这一行插在提示符后面可以接受，总好过没有。
         """
         if self.verbose and event.items:
+            self.suggestions = list(event.items)
             print(ui.secondary(f"{self.indent}  {_suggestions_line(event.items)}"))
 
     def _request_started(self, event: RequestStarted) -> None:

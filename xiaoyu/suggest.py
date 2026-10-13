@@ -8,7 +8,7 @@
 遵从度参差，流式还得边收边剥，剥不干净就是打到屏上的格式垃圾；常驻一条
 格式指令也会污染回答风格。
 
-本模块只管"问什么"与"答案怎么解析"，纯函数、不碰网络；发请求与线程在
+本模块负责生成提示、解析建议和展开用户选择，纯函数、不碰网络；发请求与线程在
 `Agent` 里（它持有路由与账本）。
 """
 
@@ -100,3 +100,11 @@ def render_line(items: list[str]) -> str:
     """各前端共用的那一行文案：接着问：① … ② … ③ …"""
     marks = "①②③④⑤"
     return "接着问：" + "  ".join(f"{marks[i]} {item}" for i, item in enumerate(items))
+
+
+def resolve_selection(text: str, items: list[str]) -> str:
+    """仅将当前建议的单个编号展开成正文；其它输入保持原样。"""
+    number = text.strip()
+    if number in ("1", "2", "3") and int(number) <= len(items):
+        return items[int(number) - 1]
+    return text

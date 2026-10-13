@@ -53,6 +53,20 @@ class TestBuildMessages(unittest.TestCase):
         self.assertEqual(suggest.render_line(["a", "b"]), "接着问：① a  ② b")
 
 
+class TestSelection(unittest.TestCase):
+    def test_current_number_expands_to_the_suggestion(self) -> None:
+        items = ["检查内存", "列出浏览器子进程", "按 CPU 排序"]
+        for number, item in enumerate(items, 1):
+            self.assertEqual(suggest.resolve_selection(f" {number} ", items), item)
+
+    def test_other_inputs_remain_literal(self) -> None:
+        for text in ("", "0", "4", "02", "２", "2.0", "选 2", "2\n3", "2 个进程", "! 2", "/2"):
+            with self.subTest(text=text):
+                self.assertEqual(suggest.resolve_selection(text, ["a", "b", "c"]), text)
+        self.assertEqual(suggest.resolve_selection("2", []), "2")
+        self.assertEqual(suggest.resolve_selection("2", ["a"]), "2")
+
+
 class Recorder:
     def __init__(self) -> None:
         self.events: list[UIEvent] = []
