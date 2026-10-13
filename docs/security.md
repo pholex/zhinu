@@ -97,6 +97,19 @@ xiaoyu --no-network          # 或 XIAOYU_SANDBOX_NETWORK=0，断掉沙箱内的
 
 或者干脆待在确认档（`XIAOYU_MODE=default`）。
 
+## HTTP 服务的部署环境
+
+`xiaoyu serve --environment host` 面向普通主机：开启内部命令沙箱，审批默认 `ask`。
+已有专用隔离容器或虚拟机时可用 `--environment sandbox`：关闭内部命令沙箱，
+审批默认 `allow_all`，相当于原先的 `XIAOYU_SANDBOX=0` 配合 `--approval allow_all`。
+参数只声明部署条件，不创建或验证隔离环境。未传参数时兼容原有沙箱环境变量配置。
+
+`--approval ask` 可以覆盖 sandbox 预设、保留 HTTP 审批回路。自动放行时，浏览器、MCP、
+显式 ask 规则等触发的审批也会被批准；容器隔离并不限制它们访问的外部服务权限。
+内部命令沙箱关闭后，其写入与网络限制均由外部隔离承担。
+token 鉴权、会话工作区范围、目录信任、deny 规则、不可逆命令拦截与其它护栏维持原配置，
+不会因选择 sandbox 预设一并关闭。详见 [HTTP 部署环境](http-api.md#选择部署环境)。
+
 ## 工具边界
 
 `read_file` / `str_replace` / `write_file` 有工作区边界检查；**`bash` 的真隔离只有内核级沙箱那一层**。在沙箱不可用的平台上（Windows、没装 bubblewrap、`--no-sandbox`），bash 仍能写你有权限的任何地方。

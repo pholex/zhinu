@@ -1,0 +1,16 @@
+--- default ---
+xiaoyu serve → http://127.0.0.1:8420  (root: <workspace>)
+  环境 host（普通主机）· 内部命令沙箱沿用配置 · 审批按需确认
+  文档 /docs · schema /openapi.json · MCP /mcp · Ctrl+C 停
+--- --environment host ---
+xiaoyu serve → http://127.0.0.1:8420  (root: <workspace>)
+  环境 host（普通主机）· 内部命令沙箱开启 · 审批按需确认
+  文档 /docs · schema /openapi.json · MCP /mcp · Ctrl+C 停
+--- --environment sandbox ---
+xiaoyu serve → http://127.0.0.1:8420  (root: <workspace>)
+  环境 sandbox（已有外部隔离）· 内部命令沙箱关闭 · 审批自动放行
+  文档 /docs · schema /openapi.json · MCP /mcp · Ctrl+C 停
+--- --environment sandbox --approval ask ---
+xiaoyu serve → http://127.0.0.1:8420  (root: <workspace>)
+  环境 sandbox（已有外部隔离）· 内部命令沙箱关闭 · 审批按需确认
+  文档 /docs · schema /openapi.json · MCP /mcp · Ctrl+C 停

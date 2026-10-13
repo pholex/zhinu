@@ -197,7 +197,7 @@ class ServeConfig:
     model: str = ""
     base_url: str = ""
     mode: str = ""
-    approval: str = "ask"  # ask | allow_all
+    approval: str | None = None  # ask | allow_all；未指定时由 environment 选默认值
     approval_timeout: float = DEFAULT_APPROVAL_TIMEOUT
     sandbox: bool | None = None
     sandbox_network: bool | None = None
@@ -243,6 +243,17 @@ class ServeConfig:
     #  没有反代可放、又要出回环地址时用；有反代的仍建议在反代上做 TLS
     tls_cert: Path | None = None
     tls_key: Path | None = None
+    #  部署者声明已有容器 / VM 隔离；不创建沙箱，也不改变鉴权与其它护栏。
+    environment: str = "host"
+
+    def __post_init__(self) -> None:
+        if self.environment not in ("host", "sandbox"):
+            raise ValueError("environment 必须是 host 或 sandbox")
+        if self.approval is None:
+            self.approval = "allow_all" if self.environment == "sandbox" else "ask"
+        #  只填未指定项：agent 对象经 replace 收紧到 ask / sandbox=True 时必须保留。
+        if self.environment == "sandbox" and self.sandbox is None:
+            self.sandbox = False
 
     @property
     def scheme(self) -> str:
@@ -628,7 +639,7 @@ class _Session:
 class _HttpApprover:
     """`Agent.approver`：在工作线程里阻塞等 HTTP 侧的决定。
 
-    `allow_all` 档直接放行（等价 --yolo，必须由启动方显式选）。
+    `allow_all` 档直接批准所有审批（启动方显式选，或采用 sandbox 环境预设）。
     超时 / 会话被关都按拒绝收场——安全闸门宁可多拦一次，不能在故障时静默放行。
     """
 
@@ -1589,6 +1600,7 @@ def create_app(cfg: ServeConfig):  # noqa: C901 - 路由表天然长，拆开反
             "sessions": len(sessions),
             "agents": len(agents.list()),
             "approval": cfg.approval,
+            "environment": cfg.environment,
             "persist": cfg.persist,
             "state_dir": str(state_dir) if cfg.persist else "",
         }

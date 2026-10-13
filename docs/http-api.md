@@ -15,6 +15,39 @@ xiaoyu serve --workspace ~/code/myrepo
 #  → http://127.0.0.1:8420   文档 /docs   schema /openapi.json
 ```
 
+## 选择部署环境
+
+普通主机使用 `--environment host`；服务本身已跑在专用隔离容器或虚拟机内时，
+用一项参数省去内部命令沙箱与交互审批：
+
+```bash
+xiaoyu serve --workspace /workspace --environment sandbox
+```
+
+| 参数 | 内部命令沙箱 | 审批默认值 |
+|---|---|---|
+| `--environment host` | 开启 | `ask`：需要时挂起等 HTTP 回决定 |
+| `--environment sandbox` | 关闭，依赖部署者提供的外部隔离 | `allow_all`：自动批准所有审批 |
+
+`sandbox` 是对**已有隔离环境**的声明，不会创建容器或虚拟机，也不做自动检测。
+它等效于原先的 `XIAOYU_SANDBOX=0 xiaoyu serve --approval allow_all`。
+自动批准覆盖浏览器、MCP 等工具的审批，也覆盖显式 `ask` 规则触发的审批；
+这些工具可能作用于容器外的服务或浏览器，外部隔离并不限制它们的业务权限。
+需要保留审批回路时可覆盖预设：
+
+```bash
+xiaoyu serve --workspace /workspace --environment sandbox --approval ask
+```
+
+显式 `--environment` 优先于 `XIAOYU_SANDBOX`，`--approval` 优先于环境的审批预设。
+未传 `--environment` 时采用 host 的审批默认值，并继续读取原有沙箱环境变量，旧命令无需改动。
+启动提示会列出环境、内部命令沙箱和审批设置；鉴权后的 `GET /health` 也返回 `environment`。
+
+两种环境均保留 token 鉴权、会话工作区范围、目录信任、deny 规则、不可逆命令拦截等既有保护，
+不会自动开放 agent 自带的 MCP server。关闭内部命令沙箱后，其网络限制也不再生效；
+文件挂载、进程权限与出网范围由外部容器或虚拟机控制。
+HTTP 客户端不能修改 `environment`，agent 对象仍只能收紧服务端的审批和沙箱设置。
+
 ---
 
 ## 为什么有两个 prompt 端点
@@ -175,8 +208,9 @@ curl -X DELETE $BASE/session/$SID/permissions/granted/browser_type -H "$AUTH"   
 **超时按拒绝处理**（`--approval-timeout`，默认 300 秒）。这是 fail closed：
 安全闸门宁可多拦一次，不能在没人应答时静默放行。
 
-无人值守又不想接这条回路，就 `--approval allow_all`（等价 `--yolo`）——
-但那样就没有闸门了，只在你信得过工作区和任务的场景用。
+无人值守又不想接这条回路，可用 `--approval allow_all` 自动批准所有审批。
+专用容器或虚拟机中的服务可直接选 `--environment sandbox`，同时关闭内部命令沙箱，
+详见上面的「选择部署环境」。deny 规则与不可逆命令拦截仍有效。
 
 ---
 

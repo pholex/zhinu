@@ -147,6 +147,10 @@ auto 档**放行的依据是沙箱，不是信任**——沙箱不可用时自�
 - **可编排**：`xiaoyu serve` 起 HTTP API，n8n / Dify / 自研调度直接驱动（异步提交 + 状态轮询 + 事件游标，需要放行的工具调用挂起等 HTTP 回决定）。OpenAPI schema 由代码生成，贴给 Dify 自定义工具即用——见 [docs/http-api.md](docs/http-api.md)。同一服务还在 `/mcp` 挂着 **agent 级 MCP server**（`xiaoyu` / `xiaoyu_reply` / `xiaoyu_close` 三工具，streamable HTTP），LangChain / LangGraph 经官方 `langchain-mcp-adapters` 即插即用，其它 MCP client 同理——见 [docs/mcp-server.md](docs/mcp-server.md)。**浏览器桥**：浏览器扩展连上同一服务，agent 就能在用户登录态的浏览器里读页 / 点击 / 截图，写类动作走审批——见 [docs/browser-bridge.md](docs/browser-bridge.md)
 - **浏览器**：推荐挂 chrome-devtools MCP；内置 `[browser]` 是纯 pip 的兜底，`playwright install chromium` 后即用
 
+服务已部署在专用隔离容器或虚拟机中时，使用 `xiaoyu serve --environment sandbox`
+即可关闭内部命令沙箱并自动放行审批；普通主机用 `--environment host`。
+部署说明见 [HTTP 部署环境](docs/http-api.md#选择部署环境)。
+
 ## 安全与贡献
 
 - 报告漏洞、支持的版本、给使用者的风险告诫：[SECURITY.md](SECURITY.md)；审批 / 沙箱 / 硬红线的设计：[docs/security.md](docs/security.md)
