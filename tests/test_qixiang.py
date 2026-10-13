@@ -14,6 +14,7 @@ import json
 import re
 import shutil
 import subprocess
+import threading
 import unittest
 from unittest import mock
 
@@ -390,13 +391,35 @@ class InterruptedTest(QixiangTestCase):
 
         self.config.qixiang_concurrency = 1
         runs = RunStore()
+        stop_seen = threading.Event()
+        execute = qixiang_mod.execute_delegation
+
+        def execute_until_stopped(*args, **kwargs):
+            # 假响应可能在调度线程巡检前全部跑完。让下一项等到巡检确认中止，
+            # 才能稳定构造“已有结果、仍有任务未完成”的打断现场。
+            if len(runs) >= after:
+                if not stop_seen.wait(5):
+                    raise AssertionError("调度线程未检查中止请求")
+                raise Interrupted("测试任务等待期间被打断")
+            return execute(*args, **kwargs)
+
+        def stop_requested():
+            if len(runs) < after:
+                return False
+            stop_seen.set()
+            return True
+
         self.sub_client = FakeClient([text_turn(f"第{n}项 " + LONG) for n in range(total)])
         tool = make_qixiang_tool(
             [READER], self.config, Registry.for_client(self.sub_client), Usage(),
             PlainSink(indent="", verbose=False), lambda name, args: True, None, runs,
-            stop_requested=lambda: len(runs) >= after,
+            stop_requested=stop_requested,
         )
-        with contextlib.redirect_stdout(io.StringIO()), self.assertRaises(Interrupted) as caught:
+        with (
+            mock.patch.object(qixiang_mod, "execute_delegation", execute_until_stopped),
+            contextlib.redirect_stdout(io.StringIO()),
+            self.assertRaises(Interrupted) as caught,
+        ):
             tool.handler(
                 spec="reader", prompt_template="查 {{item}}",
                 items=[f"i{n}" for n in range(total)],
