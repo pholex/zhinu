@@ -557,7 +557,8 @@ class ProjectSkillsTest(unittest.TestCase):
         self.assertTrue(trusted.toolbox.run("skill", {"name": "release"}).endswith("先跑测试"))
 
         untrusted = self.build_agent(trusted=False)
-        self.assertNotIn("release", untrusted.messages[0]["content"])
+        #  源码路径也可能包含 release；这里只判断技能目录条目是否泄漏。
+        self.assertNotIn("- release: 发版流程", untrusted.messages[0]["content"])
         #  未命中会重扫磁盘：重扫同样不许把没过门的工作区扫进来
         with contextlib.redirect_stderr(io.StringIO()):
             missed = untrusted.toolbox.run("skill", {"name": "release"}) if untrusted.toolbox.get("skill") else "ERROR"
