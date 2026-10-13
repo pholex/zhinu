@@ -2493,7 +2493,7 @@ class Tui:
         try:
             choice = self._inline_select(self._confirm_title(name, shown), options, expand)
         except Exception:  # noqa: BLE001 - 非常规终端起不了菜单：退回文本问答，确认永远可用
-            return self._confirm_text(name)
+            return self._confirm_text(name, args)
 
         amend = False
         if isinstance(choice, tuple):  # Tab 按下：批准并附言
@@ -2634,18 +2634,24 @@ class Tui:
     def _echo_verdict(self, text: str) -> None:
         self.console.print(Text(f"  {text}", style="text.secondary"))
 
-    def _confirm_text(self, name: str) -> bool | str:
+    def _confirm_text(self, name: str, args: dict[str, Any]) -> bool | str:
         """菜单起不来时的回退：与 cli.make_confirm 相同的文本问答语义。"""
         from .cli import GRANT_SESSION, interpret_confirm_answer
 
         if self._confirm_session is None:
             self._confirm_session = PromptSession()
+        escalation = bool(ui.escalation_notice(args)) if name == "bash" else False
+        verb = "升权执行" if escalation else "执行"
+        session_option = (
+            "/a=本会话都允许"
+            if self.permissions.session_grant_label(name, args) is not None else ""
+        )
         try:
             answer = self._confirm_session.prompt(
                 [
                     (
                         theme.ptk("menu.title"),
-                        f"  允许执行 {name}? [y/N/a=本会话都允许，其它输入=拒绝理由] ",
+                        f"  允许{verb} {name}? [y/N{session_option}，其它输入=拒绝理由] ",
                     )
                 ]
             )
@@ -2659,6 +2665,7 @@ class Tui:
             note = (
                 f"  （本次会话内 {scope} 不再逐次确认；/perm 可查看）"
                 if scope is not None
+                else "  （沙箱升权仅本次允许）" if escalation
                 else "  （这条命令推不出会话授权范围，仅本次允许）"
             )
             self.console.print(Text(note, style="text.secondary"))

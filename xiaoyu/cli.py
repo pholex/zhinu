@@ -3898,9 +3898,13 @@ def make_confirm(permissions: Permissions):
                 print(ui.warning(f"  ⚠ 注意：{reason}"))
 
         verb = "升权执行" if escalation else "执行"
+        session_option = (
+            "/a=本会话都允许"
+            if permissions.session_grant_label(name, args) is not None else ""
+        )
         try:
             answer = input(
-                ui.warning(f"  允许{verb} {name}? [y/N/a=本会话都允许，其它输入=拒绝理由] ")
+                ui.warning(f"  允许{verb} {name}? [y/N{session_option}，其它输入=拒绝理由] ")
             ).strip()
         except (EOFError, KeyboardInterrupt):
             print()
@@ -3915,7 +3919,8 @@ def make_confirm(permissions: Permissions):
             if scope is not None:
                 print(ui.secondary(f"  （本次会话内 {scope} 不再逐次确认；/perm 可查看）"))
             else:
-                print(ui.secondary("  （这条命令推不出会话授权范围，仅本次允许）"))
+                note = "沙箱升权仅本次允许" if escalation else "这条命令推不出会话授权范围，仅本次允许"
+                print(ui.secondary(f"  （{note}）"))
             return True
         return verdict
 

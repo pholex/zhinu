@@ -1,0 +1,12 @@
+--- ordinary / a ---
+  允许执行 bash? [y/N/a=本会话都允许，其它输入=拒绝理由] a
+  （本次会话内 ps 不再逐次确认；/perm 可查看）
+--- danger-full-access / y ---
+  ⚠ 申请沙箱升权：danger-full-access——本次不套沙箱，命令能写你有权限的任何路径
+  ⚠ 模型给的理由：查询进程
+  允许升权执行 bash? [y/N，其它输入=拒绝理由] y
+--- danger-full-access / a ---
+  ⚠ 申请沙箱升权：danger-full-access——本次不套沙箱，命令能写你有权限的任何路径
+  ⚠ 模型给的理由：查询进程
+  允许升权执行 bash? [y/N，其它输入=拒绝理由] a
+  （沙箱升权仅本次允许）
