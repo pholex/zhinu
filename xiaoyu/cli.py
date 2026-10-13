@@ -2103,10 +2103,17 @@ def serve_command(argv: list[str]) -> int:
     parser.add_argument("--mode", choices=modes.CYCLE, help="默认交互模式，会话可覆盖")
     parser.add_argument("--effort", choices=list(EFFORT_LEVELS), help="默认推理深度，agent 对象可覆盖")
     parser.add_argument(
+        "--environment",
+        choices=("host", "sandbox"),
+        help="部署环境：host=普通主机，开启内部命令沙箱、按需审批；"
+        "sandbox=已在隔离容器/虚拟机中，关闭内部命令沙箱、自动放行审批（不会创建容器）。"
+        "未指定时按 host 使用，兼容已有 XIAOYU_SANDBOX 配置",
+    )
+    parser.add_argument(
         "--approval",
         choices=("ask", "allow_all"),
-        default="ask",
-        help="ask=需要放行的工具调用挂起等 /permissions（默认）；allow_all=等价 --yolo，无人值守但没有闸门",
+        help="覆盖环境的审批预设：ask=需要放行的工具调用挂起等 /permissions；"
+        "allow_all=自动批准所有审批。host 默认 ask，sandbox 默认 allow_all",
     )
     parser.add_argument(
         "--approval-timeout",
@@ -2226,6 +2233,9 @@ def serve_command(argv: list[str]) -> int:
         base_url=args.base_url or "",
         mode=args.mode or "",
         effort=args.effort or "",
+        environment=args.environment or "host",
+        #  显式 host 开启；未选预设的旧命令仍让 Config.from_env 读取环境变量。
+        sandbox=True if args.environment == "host" else None,
         approval=args.approval,
         approval_timeout=args.approval_timeout,
         max_sessions=max(1, args.max_sessions),
@@ -2245,6 +2255,13 @@ def serve_command(argv: list[str]) -> int:
             return print_openapi(cfg)
         if args.host in ("127.0.0.1", "::1", "localhost") or args.token:
             print(ui.success(f"xiaoyu serve → {cfg.scheme}://{args.host}:{args.port}  (root: {root})"))
+            environment_label = "已有外部隔离" if cfg.environment == "sandbox" else "普通主机"
+            sandbox_label = {True: "开启", False: "关闭", None: "沿用配置"}[cfg.sandbox]
+            approval_label = "自动放行" if cfg.approval == "allow_all" else "按需确认"
+            print(ui.secondary(
+                f"  环境 {cfg.environment}（{environment_label}）· 内部命令沙箱{sandbox_label}"
+                f" · 审批{approval_label}"
+            ))
             extra = " · MCP /mcp" if args.mcp else ""
             print(ui.secondary(f"  文档 /docs · schema /openapi.json{extra} · Ctrl+C 停"))
         return serve(cfg)
