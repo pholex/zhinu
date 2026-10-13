@@ -99,6 +99,8 @@ v2（追加在 v1 之后，顺序即注册顺序；旧扩展不声明就不注�
   走既有 `/permissions` 回路。一轮里反复填字、点按钮不想每次都点放行：审批卡片上答
   `allow_session`（挂起项带 `session_scope`，如 `browser_type`），本会话内这个工具不再问，
   会话结束即失效，`GET /permissions` 的 `granted` 能看、`DELETE …/granted/{name}` 能收回。
+  七件写类不想逐个点七次：挂起项的 `session_scopes` 还列了粗档 `browser:*`，`allow_session`
+  带 `scope: "browser:*"` 一次放开本会话全部浏览器写操作（读类本来免审），同样能看、能收回。
   站点维度不在这里收：扩展侧按站点授权（逐站点 origin）已经是一道闸，有效范围 = 本会话 ×
   该工具 × 已授权站点。想跨会话长期免确认，才用 `--mode auto` 配 `/allow browser_click` 之类规则
 - 扩展对 `chrome://` / 扩展页 / 无权限站点一律回 `ok:false`，说明原因；不要静默做半截

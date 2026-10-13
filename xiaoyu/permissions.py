@@ -453,6 +453,15 @@ def command_keys(command: str) -> tuple[str, ...] | None:
     return tuple(keys)
 
 
+#  「本会话允许」的粗档位：按工具名前缀把一族工具一次放开。serve 的审批卡把它作为
+#  细档（单个工具名）之外的可选项下发，客户端只能在下发的档位里选。目前只有浏览器桥
+#  一族——七件写类工具逐个放要点七次；读类工具本来免审，粗档位对它们没有意义。
+#  键是档位名（也是 session_allowed 里记的名字），值是 (工具名前缀, 给人看的文案)。
+SESSION_SCOPE_FAMILIES: dict[str, tuple[str, str]] = {
+    "browser:*": ("browser_", "本会话全部浏览器操作"),
+}
+
+
 #  MCP 工具默认不进工具表，模型经这个转发器点名调用（见 tools.py 的检索模式）。
 #  判权限时它不是一个工具，而是参数里点名的那一个
 FORWARDER_TOOL = "use_tool"
@@ -841,7 +850,7 @@ class Permissions:
                 return "ask", rule
         for tool, call_args in identities:
             #  3. 会话授权：工具名（非命令类）或命令键（bash，每段都要已放行）
-            if tool in self.session_allowed:
+            if self._session_tool_allowed(tool):
                 return "allow", None
             if tool == "bash" and self.session_commands:
                 keys = command_keys(str(call_args.get("command", "")))
@@ -957,9 +966,44 @@ class Permissions:
 
     # ---------- 变更 ----------
 
+    def _session_tool_allowed(self, tool: str) -> bool:
+        """工具名本身在会话授权里，或它所属的一族（SESSION_SCOPE_FAMILIES 的粗档位）已放开。"""
+        if tool in self.session_allowed:
+            return True
+        return any(
+            scope in self.session_allowed and tool.startswith(prefix)
+            for scope, (prefix, _label) in SESSION_SCOPE_FAMILIES.items()
+        )
+
     def grant_session(self, name: str) -> None:
         """按工具名放行整个会话——只给非命令类工具用；bash 走 grant_session_call。"""
         self.session_allowed.add(name)
+
+    def session_grant_options(self, name: str, args: dict) -> list[tuple[str, str]]:
+        """「本会话允许」可选的档位，细到粗：[(范围, 文案), …]。第一项就是
+        session_grant_label 推出的默认档；之后是这个工具所属族的粗档位。推不出
+        默认档时返回空表——没有细档就没有粗档，粗档位不是绕过推导的后门。"""
+        label = self.session_grant_label(name, args)
+        if label is None:
+            return []
+        options = [(label, label)]
+        tool, _args = call_identity(name, args)
+        for scope, (prefix, text) in SESSION_SCOPE_FAMILIES.items():
+            if tool.startswith(prefix):
+                options.append((scope, text))
+        return options
+
+    def grant_session_scope(self, name: str, args: dict, scope: str) -> str | None:
+        """落地一次「本会话允许」，按客户端选的档位。档位必须是 session_grant_options
+        对这次调用给出的那几个之一，否则不记任何东西并返回 None——范围仍由服务端
+        推导，客户端只能选档。返回落下的范围。"""
+        options = self.session_grant_options(name, args)
+        if not options or scope not in {option for option, _text in options}:
+            return None
+        if scope == options[0][0]:
+            return self.grant_session_call(name, args)
+        self.session_allowed.add(scope)
+        return scope
 
     def session_grant_label(self, name: str, args: dict) -> str | None:
         """确认框"本会话允许"选项的文案主体；None = 这次调用推不出会话授权范围，

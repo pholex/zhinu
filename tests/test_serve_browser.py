@@ -272,6 +272,59 @@ class TestCalls(BrowserCase):
         self.assertEqual(granted["tools"], ["browser_type"])
         ws.__exit__(None, None, None)
 
+    def test_allow_session_can_pick_the_browser_wide_tier(self):
+        #  七件写类工具逐个放要点七次：挂起项随 session_scopes 下发一个粗档 browser:*，
+        #  答 allow_session 带 scope 选它，之后另一件写类工具（browser_click）直达扩展；
+        #  不在下发档位里的 scope 是 400，挂起项不消费；收回也按 browser:* 这个名字
+        self.start(
+            'tool_call: {"name": "browser_type", "arguments": {"ref": "e2", "text": "第一段"}}\n---\n'
+            'tool_call: {"name": "browser_click", "arguments": {"ref": "e3"}}\n---\n'
+            "text: 完\n"
+        )
+        session_id = self.new_session()
+        ws = self.connect(session_id, supports=["browser_type", "browser_click"])
+        self.assertEqual(ws.receive_json()["type"], "hello.ok")
+        self.client.post(f"/session/{session_id}/prompt_async", json={"text": "输入"}, headers=self.headers())
+        state = _ts.TestBasics._wait_for(self, session_id, "waiting_for_approval")
+        request = state["pending_approvals"][0]
+        self.assertEqual(request["session_scope"], "browser_type")
+        self.assertEqual(
+            request["session_scopes"],
+            [
+                {"scope": "browser_type", "label": "browser_type"},
+                {"scope": "browser:*", "label": "本会话全部浏览器操作"},
+            ],
+        )
+        bad = self.client.post(
+            f"/session/{session_id}/permissions",
+            json={"request_id": request["request_id"], "decision": "allow_session", "scope": "bash"},
+            headers=self.headers(),
+        )
+        self.assertEqual(bad.status_code, 400, bad.text)
+        response = self.client.post(
+            f"/session/{session_id}/permissions",
+            json={"request_id": request["request_id"], "decision": "allow_session", "scope": "browser:*"},
+            headers=self.headers(),
+        )
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.json()["granted"], "browser:*")
+        for tool in ("browser_type", "browser_click"):
+            call = ws.receive_json()
+            self.assertEqual(call["tool"], tool)
+            ws.send_json({"type": "result", "id": call["id"], "ok": True, "content": "好了"})
+        _ts.TestBasics._wait_for(self, session_id, "finished")
+        events = self.events(session_id)
+        self.assertEqual(sum(1 for e in events if e["kind"] == "permission.requested"), 1)
+        resolved = [e for e in events if e["kind"] == "permission.resolved"]
+        self.assertEqual([(e["decision"], e.get("granted")) for e in resolved], [("allow_session", "browser:*")])
+        listing = self.client.get(f"/session/{session_id}/permissions", headers=self.headers()).json()
+        self.assertEqual(listing["granted"]["tools"], ["browser:*"])
+        gone = self.client.delete(f"/session/{session_id}/permissions/granted/browser:*", headers=self.headers())
+        self.assertEqual(gone.status_code, 204, gone.text)
+        listing = self.client.get(f"/session/{session_id}/permissions", headers=self.headers()).json()
+        self.assertEqual(listing["granted"]["tools"], [])
+        ws.__exit__(None, None, None)
+
     def test_timeout_is_a_tool_error_and_late_result_is_ignored(self):
         self.start('tool_call: {"name": "browser_tabs", "arguments": {}}\n---\ntext: 完\n', browser_timeout=1.0)
         session_id = self.new_session()

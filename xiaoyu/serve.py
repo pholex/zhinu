@@ -271,6 +271,10 @@ class _Pending:
     #  调用推导、随挂起项下发——客户端只能选档，带不进自定义范围；None = 推不出，
     #  没有这个选项。判据与 TUI / ACP 确认框同一处（Permissions.session_grant_label）
     session_scope: str | None = None
+    #  可选的档位，细到粗：[{"scope","label"}, …]，首项就是 session_scope；之后是这个
+    #  工具所属族的粗档位（如 browser:*，一次放开全部浏览器写操作）。客户端答
+    #  allow_session 时带 scope 选档，不带 = 首项——只认 session_scope 的老客户端不受影响
+    session_scopes: list[dict[str, str]] = field(default_factory=list)
     #  答了 allow_session 后真正落下的范围，permission.resolved 事件随 decision 一起报
     granted: str | None = None
 
@@ -282,6 +286,7 @@ class _Pending:
             "created_at": self.created_at,
             "waiting_seconds": round(time.time() - self.created_at, 3),
             "session_scope": self.session_scope,
+            "session_scopes": list(self.session_scopes),
         }
 
 
@@ -638,12 +643,14 @@ class _HttpApprover:
             return Deny("会话尚未就绪，已自动拒绝")
         if session.cfg.approval == "allow_all":
             return True
+        options = session.agent.permissions.session_grant_options(name, args)
         request = _Pending(
             id=uuid.uuid4().hex[:12],
             name=name,
             args=args,
             created_at=time.time(),
-            session_scope=session.agent.permissions.session_grant_label(name, args),
+            session_scope=options[0][0] if options else None,
+            session_scopes=[{"scope": scope, "label": label} for scope, label in options],
         )
         #  先落进 pending 再通知：GET /permissions 与事件谁先到都能看到这一条
         session.add_pending(request)
@@ -2038,7 +2045,8 @@ def create_app(cfg: ServeConfig):  # noqa: C901 - 路由表天然长，拆开反
         operation_id="respond_permission",
         description=(
             "decision=allow 放行；allow_session 放行且本会话内同范围（挂起项的 session_scope）"
-            "不再问——范围由服务端按这次调用推导，退出会话即失效；deny 拒绝（reason 会原文"
+            "不再问——范围由服务端按这次调用推导，退出会话即失效；scope 可在挂起项"
+            "session_scopes 列出的档位里选一个更粗的（如 browser:*），不带即最细一档；deny 拒绝（reason 会原文"
             "回灌给模型，等于改指令）；updated_args 非空时整体替换本次调用参数再执行"
             "（宿主'包一层再放行'的通道，不能与 allow_session 同用）。"
         ),
@@ -2051,6 +2059,9 @@ def create_app(cfg: ServeConfig):  # noqa: C901 - 路由表天然长，拆开反
         decision: str = Body(embed=True, description="allow | allow_session | deny"),
         reason: str = Body(default="", embed=True),
         updated_args: dict[str, Any] | None = Body(default=None, embed=True),
+        scope: str | None = Body(
+            default=None, embed=True, description="allow_session 选哪一档，须是挂起项 session_scopes 之一"
+        ),
     ) -> dict[str, Any]:
         session = pick(session_id)
         request = session.take_pending(request_id)
@@ -2058,6 +2069,8 @@ def create_app(cfg: ServeConfig):  # noqa: C901 - 路由表天然长，拆开反
             raise HTTPException(status_code=404, detail=f"没有挂起的审批 {request_id!r}（可能已超时）")
         if decision not in ("allow", "allow_session", "deny"):
             raise HTTPException(status_code=400, detail="decision 只能是 allow、allow_session 或 deny")
+        if scope is not None and decision != "allow_session":
+            raise HTTPException(status_code=400, detail="scope 只配合 allow_session 用")
         if decision == "allow_session":
             if updated_args is not None:
                 raise HTTPException(
@@ -2068,10 +2081,19 @@ def create_app(cfg: ServeConfig):  # noqa: C901 - 路由表天然长，拆开反
             #  范围只能由服务端从挂起的这次调用推导（与 TUI / ACP 确认框同一判据）：
             #  持 token 的客户端放得开的，只有模型真实尝试过、且推得出范围的那一类调用，
             #  这是它与"建个 allow_all 的 agent"那种绕过的本质区别
-            granted = session.agent.permissions.grant_session_call(request.name, request.args)
-            if granted is None:
+            permissions = session.agent.permissions
+            if request.session_scope is None:
                 raise HTTPException(
                     status_code=400, detail="这次调用推不出会话授权范围，只能 allow 或 deny"
+                )
+            #  档位也只认服务端随挂起项下发的那几个：不带 = 最细一档
+            granted = permissions.grant_session_scope(
+                request.name, request.args, request.session_scope if scope is None else scope
+            )
+            if granted is None:
+                offered = "、".join(item["scope"] for item in request.session_scopes)
+                raise HTTPException(
+                    status_code=400, detail=f"scope {scope!r} 不在这次可选的档位里（{offered}）"
                 )
             request.granted = granted
         request.decision = decision
