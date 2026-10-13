@@ -2871,6 +2871,14 @@ class Tui:
                 self.console.print(Text(f"  {action.hint}", style="text.secondary"))
                 continue
             recall = action.args
+            items, self._suggestions = self._suggestions, []
+            if action.kind == "send" and not literal:
+                selected = suggest.resolve_selection(action.args, items)
+                if selected != action.args:
+                    self.console.print(Text(f"  ↳ {selected}", style="text.secondary"))
+                    action = keys.InputAction("send", selected)
+                    #  取回已选择的正文，避免下一轮的同一编号指向另一条建议。
+                    recall = selected
             if action.kind == "slash":
                 #  /<技能名> 参数… 展开成本轮提示（与明文 REPL 同一个入口）；
                 #  不是技能的才交给内建命令表
@@ -2900,8 +2908,6 @@ class Tui:
             line = action.args
             #  Esc-Esc 取回的是用户敲的那行（/deploy prod），不是展开后的几千字
             self._last_input = recall
-            #  上一轮的「接着问」到此作废：新一轮的内容还没出来，旧建议只会误导
-            self._suggestions = []
             self.sink.begin_turn()
             attention.running()
             #  运行期插话（steer）：整行回车即在 step 边界进入本轮。

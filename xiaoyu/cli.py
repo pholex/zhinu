@@ -3327,6 +3327,9 @@ def repl(agent: Agent) -> int:
 
 
 def _repl_loop(agent: Agent) -> int:
+    from .render import PlainSink
+    from .suggest import resolve_selection
+
     config = agent.config
     #  模型/工作区/help 提示都在启动横幅里了，这里只留必须扎眼的警告
     if config.unguarded:
@@ -3351,6 +3354,13 @@ def _repl_loop(agent: Agent) -> int:
         if action.kind == "usage":
             print(ui.secondary(f"  {action.hint}"))
             continue
+        if isinstance(agent.sink, PlainSink):
+            items, agent.sink.suggestions = agent.sink.suggestions, []
+            if action.kind == "send":
+                selected = resolve_selection(action.args, items)
+                if selected != action.args:
+                    print(ui.secondary(f"  ↳ {selected}"))
+                    action = keys.InputAction("send", selected)
         if action.kind == "slash":
             #  /<技能名> 参数… 展开成本轮提示；不是技能的才交给内建命令表
             expanded = skill_prompt(agent, action.args)
