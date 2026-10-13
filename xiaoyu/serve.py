@@ -841,8 +841,8 @@ def _install_cors(app: Any, origins: tuple[str, ...], extensions: bool = True) -
 
     class _PrivateNetworkAccess:
         """Chrome 从"公网/扩展"origin 访问回环地址会多发一次 PNA 预检，要求响应带
-        `Access-Control-Allow-Private-Network: true`——CORSMiddleware 不认识它。
-        只对白名单 origin 补，纯 ASGI 包一层，与 CORSMiddleware 各管各的头。"""
+        `Access-Control-Allow-Private-Network: true`。不同版本的 CORSMiddleware
+        对 PNA 支持不同，由本层统一按 origin 白名单处理。"""
 
         def __init__(self, inner: Any) -> None:
             self.inner = inner
@@ -869,7 +869,14 @@ def _install_cors(app: Any, origins: tuple[str, ...], extensions: bool = True) -
                     }
                 await send(message)
 
-            await self.inner(scope, receive, send_with_pna)
+            #  PNA 已按白名单判过，消费请求头，避免新版 CORSMiddleware 按其
+            #  默认关闭的 PNA 策略再次拒绝；其余来源、方法与请求头校验照常。
+            inner_scope = {
+                **scope,
+                "headers": [(k, v) for k, v in scope.get("headers", [])
+                            if k.lower() != b"access-control-request-private-network"],
+            }
+            await self.inner(inner_scope, receive, send_with_pna)
 
     app.add_middleware(
         CORSMiddleware,

@@ -17,10 +17,10 @@ requires-python = ">=3.11"
 # 精确锁版本（供应链纪律）：范围声明会让 PyPI 上被投毒的
 # 新版本无需审查自动进入用户机器。升级 = 有意改这一行并重跑测试。
 dependencies = [
-    "openai==3.23.0",
+    "openai==3.24.0",
     #  Anthropic Messages 协议直连（xiaoyu/messages.py），锁版本纪律同上；
     #  两套 SDK 均使用 httpx2 传输
-    "anthropic==1.9.0",
+    "anthropic==1.11.0",
     #  bash 语法白名单解析（权限判定用）：解析失败/缺包时代码自动回退字符串黑名单，
     #  所以两个包即使某平台没有 wheel 也不致命
     "tree-sitter>=0.22",
@@ -45,8 +45,8 @@ browser = [
 # 要 botocore；凭据走 AWS 默认凭证链，所以不引入别的东西。缺包时首个请求前报
 # 一句怎么装（见 messages.bedrock_client）。
 bedrock = [
-    "boto3==1.43.105",
-    "botocore==1.43.105",
+    "boto3==1.43.108",
+    "botocore==1.43.108",
 ]
 # 可选：`xiaoyu serve` 的 HTTP API（给 n8n / Dify 这类编排器用）。
 # 只影响这一条命令，缺包时 serve 报一句怎么装就退出。选 fastapi 是为了让
@@ -62,10 +62,10 @@ otel = [
     "opentelemetry-exporter-otlp-proto-http>=1.45.0",
 ]
 serve = [
-    "fastapi==0.141.1",
+    "fastapi==0.142.2",
     "uvicorn==0.54.0",
     # 浏览器桥的 WebSocket（uvicorn 不带 ws 实现，缺它 /session/{id}/browser 握手直接 500）
-    "websockets==17.1",
+    "websockets==17.2",
 ]
 
 [project.urls]
