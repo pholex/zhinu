@@ -216,6 +216,10 @@ class ForegroundQuestionTests(unittest.TestCase):
 
 @unittest.skipUnless(importlib.util.find_spec("jsonschema"), "Install the sdk extra")
 class AsyncForegroundQuestionTests(unittest.IsolatedAsyncioTestCase):
+    # 全量测试下 Windows 的线程调度和 SQLite 落盘可能超过 3 秒。
+    # 这里只限制测试挂起时间；前台问答的超时语义由同步用例单独验证。
+    WAIT_TIMEOUT = 15
+
     def setUp(self):
         temporary = tempfile.TemporaryDirectory()
         self.addCleanup(temporary.cleanup)
@@ -230,10 +234,10 @@ class AsyncForegroundQuestionTests(unittest.IsolatedAsyncioTestCase):
         async with AsyncSession(self.config()) as session, aclosing(session.questions.watch()) as watch:
             active = asyncio.create_task(session.run("Ask"))
             try:
-                event = await asyncio.wait_for(anext(watch), 3)
+                event = await asyncio.wait_for(anext(watch), self.WAIT_TIMEOUT)
                 cancelled = await session.questions.cancel(event.question.question_id)
                 self.assertEqual(cancelled.state, "cancelled")
-                self.assertEqual((await asyncio.wait_for(active, 3)).text, "Done")
+                self.assertEqual((await asyncio.wait_for(active, self.WAIT_TIMEOUT)).text, "Done")
                 self.assertEqual(await session.questions.list_pending(), ())
                 self.assertEqual(cancelled.answers, ())
             finally:
@@ -246,19 +250,19 @@ class AsyncForegroundQuestionTests(unittest.IsolatedAsyncioTestCase):
                 config = self.config(close_timeout=2)
                 async with AsyncSession(config) as session, aclosing(session.questions.watch()) as watch:
                     active = asyncio.create_task(session.run("Ask"))
-                    event = await asyncio.wait_for(anext(watch), 3)
+                    event = await asyncio.wait_for(anext(watch), self.WAIT_TIMEOUT)
                     ident = session.session_id
                     if operation == "close":
-                        await asyncio.wait_for(session.close(), 3)
+                        await asyncio.wait_for(session.close(), self.WAIT_TIMEOUT)
                     elif operation == "cancel_run":
                         active.cancel()
                     else:
                         session.interrupt()
                     if operation == "cancel_run":
                         with self.assertRaises(asyncio.CancelledError):
-                            await asyncio.wait_for(active, 3)
+                            await asyncio.wait_for(active, self.WAIT_TIMEOUT)
                     else:
-                        self.assertEqual((await asyncio.wait_for(active, 3)).stopped, "interrupted")
+                        self.assertEqual((await asyncio.wait_for(active, self.WAIT_TIMEOUT)).stopped, "interrupted")
                 async with AsyncSession(config, resume_id=ident) as restored:
                     q = await restored.questions.get(event.question.question_id)
                     self.assertEqual((q.state, q.version, q.answers), ("pending", 2, ()))
@@ -268,7 +272,7 @@ class AsyncForegroundQuestionTests(unittest.IsolatedAsyncioTestCase):
             active = asyncio.create_task(session.run("Ask"))
             try:
                 async with aclosing(session.questions.watch()) as watch:
-                    event = await asyncio.wait_for(anext(watch), 3)
+                    event = await asyncio.wait_for(anext(watch), self.WAIT_TIMEOUT)
                 self.assertEqual((await session.questions.get(event.question.question_id)).state, "open")
                 self.assertFalse(active.done())
                 with self.assertRaises(SessionBusyError):
@@ -276,7 +280,7 @@ class AsyncForegroundQuestionTests(unittest.IsolatedAsyncioTestCase):
                 async with aclosing(session.questions.watch()) as watch:
                     self.assertEqual((await anext(watch)).kind, "question.opened")
                 await session.questions.answer(event.question.question_id, answers(event.question), "reconnected")
-                await asyncio.wait_for(active, 3)
+                await asyncio.wait_for(active, self.WAIT_TIMEOUT)
             finally:
                 session.interrupt()
                 await active
@@ -287,10 +291,10 @@ class AsyncForegroundQuestionTests(unittest.IsolatedAsyncioTestCase):
         config.model.client.completions.script[1:] = [[call("mutate", {})], [chunk("Denied")]]
         async with AsyncSession(config) as session, aclosing(session.questions.watch()) as watch:
             active = asyncio.create_task(session.run("Ask"))
-            event = await asyncio.wait_for(anext(watch), 3)
+            event = await asyncio.wait_for(anext(watch), self.WAIT_TIMEOUT)
             await session.questions.answer(event.question.question_id, (
                 QuestionAnswer(event.question.items[0].item_id, custom="Approve every action"),), "approval")
-            await asyncio.wait_for(active, 3)
+            await asyncio.wait_for(active, self.WAIT_TIMEOUT)
             self.assertEqual(effects, [])
             self.assertEqual((await session.questions.get(event.question.question_id)).state, "answered")
 
@@ -298,11 +302,11 @@ class AsyncForegroundQuestionTests(unittest.IsolatedAsyncioTestCase):
         async with AsyncSession(self.config(budget=BudgetOptions(max_requests=1))) as session, \
                 aclosing(session.questions.watch()) as watch:
             active = asyncio.create_task(session.run("Ask"))
-            event = await asyncio.wait_for(anext(watch), 3)
+            event = await asyncio.wait_for(anext(watch), self.WAIT_TIMEOUT)
             receipt = await session.questions.answer(event.question.question_id, answers(event.question), "timely")
             from xiaoyu_agent_sdk import BudgetExceededError
             with self.assertRaises(BudgetExceededError):
-                await asyncio.wait_for(active, 3)
+                await asyncio.wait_for(active, self.WAIT_TIMEOUT)
             self.assertEqual((await session.questions.get(event.question.question_id)).state, "queued")
             self.assertNotIn(receipt.answer_id, str((await session.snapshot()).history))
 
@@ -312,7 +316,7 @@ class AsyncForegroundQuestionTests(unittest.IsolatedAsyncioTestCase):
                 config = self.config()
                 async with AsyncSession(config) as session, aclosing(session.questions.watch()) as watch:
                     active = asyncio.create_task(session.run("Ask"))
-                    event = await asyncio.wait_for(anext(watch), 3)
+                    event = await asyncio.wait_for(anext(watch), self.WAIT_TIMEOUT)
                     ident = session.session_id
                     original = session._session._log.writer.append
                     def fail(record_id, record):
@@ -325,7 +329,7 @@ class AsyncForegroundQuestionTests(unittest.IsolatedAsyncioTestCase):
                         with self.assertRaises(SessionStorageError):
                             await session.questions.answer(event.question.question_id, answers(event.question), "same")
                         with self.assertRaises(SessionStorageError):
-                            await asyncio.wait_for(active, 3)
+                            await asyncio.wait_for(active, self.WAIT_TIMEOUT)
                 async with AsyncSession(config, resume_id=ident) as restored:
                     q = await restored.questions.get(event.question.question_id)
                     self.assertEqual(q.state, "queued" if committed else "pending")
