@@ -28,6 +28,15 @@ xiaoyu sessions inspect 1 --kind compact --kind approval --limit 50
 `--errors` 显示失败请求、空补全、以 `ERROR` 开头的工具结果、非零 shell 退出码、
 可识别的拒绝以及损坏记录。没有统一错误标志的第三方工具自然语言结果不作猜测。
 
+摘要压缩的 `compact_end` 新记录带 `outcome`（`committed` / `skipped` / `failed`）
+和 `reason`：`no_history`（无可压历史）、`below_overhead`（压缩开销不划算）、
+`would_grow`（候选更大）、`summary_error`（摘要调用失败）、`empty_summary`、
+`exception` 或 `reduced`（已生效）。`--errors` 只筛出其中的失败，不把正常跳过当报错；
+旧记录没有 `outcome` 时仍按 `ok=false` 判断。
+`tokens_before` / `tokens_after` / `tokens_reclaimed` 是本地估算（`token_count_method=estimate`），
+表示该次摘要尝试实际返回的历史；放弃候选时回收量为零。`duration_ms` 包含摘要调用与
+候选构造，不含后续日志写入。这些新增字段不包含正文、路径或异常原文。
+
 默认摘要至多 240 字符；`--raw` 添加完整记录字段，仍做凭据脱敏与终端控制字符
 清理。它会包含记录中的对话、参数与工具正文，不等于仅含运行指标的报告。
 `--json` 输出相同结构，适合宿主进一步处理。读取使用固定文件大小边界，检查正在

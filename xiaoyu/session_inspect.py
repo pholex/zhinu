@@ -139,7 +139,10 @@ def inspect_session(
                 kind = str(event or "unknown")
                 detail = {k: v for k, v in record.items() if k not in ("ts", "event", "replacement", "baseline")}
                 add(line_no, record, kind, json.dumps(_clean(detail), ensure_ascii=False),
-                    failed=kind == "error" or (kind == "compact_end" and record.get("ok") is False))
+                    failed=kind == "error" or (kind == "compact_end" and (
+                        record.get("outcome") == "failed" if "outcome" in record
+                        else record.get("ok") is False
+                    )))
     return {"path": str(path), "turns": current_turn, "requests": request_count,
             "matched": matched, "shown": len(rows), "warnings": warnings, "rows": list(rows)}
 

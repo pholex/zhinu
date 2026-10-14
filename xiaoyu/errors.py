@@ -124,6 +124,19 @@ class Verdict:
 #  tests/test_errors.py 会遍历断言每一类都可构造、hint 非空、展示路径不炸。
 ALL_KINDS = ("rate_limit", "transient", "context_overflow", "quota", "auth", "fatal")
 
+#  只认明确的拒绝码/措辞，不按 policy、safety 这类也会出现在配置报错里的词猜。
+_CONTENT_CODES = frozenset({
+    "content_filter", "content_policy_violation", "responsibleaipolicyviolation",
+    "data_inspection_failed", "new_sensitive",
+})
+_CONTENT_CODE_TEXT = re.compile(
+    r"(?<![\w])(?:" + "|".join(sorted(_CONTENT_CODES)) + r")(?![\w])"
+)
+_CONTENT_REJECTIONS = (
+    "data may contain inappropriate content", "content exists risk",
+    "responses cannot be generated due to safety",
+)
+
 
 #  上下文超限的报错各家措辞不一（LiteLLM 还会转写），按关键词兜底识别
 _CONTEXT_MARKERS = (
@@ -440,6 +453,13 @@ def classify(exc: Exception) -> Verdict:
         return Verdict("transient", True, False, str(exc))
     text = str(exc).lower()
     status = _status_code(exc)
+
+    if (
+        _error_code(exc) in _CONTENT_CODES
+        or _CONTENT_CODE_TEXT.search(text)
+        or any(phrase in text for phrase in _CONTENT_REJECTIONS)
+    ):
+        return Verdict("fatal", False, False, "服务端内容过滤拒绝了请求，请调整请求内容后再试")
 
     if _certificate_failure(exc):
         #  先于瞬时判定：SDK 把它包成连接错误，按瞬时处理就是重试几次再换路由——

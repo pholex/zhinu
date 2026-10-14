@@ -931,6 +931,23 @@ def _platform_shell_note() -> str:
 PURPOSE_PARAM = "__tool_use_purpose"
 
 
+def _escape_drift_hint(text: str, old_str: str) -> str:
+    """只诊断能用原文佐证的多余转义；不猜 new_str 的意图、不改写审批参数。"""
+    candidates = []
+    if "\\\"" in old_str or "\\'" in old_str:
+        candidates.append(old_str.replace("\\\"", '"').replace("\\'", "'"))
+    runs = re.findall(r"\\+", old_str)
+    if runs and all(len(run) % 2 == 0 for run in runs):
+        candidates.append(re.sub(r"\\+", lambda match: "\\" * (len(match[0]) // 2), old_str))
+    if any(candidate != old_str and candidate in text for candidate in candidates):
+        return (
+            "\n[转义诊断] old_str 疑似多转义了一层：移除多余转义后能在文件中找到。"
+            "请重新 read_file，对照原文重发 old_str/new_str；new_str 的反斜杠可能是"
+            "有意保留的，工具不会自动反转义。"
+        )
+    return ""
+
+
 _INTEGER_TEXT = re.compile(r"[+-]?\d+$")
 _NUMBER_TEXT = re.compile(r"[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?$")
 _BOOLEAN_TEXT = {"true": True, "false": False, "1": True, "0": False}
@@ -2725,6 +2742,7 @@ class Toolbox:
                 f"ERROR: 在 {path} 中找不到 old_str（连放宽空白/标点也没匹配上）。"
                 "它必须照抄原文，常见原因是凭记忆写而非照抄、或文件内容与你的预期不同。"
                 f"{self._near_miss_hint(text, old_str)}\n"
+                f"{_escape_drift_hint(text, old_str)}\n"
                 f"你提供的 old_str 原文如下，请对照 read_file 的结果找差异：\n{echo}"
             )
 

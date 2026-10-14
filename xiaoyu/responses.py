@@ -622,6 +622,54 @@ def _tool_chunk(index: int, **kwargs: Any) -> Chunk:
     return Chunk(choices=[Choice(Delta(tool_calls=[ToolCallFragment(index, **kwargs)]))])
 
 
+class _ResponseCalls:
+    """按输出槽对账完成态；只补缺失后缀，绝不把整份参数重复拼进内核。
+
+    item id 可以变化，call id 可以迟到；已有非空身份或参数互相矛盾时拒绝这次
+    响应，不能把两个动作拼成一个。分片用列表保存，避免大文件参数的平方级复制。
+    """
+
+    def __init__(self) -> None:
+        self.slots: dict[int, dict[str, Any]] = {}
+        self.identities: dict[str, int] = {}
+
+    def feed(self, event: Any, *, final: bool = False) -> Chunk:
+        item = getattr(event, "item", None)
+        call_id = getattr(item, "call_id", None) or ""
+        item_id = getattr(item, "id", None) or getattr(event, "item_id", None) or ""
+        index = getattr(event, "output_index", None)
+        if type(index) is not int or index < 0:
+            index = self.identities.get("call:" + call_id) if call_id else None
+            if index is None and item_id:
+                index = self.identities.get("item:" + item_id)
+        if index is None:
+            raise StreamFailed("工具调用缺少可关联的输出槽或身份")
+        slot = self.slots.setdefault(index, {"id": "", "name": "", "parts": []})
+        name = getattr(item, "name", None) or ""
+        for key, value in (("id", call_id), ("name", name)):
+            if value and slot[key] and value != slot[key]:
+                raise StreamFailed("工具调用的完成态与已收到的身份不一致")
+            if value:
+                slot[key] = value
+        for key in (["call:" + call_id] if call_id else []) + (["item:" + item_id] if item_id else []):
+            if key in self.identities and self.identities[key] != index:
+                raise StreamFailed("工具调用身份指向不同输出槽")
+            self.identities[key] = index
+        suffix = ""
+        if final:
+            complete = getattr(item if item is not None else event, "arguments", None)
+            if isinstance(complete, str):
+                previous = "".join(slot["parts"])
+                if not complete.startswith(previous):
+                    raise StreamFailed("工具调用的完成态参数与流式分片不一致")
+                suffix = complete[len(previous):]
+        else:
+            suffix = getattr(event, "delta", "") or ""
+        if suffix:
+            slot["parts"].append(suffix)
+        return _tool_chunk(index, id=call_id or None, function=Function(name=name or None, arguments=suffix))
+
+
 def stream_chunks(events: Iterator[Any]) -> Iterator[Chunk]:
     """Responses 事件流 → chat completions chunk 流。
 
@@ -629,9 +677,9 @@ def stream_chunks(events: Iterator[Any]) -> Iterator[Chunk]:
     function_call 混排），function_call 的 output_index 天然唯一且保序，正好当
     `tool_calls[].index` 使——内核那边按 index 攒分片、按 index 排序，语义一致。
 
-    reasoning / 内置工具等其它事件一律忽略：内核没有展示位，多一路事件只会让
-    「模型说了什么」这件事变得不确定。
+    完成态补迟到的身份和缺失参数；reasoning 只在 done 保存，内置工具事件忽略。
     """
+    calls = _ResponseCalls()
     for event in events:
         kind = getattr(event, "type", "")
         if kind == "response.output_text.delta":
@@ -641,23 +689,29 @@ def stream_chunks(events: Iterator[Any]) -> Iterator[Chunk]:
             if getattr(item, "type", "") == "function_call":
                 #  name 在 item 加进来时就给全了（chat 侧也是一次给全），
                 #  arguments 随后分片累加
-                yield _tool_chunk(
-                    event.output_index,
-                    id=getattr(item, "call_id", "") or "",
-                    function=Function(name=getattr(item, "name", "") or "", arguments=""),
-                )
+                yield calls.feed(event)
         elif kind == "response.output_item.done":
             item = getattr(event, "item", None)
-            if getattr(item, "type", "") == "reasoning":
+            if getattr(item, "type", "") == "function_call":
+                yield calls.feed(event, final=True)
+            elif getattr(item, "type", "") == "reasoning":
                 #  必须等 done：added 时 encrypted_content 还是半截的（实测 932 vs
                 #  1124 字符）。存 dict 而不是 pydantic 对象——会话日志要能 json 落盘
                 if dumped := _replayable(_dump(item)):
                     yield Chunk(reasoning=[dumped])
         elif kind == "response.function_call_arguments.delta":
-            yield _tool_chunk(
-                event.output_index, function=Function(arguments=event.delta)
-            )
+            yield calls.feed(event)
+        elif kind == "response.function_call_arguments.done":
+            yield calls.feed(event, final=True)
         elif kind in ("response.completed", "response.incomplete"):
+            if kind == "response.completed":
+                #  部分端点省略 item.done，只在终帧给完整 output。索引仍是整个
+                #  output（含 reasoning/message）里的位置，不能只数 function_call。
+                from types import SimpleNamespace
+
+                for index, item in enumerate(getattr(event.response, "output", None) or []):
+                    if getattr(item, "type", "") == "function_call":
+                        yield calls.feed(SimpleNamespace(output_index=index, item=item), final=True)
             #  usage 只在收尾事件里给一次，choices 留空——内核见空 choices 就跳过，
             #  和 OpenAI chat 流最后那个纯 usage chunk 形状一致。
             #  incomplete（截断、内容过滤）同样走这里而不是抛异常：chat completions

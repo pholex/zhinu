@@ -3884,7 +3884,12 @@ class Agent:
         #  而不是一条谎称压缩完成的记录。
         if self.session_log:
             self.session_log.event("compact_start", trigger="manual" if force else "auto")
-        self.messages, note = self.compactor.compact(self.messages)
+        try:
+            self.messages, note = self.compactor.compact(self.messages)
+        except BaseException:
+            if self.session_log:
+                self.session_log.event("compact_end", ok=False, **self.compactor.last_attempt)
+            raise
         self.emit(Notice(f"  {note}"))
         changed = self.messages is not before_compact
         if changed:
@@ -3899,7 +3904,7 @@ class Agent:
                 self.session_log.event("compact", note=note, replacement=self.messages[1:])
             else:
                 self.session_log.event("compact", note=note)
-            self.session_log.event("compact_end", ok=changed)
+            self.session_log.event("compact_end", ok=changed, **self.compactor.last_attempt)
         if self.hook_engine is not None and self.hook_engine.has("AfterCompact"):
             self._fire_hook("AfterCompact", {"changed": changed, "method": "summary"})
         return note

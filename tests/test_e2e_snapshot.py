@@ -72,6 +72,7 @@ SCENARIOS = (
     Scenario("tool-turn", "用 bash 运行 echo snapshot-ok，然后汇报结果", args=("--yolo",)),
     Scenario("error-retry", "试试限流恢复", recorded=False),
     Scenario("error-fatal", "撞一个致命错误", recorded=False, expect_exit=1),
+    Scenario("content-rejection", "处理服务端内容拒绝", recorded=False, expect_exit=1),
 )
 
 _PIN = next(sc for sc in SCENARIOS if sc.pins_header)
@@ -236,6 +237,11 @@ class ErrorRetrySnapshot(SnapshotCase):
 class ErrorFatalSnapshot(SnapshotCase):
     def test_scenario(self) -> None:
         self.check_scenario(SCENARIOS[3])
+
+
+class ContentRejectionSnapshot(SnapshotCase):
+    def test_scenario(self) -> None:
+        self.check_scenario(SCENARIOS[4])
 
 
 class UnconsumedGuardTest(SnapshotCase):
