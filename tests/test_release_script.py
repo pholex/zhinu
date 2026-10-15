@@ -110,6 +110,8 @@ class EvaluateTest(unittest.TestCase):
         self.assertEqual(statuses(release.evaluate(facts(ci_run=None, ci_error="没有 gh")))["ci"], release.SKIP)
         red = {"conclusion": "failure", "status": "completed", "headSha": "a" * 40, "url": "u"}
         self.assertEqual(statuses(release.evaluate(facts(ci_run=red)))["ci"], release.FAIL)
+        running = {"conclusion": None, "status": "in_progress", "headSha": "a" * 40, "url": "u"}
+        self.assertEqual(statuses(release.evaluate(facts(ci_run=running)))["ci"], release.WARN)
         older = {"conclusion": "success", "status": "completed", "headSha": "c" * 40, "url": "u"}
         self.assertEqual(statuses(release.evaluate(facts(ci_run=older)))["ci"], release.WARN)
 
