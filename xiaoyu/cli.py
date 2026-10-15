@@ -3181,6 +3181,10 @@ def _run_once(
         "usage": agent.usage.to_dict(),
         "model": agent.config.model,
     }
+    if artifacts := getattr(agent, "last_artifacts", ()):
+        from dataclasses import asdict
+
+        payload["artifacts"] = [asdict(item) for item in artifacts]
     if output_schema is not None:
         payload["output"] = agent.structured_output
     if getattr(agent, "suggest_in_result", False):

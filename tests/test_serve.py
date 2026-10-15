@@ -142,6 +142,19 @@ class ServeCase(unittest.TestCase):
 
 
 class TestBasics(ServeCase):
+    def test_file_artifacts_match_result_status_and_event(self):
+        self.start('tool_call: {"name": "write_file", "arguments": {"path": "report.txt", "content": "result"}}\n'
+                   '---\ntext: done\n')
+        session_id = self.new_session(mode="auto")
+        response = self.client.post(f"/session/{session_id}/prompt", json={"text": "create report"})
+        self.assertEqual(response.status_code, 200, response.text)
+        artifacts = response.json()["result"]["artifacts"]
+        self.assertEqual(len(artifacts), 1)
+        self.assertEqual((artifacts[0]["path"], artifacts[0]["operation"]), ("report.txt", "created"))
+        self.assertEqual(self.status(session_id)["last_result"]["artifacts"], artifacts)
+        event = next(e for e in self.events(session_id) if e["kind"] == "artifacts.ready")
+        self.assertEqual(event["artifacts"], artifacts)
+
     def test_health_needs_no_token(self):
         client = self.start("text: 你好\n")
         body = client.get("/health").json()

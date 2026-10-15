@@ -1323,11 +1323,14 @@ class LoadedMessages(list):
     子类而不是改返回类型：公开契约里 load_messages 返回 list，嵌入宿主
     `agent.restore(load_messages(path))` 一行不改就能在 restore 时收到提示。
     切片会退化成普通 list、丢掉这个属性——要切片的调用方自己带上。
+    checkpoints 携带独立于模型消息的活动文件快照，交给 Agent.restore 接回；
+    切片或 list() 只复制对话，不复制文件快照。
     """
 
     def __init__(self, messages: Any = (), corrupt_lines: Any = ()) -> None:
         super().__init__(messages)
         self.corrupt_lines: list[int] = list(corrupt_lines)
+        self.checkpoints: Any = None
 
 
 SYSTEM_PROMPT_EVENT = "system_prompt"
@@ -1385,6 +1388,9 @@ def replay_records(records: Iterable[dict[str, Any]]) -> LoadedMessages:
 
 
 def _replay_lines(lines: Iterable[str]) -> LoadedMessages:
+    from .rewind import CheckpointReplay
+
+    checkpoints = CheckpointReplay()
     messages: list[dict[str, Any]] = []
     corrupt: list[int] = []
     #  最近一条还没定性的坏行：看下一条有效记录（或文件结束）才知道它是不是尾巴
@@ -1398,6 +1404,8 @@ def _replay_lines(lines: Iterable[str]) -> LoadedMessages:
         except json.JSONDecodeError:
             record = None
         if not isinstance(record, dict):
+            # 坏行可能就是写后确认或 clear，不能猜它对快照状态没有影响。
+            checkpoints.invalidate()
             if pending_bad:
                 corrupt.append(pending_bad)
             pending_bad = number
@@ -1406,6 +1414,7 @@ def _replay_lines(lines: Iterable[str]) -> LoadedMessages:
             if record.get("event") != "torn_tail":
                 corrupt.append(pending_bad)
             pending_bad = 0
+        checkpoints.accept(record)
         if "event" in record:
             kind = record["event"]
             if kind == "meta":
@@ -1435,4 +1444,6 @@ def _replay_lines(lines: Iterable[str]) -> LoadedMessages:
         if "role" in record:
             messages.append({key: value for key, value in record.items() if key != "ts"})
     #  循环结束还挂着的 pending_bad 就是最后一行：尾部半行，静默
-    return LoadedMessages(messages, corrupt)
+    loaded = LoadedMessages(messages, corrupt)
+    loaded.checkpoints = checkpoints.finish()
+    return loaded

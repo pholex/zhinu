@@ -1,0 +1,15 @@
+{"ts": "<ts>", "event": "meta", "format": 2, "version": "<version>", "model": "snapshot-model", "workspace": "<tmp>/ws", "started_at": "<ts>"}
+{"ts": "<ts>", "event": "checkpoint", "version": 1, "action": "begin", "index": 1, "prompt": "生成 report.txt 并交付", "workspace": "<tmp>/ws", "started_at": "<ts>"}
+{"ts": "<ts>", "role": "user", "content": "生成 report.txt 并交付"}
+{"ts": "<ts>", "event": "world_state", "baseline": {"model": {"value": "snapshot-model"}, "mode": {"value": ["default", false]}, "cwd": {"value": "<tmp>/ws"}, "skills": {"names": []}, "tools": {"names": ["ask_user", "bash", "browser", "chenshu_inbox", "chenshu_init", "chenshu_merge", "chenshu_mission", "chenshu_plan", "chenshu_review", "chenshu_send", "chenshu_spawn", "chenshu_status", "chenshu_teardown", "chenshu_wait", "exit_plan_mode", "get_context_remaining", "grep", "kill_task", "list_files", "monitor", "new_context", "read_file", "recall", "str_replace", "task_output", "update_plan", "write_file"]}, "project_instructions": {"digest": ""}, "date": {"value": "<today>"}, "context_window": {"value": 1}}}
+{"ts": "<ts>", "event": "request", "provider": "_scripted", "model": "snapshot-model", "attempt": 1, "outcome": "ok", "total_ms": "<ms>", "first_chunk_ms": "<ms>", "prompt_tokens": 150, "completion_tokens": 20}
+{"ts": "<ts>", "role": "assistant", "content": null, "tool_calls": [{"id": "<call-1>", "type": "function", "function": {"name": "write_file", "arguments": "{\"path\": \"report.txt\", \"content\": \"artifact result\\n\"}"}}]}
+{"ts": "<ts>", "event": "checkpoint", "version": 1, "action": "prepare", "path": "report.txt", "before": null}
+{"ts": "<ts>", "event": "checkpoint", "version": 1, "action": "written", "path": "report.txt", "fingerprint": "440a45594fdb052aa73d9d7d374871478cceef49d301ea9e252cd93539867f63"}
+{"ts": "<ts>", "role": "tool", "tool_call_id": "<call-1>", "content": "已创建 report.txt：16 字符 / 1 行"}
+{"ts": "<ts>", "event": "request", "provider": "_scripted", "model": "snapshot-model", "attempt": 1, "outcome": "ok", "total_ms": "<ms>", "first_chunk_ms": "<ms>", "prompt_tokens": 190, "completion_tokens": 20}
+{"ts": "<ts>", "role": "assistant", "content": "report.txt 已生成。"}
+{"ts": "<ts>", "event": "checkpoint", "version": 1, "action": "finish", "index": 1}
+{"ts": "<ts>", "event": "artifacts", "artifacts": [{"id": "<artifact-id>", "path": "report.txt", "size": 16, "sha256": "440a45594fdb052aa73d9d7d374871478cceef49d301ea9e252cd93539867f63", "operation": "created", "source": "file_tool", "status": "complete", "mime_type": "text/plain"}]}
+{"ts": "<ts>", "event": "usage", "turns": 2, "prompt_tokens": 340, "completion_tokens": 40, "by_model": {"_scripted/snapshot-model": {"calls": 2, "prompt_tokens": 340, "completion_tokens": 40}}}
+{"ts": "<ts>", "event": "exit", "reason": "normal"}

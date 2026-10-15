@@ -57,7 +57,9 @@ from .errors import Interrupted, classify
 from .providers import Registry, Route, UnknownModel, first_chunk_timeout, request_timeout
 from .permissions import Permissions, call_identity
 from .rewind import RewindResult
+from .artifacts import FileArtifact
 from .events import (
+    ArtifactsReady,
     Notice,
     PlanUpdated,
     RequestEnded,
@@ -1147,6 +1149,11 @@ class Agent:
         self.peer = peer
         #  会话落盘（可选，由 CLI 注入；eval / explore 子 agent 不落盘）
         self.session_log = session_log
+        self.last_artifacts: tuple[FileArtifact, ...] = ()
+        self._checkpoint_warning = False
+        self._checkpoint_strict = False
+        if (checkpoints := getattr(self.toolbox, "rewind", None)) is not None and session_log is not None:
+            checkpoints.journal = self._checkpoint_event
         #  上一次快照进日志的用量（轮末对比，变了才写；见 _log_usage）
         self._usage_logged: dict[str, Any] | None = None
         #  会话日志停写的提示只发一次
@@ -2335,7 +2342,8 @@ class Agent:
         #  快照点的对话锚点（用户原话）随历史清空而失效，整表一起清
         store = getattr(self.toolbox, "rewind", None)
         if store is not None:
-            store.drop_all()
+            store.drop_all(persist=False)
+        self.last_artifacts = ()
         self.trace.clear()
         self._post_compact_window = 0
         self._loaded_skills.clear()
@@ -2377,6 +2385,12 @@ class Agent:
         copy=False = 只接上下文、不写文件：`--session-id` 续写的是历史所在的
         那个文件本身，再抄一遍等于每次调用都把全部历史翻倍。
         """
+        saved_checkpoints = getattr(messages, "checkpoints", None)
+        store = getattr(self.toolbox, "rewind", None)
+        if store is not None and saved_checkpoints is not None:
+            store.adopt(saved_checkpoints, persist=copy)
+            if store.problem:
+                self.emit(Notice(store.problem, "warn"))
         for message in messages:
             if copy:
                 self._record(message)
@@ -2824,11 +2838,11 @@ class Agent:
             occurrence = sum(
                 1
                 for other in store.points()
-                if other.index <= index and other.prompt_text == point.prompt_text
+                if other.conversation_available and other.index <= index and other.prompt_text == point.prompt_text
             )
             found = -1
             seen = 0
-            for position, message in enumerate(self.messages):
+            for position, message in enumerate(self.messages if point.conversation_available else []):
                 if message.get("role") != "user":
                     continue
                 if media.text_of(message.get("content")) != point.prompt_text:
@@ -2873,6 +2887,7 @@ class Agent:
                     "rewind", target=index, replacement=self.messages[1:]
                 )
             notes.append(f"对话已回滚到第 {index} 轮开始前（截掉其后的全部轮次）")
+            store.forget_conversation(index)
         if files:
             notes.append("文件：" + summary)
         return RewindResult(
@@ -2986,6 +3001,23 @@ class Agent:
 
     # ---------- 主循环 ----------
 
+    def _checkpoint_event(self, kind: str, **fields: Any) -> None:
+        """快照写入失败沿用 CLI 日志降级纪律；缺确认的路径在重放时不可恢复。"""
+        if self._checkpoint_warning:
+            return
+        try:
+            log = self.session_log
+            if hasattr(log, "commit_event"):
+                log.materialize()
+                log.commit_event(kind, **fields)
+            else:
+                log.event(kind, **fields)
+        except Exception:
+            if self._checkpoint_strict:
+                raise
+            self._checkpoint_warning = True
+            self.emit(Notice("文件快照未能持久化；本次进程内仍可回滚，接回会话后可能不可用。", "warn"))
+
     def send(self, user_input: str | list[dict[str, Any]]) -> None:
         """跑完一轮。有跨会话登记时顺带维护 idle/busy——纯展示，不门控投递。
 
@@ -2995,11 +3027,13 @@ class Agent:
         """
         self._peer_state("busy")
         self.turn_stats = TurnStats()
+        self.last_artifacts = ()
+        artifacts = getattr(self.toolbox, "artifacts", None)
+        if artifacts is not None:
+            artifacts.begin()
         #  /rewind 快照的轮次边界：begin 开一个新点，finally 里 finish 补 after
         #  快照并归档——中断/异常路径也要收口，否则该轮的改动不可回滚。
         store = getattr(self.toolbox, "rewind", None)
-        if store is not None:
-            store.begin(media.text_of(user_input))
         if self._otel is not None:
             #  轮的 span（invoke_agent）：事件流里没有"轮开始"的事件，只能在这里显式开
             try:
@@ -3008,21 +3042,35 @@ class Agent:
                 self._otel = None
         failure: BaseException | None = None
         try:
+            if store is not None:
+                store.begin(media.text_of(user_input))
             with _TURNS_ACTIVE.track():
                 self._turn(user_input)
         except BaseException as exc:
             failure = exc
             raise
         finally:
-            if self._otel is not None:
-                try:
-                    self._otel.end_turn(failure)
-                except Exception:  # noqa: BLE001
-                    self._otel = None
-            if store is not None:
-                store.finish()
-            self._log_usage()
-            self._peer_state("idle")
+            try:
+                if self._otel is not None:
+                    try:
+                        self._otel.end_turn(failure)
+                    except Exception:  # noqa: BLE001
+                        self._otel = None
+                if store is not None:
+                    store.finish()
+                if artifacts is not None:
+                    self.last_artifacts = artifacts.finish(failure is None and self.last_stop == "done")
+                    if self.last_artifacts:
+                        event = ArtifactsReady(self.last_artifacts)
+                        if self.session_log:
+                            self.session_log.event("artifacts", artifacts=event.to_dict()["artifacts"])
+                        self.emit(event)
+                self._log_usage()
+            finally:
+                # 持久化失败也必须结束收集与 busy 状态，避免泄漏到下一轮。
+                if artifacts is not None and artifacts.active:
+                    artifacts.finish(False)
+                self._peer_state("idle")
             #  正常收尾的轮才配建议：中断/报错的轮，用户下一步多半是重来或问原因
             if failure is None and self.suggestions_enabled:
                 self._start_suggestions()

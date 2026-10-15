@@ -81,6 +81,7 @@ SCENARIOS = (
     Scenario("cancel-before-tool", "尝试写文件，执行前中断", args=("--yolo",), recorded=False, expect_exit=130),
     Scenario("bounded-hook-output", "验证长钩子输出", recorded=False),
     Scenario("content-rejection", "处理服务端内容拒绝", recorded=False, expect_exit=1),
+    Scenario("file-delivery", "生成 report.txt 并交付", args=("--yolo",), recorded=False),
 )
 
 _PIN = next(sc for sc in SCENARIOS if sc.pins_header)
@@ -390,6 +391,12 @@ class BoundedHookOutputSnapshot(SnapshotCase):
 class ContentRejectionSnapshot(SnapshotCase):
     def test_scenario(self) -> None:
         self.check_scenario(SCENARIOS[8])
+
+
+class FileDeliverySnapshot(SnapshotCase):
+    def test_scenario(self) -> None:
+        self.check_scenario(SCENARIOS[9])
+        self.assertEqual((self.workspace / "report.txt").read_bytes(), b"artifact result\n")
 
 
 class UnconsumedGuardTest(SnapshotCase):

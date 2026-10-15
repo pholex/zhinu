@@ -391,7 +391,7 @@ class SDKTests(unittest.TestCase):
             session.run("blocked")
         self.assertEqual(options.model.client.completions.calls, [])
 
-    def test_resume_lock_fork_and_restart_snapshot_limit(self):
+    def test_resume_lock_fork_and_persisted_checkpoints(self):
         options = self.options([[chunk("first")]], session_dir=self.workspace / "logs")
         with Session(options) as session:
             session.run("remember")
@@ -402,8 +402,9 @@ class SDKTests(unittest.TestCase):
                 self.assertEqual(child.run("fork").text, "forked")
                 self.assertTrue(any(m.get("content") == "remember" for m in child._agent.messages))
         with Session(self.options([[chunk("resumed")]]), resume_from=path) as restored:
-            self.assertEqual(restored.checkpoints(), ())
+            self.assertEqual(restored.checkpoints(), (1,))
             self.assertEqual(restored.run("continue").text, "resumed")
+            self.assertEqual(restored.checkpoints(), (1, 2))
             self.assertTrue(any(m.get("content") == "remember" for m in restored._agent.messages))
 
     def test_slow_callback_close_reports_timeout_then_finishes(self):

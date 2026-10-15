@@ -103,6 +103,7 @@ from . import attention, command_check, keys, media, modes, suggest, theme, ui
 from .agent import Agent, _CancelledAnswers
 from .config import user_config_dir
 from .events import (
+    ArtifactsReady,
     Notice,
     NoticeLevel,
     PlanUpdated,
@@ -1314,6 +1315,7 @@ class RichSink:
             PlanUpdated: self._plan,
             SteerAccepted: self._steer,
             Notice: self._notice,
+            ArtifactsReady: self._artifacts,
             Suggestions: self._suggestions,
         }
         #  轮末「接着问」的接手方（Tui 接线）：它知道提示符挂没挂着、怎么喂输入行的
@@ -1325,6 +1327,10 @@ class RichSink:
         if handler is not None:
             #  终端注入面：模型正文与工具输出可能夹带转义序列（见 ui.strip_controls）
             handler(render.sanitize_event(event))
+
+    def _artifacts(self, event: ArtifactsReady) -> None:
+        if self.verbose:
+            self._notice(Notice(render.artifact_summary(event)))
 
     def quiet_child(self, indent: str = "    ") -> "RichSink":
         """给子 agent 的静默 sink：共用 Console、带缩进、不刷正文、不开 spinner。"""

@@ -19,6 +19,7 @@ from typing import Any, Callable
 
 from . import media, ui
 from .events import (
+    ArtifactsReady,
     Notice,
     PlanUpdated,
     RequestStarted,
@@ -183,6 +184,7 @@ class PlainSink:
             PlanUpdated: self._plan,
             SteerAccepted: self._steer,
             Notice: self._notice,
+            ArtifactsReady: self._artifacts,
             Suggestions: self._suggestions,
         }
 
@@ -190,6 +192,10 @@ class PlainSink:
         handler = self._handlers.get(type(event))
         if handler is not None:
             handler(sanitize_event(event))
+
+    def _artifacts(self, event: ArtifactsReady) -> None:
+        if self.verbose:
+            self._notice(Notice(artifact_summary(event)))
 
     def _suggestions(self, event: Suggestions) -> None:
         """轮末「接着问」一行，保留显示过的建议供明文 REPL 按编号选择。
@@ -325,6 +331,12 @@ def preparation_text(event: ToolPreparing) -> str:
         parts.append(event.purpose)
     parts.append(f"参数 {event.argument_chars:,} 字符")
     return " · ".join(parts)
+
+
+def artifact_summary(event: ArtifactsReady) -> str:
+    paths = "、".join(str(clean_value(item.path, True)) for item in event.artifacts)
+    label = "本轮文件" if all(item.status == "complete" for item in event.artifacts) else "未完成轮次留下的文件"
+    return f"[{label}：{paths}]"
 
 
 def sanitize_event(event: UIEvent) -> UIEvent:

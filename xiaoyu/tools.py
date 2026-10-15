@@ -46,6 +46,7 @@ from .config import Config
 from .errors import Interrupted, attach_partial
 from .invisible import strip_invisible
 from .rewind import RewindStore
+from .artifacts import ArtifactCollector
 
 
 #  硬性拦截：不可撤销的系统级破坏，
@@ -1566,7 +1567,8 @@ class Toolbox:
         self._task_output_seen: dict[str, tuple[int | None, str, int]] = {}
         #  文件快照（/rewind）：write_file / str_replace 改前把原内容记进当前轮
         #  的快照点；轮次边界由 Agent.send 划（begin/finish）。
-        self.rewind = RewindStore()
+        self.rewind = RewindStore(config.workspace)
+        self.artifacts = ArtifactCollector(config.workspace)
         #  已用 read_file 读过的文件 → 当时的 mtime。
         #  用来强制"先读再改"，并检测读完之后文件被外部改动。
         self._reads: dict[Path, _ReadMark] = {}
@@ -2073,6 +2075,10 @@ class Toolbox:
 
         note = self._streak_warn_note(name)
         return f"{output}\n\n{note}" if note else output
+
+    def report_artifact(self, path: str | Path) -> None:
+        """进程内业务工具显式交付工作区文件，交给本轮结果与事件消费者。"""
+        self.artifacts.report(path)
 
     def take_media(self) -> list[dict[str, Any]]:
         """本批工具调用产出的图片部件（取完即清）。来源：MCP 工具，以及经 push_media 交图的进程内工具（浏览器桥截图）。
@@ -2713,9 +2719,10 @@ class Toolbox:
         if existed:
             try:
                 previous = target.read_bytes()
-                self.rewind.record(target, previous)
             except OSError:
                 pass
+            else:
+                self.rewind.record(target, previous)
         else:
             self.rewind.record(target, None)
         converted = ""
@@ -2738,6 +2745,8 @@ class Toolbox:
         except OSError as exc:
             return f"ERROR: 写入失败 {path}: {exc}"
         self._mark_read(target, raw=written)
+        self.artifacts.written(target, previous, written)
+        self.rewind.written(target, written)
         action = "已覆盖" if existed else "已创建"
         note = ("（工作区之外）" if outside else "") + converted
         lines = content.count("\n") + (1 if content and not content.endswith("\n") else 0)
@@ -2801,6 +2810,8 @@ class Toolbox:
         except OSError as exc:
             return f"ERROR: 写入失败 {path}: {exc}"
         self._mark_read(target, keep_level=True, raw=written)
+        self.artifacts.written(target, raw, written)
+        self.rewind.written(target, written)
 
         note = "（工作区之外）" if outside else ""
         delta = updated.count("\n") - text.count("\n")
@@ -2878,6 +2889,8 @@ class Toolbox:
         except OSError as exc:
             return f"ERROR: 写入失败 {path}: {exc}"
         self._mark_read(target, keep_level=True, raw=written)
+        self.artifacts.written(target, raw if raw is not None else text.encode(encoding), written)
+        self.rewind.written(target, written)
 
         offset = sum(len(line) + 1 for line in updated_lines[: found.line_index])
         note = "（工作区之外）" if outside else ""

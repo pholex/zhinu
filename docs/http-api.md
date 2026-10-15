@@ -76,6 +76,11 @@ coding agent 一轮动辄几分钟，而编排器的 HTTP 节点普遍有分钟�
 模型没按要求给则为 `null`，编排侧据此判失败。校验只做 type / required /
 enum / items 这一层，复杂关键字自己再校。
 
+本轮文件交付在 `result.artifacts`（异步为 `last_result.artifacts`），没有文件时为空
+数组；非空时事件流另发 `artifacts.ready`。每项包含工作区相对路径、文件大小、SHA-256、
+创建/更新/显式交付类型与本轮完整性状态。文件工具自动记录，bash 等工具不会触发
+目录扫描。它是文件清单，不是下载接口；详见 [文件产物协议](embedding.md#单轮结算-runresult)。
+
 ```bash
 curl -X POST :8420/session/$SID/prompt -d '{"text":"评估这个 PR 能不能合",
   "output_schema":{"type":"object","properties":{"mergeable":{"type":"boolean"},

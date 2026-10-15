@@ -23,6 +23,8 @@ from .observation import (
     SessionSnapshot as SessionSnapshot, SessionState as SessionState,
 )
 from xiaoyu.rewind import RewindResult as RewindResult
+from xiaoyu.artifacts import FileArtifact as FileArtifact
+from xiaoyu.events import ArtifactsReady as ArtifactsReady
 from .types import (
     Allow as Allow, Approval as Approval, Approver as Approver, Asker as Asker, Deny as Deny,
     CloseTimeoutError as CloseTimeoutError, ConfigurationError as ConfigurationError,
@@ -49,6 +51,7 @@ from xiaoyu.session_log import SessionLockedError as SessionLockedError
 from xiaoyu.session_log import SessionInfo as SessionInfo
 
 __all__ = [
+    "FileArtifact", "ArtifactsReady",
     "QuestionOptions", "QuestionOption", "QuestionItem", "QuestionAnswer", "QuestionSnapshot",
     "QuestionManager", "AsyncQuestionManager", "QuestionConflictError", "QuestionNotFoundError",
     "QuestionEvent",

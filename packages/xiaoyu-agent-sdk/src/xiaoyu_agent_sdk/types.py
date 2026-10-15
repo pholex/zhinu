@@ -54,6 +54,7 @@ class Tool:
 class ToolResult:
     content: Any
     is_error: bool = False
+    artifacts: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)

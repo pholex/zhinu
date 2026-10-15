@@ -162,6 +162,13 @@ lookup_tool = Tool(
 结果转成 JSON；`ToolResult(is_error=True)` 回灌工具错误。未捕获的业务异常被转换
 为不含异常正文的 `ERROR: Host tool failed`，模型可以调整后续操作。
 
+业务工具可返回 `ToolResult("报告已生成", artifacts=("reports/result.pdf",))`，显式交付
+工作区内的文件。`run().artifacts` 返回 `FileArtifact` 元组，流式调用同时收到
+`ArtifactsReady`。路径在轮末重新核对，工作区之外、Git 内部、缺失或非普通文件不接受；
+同一工具的一批路径有任何一项不合法，整批不交付并返回工具错误。`is_error=True` 时
+不接纳显式产物，但工具已发生的文件修改不会因此撤销。内置文件工具自动记录交付。
+字段和状态语义见 [文件产物协议](embedding.md#单轮结算-runresult)。
+
 基础 Python hook 事件是 `PreToolUse`、`PostToolUse`、`UserPromptSubmit`、`Stop`。
 callback 收到带 `event` 的 payload，返回 `HookDecision(blocked, reason)`。
 Pre/User 的 block 阻止执行，Post 的 block 反馈给模型但不撤销副作用，Stop 最多顶回
@@ -537,7 +544,7 @@ plan 模式按内核规则退回先前模式，auto／default 保持；生命周
 损坏日志不会无声降级。日志包含对话和工具结果，存储目录应由宿主管理访问权限。
 
 空闲会话的 `fork(options=...)` 复制对话并创建独立资源/日志，不复制工作区文件或
-文件检查点。要改工作区，传新的 options。`checkpoints()` 返回本进程的快照编号，
+文件检查点。要改工作区，传新的 options。`checkpoints()` 返回当前可用的快照编号，
 `rewind(index, conversation=True, files=True)` 返回 `RewindResult`。状态为
 `completed`、`partial`、`conflict`、`failed`、`unavailable` 或 `noop`；文件冲突时
 保留文件和对话，由宿主决定如何处理。结果分别给出 `conversation_rewound`、
@@ -546,7 +553,16 @@ plan 模式按内核规则退回先前模式，auto／default 保持；生命周
 只取文本），宿主可拿它预填下一次输入。文件恢复失败时保守地将所有目标列为 uncertain，需核对后重试。
 超过快照大小上限、对话已压缩等情况可得到 partial；不要只凭调用返回宣称全部回滚。
 仅内核记录的编辑工具有文件快照，bash/业务工具/外部系统的副作用不受其保护。
-重启后文件快照不可恢复，`checkpoints()` 为空，不存在的点返回 `unavailable`。
+启用 `session_dir` 或 `session_store` 后，文件工具检查点随会话记录持久化，重启后
+在同一工作区恢复；未启用持久化时仍只在内存。保留最近 64 轮可用快照，单文件改前
+内容超过 5 MiB 时跳过；写后只存 SHA-256 指纹。日志追加保存原始字节的 Base64
+表示，不送进模型上下文，但会增加本地日志体积，也可能包含编辑前的敏感内容。
+淘汰活动快照不会改写旧日志，删除会话记录才能一并清除其中的备份。
+
+写入后确认缺失、恢复过程中退出、路径变成符号链接、日志损坏等情况保守拒绝自动
+恢复。普通文件冲突返回 `conflict`；损坏快照会给出 Notice 并停用该历史的回滚。
+`reset()` 清除活动快照，成功回滚的快照不会在重启后重新出现。旧版本日志没有保存
+文件快照，仍返回空清单；不存在的点返回 `unavailable`。
 
 ## 验证与发布
 

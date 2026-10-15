@@ -20,7 +20,7 @@
 | `on_notification`、`AsyncAgent.watch_notifications` | `watch_notifications()` 观察流 | 替代入口；每个观察者独立，合并变化后查询当前待通知快照，无宿主回调占用内核线程 |
 | `reset`、`AsyncAgent.recycle` | `reset()`；异步版 await | 已接入；仅重置对话及相关内存状态，保留身份、资源、累计消耗及终态任务档案；不另增同义方法 |
 | `restore`、`SessionLog`、`load_messages` | 构造时 `resume_from` / `resume_id`，`SessionStore` | 替代入口；恢复由会话生命周期管理，不向忙碌会话原地导入历史 |
-| 会话分叉、文件／对话回滚 | `fork`、`checkpoints`、`rewind`、`RewindResult` | 已接入；文件快照跨重启持久化尚未实现 |
+| 会话分叉、文件／对话回滚 | `fork`、`checkpoints`、`rewind`、`RewindResult` | 已接入；文件日志和存储后端均可恢复文件工具检查点，fork 只复制对话 |
 | `SessionLockedError`、`SessionInfo`、`list_sessions` | 同名入口 | 已接入；宿主显式指定目录 |
 | `set_output_schema`、`structured_output` | `OutputSpec`、`RunResult.output` / `output_status` | 替代入口；按轮次设置并校验，避免遗留到下一轮 |
 

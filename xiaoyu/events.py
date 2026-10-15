@@ -25,6 +25,7 @@ import time
 
 from dataclasses import asdict, dataclass, field
 from typing import Any, ClassVar, Literal, Protocol
+from .artifacts import FileArtifact
 
 NoticeLevel = Literal["info", "warn", "error"]
 
@@ -216,6 +217,14 @@ class PlanUpdated(UIEvent):
     kind: ClassVar[str] = "plan.updated"
     plan: list[dict[str, str]]
     explanation: str = ""
+
+
+@dataclass(frozen=True)
+class ArtifactsReady(UIEvent):
+    """本轮已核对存在的文件交付；空清单不发事件。"""
+
+    kind: ClassVar[str] = "artifacts.ready"
+    artifacts: tuple[FileArtifact, ...]
 
 
 @dataclass(frozen=True)

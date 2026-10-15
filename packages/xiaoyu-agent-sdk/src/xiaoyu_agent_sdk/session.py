@@ -342,6 +342,9 @@ class Session:
                     error = isinstance(result, ToolResult) and result.is_error
                     content = result.content if isinstance(result, ToolResult) else result
                     text = content if isinstance(content, str) else json.dumps(content, ensure_ascii=False, allow_nan=False)
+                    if isinstance(result, ToolResult) and not error:
+                        assert self._toolbox is not None
+                        self._toolbox.artifacts.report_many(result.artifacts)
                     return ("ERROR: " if error else "") + text
                 except Interrupted:
                     raise
@@ -420,6 +423,7 @@ class Session:
                             hook_engine=_Hooks(self, options.hooks), session_log=self._log,
                             upstream_stop=self._cancel.is_set)
         self._agent.on_notification = lambda _: self._notifications.changed()
+        self._agent._checkpoint_strict = True
         self._has_question_history = options.questions is not None or any(
             r.get("event") in {"sdk.question", "sdk.question.delivery"} for r in stored_records or [])
         if options.questions is not None:

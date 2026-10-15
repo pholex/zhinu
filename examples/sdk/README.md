@@ -19,6 +19,7 @@ python examples/sdk/observation.py --demo
 python examples/sdk/controls.py --demo
 python examples/sdk/planning.py --demo
 python examples/sdk/result_transforms.py --demo
+python examples/sdk/artifacts.py --demo
 python examples/sdk/cache_report.py --demo
 python examples/sdk/storage.py --demo
 python examples/sdk/orchestration.py --demo
@@ -63,6 +64,8 @@ python examples/sdk/business.py --demo --workspace /same/workspace --resume /pri
 `planning.py` 演示显式启用计划工具、接收 `PlanUpdated`、读取不可变计划快照和重置；
 依赖 0.62.0 起提供的接口，`--demo` 完全离线。
 `result_transforms.py` 演示业务工具返回文本脱敏，使用 0.62.0 起提供的 ResultTransform。
+`artifacts.py` 演示业务工具生成 CSV 并显式交付，宿主从结果读取文件路径、大小、
+内容指纹和轮次状态；临时工作区在示例结束时清理。
 `cache_report.py` 独立消费 RequestEnded，报告已上报的 prompt cache 使用量；不改变
 执行或推算费用。两者分别移除注册项／观察调用即可关闭，不依赖内核私有对象。
 数据边界见 [变换契约](../../docs/sdk-result-transforms.md)。

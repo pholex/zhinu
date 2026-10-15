@@ -37,6 +37,8 @@ _EXPORTS: dict[str, str] = {
     "normalize_verdict": "xiaoyu.agent",
     #  单轮结算
     "RunResult": "xiaoyu.embedding",
+    "FileArtifact": "xiaoyu.artifacts",
+    "ArtifactsReady": "xiaoyu.events",
     "RunCompleted": "xiaoyu.embedding",
     "measured_send": "xiaoyu.embedding",
     "Interrupted": "xiaoyu.agent",
@@ -96,6 +98,8 @@ def __dir__() -> list[str]:
 
 
 if TYPE_CHECKING:  # 给类型检查器 / IDE 看的静态视图，运行期不执行
+    from .artifacts import FileArtifact  # noqa: F401
+    from .events import ArtifactsReady  # noqa: F401
     from .agent import (  # noqa: F401
         Agent,
         Allow,

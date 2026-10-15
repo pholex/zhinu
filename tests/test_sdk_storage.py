@@ -168,8 +168,9 @@ class StorageTests(unittest.TestCase):
                                   session_store=SQLiteSessionStore(self.store.path))
         with Session(resumed_options, resume_id=key) as restored:
             self.assertEqual(restored.session_id, key)
-            self.assertEqual(restored.checkpoints(), ())
+            self.assertEqual(restored.checkpoints(), (1,))
             self.assertEqual(restored.run("continue").text, "resumed")
+            self.assertEqual(restored.checkpoints(), (1, 2))
             self.assertTrue(any(m.get("content") == "remember-me"
                                 for m in resumed_options.model.client.completions.calls[-1]["messages"]))
         self.assertEqual(len(self.store.list_sessions()), 2)

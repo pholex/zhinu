@@ -86,6 +86,10 @@ def normalize_event(event: dict[str, Any], tmp: str) -> dict[str, Any]:
             out[key] = 0 if value is not None else None
         elif key == "session_log":
             out[key] = "<session_log>"
+        elif key == "id" and "sha256" in event and "path" in event:
+            out[key] = "<artifact-id>"
+        elif key == "artifacts" and isinstance(value, (list, tuple)):
+            out[key] = [normalize_event(item, tmp) for item in value]
         elif isinstance(value, str):
             value = _token_tmp_paths(value.replace("\r\n", "\n"), tmp, "<tmp>")
             out[key] = _WAIT_RE.sub("<wait>s 后重试", value)
@@ -126,8 +130,10 @@ def normalize_session_record(
         elif key in ("total_ms", "first_chunk_ms", "wait_s"):
             #  请求留痕里的耗时：字段在不在要进 golden，数值每次都不同
             out[key] = "<ms>"
-        elif key == "version":
+        elif key == "version" and record.get("event") != "checkpoint":
             out[key] = "<version>"
+        elif key == "artifacts" and isinstance(value, (list, tuple)):
+            out[key] = [normalize_event(item, tmp) for item in value]
         elif key == "tool_call_id" and isinstance(value, str):
             out[key] = ids.token(value)
         elif key == "tool_calls" and isinstance(value, list):

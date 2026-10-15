@@ -75,6 +75,7 @@ from typing import Any, AsyncIterator, Awaitable, Callable, ClassVar
 from .agent import Agent, Allow, Deny, Interrupted  # noqa: F401 - Allow/Deny 是嵌入宿主的常用面，从这里一并可得
 from . import media
 from .events import UIEvent
+from .artifacts import FileArtifact
 
 
 @dataclass(frozen=True)
@@ -102,6 +103,7 @@ class RunResult:
     output_status: str = "not_requested"
     output_errors: tuple[str, ...] = ()
     output_retries: int = 0
+    artifacts: tuple[FileArtifact, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -226,6 +228,7 @@ def measured_send(
         ),
         output_errors=output_contract.errors if output_contract else (),
         output_retries=output_contract.repairs if output_contract else 0,
+        artifacts=agent.last_artifacts,
     )
 
 

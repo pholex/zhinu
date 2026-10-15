@@ -215,9 +215,21 @@ host.watch_notifications(on_notification)   # 在事件循环里调用；传 Non
 | `interrupted` | 被 `interrupt()` 收掉为 `True`——打断是宿主自己的动作，不以异常弹回 |
 | `stopped` | `done` / `turn_cap` / `budget` / `truncated`（回复撞了输出长度上限，自动续写 3 次后仍没说完） / `interrupted` |
 | `output` | 带 `output_schema` 跑的那一轮，模型交回的结构化对象；否则 `None` |
+| `artifacts` | 本轮文件交付的 `FileArtifact` 元组；无文件时为空。文件工具自动记录，进程内业务工具可调用 `Toolbox.report_artifact(path)` 显式交付 |
 
 真正的错误（网络、配置、bug）照常抛出；`Interrupted` 只在直接调 `Agent.send()`
 时会看到，经 `measured_send` 已吸收。
+
+`FileArtifact` 包含轮内稳定的 `id`、工作区相对 `path`、`size`、`sha256`、`mime_type`、
+`operation`（created / updated / reported）、`source`（file_tool / tool）及 `status`
+（complete / incomplete）。状态只表示这轮是否正常收尾，不代表产物通过业务验收。
+同一文件一轮只交付一次，文件工具取首写前与末次写后的净变化；被删除、被外部改写、
+改回原样的文件不列入。只收工作区普通文件，不扫描目录、不从正文猜路径；bash、MCP
+或子任务生成的文件需由宿主业务工具显式交付。显式交付可以引用已有文件。
+
+非空清单同时经 `ArtifactsReady`（`artifacts.ready`）发布并记入会话日志；HTTP 的
+`result.artifacts` 与 SDK 结果相同，CLI JSON/stream-json 的非空结果也带 `artifacts`。
+该协议不提供文件内容或下载权限；宿主提供下载时仍需自行校验路径、权限和文件指纹。
 
 **结构化收尾**：`measured_send(agent, task, output_schema={...JSON Schema...})`
 （`AsyncAgent.send/stream` 同参）只对这一轮挂 `structured_output` 工具，结果在
@@ -232,6 +244,9 @@ host.watch_notifications(on_notification)   # 在事件循环里调用；传 Non
   `agent.restore(messages, source=str(path))`——与 CLI `xiaoyu resume` 同一条路径；
   默认把历史复制进新会话文件（新文件自包含），`copy=False` 表示续写历史所在的
   那个文件，只接上下文不再抄一遍。`list_sessions(workspace=...)` 列可续的会话。
+  `load_messages` 同时携带活动文件检查点；直接交给 `restore` 可在同工作区接回
+  `/rewind` 快照。复制到新日志时快照记录也独立复制；切片或转成普通 list 会丢掉
+  快照元数据，适合只复制对话的 fork。旧日志没有快照记录时不补造。
 - **写锁**：`SessionLog` 构造即对日志旁的 `<日志>.lock` 加跨进程排他锁（内核锁，进程
   死亡自动释放），同一会话文件同一时刻只允许一个写句柄——另一个进程（或本进程里
   另一个 `SessionLog`）已持有时抛 `SessionLockedError`（`.pid` 是持有者，消息可直接
@@ -322,10 +337,10 @@ EOF / 连接关闭：挂起审批全部拒绝、打断当前轮、等工作线�
 
 - **内核对象**：`Agent`、`AsyncAgent`、`Config`、`Toolbox`
 - **审批 / 提问**：`Allow`、`Deny`、`Approver`、`Asker`、`AsyncApprover`、`normalize_verdict`
-- **单轮结算**：`RunResult`、`RunCompleted`、`measured_send`、`Interrupted`
+- **单轮结算**：`RunResult`、`RunCompleted`、`FileArtifact`、`measured_send`、`Interrupted`
 - **事件**：`UIEvent`、`UISink`、`RequestStarted`、`RequestEnded`、`TextDelta`、
   `TextEnd`、`ToolPreparing`、`ToolPending`、`ToolPurpose`、`ToolRunning`、`ToolCompleted`、
-  `ToolDenied`、`SteerAccepted`、`PlanUpdated`、`Notice`
+  `ToolDenied`、`SteerAccepted`、`PlanUpdated`、`ArtifactsReady`、`Notice`
 - **会话**：`SessionLog`、`SessionLockedError`、`load_messages`、`list_sessions`
 - **权限**：`Permissions`、`Rule`、`parse_rule`、`suggest_allow_rule`、
   `banned_allow_reason`、`user_rules_path`、`workspace_rules_path`
