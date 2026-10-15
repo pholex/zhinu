@@ -63,6 +63,14 @@ class EvaluateTest(unittest.TestCase):
         self.assertEqual(got["branch"], release.FAIL)
         self.assertEqual(got["clean"], release.FAIL)
 
+    def test_notes_start_from_last_published_tag_not_burned_one(self):
+        # v0.66.0 打了 tag 但没发出去（烧号），PyPI 最高是 0.65.0：说明从 v0.65.0 起算
+        got = facts(tags=["v0.65.0", "v0.66.0"], last_tag="v0.66.0", pypi_versions=["0.64.0", "0.65.0"])
+        self.assertEqual(release.notes_since(got), "v0.65.0")
+        # PyPI 查不到就退回最近的 tag；连 tag 都没有退回 HEAD~1
+        self.assertEqual(release.notes_since(facts(pypi_versions=None)), "v0.66.0")
+        self.assertEqual(release.notes_since(facts(pypi_versions=None, last_tag=None, tags=[])), "HEAD~1")
+
     def test_untracked_files_only_warn(self):
         got = statuses(release.evaluate(facts(dirty=["?? lab-results/"])))
         self.assertEqual(got["clean"], release.WARN)
