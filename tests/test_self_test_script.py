@@ -125,15 +125,15 @@ class RunTest(unittest.TestCase):
 
 class PlistTest(unittest.TestCase):
     def test_render_plist_shape(self):
-        plist = self_test.render_plist(python="/usr/bin/python3", script=Path("/r/scripts/self_test.py"),
-                                       out_dir=Path("/h/.config/xiaoyu/self-test"), hour=3, minute=30,
-                                       env_file=Path("/r/.env"), model=None)
+        #  期望值也经 Path 转字符串：Windows 上分隔符是反斜杠，plist 只在 macOS 用但测试三平台都跑
+        script, out_dir, env_file = Path("/r/scripts/self_test.py"), Path("/h/.config/xiaoyu/self-test"), Path("/r/.env")
+        plist = self_test.render_plist(python="/usr/bin/python3", script=script, out_dir=out_dir,
+                                       hour=3, minute=30, env_file=env_file, model=None)
         self.assertEqual(plist["Label"], self_test.LAUNCHD_LABEL)
         self.assertEqual(plist["ProgramArguments"],
-                         ["/usr/bin/python3", "/r/scripts/self_test.py", "--out-dir", "/h/.config/xiaoyu/self-test",
-                          "--env-file", "/r/.env"])
+                         ["/usr/bin/python3", str(script), "--out-dir", str(out_dir), "--env-file", str(env_file)])
         self.assertEqual(plist["StartCalendarInterval"], {"Hour": 3, "Minute": 30})
-        self.assertEqual(plist["StandardOutPath"], "/h/.config/xiaoyu/self-test/launchd.log")
+        self.assertEqual(plist["StandardOutPath"], str(out_dir / "launchd.log"))
         self.assertFalse(plist["RunAtLoad"])
 
 
