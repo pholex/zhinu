@@ -6,14 +6,16 @@ from types import SimpleNamespace
 from unittest import mock
 
 from xiaoyu.agent import Agent
+from xiaoyu.providers import Registry
 from xiaoyu.tools import Toolbox, _argument_problem, _prepare_arguments
-from .test_agent_paths import AgentTestCase
+from .test_agent_paths import AgentTestCase, FakeClient
 
 
 class BuiltinContractTest(AgentTestCase):
     def tools(self):
         box = Toolbox(self.config, mcp_view=SimpleNamespace(ready_tools=lambda: []))
-        Agent(self.config, box)
+        # 只为让 Agent 把内置工具登记进 box；模型端点用桩，测试机上没有任何 key 也能跑。
+        Agent(self.config, box, registry=Registry.for_client(FakeClient([])))
         return box
 
     def test_declarations_match_handler_arguments_and_optional_nulls(self):
