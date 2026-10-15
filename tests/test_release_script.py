@@ -63,6 +63,12 @@ class EvaluateTest(unittest.TestCase):
         self.assertEqual(got["branch"], release.FAIL)
         self.assertEqual(got["clean"], release.FAIL)
 
+    def test_untracked_files_only_warn(self):
+        got = statuses(release.evaluate(facts(dirty=["?? lab-results/"])))
+        self.assertEqual(got["clean"], release.WARN)
+        got = statuses(release.evaluate(facts(dirty=["?? lab-results/", " M a.py"])))
+        self.assertEqual(got["clean"], release.FAIL)
+
     def test_unpushed_head_fails_but_only_warns_when_fetch_failed(self):
         self.assertEqual(statuses(release.evaluate(facts(upstream_head="b" * 40)))["upstream"], release.FAIL)
         got = statuses(release.evaluate(facts(upstream_head="b" * 40, fetch_error="没网")))
