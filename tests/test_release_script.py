@@ -209,7 +209,7 @@ class TempRepoTest(unittest.TestCase):
         notes = (self.repo / "docs" / "releases" / "0.2.0.md").read_text(encoding="utf-8")
         self.assertIn("# 0.2.0（", notes)
         self.assertIn("## 行为变化（升级前看一眼）\n\n- 默认不再自动重试（", notes)
-        self.assertIn("- cli：修一个坑（", notes)
+        self.assertIn("- 修复：修一个坑（", notes)  # scope（cli）不进列表行
         self.assertIn("- 未附自测记录", notes)
         pin = json.loads((self.repo / "docs" / "acp-registry" / "agent.json").read_text(encoding="utf-8"))
         self.assertEqual(pin["distribution"]["uvx"]["package"], "xiaoyu-agent==0.2.0")

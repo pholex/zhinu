@@ -27,7 +27,7 @@ Publishing → 装回冒烟 → 用 `docs/releases/<版本>.md` 建 GitHub Relea
    不可复用）、tag 不存在、自上个 tag 有非 merge 提交、公开文档没有「尚未发布」、父提交最近
    一次 CI 绿（要 `gh`）、nightly 自测记录存在且不旧（只警告）。
 2. 改 `xiaoyu/__init__.py` 的 `__version__`（pyproject 是 dynamic，别处不写）。
-3. `scripts/release_notes.py` 生成 `docs/releases/<版本>.md`：按 feat/fix/docs/chore 分组；
+3. `scripts/release_notes.py` 生成 `docs/releases/<版本>.md`：一张平铺列表，一个提交一行「新增/修复/文档/工程/改动：subject（短 sha）」，不抄正文、不带 scope；
    **「行为变化（升级前看一眼）」从 commit 正文抽**（见下）；「本版验证」取最近一次 nightly
    自测记录。默认不调模型；要润色加 `--polish`。
 4. 同步 `docs/acp-registry/agent.json` 的 `version` 与 `package==` 钉版本（registry 收录后会

@@ -45,11 +45,11 @@ class RenderTest(unittest.TestCase):
         text = release_notes.render_plain(release_notes.group_commits(commits))
         self.assertEqual(
             text,
-            "## 新功能\n\n- tui：一（bbbbbbb）\n\n"
-            "## 修复\n\n- 二（aaaaaaa）\n\n"
-            "## 其它\n\n- 三（ccccccc）\n",
+            "## 变化\n\n- 新增：一（bbbbbbb）\n- 修复：二（aaaaaaa）\n- 改动：三（ccccccc）\n",
         )
-        self.assertNotIn("文档", text)
+        #  scope（tui）不进列表行；没有任何提交时整节不出现
+        self.assertNotIn("tui", text)
+        self.assertEqual(release_notes.render_plain(release_notes.group_commits([])), "")
         # 正文一个字都不进列表：一个提交一行
         self.assertNotIn("第一段", text)
         self.assertNotIn("第二段", text)
@@ -140,13 +140,13 @@ class BehaviorNotesTest(unittest.TestCase):
             {"sha": "c" * 40, "subject": "docs: 三", "body": ""},
         ]
         text = release_notes.render_body(commits)
-        self.assertTrue(text.startswith("## 行为变化（升级前看一眼）\n\n- 变了（aaaaaaa）\n- 又变了（bbbbbbb）\n\n## 新功能"), text)
-        self.assertIn("- 一（bbbbbbb）\n\n", text)
+        self.assertTrue(text.startswith("## 行为变化（升级前看一眼）\n\n- 变了（aaaaaaa）\n- 又变了（bbbbbbb）\n\n## 变化"), text)
+        self.assertIn("- 新增：一（bbbbbbb）\n", text)
         self.assertNotIn("正文", text)
         self.assertNotIn("  行为变化", text)
-        self.assertIn("- 二（aaaaaaa）\n\n", text)
+        self.assertIn("- 修复：二（aaaaaaa）\n", text)
         self.assertNotIn("第二段", text)
-        self.assertEqual(release_notes.render_body([commits[2]]), "## 文档\n\n- 三（ccccccc）\n")
+        self.assertEqual(release_notes.render_body([commits[2]]), "## 变化\n\n- 文档：三（ccccccc）\n")
 
 
 class AutoValidationTest(unittest.TestCase):
