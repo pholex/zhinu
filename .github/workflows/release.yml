@@ -90,6 +90,9 @@ jobs:
 
   publish:
     needs: artifacts
+    #  不写 if 时默认要求链路上游全部 success，gate 跳过的 test / sdk-test 算 skipped，
+    #  publish 会跟着被跳过（v0.72.0 就是这样空跑了一次）。只看 artifacts 的结论。
+    if: ${{ !cancelled() && needs.artifacts.result == 'success' }}
     runs-on: ubuntu-latest
     environment: pypi
     permissions:
