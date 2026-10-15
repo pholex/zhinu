@@ -43,6 +43,13 @@ class TestInterpretConfirmAnswer(unittest.TestCase):
         #  任意其它文本 = 拒绝理由（原文回灌模型），去除首尾空白
         self.assertEqual(interpret_confirm_answer(" 别动这个文件 "), "别动这个文件")
 
+    def test_short_affirmatives_count_as_yes_but_only_as_whole_words(self) -> None:
+        for word in ("go", "GO", "做", "办", "干", " 干 "):
+            self.assertIs(interpret_confirm_answer(word), True, word)
+        #  多一个字就不是同意，是拒绝理由；"继续"两可（接着说 / 照做），刻意不认
+        for text in ("做吧", "go ahead", "干活", "继续", "ok", "好"):
+            self.assertEqual(interpret_confirm_answer(text), text.strip(), text)
+
     def test_literal_grant_is_a_reason_not_a_sentinel(self) -> None:
         """用户拿 "grant" 当拒绝理由时不能被误判成会话授权。"""
         verdict = interpret_confirm_answer("grant")
