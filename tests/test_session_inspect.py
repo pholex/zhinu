@@ -53,6 +53,52 @@ class InspectTest(TestCase):
         self.assertEqual(inspect_session(self.path, kinds=("approval",), turn=2)["matched"], 1)
         self.assertEqual(inspect_session(self.path, kinds=("request",), request=1)["matched"], 1)
 
+    def test_model_switch_reasons_are_readable_and_filterable(self):
+        records = [
+            {"event": "model", "from_model": "main", "model": "backup", "reason": "auth",
+             "from_route": "direct/main", "to_route": "gateway/main"},
+            {"event": "model", "from_model": "backup", "model": "main", "reason": "preferred_recovered"},
+            {"event": "model", "from_model": "main", "model": "chosen", "reason": "manual"},
+        ]
+        with self.path.open("a", encoding="utf-8") as handle:
+            for record in records:
+                handle.write(json.dumps(record) + "\n")
+        rows = inspect_session(self.path, kinds=("model",), raw=True)["rows"]
+        self.assertEqual([row["summary"] for row in rows], [
+            "direct/main → gateway/main · 鉴权失败",
+            "backup → main · 首选模型恢复",
+            "main → chosen · 手动或宿主切换",
+        ])
+        failures = inspect_session(self.path, kinds=("model",), errors_only=True)["rows"]
+        self.assertEqual(len(failures), 1)
+        self.assertEqual(failures[0]["line"], rows[0]["line"])
+        self.assertEqual(rows[0]["data"]["model"], "backup")
+
+    def test_old_and_future_model_events_do_not_invent_reasons(self):
+        from xiaoyu.session_log import last_model
+
+        records = [
+            {"event": "model", "model": "old"},
+            {"event": "model", "from_model": "old", "model": "next", "reason": "future_reason"},
+        ]
+        with self.path.open("a", encoding="utf-8") as handle:
+            for record in records:
+                handle.write(json.dumps(record) + "\n")
+        rows = inspect_session(self.path, kinds=("model",))["rows"]
+        self.assertEqual(rows[0]["summary"], "未知来源 → old · 原因未记录")
+        self.assertIn("未知原因（future_reason）", rows[1]["summary"])
+        self.assertFalse(any(row["error"] for row in rows))
+        self.assertEqual(last_model(self.path), "next")
+
+    def test_switch_reason_output_is_sanitized(self):
+        token = "sk-" + "abc123private456secret789"
+        with self.path.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps({"event": "model", "model": token,
+                                     "reason": "\u001b[31m" + token}) + "\n")
+        rendered = render_report(inspect_session(self.path, kinds=("model",), raw=True), raw=True)
+        self.assertNotIn(token, rendered)
+        self.assertNotIn("\u001b", rendered)
+
     def test_malformed_and_torn_tail_are_visible(self):
         with self.path.open("ab") as handle:
             handle.write(b'bad\n{"role":"user","content":"\xff"}\n{"role":')

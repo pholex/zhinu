@@ -136,6 +136,58 @@ class AskUserCancelSnapshot(AgentTestCase):
         self.assertEqual(actual["model_requests"], 1)
 
 
+class ModelSwitchSnapshot(AgentTestCase):
+    """跨服务降级、首选恢复与手动切换，在线提示和落盘诊断一起回放。"""
+
+    def test_scenario(self) -> None:
+        import openai
+
+        from xiaoyu.events import Notice
+        from xiaoyu.providers import Provider, Registry
+        from xiaoyu.session_inspect import inspect_session, render_report
+        from xiaoyu.session_log import SessionLog, last_model
+        from .test_agent_paths import FakeClient
+        from .test_errors import _response
+
+        if MODE == "record":
+            self.skipTest("模型切换使用确定性 fixture，不调用真实模型")
+        primary = FakeClient([
+            openai.AuthenticationError("bad key", response=_response(401), body=None),
+            [chunk(content="主服务恢复"), usage_chunk(10, 2)],
+        ])
+        backup = FakeClient([[chunk(content="备用答复"), usage_chunk(10, 2)]])
+        agent = self.build([])
+        agent.registry = Registry([
+            Provider("primary", "http://unused", "", ("main-model",), "主服务"),
+            Provider("gateway", "http://unused", "", (), "备用服务"),
+        ], clients={"primary": primary, "gateway": backup})
+        log = SessionLog.create(str(self.root), "main-model", directory=self.root / "sessions")
+        self.addCleanup(log.release)
+        agent.session_log = log
+        with (mock.patch.object(agent, "emit") as emitted,
+              mock.patch.object(agent.world_state, "diff", return_value=None),
+              mock.patch.object(agent, "_sleep") as sleep):
+            agent.send("开始")
+            agent._preferred_retry_at = 0.0
+            agent.send("继续")
+            agent.switch_model("chosen-model")
+        sleep.assert_not_called()
+        records = [json.loads(line) for line in log.path.read_text(encoding="utf-8", errors="replace").splitlines()]
+        actual = {
+            "notices": [call.args[0].text for call in emitted.call_args_list if isinstance(call.args[0], Notice)],
+            "model_events": [{k: v for k, v in record.items() if k != "ts"}
+                             for record in records if record.get("event") == "model"],
+            "inspect": render_report(inspect_session(log.path, kinds=("model",))).replace(str(log.path), "<SESSION>"),
+            "restored_model": last_model(log.path),
+            "requests_by_provider": [len(primary.completions.calls), len(backup.completions.calls)],
+        }
+        path = Path(__file__).parent / "fixtures" / "model_switch.expected.json"
+        if MODE == "refresh":
+            path.write_text(json.dumps(actual, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        self.assertEqual(actual, json.loads(path.read_text(encoding="utf-8", errors="replace")))
+        self.assertEqual(actual["requests_by_provider"], [2, 1])
+
+
 class ContextSourcesSnapshot(AgentTestCase):
     """项目规则在启动后变更，诊断仍反映装入会话的原文与懒加载结果。"""
 

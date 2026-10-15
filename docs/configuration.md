@@ -91,7 +91,7 @@ XIAOYU_API_KEY=<key>
 | `XIAOYU_API_KEY` | — | 网关 key（也认 `LITELLM_API_KEY`） |
 | `XIAOYU_BEDROCK_REGION` | —（有 key 时 `us-east-1`） | AWS Bedrock 区域，设了即激活 IAM 路线（`1` / `default` = `us-east-1`）；见上方"AWS Bedrock" |
 | `AWS_BEARER_TOKEN_BEDROCK` | — | Bedrock API key（AWS 官方变量名），找到即激活 Bedrock 直连 |
-| `XIAOYU_FALLBACK_MODELS` | —（不降级） | 备用模型链，逗号分隔，主模型重试耗尽后依次切。委托出去的子 agent（含 explore、七襄、斗巧、宸枢成员）沿用同一条链，即使那次委托另外点名了模型 |
+| `XIAOYU_FALLBACK_MODELS` | —（不降级） | 备用模型链，逗号分隔；按错误分类决定重试或切换，切换原因写入会话日志。委托出去的子 agent（含 explore、七襄、斗巧、宸枢成员）沿用同一条链，即使那次委托另外点名了模型 |
 | `XIAOYU_PROVIDERS` | 直连 → 网关 | 覆盖 provider 优先级（如 `gateway,deepseek` = 临时全走网关） |
 | `XIAOYU_VISION_MODELS` | — | 网关后面挂的视觉模型点名（`*` = 一律放行） |
 | `XIAOYU_SIGNATURE_MODELS` | — | 网关后面挂的签名型号点名（Gemini 系，工具重放需带回 thought_signature；`*` = 一律） |

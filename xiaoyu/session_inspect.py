@@ -8,13 +8,13 @@ from pathlib import Path
 import re
 from typing import Any
 
-from . import fsguard, media, ui
+from . import fsguard, media, model_switch, ui
 from .diagnostics import redact_value
 
 
 def _clean(value: Any, key: str = "") -> Any:
     if isinstance(value, str):
-        return ui.strip_sequences(redact_value(key, value)).encode("utf-8", "replace").decode("utf-8", errors="replace")
+        return redact_value(key, ui.strip_sequences(value)).encode("utf-8", "replace").decode("utf-8", errors="replace")
     if isinstance(value, dict):
         return {str(k): _clean(v, str(k)) for k, v in value.items()}
     if isinstance(value, list):
@@ -103,6 +103,12 @@ def inspect_session(
                     if key in record:
                         summary += f" {key}={record[key]}"
                 add(line_no, record, "request", summary, failed=outcome in ("error", "empty"))
+            elif event == "model":
+                before = record.get("from_route") or record.get("from_model") or "未知来源"
+                after = record.get("to_route") or record.get("model") or "未知模型"
+                reason = str(record.get("reason") or "")
+                summary = f"{before} → {after} · {model_switch.describe(reason)}"
+                add(line_no, record, "model", summary, failed=model_switch.is_failure(reason))
             elif role == "assistant":
                 if text := media.text_of(record.get("content")):
                     add(line_no, record, "message.assistant", text)

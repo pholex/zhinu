@@ -595,6 +595,18 @@ class RequestLogTest(AgentTestCase):
             self.assertEqual((record["provider"], record["model"]), ("gateway", "main-model"))
             self.assertIn("total_ms", record)
 
+    def test_fallback_records_the_cause_and_both_routes(self):
+        self.config.fallback_models = ["backup-model"]
+        agent = self.run_with_log([
+            rate_limit_error(), rate_limit_error(), rate_limit_error(),
+            [chunk(content="好了"), usage_chunk(10, 1)],
+        ])
+        changes = [fields for kind, fields in agent.session_log.events if kind == "model"]
+        self.assertEqual(changes, [{
+            "model": "backup-model", "from_model": "main-model", "reason": "rate_limit",
+            "from_route": "gateway/main-model", "to_route": "gateway/backup-model",
+        }])
+
     def test_request_id_and_code_are_kept_when_the_upstream_gives_them(self):
         response = httpx2.Response(
             429, request=httpx2.Request("POST", "http://unused"),

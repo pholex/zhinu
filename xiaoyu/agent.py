@@ -29,6 +29,7 @@ from . import (
     envprobe,
     errors,
     media,
+    model_switch,
     modes,
     otel,
     providers,
@@ -4410,6 +4411,14 @@ class Agent:
         轮次进行中调用时对当前这一步无效：本步已按开头的快照选好路由
         （见 StepContext），下一步起生效。
         """
+        self._switch_model(name, sticky=sticky, reason="automatic" if sticky else "manual")
+
+    def _switch_model(
+        self, name: str, *, sticky: bool = False, reason: str,
+        from_route: str = "", to_route: str = "",
+    ) -> None:
+        """内部切换附上已知原因；model 字段继续供旧会话恢复入口读取。"""
+        previous = self.config.model
         if sticky and name != self._preferred_model:
             #  降级链的自动切换：记住首选模型（连环降级只记最初那个），冷却后回探
             if self._preferred_model is None:
@@ -4424,7 +4433,12 @@ class Agent:
             self.compactor.state.recover()
         self.config.model = name
         if self.session_log:
-            self.session_log.event("model", model=name)
+            fields = {"model": name, "from_model": previous, "reason": reason}
+            if from_route:
+                fields["from_route"] = from_route
+            if to_route:
+                fields["to_route"] = to_route
+            self.session_log.event("model", **fields)
 
     def refresh_capabilities(self, model: str | None = None) -> list[str]:
         """探测当前模型的 Models API 能力并自校正上下文上限（on-demand，非启动期）。
@@ -4484,11 +4498,12 @@ class Agent:
         return self._routes([model, *self.config.fallback_models])
 
     def _stream_with_recovery(self, with_tools: bool = True) -> dict[str, Any]:
-        """备用模型降级链的外层：主模型重试耗尽后依次切备用模型。
+        """备用模型降级链的外层：按错误分类决定是否切备用路由。
 
         层序不能反：
         retry 在内层——瞬时错误该等，等完多半就好了；换模型在外层——重试都耗尽
         说明是模型级故障（持续限流/持续 5xx），再等下去只是白挨。
+        鉴权失败、额度耗尽或确定性空回复等可提前切换，提示与日志按实际原因留痕。
         换模型时 self.messages 原样重发，会话状态一点不丢。
         切换是粘性的（改 config.model）：否则主模型宕机期间每次请求都要先
         白等一轮重试退避才轮到备用模型。粘性不等于永久：冷却到期后在真实请求上
@@ -4503,16 +4518,21 @@ class Agent:
         budget = _RetryBudget(self._RECOVERY_BUDGET)
         for index, route in enumerate(chain):
             if index:
+                assert last_error is not None
+                reason = "empty" if isinstance(last_error, _DeterministicEmpty) else classify(last_error).kind
                 self.emit(
                     Notice(
-                        f"[{chain[index - 1].qualified} 重试已耗尽，切换到 {route.qualified}"
+                        f"[{chain[index - 1].qualified} 因{model_switch.describe(reason)}，切换到 {route.qualified}"
                         "（对话原样继续；/model 可切回）]",
                         "warn",
                     )
                 )
                 #  粘性写回：能用裸名表达就用裸名，跨 provider 才写全限定名。
                 #  粘性状态仍是单个字符串，/model、banner、SessionLog 都不用改。
-                self.switch_model(self.registry.sticky_name(route), sticky=True)
+                self._switch_model(
+                    self.registry.sticky_name(route), sticky=True, reason=reason,
+                    from_route=chain[index - 1].qualified, to_route=route.qualified,
+                )
             try:
                 return self._stream_retrying(
                     route, with_tools=with_tools, budget=budget,
@@ -4571,8 +4591,11 @@ class Agent:
             message = self._stream_once(route, with_tools=with_tools)
             if not media.text_of(message.get("content")).strip() and not message.get("tool_calls"):
                 failure = "返回空补全"
+            self._log_request(route, 1, "empty" if failure else "ok")
         except Exception as exc:  # noqa: BLE001 - 回探失败只影响回探节奏，不影响本次请求
-            failure = classify(exc).hint
+            verdict = classify(exc)
+            failure = verdict.hint
+            self._log_request(route, 1, "error", exc=exc, verdict=verdict)
         if failure:
             self._preferred_backoff = min(
                 max(self._preferred_backoff, self._PREFERRED_PROBE_DELAY) * 2,
@@ -4588,7 +4611,11 @@ class Agent:
             )
             return None
         self.emit(Notice(f"[首选模型 {route.qualified} 已恢复，切回]", "info"))
-        self.switch_model(preferred)
+        current = self._main_route()
+        self._switch_model(
+            preferred, reason="preferred_recovered",
+            from_route=current.qualified if current is not None else "", to_route=route.qualified,
+        )
         return message
 
     def _stream_retrying(
