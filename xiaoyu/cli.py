@@ -3863,14 +3863,20 @@ def sandbox_status(config: Config) -> str:
 GRANT_SESSION = object()
 
 
+#  确认框里算"允许"的整词：只认整条输入恰好是其中之一（去首尾空白、不分大小写），
+#  "做吧""go ahead"都不算——多一个字就是拒绝理由。刻意不收"继续"：它两可，既可能
+#  是"按这个方案干"，也可能是"接着说"，放进来会把后者误放行。
+CONFIRM_YES = frozenset({"y", "yes", "go", "做", "办", "干"})
+
+
 def interpret_confirm_answer(answer: str) -> bool | str | object:
     """确认框输入 → 判定（明文与 TUI 两个前端共用的单一语义源）：
-    y/yes=允许；GRANT_SESSION=本会话该工具全允许（调用方负责落会话授权并提示）；
-    空/n/no=拒绝；其它任意文本=拒绝并把原文当理由回灌模型。"""
+    CONFIRM_YES 里的整词=允许；GRANT_SESSION=本会话该工具全允许（调用方负责落会话
+    授权并提示）；空/n/no=拒绝；其它任意文本=拒绝并把原文当理由回灌模型。"""
     lowered = answer.strip().lower()
     if lowered == "a":
         return GRANT_SESSION
-    if lowered in ("y", "yes"):
+    if lowered in CONFIRM_YES:
         return True
     if lowered in ("", "n", "no"):
         return False
