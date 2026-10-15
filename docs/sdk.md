@@ -564,6 +564,39 @@ plan 模式按内核规则退回先前模式，auto／default 保持；生命周
 `reset()` 清除活动快照，成功回滚的快照不会在重启后重新出现。旧版本日志没有保存
 文件快照，仍返回空清单；不存在的点返回 `unavailable`。
 
+回滚前可先只读预览，再将原预览传回执行：
+
+```python
+preview = session.preview_rewind(3, conversation=False)
+for item in preview.files:
+    print(item.action, item.path, item.note)
+    print(item.diff)  # 当前文件 → 回滚目标
+# 宿主展示后取得用户确认；同一次操作的范围参数保持一致。
+result = session.rewind(3, conversation=False, preview=preview)
+```
+
+`AsyncSession` 的两个方法都用 `await`。`RewindPreview` 包含 `checkpoint`、
+`available`、`files`、不透明 `token`、`conversation_requested`、`files_requested`
+和 `conversation_available`。每个 `RewindFilePreview` 包含工作区相对 `path`、
+`action`（restore / delete / conflict / skip）、`diff`、`note`、`diff_truncated`。
+未知检查点的 `available=False`；对话原轮次已无法定位时 `conversation_available=False`。
+
+预览不写文件、对话或日志，只读取快照追踪的路径。UTF-8 文本显示统一差异；
+二进制、非 UTF-8、任一版本超过 64 KiB 或合计超过 2,000 行时仅列操作。
+每份预览的差异总量最多 12,000 字符，省略或截断会显式标注。
+预览内容供宿主审阅，不自动送给模型；宿主渲染时仍须按不可信文本转义。
+
+传入预览后，执行会校验会话、检查点、范围、文件版本及所选对话状态；
+状态变化时拒绝恢复并要求重新预览，重启后也须重新获取。
+SDK 中已有外部编辑仍返回 `conflict`，预览不授予强制覆盖权限。
+文件与对话的恢复仍是现有整批语义，`skip` 文件不会恢复；预览不保证文件可写，
+执行失败仍需检查 `RewindResult`。执行前校验与写入之间的系统调用竞态仍存在，
+不提供跨进程文件锁。已有不传 `preview` 的调用保持原行为。
+
+CLI `/rewind`（或 `/undo`）在选择范围后显示同一预览，再以默认否确认；
+取消会保留文件和对话。`/rewind 3 --preview` 选择范围后只显示、不执行。
+CLI 保留用户显式确认覆盖已有冲突的入口，但确认期间发生的新变化仍会阻止执行。
+
 ## 验证与发布
 
 完整示例见 [examples/sdk](../examples/sdk/README.md)，支持无凭据的 `--demo`。

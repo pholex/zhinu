@@ -26,7 +26,7 @@ from xiaoyu.hooks import Decision
 from xiaoyu.output import OutputContract, validator_for
 from xiaoyu.permissions import Permissions, parse_rule, call_identity
 from xiaoyu.providers import Provider, Registry
-from xiaoyu.rewind import RewindResult
+from xiaoyu.rewind import RewindPreview, RewindResult
 from xiaoyu.session_log import SessionInfo, SessionLog, SessionLockedError, load_messages, replay_records, list_sessions as _list_sessions
 from xiaoyu.tools import Tool as KernelTool, Toolbox
 
@@ -1003,13 +1003,22 @@ class Session:
             assert self._toolbox is not None
             return tuple(p.index for p in self._toolbox.rewind.points())
 
-    def rewind(self, index: int, *, conversation: bool = True, files: bool = True) -> RewindResult:
+    def preview_rewind(self, index: int, *, conversation: bool = True, files: bool = True) -> RewindPreview:
+        with self._mutex:
+            self._check_idle()
+            if conversation and self._has_question_history:
+                raise ConfigurationError("Conversation rewind with durable questions is not supported yet; use reset or fork")
+            assert self._agent is not None
+            return self._agent.preview_rewind(index, conversation, files)
+
+    def rewind(self, index: int, *, conversation: bool = True, files: bool = True,
+               preview: RewindPreview | None = None) -> RewindResult:
         with self._mutex:
             self._check_idle()
             if conversation and self._has_question_history:
                 raise ConfigurationError("Conversation rewind with durable questions is not supported yet; use reset or fork")
             assert self._toolbox is not None and self._agent is not None
-            return self._agent.rewind_result(index, conversation=conversation, files=files)
+            return self._agent.rewind_result(index, conversation=conversation, files=files, preview=preview)
 
     def mcp_status(self) -> tuple[McpServerStatus, ...]:
         """Read immutable state snapshots; never include server error bodies/headers."""
@@ -1379,8 +1388,12 @@ class AsyncSession:
         self._bind_loop()
         return type(self)._adopt(await asyncio.to_thread(self._session.fork, options=options))
 
-    async def rewind(self, index: int, *, conversation: bool = True, files: bool = True) -> RewindResult:
-        return await asyncio.to_thread(self._session.rewind, index, conversation=conversation, files=files)
+    async def preview_rewind(self, index: int, *, conversation: bool = True, files: bool = True) -> RewindPreview:
+        return await asyncio.to_thread(self._session.preview_rewind, index, conversation=conversation, files=files)
+
+    async def rewind(self, index: int, *, conversation: bool = True, files: bool = True,
+                     preview: RewindPreview | None = None) -> RewindResult:
+        return await asyncio.to_thread(self._session.rewind, index, conversation=conversation, files=files, preview=preview)
 
     def checkpoints(self) -> tuple[int, ...]:
         return self._session.checkpoints()

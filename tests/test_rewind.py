@@ -376,11 +376,11 @@ class AgentRewindTest(unittest.TestCase):
         self.turn(agent, "第二件事")
         self.turn(agent, "第三件事")
         #  仅文件（scope 3）：不预填
-        with mock.patch("builtins.input", side_effect=["3"]), contextlib.redirect_stdout(io.StringIO()):
+        with mock.patch("builtins.input", side_effect=["3", "y"]), contextlib.redirect_stdout(io.StringIO()):
             _rewind_flow(agent, ["3"])
         self.assertEqual(agent.drain_steers(), [])
         #  仅对话（scope 2）：第二轮原话预填，可改可直接回车
-        with mock.patch("builtins.input", side_effect=["2"]), contextlib.redirect_stdout(io.StringIO()):
+        with mock.patch("builtins.input", side_effect=["2", "y"]), contextlib.redirect_stdout(io.StringIO()):
             _rewind_flow(agent, ["2"])
         self.assertEqual(agent.drain_steers(), ["第二件事"])
         texts = [m.get("content") for m in agent.messages if m.get("role") == "user"]

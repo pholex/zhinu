@@ -23,6 +23,7 @@ from .observation import (
     SessionSnapshot as SessionSnapshot, SessionState as SessionState,
 )
 from xiaoyu.rewind import RewindResult as RewindResult
+from xiaoyu.rewind import RewindPreview as RewindPreview, RewindFilePreview as RewindFilePreview
 from xiaoyu.artifacts import FileArtifact as FileArtifact
 from xiaoyu.events import ArtifactsReady as ArtifactsReady
 from .types import (
@@ -64,7 +65,7 @@ __all__ = [
     "McpPool", "OAuthClient", "OAuthTokens", "OAuthTokenStore", "MemoryTokenStore", "OAuthError", "McpManagementError",
     "TaskSpec", "TaskSnapshot", "TaskHandle", "TaskManager",
     "SessionStore", "SessionWriter", "SQLiteSessionStore", "StoredSessionInfo",
-    "Plugin", "McpServerStatus", "RewindResult",
+    "Plugin", "McpServerStatus", "RewindResult", "RewindPreview", "RewindFilePreview",
     "__version__", "Session", "AsyncSession", "run", "run_async", "ModelOptions",
     "SessionOptions", "OutputSpec", "Tool", "ToolResult", "ToolHandler", "Hook",
     "HookHandler", "HookDecision", "McpServer", "Subagent", "Approval", "Approver", "Asker",

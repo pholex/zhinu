@@ -29,9 +29,13 @@ from __future__ import annotations
 
 import base64
 import copy
+import difflib
 import hashlib
+import json
 import os
+import stat
 import time
+import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Literal
@@ -43,6 +47,32 @@ from .artifacts import fingerprint_file
 MAX_POINTS = 64
 #  单文件超过这个字节数不快照（该文件从此轮起不可回滚，点上有标记）
 MAX_FILE_BYTES = 5 * 1024 * 1024
+PREVIEW_BYTES = 64 * 1024
+PREVIEW_CHARS = 12_000
+
+
+@dataclass(frozen=True)
+class RewindFilePreview:
+    """One proposed whole-file operation; diff runs from current to target bytes."""
+
+    path: str
+    action: Literal["restore", "delete", "conflict", "skip"]
+    diff: str = ""
+    note: str = ""
+    diff_truncated: bool = False
+
+
+@dataclass(frozen=True)
+class RewindPreview:
+    """Read-only review. The opaque token expires when the reviewed state changes."""
+
+    checkpoint: int
+    available: bool
+    files: tuple[RewindFilePreview, ...] = ()
+    token: str = ""
+    conversation_requested: bool = True
+    files_requested: bool = True
+    conversation_available: bool = False
 
 
 @dataclass(frozen=True)
@@ -97,6 +127,7 @@ class RewindStore:
         self.workspace = workspace.resolve() if workspace is not None else None
         self.journal: Callable[..., None] | None = None
         self.problem = ""
+        self._preview_nonce = uuid.uuid4().hex
 
     def _event(self, action: str, **fields: Any) -> None:
         if self.journal is not None:
@@ -107,7 +138,11 @@ class RewindStore:
             raise ValueError("Checkpoint workspace is unknown")
         target = Path(raw)
         # 恢复仅接受原工作区内未被替换为符号链接的路径。
-        if target.resolve() != target or not target.is_relative_to(self.workspace):
+        try:
+            resolved = target.resolve()
+        except (OSError, RuntimeError) as exc:
+            raise ValueError("Checkpoint path cannot be resolved") from exc
+        if resolved != target or not target.is_relative_to(self.workspace):
             raise ValueError("Checkpoint path is outside its original workspace")
         relative = target.relative_to(self.workspace).as_posix()
         if relative == "." or ".git" in Path(relative).parts:
@@ -233,9 +268,69 @@ class RewindStore:
                 seen.update(point.skipped)
         return sorted(seen)
 
+    def preview(self, index: int, *, files: bool = True, include_diff: bool = True) -> RewindPreview:
+        """仅读取已追踪路径；令牌绑定检查点、当前版本及所属 store。"""
+        if self.get(index) is None:
+            return RewindPreview(index, False, files_requested=files)
+        targets = self.files_from(index) if files else {}
+        latest: dict[str, str | None] = {}
+        pending: set[str] = set()
+        state: list[Any] = [self._preview_nonce, self._counter, index, files]
+        for point in self._points:
+            if point.index >= index:
+                latest.update(point.after)
+                pending.update(point.pending)
+                state.append([point.index, point.conversation_available,
+                              sorted((p, _fingerprint(b)) for p, b in point.files.items()),
+                              sorted(point.after.items()), sorted(point.pending), sorted(point.skipped)])
+        items = []
+        diff_budget = PREVIEW_CHARS
+        for raw, before in sorted(targets.items()):
+            path = Path(raw)
+            display = path.relative_to(self.workspace).as_posix() if self.workspace else raw
+            content: bytes | None = None
+            note = ""
+            try:
+                if self.workspace is not None:
+                    self._relative(raw)
+                fingerprint, version, content = _preview_read(path, include_diff)
+                if self.workspace is not None:
+                    self._relative(raw)
+            except (OSError, ValueError, RuntimeError):
+                fingerprint, version = "unreadable", "unreadable"
+                note = "路径已改变、无法读取或不是普通文件"
+            state.append([raw, fingerprint, version])
+            action: Literal["restore", "delete", "conflict", "skip"] = "delete" if before is None else "restore"
+            if raw in pending or raw not in latest:
+                action, note = "conflict", "缺少可靠的写后确认"
+            elif fingerprint != latest[raw] or note:
+                action = "conflict"
+                note = note or "当前内容与工具确认的版本不同"
+            if action == "conflict":
+                note = ("拟删除文件；" if before is None else "拟恢复文件；") + note
+            diff, truncated = "", False
+            if include_diff and fingerprint != "unreadable":
+                if diff_budget > 0:
+                    diff, diff_note, truncated = _preview_diff(display, content, before)
+                    if len(diff) > diff_budget:
+                        diff, diff_note, truncated = diff[:diff_budget], "差异已截断", True
+                    diff_budget -= len(diff)
+                else:
+                    diff_note, truncated = "差异总量已达上限，仅展示操作清单", True
+                note = "；".join(part for part in (note, diff_note) if part)
+            items.append(RewindFilePreview(display, action, diff, note, truncated))
+        if files:
+            for raw in self.skipped_from(index):
+                if raw not in targets:
+                    path = Path(raw)
+                    display = path.relative_to(self.workspace).as_posix() if self.workspace else raw
+                    items.append(RewindFilePreview(display, "skip", note="改前内容超过快照上限，无法恢复"))
+        token = hashlib.sha256(json.dumps(state, ensure_ascii=True).encode()).hexdigest()
+        return RewindPreview(index, True, tuple(items), token, files_requested=files)
+
     # ---------- 恢复 ----------
 
-    def rewind_files(self, index: int) -> tuple[bool, str]:
+    def rewind_files(self, index: int, *, validate: Callable[[], bool] | None = None) -> tuple[bool, str]:
         """把 ≥index 各点覆盖的文件恢复到第 index 轮开始前。返回 (成功?, 摘要)。
 
         全成或全不动：全部成功才丢弃 ≥index 的点；中途有一个写不回去，已经写回的
@@ -266,6 +361,9 @@ class RewindStore:
         #  写盘前持久化不确定状态。进程在恢复中途退出时，接回不能再把这些
         # 路径当成可靠的写后版本；普通异常仍走原有逆序回退。
         self._event("restore_started", index=index)
+        if validate is not None and not validate():
+            self._event("restore_cancelled", index=index)
+            return False, "预览已失效，文件未恢复；请重新预览。"
 
         restored, removed = 0, 0
         undo: list[tuple[Path, bytes | None]] = []  # 动手前的样子，失败时逆序还原
@@ -490,6 +588,60 @@ class CheckpointReplay:
 
 def _fingerprint(content: bytes | None) -> str | None:
     return hashlib.sha256(content).hexdigest() if content is not None else None
+
+
+def _preview_read(path: Path, include_content: bool) -> tuple[str | None, Any, bytes | None]:
+    """Hash through one regular-file descriptor; retain only a bounded diff input."""
+    try:
+        fsguard.require_regular(path)
+        descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0))
+    except FileNotFoundError:
+        return None, None, b""
+    with os.fdopen(descriptor, "rb") as stream:
+        before = os.fstat(stream.fileno())
+        if not stat.S_ISREG(before.st_mode):
+            raise ValueError("Not a regular file")
+        digest = hashlib.sha256()
+        content = bytearray()
+        remaining = before.st_size
+        while remaining:
+            chunk = stream.read(min(remaining, 1024 * 1024))
+            if not chunk:
+                raise ValueError("File changed during preview")
+            digest.update(chunk)
+            if include_content and before.st_size <= PREVIEW_BYTES:
+                content.extend(chunk)
+            remaining -= len(chunk)
+        after = os.fstat(stream.fileno())
+        version = lambda value: (value.st_dev, value.st_ino, value.st_size, value.st_mtime_ns, value.st_ctime_ns)
+        if version(before) != version(after):
+            raise ValueError("File changed during preview")
+        return digest.hexdigest(), version(after), bytes(content) if include_content and before.st_size <= PREVIEW_BYTES else None
+
+
+def _preview_diff(path: str, current: bytes | None, target: bytes | None) -> tuple[str, str, bool]:
+    target = target if target is not None else b""
+    if current is None or len(target) > PREVIEW_BYTES:
+        return "", "文件较大，仅展示操作清单", False
+    old, new = (data.decode("utf-8", errors="replace") for data in (current, target))
+    if any("\x00" in text or "\ufffd" in text for text in (old, new)):
+        return "", "二进制或非 UTF-8 文件，仅展示操作清单", False
+    # 限制输入行数，避免大量短行拖慢差异计算；输出也有独立上限。
+    if old.count("\n") + new.count("\n") > 2000:
+        return "", "文件行数较多，仅展示操作清单", False
+    parts, length, truncated = [], 0, False
+    for line in difflib.unified_diff(old.splitlines(keepends=True), new.splitlines(keepends=True),
+                                     fromfile=f"current/{path}", tofile=f"target/{path}"):
+        if not line.endswith("\n"):
+            line += "\n\\ No newline at end of file\n"
+        remaining = PREVIEW_CHARS - length
+        if len(line) > remaining:
+            parts.append(line[:remaining])
+            truncated = True
+            break
+        parts.append(line)
+        length += len(line)
+    return "".join(parts), "差异已截断" if truncated else "", truncated
 
 
 def _undo(journal: list[tuple[Path, bytes | None]]) -> list[str]:

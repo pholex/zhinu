@@ -237,6 +237,11 @@ host.watch_notifications(on_notification)   # 在事件循环里调用；传 Non
 
 ## 会话：resume / recycle / 落盘
 
+`agent.preview_rewind(index, conversation=True, files=True)` 返回只读 `RewindPreview`；
+`agent.rewind_result(index, ..., preview=preview)` 校验预览仍对应当前状态后执行。
+文件条目为 `RewindFilePreview`，包含恢复/删除/冲突/跳过操作与有界文本差异。
+完整字段、冲突和范围契约见 [SDK 回滚预览](sdk.md#本地恢复分叉和回滚)。
+
 - **落盘**：`Agent(session_log=xiaoyu.SessionLog.create(model, str(workspace), directory=自己的目录))`。
   常驻宿主**显式传 `directory`**，与用户 CLI 手动会话彻底隔离；缺省落在按工作区
   分区的公共目录。
@@ -341,7 +346,7 @@ EOF / 连接关闭：挂起审批全部拒绝、打断当前轮、等工作线�
 - **事件**：`UIEvent`、`UISink`、`RequestStarted`、`RequestEnded`、`TextDelta`、
   `TextEnd`、`ToolPreparing`、`ToolPending`、`ToolPurpose`、`ToolRunning`、`ToolCompleted`、
   `ToolDenied`、`SteerAccepted`、`PlanUpdated`、`ArtifactsReady`、`Notice`
-- **会话**：`SessionLog`、`SessionLockedError`、`load_messages`、`list_sessions`
+- **会话**：`SessionLog`、`SessionLockedError`、`load_messages`、`list_sessions`、`RewindPreview`、`RewindFilePreview`
 - **权限**：`Permissions`、`Rule`、`parse_rule`、`suggest_allow_rule`、
   `banned_allow_reason`、`user_rules_path`、`workspace_rules_path`
 - **配置**：`load_dotenv`、`user_env_path`、`MissingConfig`、`MissingApiKey`

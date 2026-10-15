@@ -21,6 +21,8 @@ assert importlib.util.find_spec("xiaoyu_agent_sdk.testing") is None, "Storage te
 assert sdk.__version__ == xiaoyu.__version__
 assert sdk.FileArtifact is xiaoyu.FileArtifact
 assert sdk.ArtifactsReady is xiaoyu.ArtifactsReady
+assert sdk.RewindPreview is xiaoyu.RewindPreview
+assert sdk.RewindFilePreview is xiaoyu.RewindFilePreview
 assert importlib.metadata.version("xiaoyu-agent-sdk") == sdk.__version__
 for package in ("fastapi", "playwright", "prompt_toolkit", "rich"):
     assert importlib.util.find_spec(package) is None, f"Unselected extra installed: {package}"
@@ -59,6 +61,8 @@ with tempfile.TemporaryDirectory() as directory:
     with sdk.Session(options, resume_id=key) as restored:
         assert restored.session_id == key
         assert restored.checkpoints() == (1,)
+        preview = restored.preview_rewind(1)
+        assert preview.available and preview.conversation_available and not preview.files
         assert restored.run("Return 42 again", output=sdk.OutputSpec({"type": "integer"})).output_status == "valid"
     assert len(store.list_sessions()) == 1
     class PlainClient:

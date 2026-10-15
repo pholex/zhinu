@@ -1,0 +1,6 @@
+{
+  "terminal": "  可回滚的轮次（恢复到该轮**开始前**的状态）：\n    1. [12:00] 生成草稿，改动 1 个文件\n  （快照只覆盖 write_file/str_replace；bash 改动与 git 操作不在内）\n  回滚范围：1=对话+文件（默认） 2=仅对话 3=仅文件\n  › 3\n  回滚预览（当前文件 → 目标版本）：\n    [删除] draft.txt\n--- current/draft.txt\n+++ target/draft.txt\n@@ -1 +0,0 @@\n-Draft report.\n  执行以上回滚？[y/N] › y\n  文件：删除 1 个本轮新建的文件。\n",
+  "file_exists": false,
+  "checkpoints": [],
+  "model_requests": 2
+}

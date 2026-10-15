@@ -56,7 +56,7 @@ from .config import EFFORT_LEVELS, Config, project_levels
 from .errors import Interrupted, classify
 from .providers import Registry, Route, UnknownModel, first_chunk_timeout, request_timeout
 from .permissions import Permissions, call_identity
-from .rewind import RewindResult
+from .rewind import RewindPreview, RewindResult
 from .artifacts import FileArtifact
 from .events import (
     ArtifactsReady,
@@ -2807,8 +2807,35 @@ class Agent:
     def rewind_to(self, index: int, conversation: bool = True, files: bool = True) -> str:
         return self.rewind_result(index, conversation, files, check_conflicts=False).summary
 
+    def _rewind_position(self, index: int) -> int:
+        store = getattr(self.toolbox, "rewind", None)
+        point = store.get(index) if store is not None else None
+        if point is None or not point.conversation_available:
+            return -1
+        occurrence = sum(1 for other in store.points() if other.conversation_available
+                         and other.index <= index and other.prompt_text == point.prompt_text)
+        for position, message in enumerate(self.messages):
+            if message.get("role") == "user" and media.text_of(message.get("content")) == point.prompt_text:
+                occurrence -= 1
+                if occurrence == 0:
+                    return position
+        return -1
+
+    def preview_rewind(self, index: int, conversation: bool = True, files: bool = True,
+                       *, include_diff: bool = True) -> RewindPreview:
+        """只读预览，令牌绑定文件版本、检查点与当前对话；不会写会话日志。"""
+        from dataclasses import replace
+
+        store = getattr(self.toolbox, "rewind", None)
+        preview = store.preview(index, files=files, include_diff=include_diff) if store else RewindPreview(index, False)
+        state = [preview.token, conversation, files, self.history_version, self._rewind_position(index),
+                 self.messages if conversation else None]
+        token = hashlib.sha256(json.dumps(state, ensure_ascii=True, sort_keys=True).encode()).hexdigest() if preview.available else ""
+        return replace(preview, token=token, conversation_requested=conversation, files_requested=files,
+                       conversation_available=conversation and self._rewind_position(index) >= 0)
+
     def rewind_result(self, index: int, conversation: bool = True, files: bool = True,
-                      *, check_conflicts: bool = True) -> RewindResult:
+                      *, check_conflicts: bool = True, preview: RewindPreview | None = None) -> RewindResult:
         """回滚到快照点 index，返回状态、文件清单与可读说明。
 
         对话截断按**该轮用户输入原文**在当前历史里定位（同文多次出现按点序数
@@ -2826,6 +2853,12 @@ class Agent:
         point = store.get(index)
         if point is None:
             return RewindResult(index, "unavailable", summary=f"没有编号为 {index} 的快照点（/rewind 重新看列表）。")
+        if preview is not None:
+            fresh = self.preview_rewind(index, conversation, files, include_diff=False)
+            if (not preview.available or preview.checkpoint != index
+                    or preview.token != fresh.token
+                    or preview.conversation_requested != conversation or preview.files_requested != files):
+                return RewindResult(index, "conflict", summary="预览已失效，文件与对话均未回滚；请重新预览。")
         targets = store.files_from(index) if files else {}
         skipped = tuple(store.skipped_from(index)) if files else ()
         conflicts = tuple(store.conflicts(index)) if files and check_conflicts else ()
@@ -2835,27 +2868,14 @@ class Agent:
         requested_conversation = conversation
         notes: list[str] = []
         if conversation:
-            occurrence = sum(
-                1
-                for other in store.points()
-                if other.conversation_available and other.index <= index and other.prompt_text == point.prompt_text
-            )
-            found = -1
-            seen = 0
-            for position, message in enumerate(self.messages if point.conversation_available else []):
-                if message.get("role") != "user":
-                    continue
-                if media.text_of(message.get("content")) != point.prompt_text:
-                    continue
-                seen += 1
-                if seen == occurrence:
-                    found = position
-                    break
+            found = self._rewind_position(index)
             if found < 0:
                 notes.append("该轮对话已被压缩合并，本次只回滚文件、不动对话")
                 conversation = False
         if files:
-            ok, summary = store.rewind_files(index)
+            validate = (lambda: self.preview_rewind(index, preview.conversation_requested,
+                         preview.files_requested, include_diff=False).token == preview.token) if preview is not None else None
+            ok, summary = store.rewind_files(index, validate=validate)
             if self.session_log:
                 self.session_log.event("rewind_files", target=index, ok=ok)
             if not ok:

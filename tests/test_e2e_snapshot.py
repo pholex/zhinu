@@ -136,6 +136,44 @@ class AskUserCancelSnapshot(AgentTestCase):
         self.assertEqual(actual["model_requests"], 1)
 
 
+class RewindPreviewSnapshot(AgentTestCase):
+    """真实文件工具写入后，CLI 显示预览并确认恢复；不调用网络。"""
+
+    def test_scenario(self) -> None:
+        from xiaoyu.cli import _rewind_flow
+        from xiaoyu.render import NullSink
+
+        if MODE == "record":
+            self.skipTest("回滚交互使用确定性 fixture，不调用真实模型")
+        agent = self.build([
+            [chunk(tool_calls=[call_fragment(0, "write", "write_file", json.dumps(
+                {"path": "draft.txt", "content": "Draft report.\n"}))]), usage_chunk(10, 5)],
+            [chunk(content="草稿已写入。"), usage_chunk(15, 5)],
+        ], sink=NullSink())
+        agent.send("生成草稿")
+        shown = io.StringIO()
+        replies = iter(["3", "y"])
+
+        def answer(prompt):
+            reply = next(replies)
+            print(prompt + reply)
+            return reply
+
+        with (contextlib.redirect_stdout(shown), mock.patch("builtins.input", side_effect=answer),
+              mock.patch("xiaoyu.cli.time.strftime", return_value="12:00"),
+              mock.patch("xiaoyu.ui._ENABLED", False)):
+            _rewind_flow(agent, ["1"])
+        actual = {"terminal": shown.getvalue(), "file_exists": (self.root / "draft.txt").exists(),
+                  "checkpoints": [p.index for p in agent.toolbox.rewind.points()],
+                  "model_requests": len(self.client.completions.calls)}
+        path = Path(__file__).parent / "fixtures" / "rewind_preview.expected.json"
+        if MODE == "refresh":
+            path.write_text(json.dumps(actual, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        self.assertEqual(actual, json.loads(path.read_text(encoding="utf-8", errors="replace")))
+        self.assertFalse(actual["file_exists"])
+        self.assertEqual(actual["model_requests"], 2)
+
+
 def _scenario_dir(name: str) -> Path:
     return SNAPSHOTS / name
 

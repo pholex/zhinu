@@ -89,7 +89,7 @@ SLASH_COMMANDS: dict[str, str] = {
     "/allow": "持久允许，如 /allow bash(git *)、/allow write_file",
     "/deny": "持久拒绝（任何模式下都拦，包括 --yolo）",
     "/resume": "切到本工作区的历史会话（当前对话被清空；菜单里敲字过滤，/resume <序号> 直接选）",
-    "/rewind": "回滚到某轮开始前（对话和/或文件；/undo 同义）。回退对话后那一轮的原话预填回输入行，可改可直接回车",
+    "/rewind": "预览并确认回滚（对话和/或文件；/undo 同义）；--preview 只查看。回退对话后原话预填回输入行",
     "/copy": "把最后一条回复复制到剪贴板（没有剪贴板命令时经终端 OSC 52）",
     "/export": "把本会话导出成 Markdown（/export [路径]，默认写到工作区 xiaoyu-session-<id>.md）",
     "/clear": "清空对话历史（保留 system prompt）",
@@ -3423,7 +3423,7 @@ def _repl_loop(agent: Agent) -> int:
 
 
 def _rewind_flow(agent: Agent, rest: list[str]) -> None:
-    """/rewind 的交互流程：列点 → 选点 → 选范围 → 冲突确认 → 执行。
+    """/rewind 的交互流程：列点 → 选点 → 选范围 → 预览 → 确认 → 执行。
 
     快照只覆盖 write_file / str_replace 的改动；bash 里改的、git 操作不在
     范围内——列表下方明说，不装作全能。
@@ -3441,7 +3441,9 @@ def _rewind_flow(agent: Agent, rest: list[str]) -> None:
         print(f"  {point.index:>3}. [{stamp}] {point.preview}{touched}")
     print(ui.secondary("  （快照只覆盖 write_file/str_replace；bash 改动与 git 操作不在内）"))
 
-    choice = rest[0] if rest else input(ui.prompt("  回滚到第几轮前（回车取消）› ")).strip()
+    preview_only = "--preview" in rest
+    arguments = [arg for arg in rest if arg != "--preview"]
+    choice = arguments[0] if arguments else input(ui.prompt("  回滚到第几轮前（回车取消）› ")).strip()
     if not choice:
         return
     try:
@@ -3461,26 +3463,31 @@ def _rewind_flow(agent: Agent, rest: list[str]) -> None:
         print(ui.warning("  只认 1/2/3。"))
         return
 
-    if files:
-        conflicts = store.conflicts(index)
-        if conflicts:
-            print(ui.warning("  以下文件在轮次之外被改动过（手改/外部进程），恢复会覆盖："))
-            for raw in conflicts[:8]:
-                print(ui.warning(f"    {raw}"))
-        skipped = store.skipped_from(index)
-        if skipped:
-            print(ui.warning(f"  另有 {len(skipped)} 个超大文件没有快照，无法恢复。"))
-        if conflicts and input(ui.prompt("  仍要恢复文件吗？[y/N] › ")).strip().lower() not in (
-            "y",
-            "yes",
-        ):
-            files = False
-            if not conversation:
-                return
-
-    result = agent.rewind_result(index, conversation, files, check_conflicts=False)
-    print(ui.success(f"  {result.summary}"))
+    preview = agent.preview_rewind(index, conversation, files)
+    print("  回滚预览（当前文件 → 目标版本）：")
+    labels = {"restore": "恢复", "delete": "删除", "conflict": "冲突", "skip": "跳过"}
+    for item in preview.files:
+        print(ui.strip_controls(f"    [{labels[item.action]}] {item.path}"))
+        if item.note:
+            print(ui.secondary("      " + ui.strip_controls(item.note)))
+        if item.diff:
+            print(ui.strip_controls(item.diff), end="" if item.diff.endswith("\n") else "\n")
+    if files and not preview.files:
+        print(ui.secondary("    没有需要恢复的文件。"))
     if conversation:
+        print(ui.secondary("    对话：回退到该轮开始前。" if preview.conversation_available
+                           else "    对话：原轮次已不可定位，将保留当前对话。"))
+    if preview_only:
+        return
+    conflicts = any(item.action == "conflict" for item in preview.files)
+    question = "  有冲突，仍覆盖这些文件并执行以上回滚？[y/N] › " if conflicts else "  执行以上回滚？[y/N] › "
+    if input(ui.prompt(question)).strip().lower() not in ("y", "yes"):
+        print(ui.secondary("  已取消回滚。"))
+        return
+    result = agent.rewind_result(index, conversation, files, check_conflicts=False, preview=preview)
+    style = ui.success if result.status in ("completed", "noop") else ui.warning
+    print(style("  " + ui.strip_controls(result.summary)))
+    if result.conversation_rewound:
         print(ui.secondary("  （屏幕上方的旧输出只是显示残留，模型已不记得被截掉的轮次）"))
     if result.conversation_rewound and result.prompt_text:
         #  被回退那一轮的原话走"没赶上本轮的插话"同一条预填通道：前端在命令
