@@ -112,6 +112,34 @@ class WorkspaceFilesTest(MaliciousRepoCase):
 
 
 @unittest.skipUnless(HAS_GIT, "机器上没有 git")
+class OutputShapeTest(MaliciousRepoCase):
+    """宿主解析的输出不随用户/仓库配置变形（gitsafe 的输出面钉值）。"""
+
+    def test_non_ascii_paths_are_not_octal_escaped(self):
+        (self.root / "文档.txt").write_text("c\n", encoding="utf-8")
+        _setup_git(self.root, "add", "-A")
+        _setup_git(self.root, "config", "core.quotePath", "true")
+        out = worktree_mod._run_git(["ls-files"], self.root).stdout
+        self.assertIn("文档.txt", out)
+        self.assertNotIn("\\346", out)
+
+    def test_diff_paths_stay_repo_relative_outside_cwd(self):
+        _setup_git(self.root, "config", "diff.relative", "true")
+        (self.root / "a.txt").write_text("changed\n", encoding="utf-8")
+        sub = self.root / "sub"
+        sub.mkdir()
+        #  diff.relative=true 下从子目录跑会把 a.txt（在 cwd 之外）整个漏掉
+        out = worktree_mod._run_git(["diff", "--name-only"], sub).stdout
+        self.assertEqual(out.split(), ["a.txt"])
+
+    def test_color_never_leaks_into_parsed_output(self):
+        _setup_git(self.root, "config", "color.ui", "always")
+        (self.root / "a.txt").write_text("changed\n", encoding="utf-8")
+        out = worktree_mod._run_git(["diff", "--stat"], self.root).stdout
+        self.assertNotIn("\x1b[", out)
+
+
+@unittest.skipUnless(HAS_GIT, "机器上没有 git")
 class WorktreeTest(MaliciousRepoCase):
     def setUp(self):
         super().setUp()
@@ -304,6 +332,21 @@ class HardenArgvTest(unittest.TestCase):
         self.assertTrue(env["GIT_CONFIG_COUNT"].isdigit())
         keys = [env[f"GIT_CONFIG_KEY_{i}"] for i in range(int(env["GIT_CONFIG_COUNT"]))]
         self.assertIn("core.fsmonitor", keys)
+
+    def test_optional_locks_off_in_both_modes(self):
+        from xiaoyu import gitsafe
+
+        for network in (False, True):
+            _, env = gitsafe.prepare(["status"], None, env={"GIT_OPTIONAL_LOCKS": "1"}, network=network)
+            self.assertEqual(env["GIT_OPTIONAL_LOCKS"], "0")
+
+    def test_output_pins_apply_in_both_modes(self):
+        from xiaoyu import gitsafe
+
+        for network in (False, True):
+            _, env = gitsafe.prepare(["ls-files"], None, env={}, network=network)
+            keys = {env[f"GIT_CONFIG_KEY_{i}"] for i in range(int(env["GIT_CONFIG_COUNT"]))}
+            self.assertLessEqual({"core.quotePath", "diff.relative", "color.ui"}, keys)
 
     def test_network_mode_keeps_user_config(self):
         from xiaoyu import gitsafe
