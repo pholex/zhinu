@@ -95,7 +95,8 @@ def require_regular(path: Path) -> os.stat_result:
 
 
 def write_atomic(
-    path: Path, data: str | bytes, *, private: bool = False, encoding: str = "utf-8"
+    path: Path, data: str | bytes, *, private: bool = False, encoding: str = "utf-8",
+    check_writable: bool = False,
 ) -> None:
     """把 data 原子地写到 path：同目录临时文件写完再改名，读者看不到半个文件。
 
@@ -108,13 +109,34 @@ def write_atomic(
     - private=False 时沿用目标已有的权限位（没有目标就交给 umask）：改名换的是
       inode，不沿用的话用户手工收紧过的权限会被悄悄放宽；
     - 任何一步失败都清掉临时文件再原样抛 OSError，目标保持原样。
+    - 编辑用户文件时用 check_writable=True：先无截断地打开已有目标，保留原来
+      的写权限检查；不能因为目录可写，就用改名绕过只读文件的限制。
 
     父目录不存在会先建。不 fsync：防的是进程中途死掉，不是断电。
     """
     payload = data.encode(encoding) if isinstance(data, str) else data
     path.parent.mkdir(parents=True, exist_ok=True)
+    original_mode = None
+    if check_writable:
+        try:
+            probe = os.open(path, os.O_WRONLY | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_NOFOLLOW", 0))
+        except FileNotFoundError:
+            pass
+        else:
+            try:
+                info = os.fstat(probe)
+                if kind := non_regular_kind(info.st_mode):
+                    raise NotRegularFile(path, kind)
+                original_mode = stat.S_IMODE(info.st_mode)
+            finally:
+                os.close(probe)
+    elif not private:
+        try:
+            original_mode = stat.S_IMODE(path.stat().st_mode)
+        except FileNotFoundError:
+            pass
     tmp = path.with_name(f".{path.name}.{os.getpid()}.{uuid.uuid4().hex[:8]}.tmp")
-    mode = 0o600 if private else 0o666
+    mode = 0o600 if private else original_mode if original_mode is not None else 0o666
     flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0)
     try:
         fd = os.open(tmp, flags, mode)
@@ -126,10 +148,10 @@ def write_atomic(
             os.close(fd)
             raise
         with handle:
+            if not private and original_mode is not None:
+                # 创建时就不比原文件宽；恢复 umask 削掉的权限也必须在写正文前完成。
+                os.chmod(tmp, original_mode)
             handle.write(payload)
-        if not private:
-            with contextlib.suppress(OSError):
-                os.chmod(tmp, stat.S_IMODE(os.stat(path).st_mode))
         _replace(tmp, path)
     except BaseException:
         with contextlib.suppress(OSError):

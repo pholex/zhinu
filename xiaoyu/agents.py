@@ -1091,7 +1091,17 @@ def execute_delegation(
 
     def fire_lifecycle(event: str, payload: dict[str, Any]) -> Any:
         #  与 Agent._fire_hook 同一约定：钩子给用户的 systemMessage 只显示不进历史
-        decision = lifecycle.fire(event, payload)
+        from .errors import Interrupted
+        from .hooks import Decision, stop_scope
+
+        try:
+            with stop_scope(stop_requested):
+                decision = lifecycle.fire(event, payload)
+        except Interrupted:
+            if event != "SubagentEnd":
+                raise
+            # 收尾通知中取消不应丢失待归档的子任务结果。
+            return Decision(blocked=False)
         if notice := getattr(decision, "notice", ""):
             sink.emit(Notice(f"[{event} hook] {notice}", "info"))
         return decision

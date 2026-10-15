@@ -1480,7 +1480,8 @@ class TestSandboxEscalation(unittest.TestCase):
                     "justification": "要联网",
                 },
             )
-            self.assertIn("未知的升权档位", result)
+            self.assertIn("sandbox_permissions", result)
+            self.assertIn("enum", result)
 
     def test_escalation_without_sandbox_rejected(self) -> None:
         box = self.build(sandbox_on=False)

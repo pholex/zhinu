@@ -72,6 +72,10 @@ SCENARIOS = (
     Scenario("tool-turn", "用 bash 运行 echo snapshot-ok，然后汇报结果", args=("--yolo",)),
     Scenario("error-retry", "试试限流恢复", recorded=False),
     Scenario("error-fatal", "撞一个致命错误", recorded=False, expect_exit=1),
+    Scenario("invalid-tool-arguments", "验证错误参数不会写文件", args=("--yolo",), recorded=False),
+    Scenario("stale-file-version", "读取后尝试覆盖文件，发现外部修改就停止", args=("--yolo",), recorded=False),
+    Scenario("cancel-before-tool", "尝试写文件，执行前中断", args=("--yolo",), recorded=False, expect_exit=130),
+    Scenario("bounded-hook-output", "验证长钩子输出", recorded=False),
 )
 
 _PIN = next(sc for sc in SCENARIOS if sc.pins_header)
@@ -236,6 +240,97 @@ class ErrorRetrySnapshot(SnapshotCase):
 class ErrorFatalSnapshot(SnapshotCase):
     def test_scenario(self) -> None:
         self.check_scenario(SCENARIOS[3])
+
+
+class InvalidToolArgumentsSnapshot(SnapshotCase):
+    def test_scenario(self) -> None:
+        self.check_scenario(SCENARIOS[4])
+        self.assertFalse((self.workspace / "must-not-exist.txt").exists())
+
+
+class StaleFileVersionSnapshot(SnapshotCase):
+    def env_for(self, script_path: Path) -> dict[str, str]:
+        env = super().env_for(script_path)
+        env["XIAOYU_ENABLE_HOOKS"] = "1"
+        return env
+
+    def test_scenario(self) -> None:
+        target = self.workspace / "owner.txt"
+        target.write_bytes(b"owner=A\n")
+        # 读取已登记后模拟外部编辑；时间、大小不变，只有内容指纹能识别。
+        script = Path(self.tmp) / "change.py"
+        script.write_text(
+            "import os\nfrom pathlib import Path\n"
+            "p = Path('owner.txt')\ns = p.stat()\n"
+            "p.write_bytes(b'owner=B\\n')\n"
+            "os.utime(p, ns=(s.st_atime_ns, s.st_mtime_ns))\n",
+            encoding="utf-8",
+        )
+        config = Path(self.tmp) / "config" / "xiaoyu"
+        config.mkdir(exist_ok=True)
+        command = f'"{sys.executable}" "{script}"'
+        (config / "hooks.toml").write_text(
+            '[[hooks]]\nevent = "PostToolUse"\nmatcher = "^read_file$"\n'
+            f"command = {json.dumps(command)}\ntimeout = 5\n",
+            encoding="utf-8",
+        )
+        self.check_scenario(SCENARIOS[5])
+        self.assertEqual(target.read_bytes(), b"owner=B\n")
+
+
+@unittest.skipIf(os.name == "nt", "信号中断快照依赖 POSIX；宿主 interrupt 回归全平台运行")
+class CancelBeforeToolSnapshot(SnapshotCase):
+    def env_for(self, script_path: Path) -> dict[str, str]:
+        env = super().env_for(script_path)
+        env["XIAOYU_ENABLE_HOOKS"] = "1"
+        return env
+
+    def test_scenario(self) -> None:
+        script = Path(self.tmp) / "cancel.py"
+        script.write_text(
+            "import os, signal\nos.kill(os.getppid(), signal.SIGINT)\n",
+            encoding="utf-8",
+        )
+        config = Path(self.tmp) / "config" / "xiaoyu"
+        config.mkdir(exist_ok=True)
+        # exec 去掉中间 shell，信号只发给本测试的 CLI 父进程。
+        command = f'exec "{sys.executable}" "{script}"'
+        (config / "hooks.toml").write_text(
+            '[[hooks]]\nevent = "PreToolUse"\nmatcher = "^write_file$"\n'
+            f"command = {json.dumps(command)}\ntimeout = 5\n",
+            encoding="utf-8",
+        )
+        self.check_scenario(SCENARIOS[6])
+        self.assertFalse((self.workspace / "cancelled.txt").exists())
+
+
+class BoundedHookOutputSnapshot(SnapshotCase):
+    def env_for(self, script_path: Path) -> dict[str, str]:
+        env = super().env_for(script_path)
+        env["XIAOYU_ENABLE_HOOKS"] = "1"
+        return env
+
+    def replay_run(self, sc: Scenario) -> dict[str, Any]:
+        run = super().replay_run(sc)
+        # 告警包含命令；仅归一化当前解释器的位置，保留截断语义和脚本路径。
+        executable = json.dumps(sys.executable, ensure_ascii=False)[1:-1]
+        for surface in ("stdout", "session"):
+            run[surface] = [line.replace(executable, "<python>") for line in run[surface]]
+        self.assertTrue(any("首行上下文" in line for line in run["session"]))
+        self.assertNotIn("x" * 100, str(run["session"]))
+        return run
+
+    def test_scenario(self) -> None:
+        script = Path(self.tmp) / "output.py"
+        script.write_text("print('首行上下文')\nprint('x' * 1048576)\n", encoding="utf-8")
+        config = Path(self.tmp) / "config" / "xiaoyu"
+        config.mkdir(exist_ok=True)
+        command = f'"{sys.executable}" "{script}"'
+        (config / "hooks.toml").write_text(
+            '[[hooks]]\nevent = "UserPromptSubmit"\n'
+            f"command = {json.dumps(command)}\ntimeout = 5\n", encoding="utf-8",
+        )
+        self.check_scenario(SCENARIOS[7])
 
 
 class UnconsumedGuardTest(SnapshotCase):

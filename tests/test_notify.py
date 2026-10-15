@@ -89,14 +89,26 @@ class NotifyTest(AgentTestCase):
         self.assertEqual(contents[-1], ("assistant", "做完了"))
         self.assertNotIn("MCP server github 已上线", str(contents))
 
-    def test_non_waking_notification_still_rides_next_tool_result(self):
-        """不唤醒 ≠ 丢弃：留在队列里，下一条工具结果照常带上。"""
+    def test_non_waking_notification_reaches_request_before_next_tool(self):
+        """新一轮已经开始：上线公告在请求前送达，工具结果不再重复附带。"""
         agent = self.build([tool_turn("read_file", {"path": "calc.py"}), text_turn("好")])
         agent.notify("MCP server github 已上线", wake=False)
         with contextlib.redirect_stdout(io.StringIO()):
             agent.send("干活")
+        sent = self.client.completions.calls[0]["messages"]
+        self.assertIn("MCP server github 已上线", str(sent))
+        self.assertEqual(str(agent.messages).count("MCP server github 已上线"), 1)
         tool_msg = next(m for m in agent.messages if m.get("role") == "tool")
-        self.assertIn("MCP server github 已上线", tool_msg["content"])
+        self.assertNotIn("MCP server github 已上线", tool_msg["content"])
+
+    def test_passive_drain_keeps_waking_events_and_deduplicates(self):
+        agent = self.build([])
+        agent.notify("任务完成", key="job")
+        agent.notify("工具上线", key="online", wake=False)
+        self.assertEqual(agent._drain_notifications(passive_only=True), ["工具上线"])
+        agent.notify("重复上线", key="online", wake=False)
+        self.assertEqual(agent._drain_notifications(passive_only=True), [])
+        self.assertEqual(agent._drain_notifications(), ["任务完成"])
 
     def test_waking_notification_carries_non_waking_ones_along(self):
         """这一步反正要跑（有 wake 项）：不唤醒的那条捎带一起送，不必再等。"""

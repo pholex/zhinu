@@ -1369,7 +1369,7 @@ class Agent:
                                             "minItems": 2,
                                             "maxItems": 4,
                                             "items": {
-                                                "type": "object",
+                                                "type": ["object", "string"],
                                                 "properties": {
                                                     "label": {
                                                         "type": "string",
@@ -1959,16 +1959,18 @@ class Agent:
         （再次进入时上次的计划还在，模型可以接着改）。
         创建即登记"已读"——空文件没有内容可读，逼模型先 read_file 纯属流程税。
         """
+        created = False
         try:
             if not self.plan_file.exists():
                 self.plan_file.parent.mkdir(parents=True, exist_ok=True)
                 self.plan_file.write_bytes(b"")
+                created = True
         except OSError as exc:
             self.emit(Notice(f"[plan 文件创建失败：{exc}，编辑时会再报错]", "warn"))
             return
         mark = getattr(self.toolbox, "_mark_read", None)
-        if callable(mark):
-            mark(self.plan_file.resolve())
+        if created and callable(mark):
+            mark(self.plan_file.resolve(), raw=b"")
 
     def _is_plan_file(self, path: Any) -> bool:
         """这次调用的 path 是不是 plan 文件（严格路径相等；
@@ -2490,8 +2492,8 @@ class Agent:
     def interrupt(self) -> None:
         """请求打断当前正在进行的生成（线程安全，可从任意线程/协程调用）。
 
-        不是立即抛异常——只是置一个标志位，`_consume_stream` 在处理下一个
-        chunk 前自己发现并优雅收尾：已经说出的半截话正常入历史，残缺的
+        不是立即抛异常——只是置一个标志位，在工具/请求启动前、hook 返回后及
+        下一个流式 chunk 边界检查并收尾：已经说出的半截话正常入历史，残缺的
         tool_calls 直接丢弃，会话可以继续。语义与 Ctrl-C 完全一致（见
         `Interrupted`），区别只是触发源不是 OS 信号。
 
@@ -2584,7 +2586,7 @@ class Agent:
         与信箱同一纪律）。同一 key 的通知整个会话只送达一次（防宿主重复投递）。
 
         wake=False = "捎带送达"：**绝不为这一条自己多跑一步**，只在已经要跑的
-        step（有插话/信箱消息要消费）或下一条工具结果上搭便车。用于"发生了但
+        step（包括用户开始的新一轮）或下一条工具结果上搭便车。用于"发生了但
         不必打断"的公告——典型是 MCP server 上线。为什么要这档：模型给完收尾
         正文后被强制再跑一步，它会把同一个问题再答一遍，client 端把两段拼成
         一条，用户看到的就是答案重复。信息不丢（留在队列里），丢的只是那一步。
@@ -2633,19 +2635,24 @@ class Agent:
             items.append({"key": key, "text": text, "wake": wake})
         return items
 
-    def _drain_notifications(self, wake_only: bool = False) -> list[str]:
+    def _drain_notifications(self, wake_only: bool = False, passive_only: bool = False) -> list[str]:
         """取走待送达的通知并登记已报 key（只在会话自己的执行线程里调用）。
 
         wake_only=True：队里没有 wake 项时一条都不取，全留着搭下一次工具结果
         的便车（补投点用这个模式——那里"取到东西"等于"多跑一步"）。有 wake 项
         则整队取走：这一步反正要跑，捎带把不唤醒的也送到最省。
+        passive_only=True：请求前只捎带公告；需要唤醒的后台事件仍走工具结果或
+        收尾边界的既有投递路径。
         """
         with self._notify_lock:
             if wake_only and not any(wake for _, _, wake in self._notify_queue):
                 return []
             pending, self._notify_queue = self._notify_queue, []
             items: list[str] = []
-            for key, text, _ in pending:
+            for key, text, wake in pending:
+                if passive_only and wake:
+                    self._notify_queue.append((key, text, wake))
+                    continue
                 if key:
                     if key in self._notified_keys:
                         continue
@@ -2914,7 +2921,17 @@ class Agent:
         （"已记录到审计日志"），不进历史、不进模型——所以在这里统一发 Notice，
         各触发点不必各自记得消费 Decision.notice。
         """
-        decision = self.hook_engine.fire(event, payload, **kwargs)
+        from .hooks import Decision, stop_scope
+
+        try:
+            # SessionEnd 是退出清理，不受上一轮遗留的取消标志阻止。
+            with stop_scope(None if event == "SessionEnd" else self.interrupt_requested):
+                decision = self.hook_engine.fire(event, payload, **kwargs)
+        except Interrupted:
+            if event not in ("PostToolUse", "ToolFailed"):
+                raise
+            # 工具已经执行：先让调用方登记真实结果，随后检查点再结束本轮。
+            return Decision(blocked=False)
         if notice := getattr(decision, "notice", ""):
             self.emit(Notice(f"[{event} hook] {notice}", "info"))
         return decision
@@ -3117,6 +3134,7 @@ class Agent:
             decision = self._fire_hook(
                 "UserPromptSubmit", {"prompt": clip(media.text_of(user_input))}
             )
+            self._checkpoint()
             if decision.blocked:
                 self.emit(Notice(f"[hook 拦截了本轮输入：{decision.reason}]", "warn"))
                 return
@@ -3153,6 +3171,7 @@ class Agent:
         extension_pool = int(self.config.max_iterations * self.config.turn_extension)
         self.last_stop = "done"
         while True:
+            self._checkpoint()
             if steps >= turn_budget:
                 if self.output_contract is not None:
                     self.last_stop = "turn_cap"
@@ -3283,6 +3302,7 @@ class Agent:
                         decision = self._fire_hook(
                             "Stop", {"last_text": clip(media.text_of(message.get("content")))}
                         )
+                        self._checkpoint()
                         if decision.blocked:
                             self.emit(
                                 Notice(f"[Stop hook 要求继续：{decision.reason}]", "warn")
@@ -3318,6 +3338,8 @@ class Agent:
                 self._checkpoint()
                 failures_before_call = self.output_contract.failures if self.output_contract else 0
                 self._record(self._execute(call))
+                #  PostToolUse/ToolFailed 期间的取消先保留已执行结果，再结束本轮。
+                self._checkpoint()
                 if (
                     self.output_contract is not None
                     and call.get("function", {}).get("name") == STRUCTURED_OUTPUT_TOOL
@@ -3575,6 +3597,12 @@ class Agent:
             self.session_log.event("world_state", baseline=self.world_state.baseline)
         if schemas is None:
             schemas = tuple(self.toolbox.schemas()) if with_tools else ()
+        # 工具集扫描可能刚发现 MCP 上线；这一步已经要发请求，立即捎带公告。
+        # 等到工具结果再投会让纯文本轮次一直看不到新能力，恢复/压缩后尤其明显。
+        for notification in self._drain_notifications(passive_only=True):
+            self._record_injected(f"<system-reminder>\n{notification}\n</system-reminder>")
+            if self.session_log:
+                self.session_log.event("notify")
         self._step_index += 1
         self._step = StepContext(
             index=self._step_index,
@@ -3850,6 +3878,7 @@ class Agent:
 
         if self.hook_engine is not None and self.hook_engine.has("BeforeCompact"):
             decision = self._fire_hook("BeforeCompact", {"context_tokens": estimated, "forced": force})
+            self._checkpoint()
             if decision.blocked:
                 raise RuntimeError("BeforeCompact hook blocked compaction")
         self.messages, cleared, saved_chars = microcompact(
@@ -3870,6 +3899,7 @@ class Agent:
             if not force and not self.compactor.should_compact(after_micro):
                 if self.hook_engine is not None and self.hook_engine.has("AfterCompact"):
                     self._fire_hook("AfterCompact", {"changed": True, "method": "microcompact"})
+                    self._checkpoint()
                 #  清完就降到阈值以下：这轮不必花钱做摘要了
                 return f"microcompact：清理 {cleared} 条旧工具输出，估算 {estimated} → {after_micro} tok"
             estimated = after_micro
@@ -3902,6 +3932,7 @@ class Agent:
             self.session_log.event("compact_end", ok=changed)
         if self.hook_engine is not None and self.hook_engine.has("AfterCompact"):
             self._fire_hook("AfterCompact", {"changed": changed, "method": "summary"})
+            self._checkpoint()
         return note
 
     def _shrink_after_overflow(self) -> bool:
@@ -4732,6 +4763,7 @@ class Agent:
         with_tools=False 用于收尾总结这类"只许说话不许干活"的调用。
         bypass_cache=True 只由空补全重发传入（见 _stream_retrying）。
         """
+        self._checkpoint()
         #  发请求前惰性修复历史不变量：
         #  中断路径不需要记得做清理，任何来路的悬空/孤儿都在这里兜住。
         self._repair_history()
@@ -4833,6 +4865,8 @@ class Agent:
         self._prompt_tokens_seen: int | None = None
         self._cached_tokens_seen = 0
         try:
+            #  RequestStarted 的宿主回调也可能取消；检查后再进入传输层。
+            self._checkpoint()
             stream = route.client.chat.completions.create(**request)
             self._consume_stream(route, stream, content_parts, pending, reasoning)
         except (KeyboardInterrupt, Interrupted) as exc:
@@ -5646,24 +5680,17 @@ class Agent:
 
         #  PreToolUse hook：在审批之后、执行之前——审批改写过的参数也在
         #  hook 眼前（宿主 seatbelt 包装后的命令才是真正要跑的东西）
-        if self.hook_engine is not None and self.hook_engine.has("PreToolUse"):
-            decision = self._fire_hook(
-                #  call_id 在 Pre / Post / ToolFailed 三处同值：外部钩子靠它把
-                #  "要跑什么"和"跑出了什么"对上（并行工具调用下光靠工具名对不上）
-                "PreToolUse", {"tool": name, "args": args, "call_id": call.get("id", "")},
-                tool_name=name,
-                **self._hook_alias(name, args),
+        decision = self._before_tool(name, args, call.get("id", ""))
+        if decision is not None and decision.blocked:
+            self.trace.append(
+                {"tool": name, "args": args, "ok": False, "output": "DENIED_BY_HOOK"}
             )
-            if decision.blocked:
-                self.trace.append(
-                    {"tool": name, "args": args, "ok": False, "output": "DENIED_BY_HOOK"}
-                )
-                self.emit(ToolDenied(name, by="rule", tool_call_id=call.get("id", "")))
-                return self._tool_message(
-                    call,
-                    f"ERROR: 这次调用被用户配置的 PreToolUse hook 拦截：{decision.reason}。"
-                    "请按此反馈调整做法。",
-                )
+            self.emit(ToolDenied(name, by="rule", tool_call_id=call.get("id", "")))
+            return self._tool_message(
+                call,
+                f"ERROR: 这次调用被用户配置的 PreToolUse hook 拦截：{decision.reason}。"
+                "请按此反馈调整做法。",
+            )
 
         if moved := self.toolbox.target_moved(args, reviewed_target):
             self.trace.append({"tool": name, "args": args, "ok": False, "output": "TARGET_MOVED"})
@@ -5675,6 +5702,7 @@ class Agent:
         self.emit(ToolRunning(name, args, tool_call_id=call.get("id", "")))
         started = time.monotonic()
         try:
+            self._checkpoint()
             output = self.toolbox.run(name, args)
         except BaseException as exc:
             #  终态承诺覆盖异常路径（Ctrl-C 最常打在长命令执行中）：running 已发
@@ -5779,6 +5807,26 @@ class Agent:
         self.trace.append({"tool": name, "args": args, "ok": ok, "output": output})
         self.emit(ToolCompleted(name, output=output, ok=ok, seconds=elapsed, tool_call_id=call.get("id", "")))
         return self._tool_message(call, self._for_model(name, args, raw_output, output))
+
+    def _before_tool(self, name: str, args: dict[str, Any], call_id: str) -> Any:
+        """审批与执行之间的取消边界；尚未运行的调用以 denied 结束 pending。"""
+        try:
+            self._checkpoint()
+            if self.hook_engine is not None and self.hook_engine.has("PreToolUse"):
+                # call_id 贯穿 Pre / Post / ToolFailed，供外部钩子对齐同次调用。
+                decision = self._fire_hook(
+                    "PreToolUse", {"tool": name, "args": args, "call_id": call_id},
+                    tool_name=name, **self._hook_alias(name, args),
+                )
+                self._checkpoint()
+                return decision
+            return None
+        except (KeyboardInterrupt, Interrupted):
+            self.trace.append(
+                {"tool": name, "args": args, "ok": False, "output": "INTERRUPTED_BEFORE_RUN"}
+            )
+            self.emit(ToolDenied(name, by="user", tool_call_id=call_id))
+            raise
 
     @staticmethod
     def _hook_alias(name: str, args: dict[str, Any]) -> dict[str, str]:

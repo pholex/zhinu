@@ -765,6 +765,66 @@ class ToolboxInterruptTest(_StdioCase):
         self.assertIn("远端可能仍在执行", results[0]["content"])
 
 
+class ReconnectCancellationTest(_StdioCase):
+    def test_cancel_during_reconnect_does_not_replay_old_call(self):
+        manager = mcp.McpManager([self.spec(timeout=10.0)])
+        self.addCleanup(manager.close)
+        manager.start()
+        manager.wait_ready(10.0)
+        server = manager._servers["fake"]
+        config = Config(base_url="http://unused", model="m", workspace=self.root,
+                        enable_plugins=False, enable_mcp=False)
+        box = Toolbox(config, mcp_view=mcp.McpView(manager))
+        stop = threading.Event()
+        box.stop_requested = stop.is_set
+        outcomes = []
+        reconnected = []
+        entered = threading.Event()
+        proceed = threading.Event()
+        original_restart = server.restart
+
+        def paused_restart(*args, **kwargs):
+            entered.set()
+            if not proceed.wait(10.0):
+                raise mcp.McpError("测试等待重连放行超时")
+            return original_restart(*args, **kwargs)
+
+        def call():
+            try:
+                outcomes.append(box.run("use_tool", {"tool_name": "mcp__fake__never", "tool_input": {}}))
+            except Interrupted as exc:
+                outcomes.append(getattr(exc, errors.PARTIAL_OUTPUT, ""))
+
+        caller = threading.Thread(target=call, daemon=True)
+        reconnect = threading.Thread(target=lambda: reconnected.append(manager.reconnect("fake")), daemon=True)
+        with mock.patch.object(server, "restart", paused_restart):
+            try:
+                caller.start()
+                self.wait_until(lambda: any(m.get("method") == "tools/call" for m in self.received()))
+                reconnect.start()
+                self.assertTrue(entered.wait(5.0), "重连没有进入 restart")
+                stop.set()
+                caller.join(3.0)
+                self.assertFalse(caller.is_alive(), "取消被重连阻塞")
+                self.assertEqual(len(outcomes), 1)
+                self.assertIn("本地已取消", outcomes[0])
+                self.assertIn("结果未知", outcomes[0])
+                self.wait_until(lambda: _cancelled(self.received()))
+            finally:
+                stop.set()
+                proceed.set()
+                caller.join(12.0)
+                if reconnect.ident is not None:
+                    reconnect.join(12.0)
+        self.assertFalse(reconnect.is_alive())
+        self.assertTrue(reconnected and "已重启" in reconnected[0], reconnected)
+        stop.clear()
+        self.assertEqual(box.run("use_tool", {"tool_name": "mcp__fake__echo", "tool_input": {"text": "新调用"}}),
+                         "echo: 新调用")
+        calls = [m["params"]["name"] for m in self.received() if m.get("method") == "tools/call"]
+        self.assertEqual(calls, ["never", "echo"], "重连不能自动重发旧调用")
+
+
 class HttpInterruptTest(_HttpCase):
     def test_interrupt_while_the_server_is_still_thinking(self):
         """server 压着响应头不发（算完才一次性回 JSON 的那种）：打断不能等它。"""

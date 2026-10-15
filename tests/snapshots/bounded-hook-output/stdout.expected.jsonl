@@ -1,0 +1,6 @@
+{"kind": "notice", "text": "[hook stdout 超过 262144 字节，已截断保留头尾：\"<python>\" \"<tmp>/output.py\"]", "level": "warn"}
+{"kind": "request.started", "model": "snapshot-model", "provider": "_scripted"}
+{"kind": "text.delta", "text": "已收到首行上下文。"}
+{"kind": "text.end"}
+{"kind": "request.ended", "duration_ms": 0, "ttft_ms": 0, "usage": {}, "model": "", "response_id": "", "finish_reason": "", "error": ""}
+{"kind": "result", "result": "已收到首行上下文。", "usage": {"turns": 0, "prompt_tokens": 0, "completion_tokens": 0, "by_model": {}}, "model": "snapshot-model", "session_log": "<session_log>"}

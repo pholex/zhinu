@@ -550,6 +550,10 @@ class TaskOutputSliceTest(unittest.TestCase):
         self.assertNotIn("next_offset=", plain)
         self.assertNotIn("内容与上次查询相同", plain)
 
+        encoded = self.toolbox.run("task_output", {"task_ids": '["task-1"]', "offset": 0, "limit": 4})
+        self.assertIn("abcd", encoded)
+        self.assertIn("next_offset=4", encoded)
+
     def test_repeat_query_at_same_offset_is_flagged(self):
         self._finished_task("echo once")
         first = self.toolbox.run("task_output", {"task_ids": ["task-1"], "offset": 0})

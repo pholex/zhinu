@@ -817,7 +817,8 @@ def last_preview(path: Path, limit: int = LAST_PREVIEW) -> str:
             raw = handle.read()
     except OSError:
         return ""
-    lines = raw.decode("utf-8", errors="replace").splitlines()
+    # JSONL 只以 LF 分隔记录；U+2028/U+2029 是 JSON 字符串里的合法正文。
+    lines = raw.decode("utf-8", errors="replace").split("\n")
     if size > _TAIL_WINDOW and lines:
         lines = lines[1:]  # 窗口起点落在行中间：首行是半截
     for line in reversed(lines):

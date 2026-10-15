@@ -100,14 +100,14 @@ def make_x_search_tool(config: Config, registry: Registry, usage,
 
     properties = {
         "query": {"type": "string", "description": "要搜索的 X 帖子、账号或讨论话题"},
-        "allowed_x_handles": {"type": "array", "items": {"type": "string"},
+        "allowed_x_handles": {"type": ["array", "null"], "items": {"type": "string"},
                               "minItems": 1, "maxItems": 20,
                               "description": "只搜索这些账号，与 excluded_x_handles 互斥"},
-        "excluded_x_handles": {"type": "array", "items": {"type": "string"},
+        "excluded_x_handles": {"type": ["array", "null"], "items": {"type": "string"},
                                "minItems": 1, "maxItems": 20,
                                "description": "排除这些账号，与 allowed_x_handles 互斥"},
-        "from_date": {"type": "string", "description": "起始日期 YYYY-MM-DD，含当天（UTC）"},
-        "to_date": {"type": "string", "description": "结束日期 YYYY-MM-DD，含当天（UTC）"},
+        "from_date": {"type": ["string", "null"], "description": "起始日期 YYYY-MM-DD，含当天（UTC）"},
+        "to_date": {"type": ["string", "null"], "description": "结束日期 YYYY-MM-DD，含当天（UTC）"},
         "enable_image_understanding": {"type": "boolean", "description": "分析帖子图片，默认关闭"},
         "enable_video_understanding": {"type": "boolean", "description": "分析帖子视频，默认关闭"},
     }
