@@ -6,7 +6,7 @@ import stat
 from pathlib import Path
 from unittest import mock
 
-from xiaoyu import fsguard
+from xiaoyu import fsguard, tools
 from .test_tools import ToolboxTestCase
 
 
@@ -67,8 +67,13 @@ class AtomicEditTest(ToolboxTestCase):
         self.assertEqual(list(self.root.glob(".*.tmp")), [])
 
     def test_symlink_target_mode_and_encoded_bytes_survive(self):
+        # 编辑链路按 UTF-8 → 本地代码页 → GBK 的顺序解码，英文 Windows 的 cp1252
+        # 排在 GBK 前面且几乎什么字节都认，所以"非 UTF-8 原文"要按本机排在
+        # UTF-8 之后的那个编码来造，否则 GBK 字节会被当成 cp1252 乱码读出。
+        encoding = next(e for e in tools._edit_encodings() if e != "utf-8")
+        old, new, keep = ("旧行", "新行", "保留") if encoding == "gbk" else ("ligne \u00e9", "ligne \u00e8", "gard\u00e9")
         target = self.root / "real.txt"
-        target.write_bytes("旧行\r\n保留\r\n".encode("gbk"))
+        target.write_bytes(f"{old}\r\n{keep}\r\n".encode(encoding))
         if os.name != "nt":
             target.chmod(0o750)
             link = self.root / "alias.txt"
@@ -76,9 +81,9 @@ class AtomicEditTest(ToolboxTestCase):
         else:
             link = target
         self.box.run("read_file", {"path": link.name})
-        result = self.box.run("str_replace", {"path": link.name, "old_str": "旧行", "new_str": "新行"})
+        result = self.box.run("str_replace", {"path": link.name, "old_str": old, "new_str": new})
         self.assertFalse(result.startswith("ERROR:"), result)
-        self.assertEqual(target.read_bytes(), "新行\r\n保留\r\n".encode("gbk"))
+        self.assertEqual(target.read_bytes(), f"{new}\r\n{keep}\r\n".encode(encoding))
         if os.name != "nt":
             self.assertTrue(link.is_symlink())
             self.assertEqual(stat.S_IMODE(target.stat().st_mode), 0o750)

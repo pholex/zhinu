@@ -83,7 +83,9 @@ class FileVersionTest(ToolboxTestCase):
         self.assertIn("被改动过", self.box.run("write_file", {"path": "calc.py", "content": "new"}))
 
     def test_lossy_read_still_tracks_original_bytes(self):
-        self.sample.write_bytes(b"owner=\xff\n")
+        # 0x81 后面跟换行：UTF-8、cp1252（未定义码位）、GBK（缺尾字节）都解不开，
+        # 不管测试机本地代码页是什么，这一读都是有损的。0xff 在 cp1252 里是 ÿ。
+        self.sample.write_bytes(b"owner=\x81\n")
         self.assertIn("有损", self.box.run("read_file", {"path": "calc.py"}))
         self.change_preserving_metadata(self.sample, b"owner=\xfe\n")
         self.assertIn("被改动过", self.box.run("write_file", {"path": "calc.py", "content": "new"}))
