@@ -1,0 +1,97 @@
+{
+  "terminal": "  ? 给谁用？（1/2）\n    1. 客户\n    2. 内部同事\n    0. 取消提问，返回对话（保留已答内容）\n    回答（数字选择；其它文本=自由回答；0/回车/Ctrl-C=取消并返回对话）：1\n  ? 先做什么？（2/2）\n    1. 展示产品\n    2. 收集反馈\n    0. 取消提问，返回对话（保留已答内容）\n    回答（数字选择；其它文本=自由回答；0/回车/Ctrl-C=取消并返回对话）：0\n",
+  "events": [
+    {
+      "kind": "request.started",
+      "model": "main-model",
+      "provider": "gateway"
+    },
+    {
+      "kind": "tool.preparing",
+      "name": "ask_user",
+      "index": 0,
+      "argument_chars": 231,
+      "path": "",
+      "purpose": ""
+    },
+    {
+      "kind": "request.ended",
+      "duration_ms": 0,
+      "ttft_ms": 0,
+      "usage": {
+        "prompt_tokens": 10,
+        "completion_tokens": 5,
+        "cached_tokens": 0
+      },
+      "model": "",
+      "response_id": "",
+      "finish_reason": "",
+      "error": ""
+    },
+    {
+      "kind": "tool.pending",
+      "name": "ask_user",
+      "args": {
+        "questions": [
+          {
+            "question": "给谁用？",
+            "options": [
+              "客户",
+              "内部同事"
+            ]
+          },
+          {
+            "question": "先做什么？",
+            "options": [
+              "展示产品",
+              "收集反馈"
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "kind": "tool.running",
+      "name": "ask_user",
+      "args": {
+        "questions": [
+          {
+            "question": "给谁用？",
+            "options": [
+              "客户",
+              "内部同事"
+            ]
+          },
+          {
+            "question": "先做什么？",
+            "options": [
+              "展示产品",
+              "收集反馈"
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "kind": "notice",
+      "text": "[已取消提问，本轮已停止；可直接输入新消息]",
+      "level": "info"
+    },
+    {
+      "kind": "tool.completed",
+      "name": "ask_user",
+      "output": "已保留的回答：\n- 给谁用？：客户\n\n用户取消了提问，本轮已停止，等待用户的新消息；未回答的问题没有默认答案。",
+      "ok": true,
+      "seconds": 0
+    }
+  ],
+  "tool_results": [
+    {
+      "role": "tool",
+      "tool_call_id": "ask",
+      "content": "已保留的回答：\n- 给谁用？：客户\n\n用户取消了提问，本轮已停止，等待用户的新消息；未回答的问题没有默认答案。"
+    }
+  ],
+  "stopped": "interrupted",
+  "model_requests": 1
+}

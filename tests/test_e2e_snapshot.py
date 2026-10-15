@@ -28,6 +28,8 @@ shell 注记/工具面不同），stdout 与会话 golden 照常全平台比。
 
 from __future__ import annotations
 
+import contextlib
+import io
 import json
 import os
 import subprocess
@@ -36,6 +38,7 @@ import unittest
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
+from unittest import mock
 
 from xiaoyu.scripted import CAPTURE_ENV, STRICT_ENV, SCRIPTED_ENV, load_scripts
 from xiaoyu.snapshot import RECORD_ENV
@@ -47,6 +50,7 @@ from .snapshot_support import (
     normalize_tool_schemas,
 )
 from .test_e2e_scripted import _TIMEOUT, E2ECase
+from .test_agent_paths import AgentTestCase, call_fragment, chunk, usage_chunk
 
 MODE = os.environ.get("XIAOYU_SNAPSHOT", "").strip() or "replay"
 if MODE not in ("replay", "record", "refresh"):
@@ -80,6 +84,55 @@ SCENARIOS = (
 )
 
 _PIN = next(sc for sc in SCENARIOS if sc.pins_header)
+
+
+class AskUserCancelSnapshot(AgentTestCase):
+    """终端问答的 keyless 场景；headless CLI 不暴露 asker，故在此注入真实明文前端。"""
+
+    def test_scenario(self) -> None:
+        from xiaoyu.cli import text_ask_questions
+        from xiaoyu.embedding import measured_send
+        from xiaoyu.render import NullSink
+
+        if MODE == "record":
+            self.skipTest("取消交互使用确定性 fixture，不调用真实模型")
+        questions = [
+            {"question": "给谁用？", "options": ["客户", "内部同事"]},
+            {"question": "先做什么？", "options": ["展示产品", "收集反馈"]},
+        ]
+        agent = self.build([
+            [chunk(tool_calls=[call_fragment(0, "ask", "ask_user", json.dumps({"questions": questions}))]),
+             usage_chunk(10, 5)],
+        ], asker=text_ask_questions, sink=NullSink())
+        shown = io.StringIO()
+        replies = iter(["1", "0"])
+
+        def answer(prompt):
+            reply = next(replies)
+            print(prompt + reply)
+            return reply
+
+        with (
+            contextlib.redirect_stdout(shown),
+            mock.patch("builtins.input", side_effect=answer),
+            mock.patch("xiaoyu.ui._ENABLED", False),
+        ):
+            with mock.patch.object(agent, "emit") as emitted:
+                result = measured_send(agent, "先问我网站需求")
+        actual = {
+            "terminal": shown.getvalue(),
+            "events": [normalize_event(call.args[0].to_dict(), str(self.root)) for call in emitted.call_args_list],
+            "tool_results": [m for m in agent.messages if m["role"] == "tool"],
+            "stopped": result.stopped,
+            "model_requests": len(self.client.completions.calls),
+        }
+        path = Path(__file__).parent / "fixtures" / "ask_user_cancel.expected.json"
+        if MODE == "refresh":
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(json.dumps(actual, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        self.assertEqual(actual, json.loads(path.read_text(encoding="utf-8", errors="replace")))
+        self.assertTrue(result.interrupted)
+        self.assertEqual(actual["model_requests"], 1)
 
 
 def _scenario_dir(name: str) -> Path:

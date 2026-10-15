@@ -21,7 +21,7 @@ from . import (
     __version__, attention, command_check, envprobe, errors, keys, media, modes, peers,
     providers, skills, terminal, ui,
 )
-from .agent import Agent
+from .agent import Agent, _CancelledAnswers
 from .banner import build_banner
 from .term import SESSION_PREFIX as TERM_SESSION_PREFIX
 from .session_log import (
@@ -2460,7 +2460,7 @@ def ask_one_text(item: dict[str, Any], position: str = "") -> str | None:
 
     也是 TUI 面板起不来时的逐题回退（与确认框的 _confirm_text 同一条纪律：
     提问永远可用）。数字=选对应项（多选可空格分隔多个），其它文本=自由回答，
-    回车/Ctrl-C/EOF=不答了。
+    0/回车/Ctrl-C/EOF=取消提问，结束本轮并返回对话。
     """
     multi = bool(item.get("multi_select"))
     suffix = f"（{position}）" if position else ""
@@ -2470,13 +2470,14 @@ def ask_one_text(item: dict[str, Any], position: str = "") -> str | None:
         description = str(option.get("description", "") or "")
         tail = f" — {description}" if description else ""
         print(ui.secondary(f"    {number}. {labels[number - 1]}{tail}"))
+    print(ui.secondary("    0. 取消提问，返回对话（保留已答内容）"))
     hint = "数字多选可空格分隔；" if multi else "数字选择；"
     try:
-        answer = input(ui.secondary(f"    回答（{hint}其它文本=自由回答；回车=不答了）：")).strip()
+        answer = input(ui.secondary(f"    回答（{hint}其它文本=自由回答；0/回车/Ctrl-C=取消并返回对话）：")).strip()
     except (EOFError, KeyboardInterrupt):
         print()
         return None
-    if not answer:
+    if not answer or answer == "0":
         return None
     tokens = answer.split()
     if all(token.isdigit() and 1 <= int(token) <= len(labels) for token in tokens):
@@ -2519,7 +2520,7 @@ def text_ask_questions(questions: list[dict[str, Any]]) -> dict[str, str]:
         for number, item in enumerate(questions, start=1):
             answer = ask_one_text(item, position=f"{number}/{total}" if total > 1 else "")
             if answer is None:
-                break
+                return _CancelledAnswers(answers)
             answers[item["question"]] = answer
     finally:
         attention.running()

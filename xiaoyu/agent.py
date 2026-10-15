@@ -110,6 +110,10 @@ Approver = Callable[[str, dict[str, Any]], "bool | str | tuple[bool, str] | Allo
 Asker = Callable[[list[dict[str, Any]]], dict[str, str]]
 
 
+class _CancelledAnswers(dict[str, str]):
+    """终端取消提问，携带已答部分；普通 dict 仍表示宿主提交或跳过。"""
+
+
 class PeerLink(Protocol):
     """跨会话信箱的注入契约（实现见 peers.Registration）。
 
@@ -2037,7 +2041,7 @@ class Agent:
         """ask_user 的 handler：校验归一 → 交给前端 asker → 把答案排版回模型。
 
         校验错误按 ERROR 文本回灌（模型自愈重调）；用户提前收工不是错误——
-        已答的照常返回，没答的点名列出，让模型自行判断或换文字形式问。
+        宿主跳过的问题点名列出；终端显式取消则保留已答部分并结束本轮。
         """
         if extra:
             return f"ERROR: ask_user 不接受这些字段：{', '.join(extra)}。只有 questions。"
@@ -2048,6 +2052,14 @@ class Agent:
         if isinstance(normalized, str):
             return f"ERROR: {normalized}"
         answers = self.asker(normalized)
+        if isinstance(answers, _CancelledAnswers):
+            #  先返回工具结果保存已答内容，再由工具后的检查点结束本轮。
+            #  不能直接抛中断，否则这些答案会被通用的中断占位覆盖。
+            self.interrupt()
+            self.emit(Notice("[已取消提问，本轮已停止；可直接输入新消息]", "info"))
+            lines = [f"- {question}：{answer}" for question, answer in answers.items()]
+            saved = "已保留的回答：\n" + "\n".join(lines) + "\n\n" if lines else ""
+            return saved + "用户取消了提问，本轮已停止，等待用户的新消息；未回答的问题没有默认答案。"
         if not answers:
             return (
                 "用户关闭了提问，一题都没有回答。请自行做出合理决定并继续；"

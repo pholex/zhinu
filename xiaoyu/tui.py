@@ -100,7 +100,7 @@ from rich.text import Text
 from rich.theme import Theme as RichTheme
 
 from . import attention, command_check, keys, media, modes, suggest, theme, ui
-from .agent import Agent
+from .agent import Agent, _CancelledAnswers
 from .config import user_config_dir
 from .events import (
     Notice,
@@ -1020,6 +1020,7 @@ def search_select(
 #  提问面板自动附加的自由输入项（模型不许自己造「其他」，
 #  系统统一加，保证它永远存在且行为一致）
 OTHER_LABEL = "其他（自由输入）"
+CANCEL_QUESTION_LABEL = "取消提问，返回对话"
 
 
 def question_select(
@@ -1028,6 +1029,7 @@ def question_select(
     multi: bool = False,
     checked: set[int] | None = None,
     selected: int = 0,
+    cancel_index: int | None = None,
 ) -> int | list[int] | None:
     """ask_user 的行内选择面板（inline 形态）。
 
@@ -1035,6 +1037,7 @@ def question_select(
     ——说明另起一行淡色显示（模型给的选项没有快捷键可言，数字直选就够）；
     multi=True 时 Space/数字是勾选开关、Enter 提交勾选集合。
     返回：单选 → 选中项下标；多选 → 勾选下标列表（显示顺序）；取消 → None。
+    cancel_index 指向取消操作行，单选与多选下都立即取消，不作为答案提交。
     面板退出即擦除，答案由调用方回显一行定格进 scrollback（与确认框同一纪律）。
     """
     marked: set[int] = set(checked or ())
@@ -1049,13 +1052,17 @@ def question_select(
         cursor = (cursor + 1) % len(options)
 
     def _accept(event: Any) -> None:
-        if multi:
+        if cursor == cancel_index:
+            event.app.exit(result=None)
+        elif multi:
             event.app.exit(result=sorted(marked))
         else:
             event.app.exit(result=cursor)
 
     def _toggle(event: Any) -> None:
-        if multi:
+        if cursor == cancel_index:
+            event.app.exit(result=None)
+        elif multi:
             marked.symmetric_difference_update({cursor})
 
     def _cancel(event: Any) -> None:
@@ -1080,7 +1087,9 @@ def question_select(
         def handler(event: Any) -> None:
             nonlocal cursor
             cursor = index
-            if multi:
+            if index == cancel_index:
+                event.app.exit(result=None)
+            elif multi:
                 marked.symmetric_difference_update({index})
             else:
                 event.app.exit(result=index)
@@ -1100,7 +1109,7 @@ def question_select(
     def fragments() -> list[tuple[str, str]]:
         rows: list[tuple[str, str]] = [("class:menu-title", f"  {title}\n")]
         for index, (label, description) in enumerate(options):
-            mark = f"[{'✓' if index in marked else ' '}] " if multi else ""
+            mark = f"[{'✓' if index in marked else ' '}] " if multi and index != cancel_index else ""
             tail = f"  ({index + 1})" if index < 9 else ""
             if index == cursor:
                 rows.append(("class:menu-selected", f"  ❯ {mark}{label}{tail}\n"))
@@ -1137,7 +1146,7 @@ def ask_questions(questions: list[dict[str, Any]], console: Console) -> dict[str
     「其他」项自动附加在每题末尾；选中后转行内自由输入，Esc 放弃输入退回
     面板，已敲的草稿保留、下次进入预填。
     多选题勾了「其他」时，提交前先问自由输入，与勾选项合并成一个答案。
-    面板上 Esc = 不再回答剩余问题（已答的部分照常返回，交给工具层解释）。
+    面板上 Esc / Ctrl-C / 取消项 = 结束本轮并返回对话，已答部分交给工具层保留。
     """
     answers: dict[str, str] = {}
     total = len(questions)
@@ -1166,6 +1175,8 @@ def ask_questions(questions: list[dict[str, Any]], console: Console) -> dict[str
         ]
         rows.append((OTHER_LABEL, ""))
         other_index = len(rows) - 1
+        rows.append((CANCEL_QUESTION_LABEL, "结束本轮，保留已答内容"))
+        cancel_index = len(rows) - 1
         multi = bool(item.get("multi_select"))
         title = ui.strip_controls(item["question"]) + (f"（{number}/{total}）" if total > 1 else "")
         draft = ""
@@ -1174,7 +1185,10 @@ def ask_questions(questions: list[dict[str, Any]], console: Console) -> dict[str
         answer: str | None = None
         while True:
             try:
-                result = question_select(title, rows, multi=multi, checked=checked, selected=cursor)
+                result = question_select(
+                    title, rows, multi=multi, checked=checked, selected=cursor,
+                    cancel_index=cancel_index,
+                )
             except Exception:  # noqa: BLE001 - 非常规终端起不了面板：退回文本问答，提问永远可用
                 from .cli import ask_one_text
 
@@ -1211,7 +1225,7 @@ def ask_questions(questions: list[dict[str, Any]], console: Console) -> dict[str
             answer = rows[result][0]
             break
         if answer is None:
-            break
+            return _CancelledAnswers(answers)
         answers[item["question"]] = answer
         console.print(
             Text(f"  ✔ {ui.strip_controls(item['question'])}：{ui.strip_controls(answer)}",

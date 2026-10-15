@@ -96,6 +96,9 @@ xiaoyu term install                     # 把终端集成与 Tab 补全写进 ~/
 
 REPL 里：`/help` `/tools` `/skills` `/model` `/search` `/effort` `/mode` `/usage` `/context` `/compact` `/copy` `/export` `/clear` `/exit` `/tasks` `/plan` `/goal` `/perm` `/allow` `/deny` `/resume` `/rewind` `/mcp` `/quit`
 
+提问面板中选「取消提问，返回对话」或按 `Esc` / `Ctrl-C`，会停止本轮并保留已答内容，
+可直接输入新消息；明文问答中输入 `0`、直接回车或按 `Ctrl-C` 同效。
+
 第一次用，想先看它怎么干活：[examples/first-task](examples/first-task/)——一个带着一个失败测试的小项目，照 README 跑一遍，五分钟。
 
 无人值守时没人按确认键：先用 `/allow` 配规则，或 `--mode auto`、`--yolo`。放进 CI 跑见 [docs/ci.md](docs/ci.md)（附 GitHub Actions 样本）。

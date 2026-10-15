@@ -10,11 +10,15 @@ from __future__ import annotations
 
 import contextlib
 import io
+import json
 import unittest
 from unittest import mock
 
-from xiaoyu.agent import PLAN_MODE_TOOLS, normalize_questions
+from xiaoyu.agent import PLAN_MODE_TOOLS, _CancelledAnswers, normalize_questions
 from xiaoyu.cli import ask_one_text, text_ask_questions
+from xiaoyu.embedding import measured_send
+from xiaoyu.render import NullSink
+from xiaoyu.session_log import SessionLog, load_messages
 
 try:
     import prompt_toolkit  # noqa: F401
@@ -24,7 +28,7 @@ try:
 except ImportError:
     HAS_TUI = False
 
-from .test_agent_paths import AgentTestCase
+from .test_agent_paths import AgentTestCase, call_fragment, chunk, usage_chunk
 
 QUESTION = {
     "question": "用哪个方案？",
@@ -115,6 +119,7 @@ class TestAskUserTool(AgentTestCase):
         out = agent.toolbox.run("ask_user", {"questions": [QUESTION]})
         self.assertNotIn("ERROR", out)
         self.assertIn("关闭了提问", out)
+        self.assertFalse(agent.interrupt_requested())  # 宿主的空 dict 仍然表示跳过
 
     def test_partial_answers_name_the_skipped_questions(self) -> None:
         second = {"question": "还要测试吗？", "options": [{"label": "要"}, {"label": "不要"}]}
@@ -123,6 +128,42 @@ class TestAskUserTool(AgentTestCase):
         self.assertIn("方案 B", out)
         self.assertIn("还要测试吗？", out)
         self.assertIn("没有回答其余问题", out)
+        self.assertFalse(agent.interrupt_requested())
+
+    def test_cancel_stops_batch_preserves_answers_and_allows_next_turn(self) -> None:
+        second = {"question": "还要测试吗？", "options": ["要", "不要"]}
+        for replies, expected in (([""], None), (["2", "0"], "方案 B")):
+            with self.subTest(replies=replies):
+                log = SessionLog(self.root / f"cancel-{len(replies)}.jsonl")
+                self.addCleanup(log.release)
+                agent = self.build([
+                    [chunk(tool_calls=[
+                        call_fragment(0, "ask", "ask_user", json.dumps({"questions": [QUESTION, second]})),
+                        call_fragment(1, "write", "write_file", json.dumps({
+                            "path": str(self.root / "must-not-exist.txt"), "content": "不应执行",
+                        })),
+                    ]), usage_chunk(10, 5)],
+                    [chunk(content="好的，先解释刚才的行为。"), usage_chunk(10, 5)],
+                ], asker=text_ask_questions, sink=NullSink(), session_log=log)
+                with mock.patch("builtins.input", side_effect=replies), contextlib.redirect_stdout(io.StringIO()):
+                    result = measured_send(agent, "先问我，再写文件")
+                self.assertTrue(result.interrupted)
+                self.assertEqual(len(self.client.completions.calls), 1)
+                self.assertFalse((self.root / "must-not-exist.txt").exists())
+                results = {m["tool_call_id"]: m["content"] for m in agent.messages if m["role"] == "tool"}
+                self.assertEqual(set(results), {"ask", "write"})
+                self.assertIn("用户取消了提问", results["ask"])
+                self.assertNotIn("自行", results["ask"])
+                if expected:
+                    self.assertIn(expected, results["ask"])
+                restored = {
+                    m["tool_call_id"]: m["content"] for m in load_messages(log.path) if m["role"] == "tool"
+                }
+                self.assertEqual(restored, results)
+                resumed = measured_send(agent, "先解释刚才的行为")
+                self.assertFalse(resumed.interrupted)
+                self.assertEqual(len(self.client.completions.calls), 2)
+                self.assertIn("先解释", resumed.text)
 
     def test_invalid_args_return_error_for_model_to_retry(self) -> None:
         agent = self.build([], asker=lambda questions: {})
@@ -160,6 +201,19 @@ class TestTextAsker(unittest.TestCase):
     def test_empty_answer_stops_asking(self) -> None:
         second = {"question": "q2?", "options": [{"label": "a"}, {"label": "b"}]}
         self.assertEqual(self.ask([""], [QUESTION, second]), {})
+
+    def test_cancel_inputs_are_distinct_from_skipping(self) -> None:
+        for value in ("", "0", KeyboardInterrupt(), EOFError()):
+            with self.subTest(value=value):
+                result = self.ask([value])
+                self.assertIsInstance(result, _CancelledAnswers)
+                self.assertEqual(result, {})
+
+    def test_cancel_preserves_previous_answers(self) -> None:
+        second = {"question": "q2?", "options": [{"label": "a"}, {"label": "b"}]}
+        result = self.ask(["1", "0"], [QUESTION, second])
+        self.assertIsInstance(result, _CancelledAnswers)
+        self.assertEqual(result, {"用哪个方案？": "方案 A"})
 
     def test_eof_stops_asking(self) -> None:
         with contextlib.redirect_stdout(io.StringIO()):
@@ -231,6 +285,28 @@ class TestQuestionPanel(unittest.TestCase):
     def test_cancel_returns_partial_answers(self) -> None:
         second = {"question": "还要测试吗？", "options": [{"label": "要"}, {"label": "不要"}]}
         answers, _ = self.ask([dict(QUESTION), second], "1\x03")
+        self.assertEqual(answers, {"用哪个方案？": "方案 A"})
+        self.assertIsInstance(answers, _CancelledAnswers)
+
+    def test_explicit_cancel_and_shortcuts_return_to_conversation(self) -> None:
+        for multi in (False, True):
+            for pressed in ("4", "\x03", "\x1b", "\x1b[A\r"):
+                with self.subTest(multi=multi, pressed=pressed):
+                    answers, _ = self.ask([dict(QUESTION, multi_select=multi)], pressed)
+                    self.assertIsInstance(answers, _CancelledAnswers)
+                    self.assertEqual(answers, {})
+
+    def test_cancel_in_multi_select_does_not_submit_checked_choices(self) -> None:
+        answers, _ = self.ask([dict(QUESTION, multi_select=True)], "14")
+        self.assertIsInstance(answers, _CancelledAnswers)
+        self.assertEqual(answers, {})
+
+    def test_fallback_cancel_preserves_previous_answers(self) -> None:
+        second = {"question": "q2?", "options": [{"label": "a"}]}
+        with mock.patch("xiaoyu.tui.question_select", side_effect=[0, RuntimeError("no terminal")]):
+            with mock.patch("xiaoyu.cli.ask_one_text", return_value=None):
+                answers, _ = self.ask([dict(QUESTION), second], "")
+        self.assertIsInstance(answers, _CancelledAnswers)
         self.assertEqual(answers, {"用哪个方案？": "方案 A"})
 
     def test_multi_select_combines_choice_and_other_text(self) -> None:

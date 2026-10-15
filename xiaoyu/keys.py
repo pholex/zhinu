@@ -142,7 +142,7 @@ BINDINGS: tuple[Binding, ...] = (
         MENU, keys=(("c-o",),), hint="看全文",
     ),
     Binding(
-        "menu.cancel", "Esc", "取消（等同拒绝）",
+        "menu.cancel", "Esc / Ctrl-C", "取消（审批菜单为拒绝；提问面板结束本轮并返回对话，保留已答内容）",
         MENU, keys=(("escape",), ("c-c",)), hint="取消",
     ),
     #  会话选择器里敲字即过滤：按 Keys.Any 动态注册（不是固定键），本表只登记。
