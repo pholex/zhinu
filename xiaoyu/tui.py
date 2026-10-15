@@ -2651,7 +2651,7 @@ class Tui:
                 [
                     (
                         theme.ptk("menu.title"),
-                        f"  允许{verb} {name}? [y/N{session_option}，其它输入=拒绝理由] ",
+                        f"  允许{verb} {name}? [y/N{session_option}；ok/好/做 等也算 y，其它输入=拒绝理由] ",
                     )
                 ]
             )
