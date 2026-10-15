@@ -1,0 +1,17 @@
+{"kind": "request.started", "model": "snapshot-model", "provider": "_scripted"}
+{"kind": "tool.preparing", "name": "read_file", "index": 0, "argument_chars": 21, "path": "owner.txt", "purpose": ""}
+{"kind": "request.ended", "duration_ms": 0, "ttft_ms": 0, "usage": {"prompt_tokens": 150, "completion_tokens": 20, "cached_tokens": 0}, "model": "", "response_id": "", "finish_reason": "", "error": ""}
+{"kind": "tool.pending", "name": "read_file", "args": {"path": "owner.txt"}}
+{"kind": "tool.running", "name": "read_file", "args": {"path": "owner.txt"}}
+{"kind": "tool.completed", "name": "read_file", "output": "owner=A\n", "ok": true, "seconds": 0}
+{"kind": "request.started", "model": "snapshot-model", "provider": "_scripted"}
+{"kind": "tool.preparing", "name": "write_file", "index": 0, "argument_chars": 45, "path": "owner.txt", "purpose": ""}
+{"kind": "request.ended", "duration_ms": 0, "ttft_ms": 0, "usage": {"prompt_tokens": 190, "completion_tokens": 20, "cached_tokens": 0}, "model": "", "response_id": "", "finish_reason": "", "error": ""}
+{"kind": "tool.pending", "name": "write_file", "args": {"path": "owner.txt", "content": "owner=C\n"}}
+{"kind": "tool.running", "name": "write_file", "args": {"path": "owner.txt", "content": "owner=C\n"}}
+{"kind": "tool.completed", "name": "write_file", "output": "ERROR: owner.txt 在你上次 read_file 之后被改动过（可能是你自己用 bash 改的，或外部编辑器改的）。请重新 read_file 拿到最新内容再改，否则会覆盖掉别人的改动。", "ok": false, "seconds": 0}
+{"kind": "request.started", "model": "snapshot-model", "provider": "_scripted"}
+{"kind": "text.delta", "text": "文件在读取后被外部修改，本次覆盖已拒绝，保留外部修改。"}
+{"kind": "text.end"}
+{"kind": "request.ended", "duration_ms": 0, "ttft_ms": 0, "usage": {"prompt_tokens": 230, "completion_tokens": 20, "cached_tokens": 0}, "model": "", "response_id": "", "finish_reason": "", "error": ""}
+{"kind": "result", "result": "文件在读取后被外部修改，本次覆盖已拒绝，保留外部修改。", "usage": {"turns": 3, "prompt_tokens": 570, "completion_tokens": 60, "by_model": {"_scripted/snapshot-model": {"calls": 3, "prompt_tokens": 570, "completion_tokens": 60}}}, "model": "snapshot-model", "session_log": "<session_log>"}

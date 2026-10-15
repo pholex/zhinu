@@ -7,11 +7,17 @@
         "properties": {
           "limit": {
             "description": "最多读多少行；省略表示读到结尾",
-            "type": "integer"
+            "type": [
+              "integer",
+              "null"
+            ]
           },
           "offset": {
             "description": "起始行号，从 1 开始；省略表示从头读",
-            "type": "integer"
+            "type": [
+              "integer",
+              "null"
+            ]
           },
           "path": {
             "description": "文件路径",
@@ -95,7 +101,10 @@
         "properties": {
           "glob": {
             "description": "文件名 glob 过滤，如 *.py；省略表示不过滤",
-            "type": "string"
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "max_matches": {
             "description": "最多返回多少条，默认 200；结果被截断时会提示总数",
@@ -163,7 +172,10 @@
           },
           "timeout": {
             "description": "超时秒数，默认 120。超时的命令会被终止，已产生的输出仍会返回给你；预计耗时长的命令（完整测试、构建）请显式调大。后台任务默认不受超时约束，显式给了才生效",
-            "type": "integer"
+            "type": [
+              "integer",
+              "null"
+            ]
           }
         },
         "required": [
@@ -194,7 +206,10 @@
           },
           "timeout": {
             "description": "最长观察秒数，默认 36000（10 小时）",
-            "type": "integer"
+            "type": [
+              "integer",
+              "null"
+            ]
           }
         },
         "required": [

@@ -18,6 +18,7 @@ import functools
 import hashlib
 import json
 import locale
+import math
 import os
 import re
 import signal
@@ -599,7 +600,7 @@ def _newline_of(raw: bytes) -> str:
     return "\n"
 
 
-def _write_like_original(target: Path, text: str, encoding: str, raw: bytes | None) -> None:
+def _write_like_original(target: Path, text: str, encoding: str, raw: bytes | None) -> bytes:
     """按原文件的样子写回：同样的编码、同样的换行、原来带 BOM 的还带。
 
     读的时候换行统一成了 LF（匹配要用），写回时不还原的话，改一处就等于把整份
@@ -614,7 +615,8 @@ def _write_like_original(target: Path, text: str, encoding: str, raw: bytes | No
     data = body.encode(encoding)
     if original.startswith(codecs.BOM_UTF8) and codecs.lookup(encoding).name == "utf-8":
         data = codecs.BOM_UTF8 + data
-    target.write_bytes(data)
+    fsguard.write_atomic(target, data, check_writable=True)
+    return data
 
 
 def _mixed_newlines(raw: bytes) -> bool:
@@ -624,7 +626,7 @@ def _mixed_newlines(raw: bytes) -> bool:
     return sum(1 for count in kinds if count) > 1
 
 
-def _write_edit(target: Path, before: str, updated: str, encoding: str, raw: bytes | None) -> None:
+def _write_edit(target: Path, before: str, updated: str, encoding: str, raw: bytes | None) -> bytes:
     """局部替换的写回：换行不纯的文件只动被替换的那一段，其余字节原样留着。
 
     匹配是在换行归一成 LF 的文本上做的，写回时整体换成"多数派"换行——对换行
@@ -634,13 +636,11 @@ def _write_edit(target: Path, before: str, updated: str, encoding: str, raw: byt
     新写的那段用多数派换行。
     """
     if raw is None or not _mixed_newlines(raw):
-        _write_like_original(target, updated, encoding, raw)
-        return
+        return _write_like_original(target, updated, encoding, raw)
     try:
         decoded = raw.decode(encoding).removeprefix("\ufeff")
     except UnicodeDecodeError:
-        _write_like_original(target, updated, encoding, raw)
-        return
+        return _write_like_original(target, updated, encoding, raw)
     #  归一后第 i 个字符在原文里从哪儿开始（\\r\\n 占两个字符）
     starts: list[int] = []
     index = 0
@@ -650,8 +650,7 @@ def _write_edit(target: Path, before: str, updated: str, encoding: str, raw: byt
     starts.append(len(decoded))
     if len(starts) - 1 != len(before):
         #  对不上说明手里的 before 不是这份字节归一出来的：不猜，走整体写回
-        _write_like_original(target, updated, encoding, raw)
-        return
+        return _write_like_original(target, updated, encoding, raw)
     limit = min(len(before), len(updated))
     head = 0
     while head < limit and before[head] == updated[head]:
@@ -666,7 +665,8 @@ def _write_edit(target: Path, before: str, updated: str, encoding: str, raw: byt
     data = (decoded[: starts[head]] + middle + decoded[starts[len(before) - tail] :]).encode(encoding)
     if raw.startswith(codecs.BOM_UTF8) and codecs.lookup(encoding).name == "utf-8":
         data = codecs.BOM_UTF8 + data
-    target.write_bytes(data)
+    fsguard.write_atomic(target, data, check_writable=True)
+    return data
 
 
 def _undecodable_error(path: str) -> str:
@@ -938,6 +938,14 @@ _TYPE_NAMES = {"integer": "整数", "number": "数字", "boolean": "布尔值（
 _MAX_COERCE_DEPTH = 8
 
 
+def _coercion_kind(schema: dict[str, Any]) -> Any:
+    kind = schema.get("type")
+    if isinstance(kind, list) and len(kind) == 2 and kind.count("null") == 1:
+        # 可选空值不增加转换歧义；多个非空类型仍不猜。
+        return next(item for item in kind if item != "null")
+    return kind
+
+
 def coerce_to_schema(value: Any, schema: Any, depth: int = 0) -> Any:
     """按 schema 声明的类型，把模型写成字符串的数字 / 布尔 / 数组 / 对象还原成真类型。
 
@@ -945,11 +953,11 @@ def coerce_to_schema(value: Any, schema: Any, depth: int = 0) -> Any:
     一个 JSON 字符串。不还原的后果各不相同：`"false"` 是非空字符串，直接拿去判真假
     恰好是反的；`"5"` 进了算术才炸，那时进程可能已经起来了。
 
-    只按声明转、只转认得出的：联合类型与没声明类型的不猜，转不动的原样留着。
+    只按声明转、只转认得出的：单类型可带 null，多种非空类型不猜，转不动原样留着。
     """
     if not isinstance(schema, dict) or depth > _MAX_COERCE_DEPTH:
         return value
-    kind = schema.get("type")
+    kind = _coercion_kind(schema)
     if not isinstance(kind, str):
         return value
     if isinstance(value, str):
@@ -988,10 +996,87 @@ def _mistyped_argument(args: dict[str, Any], schema: Any) -> str:
     是一句 Python 的类型错误，模型看不出是哪个参数、该改成什么。"""
     properties = schema.get("properties") if isinstance(schema, dict) else None
     for key, declared in (properties or {}).items():
-        kind = declared.get("type") if isinstance(declared, dict) else None
+        kind = _coercion_kind(declared) if isinstance(declared, dict) else None
         if isinstance(kind, str) and kind in _TYPE_NAMES and isinstance(args.get(key), str):
             return f"{key} 应为{_TYPE_NAMES[kind]}，收到的是字符串 {args[key]!r}"
     return ""
+
+
+def _json_equal(left: Any, right: Any) -> bool:
+    """JSON 的布尔值不是数字；Python 的 True == 1 不能用于 enum。"""
+    if isinstance(left, bool) or isinstance(right, bool):
+        return type(left) is type(right) and left == right
+    if isinstance(left, dict) and isinstance(right, dict):
+        return left.keys() == right.keys() and all(_json_equal(left[k], right[k]) for k in left)
+    if isinstance(left, list) and isinstance(right, list):
+        return len(left) == len(right) and all(_json_equal(a, b) for a, b in zip(left, right))
+    return left == right
+
+
+def _argument_problem(value: Any, schema: Any, path: str = "$") -> str:
+    """基础参数契约：类型、枚举、必填、对象成员与数组元素，返回首个问题。
+
+    不冒充完整 JSON Schema：引用、组合分支、pattern 等复杂约束仍由远端或
+    工具自己的 validator 负责。patternProperties 存在时不猜哪些键是额外字段。
+    SDK 的严格工具自行校验，不经过这里，也不做类型转换。
+    """
+    if schema is False:
+        return f"{path} 不允许这个值"
+    if not isinstance(schema, dict) or "$ref" in schema:
+        return ""
+    numeric = isinstance(value, (int, float)) and not isinstance(value, bool)
+    finite = numeric and (not isinstance(value, float) or math.isfinite(value))
+    matches = {
+        "object": isinstance(value, dict), "array": isinstance(value, list),
+        "string": isinstance(value, str), "boolean": isinstance(value, bool),
+        "null": value is None, "number": finite,
+        "integer": finite and (isinstance(value, int) or value.is_integer()),
+    }
+    kind = schema.get("type")
+    kinds = [kind] if isinstance(kind, str) else kind
+    if isinstance(kinds, list) and kinds and all(isinstance(k, str) and k in matches for k in kinds):
+        if not any(matches[k] for k in kinds):
+            labels = {**_TYPE_NAMES, "object": "JSON 对象", "array": "数组", "string": "字符串", "null": "null"}
+            return f"{path} 类型应为 {' / '.join(labels.get(k, k) for k in kinds)}"
+    if isinstance(schema.get("enum"), list) and not any(_json_equal(value, choice) for choice in schema["enum"]):
+        return f"{path} 不在允许的 enum 内"
+    if "const" in schema and not _json_equal(value, schema["const"]):
+        return f"{path} 不符合 const"
+    if isinstance(value, dict):
+        required = schema.get("required", [])
+        if isinstance(required, list):
+            for key in required:
+                if isinstance(key, str) and key not in value:
+                    return f"{path} 缺少必填字段 {key}"
+        properties = schema.get("properties", {})
+        properties = properties if isinstance(properties, dict) else {}
+        for key, item in value.items():
+            if key in properties:
+                child = properties[key]
+            elif "patternProperties" in schema:
+                continue
+            else:
+                child = schema.get("additionalProperties", True)
+            if problem := _argument_problem(item, child, f"{path}.{key}"):
+                return problem
+    if isinstance(value, list) and isinstance(schema.get("items"), (dict, bool)):
+        # prefixItems 的前缀有独立 schema，不能拿尾部 items 误验前缀。
+        start = len(schema["prefixItems"]) if isinstance(schema.get("prefixItems"), list) else 0
+        for index in range(start, len(value)):
+            if problem := _argument_problem(value[index], schema["items"], f"{path}[{index}]"):
+                return problem
+    return ""
+
+
+def _prepare_arguments(args: Any, schema: dict[str, Any]) -> tuple[dict[str, Any], str]:
+    """本地与 MCP 共用的执行前收口；不改写调用方持有的参数。"""
+    if not isinstance(args, dict):
+        return {}, "参数必须是 JSON 对象"
+    try:
+        args = coerce_to_schema(args, {**schema, "type": "object"})
+        return args, _mistyped_argument(args, schema) or _argument_problem(args, schema)
+    except (RecursionError, ValueError, OverflowError):
+        return {}, "参数嵌套过深或数值无法表示"
 
 
 @dataclass(frozen=True)
@@ -1001,6 +1086,7 @@ class _ReadMark:
     mtime: float
     size: int  # -1 = 当时取不到
     whole: bool  # 模型手上有全文
+    digest: bytes | None  # 实际展示或写出的原始字节的 SHA-256；None = 无法确认版本
     seen: tuple[tuple[int, int], ...] = ()  # 分段读过的行范围（1 起、闭区间、已合并）
     total: int = 0  # 分段读时文件的总行数
 
@@ -1568,7 +1654,7 @@ class Toolbox:
                             "description": "检索关键词（server 名 / 动作 / 工具名）",
                         },
                         "limit": {
-                            "type": "integer",
+                            "type": ["integer", "null"],
                             "description": "最多返回几个结果，默认 5",
                         },
                     },
@@ -1595,7 +1681,7 @@ class Toolbox:
                             "description": "全限定工具名（search_tool 的结果里抄）",
                         },
                         "tool_input": {
-                            "type": "object",
+                            "type": ["object", "null"],
                             "description": "传给该工具的参数对象（按其 schema 构造）",
                         },
                     },
@@ -1684,7 +1770,10 @@ class Toolbox:
         if not remote.check_fn():
             return f"ERROR: MCP 工具 {name} 当前不可用（server 未就绪或已退出）。"
         #  目的参数是给审批框看的，别漏进远端参数
-        tool_input.pop(PURPOSE_PARAM, None)
+        tool_input = {key: value for key, value in tool_input.items() if key != PURPOSE_PARAM}
+        tool_input, problem = _prepare_arguments(tool_input, remote.parameters)
+        if problem:
+            return f"ERROR: 调用 {name} 的参数不对：{problem}"
         return self._interruptible(remote.handler, name)(**tool_input)
 
     def _interruptible(self, handler: Callable[..., str], name: str = "") -> Callable[..., str]:
@@ -1912,9 +2001,9 @@ class Toolbox:
         if blocked:
             return blocked
 
-        if isinstance(args, dict) and tool.coerce_arguments:
-            args = coerce_to_schema(args, {**tool.parameters, "type": "object"})
-            if problem := _mistyped_argument(args, tool.parameters):
+        if tool.coerce_arguments:
+            args, problem = _prepare_arguments(args, tool.parameters)
+            if problem:
                 return f"ERROR: 调用 {name} 的参数不对：{problem}"
 
         try:
@@ -2042,11 +2131,11 @@ class Toolbox:
                     "properties": {
                         "path": {"type": "string", "description": "文件路径"},
                         "offset": {
-                            "type": "integer",
+                            "type": ["integer", "null"],
                             "description": "起始行号，从 1 开始；省略表示从头读",
                         },
                         "limit": {
-                            "type": "integer",
+                            "type": ["integer", "null"],
                             "description": "最多读多少行；省略表示读到结尾",
                         },
                     },
@@ -2130,7 +2219,7 @@ class Toolbox:
                             "description": "搜索起点，默认工作区根目录",
                         },
                         "glob": {
-                            "type": "string",
+                            "type": ["string", "null"],
                             "description": "文件名 glob 过滤，如 *.py；省略表示不过滤",
                         },
                         "max_matches": {
@@ -2157,10 +2246,10 @@ class Toolbox:
                 parameters={
                     "type": "object",
                     "properties": {
-                        "id": {"type": "string", "description": "召回 id（预览里给的）；省略则列出全部"},
-                        "pattern": {"type": "string", "description": "正则：在该输出里找匹配行"},
-                        "offset": {"type": "integer", "description": "起始行号（从 1）；与 limit 配合取一段"},
-                        "limit": {"type": "integer", "description": "最多取多少行"},
+                        "id": {"type": ["string", "null"], "description": "召回 id（预览里给的）；省略则列出全部"},
+                        "pattern": {"type": ["string", "null"], "description": "正则：在该输出里找匹配行"},
+                        "offset": {"type": ["integer", "null"], "description": "起始行号（从 1）；与 limit 配合取一段"},
+                        "limit": {"type": ["integer", "null"], "description": "最多取多少行"},
                     },
                     "required": [],
                 },
@@ -2220,7 +2309,7 @@ class Toolbox:
                     "properties": {
                         "command": {"type": "string", "description": "要执行的命令"},
                         "timeout": {
-                            "type": "integer",
+                            "type": ["integer", "null"],
                             "description": (
                                 f"超时秒数，默认 {self.config.bash_timeout}。"
                                 "超时的命令会被终止，已产生的输出仍会返回给你；"
@@ -2240,8 +2329,8 @@ class Toolbox:
                         **(
                             {
                                 "sandbox_permissions": {
-                                    "type": "string",
-                                    "enum": self._escalation_modes(),
+                                    "type": ["string", "null"],
+                                    "enum": self._escalation_modes() + [None],
                                     "description": (
                                         "为**这一次**调用申请更高的沙箱权限（需用户批准，"
                                         "仅本次生效）。只在命令确实被沙箱拦截时使用，"
@@ -2249,7 +2338,7 @@ class Toolbox:
                                     ),
                                 },
                                 "justification": {
-                                    "type": "string",
+                                    "type": ["string", "null"],
                                     "description": (
                                         "一句给用户看的解释：为什么这条命令需要升权。"
                                         "必须与 sandbox_permissions 成对出现。"
@@ -2281,23 +2370,23 @@ class Toolbox:
                     "type": "object",
                     "properties": {
                         "task_ids": {
-                            "type": "array",
+                            "type": ["array", "string"],
                             "items": {"type": "string"},
-                            "description": "要查看的任务 id 列表（单个也写成数组）",
+                            "description": "要查看的任务 id 列表；单个任务也可传 id 字符串",
                         },
                         "timeout": {
-                            "type": "integer",
+                            "type": ["integer", "null"],
                             "description": "最多等多少秒（上限 600）；省略或 0 = 立即返回快照",
                         },
                         "offset": {
-                            "type": "integer",
+                            "type": ["integer", "null"],
                             "description": (
                                 "从日志的第几个字节起读（0 = 开头）；接着上次读就填"
                                 "上次返回的 next_offset。省略 = 头尾快照"
                             ),
                         },
                         "limit": {
-                            "type": "integer",
+                            "type": ["integer", "null"],
                             "description": (
                                 f"这一段最多读多少字节，默认 {OUTPUT_READ_BYTES}"
                             ),
@@ -2349,7 +2438,7 @@ class Toolbox:
                             "description": "在观察什么（每条事件通知都会带上这句话）",
                         },
                         "timeout": {
-                            "type": "integer",
+                            "type": ["integer", "null"],
                             "description": f"最长观察秒数，默认 {MONITOR_DEFAULT_TIMEOUT}（10 小时）",
                         },
                     },
@@ -2381,14 +2470,14 @@ class Toolbox:
                     "type": "object",
                     "properties": {
                         "action": {"type": "string", "enum": list(browser.ACTIONS)},
-                        "url": {"type": "string", "description": "open 用"},
-                        "selector": {"type": "string", "description": "click/fill 用"},
-                        "text": {"type": "string", "description": "fill 用"},
-                        "key": {"type": "string", "description": "press 用"},
-                        "path": {"type": "string", "description": "screenshot 用"},
+                        "url": {"type": ["string", "null"], "description": "open 用"},
+                        "selector": {"type": ["string", "null"], "description": "click/fill 用"},
+                        "text": {"type": ["string", "null"], "description": "fill 用"},
+                        "key": {"type": ["string", "null"], "description": "press 用"},
+                        "path": {"type": ["string", "null"], "description": "screenshot 用"},
                         "dialog": {
-                            "type": "string",
-                            "enum": list(browser.DIALOG_CHOICES),
+                            "type": ["string", "null"],
+                            "enum": list(browser.DIALOG_CHOICES) + [None],
                             "description": (
                                 "这一步里页面弹出确认框时怎么答：dismiss=取消（默认），"
                                 "accept=确认"
@@ -2504,11 +2593,13 @@ class Toolbox:
         if error := _binary_file_error(target, path):
             return error
         try:
-            text, encoding, _ = _read_for_edit(target)
+            text, encoding, raw = _read_for_edit(target)
         except _Undecodable:
             #  只读展示仍给有损文本（总比什么都不给强），但明说有损、编辑会被拒
             try:
-                text, encoding = target.read_text(encoding="utf-8", errors="replace"), ""
+                raw = target.read_bytes()
+                text = raw.decode("utf-8", errors="replace").replace("\r\n", "\n").replace("\r", "\n")
+                encoding = ""
             except OSError as exc:
                 return f"ERROR: 读取失败 {path}: {exc}"
         except OSError as exc:
@@ -2523,7 +2614,7 @@ class Toolbox:
         elif encoding != "utf-8":
             prefix += f"(注意：该文件按 {encoding} 解码显示，str_replace 会按原编码写回)\n"
         if not text:
-            self._mark_read(target)
+            self._mark_read(target, raw=raw)
             return f"{prefix}(文件为空：{path})"
 
         limit_chars = self.config.max_tool_output
@@ -2541,6 +2632,7 @@ class Toolbox:
                 fits = len(shown) <= limit_chars
                 self._mark_read(
                     target,
+                    raw=raw,
                     seen=_ranges_without(1, len(lines), clipped) if fits else (),
                     total=len(lines),
                 )
@@ -2552,11 +2644,11 @@ class Toolbox:
                 )
             shown = f"{prefix}{text}"
             if len(shown) <= limit_chars:
-                self._mark_read(target)
+                self._mark_read(target, raw=raw)
                 return shown
             #  整读但装不下：回给模型的只有头尾预览，中段它没看见。记成"读过一部分"——
             #  够做局部替换（old_str 得逐字对上），不够整体覆盖
-            self._mark_read(target, seen=())
+            self._mark_read(target, seen=(), raw=raw)
             return shown + (
                 f"\n[{path} 太长，上面只显示了头尾；没显示的部分用 offset/limit 分段读。"
                 "整体覆盖（write_file）要把各段都读到，局部修改（str_replace）现在就可以]"
@@ -2586,7 +2678,7 @@ class Toolbox:
         #  这一段自己也装不下的话，模型同样只看见头尾——不计入已读范围
         fits = len(note) + len(chunk) <= limit_chars
         seen = _ranges_without(start, end, clipped) if fits else ()
-        self._mark_read(target, seen=seen, total=len(lines))
+        self._mark_read(target, seen=seen, total=len(lines), raw=raw)
         return note + chunk
 
     def _write_file(self, path: str, content: str) -> str:
@@ -2622,12 +2714,13 @@ class Toolbox:
                         f"；原文件是 {encoding} 编码，新内容里有它表示不了的字符，已改用 UTF-8"
                     )
                     encoding = "utf-8"
-                _write_like_original(target, content, encoding, previous)
+                written = _write_like_original(target, content, encoding, previous)
             else:
-                target.write_text(content, encoding="utf-8")
+                written = content.encode("utf-8")
+                fsguard.write_atomic(target, written, check_writable=True)
         except OSError as exc:
             return f"ERROR: 写入失败 {path}: {exc}"
-        self._mark_read(target)
+        self._mark_read(target, raw=written)
         action = "已覆盖" if existed else "已创建"
         note = ("（工作区之外）" if outside else "") + converted
         lines = content.count("\n") + (1 if content and not content.endswith("\n") else 0)
@@ -2687,10 +2780,10 @@ class Toolbox:
             return error
         self.rewind.record(target, raw)
         try:
-            _write_edit(target, text, updated, encoding, raw)
+            written = _write_edit(target, text, updated, encoding, raw)
         except OSError as exc:
             return f"ERROR: 写入失败 {path}: {exc}"
-        self._mark_read(target, keep_level=True)
+        self._mark_read(target, keep_level=True, raw=written)
 
         note = "（工作区之外）" if outside else ""
         delta = updated.count("\n") - text.count("\n")
@@ -2763,10 +2856,10 @@ class Toolbox:
             return error
         self.rewind.record(target, raw if raw is not None else text.encode(encoding))
         try:
-            _write_edit(target, text, updated, encoding, raw)
+            written = _write_edit(target, text, updated, encoding, raw)
         except OSError as exc:
             return f"ERROR: 写入失败 {path}: {exc}"
-        self._mark_read(target, keep_level=True)
+        self._mark_read(target, keep_level=True, raw=written)
 
         offset = sum(len(line) + 1 for line in updated_lines[: found.line_index])
         note = "（工作区之外）" if outside else ""
@@ -3275,7 +3368,10 @@ class Toolbox:
         和上次一样时提醒一句——那是在原地重查，看多少遍都是同一份内容。
         """
         if isinstance(task_ids, str):
-            task_ids = [task_ids]
+            # 保留单 id 与 JSON 编码数组两种已有输入形式。
+            task_ids = coerce_to_schema(task_ids, {"type": "array", "items": {"type": "string"}})
+            if isinstance(task_ids, str):
+                task_ids = [task_ids]
         if not isinstance(task_ids, list) or not task_ids:
             return "ERROR: task_ids 必须是非空数组（单个任务写成一元数组）。"
         ids: list[str] = []
@@ -3348,36 +3444,42 @@ class Toolbox:
         seen: tuple[tuple[int, int], ...] | None = None,
         total: int = 0,
         keep_level: bool = False,
+        *,
+        raw: bytes | None = None,
     ) -> None:
-        """记下这个文件"已被读过"、读到了哪个程度，以及当时的 mtime 与大小。
+        """记下这个文件"已被读过"、读到了哪个程度，以及元数据和内容指纹。
 
         seen=None 是模型手上有全文（完整读过，或刚由它整个写出来）；给了 seen
         就是只看过这些行范围（1 起、闭区间），同一版本文件的多次分段读累加，
         凑齐全部行即等同全文。keep_level 给局部替换后用：文件版本换了、行号也
         可能错位，全文的仍算全文，只读过一部分的清空已读范围但保留"读过"。
+        raw 必须来自实际展示或写出的字节，不能在登记时重读并认证另一份内容。
         """
         try:
             stat_result = target.stat()
             mtime, size = stat_result.st_mtime, stat_result.st_size
         except OSError:
             mtime, size = 0.0, -1
+        digest = hashlib.sha256(raw).digest() if raw is not None else None
         previous = self._reads.get(target)
         if keep_level and previous is not None:
-            self._reads[target] = _ReadMark(mtime, size, previous.whole, (), 0)
+            self._reads[target] = _ReadMark(mtime, size, previous.whole, digest, (), 0)
             return
         if seen is None:
-            self._reads[target] = _ReadMark(mtime, size, True, (), 0)
+            self._reads[target] = _ReadMark(mtime, size, True, digest, (), 0)
             return
         ranges = list(seen)
         whole = False
-        if previous is not None and (previous.mtime, previous.size) == (mtime, size):
+        if digest is not None and previous is not None and (
+            previous.mtime, previous.size, previous.digest
+        ) == (mtime, size, digest):
             #  同一版本上的又一次读：已读范围累加；之前就有全文的不降级
             whole = previous.whole
             ranges += previous.seen
         merged = _merge_ranges(ranges)
         if total and merged == ((1, total),):
             whole = True
-        self._reads[target] = _ReadMark(mtime, size, whole, merged, total)
+        self._reads[target] = _ReadMark(mtime, size, whole, digest, merged, total)
 
     def _guard_known(self, target: Path, shown: str, whole: bool = False) -> str | None:
         """改动已有文件前的两道闸：必须读过，且读过之后没被别人改。
@@ -3393,11 +3495,24 @@ class Toolbox:
             )
         try:
             current = target.stat()
-        except OSError:
-            return None
+        except OSError as exc:
+            return f"ERROR: 无法确认 {shown} 的当前内容：{exc}。请重新 read_file 后再改。"
+        if error := _unreadable_file_error(target, shown, size_cap=False):
+            return error
         #  mtime 比"不等"而不是"更新"、再加上大小：换回一份更旧的文件（git checkout、
         #  从备份恢复）mtime 是往回走的，只比"更新"会漏掉
-        if current.st_mtime != mark.mtime or (mark.size >= 0 and current.st_size != mark.size):
+        changed = current.st_mtime != mark.mtime or (mark.size >= 0 and current.st_size != mark.size)
+        if not changed:
+            try:
+                # 时间与大小相同也可能是另一份内容；分块散列避免额外整读占用内存。
+                digest = hashlib.sha256()
+                with target.open("rb") as handle:
+                    while chunk := handle.read(1024 * 1024):
+                        digest.update(chunk)
+                changed = mark.digest is None or digest.digest() != mark.digest
+            except OSError as exc:
+                return f"ERROR: 无法确认 {shown} 的当前内容：{exc}。请重新 read_file 后再改。"
+        if changed:
             return (
                 f"ERROR: {shown} 在你上次 read_file 之后被改动过"
                 "（可能是你自己用 bash 改的，或外部编辑器改的）。"

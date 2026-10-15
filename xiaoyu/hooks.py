@@ -67,16 +67,23 @@
 
 from __future__ import annotations
 
+import atexit
+import codecs
+import contextlib
 import json
 import os
 import re
 import subprocess
+import threading
+import time
 import tomllib
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable, Iterator
 
+from .background import kill_tree, mark_group_leader, TERM_GRACE_SECONDS
 from .config import user_config_dir
+from .errors import Interrupted
 
 EVENTS = (
     "PreToolUse", "PostToolUse", "ToolFailed", "UserPromptSubmit", "Stop",
@@ -95,6 +102,165 @@ _PAYLOAD_TEXT_CAP = 8_000
 #  放行钩子 stdout 首行的上限：它会原样进历史（SessionStart 的环境说明），
 #  一行就够说清"当前分支 / 值班提示"，更长的说明该写进 AGENTS.md
 OUTPUT_LINE_CAP = 2_000
+# 每路输出只留头尾各一半；继续排空管道，不让子进程因输出堵住。
+_OUTPUT_KEEP_BYTES = 256 * 1024
+_READ_BYTES = 64 * 1024
+_POLL_SECONDS = 0.05
+_REAP_SECONDS = 2.0
+_call_scope = threading.local()
+
+
+@contextlib.contextmanager
+def stop_scope(stop_requested: Callable[[], bool] | None) -> Iterator[None]:
+    """取消属于本次调用，不挂到可能被父子 agent 共用的引擎实例上。"""
+    previous = getattr(_call_scope, "stop", None)
+    _call_scope.stop = stop_requested
+    try:
+        yield
+    finally:
+        _call_scope.stop = previous
+
+
+class _Output:
+    """仅由一路读线程写入；线程结束后才读取结果。"""
+
+    def __init__(self) -> None:
+        self.head = bytearray()
+        self.tail = bytearray()
+        self.total = 0
+        self.error: OSError | None = None
+        self.nonblank = False
+        self._decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
+
+    def append(self, data: bytes) -> None:
+        self.total += len(data)
+        if not self.nonblank:
+            self.nonblank = bool(self._decoder.decode(data).strip())
+        room = _OUTPUT_KEEP_BYTES // 2 - len(self.head)
+        self.head.extend(data[:room])
+        self.tail.extend(data[room:])
+        excess = len(self.tail) - _OUTPUT_KEEP_BYTES // 2
+        if excess > 0:
+            del self.tail[:excess]
+
+    @property
+    def truncated(self) -> bool:
+        return self.total > _OUTPUT_KEEP_BYTES
+
+    def text(self) -> str:
+        if not self.truncated:
+            return (self.head + self.tail).decode("utf-8", errors="replace")
+        dropped = self.total - len(self.head) - len(self.tail)
+        return (self.head.decode("utf-8", errors="replace")
+                + f"\n…（hook 输出已截断，中间省略 {dropped} 字节）…\n"
+                + self.tail.decode("utf-8", errors="replace"))
+
+
+# 在退出清理时仍有明确的进程所有者；不让正在执行的 hook 变成匿名孤儿。
+_active: dict[subprocess.Popen, list[threading.Thread]] = {}
+_active_lock = threading.Lock()
+
+
+def _cleanup(proc: subprocess.Popen, workers: list[threading.Thread], grace: float) -> None:
+    try:
+        kill_tree(proc, grace=grace)
+    finally:
+        with contextlib.suppress(subprocess.TimeoutExpired):
+            proc.wait(timeout=_REAP_SECONDS)
+        deadline = time.monotonic() + _REAP_SECONDS
+        for worker in workers:
+            worker.join(max(0.0, deadline - time.monotonic()))
+        if proc.poll() is not None and not any(worker.is_alive() for worker in workers):
+            for stream in (proc.stdin, proc.stdout, proc.stderr):
+                if stream is not None:
+                    with contextlib.suppress(OSError):
+                        stream.close()
+            with _active_lock:
+                _active.pop(proc, None)
+
+
+def _cleanup_active() -> None:
+    with _active_lock:
+        pending = list(_active.items())
+    for proc, workers in pending:
+        with contextlib.suppress(Exception):
+            _cleanup(proc, workers, 0.0)
+
+
+atexit.register(_cleanup_active)
+
+
+def _run(hook: "Hook", body: str, workspace: Path,
+         stop_requested: Callable[[], bool] | None) -> tuple[int, _Output, _Output]:
+    """顺序执行一个 hook；三个 I/O 泵只负责排空管道，等待线程管取消和超时。"""
+    def check_stop() -> None:
+        if stop_requested is not None and stop_requested():
+            raise Interrupted("宿主请求打断 hook")
+
+    check_stop()
+    started = time.monotonic()
+    proc = subprocess.Popen(
+        hook.command, shell=True, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE, bufsize=0, cwd=workspace, env=_hook_env(),
+        start_new_session=os.name != "nt",
+    )
+    mark_group_leader(proc)
+    workers: list[threading.Thread] = []
+    with _active_lock:
+        _active[proc] = workers
+    stdout, stderr = _Output(), _Output()
+    write_errors: list[OSError] = []
+    completed = False
+
+    def read(stream: Any, output: _Output) -> None:
+        try:
+            while data := stream.read(_READ_BYTES):
+                output.append(data)
+        except OSError as exc:
+            output.error = exc
+        finally:
+            if not output.nonblank:
+                output.nonblank = bool(output._decoder.decode(b"", final=True).strip())
+            stream.close()
+
+    def write() -> None:
+        try:
+            data = memoryview(body.encode("utf-8"))
+            while data:
+                count = proc.stdin.write(data)
+                data = data[count:]
+        except BrokenPipeError:
+            pass  # hook 可以不读 stdin；与 subprocess.run 的约定一致
+        except OSError as exc:
+            write_errors.append(exc)
+        finally:
+            proc.stdin.close()
+
+    try:
+        for name, target, args in (
+            ("stdout", read, (proc.stdout, stdout)),
+            ("stderr", read, (proc.stderr, stderr)),
+            ("stdin", write, ()),
+        ):
+            worker = threading.Thread(target=target, args=args, name=f"xiaoyu-hook-{name}", daemon=True)
+            worker.start()
+            workers.append(worker)
+        while True:
+            check_stop()
+            if proc.poll() is not None and not any(worker.is_alive() for worker in workers):
+                break
+            remaining = started + hook.timeout - time.monotonic()
+            if remaining <= 0:
+                raise subprocess.TimeoutExpired(hook.command, hook.timeout)
+            time.sleep(min(_POLL_SECONDS, remaining))
+        for error in (stdout.error, stderr.error, *write_errors):
+            if error is not None:
+                raise error
+        completed = True
+        return proc.returncode, stdout, stderr
+    finally:
+        # 组长先退、孙进程仍持管道时也按同一截止时间终止整组。
+        _cleanup(proc, workers, 0.0 if completed else TERM_GRACE_SECONDS)
 
 
 @dataclass(frozen=True)
@@ -258,39 +424,36 @@ class HookEngine:
             {"event": event, "workspace": str(self.workspace), **payload},
             ensure_ascii=False,
         )
+        stop_requested = getattr(_call_scope, "stop", None)
         for hook in self.hooks:
             if hook.event != event or not (
                 hook.matches(tool_name) or (also and hook.matches(also))
             ):
                 continue
             try:
-                proc = subprocess.run(
-                    hook.command,
-                    shell=True,
-                    input=body,
-                    capture_output=True,
-                    text=True,
-                    #  两个方向都钉死 UTF-8（见 _hook_env）；replace 兜底，
-                    #  hook 输出里一个坏字节不该让整条 fire 抛异常
-                    encoding="utf-8",
-                    errors="replace",
-                    timeout=hook.timeout,
-                    cwd=self.workspace,
-                    env=_hook_env(),
-                )
+                code, stdout, stderr = _run(hook, body, self.workspace, stop_requested)
             except subprocess.TimeoutExpired:
                 self._failed(hook, f"超时（>{hook.timeout:.0f}s）", reasons)
                 continue
             except OSError as exc:
-                self._failed(hook, f"启动失败（{exc}）", reasons)
+                self._failed(hook, f"执行失败（{exc}）", reasons)
                 continue
-            if proc.returncode == 2:
-                reason = proc.stderr.strip() or proc.stdout.strip() or "（hook 未给出理由）"
+            for name, output in (("stdout", stdout), ("stderr", stderr)):
+                if output.truncated:
+                    self._notify(f"[hook {name} 超过 {_OUTPUT_KEEP_BYTES} 字节，已截断保留头尾：{hook.command}]")
+            if code == 2:
+                reason = (stderr.text().strip() if stderr.nonblank else
+                          stdout.text().strip() if stdout.nonblank else "（hook 未给出理由）")
                 reasons.append(clip_reason(reason))
-            elif proc.returncode != 0:
-                self._failed(hook, f"退出码 {proc.returncode}（既非 0 放行也非 2 拦截）", reasons)
+            elif code != 0:
+                self._failed(hook, f"退出码 {code}（既非 0 放行也非 2 拦截）", reasons)
             else:
-                line, note = parse_stdout(proc.stdout)
+                if stdout.truncated:
+                    prefix = stdout.head.decode("utf-8", errors="replace")
+                    # JSON 没读全就不能降格为普通上下文；只对明确的纯文本保留首行。
+                    line, note = ("", "") if prefix.lstrip().startswith("{") else (first_line(prefix), "")
+                else:
+                    line, note = parse_stdout(stdout.text())
                 if line:
                     outputs.append(line)
                 if note:

@@ -82,6 +82,15 @@ async def main() -> None:
 await 的协程对象，永远等不到答复——`Agent` 构造时直接抛 `TypeError`。异步审批
 必须经 `AsyncApprover`。
 
+`interrupt()` 在工具与模型请求启动前、运行中的流式检查点以及 hook 返回后
+生效。取消发生在 `PreToolUse` 期间时，该工具以 `ToolDenied` 收尾且不执行；
+发生在 `PostToolUse` / `ToolFailed` 期间时，已执行的工具结果先保留，再结束
+本轮，不继续请求模型。运行中的命令 hook 每 50 毫秒检查取消，随后终止并回收
+进程及管道；POSIX 下先给进程组最多 1 秒收尾，再强制终止。同一事件余下的
+hook 不再启动。子任务生命周期 hook 同样响应取消，收尾时保留子任务结果；
+`SessionEnd` 不受上一轮取消标志影响，仍按自身超时执行。宿主自定义的进程内
+hook 需自行实现运行中取消。已发生的工具副作用不会自动回滚。
+
 ## 审批契约
 
 `approver(tool_name, args)` 在**工作线程**里同步调用，返回：
@@ -238,6 +247,8 @@ host.watch_notifications(on_notification)   # 在事件循环里调用；传 Non
   边界收尾、半截话入历史；`steer(text)` 让模型在下一个 step 边界看到这句话再继续
   （本轮已结束时下一次 `send()` 开头丢弃，要保留用 `agent.drain_steers()`）；
   `notify(text, key="")` 投递系统通知，搭下一条工具结果送达、同 key 只送一次。
+  `wake=False` 的公告在下一次已确定要发送的模型请求前捎带送达；不会单独触发
+  一次请求。MCP 晚连接或恢复后的上线公告也遵守此规则。
 - **并发纪律**：同一个 `Agent` 同时只能有一轮在跑；`AsyncAgent` 的每轮入口会
   先等上一轮工作线程真正收尾，宿主不必自己等。要并发就开多个实例。
 - `Agent.messages` / `Agent.usage` / `Agent.trace` 都持久在实例上，宿主随时可读。
@@ -252,6 +263,31 @@ host.watch_notifications(on_notification)   # 在事件循环里调用；传 Non
 `Config` 的 `enable_skills` / `enable_agents` / `enable_hooks` / `enable_plugins` /
 `enable_mcp` / `enable_explore` 开关决定内核挂哪些能力；嵌入宿主要"行为确定"
 （测试、审计）时逐个关掉。
+
+核心工具执行前会按声明还原可识别的数字、布尔值与容器参数，再检查基础约束：
+`type`（含类型列表）、`required`、`enum` / `const`、`properties`、
+`additionalProperties` 与 `items`。错误作为工具结果返回，不进入 handler；
+审批通过 `Allow.updated_args` 改写的参数也经过此检查。额外字段默认保留；
+`additionalProperties: false` 拒绝额外字段，声明为 schema 时检查其值，
+绝不静默删字段。
+MCP 的全量注册与 `use_tool` 检索调用走同一检查。
+内置工具中以 `None` 表示未指定的可选参数接受 JSON `null`；单个类型加 `null`
+的声明仍支持上述字符串转换，多种非空类型的联合声明不猜测转换方向。
+
+这是基础输入检查，不是完整 JSON Schema 验证：`$ref` 节点、组合分支、
+正则及数值范围等复杂约束仍由工具实现或 MCP server 负责；存在
+`patternProperties` 时，额外字段也交给工具判定。独立 SDK 的业务工具继续
+使用其严格校验器，保留原始参数，不走上述类型转换。
+
+`write_file` 与 `str_replace` 在编辑前核对上次读取的文件时间、大小和原始字节
+指纹；即使外部修改保持时间与大小不变，也需要重新读取。分段阅读只在同一
+内容版本内累计。核对与替换之间没有跨进程文件锁，不能保证并发写入的事务隔离。
+
+两种编辑工具先写同目录临时文件，再原子替换目标。写入或替换
+失败时保留原文件，并清理临时文件；新文件写入失败时不留下半个文件。已有文件
+仍检查写权限，保留权限位及工具原有的编码、换行处理。符号链接按解析后的目标
+写入，链接本身保留。成功替换会更换 inode，硬链接的其他路径不会随之改写；
+这不提供断电持久性保证，也不承诺保留 ACL 等额外文件元数据。
 
 ## 跨语言：`--wire` 的 JSON-RPC 契约
 

@@ -1064,6 +1064,22 @@ class TitleExportTest(SessionDirTestCase):
         self.assertEqual(info.title, "")
         self.assertEqual(info.label, info.preview)
 
+    def test_unicode_separators_do_not_split_jsonl_records(self):
+        from xiaoyu.session_log import last_preview, rename_session
+
+        for separator in ("\u2028", "\u2029"):
+            with self.subTest(separator=repr(separator)):
+                log = SessionLog.create("m", "/ws/a")
+                log.append({"role": "user", "content": "上一条"})
+                latest = {"role": "assistant", "content": "最新" + separator + "结果"}
+                log.append(latest)
+                log.release()
+                self.assertEqual(last_preview(log.path), "最新 结果")
+                self.assertEqual(load_messages(log.path)[-1], latest)
+                rename_session(log.path, "新名字")
+                self.assertEqual(last_preview(log.path), "最新 结果")
+                self.assertEqual(load_messages(log.path)[-1], latest)
+
     def test_rename_sets_meta_title_and_list_shows_it(self):
         from xiaoyu.session_log import rename_session
 

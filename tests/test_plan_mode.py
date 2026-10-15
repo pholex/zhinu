@@ -244,6 +244,29 @@ class PlanFileTest(AgentTestCase):
             agent.plan_file.read_text(encoding="utf-8"), "# 计划\n1. 改 calc\n"
         )
 
+    def test_existing_plan_needs_read_before_overwrite(self):
+        agent = self.build([])
+        agent.plan_file.parent.mkdir(parents=True, exist_ok=True)
+        agent.plan_file.write_text("# 已有计划\n", encoding="utf-8")
+        agent.enter_plan_mode()
+        args = {"path": str(agent.plan_file), "content": "# 新计划\n"}
+        self.assertIn("还没读过", agent.toolbox.run("write_file", args))
+        self.assertEqual(agent.plan_file.read_text(encoding="utf-8"), "# 已有计划\n")
+        agent.toolbox.run("read_file", {"path": str(agent.plan_file)})
+        self.assertIn("已覆盖", agent.toolbox.run("write_file", args))
+
+    def test_reenter_plan_does_not_certify_external_edits(self):
+        agent = self.build([])
+        agent.enter_plan_mode()
+        path = str(agent.plan_file)
+        agent.toolbox.run("write_file", {"path": path, "content": "# 原计划\n"})
+        agent.leave_plan_mode()
+        agent.plan_file.write_text("# 外部改动\n", encoding="utf-8")
+        agent.enter_plan_mode()
+        result = agent.toolbox.run("write_file", {"path": path, "content": "# 新计划\n"})
+        self.assertIn("被改动过", result)
+        self.assertEqual(agent.plan_file.read_text(encoding="utf-8"), "# 外部改动\n")
+
     def test_other_files_still_rejected_with_plan_path(self):
         agent = self.build(
             [

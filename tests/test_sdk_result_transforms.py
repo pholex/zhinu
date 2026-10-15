@@ -187,7 +187,8 @@ class TransformTests(unittest.TestCase):
         with Session(config) as session:
             # A deterministic MCP transport view exercises the real use_tool route.
             session._toolbox._mcp = SimpleNamespace(
-                ready_tools=lambda: [SimpleNamespace(name="mcp__test__lookup", check_fn=lambda: True, handler=lambda: SECRET)],
+                ready_tools=lambda: [SimpleNamespace(name="mcp__test__lookup", parameters={"type": "object"},
+                                                    check_fn=lambda: True, handler=lambda: SECRET)],
                 take_media=lambda: [], server_states=lambda: {},
             )
             session._toolbox._mcp_search = True

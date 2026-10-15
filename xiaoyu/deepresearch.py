@@ -146,7 +146,7 @@ def make_deep_research_tools(config: Config, registry: Registry, usage) -> list[
         ), parameters={"type": "object", "properties": {
             "query": {"type": "string", "description": "完整研究要求、范围与期望报告格式"},
             "tier": {"type": "string", "enum": list(AGENTS), "description": "默认 standard；max 更全面"},
-            "previous_interaction_id": {"type": "string", "description": "可选，继续研究的旧任务 ID"},
+            "previous_interaction_id": {"type": ["string", "null"], "description": "可选，继续研究的旧任务 ID"},
         }, "required": ["query"]}, handler=start, requires_approval=False,
              untrusted=True, output_limit=6000, check_fn=available),
         Tool(name="deep_research_status", description=(
