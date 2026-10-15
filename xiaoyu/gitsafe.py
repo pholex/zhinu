@@ -18,6 +18,12 @@ xiaoyu 自己起的 git——@ 补全的 ls-files、子 agent worktree 的建/�
 3. **argv**：diff 家族补 `--no-ext-diff --no-textconv`（diff.external 不能
    钉空：空值会让 diff 直接报"cannot run"）。
 
+另有两样不是防注入、是宿主当"读者"的礼貌：输出面钉值让 ls-files / diff
+--name-only 这类被解析的输出不随用户或仓库配置变形（非 ASCII 路径不转义、
+路径恒相对仓库根、不带颜色码）；GIT_OPTIONAL_LOCKS=0 让只读探针不顺手刷新
+index、不去抢 index.lock——用户正在另一个终端跑 git 时，宿主的 status /
+diff 不该让他撞上 "index.lock exists"。
+
 隔离全局配置的两处代价已补回：safe.directory 只认 system/global/命令级，
 从用户配置读出来经命令级转回；会产生提交的子命令（宸枢 merge）按 git 自己
 的优先级查出生效身份、经 GIT_AUTHOR_*/GIT_COMMITTER_* 传入——不补的话
@@ -53,6 +59,16 @@ _EXEC_PINS: tuple[tuple[str, str], ...] = (
     #  gc --auto / maintenance 是宿主在用户仓库里额外的写动作，还会再起子进程
     ("gc.auto", "0"),
     ("maintenance.auto", "false"),
+)
+
+#  输出面钉值：宿主要解析的输出不随配置变形。quotePath 默认 true 会把非 ASCII
+#  路径打成 "\346\226\207" 八进制转义，@ 补全与宸枢的 diff --name-only 都会
+#  拿到假路径；diff.relative=true 会按 cwd 裁路径并漏掉 cwd 之外的文件；
+#  color.ui=always 会往非 tty 输出里塞转义码
+_OUTPUT_PINS: tuple[tuple[str, str], ...] = (
+    ("core.quotePath", "false"),
+    ("diff.relative", "false"),
+    ("color.ui", "false"),
 )
 
 #  传输面钉值：只给本地模式。本地动作本不该碰网络——partial clone 的懒取回
@@ -116,6 +132,7 @@ def prepare(
     if not network:
         pins += _safe_directories(base)
     pins += _EXEC_PINS
+    pins += _OUTPUT_PINS
     if not network:
         pins += _LOCAL_PINS
     hardened = _compose(base, isolate=not network, pins=pins)
@@ -145,6 +162,9 @@ def _compose(base: Mapping[str, str], *, isolate: bool, pins: Sequence[tuple[str
         env["GIT_CONFIG_GLOBAL"] = os.devnull
         env["GIT_NO_LAZY_FETCH"] = "1"
     env["GIT_TERMINAL_PROMPT"] = "0"
+    #  等价于每条命令带 --no-optional-locks：status / diff 这类读操作不再顺手
+    #  刷新 index，也就不抢 index.lock；写操作（worktree add、merge）本来就要锁，不受影响
+    env["GIT_OPTIONAL_LOCKS"] = "0"
     _append_pins(env, pins)
     return env
 
