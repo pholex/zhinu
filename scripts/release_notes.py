@@ -168,7 +168,11 @@ def render_behavior(commits: list[dict[str, str]]) -> str:
 
 
 def render_plain(grouped: dict[str, list[dict[str, str]]]) -> str:
-    """纯分组列表（也是润色的输入）。body 只取第一段（footer 段落除外），缩进成子项。"""
+    """纯分组列表（也是润色的输入）：一个提交一行，只有 subject 与短 sha。
+
+    正文不抄进来——「为什么」留在 git log 里，想看的人按 sha 去看；说明是给
+    升级的人扫一眼的，长了反而没人读。需要用户先知道的事走「行为变化」一节。
+    """
     out: list[str] = []
     for key, title in GROUPS:
         items = grouped.get(key) or []
@@ -178,10 +182,6 @@ def render_plain(grouped: dict[str, list[dict[str, str]]]) -> str:
         out.append("")
         for item in items:
             out.append(f"- {item['text']}（{item['sha'][:7]}）")
-            first_para = strip_footers(item["body"]).split("\n\n", 1)[0].strip()
-            if first_para:
-                for line in first_para.splitlines():
-                    out.append(f"  {line.strip()}")
         out.append("")
     return "\n".join(out).rstrip() + "\n"
 

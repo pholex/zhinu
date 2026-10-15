@@ -45,11 +45,13 @@ class RenderTest(unittest.TestCase):
         text = release_notes.render_plain(release_notes.group_commits(commits))
         self.assertEqual(
             text,
-            "## 新功能\n\n- tui：一（bbbbbbb）\n  第一段\n  两行\n\n"
+            "## 新功能\n\n- tui：一（bbbbbbb）\n\n"
             "## 修复\n\n- 二（aaaaaaa）\n\n"
             "## 其它\n\n- 三（ccccccc）\n",
         )
         self.assertNotIn("文档", text)
+        # 正文一个字都不进列表：一个提交一行
+        self.assertNotIn("第一段", text)
         self.assertNotIn("第二段", text)
 
     def test_document_header(self):
@@ -139,9 +141,11 @@ class BehaviorNotesTest(unittest.TestCase):
         ]
         text = release_notes.render_body(commits)
         self.assertTrue(text.startswith("## 行为变化（升级前看一眼）\n\n- 变了（aaaaaaa）\n- 又变了（bbbbbbb）\n\n## 新功能"), text)
-        self.assertIn("- 一（bbbbbbb）\n  正文\n", text)
+        self.assertIn("- 一（bbbbbbb）\n\n", text)
+        self.assertNotIn("正文", text)
         self.assertNotIn("  行为变化", text)
-        self.assertIn("- 二（aaaaaaa）\n  第二段\n", text)  # footer 段跳过，取下一段
+        self.assertIn("- 二（aaaaaaa）\n\n", text)
+        self.assertNotIn("第二段", text)
         self.assertEqual(release_notes.render_body([commits[2]]), "## 文档\n\n- 三（ccccccc）\n")
 
 
