@@ -365,7 +365,10 @@ def evaluate(facts: Facts) -> list[Check]:
         run = facts.ci_run
         conclusion = run.get("conclusion") or run.get("status") or "?"
         same_head = facts.head is not None and run.get("headSha") == facts.head
-        if conclusion != "success":
+        if not run.get("conclusion"):
+            # 刚推的 main 多半还在跑；release 工作流的 gate 会等它，红了就烧号，这里不拦。
+            checks.append(Check("ci", WARN, f"main 最近一次 CI 还在跑（{conclusion}），发版工作流会等它的结论：{run.get('url', '')}"))
+        elif conclusion != "success":
             checks.append(Check("ci", FAIL, f"main 最近一次 CI 结论 {conclusion}：{run.get('url', '')}"))
         elif not same_head:
             checks.append(Check("ci", WARN,
