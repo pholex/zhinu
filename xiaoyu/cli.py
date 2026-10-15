@@ -3865,8 +3865,12 @@ GRANT_SESSION = object()
 
 #  确认框里算"允许"的整词：只认整条输入恰好是其中之一（去首尾空白、不分大小写），
 #  "做吧""go ahead"都不算——多一个字就是拒绝理由。刻意不收"继续"：它两可，既可能
-#  是"按这个方案干"，也可能是"接着说"，放进来会把后者误放行。
-CONFIRM_YES = frozenset({"y", "yes", "go", "做", "办", "干"})
+#  是"按这个方案干"，也可能是"接着说"，放进来会把后者误放行；"对""嗯"更像应声，
+#  也不收。"a" 另有含义（本会话都允许），相近的 all/always 不进这张表。
+CONFIRM_YES = frozenset({
+    "y", "yes", "ok", "okay", "sure", "yep", "yeah", "go", "run", "approve", "allow",
+    "做", "办", "干", "同意", "批准", "可以", "行", "是", "好",
+})
 
 
 def interpret_confirm_answer(answer: str) -> bool | str | object:
@@ -3927,7 +3931,7 @@ def make_confirm(permissions: Permissions):
         )
         try:
             answer = input(
-                ui.warning(f"  允许{verb} {name}? [y/N{session_option}，其它输入=拒绝理由] ")
+                ui.warning(f"  允许{verb} {name}? [y/N{session_option}；ok/好/做 等也算 y，其它输入=拒绝理由] ")
             ).strip()
         except (EOFError, KeyboardInterrupt):
             print()
