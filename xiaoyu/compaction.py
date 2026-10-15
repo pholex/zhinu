@@ -706,6 +706,7 @@ class Compactor:
         #  压缩时刻取当前计划（None = 无 agent 上下文，不附计划快照）
         self.plan_provider = plan_provider
         self.state = CompactionState()
+        self.last_attempt: dict[str, Any] = {}
 
     # ---------- 判断 ----------
 
@@ -762,6 +763,7 @@ class Compactor:
         过一会儿多半就好。改成冷却后重试，冷却逐次翻倍——不然上游持续限流时
         每一步都要白发一次摘要请求。
         """
+        self.last_attempt.update(outcome="failed", reason="summary_error")
         self.state.last_failure = reason
         if transient:
             self.state.transient_failures += 1
@@ -784,6 +786,23 @@ class Compactor:
         return messages, note
 
     def compact(self, messages: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], str]:
+        """压缩并记录本次的无正文诊断；计数均为本地估算，不与服务端 usage 混用。"""
+        started = time.monotonic()
+        before = tokens.estimate_messages(messages)
+        self.last_attempt = {
+            "outcome": "failed", "reason": "exception", "method": "summary",
+            "tokens_before": before, "tokens_after": before, "tokens_reclaimed": 0,
+            "token_count_method": "estimate", "duration_ms": 0,
+        }
+        try:
+            result, note = self._compact(messages)
+            after = tokens.estimate_messages(result)
+            self.last_attempt.update(tokens_after=after, tokens_reclaimed=before - after)
+            return result, note
+        finally:
+            self.last_attempt["duration_ms"] = round((time.monotonic() - started) * 1000)
+
+    def _compact(self, messages: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], str]:
         """返回 (新消息列表, 结果说明)。失败或无益时原样返回。
 
         压缩后的形状固定为：[system, user(原始任务 + 摘要), ...最近若干条]
@@ -796,6 +815,7 @@ class Compactor:
 
         cut = self.find_cut(messages, min_index=head_end)
         if cut < 0:
+            self.last_attempt.update(outcome="skipped", reason="no_history")
             return messages, f"跳过：除最近 {self.keep_recent} 条外没有可压缩的历史"
 
         older = messages[head_end:cut]
@@ -808,6 +828,7 @@ class Compactor:
         region = tokens.estimate_messages(older)
         floor = min(2_000, int(self.context_limit * 0.02))
         if region <= floor:
+            self.last_attempt.update(outcome="skipped", reason="below_overhead")
             return messages, (
                 f"跳过：可压区间仅约 {region} tok，低于摘要固定开销的量级（{floor}）"
             )
@@ -839,7 +860,9 @@ class Compactor:
                 )
 
         if not summary.strip():
-            return self._fail(messages, "摘要为空")
+            result = self._fail(messages, "摘要为空")
+            self.last_attempt["reason"] = "empty_summary"
+            return result
 
         #  用户原话备份跟在摘要后面（同一条 user 消息里，不引入新的消息角色问题）。
         #  摘要是有损的，用户消息是最不可丢的——原文备份的成本远低于丢失的代价。
@@ -889,6 +912,7 @@ class Compactor:
             #  摘要比原文还长 → 压缩没有意义，退回原状。
             #  不做这道检查的话会出现"压缩后上下文反而变大"，而且会白丢历史细节。
             self.state.failures += 1
+            self.last_attempt.update(outcome="skipped", reason="would_grow")
             return messages, (
                 f"跳过：摘要后反而更大（{before} → {after} tok），已放弃本次压缩"
             )
@@ -910,6 +934,7 @@ class Compactor:
                 note += "；连续两次收效甚微，暂停自动压缩（手动 /compact 仍可用）"
         else:
             self.state.ineffective = 0
+        self.last_attempt.update(outcome="committed", reason="reduced")
         return compacted, note
 
     # ---------- 最后手段 ----------

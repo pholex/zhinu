@@ -28,6 +28,10 @@ nohup bash -c "trap '' HUP; exec ./experiments/compaction_e2e.sh" >/tmp/run.log 
 
 ## 脚本
 
+提示词成本对照与推理回放探测见 [测量入口与判据](runtime-measurements.md)。
+两项入口保留备用，已移出当前待办；尚未运行真实模型实验，也无收益结论。
+其中离线捕获和默认计划模式不调用模型，也不执行模型工具，不适用上面的无人值守 shell 前提。
+
 | 脚本 | 测什么 |
 |---|---|
 | `explore_ab.sh off\|on\|forced\|compare` | explore 子 agent 到底省不省 |

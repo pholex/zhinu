@@ -76,6 +76,7 @@ SCENARIOS = (
     Scenario("stale-file-version", "读取后尝试覆盖文件，发现外部修改就停止", args=("--yolo",), recorded=False),
     Scenario("cancel-before-tool", "尝试写文件，执行前中断", args=("--yolo",), recorded=False, expect_exit=130),
     Scenario("bounded-hook-output", "验证长钩子输出", recorded=False),
+    Scenario("content-rejection", "处理服务端内容拒绝", recorded=False, expect_exit=1),
 )
 
 _PIN = next(sc for sc in SCENARIOS if sc.pins_header)
@@ -331,6 +332,11 @@ class BoundedHookOutputSnapshot(SnapshotCase):
             f"command = {json.dumps(command)}\ntimeout = 5\n", encoding="utf-8",
         )
         self.check_scenario(SCENARIOS[7])
+
+
+class ContentRejectionSnapshot(SnapshotCase):
+    def test_scenario(self) -> None:
+        self.check_scenario(SCENARIOS[8])
 
 
 class UnconsumedGuardTest(SnapshotCase):
