@@ -300,8 +300,16 @@ def evaluate(facts: Facts) -> list[Check]:
 
     checks.append(Check("branch", OK if facts.branch == "main" else FAIL,
                         f"当前分支 {facts.branch or '未知'}（发版只从 main 打 tag）"))
-    checks.append(Check("clean", OK if not facts.dirty else FAIL,
-                        "工作树干净" if not facts.dirty else f"未提交改动 {len(facts.dirty)} 处：" + "; ".join(facts.dirty[:5])))
+    tracked = [line for line in facts.dirty if not line.startswith("??")]
+    untracked = [line for line in facts.dirty if line.startswith("??")]
+    if tracked:
+        checks.append(Check("clean", FAIL, f"未提交改动 {len(tracked)} 处：" + "; ".join(tracked[:5])))
+    elif untracked:
+        # 未跟踪文件进不了发版提交（只 add 点名的文件），多半是本机产物；提醒即可。
+        checks.append(Check("clean", WARN, f"工作树干净，但有 {len(untracked)} 处未跟踪文件（不会进发版提交）："
+                            + "; ".join(line[3:] for line in untracked[:5])))
+    else:
+        checks.append(Check("clean", OK, "工作树干净"))
 
     if facts.upstream_head is None:
         checks.append(Check("upstream", WARN, "本地没有 origin/main，无法核对是否已推"))
