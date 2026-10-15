@@ -1,9 +1,9 @@
-# 发布：推 v* tag 跑完整 CI，全绿才构建并发布到 PyPI。
+# 发布：推 v* tag → 等同一提交的 CI 结论（不重跑）→ 构建 → 发布到 PyPI → GitHub Release。
 #
 # 鉴权走 PyPI Trusted Publishing（OIDC，无需长期 token）：
 # 先在 https://pypi.org/manage/project/xiaoyu-agent/settings/publishing/
 # 添加 GitHub 仓库为 trusted publisher（workflow 名填 release.yml），
-# 之后 `git push origin vX.Y.Z` 即完成发布。
+# 之后 `git push --atomic origin main vX.Y.Z` 即完成发布（scripts/release.py 打的 tag）。
 name: release
 
 on:
@@ -15,14 +15,52 @@ jobs:
   #  互不相干的 workflow，tag 一推就发、CI 红不红都拦不住——v0.29.0 就是这么
   #  带着两个红着的 Windows job 发上 PyPI 的，Windows 上"拖文件进终端"整个
   #  功能是死的，没人拦。
+  #
+  #  2026-10-15 起不再把 CI 重跑一遍：tag 指向的提交同时推上了 main，ci.yml / sdk.yml
+  #  已经在跑，这里（scripts/ci_gate.py）等它们的结论——绿就跳过下面两个 job，
+  #  红就停在这里（版本号烧掉，换个号再发）；一次运行都没有（只改文档的发版，
+  #  路径过滤没触发 CI）才自己跑一遍。
+  gate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    permissions:
+      contents: read
+      actions: read
+    outputs:
+      ci: ${{ steps.ci.outputs.result }}
+      sdk: ${{ steps.sdk.outputs.result }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+      - id: ci
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python scripts/ci_gate.py --repo "$GITHUB_REPOSITORY" --sha "$GITHUB_SHA" --workflow ci.yml
+      - id: sdk
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python scripts/ci_gate.py --repo "$GITHUB_REPOSITORY" --sha "$GITHUB_SHA" --workflow sdk.yml
+
   test:
+    needs: gate
+    if: needs.gate.outputs.ci != 'verified'
     uses: ./.github/workflows/ci.yml
 
   sdk-test:
+    needs: gate
+    if: needs.gate.outputs.sdk != 'verified'
     uses: ./.github/workflows/sdk.yml
 
   artifacts:
-    needs: [test, sdk-test]
+    needs: [gate, test, sdk-test]
+    #  test / sdk-test 被 gate 跳过时 result 是 skipped，也算过；gate 红或任一测试红都不往下走
+    if: >-
+      ${{ !cancelled()
+          && needs.gate.result == 'success'
+          && contains(fromJSON('["success","skipped"]'), needs.test.result)
+          && contains(fromJSON('["success","skipped"]'), needs.sdk-test.result) }}
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -98,7 +136,7 @@ jobs:
       - run: /tmp/released-sdk/bin/python -I tests/sdk_wheel_smoke.py
       - name: GitHub Release（docs/releases/<版本>.md 存在就用它，否则自动生成说明）
         #  放在 PyPI 发布与装回冒烟之后：包没发出去就不该有 Release。
-        #  发版说明由 scripts/release_notes.py 在打 tag 前生成并提交（见 DEVELOPMENT.md）；
+        #  发版说明由 scripts/release.py 在打 tag 时生成并提交（见 AGENTS.md「发版」）；
         #  忘了生成就退回 GitHub 的 --generate-notes，不拦发版。已存在（rerun）则跳过
         env:
           GH_TOKEN: ${{ github.token }}
@@ -112,6 +150,6 @@ jobs:
           if [ -f "$notes" ]; then
             gh release create "$tag" --repo "$GITHUB_REPOSITORY" --title "$tag" --notes-file "$notes"
           else
-            echo "::warning::没有 $notes，改用自动生成的说明（发版前跑 scripts/release_notes.py 可避免）"
+            echo "::warning::没有 $notes，改用自动生成的说明（scripts/release.py 会生成）"
             gh release create "$tag" --repo "$GITHUB_REPOSITORY" --title "$tag" --generate-notes
           fi
