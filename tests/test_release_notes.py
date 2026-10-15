@@ -11,6 +11,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 REPO = Path(__file__).resolve().parent.parent
 _SPEC = importlib.util.spec_from_file_location("release_notes", REPO / "scripts" / "release_notes.py")
@@ -112,6 +113,62 @@ class ValidationSectionTest(unittest.TestCase):
         self.assertIn("- 模型：未记录\n- 平台：未记录\n", text)
         self.assertIn("3/3 项通过\n", text)
         self.assertNotIn("未通过", text)
+
+
+class BehaviorNotesTest(unittest.TestCase):
+    """「行为变化」从提交正文的 footer 抽，不再手写。"""
+
+    def test_footer_forms(self):
+        body = "正文一段。\n\n行为变化: 默认不再自动重试\n续一行\n\nBREAKING CHANGE: 去掉了 --old\n"
+        self.assertEqual(release_notes.behavior_notes("fix: x", body), ["默认不再自动重试 续一行", "去掉了 --old"])
+        self.assertEqual(release_notes.behavior_notes("fix: x", "行为变化：中文冒号也认"), ["中文冒号也认"])
+        self.assertEqual(release_notes.behavior_notes("fix: x", "没有 footer"), [])
+
+    def test_bang_subject_without_footer(self):
+        self.assertEqual(release_notes.behavior_notes("feat(cli)!: 改默认值", ""), ["cli：改默认值"])
+        #  有 footer 就以 footer 为准，不重复
+        self.assertEqual(release_notes.behavior_notes("feat!: 改默认值", "行为变化: 说清楚"), ["说清楚"])
+        self.assertTrue(release_notes.is_breaking_subject("fix!: x"))
+        self.assertFalse(release_notes.is_breaking_subject("fix: x!"))
+
+    def test_section_first_and_footer_not_repeated_in_items(self):
+        commits = [
+            {"sha": "a" * 40, "subject": "fix: 二", "body": "行为变化: 变了\n\n第二段"},
+            {"sha": "b" * 40, "subject": "feat: 一", "body": "正文\n\n行为变化: 又变了"},
+            {"sha": "c" * 40, "subject": "docs: 三", "body": ""},
+        ]
+        text = release_notes.render_body(commits)
+        self.assertTrue(text.startswith("## 行为变化（升级前看一眼）\n\n- 变了（aaaaaaa）\n- 又变了（bbbbbbb）\n\n## 新功能"), text)
+        self.assertIn("- 一（bbbbbbb）\n  正文\n", text)
+        self.assertNotIn("  行为变化", text)
+        self.assertIn("- 二（aaaaaaa）\n  第二段\n", text)  # footer 段跳过，取下一段
+        self.assertEqual(release_notes.render_body([commits[2]]), "## 文档\n\n- 三（ccccccc）\n")
+
+
+class AutoValidationTest(unittest.TestCase):
+    """默认读 nightly 的 latest.json；记录带时间与源码就写进节里，太旧标出来。"""
+
+    def test_dir_follows_xdg_and_latest_lookup(self):
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.dict(os.environ, {"XDG_CONFIG_HOME": tmp, "APPDATA": tmp}):
+            self.assertEqual(release_notes.self_test_dir(), Path(tmp) / "xiaoyu" / "self-test")
+            self.assertIsNone(release_notes.latest_record_path())
+            self.assertEqual(release_notes.resolve_validation("auto"), (None, None))
+            self.assertEqual(release_notes.resolve_validation("none"), (None, None))
+            latest = Path(tmp) / "xiaoyu" / "self-test" / "latest.json"
+            latest.parent.mkdir(parents=True)
+            latest.write_text(json.dumps({"output": {"total": 2, "passed": 2, "skipped": 0, "items": []},
+                                          "model": "m", "recorded_at": "2026-10-01T03:30:00",
+                                          "source": {"version": "0.71.1", "branch": "main", "commit": "0123456789"}}),
+                              encoding="utf-8")
+            path, record = release_notes.resolve_validation(None)
+            self.assertEqual(path, latest)
+            self.assertEqual(record["source"]["version"], "0.71.1")
+            text = release_notes.render_validation(record, today=dt.date(2026, 10, 15))
+            self.assertIn("- 记录：2026-10-01 03:30，源码 0.71.1（main@0123456），已 14 天\n", text)
+            fresh = release_notes.render_validation(record, today=dt.date(2026, 10, 2))
+            self.assertIn("- 记录：2026-10-01 03:30，源码 0.71.1（main@0123456）\n", fresh)
+            self.assertEqual(release_notes.record_age_days(record, dt.date(2026, 10, 15)), 14)
+            self.assertIsNone(release_notes.record_age_days(None))
 
 
 class GitAndFallbackTest(unittest.TestCase):

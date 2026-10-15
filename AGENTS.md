@@ -94,10 +94,23 @@ id 精确到文件，在哪个目录跑都找得到；记录可能含用户隐�
 
 ## 发版
 
-见 `docs/internal/DEVELOPMENT.md`「发版」。要点：改 `xiaoyu/__init__.py` 的
-`__version__` → 跑 `tests_ai/self_test.md` 与 `scripts/release_notes.py`（自测记录用
-`--validation self_test.record.json` 附进「本版验证」一节）→ 推 main 等 CI
-绿 → 打 `vX.Y.Z` tag，其余自动。打 tag 前跑 `scripts/release.py --dry-run`：在 main、
-工作树干净、HEAD 已推、版本号大于所有本地 tag 与 PyPI 已发布版本、发版说明文件存在、
-公开文档没有「尚未发布」、main 最近一次 CI 绿；全过后不带 `--dry-run` 即在本地打带注释
-的 tag（它绝不 push，推 tag 由人做）。
+一条命令 + 一次 push，之后无人值守（细节见 `.agents/skills/release-checklist/SKILL.md`）：
+
+```bash
+.venv/bin/python scripts/release.py 0.72.0      # 或 --bump patch / minor；先 --dry-run 看预检
+git push --atomic origin main v0.72.0           # 推 main 与 tag 一次走，由人做
+```
+
+`release.py` 预检（在 main、干净、HEAD == origin/main、版本号大于当前 / 所有 tag / PyPI
+已发布、自上版有提交、公开文档没有「尚未发布」、父提交 CI 绿）→ 改 `__version__` →
+`scripts/release_notes.py` 生成发版说明（「行为变化」从 commit 正文 `行为变化:` footer 抽，
+「本版验证」取最近一次 nightly 自测）→ 同步 `docs/acp-registry/agent.json` 钉版本 →
+提交 `chore(release): X.Y.Z` → 打带注释的 tag。它绝不 push。
+推上去后 release.yml 等同一提交的 ci.yml / sdk.yml 结论（`scripts/ci_gate.py`，不重跑），
+绿了就发 PyPI、建 GitHub Release；红了版本号烧掉，换个号再来。
+
+- **写提交时**把升级后用户会感知的变化放进正文 footer：`行为变化: …`（到空行为止），
+  发版说明的「行为变化（升级前看一眼）」一节就自动有了；subject 带 `!` 也算。
+- **第一人称自测**不再按版跑：`scripts/self_test.py` 每晚跑（macOS 用
+  `--install-launchd` 装定时），记录在用户配置目录 `self-test/latest.json`，发版说明引用它。
+- 旧 tag 与 GitHub Release 不删。

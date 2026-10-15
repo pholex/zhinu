@@ -31,7 +31,7 @@ cd "$R" && PYTHONPATH="$R" .venv/bin/python -P -m unittest discover -s tests -t 
 | `xiaoyu/tui.py`、按键表 `keys.py` | `tests.test_tui`、`tests.test_keys` | CI 三平台都装了 `[tui]`，这些用例不会被跳过；行编辑类改动再开真终端手测 |
 | 跨平台敏感：路径、子进程、文件锁、编码、信号 | 推分支后**手动触发**三平台 CI（见下） | ci.yml 只对 main 的 push 自动跑 |
 | import 分层、外部字节解码这类架构约束 | `tests_ai/run.py`（真调模型，不进 CI） | `.venv/bin/python tests_ai/run.py [layering|encoding]`，吃仓库 `.env` 的模型 key |
-| 发版前 | `tests_ai/self_test.md` + `scripts/verify.py` + `scripts/release.py --dry-run` | 见 release-checklist 技能 |
+| 发版前 | `scripts/release.py <版本> --dry-run`（预检）；第一人称自测由 `scripts/self_test.py` 每晚跑，不按版跑 | 见 release-checklist 技能 |
 
 ## 多平台 CI 手动触发
 
