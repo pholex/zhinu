@@ -3782,6 +3782,9 @@ def handle_slash(agent: Agent, line: str, select: Any = None) -> bool:
             if chars == 0:
                 continue
             print(ui.secondary(f"    {label:<16} {chars:>8}  {chars / total_chars:>4.0%}"))
+        print(ui.secondary("  ── 项目指令来源（本次运行记录，不重读磁盘）──"))
+        for path, status in agent.context_instruction_sources():
+            print(ui.secondary(f"    {ui.strip_controls(path)} · {status}"))
     elif command == "/compact":
         note = agent.maybe_compact(force=True)
         print(ui.secondary(f"  {note or '无需压缩'}"))

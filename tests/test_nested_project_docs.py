@@ -165,6 +165,39 @@ class LazyNestedDocsTest(AgentTestCase):
         self.assertIn("会随工具结果附上", agent.messages[0]["content"])
         self.assertIn("api/AGENTS.md", agent.messages[0]["content"])
 
+    def test_diagnostics_check_actual_tool_message_and_survive_removal(self) -> None:
+        agent = self.build([])
+        self.assertIn("仅指针", dict(agent.context_instruction_sources())["api/AGENTS.md"])
+        output = self.execute(agent, "read_file", json.dumps({"path": "api/sub/x.py"}))
+        agent.messages.append({"role": "tool", "content": output, "tool_call_id": "t1"})
+        loaded = dict(agent.context_instruction_sources())
+        self.assertIn("工具消息：已加载", loaded["api/AGENTS.md"])
+        (self.root / "api/AGENTS.md").unlink()
+        self.assertEqual(dict(agent.context_instruction_sources()), loaded)
+        #  压缩 / 回滚拿掉原工具结果后，不能仍声称正文留在上下文。
+        agent.messages.pop()
+        self.assertIn("当前消息无完整附文", dict(agent.context_instruction_sources())["api/AGENTS.md"])
+
+    def test_diagnostics_track_nested_truncation_and_budget_omission(self) -> None:
+        agent = self.build([])
+        agent._nested_docs_budget = 5
+        output = self.execute(agent, "read_file", json.dumps({"path": "api/sub/x.py"}))
+        agent.messages.append({"role": "tool", "content": output, "tool_call_id": "t1"})
+        rows = dict(agent.context_instruction_sources())
+        self.assertIn("工具消息：已截断 · 正文 5/", rows["api/AGENTS.md"])
+        omitted = [status for path, status in rows.items() if path.startswith("api/sub/")]
+        self.assertEqual(len(omitted), 1)
+        self.assertIn("工具消息：预算省略 · 正文 0/", omitted[0])
+
+    def test_reset_clears_nested_records_and_allows_loading_again(self) -> None:
+        agent = self.build([])
+        self.execute(agent, "read_file", json.dumps({"path": "api/sub/x.py"}))
+        agent.reset()
+        rows = dict(agent.context_instruction_sources())
+        self.assertNotIn("加载记录", rows["api/AGENTS.md"])
+        output = self.execute(agent, "read_file", json.dumps({"path": "api/sub/x.py"}))
+        self.assertIn("API 约定：接口一律加版本前缀", output)
+
 
 if __name__ == "__main__":
     unittest.main()

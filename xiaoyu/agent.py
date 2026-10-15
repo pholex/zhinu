@@ -635,8 +635,26 @@ def phantom_claims(text: str) -> list[str]:
     return found
 
 
+@dataclass(frozen=True)
+class _InstructionSource:
+    """加载时的来源与正文预算；不保存或重新读取磁盘正文。"""
+
+    path: Path
+    status: str
+    included: int = 0
+    total: int | None = None
+
+    def describe(self) -> str:
+        if self.status == "仅指针":
+            return "仅指针（未在 system 中加载正文）"
+        if self.total is None:
+            return self.status
+        return f"{self.status} · 正文 {self.included}/{self.total} 字符"
+
+
 def collect_project_docs(
-    workspace: Path, names: tuple[str, ...], cap: int
+    workspace: Path, names: tuple[str, ...], cap: int,
+    *, sources: list[_InstructionSource] | None = None,
 ) -> list[tuple[str, str]]:
     """git 根→工作区逐层收集项目指令文件，返回 [(来源标注, 正文)]，root→leaf 序。
 
@@ -646,7 +664,7 @@ def collect_project_docs(
     #  层链与工作区技能目录（skills.project_skill_dirs）同源，见 config.project_levels
     levels = project_levels(workspace)
 
-    found: list[tuple[str, str]] = []
+    found: list[tuple[str, str, Path]] = []
     for level in levels:
         for name in names:
             path = level / name
@@ -655,11 +673,15 @@ def collect_project_docs(
             try:
                 text = path.read_text(encoding="utf-8", errors="replace").strip()
             except OSError:
+                if sources is not None:
+                    sources.append(_InstructionSource(path, "未加载（读取失败）"))
                 continue
             #  指令文件进的是 system prompt，"由项目维护者提供，遵照执行"——
             #  clone 下来的仓库里一段看不见的 Tag 字符就是一段看不见的指令
             text = strip_invisible(text, f"项目指令文件 {path}").strip()
             if not text:
+                if sources is not None:
+                    sources.append(_InstructionSource(path, "未加载（空文件）", total=0))
                 continue
             if level == workspace:
                 label = name
@@ -668,13 +690,17 @@ def collect_project_docs(
                     label = f"上层 {path.relative_to(workspace.parent)}"
                 except ValueError:
                     label = f"上层 {path}"
-            found.append((label, text))
+            found.append((label, text, path))
             break
 
     #  leaf-first 预算：倒序分配，深层（更具体）的永不被浅层挤掉
     budget = cap
     kept: list[tuple[str, str]] = []
-    for label, text in reversed(found):
+    records: list[_InstructionSource] = []
+    for label, text, path in reversed(found):
+        included = min(len(text), max(0, budget))
+        status = "预算省略" if budget <= 0 else "已截断" if included < len(text) else "已加载"
+        records.append(_InstructionSource(path, status, included, len(text)))
         if budget <= 0:
             kept.append((label, "…（预算已被更深层的指令文件用完，本文件整体省略）"))
             continue
@@ -683,6 +709,8 @@ def collect_project_docs(
         budget -= len(text)
         kept.append((label, text))
     kept.reverse()
+    if sources is not None:
+        sources.extend(reversed(records))
     return kept
 
 
@@ -1206,7 +1234,7 @@ class Agent:
         self._crystallize_nudged = False
         #  gate_skip 事件按轮去重：门控一轮内会被评估多次（每个收尾步都问一遍）
         self._crystallize_skip_logged = False
-        self.messages: list[dict[str, Any]] = [{"role": "system", "content": self._system_prompt()}]
+        self.messages: list[dict[str, Any]] = [self._system_message()]
         self._log_custom_system_prompt()
         self._log_guardrails()
         #  token 记账锚点（服务端 usage 是权威值，本地只估算它之后新增的
@@ -1240,6 +1268,7 @@ class Agent:
         #  字符预算（与 system prompt 里项目指令同一上限，见 _nested_docs_note）
         self._nested_docs_seen: set[Path] = set()
         self._nested_docs_budget = self._PROJECT_DOC_CAP
+        self._nested_instruction_sources: dict[Path, tuple[_InstructionSource, str]] = {}
         #  环境差量播报的基线：__init__ 末尾 adopt（system prompt 刚说过）
         self.world_state = world_state.WorldState()
         self._logged_baseline: dict[str, Any] | None = None
@@ -1672,15 +1701,23 @@ class Agent:
         的前缀资产：OpenAI 兼容网关（DeepSeek/LiteLLM）的前缀缓存是自动的，
         守住"不往 system prompt 里放易变内容（时间、动态状态）"即可白拿折扣。
 
-        实际拼接走 `_system_segments()`：**同一份带标签的段列表既拼成 prompt、
-        又供 /context 做归因**，所以"哪段占多少"不可能和真正发出去的内容对不上
-        （归因靠反向读结构，不靠在每个拼接点埋计数器——后者一旦新增段忘了埋就
-        漂移）。段之间的 "\n\n" 连接符记在**后一段**头上，保证各段字符数之和恰好
-        等于 prompt 长度（有测试钉这个不变量）。
+        此方法只构建文本；实际装入会话走 `_system_message()`，同时冻结分段与
+        来源供 /context 读取。段间连接符记在后一段头上，字符数之和等于全文长度。
         """
         return "".join(text for _label, text in self._system_segments())
 
-    def _system_segments(self) -> list[tuple[str, str]]:
+    def _system_message(self) -> dict[str, Any]:
+        """构建即将装入会话的 system 消息，并保留同一次读取的诊断记录。"""
+        sources: list[_InstructionSource] = []
+        segments = self._system_segments(sources=sources)
+        self._loaded_system_segments = tuple(segments)
+        self._loaded_project_sources = tuple(sources)
+        self._loaded_project_enabled = self.config.load_project_instructions
+        return {"role": "system", "content": "".join(text for _, text in segments)}
+
+    def _system_segments(
+        self, *, sources: list[_InstructionSource] | None = None,
+    ) -> list[tuple[str, str]]:
         """system prompt 的带标签分段（label, text）。join 起来即完整 prompt。"""
         from .tools import _platform_shell_note
 
@@ -1728,7 +1765,7 @@ class Agent:
                     f"先完整阅读随包分发的扩展指南再动手：{extending_doc}",
                 )
             )
-        project = self._project_instructions()
+        project = self._project_instructions(sources=sources)
         if project:
             segments.append(("项目指令", project))
         skills_block = skills.index_block(
@@ -1753,18 +1790,58 @@ class Agent:
         单位是字符（精确、免费、确定；token 只是估算，比较各段占比时字符更实在）。
         各项之和恰等于 system prompt 长度 + 各消息 content 长度之和。
         """
-        rows: list[tuple[str, int]] = [
-            (f"system:{label}", len(text)) for label, text in self._system_segments()
-        ]
+        rows: list[tuple[str, int]] = []
+        has_system = bool(self.messages and self.messages[0].get("role") == "system")
+        if self._has_loaded_system():
+            rows.extend((f"system:{label}", len(text)) for label, text in self._loaded_system_segments)
+        elif has_system:
+            #  宿主允许直接替换消息：仍按实际内容计数，但不能沿用旧分段归因。
+            rows.append(("system:未分段", len(media.text_of(self.messages[0].get("content", "")))))
         #  消息按角色/种类归类（system 那条已在上面逐段拆过，这里不重复计）
         by_role: dict[str, int] = {}
-        for msg in self.messages[1:]:
+        for msg in self.messages[1 if has_system else 0:]:
             role = str(msg.get("role", "?"))
             by_role[role] = by_role.get(role, 0) + len(media.text_of(msg.get("content", "")))
         rows.extend((f"消息:{role}", chars) for role, chars in by_role.items())
         return rows
 
-    def _project_instructions(self) -> str:
+    def _has_loaded_system(self) -> bool:
+        return bool(
+            self.messages and self.messages[0].get("role") == "system"
+            and self.messages[0].get("content") == "".join(text for _, text in self._loaded_system_segments)
+        )
+
+    def context_instruction_sources(self) -> list[tuple[str, str]]:
+        """当前会话的项目指令来源；只查加载记录与消息，不探测磁盘。"""
+        rows: list[tuple[str, str]] = []
+        sources: dict[Path, _InstructionSource] = {}
+        if self._has_loaded_system():
+            sources.update((source.path, source) for source in self._loaded_project_sources)
+            if not self._loaded_project_enabled:
+                rows.append(("system", "项目指令加载已关闭"))
+            elif not sources:
+                rows.append(("system", "构建时未找到可加载的项目指令"))
+        else:
+            rows.append(("system", "已被替换或移除，原来源记录不适用"))
+        tool_texts = [media.text_of(m.get("content", "")) for m in self.messages if m.get("role") == "tool"]
+        for path in dict.fromkeys((*sources, *self._nested_instruction_sources)):
+            descriptions = []
+            if path in sources:
+                descriptions.append("system：" + sources[path].describe())
+            if path in self._nested_instruction_sources:
+                source, note = self._nested_instruction_sources[path]
+                if any(note in text for text in tool_texts):
+                    descriptions.append("工具消息：" + source.describe())
+                else:
+                    descriptions.append("当前消息无完整附文；加载记录：" + source.describe())
+            try:
+                label = path.relative_to(self.config.workspace).as_posix()
+            except ValueError:
+                label = str(path)
+            rows.append((label, "；".join(descriptions)))
+        return rows
+
+    def _project_instructions(self, *, sources: list[_InstructionSource] | None = None) -> str:
         """项目级指令文件拼进 system prompt（多层收集）。
 
         从 git 项目根到工作区逐层收集（monorepo 里在子目录启动也能吃到根目录的
@@ -1778,12 +1855,15 @@ class Agent:
         if not self.config.load_project_instructions:
             return ""
         found = collect_project_docs(
-            self.config.workspace, self._PROJECT_DOC_NAMES, self._PROJECT_DOC_CAP
+            self.config.workspace, self._PROJECT_DOC_NAMES, self._PROJECT_DOC_CAP,
+            sources=sources,
         )
         #  下层目录的约定文件只留指针、不载正文：system prompt 在会话内保持静态
         #  （它是 prompt cache 的最长前缀）；正文在模型首次触达该目录时随工具结果
         #  附上（见 _nested_docs_note）——指针只列向下两层，懒加载不限层
         nested = nested_project_docs(self.config.workspace, self._PROJECT_DOC_NAMES)
+        if sources is not None:
+            sources.extend(_InstructionSource(self.config.workspace / path, "仅指针") for path in nested)
         pointer = (
             "\n\n子目录里还有各自的约定文件（正文没有载入；你第一次读写某个子目录里的"
             "东西时，它那份会随工具结果附上，照着执行）：\n"
@@ -2293,7 +2373,7 @@ class Agent:
             self.skills = []
             self._skills_fingerprint = ()
         new_names = {item.name for item in self.skills}
-        self.messages[0] = {"role": "system", "content": self._system_prompt()}
+        self.messages[0] = self._system_message()
         self._history_rewritten()
         return sorted(new_names - old_names), sorted(old_names - new_names)
 
@@ -2324,7 +2404,10 @@ class Agent:
         转正进索引——常驻嵌入场景 recycle 一次就该拿到当前的技能表。
         静态部分（人格/环境/项目指令）逐字重建结果相同，行为不变。
         """
-        self.messages = [{"role": "system", "content": self._system_prompt()}]
+        self.messages = [self._system_message()]
+        self._nested_instruction_sources.clear()
+        self._nested_docs_seen.clear()
+        self._nested_docs_budget = self._PROJECT_DOC_CAP
         self._history_rewritten()
         #  压缩断路器说的是"那份历史压不动 / 那时的摘要调用不通"，历史没了就不作数
         self.compactor.state.recover()
@@ -5477,20 +5560,27 @@ class Agent:
             if not text:
                 return ""
             relative = path.relative_to(workspace).as_posix()
+            included = min(len(text), max(0, self._nested_docs_budget))
+            status = "预算省略" if self._nested_docs_budget <= 0 else "已截断" if included < len(text) else "已加载"
+            source = _InstructionSource(path, status, included, len(text))
             if self._nested_docs_budget <= 0:
-                return (
+                note = (
                     f"\n\n[项目指令] 你触达的目录 {directory.relative_to(workspace).as_posix()}/ "
                     f"有自己的约定文件 {relative}（本会话附带正文的预算已用完，动它之前先读一遍）。"
                 )
+                self._nested_instruction_sources[path] = (source, note)
+                return note
             if len(text) > self._nested_docs_budget:
                 text = text[: self._nested_docs_budget] + "\n…（约定文件过长，已截断）"
             self._nested_docs_budget -= len(text)
             if self.session_log:
                 self.session_log.event("nested_doc_loaded", path=relative)
-            return (
+            note = (
                 f"\n\n[项目指令] 你触达的目录 {directory.relative_to(workspace).as_posix()}/ "
                 f"有自己的约定文件（{relative}，由项目维护者提供），在该目录下的工作遵照执行：\n{text}"
             )
+            self._nested_instruction_sources[path] = (source, note)
+            return note
         return ""
 
     def _track_failure(self, name: str, ok: bool) -> int:

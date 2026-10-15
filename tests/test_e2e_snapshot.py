@@ -136,6 +136,49 @@ class AskUserCancelSnapshot(AgentTestCase):
         self.assertEqual(actual["model_requests"], 1)
 
 
+class ContextSourcesSnapshot(AgentTestCase):
+    """项目规则在启动后变更，诊断仍反映装入会话的原文与懒加载结果。"""
+
+    def test_scenario(self) -> None:
+        from xiaoyu.agent import Agent
+        from xiaoyu.cli import handle_slash
+        from xiaoyu.render import NullSink
+
+        if MODE == "record":
+            self.skipTest("上下文诊断使用确定性 fixture，不调用真实模型")
+        (self.root / "AGENTS.md").write_text("root instructions exceed budget", encoding="utf-8")
+        (self.root / "api").mkdir()
+        (self.root / "api/AGENTS.md").write_text("nested rules", encoding="utf-8")
+        (self.root / "api/code.py").write_text("pass", encoding="utf-8")
+        #  消除机器身份、日期与安装路径对字符数的影响，项目指令走真实构建路径。
+        with (mock.patch("xiaoyu.agent.SYSTEM_PROMPT", "测试核心身份。"),
+              mock.patch("xiaoyu.agent.envprobe.block", return_value=""),
+              mock.patch("xiaoyu.agent.world_state.today", return_value="2026-01-01"),
+              mock.patch("xiaoyu.agent.__file__", str(self.root / "agent.py")),
+              mock.patch.object(Agent, "_PROJECT_DOC_CAP", 10)):
+            agent = self.build([
+                [chunk(tool_calls=[call_fragment(0, "read", "read_file", '{"path":"api/code.py"}')]),
+                 usage_chunk(10, 5)],
+                [chunk(content="读完了。"), usage_chunk(15, 5)],
+            ], sink=NullSink())
+        with mock.patch.object(agent.world_state, "diff", return_value=None):
+            agent.send("读一下代码")
+        before = agent.context_breakdown()
+        (self.root / "AGENTS.md").write_text("changed", encoding="utf-8")
+        (self.root / "api/AGENTS.md").unlink()
+        shown = io.StringIO()
+        with (contextlib.redirect_stdout(shown), mock.patch("xiaoyu.ui._ENABLED", False),
+              mock.patch.object(agent, "context_tokens", return_value=100)):
+            handle_slash(agent, "/context")
+        actual = {"terminal": shown.getvalue(), "model_requests": len(self.client.completions.calls)}
+        path = Path(__file__).parent / "fixtures" / "context_sources.expected.json"
+        if MODE == "refresh":
+            path.write_text(json.dumps(actual, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        self.assertEqual(actual, json.loads(path.read_text(encoding="utf-8", errors="replace")))
+        self.assertEqual(agent.context_breakdown(), before)
+        self.assertEqual(actual["model_requests"], 2)
+
+
 class RewindPreviewSnapshot(AgentTestCase):
     """真实文件工具写入后，CLI 显示预览并确认恢复；不调用网络。"""
 

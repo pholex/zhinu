@@ -1770,7 +1770,92 @@ class TestEscalationApproval(AgentTestCase):
 
 
 class TestContextBreakdown(AgentTestCase):
-    """上下文归因：同一份段列表既拼 prompt 又做归因，两者不可能对不上。"""
+    """上下文归因必须对应已装入会话的提示词，不随磁盘内容漂移。"""
+
+    def test_disk_changes_do_not_rebuild_loaded_segments(self) -> None:
+        agent = self.build([])
+        original = agent.messages[0]["content"]
+        rows = agent.context_breakdown()
+        (self.root / "AGENTS.md").write_text("会话启动后才出现的约定", encoding="utf-8")
+        self.assertEqual(agent.context_breakdown(), rows)
+        self.assertEqual(sum(n for _, n in agent.context_breakdown()), len(original))
+
+    def test_diagnostics_use_loaded_snapshot_without_disk_reads(self) -> None:
+        path = self.root / "AGENTS.md"
+        path.write_text("original", encoding="utf-8")
+        agent = self.build([])
+        rows = agent.context_breakdown()
+        sources = agent.context_instruction_sources()
+        self.assertEqual(sources, [("AGENTS.md", "system：已加载 · 正文 8/8 字符")])
+        path.write_text("changed instructions", encoding="utf-8")
+        #  仅构建但没有装入会话的新 prompt，不得覆盖已有的来源快照。
+        agent._system_prompt()
+        path.unlink()
+        with (mock.patch.object(Path, "read_text", side_effect=AssertionError("不应读磁盘")),
+              mock.patch("xiaoyu.agent.world_state.today", return_value="2099-01-01")):
+            self.assertEqual(agent.context_breakdown(), rows)
+            self.assertEqual(agent.context_instruction_sources(), sources)
+
+    def test_explicit_prompt_rebuild_refreshes_sources(self) -> None:
+        agent = self.build([])
+        path = self.root / "AGENTS.md"
+        path.write_text("new", encoding="utf-8")
+        for action, text in ((agent.reload_skills, "new"), (agent.reset, "reset")):
+            path.write_text(text, encoding="utf-8")
+            action()
+            self.assertIn(text, agent.messages[0]["content"])
+            self.assertEqual(agent.context_instruction_sources(), [
+                ("AGENTS.md", f"system：已加载 · 正文 {len(text)}/{len(text)} 字符")])
+            self.assertEqual(sum(n for _, n in agent.context_breakdown()), len(agent.messages[0]["content"]))
+
+    def test_external_system_replacement_does_not_reuse_provenance(self) -> None:
+        (self.root / "AGENTS.md").write_text("old", encoding="utf-8")
+        agent = self.build([])
+        agent.messages[0] = {"role": "system", "content": "replacement"}
+        agent.messages.append({"role": "user", "content": "hello"})
+        self.assertEqual(agent.context_breakdown(), [("system:未分段", 11), ("消息:user", 5)])
+        self.assertEqual(agent.context_instruction_sources(), [("system", "已被替换或移除，原来源记录不适用")])
+        agent.messages.pop(0)
+        self.assertEqual(agent.context_breakdown(), [("消息:user", 5)])
+        agent.messages.clear()
+        self.assertEqual(agent.context_breakdown(), [])
+
+    def test_source_budget_and_file_precedence(self) -> None:
+        from xiaoyu.agent import collect_project_docs
+
+        child = self.root / "pkg"
+        child.mkdir()
+        (self.root / "AGENTS.md").write_text("parent rules", encoding="utf-8")
+        (child / "AGENTS.md").write_text("1234567890", encoding="utf-8")
+        (child / "XIAOYU.md").write_text("not selected", encoding="utf-8")
+        sources = []
+        with mock.patch("xiaoyu.agent.project_levels", return_value=[self.root, child]):
+            docs = collect_project_docs(child, ("AGENTS.md", "XIAOYU.md"), 5, sources=sources)
+        self.assertEqual([(s.path, s.status, s.included, s.total) for s in sources], [
+            (self.root / "AGENTS.md", "预算省略", 0, 12),
+            (child / "AGENTS.md", "已截断", 5, 10),
+        ])
+        self.assertIn("整体省略", docs[0][1])
+        self.assertEqual(docs[1][1], "12345\n…（指令文件过长，已截断）")
+
+    def test_empty_unreadable_and_disabled_sources(self) -> None:
+        path = self.root / "AGENTS.md"
+        path.touch()
+        agent = self.build([])
+        self.assertIn("未加载（空文件）", agent.context_instruction_sources()[0][1])
+        original_read = Path.read_text
+
+        def read(file, *args, **kwargs):
+            if file == path:
+                raise OSError("unreadable")
+            return original_read(file, *args, **kwargs)
+
+        with mock.patch.object(Path, "read_text", read):
+            agent.reload_skills()
+        self.assertEqual(agent.context_instruction_sources(), [("AGENTS.md", "system：未加载（读取失败）")])
+        agent.config.load_project_instructions = False
+        agent.reset()
+        self.assertEqual(agent.context_instruction_sources(), [("system", "项目指令加载已关闭")])
 
     def test_segments_join_equals_system_prompt(self) -> None:
         agent = self.build([])

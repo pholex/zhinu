@@ -1,0 +1,4 @@
+{
+  "terminal": "  ▏  100 / 180000 tok（0%）\n  压缩阈值 125999 tok · 已压缩 0 次（上次省 0 tok）\n  消息 5 条 · 估算依据：服务端锚点 15 tok（第 4 条消息处）+ 增量估算\n  摘要模型链：gateway/cheap-model → gateway/main-model\n  ── 归因（字符）──\n    system:项目指令           134   49%\n    消息:tool                96   35%\n    system:日期              28   10%\n    system:核心身份             7    3%\n    消息:user                 5    2%\n    消息:assistant            4    1%\n  ── 项目指令来源（本次运行记录，不重读磁盘）──\n    AGENTS.md · system：已截断 · 正文 10/31 字符\n    api/AGENTS.md · system：仅指针（未在 system 中加载正文）；工具消息：已截断 · 正文 10/12 字符\n",
+  "model_requests": 2
+}
