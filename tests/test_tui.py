@@ -52,6 +52,19 @@ class TestInterpretConfirmAnswer(unittest.TestCase):
         for text in ("做吧", "go ahead", "干活", "好的", "继续", "对", "嗯", "all", "always", "allowed"):
             self.assertEqual(interpret_confirm_answer(text), text.strip(), text)
 
+    def test_plain_negatives_deny_without_a_reason(self) -> None:
+        for word in ("nope", "NAH", "deny", "reject", "不", "否", "别", "不行", "不要", "不可以",
+                     "不允许", "不同意", "不赞同", "不要这样", "拒绝", " 不 "):
+            self.assertIs(interpret_confirm_answer(word), False, word)
+        #  带"整个别做了 / 跳过"意图的词留作理由回给模型；多一个字或中间带空格也是理由
+        for text in ("停", "stop", "cancel", "算了", "skip", "不 同意", "不行啊", "别动这个文件"):
+            self.assertEqual(interpret_confirm_answer(text), text.strip(), text)
+
+    def test_yes_and_no_tables_do_not_overlap(self) -> None:
+        from xiaoyu.cli import CONFIRM_NO, CONFIRM_YES
+        self.assertEqual(CONFIRM_YES & CONFIRM_NO, set())
+        self.assertNotIn("a", CONFIRM_YES | CONFIRM_NO)
+
     def test_literal_grant_is_a_reason_not_a_sentinel(self) -> None:
         """用户拿 "grant" 当拒绝理由时不能被误判成会话授权。"""
         verdict = interpret_confirm_answer("grant")
