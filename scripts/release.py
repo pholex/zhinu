@@ -226,6 +226,21 @@ def latest_ci_run(repo: Path = REPO) -> dict | None:
     return runs[0] if runs else None
 
 
+def notes_since(facts: Facts) -> str:
+    """发版说明的起点：PyPI 上真发出去的最高版本的 tag。
+
+    新流程里 CI 红了版本号就烧掉，烧掉的 tag 仍在本地；若只按「最近的 tag」起算，
+    烧掉那版的改动就从说明里消失了（用户是从上一个真发出去的版本升上来的）。
+    查不到 PyPI 时退回最近的 tag。
+    """
+    if facts.pypi_versions:
+        tags = set(facts.tags or [])
+        for version in sorted(facts.pypi_versions, key=version_key, reverse=True):
+            if f"v{version}" in tags:
+                return f"v{version}"
+    return facts.last_tag or "HEAD~1"
+
+
 def collect_facts(target: str | None, repo: Path = REPO, *, fetch: bool = True, network: bool = True) -> Facts:
     current = current_version(repo)
     branch_proc = _git(repo, "rev-parse", "--abbrev-ref", "HEAD")
@@ -447,6 +462,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--validation", default="auto",
                         help="自测记录：auto（默认）= 最近一次 nightly，none = 不附，或文件路径")
     parser.add_argument("--acp-fork", help="ACP registry fork 里的 xiaoyu/agent.json 路径，一并改版本（不提交）")
+    parser.add_argument("--since", help="发版说明的起点 tag / 提交（默认 PyPI 上最高已发布版本的 tag）")
     args = parser.parse_args(argv)
 
     if args.version and args.bump:
@@ -469,7 +485,7 @@ def main(argv: list[str] | None = None) -> int:
         print(f"\n有 {len(warned)} 项警告（{', '.join(c.name for c in warned)}），自己判断要不要继续")
     if args.check or target is None:
         return 0
-    since = facts.last_tag or "HEAD~1"
+    since = args.since or notes_since(facts)
     if args.dry_run:
         print(f"\n--dry-run：预检通过。真跑会：改 {VERSION_FILE} 到 {target} → 生成 {NOTES_DIR / (target + '.md')}"
               f"（自 {since}）→ 同步 {ACP_PIN_FILE} → 提交 chore(release): {target} → 打 tag v{target}")
