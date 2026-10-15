@@ -3871,18 +3871,27 @@ CONFIRM_YES = frozenset({
     "y", "yes", "ok", "okay", "sure", "yep", "yeah", "go", "run", "approve", "allow",
     "做", "办", "干", "同意", "批准", "可以", "行", "是", "好",
 })
+#  算"干净拒绝"的整词：纯否定、不带别的意图，模型只收到"用户拒绝了，换个做法或先问"。
+#  刻意不收"停""stop""cancel""算了""skip"：它们带着"整个别做了 / 跳过这步"的意思，
+#  留作理由原文回给模型，模型会照着停，比干净拒绝更对。两张表都只认整词，
+#  "不 同意"中间多个空格就落到理由那一路——不确定的输入永远不会变成放行。
+CONFIRM_NO = frozenset({
+    "n", "no", "nope", "nah", "deny", "reject",
+    "不", "否", "别", "不行", "不要", "不可以", "不允许", "不同意", "不赞同", "不要这样", "拒绝",
+})
 
 
 def interpret_confirm_answer(answer: str) -> bool | str | object:
     """确认框输入 → 判定（明文与 TUI 两个前端共用的单一语义源）：
     CONFIRM_YES 里的整词=允许；GRANT_SESSION=本会话该工具全允许（调用方负责落会话
-    授权并提示）；空/n/no=拒绝；其它任意文本=拒绝并把原文当理由回灌模型。"""
+    授权并提示）；空或 CONFIRM_NO 里的整词=拒绝；其它任意文本=拒绝并把原文当理由
+    回灌模型。"""
     lowered = answer.strip().lower()
     if lowered == "a":
         return GRANT_SESSION
     if lowered in CONFIRM_YES:
         return True
-    if lowered in ("", "n", "no"):
+    if lowered == "" or lowered in CONFIRM_NO:
         return False
     return answer.strip()
 
