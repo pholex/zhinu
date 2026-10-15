@@ -41,13 +41,16 @@ from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
 
+#  一张平铺列表，每条以类型词开头（新增 / 修复 / …），不再按类型分小节：条目少的版本
+#  小节标题比条目还多；平铺时按这个顺序排，新增在前
 GROUPS = (
-    ("feat", "新功能"),
+    ("feat", "新增"),
     ("fix", "修复"),
     ("docs", "文档"),
     ("chore", "工程"),
-    ("other", "其它"),
+    ("other", "改动"),
 )
+CHANGES_TITLE = "## 变化"
 _TYPES = {key for key, _ in GROUPS if key != "other"}
 #  type(scope)!: subject —— scope 与 ! 可省
 _SUBJECT = re.compile(r"^(?P<type>[a-z]+)(?:\((?P<scope>[^)]*)\))?(?P<bang>!)?:\s*(?P<subject>.+)$")
@@ -72,17 +75,19 @@ _POLISH_PROMPT = """下面是一个 Python 命令行工具（小羽，PyPI 包 x
 """
 
 
-def parse_subject(subject: str) -> tuple[str, str]:
-    """返回 (分组键, 去掉前缀的说明)。认不出前缀归 other、原样保留。"""
+def split_subject(subject: str) -> tuple[str, str, str]:
+    """返回 (分组键, scope, 去掉前缀的说明)。认不出前缀归 other、说明原样保留、scope 为空。"""
     match = _SUBJECT.match(subject.strip())
     if not match:
-        return "other", subject.strip()
+        return "other", "", subject.strip()
     kind = match.group("type")
-    text = match.group("subject").strip()
-    scope = match.group("scope")
-    if scope:
-        text = f"{scope}：{text}"
-    return (kind if kind in _TYPES else "other"), text
+    return (kind if kind in _TYPES else "other"), (match.group("scope") or "").strip(), match.group("subject").strip()
+
+
+def parse_subject(subject: str) -> tuple[str, str]:
+    """返回 (分组键, 带 scope 的说明)：scope 有就拼成「scope：说明」。"""
+    kind, scope, text = split_subject(subject)
+    return kind, (f"{scope}：{text}" if scope else text)
 
 
 def is_breaking_subject(subject: str) -> bool:
@@ -151,7 +156,9 @@ def collect_commits(since: str, repo: Path = REPO) -> list[dict[str, str]]:
 def group_commits(commits: list[dict[str, str]]) -> dict[str, list[dict[str, str]]]:
     grouped: dict[str, list[dict[str, str]]] = {key: [] for key, _ in GROUPS}
     for commit in commits:
-        kind, text = parse_subject(commit["subject"])
+        #  列表行不带 scope：那是代码里的分区名（cli / gitsafe），用户读不出意义，
+        #  行首已经有类型词，再来一个冒号段只剩噪音
+        kind, _scope, text = split_subject(commit["subject"])
         grouped[kind].append({**commit, "text": text})
     return grouped
 
@@ -168,22 +175,19 @@ def render_behavior(commits: list[dict[str, str]]) -> str:
 
 
 def render_plain(grouped: dict[str, list[dict[str, str]]]) -> str:
-    """纯分组列表（也是润色的输入）：一个提交一行，只有 subject 与短 sha。
+    """一张平铺列表（也是润色的输入）：一个提交一行，「类型词：说明（短 sha）」。
 
     正文不抄进来——「为什么」留在 git log 里，想看的人按 sha 去看；说明是给
     升级的人扫一眼的，长了反而没人读。需要用户先知道的事走「行为变化」一节。
     """
-    out: list[str] = []
-    for key, title in GROUPS:
-        items = grouped.get(key) or []
-        if not items:
-            continue
-        out.append(f"## {title}")
-        out.append("")
-        for item in items:
-            out.append(f"- {item['text']}（{item['sha'][:7]}）")
-        out.append("")
-    return "\n".join(out).rstrip() + "\n"
+    lines = [
+        f"- {label}：{item['text']}（{item['sha'][:7]}）"
+        for key, label in GROUPS
+        for item in (grouped.get(key) or [])
+    ]
+    if not lines:
+        return ""
+    return CHANGES_TITLE + "\n\n" + "\n".join(lines) + "\n"
 
 
 def render_body(commits: list[dict[str, str]], polished: str | None = None) -> str:
