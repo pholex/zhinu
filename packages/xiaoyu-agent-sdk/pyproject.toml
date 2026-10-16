@@ -12,7 +12,7 @@ license = "MIT"
 license-files = ["LICENSE"]
 
 [project.optional-dependencies]
-telemetry = ["opentelemetry-api==1.45.0"]
+telemetry = ["opentelemetry-api==1.45.1"]
 
 [project.urls]
 Repository = "https://github.com/pholex/zhinu"
