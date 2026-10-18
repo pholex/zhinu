@@ -32,7 +32,7 @@
 # <用户配置目录>/agents/tester.toml 或 <工作区>/.xiaoyu/agents/tester.toml
 description = "写并跑单元测试的子 agent"     # 必填：也是给模型看的工具说明
 system_prompt = "你是测试工程师……工作区根目录：{workspace}"   # 必填
-tools = ["read_file", "grep", "list_files", "write_file", "bash"]
+tools = ["read_file", "grep", "list_files", "write_file", "bash"]   # 可点名 web_search / web_fetch
 capability_mode = "read-write"    # 可省：粗粒度档位，与 tools 二选一或叠加
 isolation = "worktree"            # 可省：默认在独立 git worktree 里跑
 mcp = ["github"]                  # 可省：继承父会话的哪些 MCP server
@@ -51,6 +51,10 @@ inherit = "distilled"             # 可省：none（默认）/ distilled（精�
   你挂在工具调用上的钩子（`PreToolUse` / `PostToolUse` / `ToolFailed`）在子 agent 里照样触发
   （会话类的 `SessionStart` / `SessionEnd` / `UserPromptSubmit` / `Stop` 不带下去）。
   检索子 agent（explore）读文件同样过你的 deny / ask 规则。
+- **联网只读件要点名**：`tools` 里写了 `web_search` / `web_fetch` 的子 agent 才能联网，
+  且随父会话的开关（`XIAOYU_ENABLE_WEB_SEARCH` / `XIAOYU_ENABLE_WEB_FETCH` 关了子 agent
+  一起关）、没配对应 key 时同样不出现。两者归 read-only 档，不影响免确认；
+  `web_fetch` 按次计费，调研类 spec 再给。`x_search` 与 Deep Research 不开放给子 agent。
 - **worktree 隔离**：`isolation = "worktree"` 时改动落在独立 git worktree，
   跑完没改动自动删、有改动保留并把路径写进结论（`git -C <路径> diff` 查看，
   `git apply` 取回）。
@@ -146,7 +150,8 @@ douqiao(
 的编排者（总枢），工作流：
 
 1. **chenshu_plan** 把目标拆成 mission：`build` 必须给 `scope`（目录/glob，
-   **两两不相交**，共享文件归属唯一一个 mission）；`survey` 是只读调研；
+   **两两不相交**，共享文件归属唯一一个 mission）；`survey` 是只读调研
+   （只有它能联网：`web_search` / `web_fetch` 随主会话开关与 key 出现）；
    `deps` 声明合并顺序。
 2. **chenshu_spawn** 逐个起成员：worker 绑 mission（build 自动创建
    `feat/<slug>` 分支 + 独立 worktree），reviewer 绑评审目标。把依赖已

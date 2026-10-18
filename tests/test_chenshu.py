@@ -808,3 +808,53 @@ class MemberTuningAndArchiveTest(ChenshuCase):
         out = second.init()
         self.assertIn("已退役：w1", out)
         self.assertIn("resume=true", out)
+
+
+class SurveyNetworkToolsTest(ChenshuCase):
+    """联网只读件只给 survey 成员，且随主会话开关；build worker 与 reviewer 不给。"""
+
+    def wait_done(self, runtime, name, timeout: float = 30.0):
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            thread = runtime._threads.get(name)
+            if thread is not None and not thread.is_alive():
+                return
+            time.sleep(0.05)
+        self.fail(f"{name} 没有在 {timeout}s 内收工")
+
+    def _member_configs(self, enable: bool) -> dict[str, object]:
+        from xiaoyu import agent as agent_mod
+
+        self.init_repo()
+        self.config.enable_web_fetch = enable
+        self.config.enable_web_search = enable
+        seen: list = []
+        real = agent_mod.Agent
+
+        def spy(config, *args, **kwargs):
+            seen.append(config)
+            return real(config, *args, **kwargs)
+
+        runtime = self.make_runtime([text_turn(LONG), text_turn(LONG)])
+        with contextlib.redirect_stdout(io.StringIO()), mock.patch.object(agent_mod, "Agent", spy):
+            runtime.init()
+            runtime.plan([{"title": "摸底", "kind": "survey"},
+                          {"title": "改代码", "scope": ["src/"]}])
+            runtime.spawn("scout", "worker", mission_id="M1")
+            self.wait_done(runtime, "scout")
+            runtime.spawn("bee", "worker", mission_id="M2")
+            self.wait_done(runtime, "bee")
+        self.assertEqual(len(seen), 2)
+        return {"survey": seen[0], "build": seen[1]}
+
+    def test_survey_member_follows_parent_switch(self):
+        configs = self._member_configs(enable=True)
+        self.assertTrue(configs["survey"].enable_web_fetch)
+        self.assertTrue(configs["survey"].enable_web_search)
+        self.assertFalse(configs["build"].enable_web_fetch)
+        self.assertFalse(configs["build"].enable_web_search)
+
+    def test_parent_switch_off_closes_survey_too(self):
+        configs = self._member_configs(enable=False)
+        self.assertFalse(configs["survey"].enable_web_fetch)
+        self.assertFalse(configs["survey"].enable_web_search)

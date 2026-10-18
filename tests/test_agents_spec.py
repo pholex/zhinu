@@ -414,3 +414,71 @@ class InheritSpecTest(AgentTestCase):
         record = next(iter(runs.values()))
         self.assertEqual(record.messages[1]["content"], "查")
         self.assertNotIn("[继承上下文]", record.messages[0]["content"])
+
+
+class NetworkToolsTest(AgentTestCase):
+    """联网只读件（web_search / web_fetch）：spec 点名才有、随父会话开关、
+    不进 Toolbox 的 only 名单、仍算只读免确认。"""
+
+    def _delegate(self, spec: AgentSpec, **config_changes):
+        from xiaoyu.agents import execute_delegation
+
+        for key, value in config_changes.items():
+            setattr(self.config, key, value)
+        agent = self.build([text_turn("done")])
+        handle: list = []
+        with contextlib.redirect_stdout(io.StringIO()):
+            result = execute_delegation(
+                spec, self.config, agent.registry, agent.usage, agent.sink,
+                agent.approver, agent.permissions, {},
+                task="查一下", on_agent=handle.append,
+            )
+        self.assertFalse(result.error, result.error)
+        return handle[0]
+
+    def _spec(self, *tools: str, mode: str = "") -> AgentSpec:
+        return AgentSpec(name="scout", description="调研", system_prompt="查 {workspace}",
+                         tools=tools, capability_mode=mode)
+
+    def test_declared_network_tools_follow_parent_switches(self):
+        spec = self._spec("read_file", "grep", "list_files", "web_fetch", "web_search")
+        self.assertTrue(spec.readonly)
+        child = self._delegate(spec, enable_web_fetch=True, enable_web_search=True)
+        self.assertTrue(child.config.enable_web_fetch)
+        self.assertTrue(child.config.enable_web_search)
+        self.assertTrue(child.config.auto_approve)  # 仍是只读免确认
+        #  Toolbox 的 only 名单不含联网件（它们是 Agent 级挂载），注册点由 Agent 决定
+        self.assertIsNotNone(child.toolbox.get("read_file"))
+        #  父会话关了，子 agent 一起关
+        child = self._delegate(spec, enable_web_fetch=False, enable_web_search=False)
+        self.assertFalse(child.config.enable_web_fetch)
+        self.assertFalse(child.config.enable_web_search)
+        self.assertIsNone(child.toolbox.get("web_fetch"))
+
+    def test_undeclared_network_tools_stay_off(self):
+        child = self._delegate(self._spec("read_file", "grep", "list_files"),
+                               enable_web_fetch=True, enable_web_search=True)
+        self.assertFalse(child.config.enable_web_fetch)
+        self.assertFalse(child.config.enable_web_search)
+        self.assertIsNone(child.toolbox.get("web_fetch"))
+
+    def test_capability_tiers_and_spec_loading(self):
+        from xiaoyu.agents import ALLOWED_TOOLS, CAPABILITY_TOOLS, NETWORK_TOOLS
+
+        for tier in ("read-only", "read-write", "execute", "all"):
+            self.assertTrue(set(NETWORK_TOOLS) <= CAPABILITY_TOOLS[tier], tier)
+        self.assertTrue(set(NETWORK_TOOLS) <= set(ALLOWED_TOOLS))
+        write_spec(self.root / ".xiaoyu" / "agents", "scout", GOOD_SPEC.replace(
+            '"list_files"]', '"list_files", "web_fetch"]') + 'capability_mode = "read-only"\n')
+        #  只给档位不点名：按档位展开也不含联网件（必须点名）
+        write_spec(self.root / ".xiaoyu" / "agents", "tier_only",
+                   'description = "d"\nsystem_prompt = "s"\ncapability_mode = "all"\n')
+        with mock.patch.object(agents_mod, "user_config_dir", lambda: self.root / "cfg"):
+            specs, problems = load_agent_specs(self.root)
+        self.assertEqual(problems, [])
+        specs = {spec.name: spec for spec in specs}
+        self.assertIn("web_fetch", specs["scout"].tools)
+        self.assertFalse(set(NETWORK_TOOLS) & set(specs["tier_only"].tools))
+        #  调用参数再收紧到 read-only 也留得住联网件
+        child = self._delegate(specs["scout"], enable_web_fetch=True)
+        self.assertTrue(child.config.enable_web_fetch)

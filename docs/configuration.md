@@ -168,8 +168,9 @@ Markdown 正文。它补的是 `web_search` 的缺口：搜索回来的是模型
 返回内容标注外部来源，页面里的说法不代表已核实事实。
 
 此能力独立于 `XIAOYU_SEARCH_PROVIDER` 与 `/search` 切换；默认开启，未配置 DeepSeek 时
-不暴露工具，`XIAOYU_ENABLE_WEB_FETCH=0` 可关闭。检索子 agent、声明式 subagent 与评估
-默认不启用。按**成功抓取次数**计费（不计 token，不进 `/stats` 的模型用量），
+不暴露工具，`XIAOYU_ENABLE_WEB_FETCH=0` 可关闭。检索子 agent（explore）与评估不启用；
+声明式 subagent 在 `tools` 里点名 `web_fetch` 即可用、宸枢的 survey 成员自带，两者都
+随这个开关（见[多 agent 协同](multi-agent.md)）。按**成功抓取次数**计费（不计 token，不进 `/stats` 的模型用量），
 价格与限流见[官方文档](https://api-docs.deepseek.com/guides/search)。
 
 ### X 平台搜索

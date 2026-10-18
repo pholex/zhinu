@@ -88,16 +88,24 @@ from .config import EFFORT_LEVELS, Config, user_config_dir
 from .events import Notice, UISink
 from .tools import Tool, Toolbox
 
-#  spec 可点名的工具全集：内置七件。update_plan/skill/web_search/explore 是
-#  Agent 级条件挂载，不在 Toolbox(only=...) 的可选集合里
-ALLOWED_TOOLS = (*Toolbox.READONLY, "write_file", "str_replace", "bash", "browser")
+#  联网只读工具：spec 可以点名，但它们不是 Toolbox 内置件而是 Agent 级条件挂载
+#  （见 agent.py 按 enable_web_search / enable_web_fetch 注册）——所以不进
+#  Toolbox(only=...) 的名单，而是翻译成子 Config 的两个开关：声明了 ∧ 父会话开着。
+#  父会话 XIAOYU_ENABLE_WEB_FETCH=0 时所有子 agent 一起关，这就是"跟随父会话"。
+#  没声明就没有：默认面不因为父会话配了 key 而扩大。
+NETWORK_TOOLS = ("web_search", "web_fetch")
+
+#  spec 可点名的工具全集：内置七件 + 两个联网只读件。update_plan/skill/explore/
+#  x_search/deep_research 不开放：子 agent 用不上（规划归父级、社交查询与后台长任务等不到）
+ALLOWED_TOOLS = (*Toolbox.READONLY, *NETWORK_TOOLS, "write_file", "str_replace", "bash", "browser")
 
 #  能力档位 → 允许的工具（白名单方向，不做黑名单）：
-#  read-write 无执行、execute 无写文件（browser 有页面副作用，归 execute 档）
+#  read-write 无执行、execute 无写文件（browser 有页面副作用，归 execute 档）。
+#  联网只读件不改本地、不执行命令，归 read-only 档；它们按次计费，所以仍要声明者点名
 CAPABILITY_TOOLS: dict[str, frozenset[str]] = {
-    "read-only": frozenset(Toolbox.READONLY),
-    "read-write": frozenset((*Toolbox.READONLY, "write_file", "str_replace")),
-    "execute": frozenset((*Toolbox.READONLY, "bash", "browser")),
+    "read-only": frozenset((*Toolbox.READONLY, *NETWORK_TOOLS)),
+    "read-write": frozenset((*Toolbox.READONLY, *NETWORK_TOOLS, "write_file", "str_replace")),
+    "execute": frozenset((*Toolbox.READONLY, *NETWORK_TOOLS, "bash", "browser")),
     "all": frozenset(ALLOWED_TOOLS),
 }
 
@@ -180,7 +188,7 @@ class AgentSpec:
 
     @property
     def readonly(self) -> bool:
-        return set(self.tools) <= set(Toolbox.READONLY) and self.mcp_mode == "none"
+        return set(self.tools) <= {*Toolbox.READONLY, *NETWORK_TOOLS} and self.mcp_mode == "none"
 
 
 @dataclass
@@ -514,7 +522,10 @@ def _parse_spec(path: Path, source: str) -> tuple[AgentSpec | None, list[str]]:
     if raw_tools is None:
         if not mode:
             return None, [f"{path.name}: tools 与 capability_mode 至少给一个"]
-        tools = tuple(tool for tool in ALLOWED_TOOLS if tool in CAPABILITY_TOOLS[mode])
+        #  只给档位不点名时按档位全集展开，但联网件除外：它们按次计费、出网，
+        #  必须在 tools 里点名才有（档位只决定点了名之后留不留得住）
+        tools = tuple(tool for tool in ALLOWED_TOOLS
+                      if tool in CAPABILITY_TOOLS[mode] and tool not in NETWORK_TOOLS)
     else:
         if not isinstance(raw_tools, list) or not raw_tools:
             return None, [f"{path.name}: tools 必须是非空工具名列表"]
@@ -893,8 +904,9 @@ def execute_delegation(
         if record is not None
         else (model_override or spec.model or config.model)
     )
-    #  免确认只给"纯只读且无 MCP"的有效集合；否则父级审批穿透
-    readonly_run = set(tools_list) <= set(Toolbox.READONLY) and mcp_view is None
+    #  免确认只给"纯只读且无 MCP"的有效集合；否则父级审批穿透。联网只读件
+    #  本来就免确认（与父会话同级），算在只读里
+    readonly_run = set(tools_list) <= {*Toolbox.READONLY, *NETWORK_TOOLS} and mcp_view is None
     #  嵌套：默认 max=1 → nest=False → enable_agents/chenshu 关、allow_nesting=False，
     #  与"不套娃"完全一致。XIAOYU_SUBAGENT_MAX_DEPTH>1 时逐层放开、到顶即止
     nest = config.subagent_depth + 1 < config.subagent_max_depth
@@ -927,10 +939,12 @@ def execute_delegation(
         mode=guards.child_mode(),
         mcp_tool_search=config.mcp_tool_search,
         enable_explore=False,
-        enable_web_search=False,
+        #  联网只读件：spec 点名了才有，且随父会话的开关（见 NETWORK_TOOLS）；
+        #  有没有 key 由工具自己的 check_fn 判，没配就不进 schemas
+        enable_web_search=config.enable_web_search and "web_search" in tools_list,
+        enable_web_fetch=config.enable_web_fetch and "web_fetch" in tools_list,
         enable_x_search=False,
         enable_deep_research=False,
-        enable_web_fetch=False,
         enable_skills=False,
         load_project_instructions=config.load_project_instructions,
         skill_directories=config.skill_directories,
@@ -950,7 +964,9 @@ def execute_delegation(
         child_sink = child_maker() if callable(child_maker) else None
     sub_agent = Agent(
         sub_config,
-        Toolbox(sub_config, only=list(tools_list), mcp_view=mcp_view),
+        #  联网只读件不是 Toolbox 内置件（only 名单里会报未知工具），由 Agent 按
+        #  上面的两个开关挂载
+        Toolbox(sub_config, only=[t for t in tools_list if t not in NETWORK_TOOLS], mcp_view=mcp_view),
         usage=usage,
         registry=registry,
         quiet=True,
