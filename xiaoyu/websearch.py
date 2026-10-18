@@ -11,7 +11,7 @@
 搜索、抓取、筛选全在厂商服务端发生，本地不落任何中间结果。
 
 后端按 XIAOYU_SEARCH_PROVIDER 选（config.search_provider）：默认 deepseek-flash
-走 Anthropic 兼容接口，xai/grok-4.7 与 bedrock/openai.gpt-5.6-luna 走 Responses。
+走 Anthropic 兼容接口，xai/grok-4.7 与 bedrock/openai.gpt-6-luna 走 Responses。
 DeepSeek 的 Responses 接口忽略内置搜索，搜索必须单独走 /anthropic；
 不改变主对话的协议。2026-10-03 实测返回服务端搜索调用与结果块。
 """
@@ -42,7 +42,7 @@ class SearchBackend:
 SEARCH_BACKENDS: dict[str, SearchBackend] = {
     "deepseek": SearchBackend("deepseek", "deepseek-flash"),
     "xai": SearchBackend("xai", "grok-4.7"),
-    "bedrock": SearchBackend("bedrock", "openai.gpt-5.6-luna"),
+    "bedrock": SearchBackend("bedrock", "openai.gpt-6-luna"),
 }
 
 

@@ -130,7 +130,7 @@ XIAOYU_API_KEY=<key>
 | `XIAOYU_ENABLE_WEB_FETCH` | `web_fetch` 网页抓取工具（默认开启，需 `DEEPSEEK_API_KEY`；`0` 关闭），走 DeepSeek 服务端抓取接口、按次计费，独立于网页搜索后端，见下文 |
 | `XIAOYU_ENABLE_X_SEARCH` | `x_search` 工具（默认开启，需 `XAI_API_KEY`；`0` 关闭），独立于网页搜索后端 |
 | `XIAOYU_ENABLE_DEEP_RESEARCH` | Gemini 后台研究工具（默认开启，需 Gemini key；`0` 关闭），支持提交、查询报告与取消 |
-| `XIAOYU_SEARCH_PROVIDER` | 搜索走哪家：`deepseek`（默认，deepseek-flash，需 `DEEPSEEK_API_KEY`）、`xai`（grok-4.7，需 `XAI_API_KEY`）或 `bedrock`（openai.gpt-5.6-luna，走 Mantle Responses）。DeepSeek 搜索单独走 Anthropic 兼容接口，主对话协议不变；其 Responses 接口不支持内置搜索。所选 provider 未注册时不挂载工具；Bedrock 鉴权与权限见下方 |
+| `XIAOYU_SEARCH_PROVIDER` | 搜索走哪家：`deepseek`（默认，deepseek-flash，需 `DEEPSEEK_API_KEY`）、`xai`（grok-4.7，需 `XAI_API_KEY`）或 `bedrock`（openai.gpt-6-luna，走 Mantle Responses）。DeepSeek 搜索单独走 Anthropic 兼容接口，主对话协议不变；其 Responses 接口不支持内置搜索。所选 provider 未注册时不挂载工具；Bedrock 鉴权与权限见下方 |
 | `XIAOYU_ENABLE_BROWSER` | `browser` 浏览器工具（依赖可选 `[browser]` extra 的 playwright，没装时本来就不出现） |
 | `XIAOYU_ENABLE_PLUGINS` | entry point 组 `xiaoyu.tools` 的第三方工具**包**（代码级；和 `xiaoyu plugin` 装的**内容包**不是一回事，见下） |
 | `XIAOYU_ENABLE_MCP` | MCP server 挂载 |
@@ -218,7 +218,7 @@ XIAOYU_BEDROCK_REGION=us-east-1
 ```
 
 搜索使用 `bedrock-mantle.<区域>.api.aws/openai/v1` 的 Responses API，模型为
-`openai.gpt-5.6-luna`；现有 Bedrock 主对话仍走自己的模型与协议。
+`openai.gpt-6-luna`；现有 Bedrock 主对话仍走自己的模型与协议。
 鉴权复用 `AWS_BEARER_TOKEN_BEDROCK`；没配置 token 时使用 AWS 默认凭证链
 （支持 `AWS_PROFILE`），这条 IAM 路径需要可选依赖 `pip install 'xiaoyu-agent[bedrock]'`。
 

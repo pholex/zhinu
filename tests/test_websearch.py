@@ -338,14 +338,14 @@ class TestBedrockSearch(unittest.TestCase):
         self.assertTrue(self.tool.available())
         out = self.tool.handler(query="q")
         self.assertIn("https://official.example", out)
-        self.assertIn("openai.gpt-5.6-luna", out)
+        self.assertIn("openai.gpt-6-luna", out)
         self.assertEqual(self.factory.call_args.args[:2], ("us-west-2", None))
         request = self.client.responses.create.call_args.kwargs
         self.assertEqual(request["tools"], [{"type": "web_search", "external_web_access": False}])
         self.assertEqual(request["max_output_tokens"], 4096)
-        self.assertEqual(request["model"], "openai.gpt-5.6-luna")
+        self.assertEqual(request["model"], "openai.gpt-6-luna")
         self.assertEqual(self.client.__exit__.call_count, 1)
-        entry = self.usage.by_model["bedrock/openai.gpt-5.6-luna"]
+        entry = self.usage.by_model["bedrock/openai.gpt-6-luna"]
         self.assertEqual((entry.prompt_tokens, entry.completion_tokens, entry.calls), (100, 20, 1))
 
     def test_bearer_token_passed_to_search_client(self):
