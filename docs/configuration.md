@@ -127,9 +127,10 @@ XIAOYU_API_KEY=<key>
 | `XIAOYU_SKILLS_DISABLED` | 停用清单（不是开关）：逗号分隔的技能名，可通配，如 `lark-*,remotion-*,aws-core:*`。按带插件前缀的全名或目录名匹配。技能库是几家客户端共用的，要给索引腾预算时在这里点名，不必去删文件；`/skills` 会列出被停用的 |
 | `XIAOYU_SKILLS_DIR` | 覆盖技能扫描目录（`os.pathsep` 分隔）：给了就只认它、不混默认目录，工作区自带的也不扫（宿主指定技能库 / 测试隔离用） |
 | `XIAOYU_ENABLE_WEB_SEARCH` | `web_search` 工具 |
+| `XIAOYU_ENABLE_WEB_FETCH` | `web_fetch` 网页抓取工具（默认开启，需 `DEEPSEEK_API_KEY`；`0` 关闭），走 DeepSeek 服务端抓取接口、按次计费，独立于网页搜索后端，见下文 |
 | `XIAOYU_ENABLE_X_SEARCH` | `x_search` 工具（默认开启，需 `XAI_API_KEY`；`0` 关闭），独立于网页搜索后端 |
 | `XIAOYU_ENABLE_DEEP_RESEARCH` | Gemini 后台研究工具（默认开启，需 Gemini key；`0` 关闭），支持提交、查询报告与取消 |
-| `XIAOYU_SEARCH_PROVIDER` | 搜索走哪家：`deepseek`（默认，deepseek-flash，需 `DEEPSEEK_API_KEY`）、`xai`（grok-4.7，需 `XAI_API_KEY`）或 `bedrock`（openai.gpt-5.6-luna，走 Mantle Responses）。DeepSeek 搜索单独走 Anthropic 兼容接口，主对话协议不变；其 Responses 接口不支持内置搜索。所选 provider 未注册时不挂载工具；Bedrock 鉴权与权限见下方 |
+| `XIAOYU_SEARCH_PROVIDER` | 搜索走哪家：`deepseek`（默认，deepseek-flash，需 `DEEPSEEK_API_KEY`）、`xai`（grok-4.7，需 `XAI_API_KEY`）、`bedrock`（openai.gpt-6-luna，走 Mantle Responses）或 `deepseek-search`（DeepSeek 原始检索接口，不经模型，需 `DEEPSEEK_API_KEY`，见下文）。DeepSeek 搜索单独走 Anthropic 兼容接口，主对话协议不变；其 Responses 接口不支持内置搜索。所选 provider 未注册时不挂载工具；Bedrock 鉴权与权限见下方 |
 | `XIAOYU_ENABLE_BROWSER` | `browser` 浏览器工具（依赖可选 `[browser]` extra 的 playwright，没装时本来就不出现） |
 | `XIAOYU_ENABLE_PLUGINS` | entry point 组 `xiaoyu.tools` 的第三方工具**包**（代码级；和 `xiaoyu plugin` 装的**内容包**不是一回事，见下） |
 | `XIAOYU_ENABLE_MCP` | MCP server 挂载 |
@@ -150,9 +151,35 @@ XIAOYU_API_KEY=<key>
 | `XIAOYU_ENABLE_PEERS` | 跨会话消息（`--yolo` 下默认关，见[安全](security.md)） |
 
 会话中可用 `/search` 查看当前搜索后端及各后端的配置状态，
-用 `/search deepseek`、`/search xai` 或 `/search bedrock` 切换。
+用 `/search deepseek`、`/search xai`、`/search bedrock` 或 `/search deepseek-search` 切换。
 切换从下一次搜索开始生效，只影响当前会话，不修改 `.env`；新进程仍按环境配置选择。
 未配置的后端不能切换，主对话模型不受影响。TUI 支持后端名 Tab 补全，ACP 也提供此命令。
+
+四个后端分两种形态。`deepseek` / `xai` / `bedrock` 是**模型托管搜索**：搜索模型在服务端
+自己搜、自己写带来源的结论，本地看不到原始结果。`deepseek-search` 是**原始检索**：直接调
+DeepSeek 的 `/v1/tools/search`，不经任何模型，返回按相关度排序的结果列表（标题、站点、
+日期、URL、片段），由主模型自己归纳结论，需要原文再用 `web_fetch`。它的结果可审计、
+支持 `site:` / `-site:` / `after:` / `before:` 运算符，搜索词最长 128 字符，工具参数 `count`
+控制条数（默认 8，最多 20）；按**成功请求次数**计费而不是 token，价格与限流见
+[官方文档](https://api-docs.deepseek.com/guides/search)。空结果是正常情况，不会报错。
+
+### 网页抓取
+
+配置 `DEEPSEEK_API_KEY` 后，`web_fetch` 可按 URL 抓取一个公开网页，返回标题与
+Markdown 正文。它补的是 `web_search` 的缺口：搜索回来的是模型写好的结论，链接只是
+脚注；要核对原文、读文档的某一节、看某个 issue 的全文时，直接给 URL 就行。
+
+抓取由 DeepSeek 服务端完成（`/v1/tools/fetch`，纯 JSON 接口，与模型调用同一把 key），
+本机不直接访问目标站点。只接受 http / https 地址，需要登录或交互的页面抓不到；
+被安全策略拒绝、没有可用正文、余额不足等情况会明确报错，不会自动重试，也不会
+改走浏览器。正文超过 12000 字符的部分落盘，沿用 `recall` 查看全文。
+返回内容标注外部来源，页面里的说法不代表已核实事实。
+
+此能力独立于 `XIAOYU_SEARCH_PROVIDER` 与 `/search` 切换；默认开启，未配置 DeepSeek 时
+不暴露工具，`XIAOYU_ENABLE_WEB_FETCH=0` 可关闭。检索子 agent（explore）与评估不启用；
+声明式 subagent 在 `tools` 里点名 `web_fetch` 即可用、宸枢的 survey 成员自带，两者都
+随这个开关（见[多 agent 协同](multi-agent.md)）。按**成功抓取次数**计费（不计 token，不进 `/stats` 的模型用量），
+价格与限流见[官方文档](https://api-docs.deepseek.com/guides/search)。
 
 ### X 平台搜索
 
@@ -199,7 +226,7 @@ XIAOYU_BEDROCK_REGION=us-east-1
 ```
 
 搜索使用 `bedrock-mantle.<区域>.api.aws/openai/v1` 的 Responses API，模型为
-`openai.gpt-5.6-luna`；现有 Bedrock 主对话仍走自己的模型与协议。
+`openai.gpt-6-luna`；现有 Bedrock 主对话仍走自己的模型与协议。
 鉴权复用 `AWS_BEARER_TOKEN_BEDROCK`；没配置 token 时使用 AWS 默认凭证链
 （支持 `AWS_PROFILE`），这条 IAM 路径需要可选依赖 `pip install 'xiaoyu-agent[bedrock]'`。
 

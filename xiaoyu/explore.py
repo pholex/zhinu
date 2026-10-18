@@ -123,6 +123,7 @@ def make_explore_tool(
             enable_web_search=False,
             enable_x_search=False,
             enable_deep_research=False,
+            enable_web_fetch=False,
             #  检索子 agent 不需要技能，也不该受用户机器上技能库的影响
             enable_skills=False,
             #  检索任务有界且只读，不需要计划工具

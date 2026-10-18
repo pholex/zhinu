@@ -113,6 +113,7 @@ def run_case(case: Case, model: str, base_url: str | None, verbose: bool) -> dic
             enable_web_search=False,
             enable_x_search=False,
             enable_deep_research=False,
+            enable_web_fetch=False,
             max_iterations=case.max_iterations,
             request_timeout=REQUEST_TIMEOUT,
             #  eval 是无人值守 + 全放行的，必须挡住"往系统 Python 里 pip install"。

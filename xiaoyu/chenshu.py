@@ -66,6 +66,7 @@ MISSION_KINDS = ("build", "survey")
 #  worker 工具集（比声明式 subagent 的 20 轮宽裕：mission 是大活）
 _WORKER_ITERATIONS = 60
 BUILD_TOOLS = ("read_file", "grep", "list_files", "write_file", "str_replace", "bash")
+#  survey 成员另有 web_search / web_fetch（Agent 级条件挂载，见 _run_member 的开关）
 SURVEY_TOOLS = ("read_file", "grep", "list_files")
 REVIEW_TOOLS = ("read_file", "grep", "list_files", "bash")
 _WAIT_DEFAULT = 300
@@ -1092,7 +1093,11 @@ class ChenshuRuntime:
                 sandbox_network=self.config.sandbox_network,
                 auto_approve=False,
                 enable_explore=False,
-                enable_web_search=False,
+                #  联网只读件只给 survey 成员（调研就是它的本职），随主会话开关；
+                #  build 成员拿已整理好的任务干活、reviewer 只看 diff，都不给。
+                #  它们是 Agent 级挂载，不能进 Toolbox(only=...) 的名单（见 SURVEY_TOOLS 注）
+                enable_web_search=self.config.enable_web_search and tools is SURVEY_TOOLS,
+                enable_web_fetch=self.config.enable_web_fetch and tools is SURVEY_TOOLS,
                 enable_x_search=False,
                 enable_deep_research=False,
                 enable_skills=False,

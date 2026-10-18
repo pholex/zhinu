@@ -387,8 +387,8 @@ class TestTuiFrontend(AgentTestCase):
     def test_search_backend_completion(self) -> None:
         tui = self.make_tui(self.build([]))
         self.assertIn("/search", self.completions(tui, "/se"))
-        self.assertEqual(self.completions(tui, "/search "), ["deepseek", "xai", "bedrock"])
-        self.assertEqual(self.completions(tui, "/search d"), ["deepseek"])
+        self.assertEqual(self.completions(tui, "/search "), ["deepseek", "xai", "bedrock", "deepseek-search"])
+        self.assertEqual(self.completions(tui, "/search d"), ["deepseek", "deepseek-search"])
         self.assertEqual(self.completions(tui, "/search xai extra"), [])
 
     def test_truncation_hint_prints_once_at_turn_end(self) -> None:

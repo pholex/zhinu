@@ -77,7 +77,7 @@ SLASH_COMMANDS: dict[str, str] = {
     "/skills": "列出可用技能；/skills reload 重扫磁盘并刷新索引",
     "/<技能名>": "把技能展开成本轮提示（/<技能名> 参数…，正文里的 $ARGUMENTS / $1 / $名字 用参数填）；与内建命令撞名时写 /skill:<技能名>",
     "/model": "查看或切换模型（/model 名字）",
-    "/search": "查看或切换搜索后端（/search deepseek|xai|bedrock，仅当前会话）",
+    "/search": "查看或切换搜索后端（/search deepseek|xai|bedrock|deepseek-search，仅当前会话）",
     "/usage": "本次会话的 token 统计",
     "/effort": "查看或设置推理深度（/effort low|medium|high|xhigh|max）",
     "/context": "当前上下文占用与压缩状态",

@@ -338,14 +338,14 @@ class TestBedrockSearch(unittest.TestCase):
         self.assertTrue(self.tool.available())
         out = self.tool.handler(query="q")
         self.assertIn("https://official.example", out)
-        self.assertIn("openai.gpt-5.6-luna", out)
+        self.assertIn("openai.gpt-6-luna", out)
         self.assertEqual(self.factory.call_args.args[:2], ("us-west-2", None))
         request = self.client.responses.create.call_args.kwargs
         self.assertEqual(request["tools"], [{"type": "web_search", "external_web_access": False}])
         self.assertEqual(request["max_output_tokens"], 4096)
-        self.assertEqual(request["model"], "openai.gpt-5.6-luna")
+        self.assertEqual(request["model"], "openai.gpt-6-luna")
         self.assertEqual(self.client.__exit__.call_count, 1)
-        entry = self.usage.by_model["bedrock/openai.gpt-5.6-luna"]
+        entry = self.usage.by_model["bedrock/openai.gpt-6-luna"]
         self.assertEqual((entry.prompt_tokens, entry.completion_tokens, entry.calls), (100, 20, 1))
 
     def test_bearer_token_passed_to_search_client(self):
@@ -383,3 +383,108 @@ class TestBedrockSearch(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestRawSearchBackend(unittest.TestCase):
+    """deepseek-search：裸检索后端——不经模型、结果列表按固定格式交给主模型。"""
+
+    def setUp(self):
+        self.requests = []
+
+    def tool(self, replies, provider_name: str = "deepseek"):
+        import httpx2
+
+        replies = iter(replies)
+
+        def respond(request):
+            self.requests.append(request)
+            reply = next(replies)
+            if isinstance(reply, Exception):
+                raise reply
+            code, data = reply if isinstance(reply, tuple) else (200, reply)
+            return httpx2.Response(code, json=data)
+
+        patcher = mock.patch("xiaoyu.webfetch.netproxy.http_client",
+                             side_effect=lambda: httpx2.Client(transport=httpx2.MockTransport(respond)))
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.config = _config("deepseek-search")
+        self.usage = Usage()
+        registry = Registry([Provider(provider_name, "https://api.deepseek.com/v1", "sk-test-raw", ("m",))])
+        return make_web_search_tool(self.config, registry, self.usage, NullSink())
+
+    @staticmethod
+    def result(url, title="标题", score=1.0, **extra):
+        return {"url": url, "title": title, "rerank_score": score, "snippet": "ui 片段",
+                "summary": "给模型的  摘要\n换行", "site_name": "example.com", "date": "2026-10-17T08:00:00Z",
+                "authority": 3, **extra}
+
+    def test_request_and_result_format(self):
+        import json
+
+        tool = self.tool([{"results": [self.result("https://a.example/1", "低分", score=0.5),
+                                       self.result("https://a.example/2", "高分", score=2.5)]}])
+        self.assertTrue(tool.available())
+        out = tool.handler(query="  DeepSeek V4 release ", count=5)
+        request = self.requests[0]
+        self.assertEqual(str(request.url), "https://api.deepseek.com/v1/tools/search")
+        self.assertEqual(request.headers["Authorization"], "Bearer sk-test-raw")
+        self.assertEqual(json.loads(request.content),
+                         {"query": "DeepSeek V4 release", "count": 5, "need_content": False})
+        self.assertTrue(out.startswith("[原始搜索结果"))
+        self.assertIn("未经模型总结", out)
+        self.assertIn("共 2 条", out)
+        #  按 rerank_score 降序；片段取 summary、压成一行；日期只留年月日
+        self.assertLess(out.index("高分"), out.index("低分"))
+        self.assertIn("1. 高分 — example.com · 2026-10-17", out)
+        self.assertIn("   https://a.example/2", out)
+        self.assertIn("给模型的 摘要 换行", out)
+        self.assertNotIn("ui 片段", out)
+        #  不经模型：不记 token 账
+        self.assertEqual(self.usage.by_model, {})
+
+    def test_defaults_and_validation(self):
+        tool = self.tool([{"results": [self.result("https://a.example/")]}])
+        for count in (0, 21, "5", 2.0):
+            with self.subTest(count=count):
+                self.assertTrue(tool.handler(query="q", count=count).startswith("ERROR:"))
+        self.assertTrue(tool.handler(query="字" * 129).startswith("ERROR:"))
+        self.assertEqual(self.requests, [])
+        import json
+
+        tool.handler(query="q")
+        self.assertEqual(json.loads(self.requests[0].content)["count"], 8)
+
+    def test_empty_results_and_bad_shapes(self):
+        tool = self.tool([{"results": []}, {"results": [{"title": "没有 url"}]}, {"nope": 1}, [1]])
+        out = tool.handler(query="q")
+        self.assertFalse(out.startswith("ERROR:"))
+        self.assertIn("没有返回结果", out)
+        self.assertIn("没有返回结果", tool.handler(query="q"))
+        self.assertTrue(tool.handler(query="q").startswith("ERROR:"))
+        self.assertTrue(tool.handler(query="q").startswith("ERROR:"))
+
+    def test_status_codes_and_redaction(self):
+        import httpx2
+
+        tool = self.tool([(402, {"error": {"message": "balance"}}), (429, {}),
+                          (400, {"error": {"message": "proxy Bearer sk-live-secret refused"}}),
+                          httpx2.ConnectError("Bearer private-token refused")])
+        self.assertIn("余额不足", tool.handler(query="q"))
+        self.assertIn("再试一次", tool.handler(query="q"))
+        out = tool.handler(query="q")
+        self.assertIn("不要原样重试", out)
+        self.assertNotIn("sk-live-secret", out)
+        out = tool.handler(query="q")
+        self.assertIn("ConnectError", out)
+        self.assertNotIn("private-token", out)
+
+    def test_unconfigured_provider_and_switch(self):
+        tool = self.tool([], provider_name="xai")
+        self.assertFalse(tool.available())
+        self.assertIn("DEEPSEEK_API_KEY", tool.handler(query="q"))
+        registry = Registry([Provider("deepseek", "https://api.deepseek.com/v1", "sk-test-raw", ("m",))])
+        config = _config("xai")
+        self.assertIn("已切换搜索后端：deepseek-search", search_command(config, registry, "deepseek-search"))
+        self.assertEqual(config.search_provider, "deepseek-search")
+        self.assertIn("deepseek-search · v1/tools/search · 已配置", search_command(config, registry, ""))

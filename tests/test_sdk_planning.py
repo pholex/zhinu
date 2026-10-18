@@ -147,12 +147,15 @@ class PlanningTests(unittest.TestCase):
 
     def test_optional_network_factories_are_not_loaded_by_sdk(self):
         with patch("xiaoyu.websearch.make_web_search_tool") as web, \
+             patch("xiaoyu.webfetch.make_web_fetch_tool") as fetch, \
              patch("xiaoyu.xsearch.make_x_search_tool") as search, \
              patch("xiaoyu.deepresearch.make_deep_research_tools") as research:
             with Session(options(self.workspace, [])) as session:
-                for name in ("web_search", "x_search", "deep_research", "deep_research_status"):
+                for name in ("web_search", "web_fetch", "x_search", "deep_research",
+                             "deep_research_status"):
                     self.assertIsNone(session._toolbox.get(name))
             web.assert_not_called()
+            fetch.assert_not_called()
             search.assert_not_called()
             research.assert_not_called()
 

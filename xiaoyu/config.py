@@ -387,6 +387,9 @@ class Config:
     enable_x_search: bool = True
     #  Gemini 后台深度研究；需 Gemini 直连 key，与快速网页搜索独立。
     enable_deep_research: bool = True
+    #  网页抓取工具 web_fetch（DeepSeek 服务端抓取接口，按次计费）；需 DEEPSEEK_API_KEY，
+    #  没配时即便开着也不出现。explore 子 agent 与 eval 关掉，理由同 web_search。
+    enable_web_fetch: bool = True
     #  web_search 用哪家的内置搜索（websearch.SEARCH_BACKENDS 的键）。
     #  默认 deepseek：搜索单独走 Anthropic 兼容接口；xai 与 bedrock Mantle 可选。
     #  对应后端没配 key 时 web_search 不进 schemas（见 websearch 的 check_fn）。
@@ -626,6 +629,8 @@ class Config:
             cfg.enable_x_search = flag.strip().lower() not in ("0", "false", "no", "off")
         if (flag := os.environ.get("XIAOYU_ENABLE_DEEP_RESEARCH")) is not None:
             cfg.enable_deep_research = flag.strip().lower() not in ("0", "false", "no", "off")
+        if (flag := os.environ.get("XIAOYU_ENABLE_WEB_FETCH")) is not None:
+            cfg.enable_web_fetch = flag.strip().lower() not in ("0", "false", "no", "off")
         if backend := os.environ.get("XIAOYU_SEARCH_PROVIDER", "").strip():
             cfg.search_provider = backend
         #  个人默认交互模式（default/auto/plan）。命令行 --mode 经 overrides

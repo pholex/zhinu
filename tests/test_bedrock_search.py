@@ -30,7 +30,7 @@ class TestMantleClient(unittest.TestCase):
     def test_bearer_request_endpoint_and_client_closed(self):
         with mock.patch.object(bedrock_search, "_MantleAuth", side_effect=AssertionError("不该取 IAM 凭证")):
             with bedrock_search.client("us-east-1", "test-bearer", 10) as client:
-                client.responses.create(model="openai.gpt-5.6-luna", input="q")
+                client.responses.create(model="openai.gpt-6-luna", input="q")
         request, = self.requests
         self.assertEqual(str(request.url), "https://bedrock-mantle.us-east-1.api.aws/openai/v1/responses")
         self.assertEqual(request.headers["Authorization"], "Bearer test-bearer")
@@ -47,7 +47,7 @@ class TestMantleClient(unittest.TestCase):
         with mock.patch.object(bedrock_search.netproxy, "http_client", return_value=http_client):
             with bedrock_search.client("us-east-1", "test-bearer", 10) as client:
                 with self.assertRaises(Exception):
-                    client.responses.create(model="openai.gpt-5.6-luna", input="q")
+                    client.responses.create(model="openai.gpt-6-luna", input="q")
         self.assertEqual(len(attempts), 1)
         self.assertTrue(attempts[0].startswith("https://bedrock-mantle.us-east-1.api.aws/"))
 
@@ -64,7 +64,7 @@ class TestMantleClient(unittest.TestCase):
             session.return_value.get_credentials.return_value = credentials
             with bedrock_search.client("us-west-2", None, 10) as client:
                 for _ in range(2):
-                    client.responses.create(model="openai.gpt-5.6-luna", input="中文查询")
+                    client.responses.create(model="openai.gpt-6-luna", input="中文查询")
         for index, request in enumerate(self.requests, start=1):
             auth = request.headers["Authorization"]
             self.assertTrue(auth.startswith("AWS4-HMAC-SHA256 "))
