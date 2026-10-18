@@ -492,7 +492,7 @@ _ACP_COMMANDS: tuple[AcpCommand, ...] = (
     AcpCommand("context", "", _cmd_context),
     AcpCommand("compact", "", _cmd_compact),
     AcpCommand("tools", "", _cmd_tools),
-    AcpCommand("search", "deepseek|xai|bedrock（可选）", _cmd_search),
+    AcpCommand("search", "deepseek|xai|bedrock|deepseek-search（可选）", _cmd_search),
     AcpCommand("skills", "", _cmd_skills),
     AcpCommand("tasks", "", _cmd_tasks),
     AcpCommand("mcp", "diff|approve|reconnect <server名>（可选）", _cmd_mcp),

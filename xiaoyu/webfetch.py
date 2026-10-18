@@ -36,17 +36,65 @@ MAX_URL_CHARS = 8192
 #  理由就是读原文；再长的部分落盘可召回（见 tools.py 的 output_limit 语义）
 MAX_PAGE_CHARS = 12_000
 
-#  官方状态码语义（guides/search）：4xx 里只有 408/429 值得稍后再试
-_STATUS_HINTS = {
-    400: "请求无效（URL 格式不被接受）",
+#  官方状态码语义（guides/search）：4xx 里只有 408/429 值得稍后再试。
+#  Search 与 Fetch 共用一套信封，只有几个码的含义随接口不同（见 websearch 的裸检索）
+COMMON_STATUS_HINTS = {
     401: "DEEPSEEK_API_KEY 无效",
-    402: "DeepSeek 账户余额不足，无法抓取",
+    402: "DeepSeek 账户余额不足",
+    408: "请求超时，可稍后重试一次",
+    429: "请求过于频繁（限 5 QPS），请稍后重试",
+}
+_STATUS_HINTS = {
+    **COMMON_STATUS_HINTS,
+    400: "请求无效（URL 格式不被接受）",
     403: "目标页面被 DeepSeek 的安全策略拒绝抓取",
     404: "目标页面没有可用正文（可能需要登录、是二进制文件或已失效）",
-    408: "抓取超时，可稍后重试一次",
     413: "目标页面过大，无法抓取",
-    429: "抓取请求过于频繁（限 5 QPS），请稍后重试",
 }
+
+
+def tools_post(provider, path: str, payload: dict, timeout) -> httpx2.Response:
+    """调一次 DeepSeek 的工具类纯 JSON 接口（/v1/tools/*）。
+
+    每次新建 client、用完关闭；固定服务端点不跟重定向——Authorization 头不该被
+    转发到别的主机。网络层异常原样抛出，由调用方按自己的文案兜。
+    """
+    base = provider.base_url.rstrip("/").removesuffix("/v1")
+    with netproxy.http_client() as client:
+        client.follow_redirects = False
+        return client.post(
+            base + path,
+            json=payload,
+            headers={"Authorization": f"Bearer {provider.api_key}",
+                     "Content-Type": "application/json"},
+            timeout=timeout,
+        )
+
+
+def status_message(response: httpx2.Response, hints: dict[int, str], service: str,
+                   retry_hint: str) -> str:
+    """非 200 的报错：优先官方语义，附服务端 message（已脱敏、截短），
+    再告诉模型这个码能不能原样重试。"""
+    code = response.status_code
+    hint = hints.get(code)
+    if hint is None:
+        hint = f"DeepSeek {service}服务暂时不可用，可稍后重试" if code >= 500 else f"{service}请求被拒绝（HTTP {code}）"
+    detail = ""
+    try:
+        error = response.json().get("error")
+        if isinstance(error, dict) and isinstance(error.get("message"), str):
+            detail = error["message"]
+    except (ValueError, AttributeError):
+        detail = response.text
+    detail = _redact(detail.strip())[:200] if isinstance(detail, str) else ""
+    message = f"{hint}（HTTP {code}）。"
+    if detail:
+        message += f" 服务端说明：{detail}"
+    if code in (408, 429) or code >= 500:
+        message += " 这类错误可以等一会再试一次。"
+    else:
+        message += f" 不要原样重试；{retry_hint}"
+    return message
 
 
 #  服务端返回的正文把**所有**非字母数字字符都加了反斜杠（`\#`、`\-`、`\'`、`\/`），
@@ -103,16 +151,8 @@ def make_web_fetch_tool(config: Config, registry: Registry, sink: UISink | None 
         sink.emit(Notice(f"  🌐 web_fetch：{ui.preview(url, 90)}"))
 
         try:
-            with netproxy.http_client() as client:
-                #  固定服务端点不跟重定向：Authorization 头不该被转发到别的主机
-                client.follow_redirects = False
-                response = client.post(
-                    fetch_endpoint(provider.base_url),
-                    json={"url": url},
-                    headers={"Authorization": f"Bearer {provider.api_key}",
-                             "Content-Type": "application/json"},
-                    timeout=request_timeout(config.request_timeout),
-                )
+            response = tools_post(provider, FETCH_PATH, {"url": url},
+                                  request_timeout(config.request_timeout))
         except Exception as exc:  # noqa: BLE001 - 抓取失败不该打断主流程
             return (
                 f"ERROR: 网页抓取失败（{type(exc).__name__}: {_redact(str(exc))}）。"
@@ -120,7 +160,7 @@ def make_web_fetch_tool(config: Config, registry: Registry, sink: UISink | None 
             )
 
         if response.status_code != 200:
-            return f"ERROR: {_status_message(response)}"
+            return "ERROR: " + status_message(response, _STATUS_HINTS, "抓取", "请换 URL 或改用其它途径。")
         try:
             body = response.json()
         except ValueError:
@@ -166,27 +206,4 @@ def make_web_fetch_tool(config: Config, registry: Registry, sink: UISink | None 
         check_fn=lambda: config.enable_web_fetch and registry.get(FETCH_PROVIDER) is not None,
     )
 
-
-def _status_message(response: httpx2.Response) -> str:
-    """非 200 的报错：优先官方语义，附服务端 message（已脱敏、截短）。"""
-    code = response.status_code
-    hint = _STATUS_HINTS.get(code)
-    if hint is None:
-        hint = "DeepSeek 抓取服务暂时不可用，可稍后重试" if code >= 500 else f"抓取请求被拒绝（HTTP {code}）"
-    detail = ""
-    try:
-        error = response.json().get("error")
-        if isinstance(error, dict) and isinstance(error.get("message"), str):
-            detail = error["message"]
-    except (ValueError, AttributeError):
-        detail = response.text
-    detail = _redact(detail.strip())[:200] if isinstance(detail, str) else ""
-    message = f"{hint}（HTTP {code}）。"
-    if detail:
-        message += f" 服务端说明：{detail}"
-    if code in (408, 429) or code >= 500:
-        message += " 这类错误可以等一会再试一次。"
-    else:
-        message += " 不要原样重试；请换 URL 或改用其它途径。"
-    return message
 

@@ -10,10 +10,14 @@
 一次性调用：把查询交给搜索后端（模型 + 服务端 web_search），拿回带来源的结论。
 搜索、抓取、筛选全在厂商服务端发生，本地不落任何中间结果。
 
-后端按 XIAOYU_SEARCH_PROVIDER 选（config.search_provider）：默认 deepseek-flash
-走 Anthropic 兼容接口，xai/grok-4.7 与 bedrock/openai.gpt-6-luna 走 Responses。
-DeepSeek 的 Responses 接口忽略内置搜索，搜索必须单独走 /anthropic；
-不改变主对话的协议。2026-10-03 实测返回服务端搜索调用与结果块。
+后端按 XIAOYU_SEARCH_PROVIDER 选（config.search_provider）。两种形态：
+- **模型托管**（kind="model"）：deepseek-flash 走 Anthropic 兼容接口，xai/grok-4.7 与
+  bedrock/openai.gpt-6-luna 走 Responses——搜索模型自己搜、自己写带来源的结论。
+  DeepSeek 的 Responses 接口忽略内置搜索，搜索必须单独走 /anthropic；不改变主对话的
+  协议。2026-10-03 实测返回服务端搜索调用与结果块。
+- **裸检索**（kind="raw"）：deepseek-search 直接调 DeepSeek 的 /v1/tools/search，拿回
+  结构化结果列表（标题 / URL / 日期 / 片段），不经任何模型；结论由主模型自己从结果里
+  归纳，要原文再用 web_fetch。结果可审计、按次计费，不吃搜索模型的 token。
 """
 
 from __future__ import annotations
@@ -28,14 +32,17 @@ from .mcp import _redact
 from .providers import DEFAULT_BEDROCK_REGION, IAM_PLACEHOLDER_KEY, PRESETS, Registry, request_timeout
 from .render import PlainSink
 from .tools import Tool
+from .webfetch import COMMON_STATUS_HINTS, status_message, tools_post
 
 
 @dataclass(frozen=True)
 class SearchBackend:
-    """一个可用的搜索后端：registry 里的 provider 名 + 跑搜索的模型。"""
+    """一个可用的搜索后端：registry 里的 provider 名 + 跑搜索的模型（裸检索时是接口路径）。"""
 
     provider: str
     model: str
+    #  model = 搜索模型写结论；raw = 直接返回检索接口的结果列表，不经模型
+    kind: str = "model"
 
 
 #  模型选各家里"够用且便宜"的档：搜索是有界辅助任务，不需要旗舰。
@@ -43,6 +50,21 @@ SEARCH_BACKENDS: dict[str, SearchBackend] = {
     "deepseek": SearchBackend("deepseek", "deepseek-flash"),
     "xai": SearchBackend("xai", "grok-4.7"),
     "bedrock": SearchBackend("bedrock", "openai.gpt-6-luna"),
+    "deepseek-search": SearchBackend("deepseek", "v1/tools/search", kind="raw"),
+}
+_BACKEND_CHOICES = "|".join(SEARCH_BACKENDS)
+
+#  裸检索的官方限制与本地预算（guides/search）
+RAW_SEARCH_PATH = "/v1/tools/search"
+RAW_QUERY_MAX_CHARS = 128
+RAW_COUNT_DEFAULT = 8
+RAW_COUNT_MAX = 20
+#  每条结果留给模型的片段长度：8 条 × 这个数落在结论上限（MAX_ANSWER_CHARS）之内
+RAW_SNIPPET_CHARS = 280
+_RAW_STATUS_HINTS = {
+    **COMMON_STATUS_HINTS,
+    400: "请求无效（搜索词需 1–128 字符、count 1–50）",
+    403: "搜索请求被 DeepSeek 的安全策略拒绝",
 }
 
 
@@ -55,10 +77,10 @@ def search_command(config: Config, registry: Registry, args: str) -> str:
         for name, backend in SEARCH_BACKENDS.items():
             available = "已配置" if registry.get(backend.provider) is not None else "未配置"
             lines.append(f"  {name} · {backend.model} · {available}")
-        lines.append("用 /search deepseek|xai|bedrock 切换，仅当前会话生效。")
+        lines.append(f"用 /search {_BACKEND_CHOICES} 切换，仅当前会话生效。")
         return "\n".join(lines)
     if len(parts) != 1 or parts[0] not in SEARCH_BACKENDS:
-        return "用法：/search [deepseek|xai|bedrock]；原搜索后端未改变。"
+        return f"用法：/search [{_BACKEND_CHOICES}]；原搜索后端未改变。"
     if not config.enable_web_search:
         return "联网搜索已禁用；需先启用 XIAOYU_ENABLE_WEB_SEARCH，原搜索后端未改变。"
     name = parts[0]
@@ -94,11 +116,13 @@ def make_web_search_tool(
     def _backend() -> SearchBackend | None:
         return SEARCH_BACKENDS.get(config.search_provider)
 
-    def web_search(query: str) -> str:
+    def web_search(query: str, count=None) -> str:
         if not config.enable_web_search:
             return "ERROR: 联网搜索已禁用（XIAOYU_ENABLE_WEB_SEARCH）。"
         if not isinstance(query, str) or not query.strip():
             return "ERROR: query 必须是非空搜索词。"
+        if count is not None and (type(count) is not int or not 1 <= count <= RAW_COUNT_MAX):
+            return f"ERROR: count 必须是 1–{RAW_COUNT_MAX} 的整数。"
         backend = _backend()
         if backend is None:
             return (
@@ -116,6 +140,9 @@ def make_web_search_tool(
                 "请改用其它途径，或提示用户配置。"
             )
         sink.emit(Notice(f"  🌐 web_search（{backend.model}）：{ui.preview(query, 90)}"))
+        if backend.kind == "raw":
+            return _raw_search(config, registry.get(backend.provider), query.strip(),
+                               count or RAW_COUNT_DEFAULT)
 
         try:
             instructions = f"当前日期：{date.today().isoformat()}。{SEARCH_INSTRUCTIONS}"
@@ -198,9 +225,11 @@ def make_web_search_tool(
         #  超出的部分落盘可召回，不直接切掉（来源列表排在结论最后）
         output_limit=MAX_ANSWER_CHARS + 500,
         description=(
-            "联网搜索并返回带来源的结论。适合：查时效性信息（版本号、新闻、价格、"
-            "文档更新）、核实你不确定的事实、找报错信息的解法。"
-            "查询要具体，像对搜索引擎提问一样。"
+            "联网搜索。适合：查时效性信息（版本号、新闻、价格、文档更新）、核实你不确定"
+            "的事实、找报错信息的解法。查询要具体，像对搜索引擎提问一样。"
+            "返回形态看结果首行：要么是搜索模型写好的带来源结论，要么是未经总结的原始"
+            "结果列表（标题 / URL / 日期 / 片段，支持 site: -site: after: before: 运算符），"
+            "后者由你自己归纳结论，需要原文再用 web_fetch。"
             "它只读互联网，不访问本地文件；查代码库内部的问题用 explore。"
         ),
         parameters={
@@ -209,7 +238,12 @@ def make_web_search_tool(
                 "query": {
                     "type": "string",
                     "description": "要查证的问题或搜索词，越具体越好",
-                }
+                },
+                "count": {
+                    "type": ["integer", "null"],
+                    "description": f"原始结果列表要多少条（1–{RAW_COUNT_MAX}，默认 {RAW_COUNT_DEFAULT}）；"
+                                   "后端返回模型结论时忽略",
+                },
             },
             "required": ["query"],
         },
@@ -223,6 +257,61 @@ def make_web_search_tool(
         check_fn=lambda: config.enable_web_search and (b := _backend()) is not None
         and registry.get(b.provider) is not None,
     )
+
+
+def _raw_search(config: Config, provider, query: str, count: int) -> str:
+    """裸检索：调 DeepSeek /v1/tools/search，把结果列表按固定格式交给主模型。
+
+    不经任何模型：结论由主模型自己从结果里归纳。只要 summary（给模型看的摘要），
+    不要 need_content——整页正文该走 web_fetch 按需取，不该在搜索这一步全塞进上下文。
+    """
+    if len(query) > RAW_QUERY_MAX_CHARS:
+        return f"ERROR: 原始检索的搜索词最长 {RAW_QUERY_MAX_CHARS} 字符，请精简后重试。"
+    try:
+        response = tools_post(provider, RAW_SEARCH_PATH,
+                              {"query": query, "count": count, "need_content": False},
+                              request_timeout(config.request_timeout))
+    except Exception as exc:  # noqa: BLE001 - 搜索失败不该打断主流程
+        return (
+            f"ERROR: 联网搜索失败（{type(exc).__name__}: {_redact(str(exc))}）。"
+            "可以换个问法重试一次；再失败就基于已有信息继续，并向用户说明。"
+        )
+    if response.status_code != 200:
+        return "ERROR: " + status_message(response, _RAW_STATUS_HINTS, "搜索", "请换个搜索词或改用其它途径。")
+    try:
+        body = response.json()
+    except ValueError:
+        return "ERROR: 联网搜索返回了无法解析的响应，请稍后重试。"
+    results = body.get("results") if isinstance(body, dict) else None
+    if not isinstance(results, list):
+        return "ERROR: 联网搜索返回了意外的响应形态，请稍后重试。"
+    items = [r for r in results if isinstance(r, dict) and isinstance(r.get("url"), str) and r.get("url")]
+    if not items:
+        return "联网搜索没有返回结果（空结果是正常情况）。换个关键词或去掉限定词再试，或基于已有信息继续。"
+
+    def score(item) -> float:
+        value = item.get("rerank_score")
+        return float(value) if isinstance(value, (int, float)) else 0.0
+
+    items.sort(key=score, reverse=True)
+    lines = [
+        "[原始搜索结果 · 由 DeepSeek 检索接口返回，未经模型总结；结论由你从中归纳，需要原文用 web_fetch]",
+        f"查询：{query}",
+        f"共 {len(items)} 条：",
+    ]
+    for index, item in enumerate(items, start=1):
+        title = _text(item.get("title")) or "（无标题）"
+        meta = " · ".join(part for part in (_text(item.get("site_name")), _text(item.get("date"))[:10]) if part)
+        lines.append(f"{index}. {title}" + (f" — {meta}" if meta else ""))
+        lines.append(f"   {item['url']}")
+        snippet = _text(item.get("summary")) or _text(item.get("snippet"))
+        if snippet:
+            lines.append("   " + ui.preview(" ".join(snippet.split()), RAW_SNIPPET_CHARS))
+    return "\n".join(lines)
+
+
+def _text(value) -> str:
+    return value.strip() if isinstance(value, str) else ""
 
 
 def _messages_search_result(response) -> tuple[str, list[str], list[str]]:

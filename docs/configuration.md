@@ -130,7 +130,7 @@ XIAOYU_API_KEY=<key>
 | `XIAOYU_ENABLE_WEB_FETCH` | `web_fetch` 网页抓取工具（默认开启，需 `DEEPSEEK_API_KEY`；`0` 关闭），走 DeepSeek 服务端抓取接口、按次计费，独立于网页搜索后端，见下文 |
 | `XIAOYU_ENABLE_X_SEARCH` | `x_search` 工具（默认开启，需 `XAI_API_KEY`；`0` 关闭），独立于网页搜索后端 |
 | `XIAOYU_ENABLE_DEEP_RESEARCH` | Gemini 后台研究工具（默认开启，需 Gemini key；`0` 关闭），支持提交、查询报告与取消 |
-| `XIAOYU_SEARCH_PROVIDER` | 搜索走哪家：`deepseek`（默认，deepseek-flash，需 `DEEPSEEK_API_KEY`）、`xai`（grok-4.7，需 `XAI_API_KEY`）或 `bedrock`（openai.gpt-6-luna，走 Mantle Responses）。DeepSeek 搜索单独走 Anthropic 兼容接口，主对话协议不变；其 Responses 接口不支持内置搜索。所选 provider 未注册时不挂载工具；Bedrock 鉴权与权限见下方 |
+| `XIAOYU_SEARCH_PROVIDER` | 搜索走哪家：`deepseek`（默认，deepseek-flash，需 `DEEPSEEK_API_KEY`）、`xai`（grok-4.7，需 `XAI_API_KEY`）、`bedrock`（openai.gpt-6-luna，走 Mantle Responses）或 `deepseek-search`（DeepSeek 原始检索接口，不经模型，需 `DEEPSEEK_API_KEY`，见下文）。DeepSeek 搜索单独走 Anthropic 兼容接口，主对话协议不变；其 Responses 接口不支持内置搜索。所选 provider 未注册时不挂载工具；Bedrock 鉴权与权限见下方 |
 | `XIAOYU_ENABLE_BROWSER` | `browser` 浏览器工具（依赖可选 `[browser]` extra 的 playwright，没装时本来就不出现） |
 | `XIAOYU_ENABLE_PLUGINS` | entry point 组 `xiaoyu.tools` 的第三方工具**包**（代码级；和 `xiaoyu plugin` 装的**内容包**不是一回事，见下） |
 | `XIAOYU_ENABLE_MCP` | MCP server 挂载 |
@@ -151,9 +151,17 @@ XIAOYU_API_KEY=<key>
 | `XIAOYU_ENABLE_PEERS` | 跨会话消息（`--yolo` 下默认关，见[安全](security.md)） |
 
 会话中可用 `/search` 查看当前搜索后端及各后端的配置状态，
-用 `/search deepseek`、`/search xai` 或 `/search bedrock` 切换。
+用 `/search deepseek`、`/search xai`、`/search bedrock` 或 `/search deepseek-search` 切换。
 切换从下一次搜索开始生效，只影响当前会话，不修改 `.env`；新进程仍按环境配置选择。
 未配置的后端不能切换，主对话模型不受影响。TUI 支持后端名 Tab 补全，ACP 也提供此命令。
+
+四个后端分两种形态。`deepseek` / `xai` / `bedrock` 是**模型托管搜索**：搜索模型在服务端
+自己搜、自己写带来源的结论，本地看不到原始结果。`deepseek-search` 是**原始检索**：直接调
+DeepSeek 的 `/v1/tools/search`，不经任何模型，返回按相关度排序的结果列表（标题、站点、
+日期、URL、片段），由主模型自己归纳结论，需要原文再用 `web_fetch`。它的结果可审计、
+支持 `site:` / `-site:` / `after:` / `before:` 运算符，搜索词最长 128 字符，工具参数 `count`
+控制条数（默认 8，最多 20）；按**成功请求次数**计费而不是 token，价格与限流见
+[官方文档](https://api-docs.deepseek.com/guides/search)。空结果是正常情况，不会报错。
 
 ### 网页抓取
 
