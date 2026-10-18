@@ -1095,6 +1095,7 @@ class ChenshuRuntime:
                 enable_web_search=False,
                 enable_x_search=False,
                 enable_deep_research=False,
+                enable_web_fetch=False,
                 enable_skills=False,
                 enable_plan=False,
                 enable_plugins=False,

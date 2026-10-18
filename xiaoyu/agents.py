@@ -930,6 +930,7 @@ def execute_delegation(
         enable_web_search=False,
         enable_x_search=False,
         enable_deep_research=False,
+        enable_web_fetch=False,
         enable_skills=False,
         load_project_instructions=config.load_project_instructions,
         skill_directories=config.skill_directories,

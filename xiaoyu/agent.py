@@ -509,7 +509,7 @@ VISION_CAPTION_HEADER = (
 #  structured_output 在列：它只把结果存进内存、不碰现场；不在列的话
 #  `-p --mode plan --output-schema` 永远交不了结果（无人值守又退不出 plan mode）
 PLAN_MODE_TOOLS = frozenset(
-    {"read_file", "grep", "list_files", "explore", "skill", "web_search", "x_search",
+    {"read_file", "grep", "list_files", "explore", "skill", "web_search", "web_fetch", "x_search",
      "deep_research", "deep_research_status",
      "update_plan", "exit_plan_mode", "ask_user", "list_sessions", "task_output",
      "search_tool", "get_context_remaining", "structured_output"}
@@ -1329,6 +1329,12 @@ class Agent:
             self.toolbox.register(
                 make_web_search_tool(config, self.registry, self.usage, self.sink)
             )
+        #  web_fetch：DeepSeek 服务端抓取接口的一次性调用（给 URL 还正文），补 web_search
+        #  "只回结论不回原文"的缺口；没配 DeepSeek 直连时 check_fn 让它不进 schemas。
+        if config.enable_web_fetch and self.toolbox.get("web_fetch") is None:
+            from .webfetch import make_web_fetch_tool
+
+            self.toolbox.register(make_web_fetch_tool(config, self.registry, self.sink))
         if config.enable_x_search and self.toolbox.get("x_search") is None:
             from .xsearch import make_x_search_tool
 

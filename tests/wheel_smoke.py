@@ -258,6 +258,7 @@ print(json.dumps({
             XIAOYU_ENABLE_WEB_SEARCH="0", XIAOYU_ENABLE_BROWSER="0",
             XIAOYU_ENABLE_X_SEARCH="0",
             XIAOYU_ENABLE_DEEP_RESEARCH="0",
+            XIAOYU_ENABLE_WEB_FETCH="0",
             XIAOYU_SANDBOX="0",
         )
         proc = run(
