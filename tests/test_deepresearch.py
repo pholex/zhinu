@@ -1,5 +1,6 @@
 """后台研究的 REST 协议、报告边界、凭据保护与工具挂载；不打网络。"""
 
+import base64
 import json
 import os
 import tempfile
@@ -13,7 +14,7 @@ import httpx2
 
 from xiaoyu.agent import Agent, Usage, PLAN_MODE_TOOLS
 from xiaoyu.config import Config
-from xiaoyu.deepresearch import AGENTS, ENDPOINT, make_deep_research_tools
+from xiaoyu.deepresearch import AGENTS, ENDPOINT, _report, make_deep_research_tools
 from xiaoyu.providers import PRESETS, Provider, Registry
 from xiaoyu.render import NullSink
 
@@ -149,26 +150,76 @@ class TestDeepResearch(unittest.TestCase):
         self.assertIn("未返回文本报告", out)
         self.assertNotIn("旧输出", out)
 
-    def test_report_joins_adjacent_output_chunks_with_sources_and_images(self):
-        """服务端把长报告切成相邻的多个 model_output：首段标题+引用、次段图+正文。
-        只取最后一段会丢标题和全部来源（2026-10-23 真实响应的形态）。"""
-        data = self.completed(steps=[
+    #  能过魔数嗅探的最小 PNG（尺寸读不出来，标签只报体积）
+    PNG = b"\x89PNG\r\n\x1a\n" + bytes(16)
+
+    def chunked_report(self, image_payload: str):
+        """服务端把长报告切成相邻的多个 model_output：首段标题+引用、次段图+正文
+        （2026-10-23 真实响应的形态）。"""
+        return self.completed(steps=[
             {"type": "thought", "content": [{"type": "text", "text": "hidden thought"}]},
             {"type": "model_output", "content": [{"type": "text", "text": "# 标题\n摘要", "annotations": [
                 {"type": "url_citation", "url": "https://example.com/a"}]}]},
             {"type": "model_output", "content": [
-                {"type": "image", "mime_type": "image/png", "data": "AAAA"},
+                {"type": "image", "mime_type": "image/png", "data": image_payload},
                 {"type": "text", "text": "正文续", "annotations": [
                     {"type": "url_citation", "url": "https://example.com/b"},
                     {"type": "url_citation", "url": "https://example.com/a"}]}]}])
-        with self.transport([data]):
+
+    def test_report_joins_adjacent_output_chunks_with_sources(self):
+        """只取最后一段会丢标题和全部来源；附图按原位置替换成占位行。"""
+        with self.transport([self.chunked_report("AAAA")]):
             out = self.tools["deep_research_status"].handler("job_1")
-        self.assertIn("# 标题\n摘要\n正文续", out)
-        self.assertIn("1 张图", out)
+        self.assertIn("# 标题\n摘要\n[附图 1 已省略：", out)
+        self.assertIn("不是能识别的图片格式", out)
+        self.assertIn("\n正文续", out)
         self.assertNotIn("AAAA", out)
         self.assertEqual(out.index("https://example.com/a"), out.rindex("https://example.com/a"))
         self.assertIn("https://example.com/b", out)
         self.assertNotIn("hidden", out)
+        #  不带落盘回调时（纯函数用法）只报数量
+        self.assertIn("报告另含 1 张图", _report(self.chunked_report("AAAA")))
+
+    def test_figures_are_saved_per_task_and_handed_to_the_model_once(self):
+        payload = base64.b64encode(self.PNG).decode("ascii")
+        pushed = []
+        tools = {t.name: t for t in make_deep_research_tools(self.config, self.registry, self.usage,
+                                                             push_media=pushed.append)}
+        with tempfile.TemporaryDirectory() as directory, \
+                mock.patch("xiaoyu.deepresearch.user_config_dir", lambda: Path(directory)), \
+                self.transport([self.chunked_report(payload), self.chunked_report(payload),
+                                self.chunked_report("@@@")]):
+            out = tools["deep_research_status"].handler("job_1")
+            target = Path(directory) / "deep-research" / "job_1" / "figure-1.png"
+            self.assertIn(f"[附图 1：{target}（", out)
+            self.assertIn("，图片见下一条]", out)
+            self.assertEqual(target.read_bytes(), self.PNG)
+            self.assertEqual(len(pushed), 1)
+            self.assertEqual(pushed[0]["type"], "image_url")
+            #  再查一次：文件不重写、图不再重复附给模型，路径照给
+            target.write_bytes(self.PNG + b"x")
+            again = tools["deep_research_status"].handler("job_1")
+            self.assertIn(f"[附图 1：{target}（", again)
+            self.assertNotIn("图片见下一条", again)
+            self.assertEqual(len(pushed), 1)
+            self.assertEqual(target.read_bytes(), self.PNG + b"x")
+            #  坏数据只省略那一张，正文照常
+            broken = tools["deep_research_status"].handler("job_1")
+            self.assertIn("[附图 1 已省略：数据不是有效的 base64]", broken)
+            self.assertIn("正文续", broken)
+        #  没接 push_media 的宿主（headless）：只落盘给路径
+        with tempfile.TemporaryDirectory() as directory, \
+                mock.patch("xiaoyu.deepresearch.user_config_dir", lambda: Path(directory)), \
+                self.transport([self.chunked_report(payload)]):
+            out = self.tools["deep_research_status"].handler("job_1")
+        self.assertIn("[附图 1：", out)
+        self.assertNotIn("图片见下一条", out)
+
+    def test_image_only_output_is_not_a_report(self):
+        data = self.completed(steps=[{"type": "model_output", "content": [
+            {"type": "image", "mime_type": "image/png", "data": base64.b64encode(self.PNG).decode("ascii")}]}])
+        with self.transport([data]):
+            self.assertIn("未返回文本报告", self.tools["deep_research_status"].handler("job_1"))
 
     # ---------- 完成通知（watcher） ----------
 
@@ -251,14 +302,21 @@ class TestDeepResearch(unittest.TestCase):
                              enable_hooks=False, enable_plugins=False, enable_mcp=False,
                              enable_explore=False)
             agent = Agent(config, registry=self.registry, sink=NullSink())
-            with mock.patch("xiaoyu.deepresearch.POLL_SECONDS", 0.01), self.transport([
-                    {"id": "job_1", "status": "in_progress"}, self.completed()]):
+            payload = base64.b64encode(self.PNG).decode("ascii")
+            with mock.patch("xiaoyu.deepresearch.POLL_SECONDS", 0.01), \
+                    mock.patch("xiaoyu.deepresearch.user_config_dir", lambda: Path(directory)), \
+                    self.transport([{"id": "job_1", "status": "in_progress"}, self.chunked_report(payload)]):
                 out = agent.toolbox.get("deep_research").handler(query="研究问题")
                 self.assertIn("自动通知", out)
                 self.assertTrue(wait_until(lambda: agent.pending_notifications()))
+                report = agent.toolbox.get("deep_research_status").handler("job_1")
             item = agent.pending_notifications()[0]
             self.assertTrue(item["wake"])
             self.assertEqual(item["key"], "deep-research-done-job_1")
+            #  附图经 toolbox 交给模型：下一次 take_media 取到，报告里有落盘路径
+            self.assertIn("图片见下一条", report)
+            self.assertEqual(len(agent.toolbox.take_media()), 1)
+            self.assertTrue((Path(directory) / "deep-research" / "job_1" / "figure-1.png").exists())
 
     def test_disabled_and_missing_provider(self):
         self.config.enable_deep_research = False

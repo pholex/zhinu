@@ -1346,7 +1346,8 @@ class Agent:
 
             #  完成通知走后台任务同一条轨道（wake=True：值得为它多跑一步）；
             #  不接通知的话模型只能在本轮里 sleep 死等
-            for tool in make_deep_research_tools(config, self.registry, self.usage, notify=self.notify):
+            for tool in make_deep_research_tools(config, self.registry, self.usage, notify=self.notify,
+                                                 push_media=self.toolbox.push_media):
                 if self.toolbox.get(tool.name) is None:
                     self.toolbox.register(tool)
         #  交互模式（默认 / auto / plan，见 modes.py）。plan mode 是其中一档：
