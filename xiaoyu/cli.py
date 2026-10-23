@@ -3362,12 +3362,27 @@ def _repl_loop(agent: Agent) -> int:
         print(ui.error("--yolo 已开启：写文件和执行命令都不会再问你"))
     print_mode_notice(agent)
 
+    #  空闲时到达的后台事件（研究完成、后台任务结束）：打一行提示，不替用户开新一轮。
+    #  明文 REPL 没有输入行要保护，watcher 线程直接 print；模型在跑时不打——
+    #  那时通知随下一条工具结果送达（与 TUI 的 _on_notification 同一规则）
+    idle = [False]
+
+    def on_notification(item: dict[str, Any]) -> None:
+        if not item.get("wake") or not idle[0]:
+            return
+        if lines := str(item.get("text", "")).strip().splitlines():
+            print(ui.secondary(f"  ⟲ {lines[0]}（发下一条消息时送达模型）"))
+
+    agent.on_notification = on_notification
+
     while True:
+        idle[0] = True
         try:
             line = input(ui.prompt(f"{modes.prompt_prefix(agent.mode)}› "))
         except (EOFError, KeyboardInterrupt):
             print()
             return 0
+        idle[0] = False
 
         #  提交路由单点在 keys.classify_input：TUI 与明文 REPL 同一张表
         action = keys.classify_input(line)

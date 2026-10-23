@@ -207,8 +207,10 @@ Gemini 后台研究任务，`deep_research_status` 查询进度并获取完整�
 默认 `tier=standard` 使用 `deep-research-preview-04-2026`；
 要求更全面的研究时可选 `tier=max`（`deep-research-max-preview-04-2026`）。
 `previous_interaction_id` 可继续旧研究。研究经官方 Interactions API 后台执行，
-通常需要数分钟；本地不会常驻轮询或自动推送，稍后主动查询即可。
-报告保留正文与来源，长输出沿用 `recall` 查看全文。
+通常需要数分钟到数十分钟；提交后小羽结束本轮，由后台线程每 30 秒查一次状态，
+完成时通知模型（交互界面空闲时打一行提示，下一条消息时送达），模型再读报告——
+不会在本轮里 sleep 等待。跟踪最长 3 小时，之后仍可凭任务 ID 手动查询。
+报告保留全部正文段落、附图数量与来源，长输出沿用 `recall` 查看全文。
 
 此能力独立于主对话模型、`web_search` 和 `/search`；默认开启，未配置 Gemini key
 时不暴露工具，`XIAOYU_ENABLE_DEEP_RESEARCH=0` 可关闭。检索子 agent 与评估默认关闭。

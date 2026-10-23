@@ -290,6 +290,22 @@ class TestTuiFrontend(AgentTestCase):
         document = Document(text, cursor_position=len(text))
         return [item.text for item in completer.get_completions(document, None)]
 
+    def test_idle_notification_prints_one_line_and_skips_while_running(self) -> None:
+        """后台事件在空闲时到达：打一行告诉人；模型在跑或捎带型公告都不打。"""
+        agent = self.build([])
+        tui = self.make_tui(agent)
+        done = {"key": "deep-research-done-job_1", "wake": True,
+                "text": '后台研究 "job_1" 已完成（约 7 分钟）。\n用 deep_research_status 读取报告。'}
+        tui._on_notification({"key": "mcp-online", "wake": False, "text": "MCP server 上线"})
+        tui._poller = object()
+        tui._on_notification(done)
+        self.assertEqual(tui.console.file.getvalue(), "")
+        tui._poller = None
+        tui._on_notification(done)
+        out = tui.console.file.getvalue()
+        self.assertIn('⟲ 后台研究 "job_1" 已完成（约 7 分钟）。（发下一条消息时送达模型）', out)
+        self.assertNotIn("读取报告", out)
+
     def test_ctrl_c_keeps_the_cleared_draft_for_recall(self) -> None:
         """单次 Ctrl-C 清掉的半截输入存进 Esc-Esc 的取回槽，不加新键。"""
         agent = self.build([])

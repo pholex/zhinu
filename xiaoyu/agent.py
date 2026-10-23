@@ -1344,7 +1344,9 @@ class Agent:
         if config.enable_deep_research:
             from .deepresearch import make_deep_research_tools
 
-            for tool in make_deep_research_tools(config, self.registry, self.usage):
+            #  完成通知走后台任务同一条轨道（wake=True：值得为它多跑一步）；
+            #  不接通知的话模型只能在本轮里 sleep 死等
+            for tool in make_deep_research_tools(config, self.registry, self.usage, notify=self.notify):
                 if self.toolbox.get(tool.name) is None:
                     self.toolbox.register(tool)
         #  交互模式（默认 / auto / plan，见 modes.py）。plan mode 是其中一档：

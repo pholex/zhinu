@@ -1983,6 +1983,30 @@ class Tui:
 
         app.loop.call_soon_threadsafe(on_loop)
 
+    def _on_notification(self, item: dict[str, Any]) -> None:
+        """后台事件（研究完成、后台任务结束）在会话空闲时到达：打一行告诉人。
+
+        通知是给模型看的，要到下一步才送达；空闲时没有下一步，不提示的话人只能
+        干等或自己来问。模型正在跑（poller 活着）就不打——它会随下一条工具结果
+        送到；捎带型公告（wake=False）不值一行。跨线程纪律同 `_on_suggestions`。
+        """
+        if not item.get("wake") or self._poller is not None:
+            return
+        lines = str(item.get("text", "")).strip().splitlines()
+        if not lines:
+            return
+        line = Text(f"  ⟲ {lines[0]}（发下一条消息时送达模型）", style="text.secondary")
+        app = self._app
+        if app is None or not app.is_running or app.loop is None:
+            self.console.print(line)
+            return
+
+        def on_loop() -> None:
+            with set_app(app):
+                run_in_terminal(lambda: self.console.print(line))
+
+        app.loop.call_soon_threadsafe(on_loop)
+
     # ---------- 输入 ----------
 
     def _fold_paste(self, data: str) -> str:
@@ -2827,6 +2851,8 @@ class Tui:
         from .cli import handle_slash, skill_prompt
 
         self.agent = agent
+        #  空闲时到达的后台事件：打一行提示，不替用户开新的一轮
+        agent.on_notification = self._on_notification
         self.sink.bash_timeout = agent.config.bash_timeout
         self.sink.request_timeout = int(agent.config.request_timeout)
         self.sink.workspace = Path(agent.config.workspace)
