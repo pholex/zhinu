@@ -817,6 +817,27 @@ class TestBashAndSafety(ToolboxTestCase):
         result = self.box.run("bash", {"command": "sleep 5", "timeout": 1})
         self.assertIn("超时", result)
 
+    def test_bash_timeout_is_capped(self) -> None:
+        """模型自己把 timeout 调大去 sleep 等后台事件（实测调到 330s 把整轮卡死）：
+        前台命令封顶，超限时告诉它该用 run_in_background、等通知而不是 sleep。"""
+        from xiaoyu import tools as tools_module
+
+        with mock.patch.object(tools_module, "BASH_TIMEOUT_CAP", 1), \
+                mock.patch.object(self.box.config, "bash_timeout", 1):
+            result = self.box.run("bash", {"command": "sleep 5", "timeout": 300})
+        self.assertIn("命令超时（1s）", result)
+        self.assertIn("timeout=300s 超过上限 1s", result)
+        self.assertIn("run_in_background", result)
+        self.assertIn("不要 sleep", result)
+        #  用户配置的默认值比上限大时以配置为准（显式要的）
+        with mock.patch.object(tools_module, "BASH_TIMEOUT_CAP", 1), \
+                mock.patch.object(self.box.config, "bash_timeout", 2):
+            result = self.box.run("bash", {"command": "sleep 5", "timeout": 2})
+        self.assertIn("命令超时（2s）", result)
+        self.assertNotIn("超过上限", result)
+        schema = next(s for s in self.box.schemas() if s["function"]["name"] == "bash")
+        self.assertIn("上限 600", schema["function"]["parameters"]["properties"]["timeout"]["description"])
+
     def test_outside_workspace_needs_approval(self) -> None:
         self.assertTrue(self.box.needs_approval("read_file", {"path": "/etc/hosts"}))
         self.assertFalse(self.box.needs_approval("read_file", {"path": "calc.py"}))

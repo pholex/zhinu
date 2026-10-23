@@ -320,6 +320,10 @@ _STOP_POLL_SECONDS = 0.2
 #  杀掉之后等它退出的上限（秒）。kill_tree 返回时整组已收到 SIGKILL（或已自行
 #  退干净），进程是毫秒级退出的，这个数只防意外：等不到就放手，打断不能因此卡住
 _REAP_SECONDS = 2.0
+#  前台 bash 的 timeout 参数上限（秒）。模型会自己把 timeout 往上调去 sleep 等
+#  后台事件（实测逐级调到 330s，整轮卡死）；更久的活用 run_in_background /
+#  monitor，等事件靠通知。用户配置的 bash_timeout 比它还大时以配置为准。
+BASH_TIMEOUT_CAP = 600
 
 
 def _reap(proc: subprocess.Popen, timeout: float = _REAP_SECONDS) -> None:
@@ -2334,9 +2338,10 @@ class Toolbox:
                         "timeout": {
                             "type": ["integer", "null"],
                             "description": (
-                                f"超时秒数，默认 {self.config.bash_timeout}。"
+                                f"超时秒数，默认 {self.config.bash_timeout}，上限 {BASH_TIMEOUT_CAP}。"
                                 "超时的命令会被终止，已产生的输出仍会返回给你；"
-                                "预计耗时长的命令（完整测试、构建）请显式调大。"
+                                "预计耗时长的命令（完整测试、构建）请显式调大，"
+                                "更久的用 run_in_background。不要用 sleep 等后台事件：完成时会自动通知你。"
                                 "后台任务默认不受超时约束，显式给了才生效"
                             ),
                         },
@@ -3238,7 +3243,7 @@ class Toolbox:
                 "这类不可撤销的破坏性操作在任何模式下都不执行，包括 --yolo。"
                 "如果确有需要，请用户自己在终端里手动执行。"
             )
-        limit = timeout or self.config.bash_timeout
+        limit = min(timeout or self.config.bash_timeout, max(BASH_TIMEOUT_CAP, self.config.bash_timeout))
         #  macOS 上套 Seatbelt 沙箱：写权限收到工作区+临时目录+构建缓存，
         #  其余路径只读。系统只读查询有精确执行例外，其余子孙进程继承策略。
         #  升权本次生效：danger-full-access 不套沙箱；allow-network 套但放网。
@@ -3309,9 +3314,15 @@ class Toolbox:
             #  跑完了只是进程没退出）。提示前置 + 部分输出照样给模型，exit 124 是
             #  timeout 命令的约定退出码。
             partial = _partial_chunks(stdout_raw, stderr_raw)
+            capped = ""
+            if timeout and timeout > limit:
+                capped = (
+                    f"你给的 timeout={timeout}s 超过上限 {limit}s。更久的命令请用 run_in_background；"
+                    "等后台事件靠通知送达，不要 sleep。"
+                )
             output = (
                 f"命令超时（{limit}s），已终止整个进程树（含后台子进程，"
-                f"实际等待 {elapsed:.0f}s）。以下是超时前已产生的输出：\n"
+                f"实际等待 {elapsed:.0f}s）。{capped}以下是超时前已产生的输出：\n"
                 f"exit_status: 124 (timeout)\n{partial or '(无输出)'}"
             )
             return output + _interactive_auth_hint(partial)
