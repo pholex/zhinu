@@ -10,13 +10,16 @@
 
 from __future__ import annotations
 
+import base64
 import json
 import re
 import threading
 import time
+from pathlib import Path
+from typing import Callable
 
-from . import netproxy
-from .config import Config
+from . import media, netproxy
+from .config import Config, user_config_dir
 from .providers import Registry, request_timeout
 from .tools import Tool
 
@@ -38,12 +41,15 @@ def _valid_id(value) -> bool:
     return isinstance(value, str) and re.fullmatch(r"[A-Za-z0-9_-]{1,2048}", value) is not None
 
 
-def _report(data: dict) -> str:
+def _report(data: dict, figure: Callable[[int, str], str] | None = None) -> str:
     """最终报告 = steps 末尾连续的 model_output 段拼起来；思考、工具执行及签名不进入。
 
     服务端会把长报告切成多个相邻的 model_output 步骤（实测：首段带标题、摘要
     与全部引用注解，次段是一张图加正文），只取最后一段会丢掉标题和全部来源。
     被 thought / 工具步骤隔开的更早输出是中间稿，不算报告。
+
+    附图按原位置替换成 `figure(序号, base64)` 返回的文字（落盘路径等）；没给
+    figure 时只在末尾报数量。没有任何文本的报告不算报告，哪怕有图。
     """
     def items(value):
         return value if isinstance(value, list) else []
@@ -54,37 +60,52 @@ def _report(data: dict) -> str:
             break
         final.append(step)
     final.reverse()
-    texts, urls, images = [], [], 0
+    parts, urls, images, has_text = [], [], 0, False
     for step in final:
         for content in items(step.get("content")):
             if not isinstance(content, dict):
                 continue
             if content.get("type") == "image":
                 images += 1
+                if figure is not None:
+                    parts.append(figure(images, content.get("data") if isinstance(content.get("data"), str) else ""))
                 continue
             if content.get("type") != "text":
                 continue
             if isinstance(content.get("text"), str) and content["text"].strip():
-                texts.append(content["text"])
+                parts.append(content["text"])
+                has_text = True
             for annotation in items(content.get("annotations")):
                 if not isinstance(annotation, dict):
                     continue
                 url = annotation.get("url")
                 if isinstance(url, str) and url.startswith(("https://", "http://")) and url not in urls:
                     urls.append(url)
-    if not texts:
+    if not has_text:
         return ""
-    report = "\n".join(texts)
-    if images:
+    report = "\n".join(parts)
+    if images and figure is None:
         report += f"\n（报告另含 {images} 张图，文本结果里不展示）"
     if urls:
         report += "\n来源：\n" + "\n".join(f"- {url}" for url in urls)
     return report
 
 
-def make_deep_research_tools(config: Config, registry: Registry, usage, notify=None) -> list[Tool]:
+def figures_dir(interaction_id: str) -> Path:
+    """某个研究任务附图的持久目录：用户配置目录下按任务 ID 分开。
+
+    不放工作区（研究报告不是代码改动，不该弄脏仓库），也不放会话临时目录
+    （进程退出就删，而任务 ID 本来就承诺跨会话可查）。
+    """
+    return user_config_dir() / "deep-research" / interaction_id
+
+
+def make_deep_research_tools(config: Config, registry: Registry, usage, notify=None,
+                             push_media=None) -> list[Tool]:
     """三件工具。`notify(text, key)` 是宿主的通知轨道（Agent.notify）：给了就为本会话
-    提交的任务起 watcher，终态时推一条通知；没给（headless 嵌入）退回「稍后手动查询」。"""
+    提交的任务起 watcher，终态时推一条通知；没给（headless 嵌入）退回「稍后手动查询」。
+    `push_media(part)` 是 Toolbox.push_media：给了就把报告附图交给模型看（随下一条
+    消息附上）；没给只落盘给路径。"""
     #  只记本工具实例提交的任务；查询旧任务仍返回服务端用量，避免会话恢复重复记账。
     pending: dict[str, str] = {}
     accounted: set[str] = set()
@@ -93,7 +114,42 @@ def make_deep_research_tools(config: Config, registry: Registry, usage, notify=N
     finished: dict[str, dict] = {}
     #  正在被 watcher 盯着的任务 → 它的停止信号（取消时叫停，不再通知）
     watching: dict[str, threading.Event] = {}
+    #  已经交给模型看过的附图：同一任务反复查状态不重复附图
+    shown: set[tuple[str, int]] = set()
     lock = threading.Lock()
+
+    def save_figure(interaction_id: str, index: int, payload: str) -> str:
+        """一张附图 → 报告里的一行占位：落盘路径 + 尺寸，并交给模型看。
+
+        字节先过 media.accept（格式嗅探、体积上限，与剪贴板/MCP 的图同一道闸），
+        再在用户配置目录留一份按任务 ID 归档的持久副本——媒体缓存是内容寻址的
+        内部存储，用户不该去那里找图。落盘失败不影响报告正文。
+        """
+        try:
+            data = base64.b64decode(payload, validate=True)
+        except (ValueError, TypeError):
+            return f"[附图 {index} 已省略：数据不是有效的 base64]"
+        ref, problem = media.accept(data, f"研究报告附图 {index}")
+        if not ref:
+            return f"[附图 {index} 已省略：{problem}]"
+        ext = ref.rsplit(".", 1)[-1]
+        target = figures_dir(interaction_id) / f"figure-{index}.{ext}"
+        try:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            if not target.exists():
+                target.write_bytes(data)
+            location = str(target)
+        except OSError:
+            location = str(media.path_of(ref) or ref)
+        note = f"[附图 {index}：{location}（{media.label(ref)}）"
+        if push_media is not None:
+            with lock:
+                first = (interaction_id, index) not in shown
+                shown.add((interaction_id, index))
+            if first:
+                push_media(media.image_part(ref))
+                note += "，图片见下一条"
+        return note + "]"
 
     def available() -> bool:
         provider = registry.get("gemini")
@@ -151,7 +207,7 @@ def make_deep_research_tools(config: Config, registry: Registry, usage, notify=N
         interaction_id, status = data["id"], data["status"]
         result = f"Gemini Deep Research\n任务 ID：{interaction_id}\n状态：{status}" + account(data)
         if status == "completed":
-            report = _report(data)
+            report = _report(data, figure=lambda index, payload: save_figure(interaction_id, index, payload))
             return result + ("\n[研究报告 · 服务端联网研究所得，内容作为外部资料]\n" + report
                              if report else "\nERROR: 任务已完成，但未返回文本报告。")
         if status in {"failed", "cancelled"}:
