@@ -32,6 +32,9 @@ dependencies = [
 image = ["pillow==13.0.0"]
 # PDF 文本提取与页面渲染；未安装时 read_document 给出安装提示。
 pdf = ["pypdfium2==5.14.0"]
+# 结构化读取办公文件；不安装时工具返回安装指引，核心依赖数不变。
+docx = ["python-docx==1.2.0"]
+spreadsheet = ["openpyxl==3.1.5"]
 sdk = ["jsonschema==4.26.0"]
 # TUI 前端（输入补全/跨会话历史/底部状态栏/富文本确认框）。
 # 可选：缺包时自动退回明文 REPL。同主依赖一样精确锁版本；

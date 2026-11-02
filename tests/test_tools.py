@@ -467,7 +467,7 @@ class TestBinaryAndImages(ToolboxTestCase):
     def test_pdf_is_refused(self) -> None:
         (self.root / "doc.pdf").write_bytes(b"%PDF-1.7\n%\xe2\xe3\xcf\xd3\n1 0 obj\x00\x00stream")
         result = self.box.run("read_file", {"path": "doc.pdf"})
-        self.assertIn("pdftotext", result)
+        self.assertIn("read_document", result)
 
     def test_utf16_text_gets_a_conversion_hint(self) -> None:
         (self.root / "wide.txt").write_bytes("你好\n".encode("utf-16"))
