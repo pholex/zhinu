@@ -169,8 +169,11 @@ def main(argv: list[str]) -> int:
         step("2-5. 导入位置 / 版本 / 随包文件")
         probe = r"""
 import importlib.metadata, json, sys, sysconfig
+from pathlib import Path
 import xiaoyu
 from xiaoyu.evals import models
+from xiaoyu.word_documents import read_docx
+from xiaoyu.spreadsheets import read_xlsx
 print(json.dumps({
     "file": xiaoyu.__file__,
     "version": xiaoyu.__version__,
@@ -180,11 +183,15 @@ print(json.dumps({
     "eval_data_path": str(models.data_path()),
     "eval_candidates": len(models.CANDIDATES),
     "requires": importlib.metadata.requires("xiaoyu-agent") or [],
+    "docx_missing_extra": read_docx(Path("missing.docx")),
+    "spreadsheet_missing_extra": read_xlsx(Path("missing.xlsx")),
 }))
 """
         proc = run([str(py), "-c", probe], cwd=outside, env=clean_env())
         check(proc.returncode == 0, f"导入探针失败\n{describe(proc)}")
         info = json.loads(proc.stdout.strip().splitlines()[-1])
+        check("xiaoyu-agent[docx]" in info["docx_missing_extra"], "裸装缺 DOCX 扩展时没有安装指引")
+        check("xiaoyu-agent[spreadsheet]" in info["spreadsheet_missing_extra"], "裸装缺 XLSX 扩展时没有安装指引")
         purelib = Path(info["purelib"]).resolve()
         pkg_dir = Path(info["file"]).resolve().parent
         check(Path(info["prefix"]).resolve() == venv.resolve(),

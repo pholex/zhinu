@@ -200,6 +200,7 @@ _SUMMARY_FIELDS: dict[str, tuple[tuple[str, str], ...]] = {
     "view_image": (("path", ""),),
     "wait_for_event": (("timeout", "秒 "),),
     "read_document": (("path", ""), ("pages", "页 "), ("mode", "")),
+    "read_spreadsheet": (("path", ""), ("sheet", ""), ("cell_range", "")),
     "task_input": (("task_id", ""),),
     "write_file": (("path", ""),),
     "str_replace": (("path", ""),),

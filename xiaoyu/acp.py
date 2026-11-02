@@ -230,6 +230,7 @@ _TOOL_KINDS = {
     "str_replace": "edit",
     "apply_patch": "edit",
     "read_document": "read",
+    "read_spreadsheet": "read",
     "view_image": "read",
     "wait_for_event": "other",
     "task_input": "execute",

@@ -556,7 +556,7 @@ def _binary_file_error(target: Path, shown: str) -> str | None:
     return (
         f"ERROR: {shown} 是二进制文件（{size} 字节），read_file 只读文本。"
         f"想知道它是什么：bash 跑 file {shown}；要看字节：xxd {shown} | head；"
-        "PDF 用 pdftotext，压缩包用 unzip -l 或 tar -tf，数据库用对应的命令行客户端。"
+        "PDF/DOCX 用 read_document，XLSX 用 read_spreadsheet；压缩包用 unzip -l 或 tar -tf，数据库用对应的命令行客户端。"
     )
 
 
@@ -2185,13 +2185,34 @@ class Toolbox:
         ))
         self.register(Tool(
             name="read_document",
-            description=("读取本地 PDF。pages 为从 1 起的页码范围，如 1-3,5；默认第 1 页。"
+            description=("读取本地 PDF/DOCX。PDF 的 pages 为从 1 起的页码范围，如 1-3,5；默认第 1 页。"
                          "mode=text 提取带页码正文（最多 20 页），mode=image 返回页面图片（最多 4 页）。"
-                         "扫描页请用 image；不自动 OCR。需安装 xiaoyu-agent[pdf]。"),
+                         "长文档先用 mode=info 查看页数和目录，mode=search 配 query 找页（默认前 100 页，可用 pages 续查）。"
+                         "图表、双栏、扫描页和关键数值须用 image 核对；不自动 OCR。"
+                         "image 可传 crop（左上原点、0–1 的 [左,上,右,下]）和 dpi（36–600），直接渲染局部高清图。需安装 xiaoyu-agent[pdf]。"
+                         "DOCX 支持 text/info/search：按正文块号读取段落、表格，offset 从 1 起，limit 默认 50、最多 100；"
+                         "info 列标题，search 配 query 搜当前块范围；不提供页码或图片，不读取批注、修订正文等附加内容。需 xiaoyu-agent[docx]。"),
             parameters={"type": "object", "properties": {
-                "path": {"type": "string"}, "pages": {"type": "string"},
-                "mode": {"type": "string", "enum": ["text", "image"]}}, "required": ["path"]},
+                "path": {"type": "string"}, "pages": {"type": ["string", "null"]},
+                "mode": {"type": "string", "enum": ["text", "image", "info", "search"]},
+                "query": {"type": ["string", "null"], "description": "search 的字面关键词，区分大小写，最多 200 字符"},
+                "crop": {"type": ["array", "null"], "items": {"type": "number"}, "minItems": 4, "maxItems": 4},
+                "dpi": {"type": ["integer", "null"], "minimum": 36, "maximum": 600},
+                "offset": {"type": ["integer", "null"], "minimum": 1, "description": "仅 DOCX：起始正文块号"},
+                "limit": {"type": ["integer", "null"], "minimum": 1, "maximum": 100, "description": "仅 DOCX：本次读取/搜索的块数"}}, "required": ["path"]},
             handler=self._read_document, requires_approval=False, untrusted=True,
+        ))
+        self.register(Tool(
+            name="read_spreadsheet",
+            description=("只读本地 XLSX。省略 sheet 列出工作表；只传 sheet 查看声明范围、合并格和隐藏行列；"
+                         "传 sheet + cell_range（如 A1:F50，最多 2000 格）读取带坐标、类型和数字格式的单元格。"
+                         "公式原文与文件缓存结果分别返回，缓存可能缺失或过期；不重算、不更新外部链接、不执行宏。"
+                         "不读取图表、图片、批注内容；CSV/TSV 用 read_file。需 xiaoyu-agent[spreadsheet]。"),
+            parameters={"type": "object", "properties": {
+                "path": {"type": "string"},
+                "sheet": {"type": ["string", "null"]},
+                "cell_range": {"type": ["string", "null"]}}, "required": ["path"]},
+            handler=self._read_spreadsheet, requires_approval=False, untrusted=True,
         ))
         self.register(Tool(
             name="task_input",
@@ -2837,17 +2858,38 @@ class Toolbox:
         self.push_media(media.image_part(ref))
         return f"已读取图片 {path}（{media.label(ref)}）"
 
-    def _read_document(self, path: str, pages: str = "1", mode: str = "text") -> str:
+    def _read_document(self, path: str, pages: str | None = None, mode: str = "text",
+                       query: str | None = None, crop: list[float] | None = None,
+                       dpi: int | None = None, offset: int | None = None,
+                       limit: int | None = None) -> str:
         from .documents import read_pdf
 
         target, _ = self._resolve(path)
-        text, images = read_pdf(target, pages, mode)
+        if target.suffix.lower() == ".docx":
+            from .word_documents import read_docx
+
+            if pages is not None or crop is not None or dpi is not None:
+                return "ERROR: DOCX 用 offset/limit 按块读取，不支持 pages/crop/dpi；页面图请先转换为 PDF。"
+            return read_docx(target, mode, offset=offset if offset is not None else 1,
+                             limit=limit if limit is not None else 50, query=query)
+        if target.suffix.lower() == ".doc":
+            return "ERROR: 旧版 .doc 请先另存为 .docx 后读取。"
+        if offset is not None or limit is not None:
+            return "ERROR: PDF 用 pages 按页读取；offset/limit 仅用于 DOCX。"
+        text, images = read_pdf(target, pages, mode, query=query, crop=crop, dpi=dpi)
         for data in images:
             ref = media.store(data, "image/png")
             if not ref:
                 return "ERROR: 页面已渲染，但图片缓存写入失败，请检查临时目录空间与权限。"
             self.push_media(media.image_part(ref))
         return text
+
+    def _read_spreadsheet(self, path: str, sheet: str | None = None,
+                          cell_range: str | None = None) -> str:
+        from .spreadsheets import read_xlsx
+
+        target, _ = self._resolve(path)
+        return read_xlsx(target, sheet, cell_range)
 
     def _task_input(self, task_id: str, text: str = "", eof: bool = False) -> str:
         if self.config.hardline and (reason := hardline_violation(text)):

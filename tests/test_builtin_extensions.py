@@ -304,14 +304,17 @@ class ApprovalTest(AgentTestCase):
 
 
 # 手写的两页最小 PDF；不需要生成库或网络，真实文本与渲染共用它。
-def make_pdf(path):
-    objects = [b'<< /Type /Catalog /Pages 2 0 R >>',
+def make_pdf(path, *, bookmarks=False):
+    objects = [b'<< /Type /Catalog /Pages 2 0 R /Outlines 8 0 R >>' if bookmarks else b'<< /Type /Catalog /Pages 2 0 R >>',
                b'<< /Type /Pages /Kids [3 0 R 5 0 R] /Count 2 >>',
                b'<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 100] /Resources << /Font << /F1 7 0 R >> >> /Contents 4 0 R >>',
                None,
                b'<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] /Contents 6 0 R >>',
                b'<< /Length 0 >>\nstream\n\nendstream',
                b'<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>']
+    if bookmarks:
+        objects.extend([b'<< /Type /Outlines /First 9 0 R /Last 9 0 R /Count 1 >>',
+                        b'<< /Title (Introduction) /Parent 8 0 R /Dest [3 0 R /Fit] >>'])
     stream = b'BT /F1 18 Tf 10 50 Td (Hello PDF) Tj ET'
     objects[3] = b'<< /Length %d >>\nstream\n' % len(stream) + stream + b'\nendstream'
     data = bytearray(b'%PDF-1.4\n')
