@@ -37,7 +37,7 @@ class PatchTest(unittest.TestCase):
 
     def file(self, path, text="old\n"):
         target = self.root / path
-        target.write_text(text, encoding="utf-8")
+        target.write_bytes(text.encode("utf-8"))
         self.box.run("read_file", {"path": path})
         return target
 
@@ -116,7 +116,9 @@ class PatchTest(unittest.TestCase):
         self.assertIn("只读过一部分", self.patch(change("a", operation="delete")))
         self.assertTrue(target.exists())
 
-    def test_encoding_and_crlf_preserved(self):
+    # 固定解码候选，避免西文 Windows 的 cp1252 抢先解开 GBK 字节。
+    @mock.patch("xiaoyu.tools.locale.getpreferredencoding", return_value="UTF-8")
+    def test_encoding_and_crlf_preserved(self, _preferred):
         target = self.root / "a"
         target.write_bytes("旧\r\n".encode("gbk"))
         self.box.run("read_file", {"path": "a"})
