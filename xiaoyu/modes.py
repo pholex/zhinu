@@ -139,7 +139,7 @@ def help_text() -> str:
 
 #  auto 档认识的工具名。其余（browser / MCP / 插件工具）一律 fail-closed 走确认：
 #  它们的副作用在沙箱管辖之外，"沙箱兜底所以不用问"这个前提对它们不成立。
-_EDIT_TOOLS = frozenset({"write_file", "str_replace"})
+_EDIT_TOOLS = frozenset({"write_file", "str_replace", "apply_patch"})
 
 
 def auto_approves(

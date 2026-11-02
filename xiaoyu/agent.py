@@ -509,7 +509,7 @@ VISION_CAPTION_HEADER = (
 #  structured_output 在列：它只把结果存进内存、不碰现场；不在列的话
 #  `-p --mode plan --output-schema` 永远交不了结果（无人值守又退不出 plan mode）
 PLAN_MODE_TOOLS = frozenset(
-    {"read_file", "grep", "list_files", "explore", "skill", "web_search", "web_fetch", "x_search",
+    {"read_file", "read_document", "view_image", "wait_for_event", "grep", "list_files", "explore", "skill", "web_search", "web_fetch", "x_search",
      "deep_research", "deep_research_status",
      "update_plan", "exit_plan_mode", "ask_user", "list_sessions", "task_output",
      "search_tool", "get_context_remaining", "structured_output"}
@@ -1149,6 +1149,8 @@ class Agent:
         #  Queue 没有"不取就看"的办法。
         self._notify_queue: list[tuple[str, str, bool]] = []
         self._notify_lock = threading.Lock()
+        self._event_ready = threading.Event()
+        self._wait_peer_messages: list[tuple[str, str]] = []
         self._notified_keys: set[str] = set()
         #  通知入队时的旁路回调（宿主注册，见 notify）：会话空闲时模型不在跑，
         #  通知只能停在队列里等下一轮——宿主得有办法知道"有事件在等"
@@ -1449,6 +1451,17 @@ class Agent:
                     check_fn=lambda: self.asker is not None,
                 )
             )
+        if self.toolbox.get("wait_for_event") is None:
+            self.toolbox.register(Tool(
+                name="wait_for_event",
+                description=("等待后台任务完成、monitor 通知或协作消息；有待处理事件立即返回。"
+                             "timeout 为 0–600 秒，默认 60，0 仅检查；用户插话或取消会提前结束。"
+                             "不启动任务、不自动重试、不等待已送达的旧事件；任务详情用 task_output。"),
+                parameters={"type": "object", "properties": {
+                    "timeout": {"type": "integer", "minimum": 0, "maximum": 600}},
+                    "required": []},
+                handler=self._wait_for_event, requires_approval=False,
+            ))
         #  上下文窗口两件套：让模型自己看得见余量、自己决定何时翻篇。
         #  get_context_remaining 纯查询（与 maybe_compact 同一把尺子）；
         #  new_context 不做摘要调用——把"带什么过去"交给模型写成交接笔记，
@@ -2621,6 +2634,7 @@ class Agent:
         请求上——这里故意不做"当前是否在跑"的判断，避免库层再引入一层状态机。
         """
         self._interrupt_flag.set()
+        self._event_ready.set()
 
     def interrupt_requested(self) -> bool:
         """此刻有没有待处理的打断（自己的，或父级的）。只看不清。"""
@@ -2681,6 +2695,7 @@ class Agent:
         """
         if text.strip():
             self._steer_queue.put(text.strip())
+            self._event_ready.set()
 
     def drain_steers(self) -> list[str]:
         """取走全部未消费的插话（不入历史）。
@@ -2726,6 +2741,8 @@ class Agent:
             if repeated:
                 return
             self._notify_queue.append((key, text, wake))
+        if wake:
+            self._event_ready.set()
         callback = self.on_notification
         if callback is None:
             return
@@ -2733,6 +2750,32 @@ class Agent:
             callback({"key": key, "text": text, "wake": wake})
         except Exception:  # noqa: BLE001 - 宿主的回调坏了不该连累投递通知的那个线程
             pass
+
+    def _wait_for_event(self, timeout: int = 60) -> str:
+        if type(timeout) is not int or not 0 <= timeout <= 600:
+            return "ERROR: timeout 必须是 0–600 的整数秒。"
+        deadline = time.monotonic() + timeout
+        while True:
+            # 先清标志再查队列，避免检查与等待之间丢失唤醒。
+            self._event_ready.clear()
+            if self.interrupt_requested():
+                return "等待已中断。"
+            if not self._steer_queue.empty():
+                return "收到用户插话，将在工具结束后的边界送达。"
+            if any(item["wake"] for item in self.pending_notifications()):
+                return "已有后台事件待送达，内容随工具结果交付。"
+            if self.peer is not None:
+                try:
+                    self._wait_peer_messages.extend(self.peer.drain())
+                except Exception:
+                    return "ERROR: 协作信箱读取失败，请稍后重试。"
+                if self._wait_peer_messages:
+                    return "收到协作消息，将在工具结束后的边界送达。"
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return "等待超时，没有新事件。"
+            # 文件信箱和宿主取消没有通知句柄，短间隔检查；不调用模型。
+            self._event_ready.wait(min(0.2, remaining))
 
     def pending_notifications(self) -> list[dict[str, Any]]:
         """还没送达模型的通知（快照，不取走；任意线程可调）。
@@ -2789,7 +2832,8 @@ class Agent:
         if self.peer is None:
             return False
         try:
-            items = self.peer.drain()
+            items = self._wait_peer_messages + self.peer.drain()
+            self._wait_peer_messages = []
         except Exception:  # noqa: BLE001 - 信箱读不动绝不能拖垮会话
             return False
         for sender, wrapped in items:
@@ -5511,6 +5555,10 @@ class Agent:
         bash 命令按 shell 词法切开，取长得像路径的词：带 / 的，或在工作区里
         真实存在的裸名（`ls tests`）。选项（-x / --flag=路径）只取 = 后面那段。
         """
+        if name == "apply_patch":
+            from .patches import changes_of
+
+            return [item["path"] for item in changes_of(args) if isinstance(item.get("path"), str)]
         if name == "use_tool":
             return []
         if name == "bash":
@@ -5805,7 +5853,8 @@ class Agent:
         #  用户自己写的 ask 规则同理：他要的就是"别的照常自动跑，唯独这一样先问我"
         asked_by_rule = decision == "ask" and deny_rule is not None
         must_confirm = not self.config.unattended and (
-            name == "exit_plan_mode"
+            name in {"exit_plan_mode", "task_input"}
+            or (name == "bash" and bool(args.get("interactive")))
             or (name == "bash" and bool(str(args.get("sandbox_permissions", "") or "").strip()))
             or guarded is not None
             or asked_by_rule

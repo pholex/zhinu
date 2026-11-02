@@ -357,7 +357,7 @@ def resolve_system_prompt_flags(args: argparse.Namespace) -> None:
 def add_guardrail_flags(parser: argparse.ArgumentParser) -> None:
     """护栏开关：主命令与 resume 共用（表在 guardrails.py）。
 
-    --unattended 单独放开 --yolo 下仍必问的三项；--unguarded 是预设：一次放开表里
+    --unattended 单独放开 --yolo 下仍必问的操作；--unguarded 是预设：一次放开表里
     全部层，且只在 XIAOYU_UNGUARDED=1 时生效（见 resolve_guardrail_flags）。
     """
     from . import guardrails
@@ -366,7 +366,7 @@ def add_guardrail_flags(parser: argparse.ArgumentParser) -> None:
         "--unattended",
         action="store_true",
         default=None,
-        help="--yolo 之上再放开退出 plan、沙箱升权、写可执行配置这三处必问（无人值守里没人按键）",
+        help="--yolo 之上再放开退出 plan、沙箱升权、写可执行配置、交互任务输入的必问（无人值守里没人按键）",
     )
     parser.add_argument(
         guardrails.FLAG,
@@ -3440,7 +3440,7 @@ def _repl_loop(agent: Agent) -> int:
 def _rewind_flow(agent: Agent, rest: list[str]) -> None:
     """/rewind 的交互流程：列点 → 选点 → 选范围 → 预览 → 确认 → 执行。
 
-    快照只覆盖 write_file / str_replace 的改动；bash 里改的、git 操作不在
+    快照只覆盖 write_file / str_replace / apply_patch 的改动；bash 里改的、git 操作不在
     范围内——列表下方明说，不装作全能。
     """
     store = getattr(agent.toolbox, "rewind", None)
@@ -3454,7 +3454,7 @@ def _rewind_flow(agent: Agent, rest: list[str]) -> None:
         stamp = time.strftime("%H:%M", time.localtime(point.started_at))
         touched = f"，改动 {len(point.files)} 个文件" if point.files else ""
         print(f"  {point.index:>3}. [{stamp}] {point.preview}{touched}")
-    print(ui.secondary("  （快照只覆盖 write_file/str_replace；bash 改动与 git 操作不在内）"))
+    print(ui.secondary("  （快照只覆盖 write_file/str_replace/apply_patch；bash 改动与 git 操作不在内）"))
 
     preview_only = "--preview" in rest
     arguments = [arg for arg in rest if arg != "--preview"]
@@ -3955,6 +3955,15 @@ def make_confirm(permissions: Permissions):
             for row in str(args.get("new_str", "")).split("\n")[:8]:
                 print(ui.success(f"  │ + {ui.fit(row, 6)}"))
             print(ui.secondary("  └"))
+        elif name == "apply_patch":
+            from .patches import preview
+
+            print(ui.strip_sequences(preview(args)))
+        elif name == "task_input":
+            print(ui.secondary(ui.strip_sequences(f"  向 {args.get('task_id')} 输入（可能执行代码）：")))
+            print(ui.strip_sequences(repr(args.get("text", ""))))
+            if args.get("eof"):
+                print(ui.secondary("  发送 EOF"))
         elif name == "bash":
             #  升权申请先点名：批的是"这次不套沙箱"，不只是这条命令（与 TUI 同一份文案）
             for line in escalation:

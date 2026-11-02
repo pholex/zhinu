@@ -228,6 +228,11 @@ _TOOL_KINDS = {
     "bash": "execute",
     "write_file": "edit",
     "str_replace": "edit",
+    "apply_patch": "edit",
+    "read_document": "read",
+    "view_image": "read",
+    "wait_for_event": "other",
+    "task_input": "execute",
     "read_file": "read",
     "list_files": "search",
     "grep": "search",
@@ -722,6 +727,12 @@ class AcpSink:
     def _pending_extras(self, name: str, args: dict[str, Any]) -> dict[str, Any]:
         """编辑类调用的 diff 内容与位置——Zed 的 gutter/预览就吃这两样。"""
         extras: dict[str, Any] = {}
+        if name == "apply_patch":
+            from .patches import changes_of, preview
+
+            return {"locations": [{"path": self._absolute(item["path"])} for item in changes_of(args)
+                                  if isinstance(item.get("path"), str)],
+                    "content": [{"type": "content", "content": {"type": "text", "text": preview(args)}}]}
         path = args.get("path")
         if isinstance(path, str) and path.strip():
             extras["locations"] = [{"path": self._absolute(path)}]
@@ -1998,6 +2009,11 @@ class AcpServer:
         取舍的一部分。磁盘始终是唯一事实源：哨兵只拦，不把缓冲区内容
         当成文件真相去用。
         """
+        if name == "apply_patch":
+            from .patches import changes_of
+
+            return next((conflict for item in changes_of(args)
+                         if (conflict := self._buffer_conflict(session, "write_file", item))), "")
         if name not in ("write_file", "str_replace"):
             return ""
         path = args.get("path")

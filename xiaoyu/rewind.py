@@ -204,7 +204,7 @@ class RewindStore:
         if self.journal is not None:
             self._event("prepare", path=self._relative(raw), **fields)
 
-    def written(self, path: Path, content: bytes) -> None:
+    def written(self, path: Path, content: bytes | None) -> None:
         """紧接实际写入后确认版本；进程若死在两者之间，该路径保持未知。"""
         raw = str(path)
         if self._current is None or raw not in self._current.files:
@@ -558,9 +558,11 @@ class CheckpointReplay:
             point.pending.add(raw)
         elif action == "written":
             fingerprint = record["fingerprint"]
-            if raw not in point.files or not isinstance(fingerprint, str) or len(fingerprint) != 64:
+            if raw not in point.files or (fingerprint is not None and
+                                          (not isinstance(fingerprint, str) or len(fingerprint) != 64)):
                 raise ValueError("Invalid checkpoint fingerprint")
-            int(fingerprint, 16)
+            if fingerprint is not None:
+                int(fingerprint, 16)
             point.after[raw] = fingerprint
             point.pending.discard(raw)
         elif action == "skip":

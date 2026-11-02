@@ -221,6 +221,11 @@ class BackgroundTask:
     killed: bool = False
     #  被我们自己叫停的原因（超时 / 日志超限）；空串 = 自然结束
     stopped_for: str = ""
+    interactive: bool = False
+    input_fd: int | None = None
+    input_eof: bool = False
+    input_lock: threading.Lock = field(default_factory=threading.Lock)
+    output_thread: threading.Thread | None = None
 
     @property
     def status(self) -> str:
@@ -356,8 +361,12 @@ class TaskManager:
         env: dict[str, str] | None = None,
         timeout: float | None = None,
         popen_extra: dict[str, Any] | None = None,
+        interactive: bool = False,
+        tty: bool = False,
     ) -> "BackgroundTask | str":
         """拉起后台进程。成功返回任务；失败返回错误文本（交给模型自愈）。"""
+        if tty and (os.name == "nt" or not interactive):
+            return "ERROR: tty 需要 POSIX 平台与 interactive=true；Windows 请使用普通交互管道。"
         with self._lock:
             running = [task for task in self._tasks.values() if not task.done.is_set()]
             if len(running) >= MAX_RUNNING_TASKS:
@@ -378,20 +387,30 @@ class TaskManager:
             log_handle = log_path.open("wb")
         except OSError as exc:
             return f"ERROR: 无法创建后台任务日志文件：{exc}"
+        master = slave = None
         try:
+            if tty:
+                import pty
+
+                master, slave = pty.openpty()
+                os.set_blocking(master, False)
             proc = subprocess.Popen(
                 argv,
-                stdin=subprocess.DEVNULL,
-                stdout=log_handle,
-                stderr=subprocess.STDOUT,
+                stdin=slave if tty else subprocess.PIPE if interactive else subprocess.DEVNULL,
+                stdout=slave if tty else log_handle,
+                stderr=slave if tty else subprocess.STDOUT,
                 cwd=cwd,
                 env=env,
                 **(popen_extra or {}),
             )
         except OSError as exc:
+            if master is not None:
+                os.close(master)
             log_handle.close()
             return f"ERROR: 无法启动后台任务：{exc}"
         finally:
+            if slave is not None:
+                os.close(slave)
             #  子进程已继承文件描述符，父进程这份立即关掉（Windows 上不关会锁文件）
             with contextlib.suppress(OSError):
                 log_handle.close()
@@ -404,9 +423,17 @@ class TaskManager:
             description=description or command,
             log_path=log_path,
             proc=proc,
+            interactive=interactive, input_fd=master,
         )
         with self._lock:
             self._tasks[task_id] = task
+        if tty:
+            reader = threading.Thread(target=self._drain_terminal,
+                                      args=(task, os.dup(master)), daemon=True,
+                                      name=f"xiaoyu-{task_id}-terminal")
+            task.output_thread = reader
+            self._threads.append(reader)
+            reader.start()
         TASKS_LIVE.inc()
         watcher = threading.Thread(
             target=self._watch, args=(task, timeout), daemon=True, name=f"xiaoyu-{task_id}"
@@ -421,6 +448,114 @@ class TaskManager:
             self._threads.append(tail)
             tail.start()
         return task
+
+    @staticmethod
+    def _drain_terminal(task: BackgroundTask, fd: int) -> None:
+        import select
+
+        try:
+            with task.log_path.open("ab") as output:
+                while True:
+                    ready, _, _ = select.select([fd], [], [], 0.1)
+                    if ready:
+                        try:
+                            data = os.read(fd, 65536)
+                        except BlockingIOError:
+                            continue
+                        if not data:
+                            break
+                        output.write(data)
+                        output.flush()
+                        if output.tell() > MAX_LOG_BYTES:
+                            task.stopped_for = "输出日志超过上限，已终止"
+                            kill_tree(task.proc)
+                            break
+                    elif task.proc.poll() is not None:
+                        break
+        except OSError:
+            pass  # 终端关闭常以 EIO 表示 EOF
+        finally:
+            os.close(fd)
+
+    @staticmethod
+    def _close_input(task: BackgroundTask) -> None:
+        with task.input_lock:
+            if task.input_fd is not None:
+                with contextlib.suppress(OSError):
+                    os.close(task.input_fd)
+                task.input_fd = None
+            if task.proc.stdin is not None:
+                with contextlib.suppress(OSError):
+                    task.proc.stdin.close()
+
+    def send_input(self, task_id: str, text: str = "", *, eof: bool = False) -> str:
+        task = self.get(task_id)
+        if task is None:
+            return f"ERROR: 未知任务 {task_id}，任务不能跨会话或 resume 继续输入。"
+        if not task.interactive:
+            return "ERROR: 该任务启动时未设置 interactive=true。"
+        data = text.encode("utf-8", errors="replace")
+        if len(data) > 4096:
+            return "ERROR: 单次输入最多 4096 字节，请分段发送。"
+        with task.input_lock:
+            if task.proc.poll() is not None or task.done.is_set():
+                return "ERROR: 任务已经结束，未发送输入。"
+            if text == "\x03" and not eof:
+                if os.name == "nt":
+                    return "ERROR: 此平台不支持输入中断信号，请用 kill_task 终止。"
+                import signal
+
+                group = _group_of(task.proc)
+                try:
+                    if group is not None and group != os.getpgid(0):
+                        os.killpg(group, signal.SIGINT)
+                    else:
+                        task.proc.send_signal(signal.SIGINT)
+                except OSError as exc:
+                    return f"ERROR: 无法中断任务：{exc}"
+                return f"已向 {task_id} 发送中断信号"
+            if task.input_eof or (task.input_fd is None and (task.proc.stdin is None or task.proc.stdin.closed)):
+                return "ERROR: 任务的输入已关闭。"
+            #  写管道也可能阻塞；独立短命写线程 + 有界等待，超时终止任务，不能卡住主循环。
+            failure: list[Exception] = []
+            def write() -> None:
+                try:
+                    if task.input_fd is not None:
+                        import select
+
+                        payload = data + (b"\x04" if eof else b"")
+                        sent = 0
+                        deadline = time.monotonic() + 1.0
+                        while sent < len(payload):
+                            if time.monotonic() >= deadline:
+                                raise TimeoutError("终端暂时不能接受更多输入")
+                            _, ready, _ = select.select([], [task.input_fd], [], 0.05)
+                            if ready:
+                                try:
+                                    sent += os.write(task.input_fd, payload[sent:])
+                                except BlockingIOError:
+                                    continue
+                    else:
+                        task.proc.stdin.write(data)
+                        task.proc.stdin.flush()
+                        if eof:
+                            task.proc.stdin.close()
+                except (OSError, ValueError) as exc:
+                    failure.append(exc)
+            writer = threading.Thread(target=write, daemon=True, name=f"xiaoyu-{task_id}-input")
+            writer.start()
+            writer.join(timeout=1.5)
+            if writer.is_alive():
+                task.stopped_for = "输入阻塞超时，已终止；部分输入可能已送达"
+                kill_tree(task.proc)
+                writer.join(timeout=1.0)
+                self._threads.append(writer)
+                return "ERROR: " + task.stopped_for
+            if failure:
+                return f"ERROR: 输入未完整送达：{failure[0]}；请检查任务输出，勿盲目重发。"
+            if eof:
+                task.input_eof = True
+        return f"已向 {task_id} 发送 {len(data)} 字节" + ("，已发送 EOF" if eof else "")
 
     # ---------- 生命周期 ----------
 
@@ -457,6 +592,9 @@ class TaskManager:
                     break
         except Exception:  # noqa: BLE001 - watcher 线程绝不能带着异常死掉
             pass
+        self._close_input(task)
+        if task.output_thread is not None:
+            task.output_thread.join(timeout=1.0)
         task.exit_code = task.proc.returncode
         task.done.set()
         TASKS_LIVE.dec()
@@ -686,6 +824,8 @@ class TaskManager:
         for task in killed:
             with contextlib.suppress(Exception):
                 task.proc.wait(timeout=max(0.0, deadline - time.monotonic()))
+        for task in self.all():
+            self._close_input(task)
         for thread in self._threads:
             if thread is not threading.current_thread():
                 thread.join(timeout=max(0.0, deadline - time.monotonic()))

@@ -509,6 +509,10 @@ def suggest_allow_rule(name: str, args: dict, workspace: Path) -> Rule | None:
     #  升权只批本次；普通 allow 规则无法兑现「总是允许」的承诺。
     if name == "bash" and str(args.get("sandbox_permissions") or "").strip():
         return None
+    if name == "task_input" or (name == "bash" and args.get("interactive")):
+        return None
+    if name == "apply_patch":
+        return None  # 多目标不能推成一个目录的永久授权
     if name != "bash":
         path = args.get("path")
         if isinstance(path, str) and path:
@@ -831,9 +835,21 @@ class Permissions:
         规则管它、走常规确认。allow 不带规则：它可能来自会话授权或多条规则联合判定，
         没有单一出处，硬给一条反而误导。
         """
+        if name == "apply_patch" and "changes" in args:
+            from .patches import changes_of
+
+            decisions = [self.explain(name, item) for item in changes_of(args)]
+            for behavior in ("deny", "ask"):
+                for decision, rule in decisions:
+                    if decision == behavior and rule is not None:
+                        return decision, rule
+            return ("allow", None) if decisions and all(d[0] == "allow" for d in decisions) else ("ask", None)
         #  转发器调用按它点名的工具判（见 call_identity）。写给转发器本身的规则
         #  （deny use_tool = 所有 MCP 工具）照旧认：两个身份各判一遍
         identities = [call_identity(name, args)]
+        if name == "task_input":
+            # 输入可能是新的 shell 命令，显式 bash deny/ask 仍检查原样文本。
+            identities.append(("bash", {"command": args.get("text", "")}))
         if identities[0][0] != name:
             identities.append((name, args))
         #  1. deny：任一规则命中即拦，bypass-immune
@@ -1012,6 +1028,8 @@ class Permissions:
         """确认框"本会话允许"选项的文案主体；None = 这次调用推不出会话授权范围，
         选项不该出现。一处定义，三个前端（TUI / 明文 / ACP）同用。"""
         name, args = call_identity(name, args)
+        if name == "task_input" or (name == "bash" and args.get("interactive")):
+            return None
         #  沙箱升权必须逐次确认，不提供无法兑现的会话授权选项。
         if name == "bash" and str(args.get("sandbox_permissions") or "").strip():
             return None

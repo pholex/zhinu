@@ -197,6 +197,10 @@ _SUMMARY_FIELDS: dict[str, tuple[tuple[str, str], ...]] = {
     "bash": (("command", ""),),
     "monitor": (("command", ""),),
     "read_file": (("path", ""),),
+    "view_image": (("path", ""),),
+    "wait_for_event": (("timeout", "秒 "),),
+    "read_document": (("path", ""), ("pages", "页 "), ("mode", "")),
+    "task_input": (("task_id", ""),),
     "write_file": (("path", ""),),
     "str_replace": (("path", ""),),
     "grep": (("pattern", ""), ("path", "in "), ("glob", "")),
@@ -236,6 +240,11 @@ def tool_summary(name: str, args: object) -> str:
         inner = str(args.get("tool_name") or "").strip()
         rest = tool_summary(inner, args.get("tool_input") or {}) if inner else ""
         return " ".join(part for part in (inner, rest) if part)
+    if name == "apply_patch":
+        from .patches import changes_of
+
+        changes = changes_of(args)
+        return f"{len(changes)} 个文件：" + ", ".join(str(item.get("path", "?")) for item in changes)
     fields = _SUMMARY_FIELDS.get(name)
     if fields is not None:
         #  值原样给（多行命令的换行由调用方决定怎么画：终端画成 ⏎，ACP 压成空格）
@@ -270,7 +279,7 @@ _JUSTIFICATION_CAP = 160
 def escalation_notice(args: object) -> list[str]:
     """bash 调用带了沙箱升权申请时，确认框要点名的几行（没申请 = 空列表）。
 
-    升权是"必问"三项之一，确认框却只画命令本身的话，用户按下的那个"允许"
+    升权是必问操作之一，确认框却只画命令本身的话，用户按下的那个"允许"
     批的是什么他并不知道——看着是在批一条命令，实际批的是"这次不套沙箱"。
     这几行把档位、后果、模型给的理由一起摆到按键之前，TUI 与纯 CLI 两套
     确认框共用，别各写一份。

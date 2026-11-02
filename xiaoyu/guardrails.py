@@ -62,7 +62,7 @@ LAYERS: tuple[Layer, ...] = (
     ),
     Layer(
         "unattended", "unattended", True,
-        "--yolo 下仍必问的三项（退出 plan、沙箱升权、写可执行配置）", "--unattended",
+        "--yolo 下仍必问的操作（退出 plan、沙箱升权、写可执行配置、交互任务输入）", "--unattended",
     ),
     Layer(
         "mcp_trust_changes", "mcp_trust_changes", True,
