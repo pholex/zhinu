@@ -42,7 +42,9 @@ class FileToolsTest(unittest.TestCase):
         self.box.run("read_file", {"path": path})
         return target
 
-    def test_batch_uses_original_and_preserves_encoding_rewind_artifacts(self):
+    # 与已有编码回归一致，显式测试 UTF-8 → GBK 的回退路径。
+    @mock.patch("xiaoyu.tools.locale.getpreferredencoding", return_value="UTF-8")
+    def test_batch_uses_original_and_preserves_encoding_rewind_artifacts(self, _preferred):
         target = self.file("a", "甲\r\n乙\r\n".encode("gbk"))
         other = self.file("b", b"old\n")
         self.box.rewind.begin("批量替换")
