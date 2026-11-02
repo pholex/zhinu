@@ -33,7 +33,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Collection
 
-from . import askpass, browser, command_check, fsguard, mcp, media, sandbox, tempdirs
+from . import askpass, browser, command_check, fsguard, mcp, media, patches, sandbox, tempdirs
 from .background import (
     MONITOR_DEFAULT_TIMEOUT,
     OUTPUT_READ_BYTES,
@@ -1922,12 +1922,14 @@ class Toolbox:
         公开出来是给 auto 档的放行判定用（modes.auto_approves）——
         "改的是不是工作区内的文件"这个判断只应该有一处实现。
         """
+        if "changes" in args and "path" not in args:
+            return any(self.outside_workspace(item) for item in patches.changes_of(args))
         path = args.get("path")
         if not isinstance(path, str) or not path:
             return False
         try:
             resolved, outside = self._resolve(path)
-        except OSError:
+        except (OSError, RuntimeError):
             #  路径解析不了（符号链接成环等）：按越界算，退回人工确认
             return True
         #  spill 落盘文件按"工作区内"对待：是我们自己写下的工具输出，
@@ -1936,17 +1938,19 @@ class Toolbox:
             return False
         return outside
 
-    def resolved_target(self, args: dict[str, Any]) -> Path | None:
+    def resolved_target(self, args: dict[str, Any]) -> Path | tuple | None:
         """这次调用的路径参数此刻落在哪（resolve 过）。没有路径参数、解析不了返回 None。"""
+        if "changes" in args and "path" not in args:
+            return tuple(self.resolved_target(item) for item in patches.changes_of(args))
         path = args.get("path")
         if not isinstance(path, str) or not path:
             return None
         try:
             return self._resolve(path)[0]
-        except OSError:
+        except (OSError, RuntimeError):
             return None
 
-    def target_moved(self, args: dict[str, Any], reviewed: Path | None) -> str | None:
+    def target_moved(self, args: dict[str, Any], reviewed: Path | tuple | None) -> str | None:
         """过审时路径落在 reviewed，现在要执行了——还落在同一处吗？不是就返回拒因。
 
         "在不在工作区内""是不是可执行配置""命不命中 deny 规则"都是对着过审那一刻
@@ -1962,7 +1966,7 @@ class Toolbox:
         if now == reviewed:
             return None
         return (
-            f"ERROR: {args.get('path')} 在确认之后指向了别处"
+            f"ERROR: {args.get('path') or '补丁目标'} 在确认之后指向了别处"
             f"（过审时是 {reviewed}，现在是 {now or '无法解析'}）——路径上有符号链接被改动。"
             "这次调用没有执行；确认路径无误后重新发起。"
         )
@@ -1974,6 +1978,9 @@ class Toolbox:
         outside_workspace 同一个解析口。解析不了的路径不在这里拦——它会按
         越界走确认。
         """
+        if name == "apply_patch" and "changes" in args:
+            return next((reason for item in patches.changes_of(args)
+                         if (reason := self.guarded_config(name, item))), None)
         tool = self.get(name)
         if tool is None or not tool.requires_approval or name == "bash":
             return None
@@ -1982,7 +1989,7 @@ class Toolbox:
             return None
         try:
             resolved, _ = self._resolve(path)
-        except OSError:
+        except (OSError, RuntimeError):
             return None
         from . import folder_trust
 
@@ -2143,6 +2150,60 @@ class Toolbox:
     # ---------- 内部工具 ----------
 
     def _register_builtins(self) -> None:
+        self.register(Tool(
+            name="apply_patch",
+            description=("一次提交多个文件的精确补丁。changes 每项含 path、operation(create/update/delete)。"
+                         "update 推荐传 edits（old_str/new_str 数组）：每项唯一匹配同一份原文，范围不可重叠；也可传 diff，二者互斥。"
+                         "diff 是不带文件头的 unified diff，使用 @@ -旧行,数量 +新行,数量 @@ 和空格/+/- 行；"
+                         "create 使用 @@ -0,0 +1,N @@；delete 不带 diff。已有文件必须先 read_file，"
+                         "删除须完整读过。先校验全部文件再执行；写盘失败可能部分完成，按返回清单核实，勿整批盲重试。"),
+            parameters={"type": "object", "properties": {"changes": {
+                "type": "array", "minItems": 1, "maxItems": 50,
+                "items": {"type": "object", "properties": {
+                    "path": {"type": "string"},
+                    "operation": {"type": "string", "enum": ["create", "update", "delete"]},
+                    "diff": {"type": "string"},
+                    "edits": {"type": "array", "minItems": 1, "maxItems": 100,
+                              "items": {"type": "object", "properties": {
+                                  "old_str": {"type": "string"}, "new_str": {"type": "string"}},
+                                  "required": ["old_str", "new_str"], "additionalProperties": False}}},
+                    "required": ["path", "operation"],
+                    "additionalProperties": False}}}, "required": ["changes"]},
+            # 路径必须以原始对象参与审批，不在审批后才把字符串还原成目标列表。
+            handler=self._apply_patch, requires_approval=True, coerce_arguments=False,
+        ))
+        self.register(Tool(
+            name="view_image",
+            description=("查看本地 PNG/JPEG/GIF/WEBP 图片，返回图像给模型。"
+                         "crop=[左,上,右,下] 为原图像素坐标，max_size 为缩放后最长边（1–4096），"
+                         "两者均可省略；变换只影响返回图，不改原文件。裁剪缩放需 xiaoyu-agent[image]。"),
+            parameters={"type": "object", "properties": {
+                "path": {"type": "string"},
+                "crop": {"type": ["array", "null"], "items": {"type": "integer"}},
+                "max_size": {"type": ["integer", "null"]}}, "required": ["path"]},
+            handler=self._view_image, requires_approval=False, untrusted=True,
+        ))
+        self.register(Tool(
+            name="read_document",
+            description=("读取本地 PDF。pages 为从 1 起的页码范围，如 1-3,5；默认第 1 页。"
+                         "mode=text 提取带页码正文（最多 20 页），mode=image 返回页面图片（最多 4 页）。"
+                         "扫描页请用 image；不自动 OCR。需安装 xiaoyu-agent[pdf]。"),
+            parameters={"type": "object", "properties": {
+                "path": {"type": "string"}, "pages": {"type": "string"},
+                "mode": {"type": "string", "enum": ["text", "image"]}}, "required": ["path"]},
+            handler=self._read_document, requires_approval=False, untrusted=True,
+        ))
+        self.register(Tool(
+            name="task_input",
+            description=("向 bash(interactive=true) 启动的任务发送原样文本，不自动补换行。"
+                         "输入回车用 text 中的换行；eof=true 发送 EOF；POSIX 单独发送 U+0003 可中断任务。输入可能执行代码，需逐次确认；"
+                         "不用于密码或密钥。输出用 task_output，终止用 kill_task。"),
+            parameters={"type": "object", "properties": {
+                "task_id": {"type": "string"}, "text": {"type": "string"},
+                "eof": {"type": "boolean"}}, "required": ["task_id"]},
+            handler=self._task_input, requires_approval=True,
+            check_fn=lambda: any(task.interactive and not task.done.is_set() for task in self.tasks.all()),
+        ))
         self.register(
             Tool(
                 name="read_file",
@@ -2344,6 +2405,14 @@ class Toolbox:
                                 "更久的用 run_in_background。不要用 sleep 等后台事件：完成时会自动通知你。"
                                 "后台任务默认不受超时约束，显式给了才生效"
                             ),
+                        },
+                        "interactive": {
+                            "type": "boolean",
+                            "description": "保留标准输入并在后台运行，用 task_input 继续输入；不会继承用户终端。",
+                        },
+                        "tty": {
+                            "type": "boolean",
+                            "description": "分配独立伪终端（仅 POSIX，需 interactive=true），适合 REPL / 调试器。",
                         },
                         "run_in_background": {
                             "type": "boolean",
@@ -2757,6 +2826,93 @@ class Toolbox:
         lines = content.count("\n") + (1 if content and not content.endswith("\n") else 0)
         return f"{action}{note} {path}：{len(content)} 字符 / {lines} 行"
 
+    def _view_image(self, path: str, crop: list[int] | None = None,
+                    max_size: int | None = None) -> str:
+        from .images import load_image
+
+        target, _ = self._resolve(path)
+        ref, problem = load_image(target, crop, max_size)
+        if problem:
+            return f"ERROR: {problem}"
+        self.push_media(media.image_part(ref))
+        return f"已读取图片 {path}（{media.label(ref)}）"
+
+    def _read_document(self, path: str, pages: str = "1", mode: str = "text") -> str:
+        from .documents import read_pdf
+
+        target, _ = self._resolve(path)
+        text, images = read_pdf(target, pages, mode)
+        for data in images:
+            ref = media.store(data, "image/png")
+            if not ref:
+                return "ERROR: 页面已渲染，但图片缓存写入失败，请检查临时目录空间与权限。"
+            self.push_media(media.image_part(ref))
+        return text
+
+    def _task_input(self, task_id: str, text: str = "", eof: bool = False) -> str:
+        if self.config.hardline and (reason := hardline_violation(text)):
+            return f"ERROR: 输入被硬性拦截（{reason}）"
+        return self.tasks.send_input(task_id, text, eof=eof)
+
+    def _apply_patch(self, changes: list[dict]) -> str:
+        patches.validate(changes)
+        prepared = []
+        targets: set[Path] = set()
+        for item in changes:
+            path, operation = item["path"], item["operation"]
+            target, _ = self._resolve(path)
+            if target in targets:
+                return f"ERROR: 重复目标 {path}；每个文件只能出现一次。未修改文件。"
+            targets.add(target)
+            if any(target in other.parents or other in target.parents for other in targets - {target}):
+                return "ERROR: 补丁目标之间存在父子路径冲突。未修改文件。"
+            raw, text, encoding = None, "", "utf-8"
+            if operation == "create":
+                if target.exists():
+                    return f"ERROR: {path} 已存在，create 不覆盖文件。未修改文件。"
+            else:
+                if error := _unreadable_file_error(target, path):
+                    return error + "；未修改文件。"
+                if error := self._guard_known(target, path, whole=operation == "delete"):
+                    return error + "；未修改文件。"
+                text, encoding, raw = _read_for_edit(target)
+            updated = None if operation == "delete" else patches.apply_change(text, item)
+            if updated is not None and (error := _unencodable_error(path, updated, encoding)):
+                return error + "；未修改文件。"
+            prepared.append((item, target, raw, text, encoding, updated))
+        completed = []
+        for index, (item, target, raw, text, encoding, updated) in enumerate(prepared):
+            try:
+                if self._resolve(item["path"])[0] != target:
+                    raise OSError("目标路径在校验后被替换")
+                if raw is None:
+                    if target.exists():
+                        raise OSError("新文件目标在校验后已存在")
+                else:
+                    fsguard.require_regular(target)
+                    if target.read_bytes() != raw:
+                        raise OSError("文件在校验后被外部修改")
+                self.rewind.record(target, raw)
+                if updated is None:
+                    target.unlink()
+                    self._reads.pop(target, None)
+                    self.artifacts.removed(target)
+                    self.rewind.written(target, None)
+                else:
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    written = _write_edit(target, text, updated, encoding, raw) if raw is not None else updated.encode("utf-8")
+                    if raw is None:
+                        fsguard.write_atomic(target, written, check_writable=True)
+                    self._mark_read(target, keep_level=raw is not None, raw=written)
+                    self.artifacts.written(target, raw, written)
+                    self.rewind.written(target, written)
+                completed.append(f'{item["operation"]} {item["path"]}')
+            except OSError as exc:
+                pending = ", ".join(entry[0]["path"] for entry in prepared[index + 1:]) or "无"
+                return (f"ERROR: {item['path']} 操作失败：{exc}。请核实该文件状态。\n"
+                        f"已完成：{'; '.join(completed) or '无'}\n未执行：{pending}")
+        return "补丁已应用：\n" + "\n".join(completed)
+
     def _str_replace(self, path: str, old_str: str, new_str: str) -> str:
         target, outside = self._resolve(path)
         if not target.exists():
@@ -3140,6 +3296,8 @@ class Toolbox:
         description: str,
         timeout: float | None,
         escalation: str | None = None,
+        interactive: bool = False,
+        tty: bool = False,
     ) -> str:
         """后台进程的统一入口：进程策略在这里拼好，生命周期交给 TaskManager。"""
         if self.config.hardline and (reason := hardline_violation(command)):
@@ -3156,6 +3314,7 @@ class Toolbox:
             env=_hardened_env(self.config.extra_env),
             timeout=timeout,
             popen_extra=_subprocess_hardening(),
+            interactive=interactive, tty=tty,
         )
         if isinstance(started, str):
             return started
@@ -3216,13 +3375,17 @@ class Toolbox:
         command: str,
         timeout: int | None = None,
         run_in_background: bool = False,
+        interactive: bool = False,
+        tty: bool = False,
         sandbox_permissions: str | None = None,
         justification: str | None = None,
     ) -> str:
         if error := self._check_escalation(sandbox_permissions, justification):
             return error
         escalation = sandbox_permissions
-        if run_in_background:
+        if tty and not interactive:
+            return "ERROR: tty=true 必须与 interactive=true 一起使用。"
+        if run_in_background or interactive:
             command = command.rstrip()
             if command.endswith("&"):
                 return (
@@ -3233,7 +3396,7 @@ class Toolbox:
             return self._spawn_background(
                 command, kind="command", description=command,
                 timeout=float(timeout) if timeout else None,
-                escalation=escalation,
+                escalation=escalation, interactive=interactive, tty=tty,
             )
         #  硬红线查表（Config.hardline）：XIAOYU_HARDLINE=0 / --unguarded 关掉它——
         #  内部运维（镜像烧录、格式化）在隔离环境里确有 dd of=/dev/… 的真实需求

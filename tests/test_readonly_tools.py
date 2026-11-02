@@ -288,8 +288,8 @@ class TestReadonlySubset(ReadonlyToolsTestCase):
         self.assertEqual(
             sorted(self.box.names()),
             [
-                "bash", "browser", "grep", "kill_task", "list_files", "monitor",
-                "read_file", "recall", "str_replace", "task_output", "write_file",
+                "apply_patch", "bash", "browser", "grep", "kill_task", "list_files", "monitor",
+                "read_document", "read_file", "recall", "str_replace", "task_input", "task_output", "view_image", "write_file",
             ],
         )
 

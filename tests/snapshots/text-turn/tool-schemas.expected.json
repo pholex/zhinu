@@ -1,6 +1,136 @@
 [
   {
     "function": {
+      "description": "一次提交多个文件的精确补丁。changes 每项含 path、operation(create/update/delete)。update 推荐传 edits（old_str/new_str 数组）：每项唯一匹配同一份原文，范围不可重叠；也可传 diff，二者互斥。diff 是不带文件头的 unified diff，使用 @@ -旧行,数量 +新行,数量 @@ 和空格/+/- 行；create 使用 @@ -0,0 +1,N @@；delete 不带 diff。已有文件必须先 read_file，删除须完整读过。先校验全部文件再执行；写盘失败可能部分完成，按返回清单核实，勿整批盲重试。",
+      "name": "apply_patch",
+      "parameters": {
+        "properties": {
+          "__tool_use_purpose": {
+            "description": "先生成此字段，用一句话说明调用目的；再生成路径、命令或正文。会展示给用户。",
+            "type": "string"
+          },
+          "changes": {
+            "items": {
+              "additionalProperties": false,
+              "properties": {
+                "diff": {
+                  "type": "string"
+                },
+                "edits": {
+                  "items": {
+                    "additionalProperties": false,
+                    "properties": {
+                      "new_str": {
+                        "type": "string"
+                      },
+                      "old_str": {
+                        "type": "string"
+                      }
+                    },
+                    "required": [
+                      "old_str",
+                      "new_str"
+                    ],
+                    "type": "object"
+                  },
+                  "maxItems": 100,
+                  "minItems": 1,
+                  "type": "array"
+                },
+                "operation": {
+                  "enum": [
+                    "create",
+                    "update",
+                    "delete"
+                  ],
+                  "type": "string"
+                },
+                "path": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "path",
+                "operation"
+              ],
+              "type": "object"
+            },
+            "maxItems": 50,
+            "minItems": 1,
+            "type": "array"
+          }
+        },
+        "required": [
+          "changes"
+        ],
+        "type": "object"
+      }
+    },
+    "type": "function"
+  },
+  {
+    "function": {
+      "description": "查看本地 PNG/JPEG/GIF/WEBP 图片，返回图像给模型。crop=[左,上,右,下] 为原图像素坐标，max_size 为缩放后最长边（1–4096），两者均可省略；变换只影响返回图，不改原文件。裁剪缩放需 xiaoyu-agent[image]。",
+      "name": "view_image",
+      "parameters": {
+        "properties": {
+          "crop": {
+            "items": {
+              "type": "integer"
+            },
+            "type": [
+              "array",
+              "null"
+            ]
+          },
+          "max_size": {
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "path": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "path"
+        ],
+        "type": "object"
+      }
+    },
+    "type": "function"
+  },
+  {
+    "function": {
+      "description": "读取本地 PDF。pages 为从 1 起的页码范围，如 1-3,5；默认第 1 页。mode=text 提取带页码正文（最多 20 页），mode=image 返回页面图片（最多 4 页）。扫描页请用 image；不自动 OCR。需安装 xiaoyu-agent[pdf]。",
+      "name": "read_document",
+      "parameters": {
+        "properties": {
+          "mode": {
+            "enum": [
+              "text",
+              "image"
+            ],
+            "type": "string"
+          },
+          "pages": {
+            "type": "string"
+          },
+          "path": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "path"
+        ],
+        "type": "object"
+      }
+    },
+    "type": "function"
+  },
+  {
+    "function": {
       "description": "读取文本文件内容。路径相对当前工作区解析。图片（png / jpg / gif / webp）也用它：图会直接交给你看。大文件可以用 offset（起始行号，从 1 开始）和 limit（最多读多少行）只读一段。修改任何文件之前必须先读过它：局部修改（str_replace）读过要改的那一段即可，整体覆盖（write_file）要把全部内容都读到（分段读完也算）。",
       "name": "read_file",
       "parameters": {
@@ -166,6 +296,10 @@
             "description": "要执行的命令",
             "type": "string"
           },
+          "interactive": {
+            "description": "保留标准输入并在后台运行，用 task_input 继续输入；不会继承用户终端。",
+            "type": "boolean"
+          },
           "run_in_background": {
             "description": "true = 后台运行：立即返回 task id，命令继续跑，完成时自动通知你。用 task_output 查看输出、kill_task 终止",
             "type": "boolean"
@@ -176,6 +310,10 @@
               "integer",
               "null"
             ]
+          },
+          "tty": {
+            "description": "分配独立伪终端（仅 POSIX，需 interactive=true），适合 REPL / 调试器。",
+            "type": "boolean"
           }
         },
         "required": [
@@ -216,6 +354,24 @@
           "command",
           "description"
         ],
+        "type": "object"
+      }
+    },
+    "type": "function"
+  },
+  {
+    "function": {
+      "description": "等待后台任务完成、monitor 通知或协作消息；有待处理事件立即返回。timeout 为 0–600 秒，默认 60，0 仅检查；用户插话或取消会提前结束。不启动任务、不自动重试、不等待已送达的旧事件；任务详情用 task_output。",
+      "name": "wait_for_event",
+      "parameters": {
+        "properties": {
+          "timeout": {
+            "maximum": 600,
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [],
         "type": "object"
       }
     },

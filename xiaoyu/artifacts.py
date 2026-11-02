@@ -70,6 +70,14 @@ class ArtifactCollector:
             source="file_tool", mime_type=mimetypes.guess_type(relative)[0],
         )
 
+    def removed(self, path: Path) -> None:
+        """已删除的文件不能继续作为本轮可下载产物。"""
+        try:
+            _, relative = self._path(path)
+        except (ValueError, OSError):
+            return
+        self._items.pop(relative, None)
+
     def report(self, path: str | Path) -> None:
         """业务工具显式交付文件。越界、特殊文件和失效路径均拒绝。"""
         if not self.active:

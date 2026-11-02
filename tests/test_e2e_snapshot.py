@@ -81,6 +81,7 @@ SCENARIOS = (
     Scenario("cancel-before-tool", "尝试写文件，执行前中断", args=("--yolo",), recorded=False, expect_exit=130),
     Scenario("bounded-hook-output", "验证长钩子输出", recorded=False),
     Scenario("content-rejection", "处理服务端内容拒绝", recorded=False, expect_exit=1),
+    Scenario("patch-turn", "创建并修改两份文件，删除其中一份", args=("--yolo",), recorded=False),
     Scenario("file-delivery", "生成 report.txt 并交付", args=("--yolo",), recorded=False),
 )
 
@@ -528,8 +529,15 @@ class ContentRejectionSnapshot(SnapshotCase):
 
 class FileDeliverySnapshot(SnapshotCase):
     def test_scenario(self) -> None:
-        self.check_scenario(SCENARIOS[9])
+        self.check_scenario(next(sc for sc in SCENARIOS if sc.name == "file-delivery"))
         self.assertEqual((self.workspace / "report.txt").read_bytes(), b"artifact result\n")
+
+
+class PatchSnapshot(SnapshotCase):
+    def test_scenario(self) -> None:
+        self.check_scenario(next(sc for sc in SCENARIOS if sc.name == "patch-turn"))
+        self.assertEqual((self.workspace / "a.txt").read_bytes(), b"new\n")
+        self.assertFalse((self.workspace / "b.txt").exists())
 
 
 class UnconsumedGuardTest(SnapshotCase):

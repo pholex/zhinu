@@ -2513,6 +2513,18 @@ class Tui:
                 str(shown.get("new_str", "")),
             )
             self.sink.note_previewed()
+        elif name in {"apply_patch", "task_input"}:
+            from .patches import preview
+
+            content = preview(shown) if name == "apply_patch" else (
+                f"向 {shown.get('task_id')} 输入（可能执行代码）：\n"
+                f"{args.get('text', '')!r}\nEOF={bool(args.get('eof'))}"
+            )
+            rows = render.clean_value(content).splitlines()
+            self.console.print(Text("\n".join(rows[:80])))
+            if len(rows) > 80:
+                self.console.print(Text(f"还有 {len(rows) - 80} 行，Ctrl-O 展开全文"))
+                expand = lambda: self.console.print(Text("\n".join(rows)))
         elif name == "bash":
             #  升权申请先于命令风险点名：按下"允许"批的是"这次不套沙箱"，
             #  而不只是这条命令本身，用户得在按键前看到

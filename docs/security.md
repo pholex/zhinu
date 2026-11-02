@@ -4,7 +4,7 @@
 
 ## 确认与权限规则
 
-`bash` 会在你机器上执行模型给出的任意命令，`write_file` / `str_replace` 会改你的文件。确认档每条都要你确认（附模型自述的用途和 diff 预览）；出厂的 auto 档把沙箱兜得住的那部分免掉，其余照问。
+`bash` 会在你机器上执行模型给出的任意命令，`write_file` / `str_replace` / `apply_patch` 会改你的文件。确认档每条都要你确认（附模型自述的用途和 diff 预览）；出厂的 auto 档把沙箱兜得住的那部分免掉，其余照问。
 
 - `/allow` / `/deny` 配权限规则：命中 allow 免确认，命中 deny 强制拦截。确认框里的「总是允许」
   与「以后都拒绝」写的就是这两种规则（预填推导出的范围，写入前可编辑；ACP 面对应
@@ -14,9 +14,34 @@
   `deny bash(curl *)` 按命令本身认，不按写法认：`/usr/bin/curl`、`env curl`、`"curl"`、`FOO=1 curl`、`bash -c 'curl …'`、`$(curl …)` 都拦。它仍是按字面匹配的规则而不是沙箱——脚本文件里写的、解释器里拼出来的命令它看不见，要挡住出网得靠沙箱的网络策略。
   还有一档 `ask`（如 `ask bash(git push*)`）：介于放行和拦死之间——别的照常自动跑，唯独点了名的这几样先问你。它在 auto 档、`--yolo`、答过「本会话允许」、有更宽的 allow 规则时照样问；匹配口径与 deny 相同。`--unattended` 会把它和别的必问一起放开（无人值守里没人按键），要硬拦请用 deny。
   规则文件（`<用户配置目录>/permissions.txt`，受信工作区另读 `.xiaoyu/permissions.txt`）一行一条，行尾可带 `# 注释`，路径模式里的 `~` 会展开。**写坏的行不会悄悄消失**：解析不了的行、读不了的文件、多半叫错名字的工具（`Bash`、`shell`）启动时逐条报到 stderr——一条没生效的 deny 等于护栏没了，得让你看见。
-- **写可执行配置必问**：`.mcp.json`、`.env`、`.xiaoyu/`、`.git/` 之下的文件由 `write_file` / `str_replace` 改动时，auto 档、`--yolo`、allow 规则都免不掉这一问（任意子目录里的同名文件、指过去的符号链接一样算）。这一笔写下去，下次启动拉起什么进程、哪些命令免确认就由模型说了算，等于模型给自己的下一次运行放权。
+- **写可执行配置必问**：`.mcp.json`、`.env`、`.xiaoyu/`、`.git/` 之下的文件由 `write_file` / `str_replace` / `apply_patch` 改动时，auto 档、`--yolo`、allow 规则都免不掉这一问（任意子目录里的同名文件、指过去的符号链接一样算）。这一笔写下去，下次启动拉起什么进程、哪些命令免确认就由模型说了算，等于模型给自己的下一次运行放权。
 - **过审的落点执行前再核一次**：确认框挂着的那段时间里，路径上某一级被换成指向别处的符号链接的话，这次调用不执行。这把窗口从"你按键的几秒到几分钟"收到了两次系统调用之间，没有彻底关上。
 - `exit_plan_mode` 的审批同样 bypass-immune：`--yolo` 也要问。否则模型能自行退出 plan 档，"批准后才执行"就是空话。无人值守里确实没人按键时用 `--unattended` 显式放开（见文末[放开护栏](#放开护栏unattended--xiaoyu_hardline0--trustcontent--unguarded)）。
+
+## 多文件补丁与交互输入
+
+`apply_patch` 按每个目标路径检查权限：任一目标命中 deny 就拒绝整批，任一目标
+命中 ask 就确认；allow 路径规则必须覆盖全部目标。可执行配置、工作区外路径、
+审批后符号链接落点变化的检查同样覆盖全部目标。已有文件须先读过且版本未变，
+删除须完整读过。先验证全部补丁再写盘；写盘失败可能部分完成，结果列出已完成、
+失败与未执行项。补丁改动接入文件回退快照。
+
+`bash(interactive=true)` 启动独立的后台输入通道，不继承用户终端；命令沿用
+原有沙箱、环境清理和硬红线。启动交互任务及每次 `task_input` 都是必问操作，
+不因 auto、`--yolo`、allow 或会话授权而免问；无人值守可显式用 `--unattended`
+关闭这层确认。`deny task_input` 禁止所有输入；输入原文也检查 bash 的 deny/ask
+规则及硬红线。REPL 的语言、分段输入和进程内部状态无法靠 shell 字面规则完整
+理解，因此不能把启动命令的授权当成后续输入授权。不要通过模型传递密码或密钥。
+任务仅在当前会话进程内有效，resume 后不能继续向旧任务输入。
+
+`apply_patch` 的 `edits` 批量替换形式与 `diff` 共用全部路径、版本和写入保护；
+每项都在原文唯一匹配且范围不能重叠，整批预检失败不会写盘。
+
+`view_image` 沿用文件读取的路径审批与媒体通道；裁剪缩放只写媒体缓存，不改源文件。
+`wait_for_event` 只等待现有通知与信箱，不启动命令、不产生对外消息。
+
+`read_document` 沿用文件工具的路径审批，正文标为不可信外部内容；页面图走已有
+媒体缓存与模型视觉能力检查。不自动执行文档脚本、打开链接或调用 OCR。
 
 ## 模式与沙箱
 
@@ -64,7 +89,7 @@ macOS 常用诊断的回归范围（auto 档、无额外 `ask` / `deny` 规则�
 
 小羽自己在沙箱外跑的程序（搜索用的 `rg` / `grep`、宿主侧的 `git`）只在沙箱写不进去的 `PATH` 目录里找、按绝对路径起——在项目里激活了 venv 再启动时 `PATH` 打头就是工作区里的目录，不这样的话往里放一个同名程序，下一次搜索就替它在沙箱外执行了。你自己配置的命令（MCP server、hooks）不受此限，照你的 `PATH` 解析。
 
-工作区里有一处例外：`.mcp.json` 与 `.xiaoyu/` 在沙箱内只读——它们是小羽下次启动时会执行或据以放权的配置，不该被一条免确认的命令顺手改掉。要改就用 `write_file` / `str_replace`（会问你）。已知边界：Linux 上 bubblewrap 只压得住**已存在**的路径，凭空新建的 `.mcp.json` 挡不住；`.env` 与 `.git/` 里的 hooks、config 沙箱内照常可写（`cp .env.example .env`、`git push -u` 这些日常动作要用）。这两处由工作区信任门兜底：配置内容变了，下次启动会重新问你。
+工作区里有一处例外：`.mcp.json` 与 `.xiaoyu/` 在沙箱内只读——它们是小羽下次启动时会执行或据以放权的配置，不该被一条免确认的命令顺手改掉。要改就用 `write_file` / `str_replace` / `apply_patch`（会问你）。已知边界：Linux 上 bubblewrap 只压得住**已存在**的路径，凭空新建的 `.mcp.json` 挡不住；`.env` 与 `.git/` 里的 hooks、config 沙箱内照常可写（`cp .env.example .env`、`git push -u` 这些日常动作要用）。这两处由工作区信任门兜底：配置内容变了，下次启动会重新问你。
 
 ## `--yolo`：自动化给满
 
@@ -73,9 +98,9 @@ macOS 常用诊断的回归范围（auto 档、无额外 `ask` / `deny` 规则�
 - bash 照常跑在内核级沙箱里（`--yolo` 只关审批，不关沙箱）；
 - `deny` 规则一条都不放行；
 - `rm -rf /`、fork bomb 一类不可逆命令任何模式下都不执行；
-- `exit_plan_mode` 与沙箱升权仍要你批准（升权的确认框会写明申请的档位、批下去的后果与模型给的理由），跨会话消息默认不收。
+- `exit_plan_mode`、沙箱升权及交互任务启动与输入仍要你批准（升权的确认框会写明申请的档位、批下去的后果与模型给的理由），跨会话消息默认不收。
 
-这四条里有三条是可以再放开的（硬红线、三处必问、沙箱），怎么放见下文[放开护栏](#放开护栏unattended--xiaoyu_hardline0--trustcontent--unguarded)。
+这四条里有三条是可以再放开的（硬红线、必问操作、沙箱），怎么放见下文[放开护栏](#放开护栏unattended--xiaoyu_hardline0--trustcontent--unguarded)。
 
 两点差别值得知道：**`--yolo` 不像 auto 那样把"沙箱可用"当放行前提**——在没有沙箱的平台上（Windows、没装 bubblewrap、`--no-sandbox`），它是真的全放行，bash 能写你有权限的任何地方；另外它刻意不在 Shift-Tab 循环里，得显式敲命令行参数进去。
 
@@ -203,7 +228,7 @@ token 鉴权、会话工作区范围、目录信任、deny 规则、不可逆命
 |---|---|---|
 | bash 硬红线（`rm -rf /`、`mkfs`、`dd of=/dev/…`） | `XIAOYU_HARDLINE=0`（默认开，与 `XIAOYU_SANDBOX` 同形态） | 隔离环境里做镜像烧录、格式化 |
 | 搜索工具的敏感文件过滤（`grep` / `list_files` 不碰 `.env`、私钥、`.ssh/`） | `XIAOYU_SEARCH_SENSITIVE=0`（默认开） | 隔离环境里确实要在凭据目录里搜 |
-| `--yolo` 下仍必问的三项（`exit_plan_mode`、沙箱升权、写可执行配置） | `--unattended`（或 `XIAOYU_UNATTENDED=1`） | 无人值守：没人按键，卡住等于任务死掉 |
+| `--yolo` 下仍必问的操作（`exit_plan_mode`、沙箱升权、写可执行配置、交互任务启动与输入） | `--unattended`（或 `XIAOYU_UNATTENDED=1`） | 无人值守：没人按键，卡住等于任务死掉 |
 | 某个 MCP server 的结果不套 `<untrusted_content>` | 该 server 声明里 `"trustContent": true` | 内网 runbook / 工单系统——你就是想让模型照它说的做 |
 | 逐条审批 / 沙箱 / 工作区信任门 / MCP 变更隔离 | `--yolo` / `--no-sandbox` / `--trust` / `XIAOYU_MCP_TRUST_CHANGES=1` | 原有开关，不变 |
 

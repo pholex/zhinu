@@ -28,6 +28,10 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+# 图片裁剪与缩放；原图读取不需要此扩展。
+image = ["pillow==13.0.0"]
+# PDF 文本提取与页面渲染；未安装时 read_document 给出安装提示。
+pdf = ["pypdfium2==5.14.0"]
 sdk = ["jsonschema==4.26.0"]
 # TUI 前端（输入补全/跨会话历史/底部状态栏/富文本确认框）。
 # 可选：缺包时自动退回明文 REPL。同主依赖一样精确锁版本；
