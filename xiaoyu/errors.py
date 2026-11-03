@@ -95,6 +95,10 @@ class StreamFailed(RuntimeError):
     """
 
 
+class StreamLifetimeExceeded(RuntimeError):
+    """用户指定的流总时限耗尽；不自动重试，避免再次花掉同一份时间预算。"""
+
+
 class FirstChunkTimeout(RuntimeError):
     """请求发出后等第一个流事件超过了 XIAOYU_FIRST_CHUNK_TIMEOUT（agent._stream_once 抛）。
 
@@ -448,6 +452,8 @@ def classify(exc: Exception) -> Verdict:
     if isinstance(exc, StreamTruncated):
         #  先于文本判定：断流描述里的措辞不该撞上任何 marker
         return Verdict("transient", True, False, "流在工具参数写到一半时断开")
+    if isinstance(exc, StreamLifetimeExceeded):
+        return Verdict("fatal", False, False, str(exc))
     if isinstance(exc, FirstChunkTimeout):
         #  先于文本判定：报错原文已点名触发的设置，原样交给用户
         return Verdict("transient", True, False, str(exc))

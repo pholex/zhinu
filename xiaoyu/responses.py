@@ -832,7 +832,9 @@ class _Completions:
 
             messages = textcalls.to_text_messages(messages, tools)
             result = self._dispatch(model, messages, stream, stream_options, None, extra)
-            return textcalls.stream_chunks(result) if stream else textcalls.to_completion(result)
+            from .streaming import translate_stream
+
+            return translate_stream(result, textcalls.stream_chunks) if stream else textcalls.to_completion(result)
         return self._dispatch(model, messages, stream, stream_options, tools, extra)
 
     def _dispatch(
@@ -869,7 +871,9 @@ class _Completions:
             api = client.beta.messages if request.get("betas") else client.messages
             if not stream:
                 return anthro.to_completion(api.create(**request))
-            return anthro.stream_chunks(api.create(stream=True, **request))
+            from .streaming import translate_stream
+
+            return translate_stream(api.create(stream=True, **request), anthro.stream_chunks)
         #  服务端压缩只有 Anthropic 一路认；chat / Responses 两路在此摘掉私有键，
         #  别让它漏成上游 400（Responses 的 compact_threshold 是另一套，待接）
         extra = {k: v for k, v in extra.items() if k not in ("_compaction", "_task_budget")}
@@ -888,7 +892,9 @@ class _Completions:
             request["prompt_cache_key"] = cache_key
         if not stream:
             return to_completion(self._inner.responses.create(**request))
-        return stream_chunks(iter(self._inner.responses.create(stream=True, **request)))
+        from .streaming import translate_stream
+
+        return translate_stream(self._inner.responses.create(stream=True, **request), stream_chunks)
 
     def _chat(
         self,

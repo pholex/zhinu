@@ -88,6 +88,41 @@ SCENARIOS = (
 _PIN = next(sc for sc in SCENARIOS if sc.pins_header)
 
 
+class RuntimeIntegritySnapshot(AgentTestCase):
+    """真实工具结果进入下一次模型请求；转写损失与指令缺口的可见面一起钉住。"""
+
+    def test_scenario(self) -> None:
+        from xiaoyu import compaction, mcp
+        from xiaoyu.agent import collect_project_docs
+        from xiaoyu.tools import Tool
+
+        agent = self.build([
+            [chunk(tool_calls=[call_fragment(0, "query", "fixture_query", "{}")]), usage_chunk(10, 2)],
+            [chunk(content="查到记录 42。"), usage_chunk(30, 3)],
+        ])
+        agent.toolbox.register(Tool("fixture_query", "查询", {}, lambda: mcp._render_result({
+            "content": [{"type": "text", "text": "查询成功"}],
+            "structuredContent": {"rows": [{"id": 42, "status": "ready"}]},
+        })[0], requires_approval=False))
+        with mock.patch.object(agent, "emit") as emitted:
+            agent.send("查记录")
+        path = self.root / "AGENTS.md"
+        path.write_text("intro\n## 发布规则\n发布前验证\n", encoding="utf-8")
+        with mock.patch("xiaoyu.agent.project_levels", return_value=[self.root]):
+            docs = collect_project_docs(self.root, ("AGENTS.md",), cap=6)
+        actual = {
+            "events": [normalize_event(c.args[0].to_dict(), str(self.root)) for c in emitted.call_args_list],
+            "next_request_tool_results": [m["content"] for m in self.client.completions.calls[-1]["messages"] if m["role"] == "tool"],
+            "instructions": docs[0][1].replace(str(self.root), "<WORKSPACE>").replace("\\", "/"),
+            "coverage": compaction.transcript_coverage(["甲" * 100, "乙" * 100, "丙" * 100], 80),
+        }
+        fixture = Path(__file__).parent / "fixtures" / "runtime_integrity.expected.json"
+        if MODE == "refresh":
+            fixture.write_text(json.dumps(actual, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        self.assertEqual(actual, json.loads(fixture.read_text(encoding="utf-8", errors="replace")))
+        self.assertIn('"id": 42', actual["next_request_tool_results"][0])
+
+
 class AskUserCancelSnapshot(AgentTestCase):
     """终端问答的 keyless 场景；headless CLI 不暴露 asker，故在此注入真实明文前端。"""
 

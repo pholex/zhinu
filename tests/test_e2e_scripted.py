@@ -85,6 +85,8 @@ class E2ECase(unittest.TestCase):
             "XDG_CONFIG_HOME": str(Path(self.tmp) / "config"),
             "APPDATA": str(Path(self.tmp) / "config"),
             "XIAOYU_ENABLE_SKILLS": "0",
+            "XIAOYU_STREAM_MAX_LIFETIME": "0",
+            "XIAOYU_SUMMARY_RETRY_COOLDOWN": "0",
             "XIAOYU_ENABLE_PLUGINS": "0",
             "XIAOYU_ENABLE_MCP": "0",
             "XIAOYU_ENABLE_HOOKS": "0",

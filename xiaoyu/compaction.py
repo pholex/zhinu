@@ -459,9 +459,35 @@ def clamp(text: str, cap: int = MAX_TRANSCRIPT_CHARS) -> str:
     """超长 transcript 砍中段，保头保尾。"""
     if len(text) <= cap:
         return text
-    head = int(cap * 0.4)
+    if cap <= len(_ELLIPSIS):
+        return text[:max(0, cap)]
+    head = min(int(cap * 0.4), cap - len(_ELLIPSIS))
     tail = cap - head - len(_ELLIPSIS)
-    return text[:head] + _ELLIPSIS + text[-tail:]
+    return text[:head] + _ELLIPSIS + (text[-tail:] if tail else "")
+
+
+def transcript_coverage(records: list[str], cap: int) -> dict[str, int]:
+    """转写文本的截取覆盖率；不冒充原始消息或主模型前缀重放的覆盖率。"""
+    total = len("\n".join(records))
+    if total <= cap:
+        ranges = [(0, total)]
+    elif cap <= len(_ELLIPSIS):
+        ranges = [(0, max(0, cap))]
+    else:
+        head = min(int(cap * 0.4), cap - len(_ELLIPSIS))
+        tail = cap - head - len(_ELLIPSIS)
+        ranges = [(0, head), (total - tail, total)]
+    shown = sum(end - start for start, end in ranges)
+    sampled = partial = offset = 0
+    for record in records:
+        kept = sum(max(0, min(offset + len(record), end) - max(offset, start)) for start, end in ranges)
+        sampled += int(kept > 0)
+        partial += int(0 < kept < len(record))
+        offset += len(record) + 1
+    return {"transcript_chars": total, "transcript_sampled_chars": shown,
+            "transcript_omitted_chars": total - shown, "transcript_records": len(records),
+            "transcript_sampled_records": sampled, "transcript_partial_records": partial,
+            "transcript_omitted_records": len(records) - sampled}
 
 
 # ---------- 最后手段：服务端报超窗、摘要压缩又缩不动时 ----------
@@ -836,16 +862,18 @@ class Compactor:
         original, previous_summary = (
             split_head(media.text_of(messages[1].get("content"))) if has_task else ("", "")
         )
-        transcript = render(older, self.synthetic_user_texts)
+        records = [text for message in older if (text := render([message], self.synthetic_user_texts))]
         if previous_summary:
             #  上一次的摘要要一起重新摘要，否则多次压缩会层层累加
-            transcript = f"【此前的压缩摘要】\n{previous_summary}\n\n【之后的新内容】\n{transcript}"
+            records.insert(0, f"【此前的压缩摘要】\n{previous_summary}\n\n【之后的新内容】")
+        transcript = "\n".join(records)
 
         #  前缀 = 被压缩区间的**逐字消息**（含 system 与任务头；find_cut 保证
         #  切点不劈开 tool 配对）。summarizer 路由到主模型那一腿时用它做
         #  前缀重放，其余腿用渲染转写——两种姿势由 summarizer 自己按路由选。
         prefix = messages[:cut]
         try:
+            self.last_attempt.update(transcript_coverage(records, self.transcript_cap))
             summary = self.summarizer(clamp(transcript, self.transcript_cap), prefix)
         except Exception:  # noqa: BLE001 - 压缩失败必须保住历史
             #  降级阶梯：失败最常见的原因是
@@ -853,6 +881,7 @@ class Compactor:
             #  减半再试一次，还失败才放弃。摘要模型链的回退在 summarizer 内部，
             #  走到这里说明整条链都没接住，只能从输入侧想办法。
             try:
+                self.last_attempt.update(transcript_coverage(records, self.transcript_cap // 2))
                 summary = self.summarizer(clamp(transcript, self.transcript_cap // 2), prefix)
             except Exception as exc:  # noqa: BLE001
                 return self._fail(

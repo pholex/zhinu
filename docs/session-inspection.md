@@ -37,6 +37,15 @@ xiaoyu sessions inspect 1 --kind compact --kind approval --limit 50
 表示该次摘要尝试实际返回的历史；放弃候选时回收量为零。`duration_ms` 包含摘要调用与
 候选构造，不含后续日志写入。这些新增字段不包含正文、路径或异常原文。
 
+进入摘要调用后还记录转写文本的 `transcript_chars`、`transcript_sampled_chars`、
+`transcript_omitted_chars`，以及 `transcript_records`、`transcript_sampled_records`、
+`transcript_partial_records`、`transcript_omitted_records`。字符数包含记录间的换行，
+不含新插入的省略标记；记录是非空消息转写，上轮摘要另算一条。缩短输入重试时这些数字
+对应最后一次尝试。它们衡量的是**已转写文本的二次截取**，不包括工具输出在转写时
+已经省掉的内容，也不是完整原始会话的覆盖率。`summary_input_mode` 区分 `transcript`
+（使用这份转写）与 `prefix`（主模型成功使用历史前缀，转写覆盖率不适用于实际输入），
+`summary_route` 标出该次摘要路由。以上字段可用 `--raw` 或 `--json` 查看。
+
 默认摘要至多 240 字符；`--raw` 添加完整记录字段，仍做凭据脱敏与终端控制字符
 清理。它会包含记录中的对话、参数与工具正文，不等于仅含运行指标的报告。
 `--json` 输出相同结构，适合宿主进一步处理。读取使用固定文件大小边界，检查正在

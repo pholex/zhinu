@@ -1562,6 +1562,9 @@ class Toolbox:
         # Host text processing runs before recall persistence and output clipping.
         self.result_transform: Callable[[str, dict[str, Any], str], str] | None = None
         self._tools: dict[str, Tool] = {}
+        # 插件依赖的短暂抖动不应反复增删请求前缀；执行时仍实时检查。
+        self._plugin_probes: dict[str, tuple[Tool, float, bool]] = {}
+        self._plugin_advertised: set[str] = set()
         #  后台任务表（bash run_in_background / monitor）。通知回调由 Agent
         #  注入（agent.__init__ 里 tasks.notify = self.notify）；受限子集
         #  （explore 的 READONLY）没有 bash，这张表闲置无害。
@@ -1604,6 +1607,7 @@ class Toolbox:
                 #  不许覆盖内置工具：同名插件直接忽略（fail-closed）
                 if tool.name not in self._tools:
                     self.register(tool)
+                    self._plugin_probes[tool.name] = (tool, 0.0, False)
         #  MCP server 工具：后台懒加载（不阻塞启动）。默认走**检索模式**：
         #  工具不进 schema，由 search_tool 按需
         #  检索、use_tool 调用——工具集会话内稳定，prompt cache 不再被中途连上
@@ -1910,7 +1914,21 @@ class Toolbox:
         #  顺序 = 注册顺序（dict 保序），会话内必须稳定：工具列表是每轮请求的
         #  前缀之一，顺序一变 prompt cache 全部作废。不要 sort、不要中途重排。
         self._absorb_mcp()
-        return [tool.schema() for tool in self._tools.values() if tool.available()]
+        return [tool.schema() for tool in self._tools.values() if self._advertised(tool)]
+
+    def _advertised(self, tool: Tool) -> bool:
+        probe = self._plugin_probes.get(tool.name)
+        if probe is None or probe[0] is not tool:
+            return tool.available()
+        if tool.name in self._plugin_advertised:
+            return True
+        _, until, available = probe
+        if time.monotonic() >= until:
+            available = tool.available()
+            self._plugin_probes[tool.name] = (tool, time.monotonic() + 5.0, available)
+        if available:
+            self._plugin_advertised.add(tool.name)
+        return available
 
     def names(self) -> list[str]:
         self._absorb_mcp()
@@ -2902,6 +2920,8 @@ class Toolbox:
         targets: set[Path] = set()
         for item in changes:
             path, operation = item["path"], item["operation"]
+            if operation in {"create", "delete"} and self._path_entry(path).is_symlink():
+                return f"ERROR: {path} 是符号链接；create/delete 不跟随或替换链接，请显式操作链接本身。未修改文件。"
             target, _ = self._resolve(path)
             if target in targets:
                 return f"ERROR: 重复目标 {path}；每个文件只能出现一次。未修改文件。"
@@ -2925,6 +2945,8 @@ class Toolbox:
         completed = []
         for index, (item, target, raw, text, encoding, updated) in enumerate(prepared):
             try:
+                if item["operation"] in {"create", "delete"} and self._path_entry(item["path"]).is_symlink():
+                    raise OSError("目标目录项在校验后被替换为符号链接")
                 if self._resolve(item["path"])[0] != target:
                     raise OSError("目标路径在校验后被替换")
                 if raw is None:
@@ -3814,6 +3836,12 @@ class Toolbox:
         return "\n".join(
             f"{number:>{width}} | {lines[number - 1]}" for number in range(start + 1, end + 1)
         )
+
+    def _path_entry(self, path: str) -> Path:
+        candidate = Path(path).expanduser()
+        if not candidate.is_absolute():
+            candidate = self.config.workspace / candidate
+        return candidate.parent.resolve() / candidate.name
 
     def _resolve(self, path: str) -> tuple[Path, bool]:
         """相对工作区解析路径，并标记是否逃出工作区。"""

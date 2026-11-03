@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import contextlib
+import math
 import os
 import subprocess
 import sys
@@ -226,6 +227,8 @@ _NUMERIC_ENV: dict[str, tuple[type, float | None, float | None, str]] = {
     "XIAOYU_CHENSHU_MAX_WORKERS": (int, None, None, ""),
     "XIAOYU_MAX_IMAGES_PER_REQUEST": (int, 0, None, "不能为负（0 = 不限）"),
     "XIAOYU_FIRST_CHUNK_TIMEOUT": (float, 0, None, "单位是秒，不能为负（0 = 关）"),
+    "XIAOYU_STREAM_MAX_LIFETIME": (float, 0, None, "单位是秒，不能为负（0 = 关）"),
+    "XIAOYU_SUMMARY_RETRY_COOLDOWN": (float, 0, None, "单位是秒，不能为负（0 = 关）"),
 }
 
 
@@ -239,7 +242,7 @@ def _check_number(name: str) -> tuple[float | None, str]:
         value = cast(raw.strip())
     except ValueError:
         return None, f"{name}={raw.strip()!r} 不是{'整数' if cast is int else '数字'}，已忽略"
-    if (low is not None and value < low) or (high is not None and value > high):
+    if (isinstance(value, float) and not math.isfinite(value)) or (low is not None and value < low) or (high is not None and value > high):
         return None, f"{name}={raw.strip()} 超出范围（{hint}），已忽略"
     return value, ""
 
@@ -506,6 +509,8 @@ class Config:
     #  错误走重试/降级；0 = 关。request_timeout 的 read 超时是逐次读计的，兼任
     #  "等首 token"要等满 10 分钟才判死。见 providers.first_chunk_timeout
     first_chunk_timeout: float = 300.0
+    stream_max_lifetime: float = 0.0
+    summary_retry_cooldown: float = 60.0
     #  注入给 bash 工具的额外环境变量。
     #  eval 用它设 PIP_REQUIRE_VIRTUALENV：无人值守 + 全放行时，
     #  模型可能 pip install 到系统 Python 里去（已经真实发生过一次）。
@@ -619,6 +624,10 @@ class Config:
             cfg.max_images_per_request = int(cap)
         if (wait := env_number("XIAOYU_FIRST_CHUNK_TIMEOUT")) is not None:
             cfg.first_chunk_timeout = float(wait)
+        if (wait := env_number("XIAOYU_STREAM_MAX_LIFETIME")) is not None:
+            cfg.stream_max_lifetime = float(wait)
+        if (wait := env_number("XIAOYU_SUMMARY_RETRY_COOLDOWN")) is not None:
+            cfg.summary_retry_cooldown = float(wait)
         if (flag := os.environ.get("XIAOYU_ENABLE_EXPLORE")) is not None:
             cfg.enable_explore = flag.strip().lower() not in ("0", "false", "no", "off")
         if (flag := os.environ.get("XIAOYU_ENABLE_SKILLS")) is not None:
