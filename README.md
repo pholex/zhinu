@@ -86,7 +86,7 @@ xiaoyu sessions rename 1 "登录页修复"   # 给它起个名字，resume 列�
 xy --stats "跑一下测试"                  # 收尾多一行：耗时 / 首 token / 输出 tok/s（交互模式也认）
 xiaoyu send zhinu-1 "顺便把 lint 跑一下"  # 给另一个终端里的小羽递话
 
-xiaoyu mcp add chrome-devtools --scope user npx -y chrome-devtools-mcp@1.12.0 --headless --isolated --no-usage-statistics --no-performance-crux
+xiaoyu mcp add chrome-devtools --scope user npx -y chrome-devtools-mcp@1.12.0 --autoConnect --no-usage-statistics --no-performance-crux
 xiaoyu mcp list                         # 写的就是 .mcp.json / mcp.json
 xiaoyu mcp probe chrome-devtools        # 不经模型直接握手、列工具；--script 按脚本调用并逐步输出 JSON
 
@@ -150,7 +150,7 @@ auto 档**放行的依据是沙箱，不是信任**——沙箱不可用时自�
 - **可平台化**：三张脸（一次性执行 / 嵌入 SDK / `serve`）共用同一套事件流、审批回路、`output_schema` 结构化收尾与边界；宿主把业务动作包成 MCP server 挂到 agent 对象上，审批走宿主自己的 UI——选型与样本见 [docs/platform.md](docs/platform.md)、[examples/ops-console](examples/ops-console/)
 - **可嵌入**：独立 Python 包 `xiaoyu-agent-sdk`（按上面的安装命令已装好），提供同步/异步会话、审批、事件流、业务工具与严格结构化结果；见 [SDK 指南](docs/sdk.md) 和 [完整示例](examples/sdk/README.md)。现有 `import xiaoyu` 公开 API 保持兼容，契约见 [docs/embedding.md](docs/embedding.md)；跨语言可用 `--wire` 的 stdio JSON-RPC。
 - **可编排**：`xiaoyu serve` 起 HTTP API，n8n / Dify / 自研调度直接驱动（异步提交 + 状态轮询 + 事件游标，需要放行的工具调用挂起等 HTTP 回决定）。OpenAPI schema 由代码生成，贴给 Dify 自定义工具即用——见 [docs/http-api.md](docs/http-api.md)。同一服务还在 `/mcp` 挂着 **agent 级 MCP server**（`xiaoyu` / `xiaoyu_reply` / `xiaoyu_close` 三工具，streamable HTTP），LangChain / LangGraph 经官方 `langchain-mcp-adapters` 即插即用，其它 MCP client 同理——见 [docs/mcp-server.md](docs/mcp-server.md)。**浏览器桥**：浏览器扩展连上同一服务，agent 就能在用户登录态的浏览器里读页 / 点击 / 截图，写类动作走审批——见 [docs/browser-bridge.md](docs/browser-bridge.md)
-- **浏览器**：前端调试可用 [Chrome DevTools MCP](docs/plugins/chrome-devtools.md)（含固定版本与实测记录）；内置 `[browser]` 是纯 pip 的兜底，`playwright install chromium` 后即用
+- **浏览器**：推荐用 [Chrome DevTools MCP](docs/plugins/chrome-devtools.md) 连接正在使用的 Chrome，查看已有页面、复用登录态（Chrome 144+，需开启远程调试并允许连接；指南区分实测范围）。需要干净环境时可选隔离模式；内置 `[browser]` 是纯 pip 的兜底，`playwright install chromium` 后即用
 
 服务已部署在专用隔离容器或虚拟机中时，使用 `xiaoyu serve --environment sandbox`
 即可关闭内部命令沙箱并自动放行审批；普通主机用 `--environment host`。

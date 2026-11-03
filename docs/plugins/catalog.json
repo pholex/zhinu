@@ -183,7 +183,7 @@
     {
       "name": "chrome-devtools",
       "kind": "mcp",
-      "category": "frontend-debugging",
+      "category": "browser-collaboration",
       "status": "recommended",
       "maintainer": "ChromeDevTools",
       "repository": "https://github.com/ChromeDevTools/chrome-devtools-mcp",
@@ -193,11 +193,11 @@
       "artifact": "npm chrome-devtools-mcp@1.12.0；实测发行包，提交用于源码审查",
       "guide": "chrome-devtools.md",
       "scope": [
-        "独立浏览器页面验证",
-        "控制台与网络检查"
+        "连接正在使用的 Chrome、查看已有页面并复用登录态",
+        "可选隔离模式用于页面测试与调试"
       ],
       "requirements": [
-        "Google Chrome",
+        "Google Chrome >=144；已运行并开启远程调试，允许连接",
         "Node.js（包要求 ^20.19.0 || ^22.12.0 || >=23）",
         "npm/npx",
         "首次安装联网"
@@ -207,8 +207,7 @@
         "args": [
           "-y",
           "chrome-devtools-mcp@1.12.0",
-          "--headless",
-          "--isolated",
+          "--autoConnect",
           "--no-usage-statistics",
           "--no-performance-crux"
         ]
@@ -266,8 +265,60 @@
           "有头模式",
           "Windows/Linux",
           "模型任务质量",
-          "全部网络行为"
-        ]
+          "全部网络行为",
+          "--autoConnect 连接当前用户资料",
+          "现有登录态复用"
+        ],
+        "mode": "isolated_test",
+        "tested_mcp": {
+          "command": "npx",
+          "args": [
+            "-y",
+            "chrome-devtools-mcp@1.12.0",
+            "--headless",
+            "--isolated",
+            "--no-usage-statistics",
+            "--no-performance-crux"
+          ]
+        }
+      },
+      "connection_modes": {
+        "existing_browser": {
+          "recommended": true,
+          "mcp": {
+            "command": "npx",
+            "args": [
+              "-y",
+              "chrome-devtools-mcp@1.12.0",
+              "--autoConnect",
+              "--no-usage-statistics",
+              "--no-performance-crux"
+            ]
+          },
+          "verification_status": "documentation_verified_runtime_pending",
+          "source": "https://github.com/ChromeDevTools/chrome-devtools-mcp/blob/aade3be8f65d8afc941c97b498b9752ef562f181/docs/advanced-usage.md#automatically-connecting-to-a-running-chrome-instance",
+          "profile_selection": "Chrome 判定的默认资料，不保证是前台窗口；可访问选中资料的全部窗口",
+          "not_verified": [
+            "当前用户资料自动连接",
+            "现有登录态复用"
+          ]
+        },
+        "isolated_test": {
+          "recommended": false,
+          "server_name": "chrome-devtools-test",
+          "mcp": {
+            "command": "npx",
+            "args": [
+              "-y",
+              "chrome-devtools-mcp@1.12.0",
+              "--headless",
+              "--isolated",
+              "--no-usage-statistics",
+              "--no-performance-crux"
+            ]
+          },
+          "verification_status": "passed"
+        }
       }
     },
     {
