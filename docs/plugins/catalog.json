@@ -3,6 +3,184 @@
   "description": "人工维护的推荐与验证记录；不由运行期自动加载。日期和版本表示已验证范围。",
   "plugins": [
     {
+      "name": "context7",
+      "kind": "mcp",
+      "category": "development-docs",
+      "status": "recommended",
+      "maintainer": "Upstash",
+      "repository": "https://github.com/upstash/context7",
+      "license": "MIT",
+      "commit": "ceaf5f91f48949eaa6e4da5e66f3f59d1b44556d",
+      "commit_scope": "仅固定所检查的上游说明与插件声明，远端服务版本不可固定",
+      "guide": "context7.md",
+      "scope": [
+        "按库和版本查询公开 API 文档"
+      ],
+      "requirements": [
+        "网络访问；匿名调用受服务方额度限制"
+      ],
+      "mcp": {
+        "url": "https://mcp.context7.com/mcp"
+      },
+      "verification": {
+        "date": "2026-11-03",
+        "xiaoyu_version": "0.78.0",
+        "xiaoyu_commit": "5a5ecd13664a2ffeb465abd1067122b4e1a4fcbd",
+        "platform": "macOS",
+        "configuration": "临时用户配置和测试目录；未使用用户凭据；未调用模型",
+        "mcp_declaration_install_remove": "passed",
+        "mcp_initialize_tools_list": "passed",
+        "uninstall": "passed",
+        "real_calls": [
+          {
+            "tool": "resolve-library-id",
+            "arguments": {
+              "libraryName": "Python",
+              "query": "pathlib Path read_text encoding"
+            },
+            "result": "返回 /python/cpython 和 v3.13.9 等版本",
+            "status": "passed"
+          },
+          {
+            "tool": "query-docs",
+            "arguments": {
+              "libraryId": "/python/cpython/v3.13.9",
+              "query": "pathlib Path.read_text encoding parameter"
+            },
+            "result": "返回参数说明和固定版本文档来源",
+            "source_url": "https://github.com/python/cpython/blob/v3.13.9/Doc/library/pathlib.rst",
+            "status": "passed"
+          }
+        ],
+        "not_verified": [
+          "其他库覆盖率",
+          "静态凭据登录",
+          "付费额度",
+          "Windows/Linux",
+          "模型回答质量"
+        ],
+        "upstream_bundle_result": "标准包 /mcp/oauth 地址返回 401；本条只推荐普通 /mcp 地址"
+      }
+    },
+    {
+      "name": "excel",
+      "kind": "mcp",
+      "category": "spreadsheet-editing",
+      "status": "recommended",
+      "maintainer": "Haris Musa",
+      "repository": "https://github.com/haris-musa/excel-mcp-server",
+      "license": "MIT",
+      "commit": "7cc548b6a607c2441884db61205e4aac55642c58",
+      "version": "2.2.6",
+      "artifact": "PyPI excel-mcp-server==2.2.6；实测发行包，提交用于源码审查",
+      "guide": "excel.md",
+      "scope": [
+        "本地 XLSX 创建、数据写入和简单公式"
+      ],
+      "requirements": [
+        "uvx",
+        "Python >=3.11",
+        "首次下载依赖需要联网"
+      ],
+      "mcp": {
+        "command": "uvx",
+        "args": [
+          "excel-mcp-server==2.2.6",
+          "stdio",
+          "--allow-dir",
+          "/absolute/path/to/workbooks"
+        ]
+      },
+      "verification": {
+        "date": "2026-11-03",
+        "xiaoyu_version": "0.78.0",
+        "xiaoyu_commit": "5a5ecd13664a2ffeb465abd1067122b4e1a4fcbd",
+        "platform": "macOS",
+        "configuration": "临时用户配置和测试目录；未使用用户凭据；未调用模型",
+        "mcp_declaration_install_remove": "passed",
+        "mcp_initialize_tools_list": "passed",
+        "uninstall": "passed",
+        "real_calls": [
+          {
+            "tool": "create_workbook",
+            "arguments": {
+              "path": "<临时工作目录>/review.xlsx",
+              "sheets": [
+                "Data"
+              ]
+            },
+            "status": "passed"
+          },
+          {
+            "tool": "write_range",
+            "arguments": {
+              "path": "<临时工作目录>/review.xlsx",
+              "sheet": "Data",
+              "at": "A1",
+              "rows": [
+                [
+                  "Item",
+                  "Amount"
+                ],
+                [
+                  "A",
+                  2
+                ],
+                [
+                  "B",
+                  3
+                ],
+                [
+                  "Total",
+                  "=SUM(B2:B3)"
+                ]
+              ]
+            },
+            "status": "passed"
+          },
+          {
+            "tool": "read_range",
+            "arguments": {
+              "path": "<临时工作目录>/review.xlsx",
+              "sheet": "Data",
+              "range": "A1:B4"
+            },
+            "result": [
+              [
+                "Item",
+                "Amount"
+              ],
+              [
+                "A",
+                2
+              ],
+              [
+                "B",
+                3
+              ],
+              [
+                "Total",
+                5
+              ]
+            ],
+            "status": "passed"
+          }
+        ],
+        "artifact_check": "XLSX 内部 XML 保存 SUM(B2:B3) 公式",
+        "directory_boundary": "允许目录外 create_workbook 返回拒绝，目标文件未生成",
+        "not_verified": [
+          "复杂公式",
+          "图表与透视表",
+          "宏",
+          "样式保真",
+          "桌面 Excel 显示",
+          "Windows/Linux",
+          "模型任务质量",
+          "依赖安全审计"
+        ]
+      }
+    },
+    {
       "name": "aws-core",
       "status": "recommended",
       "maintainer": "Amazon Web Services",
@@ -12,8 +190,15 @@
       "subpath": "plugins/aws-core",
       "version": "1.2.0",
       "guide": "README.md#aws-core",
-      "scope": ["AWS 开发技能指导", "匿名公开文档搜索"],
-      "requirements": ["Git", "xiaoyu", "MCP 可选：uvx 和网络访问"],
+      "scope": [
+        "AWS 开发技能指导",
+        "匿名公开文档搜索"
+      ],
+      "requirements": [
+        "Git",
+        "xiaoyu",
+        "MCP 可选：uvx 和网络访问"
+      ],
       "mcp": {
         "command": "uvx",
         "args": [
@@ -31,19 +216,56 @@
         "platform": "macOS",
         "configuration": "临时 XDG_CONFIG_HOME；未配置云账户凭据；未调用模型",
         "install": "passed",
-        "skill_load": {"status": "passed", "count": 25},
+        "skill_load": {
+          "status": "passed",
+          "count": 25
+        },
         "mcp_declaration_install_remove": "passed",
         "mcp_initialize_tools_list": "passed",
         "real_call": {
           "tool": "aws___search_documentation",
-          "arguments": {"search_phrase": "AWS CDK constructs", "topics": ["cdk_docs"], "limit": 1},
+          "arguments": {
+            "search_phrase": "AWS CDK constructs",
+            "topics": [
+              "cdk_docs"
+            ],
+            "limit": 1
+          },
           "result": "返回 AWS CDK Constructs 文档正文和来源链接",
           "source_url": "https://docs.aws.amazon.com/cdk/v2/guide/constructs.md",
           "status": "passed"
         },
         "uninstall": "passed",
-        "not_verified": ["Windows/Linux", "模型任务完成质量", "账户认证", "云资源读写", "远端脚本执行", "部署"]
-      }
+        "not_verified": [
+          "Windows/Linux",
+          "模型任务完成质量",
+          "账户认证",
+          "云资源读写",
+          "远端脚本执行",
+          "部署"
+        ]
+      },
+      "kind": "bundle",
+      "category": "cloud"
+    }
+  ],
+  "candidates": [
+    {
+      "name": "document-SKILLs",
+      "repository": "https://github.com/appautomaton/document-SKILLs",
+      "commit": "dfb5685ce241dd9e1f6148ceba5977ee43b54d46",
+      "status": "not_recommended",
+      "checked_on": "2026-11-03",
+      "reason": "根目录 inspect_bundle 返回 PluginError：技能路径只在市场清单声明，缺少可识别的包级声明；未进行功能调用"
+    },
+    {
+      "name": "OfficeKit documents",
+      "repository": "https://github.com/w31r4/OfficeKit",
+      "commit": "e2b2af23b173519c61acb4f92ebd1521266adec2",
+      "subpath": "skills/documents",
+      "status": "not_recommended",
+      "checked_on": "2026-11-03",
+      "reason": "独立包安装、正文加载和卸载通过；技能引用的 ../office-kit/references/workspace.md 未随包安装；未安装完整运行时或执行创建流程"
     }
   ]
 }
