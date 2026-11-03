@@ -739,7 +739,8 @@ class TestProjectInstructions(AgentTestCase):
         #  深层完整保留；浅层被截断而不是反过来
         self.assertEqual(docs[1][1], "子项目细则")
         self.assertIn("已截断", docs[0][1])
-        self.assertLess(len(docs[0][1]), 12_100)
+        self.assertEqual(len(docs[0][1].split("\n…", 1)[0]), 12_000 - len("子项目细则"))
+        self.assertIn("../AGENTS.md", docs[0][1])
 
     def test_budget_exhausted_shallow_doc_omitted_with_note(self) -> None:
         from xiaoyu.agent import collect_project_docs
@@ -1836,7 +1837,7 @@ class TestContextBreakdown(AgentTestCase):
             (child / "AGENTS.md", "已截断", 5, 10),
         ])
         self.assertIn("整体省略", docs[0][1])
-        self.assertEqual(docs[1][1], "12345\n…（指令文件过长，已截断）")
+        self.assertEqual(docs[1][1], "12345\n…（指令文件过长，已截断；完整约定请 read_file：AGENTS.md）")
 
     def test_empty_unreadable_and_disabled_sources(self) -> None:
         path = self.root / "AGENTS.md"

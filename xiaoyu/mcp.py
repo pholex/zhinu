@@ -2422,7 +2422,7 @@ def _version() -> str:
 def _render_result(result: dict[str, Any]) -> tuple[str, list[dict[str, Any]]]:
     """tools/call 的 result → (回给模型的文本, 图片部件列表)。
 
-    text 部件直接拼；resource 取其内嵌文本；都没有时兜底 structuredContent 的 JSON。
+    text/resource 与 structuredContent 并存；仅去掉文字部件中已有的同一份 JSON。
 
     **图片单独返回、不在这里做取舍**：能不能真的发给模型，取决于当前路由到的
     型号（见 Registry.sees_images），而协议层不知道也不该知道模型是谁。这里只
@@ -2457,8 +2457,21 @@ def _render_result(result: dict[str, Any]) -> tuple[str, list[dict[str, Any]]]:
             )
         elif kind == "resource_link":
             parts.append(f"[资源链接] {item.get('uri', '?')} {item.get('description', '')}".rstrip())
-    if not parts and isinstance(result.get("structuredContent"), dict):
-        parts.append(json.dumps(result["structuredContent"], ensure_ascii=False))
+    structured = result.get("structuredContent")
+    if isinstance(structured, dict):
+        canonical = json.dumps(structured, ensure_ascii=False, sort_keys=True)
+        duplicate = False
+        for item in result.get("content") or []:
+            if not isinstance(item, dict) or item.get("type") != "text":
+                continue
+            try:
+                duplicate = json.dumps(json.loads(item.get("text", "")), ensure_ascii=False, sort_keys=True) == canonical
+            except (ValueError, TypeError):
+                continue
+            if duplicate:
+                break
+        if not duplicate:
+            parts.append(json.dumps(structured, ensure_ascii=False))
     text = "\n".join(part for part in parts if part) or "(空结果)"
     #  isError 是"工具执行失败"（参数错、业务失败），前缀 ERROR: 对齐内置工具的
     #  约定，让主循环的 ok 统计和模型的自愈路径都能识别。错误文本过凭据脱敏：

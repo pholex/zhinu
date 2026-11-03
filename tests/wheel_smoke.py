@@ -120,6 +120,7 @@ def clean_env(**extra: str) -> dict[str, str]:
     for key in ("PYTHONPATH", "PYTHONHOME", "PYTHONSTARTUP", "VIRTUAL_ENV", "XIAOYU_EVAL_MODELS",
                 "XIAOYU_SNAPSHOT_RECORD", "XIAOYU_SCRIPTED_CAPTURE", "XIAOYU_SCRIPTED_STRICT"):
         env.pop(key, None)
+    env.update(XIAOYU_STREAM_MAX_LIFETIME="0", XIAOYU_SUMMARY_RETRY_COOLDOWN="0")
     env.update(extra)
     return env
 

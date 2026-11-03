@@ -55,6 +55,7 @@ from .compaction import (
 )
 from .config import EFFORT_LEVELS, Config, project_levels
 from .errors import Interrupted, classify
+from .streaming import check_deadline, iter_stream, stream_scope
 from .providers import Registry, Route, UnknownModel, first_chunk_timeout, request_timeout
 from .permissions import Permissions, call_identity
 from .rewind import RewindPreview, RewindResult
@@ -706,13 +707,41 @@ def collect_project_docs(
             kept.append((label, "…（预算已被更深层的指令文件用完，本文件整体省略）"))
             continue
         if len(text) > budget:
-            text = text[:budget] + "\n…（指令文件过长，已截断）"
+            omitted = _omitted_instruction_headings(text, budget)
+            detail = f"；省略章节：{'、'.join(omitted)}" if omitted else ""
+            try:
+                read_path = Path(os.path.relpath(path, workspace)).as_posix()
+            except ValueError:  # Windows 不同盘符不能相对寻址。
+                read_path = path.as_posix()
+            text = text[:budget] + f"\n…（指令文件过长，已截断{detail}；完整约定请 read_file：{read_path}）"
         budget -= len(text)
         kept.append((label, text))
     kept.reverse()
     if sources is not None:
         sources.extend(reversed(records))
     return kept
+
+
+def _omitted_instruction_headings(text: str, start: int) -> list[str]:
+    headings: list[str] = []
+    fence = ""
+    offset = 0
+    for line in text.splitlines(keepends=True):
+        stripped = line.lstrip()
+        marker = re.match(r"(`{3,}|~{3,})", stripped)
+        if marker:
+            run = marker[0]
+            if not fence:
+                fence = run
+            elif run[0] == fence[0] and len(run) >= len(fence):
+                fence = ""
+        elif not fence and offset >= start and (heading := re.match(r"#{1,6}\s+(.+)", stripped)):
+            headings.append(heading[1].strip()[:100])
+            if len(headings) == 10:
+                headings.append("…")
+                break
+        offset += len(line)
+    return headings
 
 
 #  往下找子目录约定文件时不进去的目录：依赖、构建产物、版本库内部
@@ -1293,6 +1322,7 @@ class Agent:
         self.agent_name = "xiaoyu"
         #  OpenTelemetry 导出（otel.py）：没配标准变量时是 None，emit 多一次 None 判断而已
         self._otel = otel.attach(self)
+        self._summary_retry_at: dict[tuple[str, str], float] = {}
         self.compactor = Compactor(
             context_limit=config.context_limit,
             compact_at=config.compact_at,
@@ -2428,6 +2458,7 @@ class Agent:
         静态部分（人格/环境/项目指令）逐字重建结果相同，行为不变。
         """
         self.messages = [self._system_message()]
+        self._summary_retry_at.clear()
         self._nested_instruction_sources.clear()
         self._nested_docs_seen.clear()
         self._nested_docs_budget = self._PROJECT_DOC_CAP
@@ -4132,6 +4163,8 @@ class Agent:
         if self.session_log:
             self.session_log.event("compact_start", trigger="manual" if force else "auto")
         try:
+            if force:
+                self._summary_retry_at.clear()
             self.messages, note = self.compactor.compact(self.messages)
         except BaseException:
             if self.session_log:
@@ -4361,10 +4394,12 @@ class Agent:
                     )
                 content = response.choices[0].message.content or ""
                 if not self._summary_truncated(response) and not is_degenerate_summary(content):
+                    self.compactor.last_attempt.update(summary_input_mode="prefix", summary_route=route.qualified)
                     return content
                 #  重放姿势退化（比如模型执意调工具）或被截断：掉回转写姿势再试本路由
                 #  ——转写输入更短，要交接的内容少了，输出也更可能落在上限之内
         prompt = f"{SUMMARY_INSTRUCTION}\n\n---\n\n{transcript}"
+        self.compactor.last_attempt.update(summary_input_mode="transcript", summary_route=route.qualified)
         response = route.client.chat.completions.create(
             model=route.model,
             messages=[{"role": "user", "content": prompt}],
@@ -4399,17 +4434,22 @@ class Agent:
         压缩失败的代价是整段历史带不动，不值得为省这一次调用而放弃。
         """
         last_error: Exception | None = None
-
+        failed: list[tuple[str, str]] = []
         for route in self.summary_models():
+            key = (route.provider, route.model)
+            if key != self._main_route_key() and time.monotonic() < self._summary_retry_at.get(key, 0):
+                continue
             try:
                 content = self._summary_call(route, transcript, prefix or [])
             except TruncatedSummary as exc:
+                failed.append(key)
                 last_error = exc
                 self.emit(
                     Notice(f"  摘要模型 {route.qualified} 输出被截断（半截摘要不落盘），回退下一个")
                 )
                 continue
             except Exception as exc:  # noqa: BLE001 - 换下一个模型再试
+                failed.append(key)
                 last_error = exc
                 self.emit(
                     Notice(f"  摘要模型 {route.qualified} 失败（{type(exc).__name__}），回退下一个")
@@ -4417,6 +4457,10 @@ class Agent:
                 continue
 
             if not is_degenerate_summary(content):
+                self._summary_retry_at.pop(key, None)
+                #  只有备用腿接住才冷却失败腿；全链失败还需允许缩短输入再试。
+                for failed_key in failed:
+                    self._summary_retry_at[failed_key] = time.monotonic() + self.config.summary_retry_cooldown
                 if route.model != self.config.model:
                     self.emit(Notice(f"  摘要由 {route.qualified} 生成"))
                 return content
@@ -4427,6 +4471,7 @@ class Agent:
                 f"{route.qualified} 返回退化摘要"
                 f"（清洗后 {len(content.strip())} 字符，低于下限 {MIN_SUMMARY_CHARS}）"
             )
+            failed.append(key)
 
         raise last_error or RuntimeError("没有可用的摘要模型")
 
@@ -5115,8 +5160,25 @@ class Agent:
         try:
             #  RequestStarted 的宿主回调也可能取消；检查后再进入传输层。
             self._checkpoint()
-            stream = route.client.chat.completions.create(**request)
-            self._consume_stream(route, stream, content_parts, pending, reasoning)
+            with stream_scope(self.config.stream_max_lifetime):
+                try:
+                    source = route.client.chat.completions.create(**request)
+                except Interrupted:
+                    raise
+                except Exception:
+                    check_deadline()
+                    raise
+                stream = iter_stream(source)
+                try:
+                    self._consume_stream(route, stream, content_parts, pending, reasoning)
+                finally:
+                    stream.close()
+        except errors.StreamLifetimeExceeded as exc:
+            self._request_failure = exc
+            if content_parts:
+                settle()
+                self._record({"role": "assistant", "content": "".join(content_parts) + "\n[回答达到流总时限，已停止]"})
+            raise
         except (KeyboardInterrupt, Interrupted) as exc:
             #  死因先记下：finally 里组 request.ended 要据此写失败分类
             self._request_failure = exc
