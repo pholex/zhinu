@@ -323,6 +323,9 @@ xiaoyu --system-prompt-file ~/prompts/writer.md
 
 ## 插件包（skills + MCP 一起装）
 
+选择插件可先看[官方推荐目录](plugins/README.md)：包含固定版本安装步骤、真实调用
+验证记录、依赖和权限边界。推荐由小羽维护者审核，插件仍由各自上游维护。
+
 认的是 [agent-plugins.org](https://agent-plugins.org) 那套中立的 bundle 格式——
 AWS 的 [agent-toolkit-for-aws](https://github.com/aws/agent-toolkit-for-aws) 就按它分发，
 主流 agent 客户端各自认领同一个包。

@@ -1,0 +1,49 @@
+{
+  "schema_version": 1,
+  "description": "人工维护的推荐与验证记录；不由运行期自动加载。日期和版本表示已验证范围。",
+  "plugins": [
+    {
+      "name": "aws-core",
+      "status": "recommended",
+      "maintainer": "Amazon Web Services",
+      "repository": "https://github.com/aws/agent-toolkit-for-aws",
+      "license": "Apache-2.0",
+      "commit": "1761e96813ebcbd43ed81d19e837219033f0afe5",
+      "subpath": "plugins/aws-core",
+      "version": "1.2.0",
+      "guide": "README.md#aws-core",
+      "scope": ["AWS 开发技能指导", "匿名公开文档搜索"],
+      "requirements": ["Git", "xiaoyu", "MCP 可选：uvx 和网络访问"],
+      "mcp": {
+        "command": "uvx",
+        "args": [
+          "mcp-proxy-for-aws-cli==1.7.0",
+          "https://aws-mcp.us-east-1.api.aws/mcp",
+          "--skip-auth",
+          "--metadata",
+          "INSTALL_SOURCE=agent-toolkit-core"
+        ]
+      },
+      "verification": {
+        "date": "2026-11-03",
+        "xiaoyu_version": "0.78.0",
+        "xiaoyu_commit": "5a5ecd13664a2ffeb465abd1067122b4e1a4fcbd",
+        "platform": "macOS",
+        "configuration": "临时 XDG_CONFIG_HOME；未配置云账户凭据；未调用模型",
+        "install": "passed",
+        "skill_load": {"status": "passed", "count": 25},
+        "mcp_declaration_install_remove": "passed",
+        "mcp_initialize_tools_list": "passed",
+        "real_call": {
+          "tool": "aws___search_documentation",
+          "arguments": {"search_phrase": "AWS CDK constructs", "topics": ["cdk_docs"], "limit": 1},
+          "result": "返回 AWS CDK Constructs 文档正文和来源链接",
+          "source_url": "https://docs.aws.amazon.com/cdk/v2/guide/constructs.md",
+          "status": "passed"
+        },
+        "uninstall": "passed",
+        "not_verified": ["Windows/Linux", "模型任务完成质量", "账户认证", "云资源读写", "远端脚本执行", "部署"]
+      }
+    }
+  ]
+}
