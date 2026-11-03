@@ -9,6 +9,7 @@
 |---|---|---|---|---|
 | 开发文档 | [Context7](context7.md) / MCP | 按库与版本查询 API 文档 | Python 指定版本查询、声明装卸 | Upstash |
 | 表格编辑 | [Excel MCP](excel.md) / MCP | 创建 XLSX、写入数据与简单公式 | 创建、写入、求和回读、目录限制、声明装卸 | Haris Musa |
+| 前端调试 | [Chrome DevTools](chrome-devtools.md) / MCP | 页面交互、控制台和网络检查 | 页面快照、点击、日志、请求、截图、声明装卸 | ChromeDevTools |
 | 云平台 | [aws-core](#aws-core) / 技能包 + MCP | AWS 开发指导、查询公开 AWS 文档 | 技能安装与加载、匿名文档搜索、卸载 | Amazon Web Services |
 
 只有满足真实调用和维护要求的扩展才加入，不以条目数量为目标。

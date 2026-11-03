@@ -181,6 +181,96 @@
       }
     },
     {
+      "name": "chrome-devtools",
+      "kind": "mcp",
+      "category": "frontend-debugging",
+      "status": "recommended",
+      "maintainer": "ChromeDevTools",
+      "repository": "https://github.com/ChromeDevTools/chrome-devtools-mcp",
+      "license": "Apache-2.0",
+      "commit": "aade3be8f65d8afc941c97b498b9752ef562f181",
+      "version": "1.12.0",
+      "artifact": "npm chrome-devtools-mcp@1.12.0；实测发行包，提交用于源码审查",
+      "guide": "chrome-devtools.md",
+      "scope": [
+        "独立浏览器页面验证",
+        "控制台与网络检查"
+      ],
+      "requirements": [
+        "Google Chrome",
+        "Node.js（包要求 ^20.19.0 || ^22.12.0 || >=23）",
+        "npm/npx",
+        "首次安装联网"
+      ],
+      "mcp": {
+        "command": "npx",
+        "args": [
+          "-y",
+          "chrome-devtools-mcp@1.12.0",
+          "--headless",
+          "--isolated",
+          "--no-usage-statistics",
+          "--no-performance-crux"
+        ]
+      },
+      "verification": {
+        "date": "2026-11-03",
+        "xiaoyu_version": "0.78.0",
+        "xiaoyu_commit": "5a5ecd13664a2ffeb465abd1067122b4e1a4fcbd",
+        "platform": "macOS",
+        "node": "24.19.0",
+        "chrome": "156.0.8078.80",
+        "configuration": "临时用户配置、服务工作目录、无头浏览器资料；仅访问本地测试网页；未调用模型",
+        "mcp_declaration_install_remove": "passed",
+        "mcp_initialize_tools_list": "passed",
+        "real_calls": [
+          {
+            "tool": "new_page",
+            "result": "打开临时 127.0.0.1 测试页",
+            "status": "passed"
+          },
+          {
+            "tool": "take_snapshot",
+            "result": "读到标题与按钮 ID",
+            "status": "passed"
+          },
+          {
+            "tool": "click",
+            "result": "点击后快照文字由 Ready 变为 Clicked",
+            "status": "passed"
+          },
+          {
+            "tool": "list_console_messages",
+            "result": "读到 review-click",
+            "status": "passed"
+          },
+          {
+            "tool": "list_network_requests",
+            "result": "读到 /probe GET 200",
+            "status": "passed"
+          },
+          {
+            "tool": "take_screenshot",
+            "result": "保存 PNG；目视确认标题、按钮及 Clicked 文字",
+            "status": "passed"
+          }
+        ],
+        "file_boundary": "目录外截图路径被拒绝；服务工作目录内保存通过",
+        "uninstall": "passed",
+        "not_verified": [
+          "性能 trace",
+          "CrUX",
+          "登录站点",
+          "复杂页面",
+          "移动端模拟",
+          "有头模式",
+          "Windows/Linux",
+          "模型任务质量",
+          "全部网络行为"
+        ]
+      }
+    },
+    {
       "name": "aws-core",
       "status": "recommended",
       "maintainer": "Amazon Web Services",
