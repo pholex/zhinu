@@ -1351,6 +1351,7 @@ class Agent:
                 make_explore_tool(
                     config, self.registry, self.usage, self.sink,
                     approver=self.approver, permissions=self.permissions,
+                    toolbox=self.toolbox,
                 )
             )
         #  web_search：借厂商 Responses 内置搜索的一次性调用（后端见 XIAOYU_SEARCH_PROVIDER，

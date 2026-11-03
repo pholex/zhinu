@@ -633,3 +633,39 @@ class FixtureGuardTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ExploreMcpSnapshot(AgentTestCase):
+    """明确选中的代码查询工具进入子上下文，其余工具不进入。"""
+
+    def test_scenario(self):
+        from xiaoyu.agent import Agent
+        from xiaoyu.mcp import McpView
+        from xiaoyu.providers import Registry
+        from xiaoyu.tools import Toolbox
+        from .test_agent_paths import FakeClient
+        from .test_subagent_knobs import FakeManager, remote, tool_turn, text_turn
+
+        self.config.enable_mcp = False
+        self.config.mcp_tool_search = True
+        self.config.explore_mcp_tools = ["mcp__code__definition"]
+        manager = FakeManager([remote("code", "definition"), remote("code", "rename")])
+        box = Toolbox(self.config, mcp_view=McpView(manager))
+        client = FakeClient([
+            tool_turn("query", "use_tool", {"tool_name": "mcp__code__definition"}),
+            text_turn("已找到定义"),
+        ])
+        Agent(self.config, box, registry=Registry.for_client(client))
+        with contextlib.redirect_stdout(io.StringIO()):
+            result = box.get("explore").handler(question="查定义")
+        first, last = client.completions.calls
+        actual = {
+            "system": normalize_system_prompt(first["messages"][0]["content"], str(self.root)),
+            "tools": [t["function"]["name"] for t in first["tools"]],
+            "results": [m["content"] for m in last["messages"] if m["role"] == "tool"],
+            "answer": result,
+        }
+        fixture = Path(__file__).parent / "fixtures" / "explore_mcp.expected.json"
+        if MODE == "refresh":
+            fixture.write_text(json.dumps(actual, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        self.assertEqual(actual, json.loads(fixture.read_text(encoding="utf-8", errors="replace")))

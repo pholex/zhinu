@@ -92,6 +92,7 @@ class E2ECase(unittest.TestCase):
             "XIAOYU_ENABLE_HOOKS": "0",
             "XIAOYU_ENABLE_AGENTS": "0",
             "XIAOYU_ENABLE_EXPLORE": "0",
+            "XIAOYU_EXPLORE_MCP_TOOLS": "",
             "XIAOYU_ENABLE_WEB_SEARCH": "0",
             "XIAOYU_ENABLE_X_SEARCH": "0",
             "XIAOYU_ENABLE_DEEP_RESEARCH": "0",

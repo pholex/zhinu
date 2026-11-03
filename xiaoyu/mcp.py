@@ -3798,17 +3798,20 @@ class McpView:
     """父会话 MCP manager 的 server 级筛选视图（子 agent 继承用）。
 
     不持有任何进程——生命周期归父 manager；接口与 Toolbox 消费 manager 的
-    子集对齐（ready_tools / loading / take_media）。粒度是 server 而不是
-    tool：精确名匹配、引用不存在的名字不报错（过滤后少一个而已）。
+    子集对齐（ready_tools / loading / take_media）。server 精确名筛选外，
+    tool_names 可进一步按工具完整名称取交集；None 不限制，空元组不选任何工具。
+    引用不存在的名字不报错（过滤后少一个而已）。
 
     media 暂存按调用线程及 Toolbox 所有者隔离；并发子 agent 和复用 worker
     的后续任务不会接收其他工具箱尚未消费的结果。
     """
 
-    def __init__(self, manager: McpManager, mode: str = "all", names: tuple[str, ...] = ()) -> None:
+    def __init__(self, manager: McpManager, mode: str = "all", names: tuple[str, ...] = (),
+                 *, tool_names: tuple[str, ...] | None = None) -> None:
         self._manager = manager
         self._mode = mode  # all | named | except
         self._names = set(names)
+        self._tool_names = None if tool_names is None else frozenset(tool_names)
 
     def _allows(self, server: str) -> bool:
         if self._mode == "named":
@@ -3818,7 +3821,9 @@ class McpView:
         return True
 
     def ready_tools(self) -> list[RemoteTool]:
-        return [remote for remote in self._manager.ready_tools() if self._allows(remote.server)]
+        return [remote for remote in self._manager.ready_tools()
+                if self._allows(remote.server)
+                and (self._tool_names is None or remote.name in self._tool_names)]
 
     def unavailable(self) -> list[str]:
         """这个视图本该看得到、此刻却用不了的 server 名字（只给名字）。

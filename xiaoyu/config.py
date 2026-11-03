@@ -376,6 +376,8 @@ class Config:
     #  厂商的型号（还得是用户配了 key 的那家），猜错就是又一次静默失败。
     #  来源 XIAOYU_VISION_FALLBACK，值是模型名（如 deepseek-flash）。
     vision_fallback_model: str = ""
+    #  显式选入 explore 的 MCP 查询工具完整名称；不隐含执行授权。
+    explore_mcp_tools: list[str] = field(default_factory=list)
     #  是否给主 agent 挂 explore 工具（子 agent 自己一定关掉，避免套娃）
     enable_explore: bool = True
     #  是否扫描 SKILL.md 技能（explore 子 agent 与 eval 关掉，保持行为确定）
@@ -628,6 +630,11 @@ class Config:
             cfg.stream_max_lifetime = float(wait)
         if (wait := env_number("XIAOYU_SUMMARY_RETRY_COOLDOWN")) is not None:
             cfg.summary_retry_cooldown = float(wait)
+        cfg.explore_mcp_tools = [
+            name.strip()
+            for name in os.environ.get("XIAOYU_EXPLORE_MCP_TOOLS", "").split(",")
+            if name.strip()
+        ]
         if (flag := os.environ.get("XIAOYU_ENABLE_EXPLORE")) is not None:
             cfg.enable_explore = flag.strip().lower() not in ("0", "false", "no", "off")
         if (flag := os.environ.get("XIAOYU_ENABLE_SKILLS")) is not None:

@@ -87,6 +87,7 @@ XIAOYU_API_KEY=<key>
 | `XIAOYU_MODEL` | `deepseek-flash` | 主模型 |
 | `XIAOYU_SUMMARY_MODEL` | `deepseek-flash` | 压缩摘要用的便宜模型 |
 | `XIAOYU_EXPLORE_MODEL` | `deepseek-flash` | `explore` 子 agent 用的模型 |
+| `XIAOYU_EXPLORE_MCP_TOOLS` | 空 | explore 可使用的代码检索 MCP 工具完整名称，逗号分隔、精确匹配；复用父会话连接与授权，不接受通配符。仅选择定义、引用、类型、诊断等查询工具；清空恢复仅文件检索。 |
 | `XIAOYU_BASE_URL` | — | OpenAI 兼容网关端点 |
 | `XIAOYU_API_KEY` | — | 网关 key（也认 `LITELLM_API_KEY`） |
 | `XIAOYU_BEDROCK_REGION` | —（有 key 时 `us-east-1`） | AWS Bedrock 区域，设了即激活 IAM 路线（`1` / `default` = `us-east-1`）；见上方"AWS Bedrock" |
@@ -628,3 +629,22 @@ XIAOYU_VISION_FALLBACK=deepseek-flash
 - `/model` 无参会印出当前的代读状态（配了才印）。
 
 要原图保真，路只有一条：`/model` 换用支持视觉的模型。代读是够不着那条路时的兜底。
+
+### 给 explore 接入代码检索扩展
+
+默认 explore 只使用内置文件检索。已有 MCP 服务提供定义、引用、类型或诊断查询时，
+把工具搜索返回的完整工具名配置到 `XIAOYU_EXPLORE_MCP_TOOLS`，例如：
+
+```bash
+export XIAOYU_EXPLORE_MCP_TOOLS=mcp__code__definition,mcp__code__references,mcp__code__hover,mcp__code__diagnostics
+```
+
+这里的 `code` 是示例服务名，须换成实际工具搜索返回的名字。只选择用于查询的工具，
+不要加入重命名、编辑或执行命令工具。此配置决定可见范围，不授予免确认权限；
+MCP 自报只读标签也不会自动放行。已有 allow/deny/ask 规则与审批继续生效，
+plan 模式仍禁止 MCP 调用。取消配置即可恢复默认行为。
+
+explore 复用主会话已经配置的连接，不另起服务、不扫描全部插件；父会话不可见的
+工具也不会通过此配置出现。工具尚未就绪或无法使用时继续用文件检索。
+SDK 宿主可设置 `Config.explore_mcp_tools`（完整名称列表）。这只增加扩展接入能力，
+不自带语言服务器；具体 LSP 服务仍需安装并配置项目环境。

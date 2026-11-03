@@ -6,7 +6,8 @@
   主上下文只增加一段结论。这和上下文压缩是同一个方向的收益，而且更早生效。
 
 两条硬约束：
-1. **子 agent 只拿只读工具**（read_file / grep / list_files）。绝不给 bash ——
+1. **默认只拿只读文件工具**（read_file / grep / list_files）；可显式选入
+   父会话的代码检索 MCP 工具，仍走原有授权。绝不给 bash ——
    bash 能写文件、能 pip install（已经真实发生过），"只读检索"就成了空话。
 2. **子 agent 不再挂 explore**，避免无限套娃。
 """
@@ -58,6 +59,7 @@ def make_explore_tool(
     *,
     approver=None,
     permissions=None,
+    toolbox: Toolbox | None = None,
 ) -> Tool:
     """造一个 explore 工具挂到主 agent 上。usage 与 registry 都传父级的：
     成本记同一本账，client 也按 provider 复用（explore_model 可能落在另一家）。
@@ -97,7 +99,11 @@ def make_explore_tool(
     def explore(question: str) -> str:
         #  延迟导入，避免和 agent 模块循环引用
         from .agent import Agent
+        from .mcp import McpView
 
+        manager = toolbox.mcp_manager if toolbox is not None else None
+        selected = tuple(config.explore_mcp_tools)
+        view = McpView(manager, tool_names=selected) if manager is not None and selected else None
         model = effective_model()
         sub_config = Config(
             base_url=config.base_url,
@@ -116,8 +122,12 @@ def make_explore_tool(
             keep_recent=config.keep_recent,
             request_timeout=config.request_timeout,
             extra_env=config.extra_env,
-            #  只读工具，不需要人工确认
-            auto_approve=True,
+            #  扩展查询沿用主会话授权；纯文件检索保持原来的免确认行为
+            auto_approve=config.auto_approve if view is not None else True,
+            mode=config.mode,
+            unattended=config.unattended,
+            workspace_trusted=config.workspace_trusted,
+            mcp_tool_search=config.mcp_tool_search,
             enable_explore=False,
             #  检索子 agent 只查代码，不上网
             enable_web_search=False,
@@ -130,7 +140,7 @@ def make_explore_tool(
             enable_plan=False,
             #  只读子集用不上插件工具，也不为它花插件发现的时间
             enable_plugins=False,
-            #  MCP 同理：受限子集不挂第三方 server 工具
+            #  不自行发现 MCP；仅注入父会话中被显式选中的查询工具视图
             enable_mcp=False,
         )
 
@@ -143,7 +153,7 @@ def make_explore_tool(
         child_maker = getattr(sink, "quiet_child", None)
         sub_agent = Agent(
             sub_config,
-            Toolbox(sub_config, only=Toolbox.READONLY),
+            Toolbox(sub_config, only=Toolbox.READONLY, mcp_view=view),
             usage=usage,
             registry=registry,
             quiet=True,
@@ -154,6 +164,16 @@ def make_explore_tool(
         )
         sub_agent.agent_name = "explore"
         sub_agent.system_prompt_override = EXPLORE_PROMPT.format(workspace=config.workspace)
+        if view is not None:
+            sub_agent.system_prompt_override = sub_agent.system_prompt_override.replace(
+                "你只有只读工具：", "内置文件检索工具："
+            )
+            sub_agent.system_prompt_override += (
+                "\n用户另外指定了用于代码检索的 MCP 工具：" + ", ".join(selected)
+                + "。可通过工具搜索发现并调用；授权规则与主会话一致。"
+                "只用于查定义、引用、类型和诊断，不执行修改。"
+                "工具不可用时回到文件检索，不反复等待。"
+            )
         sub_agent.messages[0]["content"] = sub_agent.system_prompt_override
 
         try:
@@ -187,7 +207,11 @@ def make_explore_tool(
             "确认某个配置项/常量的值、搞清一段逻辑的来龙去脉。"
             "优先用它代替自己连续 grep + 读一堆文件 —— 中间过程不会占用你的上下文。"
             "问题要具体，并说明你想要什么形式的答案（例如「给出文件和行号」）。"
-            "它只读，不会改任何文件；要改代码仍然由你自己做。"
+            + (
+                "它仅做检索；用户选中的 MCP 查询工具沿用主会话授权。"
+                if config.explore_mcp_tools
+                else "它只读，不会改任何文件；要改代码仍然由你自己做。"
+            )
         ),
         parameters={
             "type": "object",

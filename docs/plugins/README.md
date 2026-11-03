@@ -31,6 +31,7 @@
 
 | 候选 | 本次结果 |
 |---|---|
+| [LSP 桥接](lsp-evaluation.md) | Python 定义、类型查询与修改后诊断刷新通过；引用查询遗漏别名调用，暂缓推荐 |
 | [document-SKILLs](https://github.com/appautomaton/document-SKILLs) | 技能路径放在市场清单中，固定提交的根目录缺少小羽能识别的包级技能声明；直接安装无法识别，不要求用户手改上游包凑合安装 |
 | [OfficeKit documents](https://github.com/w31r4/OfficeKit) | 单独安装 documents 包可加载技能，但其引用的相邻 office-kit 公共指引没有随包安装；完整运行时与文档创建流程未验证，暂缓推荐 |
 
