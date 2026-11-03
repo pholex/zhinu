@@ -3,184 +3,6 @@
   "description": "人工维护的推荐与验证记录；不由运行期自动加载。日期和版本表示已验证范围。",
   "plugins": [
     {
-      "name": "context7",
-      "kind": "mcp",
-      "category": "development-docs",
-      "status": "recommended",
-      "maintainer": "Upstash",
-      "repository": "https://github.com/upstash/context7",
-      "license": "MIT",
-      "commit": "ceaf5f91f48949eaa6e4da5e66f3f59d1b44556d",
-      "commit_scope": "仅固定所检查的上游说明与插件声明，远端服务版本不可固定",
-      "guide": "context7.md",
-      "scope": [
-        "按库和版本查询公开 API 文档"
-      ],
-      "requirements": [
-        "网络访问；匿名调用受服务方额度限制"
-      ],
-      "mcp": {
-        "url": "https://mcp.context7.com/mcp"
-      },
-      "verification": {
-        "date": "2026-11-03",
-        "xiaoyu_version": "0.78.0",
-        "xiaoyu_commit": "5a5ecd13664a2ffeb465abd1067122b4e1a4fcbd",
-        "platform": "macOS",
-        "configuration": "临时用户配置和测试目录；未使用用户凭据；未调用模型",
-        "mcp_declaration_install_remove": "passed",
-        "mcp_initialize_tools_list": "passed",
-        "uninstall": "passed",
-        "real_calls": [
-          {
-            "tool": "resolve-library-id",
-            "arguments": {
-              "libraryName": "Python",
-              "query": "pathlib Path read_text encoding"
-            },
-            "result": "返回 /python/cpython 和 v3.13.9 等版本",
-            "status": "passed"
-          },
-          {
-            "tool": "query-docs",
-            "arguments": {
-              "libraryId": "/python/cpython/v3.13.9",
-              "query": "pathlib Path.read_text encoding parameter"
-            },
-            "result": "返回参数说明和固定版本文档来源",
-            "source_url": "https://github.com/python/cpython/blob/v3.13.9/Doc/library/pathlib.rst",
-            "status": "passed"
-          }
-        ],
-        "not_verified": [
-          "其他库覆盖率",
-          "静态凭据登录",
-          "付费额度",
-          "Windows/Linux",
-          "模型回答质量"
-        ],
-        "upstream_bundle_result": "标准包 /mcp/oauth 地址返回 401；本条只推荐普通 /mcp 地址"
-      }
-    },
-    {
-      "name": "excel",
-      "kind": "mcp",
-      "category": "spreadsheet-editing",
-      "status": "recommended",
-      "maintainer": "Haris Musa",
-      "repository": "https://github.com/haris-musa/excel-mcp-server",
-      "license": "MIT",
-      "commit": "7cc548b6a607c2441884db61205e4aac55642c58",
-      "version": "2.2.6",
-      "artifact": "PyPI excel-mcp-server==2.2.6；实测发行包，提交用于源码审查",
-      "guide": "excel.md",
-      "scope": [
-        "本地 XLSX 创建、数据写入和简单公式"
-      ],
-      "requirements": [
-        "uvx",
-        "Python >=3.11",
-        "首次下载依赖需要联网"
-      ],
-      "mcp": {
-        "command": "uvx",
-        "args": [
-          "excel-mcp-server==2.2.6",
-          "stdio",
-          "--allow-dir",
-          "/absolute/path/to/workbooks"
-        ]
-      },
-      "verification": {
-        "date": "2026-11-03",
-        "xiaoyu_version": "0.78.0",
-        "xiaoyu_commit": "5a5ecd13664a2ffeb465abd1067122b4e1a4fcbd",
-        "platform": "macOS",
-        "configuration": "临时用户配置和测试目录；未使用用户凭据；未调用模型",
-        "mcp_declaration_install_remove": "passed",
-        "mcp_initialize_tools_list": "passed",
-        "uninstall": "passed",
-        "real_calls": [
-          {
-            "tool": "create_workbook",
-            "arguments": {
-              "path": "<临时工作目录>/review.xlsx",
-              "sheets": [
-                "Data"
-              ]
-            },
-            "status": "passed"
-          },
-          {
-            "tool": "write_range",
-            "arguments": {
-              "path": "<临时工作目录>/review.xlsx",
-              "sheet": "Data",
-              "at": "A1",
-              "rows": [
-                [
-                  "Item",
-                  "Amount"
-                ],
-                [
-                  "A",
-                  2
-                ],
-                [
-                  "B",
-                  3
-                ],
-                [
-                  "Total",
-                  "=SUM(B2:B3)"
-                ]
-              ]
-            },
-            "status": "passed"
-          },
-          {
-            "tool": "read_range",
-            "arguments": {
-              "path": "<临时工作目录>/review.xlsx",
-              "sheet": "Data",
-              "range": "A1:B4"
-            },
-            "result": [
-              [
-                "Item",
-                "Amount"
-              ],
-              [
-                "A",
-                2
-              ],
-              [
-                "B",
-                3
-              ],
-              [
-                "Total",
-                5
-              ]
-            ],
-            "status": "passed"
-          }
-        ],
-        "artifact_check": "XLSX 内部 XML 保存 SUM(B2:B3) 公式",
-        "directory_boundary": "允许目录外 create_workbook 返回拒绝，目标文件未生成",
-        "not_verified": [
-          "复杂公式",
-          "图表与透视表",
-          "宏",
-          "样式保真",
-          "桌面 Excel 显示",
-          "Windows/Linux",
-          "模型任务质量",
-          "依赖安全审计"
-        ]
-      }
-    },
-    {
       "name": "chrome-devtools",
       "kind": "mcp",
       "category": "browser-collaboration",
@@ -319,6 +141,419 @@
           },
           "verification_status": "passed"
         }
+      }
+    },
+    {
+      "name": "tabella",
+      "kind": "mcp",
+      "category": "document-creation",
+      "status": "recommended",
+      "maintainer": "D Yiapanis",
+      "repository": "https://github.com/dyiapanis/tabella",
+      "license": "MIT",
+      "commit": "449e75462dc227789ef5c64e828c4db577f40ee5",
+      "version": "2.0.2",
+      "guide": "tabella.md",
+      "scope": [
+        "基础 DOCX/PPTX/PDF 创建与回读"
+      ],
+      "requirements": [
+        "Git",
+        "Python >=3.11",
+        "独立 venv 与上游锁定依赖",
+        "PDF 另需 Pango 等 WeasyPrint 原生库"
+      ],
+      "mcp": {
+        "command": "<TABELLA_DATA>/venv/bin/python",
+        "args": [
+          "<TABELLA_SOURCE>/mcp_server.py"
+        ],
+        "env": {
+          "DOCS_VENV_PYTHON": "<TABELLA_DATA>/venv/bin/python"
+        }
+      },
+      "verification": {
+        "date": "2026-11-03",
+        "xiaoyu_version": "0.78.0",
+        "xiaoyu_commit": "5a5ecd13664a2ffeb465abd1067122b4e1a4fcbd",
+        "platform": "macOS arm64",
+        "configuration": "临时配置和自建样本；未调用模型；未修改用户文件或应用偏好",
+        "mcp_declaration_install_remove": "passed",
+        "mcp_initialize_tools_list": "passed",
+        "uninstall": "passed",
+        "tool_count": 5,
+        "real_calls": [
+          {
+            "tool": "doc_create_document",
+            "formats": [
+              "docx",
+              "pptx",
+              "pdf"
+            ],
+            "content": "Catalog review document. Total: 42.",
+            "status": "passed"
+          },
+          {
+            "tool": "doc_read",
+            "result": "三种产物均回读到已知文字与数字 42",
+            "status": "passed"
+          }
+        ],
+        "pdf_workaround": {
+          "options": {
+            "page_numbers": false
+          },
+          "result": "关闭页码后渲染 PNG，目视正文可见且无 counter(page) 占位文字",
+          "status": "passed"
+        },
+        "platform_setup": {
+          "DYLD_FALLBACK_LIBRARY_PATH": "/opt/homebrew/lib",
+          "DOCS_VENV_PYTHON": "/private/tmp/xiaoyu-tabella-data/venv/bin/python"
+        },
+        "known_issues": [
+          "macOS 首次 PDF 创建找不到 libgobject；显式设置已有 Homebrew 库路径后通过",
+          "默认 PDF 页码输出 counter(page) 字面量；page_numbers=false 后通过"
+        ],
+        "not_verified": [
+          "复杂排版",
+          "中文字体",
+          "Word/PPT 桌面视觉检查",
+          "模板保真",
+          "OCR",
+          "Pandoc 转换",
+          "PDF 编辑",
+          "Windows/Linux",
+          "模型任务质量"
+        ]
+      }
+    },
+    {
+      "name": "excel",
+      "kind": "mcp",
+      "category": "spreadsheet-editing",
+      "status": "recommended",
+      "maintainer": "Haris Musa",
+      "repository": "https://github.com/haris-musa/excel-mcp-server",
+      "license": "MIT",
+      "commit": "7cc548b6a607c2441884db61205e4aac55642c58",
+      "version": "2.2.6",
+      "artifact": "PyPI excel-mcp-server==2.2.6；实测发行包，提交用于源码审查",
+      "guide": "excel.md",
+      "scope": [
+        "本地 XLSX 创建、数据写入和简单公式"
+      ],
+      "requirements": [
+        "uvx",
+        "Python >=3.11",
+        "首次下载依赖需要联网"
+      ],
+      "mcp": {
+        "command": "uvx",
+        "args": [
+          "excel-mcp-server==2.2.6",
+          "stdio",
+          "--allow-dir",
+          "/absolute/path/to/workbooks"
+        ]
+      },
+      "verification": {
+        "date": "2026-11-03",
+        "xiaoyu_version": "0.78.0",
+        "xiaoyu_commit": "5a5ecd13664a2ffeb465abd1067122b4e1a4fcbd",
+        "platform": "macOS",
+        "configuration": "临时用户配置和测试目录；未使用用户凭据；未调用模型",
+        "mcp_declaration_install_remove": "passed",
+        "mcp_initialize_tools_list": "passed",
+        "uninstall": "passed",
+        "real_calls": [
+          {
+            "tool": "create_workbook",
+            "arguments": {
+              "path": "<临时工作目录>/review.xlsx",
+              "sheets": [
+                "Data"
+              ]
+            },
+            "status": "passed"
+          },
+          {
+            "tool": "write_range",
+            "arguments": {
+              "path": "<临时工作目录>/review.xlsx",
+              "sheet": "Data",
+              "at": "A1",
+              "rows": [
+                [
+                  "Item",
+                  "Amount"
+                ],
+                [
+                  "A",
+                  2
+                ],
+                [
+                  "B",
+                  3
+                ],
+                [
+                  "Total",
+                  "=SUM(B2:B3)"
+                ]
+              ]
+            },
+            "status": "passed"
+          },
+          {
+            "tool": "read_range",
+            "arguments": {
+              "path": "<临时工作目录>/review.xlsx",
+              "sheet": "Data",
+              "range": "A1:B4"
+            },
+            "result": [
+              [
+                "Item",
+                "Amount"
+              ],
+              [
+                "A",
+                2
+              ],
+              [
+                "B",
+                3
+              ],
+              [
+                "Total",
+                5
+              ]
+            ],
+            "status": "passed"
+          }
+        ],
+        "artifact_check": "XLSX 内部 XML 保存 SUM(B2:B3) 公式",
+        "directory_boundary": "允许目录外 create_workbook 返回拒绝，目标文件未生成",
+        "not_verified": [
+          "复杂公式",
+          "图表与透视表",
+          "宏",
+          "样式保真",
+          "桌面 Excel 显示",
+          "Windows/Linux",
+          "模型任务质量",
+          "依赖安全审计"
+        ]
+      }
+    },
+    {
+      "name": "blender",
+      "kind": "mcp",
+      "category": "3d-creation",
+      "status": "recommended",
+      "maintainer": "Blender Lab",
+      "repository": "https://projects.blender.org/lab/blender_mcp",
+      "license": "GPL-3.0-or-later",
+      "commit": "2cea8d566dde07fbac28a61d698909d69724e853",
+      "subpath": "mcp",
+      "version": "1.0.3",
+      "guide": "blender.md",
+      "scope": [
+        "读取和编辑 Blender 场景",
+        "保存工程并重开验证"
+      ],
+      "requirements": [
+        "Blender >=5.1",
+        "Blender MCP 应用内扩展 1.0.3 并启用桥接",
+        "Git",
+        "uv"
+      ],
+      "mcp": {
+        "command": "uv",
+        "args": [
+          "tool",
+          "run",
+          "--from",
+          "git+https://projects.blender.org/lab/blender_mcp.git@2cea8d566dde07fbac28a61d698909d69724e853#subdirectory=mcp",
+          "blender-mcp",
+          "--transport",
+          "stdio"
+        ],
+        "env": {
+          "BLENDER_MCP_HOST": "127.0.0.1",
+          "BLENDER_MCP_PORT": "9876"
+        }
+      },
+      "verification": {
+        "date": "2026-11-03",
+        "xiaoyu_version": "0.78.0",
+        "xiaoyu_commit": "5a5ecd13664a2ffeb465abd1067122b4e1a4fcbd",
+        "platform": "macOS arm64",
+        "configuration": "临时配置和自建样本；未调用模型；未修改用户文件或应用偏好",
+        "mcp_declaration_install_remove": "passed",
+        "mcp_initialize_tools_list": "passed",
+        "uninstall": "passed",
+        "blender_version": "5.2.2 LTS",
+        "tool_count": 26,
+        "mode": "临时 factory-startup 后台场景；从固定源码临时加载应用内桥接；随机本地端口",
+        "real_calls": [
+          {
+            "tool": "get_objects_summary",
+            "result": "读到启动场景对象",
+            "status": "passed"
+          },
+          {
+            "tool": "execute_blender_code",
+            "result": "创建 CatalogCube，坐标 (1,2,3)",
+            "status": "passed"
+          },
+          {
+            "tool": "get_objects_summary",
+            "result": "读回 CatalogCube",
+            "status": "passed"
+          },
+          {
+            "tool": "execute_blender_code",
+            "result": "保存临时 review.blend",
+            "status": "passed"
+          }
+        ],
+        "artifact_check": "另一个 Blender 后台进程重开文件，断言 CatalogCube 存在且位置为 (1,2,3)",
+        "not_verified": [
+          "图形界面安装扩展",
+          "当前用户工程",
+          "交互式截图",
+          "渲染",
+          "动画",
+          "延迟任务",
+          "Windows/Linux",
+          "模型任务质量"
+        ]
+      }
+    },
+    {
+      "name": "rea",
+      "kind": "mcp",
+      "category": "software-analysis",
+      "status": "recommended",
+      "maintainer": "REA project",
+      "repository": "https://github.com/morluto/rea",
+      "license": "MIT",
+      "version": "6.7.0",
+      "artifact": "npm rea-agents@6.7.0；版本、许可证与 Node 要求核对已下载包元数据",
+      "guide": "rea.md",
+      "scope": [
+        "JavaScript 应用目录静态分析"
+      ],
+      "requirements": [
+        "Node.js ^22.19.0 || ^24.11.0 || >=26.0.0",
+        "npm/npx",
+        "原生反编译等能力需对应后端"
+      ],
+      "mcp": {
+        "command": "npx",
+        "args": [
+          "-y",
+          "rea-agents@6.7.0",
+          "mcp"
+        ]
+      },
+      "verification": {
+        "date": "2026-11-03",
+        "xiaoyu_version": "0.78.0",
+        "xiaoyu_commit": "5a5ecd13664a2ffeb465abd1067122b4e1a4fcbd",
+        "platform": "macOS arm64",
+        "configuration": "临时配置和自建样本；未调用模型；未修改用户文件或应用偏好",
+        "mcp_declaration_install_remove": "passed",
+        "mcp_initialize_tools_list": "passed",
+        "uninstall": "passed",
+        "node": "24.19.0",
+        "tool_count": 207,
+        "real_calls": [
+          {
+            "tool": "analyze_javascript_application",
+            "arguments": {
+              "input_path": "<临时样本目录>",
+              "format": "directory",
+              "source_paths": [
+                "main.js"
+              ],
+              "detail": "complete"
+            },
+            "fixture": "package.json 声明 main.js；main.js 导出 readReport 并调用 fs.readFileSync",
+            "result": "返回结构化证据，含 readReport 与 readFileSync；样本未执行",
+            "status": "passed"
+          }
+        ],
+        "not_verified": [
+          "其余工具",
+          "原生反编译",
+          "Android",
+          "运行时调试",
+          "浏览器附加",
+          "源码恢复",
+          "Windows/Linux",
+          "模型任务质量"
+        ]
+      }
+    },
+    {
+      "name": "context7",
+      "kind": "mcp",
+      "category": "development-docs",
+      "status": "recommended",
+      "maintainer": "Upstash",
+      "repository": "https://github.com/upstash/context7",
+      "license": "MIT",
+      "commit": "ceaf5f91f48949eaa6e4da5e66f3f59d1b44556d",
+      "commit_scope": "仅固定所检查的上游说明与插件声明，远端服务版本不可固定",
+      "guide": "context7.md",
+      "scope": [
+        "按库和版本查询公开 API 文档"
+      ],
+      "requirements": [
+        "网络访问；匿名调用受服务方额度限制"
+      ],
+      "mcp": {
+        "url": "https://mcp.context7.com/mcp"
+      },
+      "verification": {
+        "date": "2026-11-03",
+        "xiaoyu_version": "0.78.0",
+        "xiaoyu_commit": "5a5ecd13664a2ffeb465abd1067122b4e1a4fcbd",
+        "platform": "macOS",
+        "configuration": "临时用户配置和测试目录；未使用用户凭据；未调用模型",
+        "mcp_declaration_install_remove": "passed",
+        "mcp_initialize_tools_list": "passed",
+        "uninstall": "passed",
+        "real_calls": [
+          {
+            "tool": "resolve-library-id",
+            "arguments": {
+              "libraryName": "Python",
+              "query": "pathlib Path read_text encoding"
+            },
+            "result": "返回 /python/cpython 和 v3.13.9 等版本",
+            "status": "passed"
+          },
+          {
+            "tool": "query-docs",
+            "arguments": {
+              "libraryId": "/python/cpython/v3.13.9",
+              "query": "pathlib Path.read_text encoding parameter"
+            },
+            "result": "返回参数说明和固定版本文档来源",
+            "source_url": "https://github.com/python/cpython/blob/v3.13.9/Doc/library/pathlib.rst",
+            "status": "passed"
+          }
+        ],
+        "not_verified": [
+          "其他库覆盖率",
+          "静态凭据登录",
+          "付费额度",
+          "Windows/Linux",
+          "模型回答质量"
+        ],
+        "upstream_bundle_result": "标准包 /mcp/oauth 地址返回 401；本条只推荐普通 /mcp 地址"
       }
     },
     {

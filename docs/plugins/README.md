@@ -10,9 +10,12 @@
 
 | 分类 | 推荐项 / 接入方式 | 适合做什么 | 已验证范围 | 上游维护者 |
 |---|---|---|---|---|
-| 开发文档 | [Context7](context7.md) / MCP | 按库与版本查询 API 文档 | Python 指定版本查询、声明装卸 | Upstash |
-| 表格编辑 | [Excel MCP](excel.md) / MCP | 创建 XLSX、写入数据与简单公式 | 创建、写入、求和回读、目录限制、声明装卸 | Haris Musa |
 | 浏览器协作 | [Chrome DevTools](chrome-devtools.md) / MCP | 连接当前 Chrome、复用登录态，也可调试页面 | 隔离模式已实测；当前资料自动连接待实测 | ChromeDevTools |
+| 文档生成 | [Tabella](tabella.md) / MCP | 生成 Word、PPT、PDF | 基础创建与内容回读；PDF 有已知页码问题及规避步骤 | D Yiapanis |
+| 表格编辑 | [Excel MCP](excel.md) / MCP | 创建 XLSX、写入数据与简单公式 | 创建、写入、求和回读、目录限制、声明装卸 | Haris Musa |
+| 3D 创作 | [Blender](blender.md) / MCP | 读取、编辑场景并保存工程 | 后台场景创建、保存及重开核验；图形界面待实测 | Blender Lab |
+| 软件分析 | [REA](rea.md) / MCP | 分析现有应用的实现与行为 | JavaScript 目录静态分析；其他后端待实测 | REA 项目 |
+| 开发文档 | [Context7](context7.md) / MCP | 按库与版本查询 API 文档 | Python 指定版本查询、声明装卸 | Upstash |
 | 云平台 | [aws-core](#aws-core) / 技能包 + MCP | AWS 开发指导、查询公开 AWS 文档 | 技能安装与加载、匿名文档搜索、卸载 | Amazon Web Services |
 
 只有满足真实调用和维护要求的扩展才加入，不以条目数量为目标。
@@ -31,8 +34,8 @@
 | [document-SKILLs](https://github.com/appautomaton/document-SKILLs) | 技能路径放在市场清单中，固定提交的根目录缺少小羽能识别的包级技能声明；直接安装无法识别，不要求用户手改上游包凑合安装 |
 | [OfficeKit documents](https://github.com/w31r4/OfficeKit) | 单独安装 documents 包可加载技能，但其引用的相邻 office-kit 公共指引没有随包安装；完整运行时与文档创建流程未验证，暂缓推荐 |
 
-PDF/Word 创建与编辑尚未找到本轮可直接推荐的完整接入路径；不把表格的验证结果
-推广到其他文档格式。候选提交和具体失败点也保留在 `catalog.json` 中，供以后复验。
+Word/PDF 的基础创建可使用上面的 Tabella；复杂编辑和版式保真仍需按具体任务验证。
+候选提交和具体失败点保留在 `catalog.json` 中，供以后复验。
 
 ## aws-core
 
@@ -110,7 +113,8 @@ xiaoyu plugin remove aws-core
 
 推荐范围必须对应具体用户场景。新增条目时，在同一份变更中提供：
 
-1. 上游仓库、维护者、许可证、固定提交、包内目录，以及必需的软件和账户条件。
+1. 上游仓库、维护者、许可证、固定提交或发行包版本，以及必需的软件和账户条件。
+   从源码安装时记录包内目录；远端服务不能固定实现时，明确记录核验日期与地址。
 2. 可复制的安装和卸载命令，联网去向、凭据使用和可能写入的资源。
 3. 在临时用户配置目录中的安装、技能加载或工具发现、一次真实能力调用、卸载结果。
    MCP 插件还需确认声明能安装和摘除。仅解析成功不能标为真实调用通过。
