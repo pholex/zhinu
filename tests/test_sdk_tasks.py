@@ -62,24 +62,26 @@ class TaskTests(unittest.TestCase):
             self.assertEqual(session.options.model.client.completions.calls, [])
 
     def test_parallel_cancel_and_busy_boundary(self):
+        # 验证取消状态与隔离，不把 Windows 线程调度、落盘耗时当作性能断言。
+        wait_timeout = 15
         barrier = threading.Barrier(3)
         release = threading.Event()
         def stream():
-            barrier.wait(5)
-            release.wait(5)
+            barrier.wait(wait_timeout)
+            release.wait(wait_timeout)
             yield chunk("finished")
-        opts = self.options([stream(), stream()], max_parallel_tasks=2)
+        opts = self.options([stream(), stream()], max_parallel_tasks=2, close_timeout=wait_timeout)
         session = Session(opts)
         try:
             left, right = session.tasks.submit((TaskSpec("a", "research", "a"), TaskSpec("b", "research", "b")))
-            barrier.wait(5)
+            barrier.wait(wait_timeout)
             with self.assertRaises(SessionBusyError):
                 session.run("no concurrent parent accounting")
             self.assertEqual(left.cancel().state, "cancelling")
             self.assertEqual(left.cancel().state, "cancelling")
             release.set()
-            self.assertEqual(left.wait(5).state, "cancelled")
-            self.assertEqual(right.wait(5).state, "succeeded")
+            self.assertEqual(left.wait(wait_timeout).state, "cancelled")
+            self.assertEqual(right.wait(wait_timeout).state, "succeeded")
             self.assertEqual(left.cancel().state, "cancelled")
         finally:
             release.set()

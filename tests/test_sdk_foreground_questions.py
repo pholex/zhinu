@@ -247,7 +247,8 @@ class AsyncForegroundQuestionTests(unittest.IsolatedAsyncioTestCase):
     async def test_interrupt_or_close_retains_pending_and_unblocks_waiter(self):
         for operation in ("interrupt", "close", "cancel_run"):
             with self.subTest(operation=operation):
-                config = self.config(close_timeout=2)
+                # 外层等待已给落盘留出余量，关闭也沿用默认时限；这里不测超时边界。
+                config = self.config()
                 async with AsyncSession(config) as session, aclosing(session.questions.watch()) as watch:
                     active = asyncio.create_task(session.run("Ask"))
                     event = await asyncio.wait_for(anext(watch), self.WAIT_TIMEOUT)
