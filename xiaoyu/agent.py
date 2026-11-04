@@ -654,13 +654,20 @@ class _InstructionSource:
         return f"{self.status} · 正文 {self.included}/{self.total} 字符"
 
 
+_PROJECT_DOC_POLICY = (
+    "更深层目录的规则优先；同目录各文件的互补内容都遵守，文件名和拼接顺序不代表优先级；"
+    "同目录规则出现实质冲突时，明确说明来源和冲突内容，向用户确认后再执行受影响的操作"
+)
+
+
 def collect_project_docs(
     workspace: Path, names: tuple[str, ...], cap: int,
     *, sources: list[_InstructionSource] | None = None,
 ) -> list[tuple[str, str]]:
     """git 根→工作区逐层收集项目指令文件，返回 [(来源标注, 正文)]，root→leaf 序。
 
-    每层只认 names 里首个命中的非空文件；预算 cap 按 leaf-first 分配——
+    每层加载 names 里的所有非空文件；文件名顺序只用于稳定展示，不代表优先级。
+    预算 cap 按 leaf-first 分配——
     从最深层往上分，分完为止，浅层文件被截断或整个丢弃时都有显式标注。
     """
     #  层链与工作区技能目录（skills.project_skill_dirs）同源，见 config.project_levels
@@ -693,7 +700,6 @@ def collect_project_docs(
                 except ValueError:
                     label = f"上层 {path}"
             found.append((label, text, path))
-            break
 
     #  leaf-first 预算：倒序分配，深层（更具体）的永不被浅层挤掉
     budget = cap
@@ -704,7 +710,7 @@ def collect_project_docs(
         status = "预算省略" if budget <= 0 else "已截断" if included < len(text) else "已加载"
         records.append(_InstructionSource(path, status, included, len(text)))
         if budget <= 0:
-            kept.append((label, "…（预算已被更深层的指令文件用完，本文件整体省略）"))
+            kept.append((label, "…（项目指令正文预算已用完，本文件整体省略）"))
             continue
         if len(text) > budget:
             omitted = _omitted_instruction_headings(text, budget)
@@ -792,7 +798,6 @@ def nested_project_docs(workspace: Path, names: tuple[str, ...]) -> list[str]:
             for doc in names:
                 if (child / doc).is_file():
                     found.append((child / doc).relative_to(workspace).as_posix())
-                    break
             if depth + 1 < _NESTED_DOC_DEPTH:
                 pending.append((child, depth + 1))
     return sorted(found)[:_NESTED_DOC_LIST_CAP]
@@ -1716,9 +1721,8 @@ class Agent:
                 return media.text_of(message["content"]).strip()
         return ""
 
-    #  项目级指令文件：按此顺序取第一个存在的（AGENTS.md 是跨 agent 的事实标准，
-    #  CLAUDE.md 兜底照顾已有此文件的仓库）。
-    _PROJECT_DOC_NAMES = ("AGENTS.md", "XIAOYU.md", "CLAUDE.md")
+    #  项目级指令文件：全部加载，顺序仅用于稳定展示；备忘写入时按此顺序选一个。
+    _PROJECT_DOC_NAMES = ("AGENTS.md", "CLAUDE.md")
     #  指令文件的字符上限：它常驻每一轮请求，不能无限大
     _PROJECT_DOC_CAP = 12_000
     #  技能索引占上下文窗口的预算比例。超预算不是丢技能而是逐字符截短描述
@@ -1899,8 +1903,8 @@ class Agent:
         """项目级指令文件拼进 system prompt（多层收集）。
 
         从 git 项目根到工作区逐层收集（monorepo 里在子目录启动也能吃到根目录的
-        总规范 + 子项目自己的细则），root→leaf 拼接并标注来源；每层仍只认
-        `_PROJECT_DOC_NAMES` 首个命中的文件——保持可预测。层链只在 git 根与
+        总规范 + 子项目自己的细则），root→leaf 拼接并标注来源；每层加载
+        `_PROJECT_DOC_NAMES` 的全部文件。层链只在 git 根与
         工作区之间走，绝不越过仓库边界往家目录爬。
 
         总预算 `_PROJECT_DOC_CAP` 按 **leaf-first** 分配：更深、更具体的文件
@@ -1935,7 +1939,7 @@ class Agent:
         blocks = "\n\n".join(f"【{label}】\n{text}" for label, text in found)
         return (
             "\n\n项目指令（由项目维护者提供，遵照执行；自项目根到工作区逐层收集，"
-            f"越靠后越具体、冲突时以靠后者为准）：\n{blocks}" + pointer
+            f"{_PROJECT_DOC_POLICY}）：\n{blocks}" + pointer
         )
 
     #  计划状态的合法值（显示符号在 render.py，这里只管校验）
@@ -5695,7 +5699,8 @@ class Agent:
         return "".join(notes)
 
     def _load_nested_doc(self, directory: Path, workspace: Path) -> str:
-        """读一个子目录的约定文件（首个命中的名字），按会话预算截断；没有返回空串。"""
+        """读一个子目录的全部约定文件，分别标注来源并按会话预算截断。"""
+        notes: list[str] = []
         for doc_name in self._PROJECT_DOC_NAMES:
             path = directory / doc_name
             if not path.is_file():
@@ -5703,9 +5708,9 @@ class Agent:
             try:
                 text = path.read_text(encoding="utf-8", errors="replace").strip()
             except OSError:
-                return ""
+                continue
             if not text:
-                return ""
+                continue
             relative = path.relative_to(workspace).as_posix()
             included = min(len(text), max(0, self._nested_docs_budget))
             status = "预算省略" if self._nested_docs_budget <= 0 else "已截断" if included < len(text) else "已加载"
@@ -5716,7 +5721,8 @@ class Agent:
                     f"有自己的约定文件 {relative}（本会话附带正文的预算已用完，动它之前先读一遍）。"
                 )
                 self._nested_instruction_sources[path] = (source, note)
-                return note
+                notes.append(note)
+                continue
             if len(text) > self._nested_docs_budget:
                 text = text[: self._nested_docs_budget] + "\n…（约定文件过长，已截断）"
             self._nested_docs_budget -= len(text)
@@ -5724,11 +5730,11 @@ class Agent:
                 self.session_log.event("nested_doc_loaded", path=relative)
             note = (
                 f"\n\n[项目指令] 你触达的目录 {directory.relative_to(workspace).as_posix()}/ "
-                f"有自己的约定文件（{relative}，由项目维护者提供），在该目录下的工作遵照执行：\n{text}"
+                f"有自己的约定文件（{relative}，由项目维护者提供），在该目录下的工作遵照执行；{_PROJECT_DOC_POLICY}：\n{text}"
             )
             self._nested_instruction_sources[path] = (source, note)
-            return note
-        return ""
+            notes.append(note)
+        return "".join(notes)
 
     def _track_failure(self, name: str, ok: bool) -> int:
         """返回该工具当前的连续失败次数（成功即归零）。"""

@@ -14,7 +14,7 @@ from xiaoyu.agent import nested_project_docs
 
 from .test_agent_paths import AgentTestCase
 
-NAMES = ("AGENTS.md", "XIAOYU.md", "CLAUDE.md")
+NAMES = ("AGENTS.md", "CLAUDE.md")
 
 
 def put(root: Path, relative: str, text: str = "约定") -> None:
@@ -38,10 +38,10 @@ class NestedDocsTest(unittest.TestCase):
             nested_project_docs(self.root, NAMES), ["api/AGENTS.md", "packages/web/CLAUDE.md"]
         )
 
-    def test_one_file_per_directory_in_name_order(self) -> None:
+    def test_both_files_per_directory(self) -> None:
         put(self.root, "api/CLAUDE.md")
         put(self.root, "api/AGENTS.md")
-        self.assertEqual(nested_project_docs(self.root, NAMES), ["api/AGENTS.md"])
+        self.assertEqual(nested_project_docs(self.root, NAMES), ["api/AGENTS.md", "api/CLAUDE.md"])
 
     def test_dependency_hidden_and_odd_directories_are_skipped(self) -> None:
         put(self.root, "node_modules/pkg/AGENTS.md")
@@ -111,6 +111,25 @@ class LazyNestedDocsTest(AgentTestCase):
         self.assertLess(out.index("API 约定"), out.index("SUB 约定"))
         self.assertIn("api/AGENTS.md", out)
         self.assertIn("api/sub/CLAUDE.md", out)
+
+    def test_same_directory_loads_both_sources_once(self) -> None:
+        put(self.root, "api/CLAUDE.md", "补充约定：跑集成测试")
+        agent = self.build([])
+        out = self.execute(agent, "read_file", json.dumps({"path": "api/sub/x.py"}))
+        self.assertIn("api/AGENTS.md", out)
+        self.assertIn("api/CLAUDE.md", out)
+        self.assertIn("补充约定：跑集成测试", out)
+        self.assertIn("向用户确认", out)
+        self.assertIn("拼接顺序不代表优先级", out)
+        again = self.execute(agent, "read_file", json.dumps({"path": "api/sub/x.py"}))
+        self.assertNotIn("补充约定", again)
+
+    def test_empty_first_file_does_not_hide_second(self) -> None:
+        put(self.root, "api/AGENTS.md", "")
+        put(self.root, "api/CLAUDE.md", "补充约定")
+        agent = self.build([])
+        out = self.execute(agent, "read_file", json.dumps({"path": "api/sub/x.py"}))
+        self.assertIn("补充约定", out)
 
     def test_each_directory_only_once(self) -> None:
         agent = self.build([])

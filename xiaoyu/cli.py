@@ -3268,15 +3268,15 @@ def user_shell(agent: Agent, command: str) -> ShellResult:
 def user_memo(agent: Agent, note: str) -> str:
     """# 前缀的核心：备忘追加进项目指令文件，返回落盘文件名。
 
-    追加到工作区第一个存在的指令文件（AGENTS.md / XIAOYU.md / CLAUDE.md），
-    都没有则新建 XIAOYU.md。指令文件在会话开始时已拼进 system prompt
+    追加到工作区第一个存在的指令文件（AGENTS.md / CLAUDE.md），
+    都没有则新建 AGENTS.md。指令文件在会话开始时已拼进 system prompt
     （之后不重建），所以同时把这句话灌进当前对话——文件管以后的会话，
     灌话管这一个。写入失败的 OSError 上抛，由前端打印。
     """
     workspace = agent.config.workspace
     target = next(
         (workspace / name for name in Agent._PROJECT_DOC_NAMES if (workspace / name).is_file()),  # noqa: SLF001
-        workspace / "XIAOYU.md",
+        workspace / "AGENTS.md",
     )
     fresh = not target.exists()
     with target.open("a", encoding="utf-8") as handle:

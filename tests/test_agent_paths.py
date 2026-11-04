@@ -694,12 +694,16 @@ class TestProjectInstructions(AgentTestCase):
         self.assertIn("跑测试用 make check", agent.messages[0]["content"])
         self.assertIn("AGENTS.md", agent.messages[0]["content"])
 
-    def test_priority_order_first_hit_wins(self) -> None:
+    def test_both_files_loaded_with_sources_and_conflict_policy(self) -> None:
         (self.root / "AGENTS.md").write_text("A 文件", encoding="utf-8")
         (self.root / "CLAUDE.md").write_text("C 文件", encoding="utf-8")
         agent = self.build([])
         self.assertIn("A 文件", agent.messages[0]["content"])
-        self.assertNotIn("C 文件", agent.messages[0]["content"])
+        self.assertIn("C 文件", agent.messages[0]["content"])
+        self.assertIn("【AGENTS.md】", agent.messages[0]["content"])
+        self.assertIn("【CLAUDE.md】", agent.messages[0]["content"])
+        self.assertIn("向用户确认", agent.messages[0]["content"])
+        self.assertIn("拼接顺序不代表优先级", agent.messages[0]["content"])
 
     def test_claude_md_as_fallback(self) -> None:
         (self.root / "CLAUDE.md").write_text("C 文件", encoding="utf-8")
@@ -711,12 +715,12 @@ class TestProjectInstructions(AgentTestCase):
         self.assertNotIn("项目指令", agent.messages[0]["content"])
 
     def _nested_workspace(self) -> Path:
-        """root(.git + AGENTS.md) / sub / ws(XIAOYU.md)，返回 ws。"""
+        """root(.git + AGENTS.md) / sub / ws(CLAUDE.md)，返回 ws。"""
         (self.root / ".git").mkdir(exist_ok=True)
         (self.root / "AGENTS.md").write_text("根目录总规范", encoding="utf-8")
         ws = self.root / "sub" / "ws"
         ws.mkdir(parents=True)
-        (ws / "XIAOYU.md").write_text("子项目细则", encoding="utf-8")
+        (ws / "CLAUDE.md").write_text("子项目细则", encoding="utf-8")
         return ws
 
     def test_multi_level_collects_root_to_leaf(self) -> None:
@@ -727,14 +731,14 @@ class TestProjectInstructions(AgentTestCase):
         self.assertIn("根目录总规范", content)
         self.assertIn("子项目细则", content)
         self.assertLess(content.index("根目录总规范"), content.index("子项目细则"))
-        self.assertIn("冲突时以靠后者为准", content)
+        self.assertIn("更深层目录的规则优先", content)
 
     def test_leaf_first_budget_never_squeezes_deep_doc(self) -> None:
         from xiaoyu.agent import collect_project_docs
 
         ws = self._nested_workspace()
         (self.root / "AGENTS.md").write_text("规" * 20_000, encoding="utf-8")
-        docs = collect_project_docs(ws, ("AGENTS.md", "XIAOYU.md"), cap=12_000)
+        docs = collect_project_docs(ws, ("AGENTS.md", "CLAUDE.md"), cap=12_000)
         self.assertEqual(len(docs), 2)
         #  深层完整保留；浅层被截断而不是反过来
         self.assertEqual(docs[1][1], "子项目细则")
@@ -746,8 +750,8 @@ class TestProjectInstructions(AgentTestCase):
         from xiaoyu.agent import collect_project_docs
 
         ws = self._nested_workspace()
-        (ws / "XIAOYU.md").write_text("细" * 12_000, encoding="utf-8")
-        docs = collect_project_docs(ws, ("AGENTS.md", "XIAOYU.md"), cap=12_000)
+        (ws / "CLAUDE.md").write_text("细" * 12_000, encoding="utf-8")
+        docs = collect_project_docs(ws, ("AGENTS.md", "CLAUDE.md"), cap=12_000)
         self.assertEqual(len(docs), 2)
         self.assertIn("整体省略", docs[0][1])
         self.assertNotIn("规", docs[0][1])
@@ -1821,23 +1825,25 @@ class TestContextBreakdown(AgentTestCase):
         agent.messages.clear()
         self.assertEqual(agent.context_breakdown(), [])
 
-    def test_source_budget_and_file_precedence(self) -> None:
+    def test_source_budget_tracks_both_files(self) -> None:
         from xiaoyu.agent import collect_project_docs
 
         child = self.root / "pkg"
         child.mkdir()
         (self.root / "AGENTS.md").write_text("parent rules", encoding="utf-8")
         (child / "AGENTS.md").write_text("1234567890", encoding="utf-8")
-        (child / "XIAOYU.md").write_text("not selected", encoding="utf-8")
+        (child / "CLAUDE.md").write_text("extra", encoding="utf-8")
         sources = []
         with mock.patch("xiaoyu.agent.project_levels", return_value=[self.root, child]):
-            docs = collect_project_docs(child, ("AGENTS.md", "XIAOYU.md"), 5, sources=sources)
+            docs = collect_project_docs(child, ("AGENTS.md", "CLAUDE.md"), 5, sources=sources)
         self.assertEqual([(s.path, s.status, s.included, s.total) for s in sources], [
             (self.root / "AGENTS.md", "预算省略", 0, 12),
-            (child / "AGENTS.md", "已截断", 5, 10),
+            (child / "AGENTS.md", "预算省略", 0, 10),
+            (child / "CLAUDE.md", "已加载", 5, 5),
         ])
         self.assertIn("整体省略", docs[0][1])
-        self.assertEqual(docs[1][1], "12345\n…（指令文件过长，已截断；完整约定请 read_file：AGENTS.md）")
+        self.assertIn("整体省略", docs[1][1])
+        self.assertEqual(docs[2], ("CLAUDE.md", "extra"))
 
     def test_empty_unreadable_and_disabled_sources(self) -> None:
         path = self.root / "AGENTS.md"

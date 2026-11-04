@@ -1140,7 +1140,7 @@ class TestTuiFrontend(AgentTestCase):
         agent = self.build([])
         tui = self.make_tui(agent)
         tui._note_memory("测试统一跑 python -m pytest")
-        target = self.root / "XIAOYU.md"
+        target = self.root / "AGENTS.md"
         self.assertTrue(target.is_file())
         self.assertIn("- 测试统一跑 python -m pytest", target.read_text(encoding="utf-8"))
         self.assertIn("测试统一跑", agent.messages[-1]["content"])

@@ -143,8 +143,8 @@ class ActionCoreTestCase(unittest.TestCase):
 
     def test_user_memo_creates_default_file(self) -> None:
         target = user_memo(self.agent, "测试统一跑 python -m unittest")
-        self.assertEqual(target, "XIAOYU.md")
-        content = (self.root / "XIAOYU.md").read_text(encoding="utf-8")
+        self.assertEqual(target, "AGENTS.md")
+        content = (self.root / "AGENTS.md").read_text(encoding="utf-8")
         self.assertIn("# 项目备忘", content)
         self.assertIn("- 测试统一跑 python -m unittest", content)
         self.assertIn("测试统一跑 python -m unittest", self._last_message())
@@ -158,11 +158,10 @@ class ActionCoreTestCase(unittest.TestCase):
         self.assertIn("- 新备忘", content)
         #  不该因为"文件已存在"再补一遍标题
         self.assertNotIn("# 项目备忘", content)
-        self.assertFalse((self.root / "XIAOYU.md").exists())
 
     def test_user_memo_write_failure_raises_oserror(self) -> None:
         """OSError 上抛由前端打印——核心不吞错也不打印。"""
-        (self.root / "XIAOYU.md").mkdir()  # 同名目录让 open 必炸
+        (self.root / "AGENTS.md").mkdir()  # 同名目录让 open 必炸
         with self.assertRaises(OSError):
             user_memo(self.agent, "写不进去")
 

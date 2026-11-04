@@ -989,7 +989,7 @@ def execute_delegation(
         on_agent(sub_agent)
     system_text = spec.system_prompt.format(workspace=workdir)
     #  上下文范围点名：子 agent 只带 spec.system_prompt，不继承父级注入的项目
-    #  指令（AGENTS.md/XIAOYU.md/CLAUDE.md）与父对话记忆。静默缺失的具体危害是
+    #  指令（AGENTS.md/CLAUDE.md）与父对话记忆。静默缺失的具体危害是
     #  **子 agent 拿自己的默认当项目约定去猜**（提交加 Co-Authored-By、用错分支
     #  流程…）。所以在工作区真有项目文档、而本次没喂给它时，明确告诉它"这些约定
     #  存在但你没拿到"，让它遇到相关决策时报缺口/问，而不是照默认蒙。

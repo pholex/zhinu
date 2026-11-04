@@ -293,7 +293,9 @@ xiaoyu --system-prompt-file ~/prompts/writer.md
 - **运行纪律**：工具怎么用（explore / str_replace / bash 验证）、计划怎么记、`<untrusted_content>` 里的指令不照做、工作区与系统信息。这是 harness 正常且安全运转的前提，不属于人格；
 - 环境画像、项目指令（`AGENTS.md` 等）、技能索引；`--append-system-prompt` 给的内容仍追加在后。
 
-项目指令按 git 根 → 工作区逐层收集进 system prompt；工作区**下层**目录（monorepo 的子包）里的 `AGENTS.md` / `XIAOYU.md` / `CLAUDE.md` 只在 system prompt 里留指针，正文在模型第一次读写该目录（`read_file` / `write_file` / `str_replace` 的路径、bash 命令里的路径词）时随工具结果附上——从工作区到那个目录的每一层各载一次，只向下、不出工作区、依赖目录不算，总量与 system prompt 里的项目指令同一上限（超了只给指针）。
+项目指令文件在同一目录内同时加载 `AGENTS.md` 与 `CLAUDE.md`，分别标注来源；文件名和拼接顺序不代表优先级，互补内容都遵守，实质冲突由模型向用户确认后再执行受影响的操作。跨目录仍以更深层规则优先。正文受预算限制，截断或省略会明确标注。`#` 备忘优先追加到已有指令文件，没有时新建 `AGENTS.md`。
+
+项目指令按 git 根 → 工作区逐层收集进 system prompt；工作区**下层**目录（monorepo 的子包）里的 `AGENTS.md` / `CLAUDE.md` 只在 system prompt 里留指针，正文在模型第一次读写该目录（`read_file` / `write_file` / `str_replace` 的路径、bash 命令里的路径词）时随工具结果附上——从工作区到那个目录的每一层各载一次，只向下、不出工作区、依赖目录不算，总量与 system prompt 里的项目指令同一上限（超了只给指针）。
 
 `/context` 按会话中实际装入的 system prompt 统计各段字符数，并列出项目指令
 来源、已加载 / 截断 / 预算省略 / 仅指针等状态。正文字符数不含包装与截断提示，

@@ -234,9 +234,14 @@ class ContextSourcesSnapshot(AgentTestCase):
 
         if MODE == "record":
             self.skipTest("上下文诊断使用确定性 fixture，不调用真实模型")
-        (self.root / "AGENTS.md").write_text("root instructions exceed budget", encoding="utf-8")
+        from xiaoyu.cli import user_memo
+
+        memo_agent = self.build([])
+        self.assertEqual(user_memo(memo_agent, "root instructions exceed budget"), "AGENTS.md")
+        (self.root / "CLAUDE.md").write_text("extra", encoding="utf-8")
         (self.root / "api").mkdir()
         (self.root / "api/AGENTS.md").write_text("nested rules", encoding="utf-8")
+        (self.root / "api/CLAUDE.md").write_text("nested extra", encoding="utf-8")
         (self.root / "api/code.py").write_text("pass", encoding="utf-8")
         #  消除机器身份、日期与安装路径对字符数的影响，项目指令走真实构建路径。
         with (mock.patch("xiaoyu.agent.SYSTEM_PROMPT", "测试核心身份。"),
