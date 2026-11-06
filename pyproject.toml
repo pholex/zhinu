@@ -20,7 +20,7 @@ dependencies = [
     "openai==3.39.0",
     #  Anthropic Messages 协议直连（xiaoyu/messages.py），锁版本纪律同上；
     #  两套 SDK 均使用 httpx2 传输
-    "anthropic==1.13.0",
+    "anthropic==2.4.0",
     #  bash 语法白名单解析（权限判定用）：解析失败/缺包时代码自动回退字符串黑名单，
     #  所以两个包即使某平台没有 wheel 也不致命
     "tree-sitter>=0.22",
