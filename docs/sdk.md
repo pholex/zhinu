@@ -365,6 +365,13 @@ hooks 接收文字投影和图片占位标记，不接收图片字节。
 - 未接纳的文字仅保留在本会话内存，跨轮次保留到宿主取回，但不自动投递下一轮、
   不随 fork 复制，也不跨进程恢复；已接纳的文字作为用户历史正常持久化。
 
+需要逐条撤回时用 `queue_steer(text) -> str`，成功返回 ID，未排队返回空串。
+`pending_steers()` 返回 `(id, text)` 元组快照；`retract_steer(id)` 取回正文，已经消费
+或不存在返回 `None`；`replace_steer(id, text)` 原位修改未消费插话并返回是否成功。
+四个方法在 `Session` / `AsyncSession` 上都无需 await。修改正文必须非空，
+否则抛 `ConfigurationError`。消费与撤回竞争时只有一方取得正文；轮末回收后 ID
+失效，正文仍走 `drain_steers()`。原 `steer()` 的 bool 返回契约保持不变。
+
 完整同步／异步调用中的图片与插话契约一致。可运行的异步宿主示例见
 [inputs.py](../examples/sdk/inputs.py)，持久化待答首版见下节。
 
@@ -618,3 +625,6 @@ SDK。两次上传不是原子事务；SDK 失败时保留制品与日志，核�
 
 0.59.0 起提供的存储扩展见 [外置 SessionStore](sdk-storage.md)。
 动态 MCP/OAuth、依赖任务、成本预算和 OpenTelemetry 见 [平台能力](sdk-platform.md)。
+
+同一响应里的读取不能为本批写入提供新的已读凭据；默认启用，宿主可用
+`SessionOptions.batch_read_guard=False` 关闭批次限制，先读和版本检查仍保留。

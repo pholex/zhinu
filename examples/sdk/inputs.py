@@ -45,7 +45,10 @@ async def main() -> None:
             task = asyncio.create_task(consume())
             try:
                 await asyncio.wait_for(ready.wait(), 5)
-                print("Queued:", session.steer("Use Chinese and keep it brief."))
+                removed = session.queue_steer("Use English.")
+                print("Retracted:", session.retract_steer(removed))
+                pending = session.queue_steer("Use Chinese.")
+                print("Updated:", session.replace_steer(pending, "Use Chinese and keep it brief."))
             finally:
                 proceed.set()
                 await task

@@ -6,7 +6,7 @@ from dataclasses import replace
 from pathlib import Path
 import tempfile
 
-from xiaoyu_agent_sdk import BudgetOptions, Session, SQLiteSessionStore, Subagent, TaskSpec, TelemetryOptions, TraceRecord
+from xiaoyu_agent_sdk import BudgetOptions, Session, SQLiteSessionStore, Subagent, TaskSpec, TaskAcceptance, TelemetryOptions, TraceRecord
 from common import options, text_chunk
 
 
@@ -29,6 +29,12 @@ def main() -> None:
             for handle in handles:
                 result = handle.wait(120)
                 print(result.name, result.state, result.answer)
+            # Demo evidence is a deterministic fixture check; real hosts supply business checks.
+            checked = session.tasks.evaluate(result.task_id, lambda task: TaskAcceptance(
+                "passed" if args.demo and task.answer == "combined answer" else "unknown",
+                "Matched the offline fixture" if args.demo else "Needs a host business check",
+            ))
+            print("Acceptance:", checked.acceptance, checked.acceptance_evidence)
             session_id = session.session_id
         with Session(opts, resume_id=session_id) as restored:
             print("Restored without rerunning:", [(t.name, t.state) for t in restored.tasks.list()])

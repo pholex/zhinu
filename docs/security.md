@@ -18,6 +18,15 @@
 - **过审的落点执行前再核一次**：确认框挂着的那段时间里，路径上某一级被换成指向别处的符号链接的话，这次调用不执行。这把窗口从"你按键的几秒到几分钟"收到了两次系统调用之间，没有彻底关上。
 - `exit_plan_mode` 的审批同样 bypass-immune：`--yolo` 也要问。否则模型能自行退出 plan 档，"批准后才执行"就是空话。无人值守里确实没人按键时用 `--unattended` 显式放开（见文末[放开护栏](#放开护栏unattended--xiaoyu_hardline0--trustcontent--unguarded)）。
 
+## 读取结果与模型请求边界
+
+修改已有文件时，“已读”只认本次模型请求之前的读取结果。同一响应里的
+`read_file` 与写入即使顺序执行，写入参数仍是在模型看到读取结果之前生成的，
+不能由这次读取获得新的写入资格。此前已经读过的文件仍可编辑；模型自己新建或
+写出的内容可继续在本批编辑。版本指纹、部分读取与整文件覆盖检查照常执行。
+`XIAOYU_BATCH_READ_GUARD=0` 只关闭批次限制，原有先读与版本检查保留；SDK 用
+`SessionOptions.batch_read_guard=False`。`--unguarded` 也关闭这一层。
+
 ## 多文件补丁与交互输入
 
 `apply_patch` 按每个目标路径检查权限：任一目标命中 deny 就拒绝整批，任一目标
@@ -151,6 +160,13 @@ token 鉴权、会话工作区范围、目录信任、deny 规则、不可逆命
 
 进模型上下文的外部文本统一剥掉**隐形 Unicode 字符**（Tag 块 U+E0000–E007F、零宽空格、word joiner、不可见运算符、ZWNBSP）：工具结果、项目指令文件（AGENTS.md 等）、技能正文与描述、`--system-prompt-file`、MCP 的工具与参数描述。这些字符在终端、编辑器、diff 里都不显示，模型却按 token 读得到，是隐写式提示注入的常见载体。ZWJ/ZWNJ 不剥（emoji 序列与阿拉伯文、印度语系的正常拼写需要它们）。首次剥到时 stderr 留一行痕迹，每个进程只说一次。
 
+## 配置损坏时的保存
+
+更新工作区信任表、插件来源登记或用户 `.env` 时，文件缺失才直接使用空默认值。
+JSON／配置正文或 UTF-8 损坏时，先把原始字节保存到同目录的 `.corrupt-<随机ID>`
+文件（仅本人可读写），再允许重建。读取因权限／IO 失败，或备份失败，均不覆盖原件。
+此保护不提供跨进程读改写事务，也不会自动删除损坏备份。
+
 ## 跨会话消息是输入通道，不是提权通道
 
 本机同一用户的任意进程都能给你的会话投消息（隔离靠文件权限，`peers` 目录 0700）。因此：
@@ -228,6 +244,7 @@ token 鉴权、会话工作区范围、目录信任、deny 规则、不可逆命
 
 | 层 | 单独关掉 | 适用场景 |
 |---|---|---|
+| 同一批读取不能为写入提供新的已读凭据 | `XIAOYU_BATCH_READ_GUARD=0`（默认开） | 受控执行器需要自行管理批次语义 |
 | bash 硬红线（`rm -rf /`、`mkfs`、`dd of=/dev/…`） | `XIAOYU_HARDLINE=0`（默认开，与 `XIAOYU_SANDBOX` 同形态） | 隔离环境里做镜像烧录、格式化 |
 | 搜索工具的敏感文件过滤（`grep` / `list_files` 不碰 `.env`、私钥、`.ssh/`） | `XIAOYU_SEARCH_SENSITIVE=0`（默认开） | 隔离环境里确实要在凭据目录里搜 |
 | `--yolo` 下仍必问的操作（`exit_plan_mode`、沙箱升权、写可执行配置、交互任务启动与输入） | `--unattended`（或 `XIAOYU_UNATTENDED=1`） | 无人值守：没人按键，卡住等于任务死掉 |
@@ -238,7 +255,7 @@ token 鉴权、会话工作区范围、目录信任、deny 规则、不可逆命
 
 ### `--unguarded`：无护栏预设
 
-一次放开上表全部层（等价 `--yolo --no-sandbox --unattended XIAOYU_HARDLINE=0 XIAOYU_SEARCH_SENSITIVE=0 XIAOYU_MCP_TRUST_CHANGES=1`，并跳过工作区信任门——本次放行，不记入信任表）。名字刻意叫"无护栏"而不是 advance / pro：读启动命令的人一眼要看出它做了什么。
+一次放开上表全部层（等价 `--yolo --no-sandbox --unattended XIAOYU_HARDLINE=0 XIAOYU_SEARCH_SENSITIVE=0 XIAOYU_MCP_TRUST_CHANGES=1 XIAOYU_BATCH_READ_GUARD=0`，并跳过工作区信任门——本次放行，不记入信任表）。名字刻意叫"无护栏"而不是 advance / pro：读启动命令的人一眼要看出它做了什么。
 
 它**只在环境变量 `XIAOYU_UNGUARDED=1` 存在时生效**，否则报错退出、不静默降级。这个变量应由容器 / VM 的编排脚本注入，只认真实环境变量、不读任何 `.env`：工作区 `.env` 能被仓库带进来，用户级 `.env` 会被"上次设过"遗忘——两种都不是"这次运行确实在沙箱里"的证据。"安全沙箱"是你和环境之间的契约，不是口头承诺。
 

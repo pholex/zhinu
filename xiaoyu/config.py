@@ -202,7 +202,9 @@ def save_user_env(values: dict[str, str]) -> Path:
     """把配置合并写入用户级 .env：只覆盖传入的键，其余原样保留。"""
     path = user_env_path()
     path.parent.mkdir(parents=True, exist_ok=True)
-    merged = _parse_dotenv(path) if path.is_file() else {}
+    from .statefiles import read_for_update
+
+    merged = read_for_update(path, lambda text: _parse_dotenv_text(text, strict=True))
     merged.update(values)
     body = "\n".join(_dotenv_line(key, value) for key, value in merged.items())
     #  里面可能有 key：创建时就是仅本人可读，而不是写完再收紧
@@ -324,9 +326,18 @@ def _parse_dotenv(path: Path) -> dict[str, str]:
         raw = path.read_text(encoding="utf-8", errors="replace")
     except OSError:
         return result
+    return _parse_dotenv_text(raw)
+
+
+def _parse_dotenv_text(raw: str, *, strict: bool = False) -> dict[str, str]:
+    result: dict[str, str] = {}
     for line in raw.splitlines():
         line = line.strip()
-        if not line or line.startswith("#") or "=" not in line:
+        if not line or line.startswith("#"):
+            continue
+        if "=" not in line:
+            if strict:
+                raise ValueError("配置行缺少等号")
             continue
         if line.startswith("export "):
             line = line[len("export ") :]
@@ -554,6 +565,8 @@ class Config:
     # Appended fields preserve positional arguments of the existing Config API.
     load_project_instructions: bool = True
     skill_directories: tuple[Path, ...] | None = None
+    #  同批读取结果须等下一次模型响应才可用于修改；来源 XIAOYU_BATCH_READ_GUARD=0。
+    batch_read_guard: bool = True
 
     @property
     def context_limit(self) -> int:
@@ -696,6 +709,8 @@ class Config:
             cfg.hardline = flag.strip().lower() not in ("0", "false", "no", "off")
         if (flag := os.environ.get("XIAOYU_SEARCH_SENSITIVE")) is not None:
             cfg.search_sensitive = flag.strip().lower() not in ("0", "false", "no", "off")
+        if (flag := os.environ.get("XIAOYU_BATCH_READ_GUARD")) is not None:
+            cfg.batch_read_guard = flag.strip().lower() not in ("0", "false", "no", "off")
         #  "放松防线"类开关：未设置 = 关，必须显式打开
         cfg.unattended = os.environ.get("XIAOYU_UNATTENDED", "").strip().lower() in _ON_VALUES
         cfg.mcp_trust_changes = (

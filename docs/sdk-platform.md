@@ -98,6 +98,58 @@ AsyncSession 提供 `submit_tasks/wait_task/cancel_task/retry_task/task_status` 
 
 可运行示例：[依赖编排与恢复](../examples/sdk/orchestration.py)。
 
+## 独立业务验收
+
+执行成功 `succeeded` 不等于业务验收通过。整批任务结束、会话空闲后，宿主显式调用：
+
+```python
+from xiaoyu_agent_sdk import TaskAcceptance
+
+checked = session.tasks.evaluate(
+    result.task_id,
+    lambda task: TaskAcceptance("passed", "测试运行记录 #42：全部通过"),
+    timeout=30,
+)
+print(checked.state, checked.acceptance, checked.acceptance_evidence)
+```
+
+回调接收不可变 `TaskSnapshot`，须返回 `TaskAcceptance(status, evidence)`；状态为
+`passed/failed/unknown`，证据须为非空文本。`TaskSnapshot.acceptance` 初始为
+`not_requested`，回调期间为 `pending`。异常、超时、取消和无效返回记为 `unknown`，
+不会误报通过，也不把异常正文中的潜在私密数据写进证据。
+
+验收结果随任务持久化。重启遇到 `pending` 转为 `unknown`，不自动重跑回调；
+写入失败抛存储错误。验收不会改任务执行终态、不会重跑子 Agent、不会改变已有 DAG
+的依赖规则。如后续任务必须等待验收，应由宿主分批提交，确认 `passed` 后再提交下一批。
+验收未通过时，可创建带 `resume_from=task.child_run_id` 的新修复任务；原成功任务
+仍不原地重试。验收回调运行期间会话保持忙碌，关闭会等待回调清理或报告超时。
+
+`await async_session.evaluate_task(id, callback, timeout=30)` 对应异步入口，接受同步或
+异步回调；同步 Session 的回调须同步。证据由宿主验证和提供，不由模型自行认证。
+
+## 状态变化通知
+
+`ObservationMonitor` 是宿主调用的状态合并器，不启动线程、定时器、网络请求或模型轮次。
+
+```python
+from xiaoyu_agent_sdk import Observation, ObservationMonitor
+
+monitor = ObservationMonitor(session.notify, coalesce_seconds=2)
+monitor.observe(Observation("build-42", "running", "构建开始", next_check_at=1800000060))
+monitor.observe(Observation("build-42", "failed", "测试运行 #42：两项失败"))
+# 宿主自己的调度器稍后调用；到期才通过 session.notify 投递。
+monitor.flush()
+```
+
+首次观察只建立基线；同一 subject 的 fingerprint 不变就不通知，即使证据文本或
+下次检查时间变了。变化后保留窗口内最新证据，到首次变化的合并期限后 `flush()`
+才发送；窗口内回到原状态则取消通知。每次变化使用新的通知 key，因此状态 A→B→A
+不会被会话级去重吞掉。通知失败保留待发项，后续 `flush()` 可重试。
+
+`observations()` 返回最新不可变观察快照，`forget(subject)` 释放该对象的跟踪记录。
+`next_check_at` 由宿主解释和调度，可用来降低等待人工审核时的检查频率；合并期限
+使用单调时钟。宿主须串行调用此对象，状态仅驻内存，重启后重新建立基线。
+
 ## 请求与费用预算
 
 `SessionOptions.budget=BudgetOptions(...)` 在实际模型请求入口计量，父轮次、子任务、

@@ -437,6 +437,18 @@ class Registration:
         """挂给模型的两件：`list_sessions` / `send_message`（见 make_peer_tools）。"""
         return make_peer_tools(self)
 
+    def bind_delivery_log(self, journal: str) -> None:
+        self.meta["delivery_journal"] = journal
+        self._write()
+
+    def pending_deliveries(self, journal: str) -> list[dict[str, Any]]:
+        from .peer_delivery import pending
+        return pending(self.ref, journal)
+
+    def accept_delivery(self, message_id: str, journal: Any, message: dict, consumed: Any) -> bool:
+        from .peer_delivery import accept
+        return accept(message_id, self.ref, journal, message, consumed)
+
     def drain(self) -> list[tuple[str, str]]:
         """取走信箱里全部消息 → [(来源展示名, 已包装文本)]，按到达顺序。
 
@@ -530,7 +542,14 @@ def make_peer_tools(registration: "Registration") -> list[Any]:
             + "\n".join(lines)
         )
 
-    def send_message(to: str, message: str) -> str:
+    def send_message(to: str, message: str, reliable: bool = False) -> str:
+        if reliable:
+            from . import peer_delivery
+            try:
+                record = peer_delivery.send(to, message, registration.address)
+            except (PeerError, OSError, ValueError) as exc:
+                return f"ERROR: 可靠投递失败：{exc}"
+            return f"已持久化投递，消息 ID：{record['id']}。用 xiaoyu send --status ID 查询接纳状态；不要轮询。"
         try:
             target = deliver(to, message, sender=registration.address)
         except PeerError as exc:
@@ -554,6 +573,7 @@ def make_peer_tools(registration: "Registration") -> list[Any]:
             parameters={
                 "type": "object",
                 "properties": {
+                    "reliable": {"type": "boolean", "description": "持久化消息并返回可查询回执；收件方需启用会话日志，默认 false。"},
                     "to": {
                         "type": "string",
                         "description": "收件会话名，如 zhinu-1；重名时写成 `zhinu-1 [b3b404]`",

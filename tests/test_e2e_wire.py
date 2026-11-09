@@ -293,6 +293,26 @@ class ApprovalTest(WireCase):
 
 
 class SteerCancelTest(WireCase):
+    def test_pending_steer_can_be_edited_or_retracted_by_id(self):
+        wire = self.start_wire(_TOOL_SCRIPT)
+        wire.send({"jsonrpc": "2.0", "id": "p", "method": "prompt", "params": {"text": "干活"}})
+        approval, _ = wire.read_until(self.is_approval)
+        def request(ident, method, params):
+            wire.send({"jsonrpc": "2.0", "id": ident, "method": method, "params": params})
+            response, _ = wire.read_until(self.is_response(ident))
+            self.assertNotIn("error", response)
+            return response["result"]
+        removed = request("q1", "steer/queue", {"text": "撤回这句"})["id"]
+        kept = request("q2", "steer/queue", {"text": "旧内容"})["id"]
+        self.assertTrue(request("edit", "steer/replace", {"id": kept, "text": "新内容"})["replaced"])
+        self.assertTrue(request("remove", "steer/retract", {"id": removed})["retracted"])
+        self.assertEqual(request("list", "steer/list", {})["items"], [{"id": kept, "text": "新内容"}])
+        wire.send({"jsonrpc": "2.0", "id": approval["id"], "result": {"verdict": "allow"}})
+        _, events = wire.read_until(self.is_response("p"))
+        accepted = [e["params"]["text"] for e in events if e.get("method") == "event" and e.get("params", {}).get("kind") == "steer.accepted"]
+        self.assertEqual(accepted, ["新内容"])
+        self.assertFalse(request("late", "steer/retract", {"id": kept})["retracted"])
+
     def test_steer_lands_in_running_turn(self):
         """用审批挂起当同步点：插话必然在工具批次收尾后被消费。"""
         wire = self.start_wire(_TOOL_SCRIPT)

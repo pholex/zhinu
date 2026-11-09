@@ -1,0 +1,7 @@
+{
+  "results": [
+    "def add(a, b):\n    return a + b\n",
+    "ERROR: calc.py 在本批调用中才读取，模型尚未看到读取结果。请在下一次模型响应中再提交修改。"
+  ],
+  "file": "def add(a, b):\n    return a + b\n"
+}

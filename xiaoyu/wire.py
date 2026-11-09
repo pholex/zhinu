@@ -188,6 +188,24 @@ class WireServer:
             assert self.agent is not None
             self.agent.steer(text)
             self._respond(req_id, {})
+        elif method in {"steer/queue", "steer/list", "steer/retract", "steer/replace"}:
+            assert self.agent is not None
+            text, ident = params.get("text"), params.get("id")
+            if method in {"steer/queue", "steer/replace"} and (not isinstance(text, str) or not text.strip()):
+                self._fail(req_id, INVALID_PARAMS, "需要非空 text")
+                return
+            if method in {"steer/retract", "steer/replace"} and (not isinstance(ident, str) or not ident):
+                self._fail(req_id, INVALID_PARAMS, "需要插话 id")
+                return
+            if method == "steer/queue":
+                self._respond(req_id, {"id": self.agent.queue_steer(text)})
+            elif method == "steer/list":
+                self._respond(req_id, {"items": [{"id": key, "text": value} for key, value in self.agent.pending_steers()]})
+            elif method == "steer/retract":
+                value = self.agent.retract_steer(ident)
+                self._respond(req_id, {"retracted": value is not None, "text": value})
+            else:
+                self._respond(req_id, {"replaced": self.agent.replace_steer(ident, text)})
         elif method == "cancel":
             self._cancel_turn()
             self._respond(req_id, {})

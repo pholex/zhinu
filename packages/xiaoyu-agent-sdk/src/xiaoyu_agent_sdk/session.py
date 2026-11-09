@@ -16,7 +16,7 @@ import uuid
 from concurrent.futures import Future, InvalidStateError, ThreadPoolExecutor, TimeoutError as FutureTimeout
 from dataclasses import replace
 from pathlib import Path
-from typing import Any, AsyncGenerator, Generator, cast
+from typing import Any, AsyncGenerator, Generator, cast, Callable, Awaitable
 
 from xiaoyu.agent import Agent, Deny, Interrupted
 from xiaoyu.config import Config
@@ -37,7 +37,7 @@ from .types import (
 )
 from .storage import _StoreLog, session_metadata
 from .questions import QuestionOptions, QuestionManager, AsyncQuestionManager
-from .tasks import TaskManager, TaskSpec, TaskHandle, TaskSnapshot
+from .tasks import TaskAcceptance, TaskManager, TaskSpec, TaskHandle, TaskSnapshot
 from .types import McpServer
 from .budget import _Ledger, _MeteredClient, BudgetExceededError, CostSnapshot, BudgetOptions
 from .telemetry import _Telemetry
@@ -239,6 +239,8 @@ class Session:
             raise ConfigurationError("question_timeout must be finite and positive")
         if options.asker is not None and not callable(options.asker):
             raise ConfigurationError("asker must be callable")
+        if type(options.batch_read_guard) is not bool:
+            raise ConfigurationError("batch_read_guard must be a boolean")
         if any(type(value) is not int or value < 1 for value in (options.max_iterations, options.event_buffer_size, options.max_parallel_tasks)):
             raise ConfigurationError("Iteration and event buffer limits must be positive")
         if options.budget_tokens is not None and (type(options.budget_tokens) is not int or options.budget_tokens < 1):
@@ -267,6 +269,7 @@ class Session:
             load_project_instructions=options.load_project_instructions,
             system_prompt=options.system_prompt, max_iterations=options.max_iterations,
             budget_tokens=options.budget_tokens, extra_env=dict(options.tool_env),
+            batch_read_guard=options.batch_read_guard,
         )
         client = model.client
         if client is None:
@@ -740,16 +743,33 @@ class Session:
 
     def steer(self, text: str) -> bool:
         """Queue text for the active parent turn; True does not mean consumed."""
+        return bool(self.queue_steer(text))
+
+    def queue_steer(self, text: str) -> str:
+        """Return a pending input ID, or an empty string if no turn can accept it."""
         if not isinstance(text, str):
             raise ConfigurationError("steer requires text")
         with self._mutex:
             if self._closed or self._closing:
                 raise SessionClosedError("Session is closed or closing")
             if not text.strip() or not self._steer_open or self._cancel.is_set():
-                return False
+                return ""
             assert self._agent is not None
-            self._agent.steer(text)
-            return True
+            return self._agent.queue_steer(text)
+
+    def pending_steers(self) -> tuple[tuple[str, str], ...]:
+        with self._mutex:
+            return self._agent.pending_steers() if self._agent is not None else ()
+
+    def retract_steer(self, ident: str) -> str | None:
+        with self._mutex:
+            return self._agent.retract_steer(ident) if self._agent is not None else None
+
+    def replace_steer(self, ident: str, text: str) -> bool:
+        if not isinstance(text, str) or not text.strip():
+            raise ConfigurationError("Replacement steer requires nonempty text")
+        with self._mutex:
+            return self._agent.replace_steer(ident, text) if self._agent is not None else False
 
     def drain_steers(self) -> list[str]:
         """Recover unconsumed text after a turn, including after close."""
@@ -1332,6 +1352,18 @@ class AsyncSession:
     def steer(self, text: str) -> bool:
         return self._session.steer(text)
 
+    def queue_steer(self, text: str) -> str:
+        return self._session.queue_steer(text)
+
+    def pending_steers(self) -> tuple[tuple[str, str], ...]:
+        return self._session.pending_steers()
+
+    def retract_steer(self, ident: str) -> str | None:
+        return self._session.retract_steer(ident)
+
+    def replace_steer(self, ident: str, text: str) -> bool:
+        return self._session.replace_steer(ident, text)
+
     def drain_steers(self) -> list[str]:
         return self._session.drain_steers()
 
@@ -1419,6 +1451,14 @@ class AsyncSession:
 
     def task_status(self) -> tuple[TaskSnapshot, ...]:
         return self._session.tasks.list()
+
+    async def evaluate_task(
+        self, task_id: str,
+        evaluator: Callable[[TaskSnapshot], TaskAcceptance | Awaitable[TaskAcceptance]],
+        *, timeout: float = 30.0,
+    ) -> TaskSnapshot:
+        self._bind_loop()
+        return await asyncio.to_thread(self._session.tasks.evaluate, task_id, evaluator, timeout=timeout)
 
     async def retry_task(self, task_id: str, *, allow_uncertain: bool = False, continue_history: bool = False) -> TaskHandle:
         self._bind_loop()

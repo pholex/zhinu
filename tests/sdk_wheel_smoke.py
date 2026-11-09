@@ -86,13 +86,21 @@ with tempfile.TemporaryDirectory() as directory:
             handles = session.tasks.submit((sdk.TaskSpec("a", "worker", "Return 42"),
                 sdk.TaskSpec("b", "worker", "Confirm the answer", depends_on=("a",))))
             assert all(h.wait(10).state == "succeeded" for h in handles)
+            accepted = session.tasks.evaluate(handles[0].task_id, lambda task: sdk.TaskAcceptance("passed", "answer is 42"))
+            assert accepted.acceptance == "passed" and accepted.state == "succeeded"
             assert session.cost.requests == 2
             key = session.session_id
         assert pool.server_states() == {}
     with sdk.Session(platform_options, resume_id=key) as session:
         assert len(session.tasks.list()) == 2
         assert all(t.state == "succeeded" for t in session.tasks.list())
+        assert session.tasks.get(handles[0].task_id).acceptance == "passed"
         assert session.cost.requests == 2
     assert len(traces) == 2
     assert sdk.MemoryTokenStore().load() is None
+    notifications = []
+    monitor = sdk.ObservationMonitor(lambda text, **kwargs: notifications.append(text), coalesce_seconds=0)
+    monitor.observe(sdk.Observation("job", "running", "started"))
+    monitor.observe(sdk.Observation("job", "complete", "finished"))
+    assert monitor.flush() == 1 and len(notifications) == 1
 print("Installed SDK smoke passed", sdk.__version__)

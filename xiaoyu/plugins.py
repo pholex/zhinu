@@ -588,8 +588,11 @@ def pick_bundle(root: Path, want: str | None, subpath: str = "") -> tuple[Path, 
 # ---------- 账本 ----------
 
 
-def load_registry() -> dict[str, Any]:
+def load_registry(*, for_update: bool = False) -> dict[str, Any]:
     path = registry_path()
+    if for_update:
+        from .statefiles import read_json_for_update
+        return read_json_for_update(path, "plugins").get("plugins", {})
     if not path.is_file():
         return {}
     try:
@@ -597,11 +600,13 @@ def load_registry() -> dict[str, Any]:
     except (OSError, ValueError):
         #  账本坏了只是丢来源信息（update 会提示重装），不该让已装的包全体消失
         return {}
-    plugins = data.get("plugins")
+    plugins = data.get("plugins") if isinstance(data, dict) else None
     return plugins if isinstance(plugins, dict) else {}
 
 
 def save_registry(plugins: dict[str, Any]) -> None:
+    from .statefiles import read_json_for_update
+    read_json_for_update(registry_path(), "plugins")
     fsguard.write_atomic(
         registry_path(), json.dumps({"plugins": plugins}, ensure_ascii=False, indent=2) + "\n"
     )
@@ -655,7 +660,7 @@ def record(name: str, bundle: Bundle, origin: Origin, mcp_installed: list[str]) 
     每次 update 都会重报一遍"有变化"——而这正是防 rug-pull 的那道提示，
     天天喊狼来了只会把用户训练成闭眼点是。
     """
-    plugins = load_registry()
+    plugins = load_registry(for_update=True)
     plugins[name] = {
         "declared_mcp": declared_mcp(bundle),
         "kind": origin.kind,
@@ -674,7 +679,7 @@ def record(name: str, bundle: Bundle, origin: Origin, mcp_installed: list[str]) 
 
 
 def forget(name: str) -> None:
-    plugins = load_registry()
+    plugins = load_registry(for_update=True)
     if plugins.pop(name, None) is not None:
         save_registry(plugins)
 

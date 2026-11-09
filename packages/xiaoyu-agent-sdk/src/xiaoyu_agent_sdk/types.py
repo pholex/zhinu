@@ -161,6 +161,7 @@ class SessionOptions:
     result_transforms: tuple[ResultTransform, ...] = ()
     result_transform_timeout: float = 30.0
     questions: QuestionOptions | None = None
+    batch_read_guard: bool = True
 
 
 class SDKError(Exception):

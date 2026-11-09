@@ -85,6 +85,9 @@ xiaoyu sessions inspect 1 --kind model # 查看前后模型、路由与切换原
 xiaoyu sessions rename 1 "登录页修复"   # 给它起个名字，resume 列表里代替首条消息
 xy --stats "跑一下测试"                  # 收尾多一行：耗时 / 首 token / 输出 tok/s（交互模式也认）
 xiaoyu send zhinu-1 "顺便把 lint 跑一下"  # 给另一个终端里的小羽递话
+xiaoyu send --reliable zhinu-1 "测试通过" # 持久化投递，返回消息 ID
+xiaoyu send --status <消息ID>            # pending / accepted
+xiaoyu send --retry <消息ID> zhinu-2     # 恢复到新会话后，显式重投未接纳消息
 
 xiaoyu mcp add chrome-devtools --scope user npx -y chrome-devtools-mcp@1.12.0 --autoConnect --no-usage-statistics --no-performance-crux
 xiaoyu mcp list                         # 写的就是 .mcp.json / mcp.json

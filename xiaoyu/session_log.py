@@ -1435,6 +1435,14 @@ def _replay_lines(lines: Iterable[str]) -> LoadedMessages:
             elif kind == "clear":
                 messages = []
                 corrupt = []
+            elif kind == "peer.delivery":
+                message = record.get("message")
+                if (not isinstance(message, dict) or message.get("role") != "user"
+                        or not isinstance(message.get("content"), str)
+                        or message.get("_peer_delivery_id") != record.get("message_id")
+                        or message.get(media.PEER_KEY) is not True):
+                    raise ValueError("Invalid peer delivery message")
+                messages.append(dict(message))
             elif kind == "sdk.question.delivery":
                 message = record.get("message")
                 if not isinstance(message, dict) or set(message) != {"role", "content"} or message.get("role") != "user" or not isinstance(message.get("content"), str):

@@ -143,6 +143,7 @@ XIAOYU_API_KEY=<key>
 | `XIAOYU_GATEWAY_CACHE_CONTROL` | 网关下型号名含 `claude` / `anthropic` 的后端：chat 载荷自动打 Anthropic 缓存断点（默认开，见上方"网关"）；`0` = 关 |
 | `XIAOYU_UPDATE_CHECK` | 新版本提示（默认开）：交互式启动时每 24 小时至多查一次 PyPI，有新版在横幅后提一行；`-p`、`--wire`、serve、ACP、嵌入宿主不查。请求只带版本号，没有身份标识；同一个新版本每 24 小时至多提一次。`0` = 关 |
 | `XIAOYU_FOLDER_TRUST` | 工作区信任门（默认开，见[安全](security.md)；只认真实环境变量与用户级 `.env`） |
+| `XIAOYU_BATCH_READ_GUARD` | 同一模型响应里的读取不能为本批写入提供新的已读凭据（默认开）；`0` 关闭批次限制，先读与文件版本检查仍保留 |
 | `XIAOYU_HARDLINE` | bash 硬红线（`rm -rf /`、`mkfs`、`dd of=/dev/…`，默认开、任何模式都拦）；`0` = 关，给隔离环境里的镜像烧录 / 格式化用（见[安全](security.md)） |
 | `XIAOYU_SEARCH_SENSITIVE` | 搜索工具的敏感文件过滤（默认开）：`grep` / `list_files` 不把 `.env`、私钥、`.ssh/`、`.aws/credentials` 等读进上下文，起点是这类路径直接拒绝；`0` = 关，给隔离环境里确实要在凭据目录里搜的任务用（见[安全](security.md)） |
 | `XIAOYU_UNATTENDED` | **默认关**，`1` = 开：`--yolo` 下仍必问的操作（`exit_plan_mode`、沙箱升权、写可执行配置、交互任务启动与输入）也不再问；等价命令行 `--unattended` |
@@ -668,3 +669,20 @@ explore 复用主会话已经配置的连接，不另起服务、不扫描全部
 工具也不会通过此配置出现。工具尚未就绪或无法使用时继续用文件检索。
 SDK 宿主可设置 `Config.explore_mcp_tools`（完整名称列表）。这只增加扩展接入能力，
 不自带语言服务器；具体 LSP 服务仍需安装并配置项目环境。
+
+## 可靠跨会话留言
+
+普通 `xiaoyu send` 保持轻量信箱语义。`xiaoyu send --reliable <会话> <正文>` 或
+模型工具 `send_message(reliable=true)` 把消息保存到用户配置目录的 `peer-deliveries/`，
+返回 ID；只有收件会话启用持久化日志时才能使用。
+
+`xiaoyu send --status ID` 返回 `pending`（已投递、未确认接纳）或 `accepted`
+（正文已提交到收件日志）；接纳不代表模型已完成消息要求的任务。未接纳记录不会随
+会话退出或过期登记清理而删除。接回同一命名会话日志可继续接收；普通 `resume`
+创建新日志时，发件方用 `xiaoyu send --retry ID <新会话>` 显式重投，保留原 ID。
+已接纳消息不会再次投递，日志提交后回执丢失会根据原日志修复。原日志缺失或损坏、
+无法判断曾经的接纳结果时拒绝盲目重投；修复日志后再查询。回执目前由用户管理，
+不会自动过期。原日志不得在回执未确认时删除。
+
+此能力只确认消息进入持久化上下文，不承诺外部业务操作只执行一次。普通留言的
+审批、来源标注、空闲不主动唤醒及 `--yolo` 下默认不收信的规则同样适用。

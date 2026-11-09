@@ -7,7 +7,7 @@
 `steer` / `drain_steers` 与 SDK 的 `SteerAccepted` 导出自 0.62.0 起提供。`SessionStore`、
 `SessionWriter`、`SQLiteSessionStore`、`StoredSessionInfo`、`session_id` 与
 `resume_id` 见 [存储扩展](sdk-storage.md)。
-动态 MCP/OAuth、`TaskSpec` / `TaskHandle` / `TaskSnapshot` / `TaskManager`、
+动态 MCP/OAuth、`Observation` / `ObservationMonitor`、`TaskAcceptance`、`TaskSpec` / `TaskHandle` / `TaskSnapshot` / `TaskManager`、
 `BudgetOptions` / `ModelPrice` / `CostSnapshot`、扩展 Hook 和 OpenTelemetry 的
 接口见 [平台能力](sdk-platform.md)。
 
@@ -171,3 +171,18 @@ context_tokens 是当前上下文估算。仅 output_status 为 valid 时消费 
 CI 覆盖 Linux/macOS/Windows × Python 3.11/3.14，发布流程以全部通过为前提。
 不承诺低版本 Python、其他内核版本或未验证平台的操作系统沙箱能力。
 0.x 破坏性变更升级 minor；移除既有接口前至少保留一个 minor 的弃用窗口。
+
+## 插话与验收扩展
+
+- `Session.queue_steer(text) -> str`、`pending_steers() -> tuple[tuple[str, str], ...]`、
+  `retract_steer(id) -> str | None`、`replace_steer(id, text) -> bool`；AsyncSession 同名方法不需要 await。
+- `SessionOptions.batch_read_guard: bool = True`：同批读取不能提供新的写入资格。
+- `TaskManager.evaluate(task_id, evaluator, *, timeout=30) -> TaskSnapshot`；
+  异步对应 `await AsyncSession.evaluate_task(...)`。
+- `TaskAcceptance(status, evidence)`：status 为 `passed/failed/unknown`，evidence 为非空 str。
+  `TaskSnapshot` 新增 `acceptance` 和 `acceptance_evidence` 字段。
+- `Observation(subject, fingerprint, evidence, next_check_at=None)` 与
+  `ObservationMonitor(notify, *, coalesce_seconds=1, clock=time.monotonic)`：
+  方法 `observe(observation) -> bool`、`flush() -> int`、`observations()`、`forget(subject)`。
+
+详细状态、持久化及调度边界见 [平台能力](sdk-platform.md)。

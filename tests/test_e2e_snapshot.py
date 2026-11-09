@@ -88,6 +88,28 @@ SCENARIOS = (
 _PIN = next(sc for sc in SCENARIOS if sc.pins_header)
 
 
+class BatchReadSnapshot(AgentTestCase):
+    def test_scenario(self) -> None:
+        agent = self.build([
+            [chunk(tool_calls=[
+                call_fragment(0, "read", "read_file", '{"path":"calc.py"}'),
+                call_fragment(1, "write", "write_file", '{"path":"calc.py","content":"guessed"}'),
+            ])],
+            [chunk(content="已看到读取结果，请下一步再修改。")],
+        ])
+        with mock.patch.object(agent, "emit"):
+            agent.send("读文件再改")
+        actual = {
+            "results": [m["content"] for m in agent.messages if m.get("role") == "tool"],
+            "file": (self.root / "calc.py").read_text(encoding="utf-8", errors="replace"),
+        }
+        fixture = Path(__file__).parent / "fixtures" / "batch_read.expected.json"
+        if MODE == "refresh":
+            fixture.write_text(json.dumps(actual, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        self.assertEqual(actual, json.loads(fixture.read_text(encoding="utf-8", errors="replace")))
+        self.assertIn("尚未看到", actual["results"][1])
+
+
 class ApiKeyReferenceSnapshot(E2ECase):
     """缺失的显式引用在配置诊断里报出，不能悄悄使用备用凭据。"""
 

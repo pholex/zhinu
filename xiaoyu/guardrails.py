@@ -53,6 +53,7 @@ class Layer:
 #  Config.workspace_trusted 正常过门后也是 True，按值看不出"是不是预设放的行"，
 #  所以它作为预设的附加动作单独处理（TRUST_GATE，CLI 在过门处按 args.unguarded 放行）
 LAYERS: tuple[Layer, ...] = (
+    Layer("batch_read_guard", "batch_read_guard", False, "同批读取不能授权写入", "XIAOYU_BATCH_READ_GUARD=0"),
     Layer("auto_approve", "yolo", True, "逐条审批", "--yolo"),
     Layer("sandbox", "sandbox", False, "bash 沙箱", "--no-sandbox"),
     Layer("hardline", "hardline", False, "bash 硬红线", "XIAOYU_HARDLINE=0"),

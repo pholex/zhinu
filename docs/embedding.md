@@ -202,6 +202,15 @@ host.watch_notifications(on_notification)   # 在事件循环里调用；传 Non
 - `pending_notifications()` 随时给出还没送达模型的通知；下一轮开跑、送达之后为空。
 - 同一个 `key` 整个会话只告知一次、只送达一次，宿主重复投递幂等事件不会刷屏。
 
+## 可撤回的插话
+
+`Agent` / `AsyncAgent` 的 `queue_steer(text)` 返回插话 ID（空白输入返回空串），
+`pending_steers()` 返回按顺序排列的 `(id, text)` 元组快照。
+`retract_steer(id)` 返回成功取回的正文，已消费或不存在时返回 `None`；
+`replace_steer(id, text)` 原位修改尚未消费的正文，返回是否成功，空白正文抛 `ValueError`。
+撤回与批次消费共用一把锁，消费先取得正文后便不能撤回。队列仅在内存中，
+轮末仍可用 `drain_steers()` 回收；原 `steer()` 的返回值与行为保持不变。
+
 ## 单轮结算 `RunResult`
 
 `measured_send()` / `AsyncAgent.send()` 返回；`stream()` 在 `RunCompleted.result` 里给：
@@ -321,6 +330,10 @@ client → server（request，带 `id`）：
 | `initialize` | `{}` | `{protocol_version, server:{name,version}, model, workspace, messages}`（`messages` = 已在场的历史条数） |
 | `prompt` | `{text}` | 整轮结束后 `{status, result, usage}`，`status ∈ finished \| interrupted \| error`；一次只跑一轮，忙时错误码 `-32000` |
 | `steer` | `{text}` | `{}` |
+| `steer/queue` | `{text}` | `{id}`，仍遵守运行中插话的轮次语义 |
+| `steer/list` | `{}` | `{items: [{id, text}]}` |
+| `steer/retract` | `{id}` | `{retracted, text}`；已消费时为 `false, null` |
+| `steer/replace` | `{id, text}` | `{replaced}` |
 | `cancel` | `{}` | `{}`；打断当前轮并把挂起审批全按拒绝解决 |
 
 server → client：
@@ -353,11 +366,13 @@ EOF / 连接关闭：挂起审批全部拒绝、打断当前轮、等工作线�
 - **版本**：`__version__`
 
 `Agent` 上属于契约的方法与属性：`send` / `interrupt` / `steer` / `drain_steers` /
+`queue_steer` / `pending_steers` / `retract_steer` / `replace_steer` /
 `notify` / `pending_notifications` / `reset` / `restore` / `set_output_schema` /
 `set_mode` / `switch_model` / `set_budget_tokens` / `context_tokens` /
 `last_assistant_text`，以及
 `messages` / `usage` / `trace` / `sink` / `approver` / `structured_output` /
 `on_notification`。
 `AsyncAgent` 上：`send` / `stream` / `interrupt` / `steer` / `notify` /
+`queue_steer` / `pending_steers` / `retract_steer` / `replace_steer` /
 `pending_notifications` / `watch_notifications` / `recycle`（`reset` 同义）/
 `restore` / `agent`。

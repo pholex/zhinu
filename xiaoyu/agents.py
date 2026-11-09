@@ -933,6 +933,7 @@ def execute_delegation(
         bash_timeout=config.bash_timeout,
         sandbox=config.sandbox,
         sandbox_network=config.sandbox_network,
+        batch_read_guard=config.batch_read_guard,
         auto_approve=readonly_run or config.auto_approve,
         #  跟父会话同一档。不传的话吃的是出厂起始档（auto）：父会话明明在确认档，
         #  子 agent 却能不问就写文件、跑命令

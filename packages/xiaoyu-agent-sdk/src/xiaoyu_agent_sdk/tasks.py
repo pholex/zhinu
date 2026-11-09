@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import copy
+import math
 import builtins
 from contextlib import nullcontext
 from concurrent.futures import Future, ThreadPoolExecutor
@@ -9,7 +10,7 @@ from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 import threading
 import time
-from typing import Any, TYPE_CHECKING
+from typing import Any, TYPE_CHECKING, Callable, Awaitable, Literal
 import uuid
 
 from xiaoyu.agents import AgentSpec, ParentGuards, RunStore, SubagentRun, execute_delegation
@@ -19,6 +20,14 @@ if TYPE_CHECKING:
     from .session import Session
 
 TERMINAL = frozenset(("succeeded", "failed", "cancelled", "blocked", "lost"))
+
+
+@dataclass(frozen=True)
+class TaskAcceptance:
+    """Host evidence, separate from whether child execution returned normally."""
+
+    status: Literal["passed", "failed", "unknown"]
+    evidence: str
 
 
 @dataclass(frozen=True)
@@ -47,6 +56,9 @@ class TaskSnapshot:
     error: str = ""
     child_run_id: str = ""
     resume_from: str = ""
+
+    acceptance: str = "not_requested"
+    acceptance_evidence: str = ""
 
 
 class _JournalRuns(RunStore):
@@ -101,6 +113,7 @@ class TaskManager:
         self._agents: dict[str, Any] = {}
         self._pending_children: list[Any] = []
         self._closed = False
+        self._evaluating: set[str] = set()
         self._pool = ThreadPoolExecutor(max_workers=session.options.max_parallel_tasks, thread_name_prefix="xiaoyu-child")
         self.runs = _JournalRuns(session, records)
         for record in records:
@@ -111,8 +124,13 @@ class TaskManager:
                     task = TaskSnapshot(**value)
                     if task.session_id != session.session_id or task.state not in TERMINAL | {"queued", "running", "cancelling"}:
                         raise SessionStorageError("Invalid stored task identity/state")
+                    if task.acceptance not in {"not_requested", "pending", "passed", "failed", "unknown"} or not isinstance(task.acceptance_evidence, str):
+                        raise SessionStorageError("Invalid stored task acceptance")
                     self._tasks[task.task_id] = task
         for key, task in list(self._tasks.items()):
+            if task.acceptance == "pending":
+                task = replace(task, acceptance="unknown", acceptance_evidence="Host exited before acceptance was persisted")
+                self._tasks[key] = task
             if not isinstance(task.task_id, str) or not task.task_id or not isinstance(task.prompt, str) or type(task.attempt) is not int or task.attempt < 1 or any(d not in self._tasks for d in task.depends_on):
                 raise SessionStorageError("Invalid stored task graph")
             if task.state not in TERMINAL:
@@ -127,7 +145,7 @@ class TaskManager:
 
     def active(self) -> bool:
         with self._condition:
-            return bool(self._running or self._pending_children) or any(t.state not in TERMINAL for t in self._tasks.values())
+            return bool(self._running or self._pending_children or self._evaluating) or any(t.state not in TERMINAL for t in self._tasks.values())
 
     def retain_pending_child(self, agent: Any) -> None:
         if agent.toolbox.tasks.shutdown_pending():
@@ -152,6 +170,44 @@ class TaskManager:
         self.session._journal("sdk.tasks", tasks=[asdict(t) for t in tasks])
         self._tasks.update((t.task_id, t) for t in tasks)
         self._condition.notify_all()
+
+    def evaluate(
+        self, task_id: str,
+        evaluator: Callable[[TaskSnapshot], TaskAcceptance | Awaitable[TaskAcceptance]],
+        *, timeout: float = 30.0,
+    ) -> TaskSnapshot:
+        """Explicit host acceptance; never reruns the child or alters dependency success."""
+        if not callable(evaluator) or type(timeout) not in (int, float) or not math.isfinite(timeout) or timeout <= 0:
+            raise ConfigurationError("Acceptance requires a callable and a finite positive timeout")
+        with self.session._mutex:
+            self.session._check_idle()
+            self.session._ensure_started()
+            with self._condition:
+                if self._closed:
+                    raise SessionClosedError("Task manager is closed")
+                task = self.get(task_id)
+                if task.state != "succeeded":
+                    raise ConfigurationError("Only successfully executed tasks can be evaluated")
+                self._save([replace(task, acceptance="pending", acceptance_evidence="")])
+                self._evaluating.add(task_id)
+                self.session._cancel.clear()
+        try:
+            try:
+                verdict = self.session._callback(evaluator, task, timeout=timeout)
+                if (not isinstance(verdict, TaskAcceptance)
+                        or verdict.status not in {"passed", "failed", "unknown"}
+                        or not isinstance(verdict.evidence, str) or not verdict.evidence.strip()):
+                    verdict = TaskAcceptance("unknown", "Evaluator returned no valid evidence")
+            except Exception:
+                verdict = TaskAcceptance("unknown", "Evaluator failed, timed out or was cancelled")
+            with self._condition:
+                updated = replace(task, acceptance=verdict.status, acceptance_evidence=verdict.evidence)
+                self._save([updated])
+                return updated
+        finally:
+            with self._condition:
+                self._evaluating.discard(task_id)
+                self._condition.notify_all()
 
     def submit(self, specs: tuple[TaskSpec, ...]) -> tuple[TaskHandle, ...]:
         with self.session._mutex:
@@ -336,7 +392,7 @@ class TaskManager:
                 if continue_history and not task.child_run_id:
                     raise ConfigurationError("No persisted child history to continue")
                 self._save([replace(task, state="queued", attempt=task.attempt + 1, answer="", error="", child_run_id="",
-                                    resume_from=task.child_run_id if continue_history else "")])
+                                    resume_from=task.child_run_id if continue_history else "", acceptance="not_requested", acceptance_evidence="")])
                 self.session._cancel.clear()
                 self._schedule()
                 return TaskHandle(self, task_id)
@@ -363,7 +419,7 @@ class TaskManager:
                     self._stops[key].set()
                     if key in self._agents:
                         self._agents[key].interrupt()
-            while self._running:
+            while self._running or self._evaluating:
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
                     raise CloseTimeoutError("Child tasks still running; retry close")

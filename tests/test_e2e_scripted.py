@@ -84,6 +84,7 @@ class E2ECase(unittest.TestCase):
             "USERPROFILE": str(Path(self.tmp) / "home"),
             "XDG_CONFIG_HOME": str(Path(self.tmp) / "config"),
             "APPDATA": str(Path(self.tmp) / "config"),
+            "XIAOYU_BATCH_READ_GUARD": "1",
             "XIAOYU_ENABLE_SKILLS": "0",
             "XIAOYU_STREAM_MAX_LIFETIME": "0",
             "XIAOYU_SUMMARY_RETRY_COOLDOWN": "0",

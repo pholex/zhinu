@@ -1,4 +1,5 @@
 """Stable host API for Xiaoyu's in-process workspace execution engine."""
+from .monitoring import Observation as Observation, ObservationMonitor as ObservationMonitor
 from ._version import __version__ as __version__
 from .questions import (QuestionOptions as QuestionOptions, QuestionOption as QuestionOption,
     QuestionItem as QuestionItem, QuestionAnswer as QuestionAnswer, QuestionSnapshot as QuestionSnapshot,
@@ -9,7 +10,7 @@ from .telemetry import TelemetryOptions as TelemetryOptions, TraceRecord as Trac
 from .budget import BudgetOptions as BudgetOptions, ModelPrice as ModelPrice, CostSnapshot as CostSnapshot, RequestCost as RequestCost, BudgetExceededError as BudgetExceededError
 from .mcp import McpPool as McpPool
 from .oauth import OAuthClient as OAuthClient, OAuthTokens as OAuthTokens, OAuthTokenStore as OAuthTokenStore, MemoryTokenStore as MemoryTokenStore
-from .tasks import TaskSpec as TaskSpec, TaskSnapshot as TaskSnapshot, TaskHandle as TaskHandle, TaskManager as TaskManager
+from .tasks import TaskAcceptance as TaskAcceptance, TaskSpec as TaskSpec, TaskSnapshot as TaskSnapshot, TaskHandle as TaskHandle, TaskManager as TaskManager
 from .types import McpManagementError as McpManagementError, OAuthError as OAuthError
 from .storage import SessionStore as SessionStore, SessionWriter as SessionWriter
 from .storage import SQLiteSessionStore as SQLiteSessionStore, StoredSessionInfo as StoredSessionInfo
@@ -52,6 +53,7 @@ from xiaoyu.session_log import SessionLockedError as SessionLockedError
 from xiaoyu.session_log import SessionInfo as SessionInfo
 
 __all__ = [
+    "Observation", "ObservationMonitor",
     "FileArtifact", "ArtifactsReady",
     "QuestionOptions", "QuestionOption", "QuestionItem", "QuestionAnswer", "QuestionSnapshot",
     "QuestionManager", "AsyncQuestionManager", "QuestionConflictError", "QuestionNotFoundError",
@@ -63,7 +65,7 @@ __all__ = [
     "TelemetryOptions", "TraceRecord", "SpanRecord", "OpenTelemetryExporter",
     "BudgetOptions", "ModelPrice", "CostSnapshot", "RequestCost", "BudgetExceededError",
     "McpPool", "OAuthClient", "OAuthTokens", "OAuthTokenStore", "MemoryTokenStore", "OAuthError", "McpManagementError",
-    "TaskSpec", "TaskSnapshot", "TaskHandle", "TaskManager",
+    "TaskAcceptance", "TaskSpec", "TaskSnapshot", "TaskHandle", "TaskManager",
     "SessionStore", "SessionWriter", "SQLiteSessionStore", "StoredSessionInfo",
     "Plugin", "McpServerStatus", "RewindResult", "RewindPreview", "RewindFilePreview",
     "__version__", "Session", "AsyncSession", "run", "run_async", "ModelOptions",

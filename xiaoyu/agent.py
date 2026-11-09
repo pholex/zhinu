@@ -1161,8 +1161,9 @@ class Agent:
         #  只问不清：那是父级的标志，由父级在自己的轮次开头清
         self._upstream_stop = upstream_stop
         #  steer：运行中追加的用户输入，任意线程可入队，
-        #  agent 在 step 边界消费。queue.Queue 自带锁，与 interrupt 同一纪律。
-        self._steer_queue: queue.Queue[str] = queue.Queue()
+        #  agent 在 step 边界消费。入队、修改、撤回和消费共享同一把锁。
+        from .steering import SteerQueue
+        self._steer_queue = SteerQueue()
         #  轮末「接着问」建议（见 suggest.py）：默认关，交互前端接线时打开——
         #  子 agent、serve、ACP、SDK 宿主都不该在背后多发请求。线程只在轮与轮
         #  之间活着，用轮序号判迟到：用户已开始下一轮时结果直接丢弃
@@ -1214,6 +1215,9 @@ class Agent:
         self.peer = peer
         #  会话落盘（可选，由 CLI 注入；eval / explore 子 agent 不落盘）
         self.session_log = session_log
+        binder = getattr(peer, "bind_delivery_log", None)
+        if binder is not None and session_log is not None and hasattr(session_log, "commit_event"):
+            binder(str(session_log.path))
         self.last_artifacts: tuple[FileArtifact, ...] = ()
         self._checkpoint_warning = False
         self._checkpoint_strict = False
@@ -2729,9 +2733,24 @@ class Agent:
         空白输入静默忽略。没有正在进行的轮次时入队也无妨：send() 开头会
         丢弃陈旧插话（与 interrupt 标志位同一纪律），不会污染下一轮。
         """
-        if text.strip():
-            self._steer_queue.put(text.strip())
+        self.queue_steer(text)
+
+    def queue_steer(self, text: str) -> str:
+        """追加插话并返回 ID；空白返回空串，ID 不代表模型已经接纳。"""
+        ident = self._steer_queue.put(text)
+        if ident:
             self._event_ready.set()
+        return ident
+
+    def pending_steers(self) -> tuple[tuple[str, str], ...]:
+        return self._steer_queue.pending()
+
+    def retract_steer(self, ident: str) -> str | None:
+        """返回撤回的正文；已经消费或不存在返回 None。"""
+        return self._steer_queue.retract(ident)
+
+    def replace_steer(self, ident: str, text: str) -> bool:
+        return self._steer_queue.replace(ident, text)
 
     def drain_steers(self) -> list[str]:
         """取走全部未消费的插话（不入历史）。
@@ -2739,12 +2758,7 @@ class Agent:
         两个用途：send() 开头丢弃陈旧插话；前端在一轮结束后回收"没赶上
         本轮"的插话，转成下一轮输入行的预填，不让用户的话凭空消失。
         """
-        items: list[str] = []
-        while True:
-            try:
-                items.append(self._steer_queue.get_nowait())
-            except queue.Empty:
-                return items
+        return self._steer_queue.take_all()
 
     def notify(self, text: str, key: str = "", wake: bool = True) -> None:
         """投递一条系统通知（线程安全），搭下一条工具结果的 <system-reminder> 送达。
@@ -2805,6 +2819,13 @@ class Agent:
                     self._wait_peer_messages.extend(self.peer.drain())
                 except Exception:
                     return "ERROR: 协作信箱读取失败，请稍后重试。"
+                pending = getattr(self.peer, "pending_deliveries", None)
+                if pending is not None and self.session_log is not None:
+                    try:
+                        if pending(str(self.session_log.path)):
+                            return "收到可靠协作消息，将在工具结束后的边界接纳。"
+                    except (OSError, ValueError, KeyError, TypeError):
+                        return "ERROR: 可靠协作信箱读取失败，请稍后重试。"
                 if self._wait_peer_messages:
                     return "收到协作消息，将在工具结束后的边界送达。"
             remaining = deadline - time.monotonic()
@@ -2872,6 +2893,7 @@ class Agent:
             self._wait_peer_messages = []
         except Exception:  # noqa: BLE001 - 信箱读不动绝不能拖垮会话
             return False
+        reliable_received = self._consume_reliable_inbox(midturn)
         for sender, wrapped in items:
             #  中途到达的消息补一句收尾提醒（与 steer 的 INTERJECTION_TAIL 同理）：
             #  不让别人的来信把在飞的活儿带偏
@@ -2880,7 +2902,34 @@ class Agent:
             self.emit(Notice(f"[收到来自 {sender} 的消息]", "info"))
             if self.session_log:
                 self.session_log.event("peer_message", sender=sender)
-        return bool(items)
+        return bool(items) or reliable_received
+
+    def _consume_reliable_inbox(self, midturn: bool = False) -> bool:
+        receive = getattr(self.peer, "pending_deliveries", None)
+        if receive is None or self.session_log is None:
+            return False
+        consumed = False
+        try:
+            from .peers import wrap
+            for item in receive(str(self.session_log.path)):
+                content = wrap(item["sender"], item["text"])
+                if midturn:
+                    content += "\n" + INBOX_MIDTURN_TAIL
+                message = {"role": "user", "content": content, media.PEER_KEY: True,
+                           "_peer_delivery_id": item["id"]}
+                # 日志提交严格成功后才进入上下文；普通 _record 的尽力写入不足以确认收信。
+                def append_received(value):
+                    nonlocal consumed
+                    self.messages.append(value)
+                    consumed = True
+                accepted = self.peer.accept_delivery(item["id"], self.session_log, message, append_received)
+                if not accepted:
+                    continue
+                consumed = True
+                self.emit(Notice(f"[已接纳来自 {item['sender']} 的可靠消息 {item['id']}]", "info"))
+        except (OSError, ValueError, KeyError, TypeError) as exc:
+            self.emit(Notice(f"[可靠消息未能完成接纳，请检查日志后重试：{exc}]", "warn"))
+        return consumed
 
     def _consume_steers(self) -> bool:
         """step 边界的消费点：插话逐条入历史，发 steer.accepted 事件。
@@ -3586,25 +3635,26 @@ class Agent:
                 continue
 
             output_failures = self.output_contract.failures if self.output_contract else 0
-            for call in calls:
-                #  同一批里后面的调用不该在打断之后照跑
-                self._checkpoint()
-                failures_before_call = self.output_contract.failures if self.output_contract else 0
-                self._record(self._execute(call))
-                #  PostToolUse/ToolFailed 期间的取消先保留已执行结果，再结束本轮。
-                self._checkpoint()
-                if (
-                    self.output_contract is not None
-                    and call.get("function", {}).get("name") == STRUCTURED_OUTPUT_TOOL
-                    and not self.output_contract.submitted
-                    and self.output_contract.failures == failures_before_call
-                ):
-                    # Invalid JSON/non-object arguments can fail before the handler.
-                    self.output_contract.failures += 1
-                    self.output_contract.errors = ("Structured output invocation failed",)
-                if self.output_contract is not None and self.output_contract.submitted:
-                    self.close_open_tool_calls("结构化结果已提交，本批其余调用未执行。")
-                    return
+            with self.toolbox.tool_batch():
+                for call in calls:
+                    #  同一批里后面的调用不该在打断之后照跑
+                    self._checkpoint()
+                    failures_before_call = self.output_contract.failures if self.output_contract else 0
+                    self._record(self._execute(call))
+                    #  PostToolUse/ToolFailed 期间的取消先保留已执行结果，再结束本轮。
+                    self._checkpoint()
+                    if (
+                        self.output_contract is not None
+                        and call.get("function", {}).get("name") == STRUCTURED_OUTPUT_TOOL
+                        and not self.output_contract.submitted
+                        and self.output_contract.failures == failures_before_call
+                    ):
+                        # Invalid JSON/non-object arguments can fail before the handler.
+                        self.output_contract.failures += 1
+                        self.output_contract.errors = ("Structured output invocation failed",)
+                    if self.output_contract is not None and self.output_contract.submitted:
+                        self.close_open_tool_calls("结构化结果已提交，本批其余调用未执行。")
+                        return
             if self.output_contract is not None and self.output_contract.failures > output_failures:
                 if not self.output_contract.retry():
                     self.last_stop = "output_invalid" if self.output_contract.max_retries == 0 else "output_retries_exhausted"

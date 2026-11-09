@@ -434,6 +434,18 @@ class AsyncAgent:
         """
         self.agent.steer(text)
 
+    def queue_steer(self, text: str) -> str:
+        return self.agent.queue_steer(text)
+
+    def pending_steers(self) -> tuple[tuple[str, str], ...]:
+        return self.agent.pending_steers()
+
+    def retract_steer(self, ident: str) -> str | None:
+        return self.agent.retract_steer(ident)
+
+    def replace_steer(self, ident: str, text: str) -> bool:
+        return self.agent.replace_steer(ident, text)
+
     def notify(self, text: str, key: str = "") -> None:
         """投递一条系统通知（线程安全、非阻塞），搭下一条工具结果送达模型。
 

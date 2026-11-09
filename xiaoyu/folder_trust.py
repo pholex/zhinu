@@ -385,7 +385,9 @@ def record_decision(
         return None
     from .mcp_guard import save_json_atomic
 
-    store = _load_store()
+    from .statefiles import read_json_for_update
+
+    store = read_json_for_update(trust_store_path(), "folders")
     folders = store.setdefault("folders", {})
     if not isinstance(folders, dict):
         folders = store["folders"] = {}

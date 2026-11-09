@@ -1579,6 +1579,7 @@ class Toolbox:
         #  已用 read_file 读过的文件 → 当时的 mtime。
         #  用来强制"先读再改"，并检测读完之后文件被外部改动。
         self._reads: dict[Path, _ReadMark] = {}
+        self._batch_reads: dict[Path, _ReadMark] | None = None
         #  超长工具输出的落盘目录（spill）：
         #  懒创建，进程级临时目录，进程退出时连内容一起删（tempdirs）——召回靠
         #  内存里的 _spills 表，resume 后的新进程本来就取不回。
@@ -2750,7 +2751,7 @@ class Toolbox:
         elif encoding != "utf-8":
             prefix += f"(注意：该文件按 {encoding} 解码显示，str_replace 会按原编码写回)\n"
         if not text:
-            self._mark_read(target, raw=raw)
+            self._mark_read(target, from_read=True, raw=raw)
             return f"{prefix}(文件为空：{path})"
 
         limit_chars = self.config.max_tool_output
@@ -2768,6 +2769,7 @@ class Toolbox:
                 fits = len(shown) <= limit_chars
                 self._mark_read(
                     target,
+                    from_read=True,
                     raw=raw,
                     seen=_ranges_without(1, len(lines), clipped) if fits else (),
                     total=len(lines),
@@ -2780,11 +2782,11 @@ class Toolbox:
                 )
             shown = f"{prefix}{text}"
             if len(shown) <= limit_chars:
-                self._mark_read(target, raw=raw)
+                self._mark_read(target, from_read=True, raw=raw)
                 return shown
             #  整读但装不下：回给模型的只有头尾预览，中段它没看见。记成"读过一部分"——
             #  够做局部替换（old_str 得逐字对上），不够整体覆盖
-            self._mark_read(target, seen=(), raw=raw)
+            self._mark_read(target, from_read=True, seen=(), raw=raw)
             return shown + (
                 f"\n[{path} 太长，上面只显示了头尾；没显示的部分用 offset/limit 分段读。"
                 "整体覆盖（write_file）要把各段都读到，局部修改（str_replace）现在就可以]"
@@ -2814,7 +2816,7 @@ class Toolbox:
         #  这一段自己也装不下的话，模型同样只看见头尾——不计入已读范围
         fits = len(note) + len(chunk) <= limit_chars
         seen = _ranges_without(start, end, clipped) if fits else ()
-        self._mark_read(target, seen=seen, total=len(lines), raw=raw)
+        self._mark_read(target, from_read=True, seen=seen, total=len(lines), raw=raw)
         return note + chunk
 
     def _write_file(self, path: str, content: str) -> str:
@@ -3707,6 +3709,22 @@ class Toolbox:
 
     # ---------- 辅助 ----------
 
+    @contextlib.contextmanager
+    def tool_batch(self):
+        """本批读取结果尚未交给模型，不能为本批写入提供新的已读凭据。"""
+        previous = self._batch_reads
+        self._batch_reads = dict(self._reads) if self.config.batch_read_guard else None
+        try:
+            yield
+        finally:
+            self._batch_reads = previous
+
+    def _set_read_mark(self, target: Path, mark: _ReadMark, from_read: bool) -> None:
+        self._reads[target] = mark
+        # 写出的内容来自模型自己的参数，后续同批编辑可以沿用它。
+        if not from_read and self._batch_reads is not None:
+            self._batch_reads[target] = mark
+
     def _mark_read(
         self,
         target: Path,
@@ -3715,6 +3733,7 @@ class Toolbox:
         keep_level: bool = False,
         *,
         raw: bytes | None = None,
+        from_read: bool = False,
     ) -> None:
         """记下这个文件"已被读过"、读到了哪个程度，以及元数据和内容指纹。
 
@@ -3730,12 +3749,13 @@ class Toolbox:
         except OSError:
             mtime, size = 0.0, -1
         digest = hashlib.sha256(raw).digest() if raw is not None else None
-        previous = self._reads.get(target)
+        marks = self._batch_reads if not from_read and self._batch_reads is not None else self._reads
+        previous = marks.get(target)
         if keep_level and previous is not None:
-            self._reads[target] = _ReadMark(mtime, size, previous.whole, digest, (), 0)
+            self._set_read_mark(target, _ReadMark(mtime, size, previous.whole, digest, (), 0), from_read)
             return
         if seen is None:
-            self._reads[target] = _ReadMark(mtime, size, True, digest, (), 0)
+            self._set_read_mark(target, _ReadMark(mtime, size, True, digest, (), 0), from_read)
             return
         ranges = list(seen)
         whole = False
@@ -3748,7 +3768,7 @@ class Toolbox:
         merged = _merge_ranges(ranges)
         if total and merged == ((1, total),):
             whole = True
-        self._reads[target] = _ReadMark(mtime, size, whole, digest, merged, total)
+        self._set_read_mark(target, _ReadMark(mtime, size, whole, digest, merged, total), from_read)
 
     def _guard_known(self, target: Path, shown: str, whole: bool = False) -> str | None:
         """改动已有文件前的两道闸：必须读过，且读过之后没被别人改。
@@ -3756,7 +3776,11 @@ class Toolbox:
         whole=True 是整体覆盖：要求手上有全文。局部替换只要求读过——old_str 得
         逐字对上、且在全文里唯一，这本身就证明模型知道它要改的那一段长什么样。
         """
-        mark = self._reads.get(target)
+        marks = self._batch_reads if self._batch_reads is not None else self._reads
+        mark = marks.get(target)
+        if mark is None and self._batch_reads is not None and target in self._reads:
+            return (f"ERROR: {shown} 在本批调用中才读取，模型尚未看到读取结果。"
+                    "请在下一次模型响应中再提交修改。")
         if mark is None:
             return (
                 f"ERROR: 还没读过 {shown}，不能直接改。"

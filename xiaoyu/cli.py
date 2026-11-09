@@ -1343,14 +1343,41 @@ def send_command(argv: list[str]) -> int:
         prog="xiaoyu send",
         description="给本机另一个小羽会话发一条消息（收件人见 xiaoyu sessions）。",
     )
-    parser.add_argument("target", help="会话名；重名时写成 `名字 [ref]`")
+    parser.add_argument("target", nargs="?", help="会话名；重名时写成 `名字 [ref]`")
     parser.add_argument("message", nargs="*", help="消息内容；省略则从管道读")
+    parser.add_argument("--reliable", action="store_true", help="持久化投递并返回消息 ID")
+    parser.add_argument("--status", metavar="ID", help="查询可靠消息是否已接纳")
+    parser.add_argument("--retry", metavar="ID", help="将未接纳的可靠消息重投到 target")
     args = parser.parse_args(argv)
     load_dotenv()
+    if args.status or args.retry:
+        from . import peer_delivery
+        try:
+            if args.status and (args.retry or args.target or args.message or args.reliable):
+                raise ValueError("--status 只接受消息 ID")
+            if args.retry and (not args.target or args.message or args.reliable):
+                raise ValueError("--retry ID 需要收件会话，不能同时提供新正文")
+            record = peer_delivery.status(args.status) if args.status else peer_delivery.retry(args.retry, args.target)
+            print(json.dumps({"id": record["id"], "status": record["status"], "target_ref": record["target_ref"]}, ensure_ascii=False))
+            return 0
+        except (OSError, ValueError, peers.PeerError) as exc:
+            print(ui.error(str(exc)), file=sys.stderr)
+            return 2
+    if not args.target:
+        parser.error("需要收件会话")
     text = compose_prompt(args.message, read_piped_stdin())
     if not text:
         print(ui.error("消息是空的（给一段文字，或从管道输入）"), file=sys.stderr)
         return 2
+    if args.reliable:
+        from . import peer_delivery
+        try:
+            record = peer_delivery.send(args.target, text, peers.self_name() or "命令行")
+            print(json.dumps({"id": record["id"], "status": record["status"]}, ensure_ascii=False))
+            return 0
+        except (OSError, ValueError, peers.PeerError) as exc:
+            print(ui.error(str(exc)), file=sys.stderr)
+            return 2
     try:
         peer = peers.deliver(args.target, text, peers.self_name() or "命令行")
     except peers.PeerError as exc:
