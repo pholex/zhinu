@@ -323,6 +323,18 @@ def check_disk(
 
 def check_providers() -> Check:
     """只报"哪些 provider 有凭据"，值永不出现在任何输出里。"""
+    from .config import MissingConfig
+
+    try:
+        return _check_provider_credentials()
+    except MissingConfig as exc:
+        return Check(
+            "providers", "fail", "API key 配置无效", [str(exc)],
+            remedy="修正 API key 引用，或设置被引用的环境变量 / 同名 Keychain",
+        )
+
+
+def _check_provider_credentials() -> Check:
     from .config import GATEWAY_KEY_ENVS, find_api_key
     from .providers import GATEWAY, PRESETS, bedrock_region
 

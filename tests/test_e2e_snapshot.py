@@ -88,6 +88,38 @@ SCENARIOS = (
 _PIN = next(sc for sc in SCENARIOS if sc.pins_header)
 
 
+class ApiKeyReferenceSnapshot(E2ECase):
+    """缺失的显式引用在配置诊断里报出，不能悄悄使用备用凭据。"""
+
+    def test_scenario(self) -> None:
+        if MODE == "record":
+            self.skipTest("密钥引用诊断不调用真实模型")
+        path = Path(self.tmp) / "reference.env"
+        path.write_text("XIAOYU_API_KEY=${env:SNAPSHOT_MISSING_TOKEN}\n", encoding="utf-8")
+        env = self.env_for(SNAPSHOTS / "text-turn" / "model.txt")
+        env.pop("XIAOYU_API_KEY", None)
+        env.update({
+            SCRIPTED_ENV: "", "XIAOYU_ENV_FILE": str(path),
+            "XIAOYU_PROVIDERS": "gateway", "XIAOYU_BASE_URL": "http://127.0.0.1:1/v1",
+            "SNAPSHOT_MISSING_TOKEN": "", "LITELLM_API_KEY": "unrelated-fixture-secret",
+            "USER": "",  # 禁止访问本机钥匙串
+        })
+        proc = subprocess.run(
+            [sys.executable, "-m", "xiaoyu", "config", "--show", "--json"],
+            env=env, cwd=self.tmp, stdin=subprocess.DEVNULL, capture_output=True,
+            text=True, encoding="utf-8", errors="replace", timeout=_TIMEOUT,
+        )
+        output = json.loads(proc.stdout)
+        output["user_env_path"] = "<USER_ENV_PATH>"
+        actual = {"exit_code": proc.returncode, "stdout": output, "stderr": proc.stderr}
+        fixture = Path(__file__).parent / "fixtures" / "api_key_reference.expected.json"
+        if MODE == "refresh":
+            fixture.write_text(json.dumps(actual, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        self.assertEqual(actual, json.loads(fixture.read_text(encoding="utf-8", errors="replace")))
+        self.assertEqual(proc.returncode, 1)
+        self.assertNotIn("unrelated-fixture-secret", proc.stdout + proc.stderr)
+
+
 class RuntimeIntegritySnapshot(AgentTestCase):
     """真实工具结果进入下一次模型请求；转写损失与指令缺口的可见面一起钉住。"""
 

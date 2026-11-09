@@ -5,6 +5,7 @@ from __future__ import annotations
 import contextlib
 import io
 import os
+import tempfile
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -14,7 +15,7 @@ import openai
 
 from xiaoyu import providers
 from xiaoyu.agent import Agent, Usage
-from xiaoyu.config import Config, MissingConfig, find_api_key
+from xiaoyu.config import Config, MissingConfig, find_api_key, load_dotenv
 from xiaoyu.providers import GATEWAY, Provider, Registry, Route, UnknownModel
 from xiaoyu.responses import Transport
 
@@ -73,6 +74,82 @@ class ProviderTestCase(unittest.TestCase):
         env = isolated_env(self.ENV)
         env.start()
         self.addCleanup(env.stop)
+
+
+class TestApiKeyReferences(ProviderTestCase):
+    def test_dotenv_reference_reaches_sdk_without_rewriting_environment(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / ".env"
+            path.write_text('XIAOYU_API_KEY="${env:TEST_GATEWAY_TOKEN}"\n', encoding="utf-8")
+            with isolated_env({"TEST_GATEWAY_TOKEN": "fixture-secret"}):
+                load_dotenv(path)
+                registry = providers.build(config())
+                with mock.patch("xiaoyu.providers.OpenAI") as sdk:
+                    registry.client(GATEWAY)
+                self.assertEqual(sdk.call_args.kwargs["api_key"], "fixture-secret")
+                self.assertEqual(os.environ["XIAOYU_API_KEY"], "${env:TEST_GATEWAY_TOKEN}")
+                self.assertNotIn("fixture-secret", path.read_text(encoding="utf-8", errors="replace"))
+
+    def test_reference_prefers_environment_then_same_name_keychain(self):
+        for reference in ("${env:TEST_GATEWAY_TOKEN}", "${TEST_GATEWAY_TOKEN}"):
+            for value in ("fixture-env", "", "   "):
+                with self.subTest(reference=reference, empty=not value.strip()), isolated_env({
+                    "XIAOYU_API_KEY": reference, "TEST_GATEWAY_TOKEN": value,
+                }), mock.patch("xiaoyu.config._read_from_keychain", return_value="fixture-keychain") as keychain:
+                    self.assertEqual(find_api_key(("XIAOYU_API_KEY",)), value.strip() or "fixture-keychain")
+                    if value.strip():
+                        keychain.assert_not_called()
+                    else:
+                        keychain.assert_called_once_with("TEST_GATEWAY_TOKEN")
+
+    def test_direct_provider_uses_referenced_keychain_secret(self):
+        with isolated_env({"AWS_BEARER_TOKEN_BEDROCK": "${env:TEST_BEDROCK_TOKEN}"}), mock.patch(
+            "xiaoyu.config._read_from_keychain",
+            side_effect=lambda name: "fixture-bedrock" if name == "TEST_BEDROCK_TOKEN" else None,
+        ):
+            registry = providers.build(config(base_url=""))
+            self.assertEqual(registry.get("bedrock").api_key, "fixture-bedrock")
+
+    def test_reference_chain_resolves_and_cycles_fail(self):
+        with isolated_env({"XIAOYU_API_KEY": "${env:FIRST}", "FIRST": "${SECOND}", "SECOND": "fixture-secret"}):
+            self.assertEqual(find_api_key(("XIAOYU_API_KEY",)), "fixture-secret")
+            os.environ["SECOND"] = "${FIRST}"
+            with self.assertRaisesRegex(MissingConfig, "循环引用"):
+                find_api_key(("XIAOYU_API_KEY",))
+        with isolated_env({"XIAOYU_API_KEY": "${env:XIAOYU_API_KEY}"}):
+            with self.assertRaisesRegex(MissingConfig, "循环引用"):
+                find_api_key(("XIAOYU_API_KEY",))
+
+    def test_missing_reference_does_not_select_another_credential(self):
+        with isolated_env({"XIAOYU_API_KEY": "${env:MISSING_TOKEN}", "LITELLM_API_KEY": "unrelated-secret"}), mock.patch(
+            "xiaoyu.config._read_from_keychain",
+            side_effect=lambda name: "unrelated-secret" if name == "XIAOYU_API_KEY" else None,
+        ):
+            with self.assertRaisesRegex(MissingConfig, "MISSING_TOKEN"):
+                providers.build(config())
+
+    def test_malformed_reference_does_not_echo_value(self):
+        for value in ("prefix-secret${env:TOKEN}", "${env:}", "${env:TOKEN", "${A}${B}"):
+            with self.subTest(value=value), isolated_env({"XIAOYU_API_KEY": value}):
+                with self.assertRaisesRegex(MissingConfig, "引用格式") as caught:
+                    find_api_key(("XIAOYU_API_KEY",))
+                self.assertNotIn(value, str(caught.exception))
+
+    def test_literal_name_and_empty_key_keep_existing_behavior(self):
+        with isolated_env({"XIAOYU_API_KEY": "TEST_GATEWAY_TOKEN", "TEST_GATEWAY_TOKEN": "fixture-env"}):
+            self.assertEqual(find_api_key(("XIAOYU_API_KEY",)), "TEST_GATEWAY_TOKEN")
+        with isolated_env({"XIAOYU_API_KEY": ""}), mock.patch("xiaoyu.config._read_from_keychain", return_value="fixture-keychain") as keychain:
+            self.assertEqual(find_api_key(("XIAOYU_API_KEY",)), "fixture-keychain")
+            keychain.assert_called_once_with("XIAOYU_API_KEY")
+
+    def test_doctor_reports_invalid_reference_without_crashing(self):
+        from xiaoyu.diagnostics import check_providers
+
+        for name in ("XIAOYU_API_KEY", "DEEPSEEK_API_KEY"):
+            with self.subTest(name=name), isolated_env({name: "${env:MISSING_TOKEN}"}):
+                check = check_providers()
+                self.assertEqual(check.status, "fail")
+                self.assertIn("MISSING_TOKEN", "\n".join(check.details))
 
 
 # ---------- 只有网关：必须与改动前完全等价 ----------

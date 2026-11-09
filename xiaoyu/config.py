@@ -8,6 +8,7 @@ from __future__ import annotations
 import contextlib
 import math
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -729,23 +730,45 @@ class MissingApiKey(MissingConfig):
     """没找到可用的 API key。"""
 
 
+_API_KEY_REFERENCE = re.compile(r"\$\{(?:env:)?([A-Za-z_][A-Za-z0-9_]*)\}")
+
+
+def _resolve_api_key(value: str, source: str) -> str:
+    """只展开整值引用；显式指定的凭据取不到就报错，不改用另一把 key。"""
+    visited = {source}
+    while "${" in value:
+        match = _API_KEY_REFERENCE.fullmatch(value)
+        if match is None:
+            raise MissingApiKey(f"{source} 的 API key 引用格式无效；请使用完整的 ${{env:变量名}} 或 ${{变量名}}。")
+        name = match.group(1)
+        if name in visited:
+            raise MissingApiKey(f"{source} 的 API key 存在循环引用（{name}）。")
+        visited.add(name)
+        value = os.environ.get(name, "").strip() or (_read_from_keychain(name) or "").strip()
+        if not value:
+            raise MissingApiKey(f"{source} 引用的 {name} 未设置：环境变量与同名 Keychain 均无有效值。")
+    return value
+
+
 def find_api_key(env_names: Sequence[str]) -> str | None:
     """按给定名字序列找 key：先环境变量（.env 已合并进来），再拿同名当
-    Keychain service 查；找不到返回 None（不抛错）。
+    Keychain service 查；未配置返回 None，显式引用错误则报错。
 
     键名只有一套——`.env`、环境变量、Keychain 三处同名（如 DEEPSEEK_API_KEY），
     用户不用记"存 Keychain 时要换个名字"。网关的 XIAOYU_API_KEY 恰好也是
     历史上的 Keychain service 名，老用户存的 key 天然继续有效。
 
-    多 provider 之后"找不到"是常态（没配直连就不该报错，跳过即可），
-    所以取值与报错分成两个函数：这里只找，load_api_key 才抛。
+    多 provider 之后"没配置"是常态（没配直连就不该报错，跳过即可），
+    所以未配置时这里返回 None，由 load_api_key 决定是否报错。
+    显式引用 ${env:VAR} / ${VAR} 在读取时展开，不回写环境或配置；引用无效则抛
+    MissingApiKey，避免把占位符发给上游或静默换一套凭据。
     """
     for name in env_names:
         if value := os.environ.get(name, "").strip():
-            return value
+            return _resolve_api_key(value, name)
     for name in env_names:
         if value := _read_from_keychain(name):
-            return value
+            return _resolve_api_key(value, name)
     return None
 
 

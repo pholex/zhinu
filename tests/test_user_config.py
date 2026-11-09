@@ -431,6 +431,16 @@ class ConfigCommandTest(IsolatedConfigTest):
         self.assertEqual(code, 0)
         fake.assert_called_once_with(["--path"])
 
+    def test_wizard_reports_invalid_key_reference_without_traceback(self):
+        err = io.StringIO()
+        with mock.patch.dict(os.environ, {"DEEPSEEK_API_KEY": "${env:XIAOYU_TEST_MISSING_TOKEN}", "XIAOYU_TEST_MISSING_TOKEN": ""}), mock.patch.object(
+            cli.sys.stdin, "isatty", return_value=True
+        ), contextlib.redirect_stderr(err):
+            code, _ = self.run_cmd([])
+        self.assertEqual(code, 2)
+        self.assertIn("XIAOYU_TEST_MISSING_TOKEN", err.getvalue())
+        self.assertNotIn("Traceback", err.getvalue())
+
 
 
 def _wizard_answers(*tail: str):

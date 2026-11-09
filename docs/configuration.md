@@ -89,7 +89,7 @@ XIAOYU_API_KEY=<key>
 | `XIAOYU_EXPLORE_MODEL` | `deepseek-flash` | `explore` 子 agent 用的模型 |
 | `XIAOYU_EXPLORE_MCP_TOOLS` | 空 | explore 可使用的代码检索 MCP 工具完整名称，逗号分隔、精确匹配；复用父会话连接与授权，不接受通配符。仅选择定义、引用、类型、诊断等查询工具；清空恢复仅文件检索。 |
 | `XIAOYU_BASE_URL` | — | OpenAI 兼容网关端点 |
-| `XIAOYU_API_KEY` | — | 网关 key（也认 `LITELLM_API_KEY`） |
+| `XIAOYU_API_KEY` | — | 网关 key（也认 `LITELLM_API_KEY`）；支持 `${env:变量名}` 引用环境变量或同名 Keychain，见下方「密钥引用」 |
 | `XIAOYU_BEDROCK_REGION` | —（有 key 时 `us-east-1`） | AWS Bedrock 区域，设了即激活 IAM 路线（`1` / `default` = `us-east-1`）；见上方"AWS Bedrock" |
 | `AWS_BEARER_TOKEN_BEDROCK` | — | Bedrock API key（AWS 官方变量名），找到即激活 Bedrock 直连 |
 | `XIAOYU_FALLBACK_MODELS` | —（不降级） | 备用模型链，逗号分隔；按错误分类决定重试或切换，切换原因写入会话日志。委托出去的子 agent（含 explore、七襄、斗巧、宸枢成员）沿用同一条链，即使那次委托另外点名了模型 |
@@ -570,6 +570,24 @@ XIAOYU_PROVIDER_MINIMAX_HEADERS=X-Title=xiaoyu;Authorization=Bearer ${env:RELAY_
 - **子进程拿到的是原值**：bash 工具、MCP stdio server 继承你设的代理变量，小羽不改写它们。
 
 `SOCKS5` 代理只作用于模型请求；MCP HTTP 传输与 OSV 预检基于标准库，只会用 http(s) 代理。`xiaoyu doctor` 的 `proxy` 一项列出解析结果（代理地址里的账号密码会脱敏）。
+
+## 密钥引用
+
+不把密钥正文写入 `.env` 时，可以显式引用已有凭据：
+
+```ini
+XIAOYU_API_KEY=${env:LITELLM_API_KEY}
+AWS_BEARER_TOKEN_BEDROCK=${env:MY_BEDROCK_TOKEN}
+```
+
+网关、内置直连与自定义 provider 的 API key 都支持这套语法，也接受 `${变量名}`。
+读取时先取被引用变量的非空值，为空或未设置则查 macOS Keychain 同名 service。
+引用在所有 `.env` 加载后解析，支持连续引用；缺失、循环或格式错误会明确报错，
+不会把引用文本发给服务端，也不会自动改用其它凭据。解析结果不回写 `.env` 或环境变量。
+
+只支持整个值为一个引用，不支持前后拼接或 shell 命令展开。
+直接写 `XIAOYU_API_KEY=LITELLM_API_KEY` 仍表示字面密钥；留空则沿用原有的
+环境变量与同名 Keychain 查找规则。已有真实环境变量不会被 `.env` 覆盖。
 
 ## macOS Keychain
 

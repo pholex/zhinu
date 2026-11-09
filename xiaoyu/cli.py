@@ -569,7 +569,11 @@ def config_command(argv: list[str]) -> int:
     if args.json:
         print(ui.error("--json 只与 --show 连用"), file=sys.stderr)
         return 2
-    return config_wizard(probe=not args.no_probe)
+    try:
+        return config_wizard(probe=not args.no_probe)
+    except MissingConfig as exc:
+        print(ui.error(str(exc)), file=sys.stderr)
+        return 2
 
 
 def show_config() -> int:
