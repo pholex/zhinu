@@ -21,6 +21,8 @@ docs/internal/
 xiaoyu/evals/models.local.json
 xiaoyu-eval-results/
 
+rixin-results/
+
 # 本机 agent 配置（别只靠用户全局 gitignore 挡，换台机器就漏了）
 .claude/settings.local.json
 .claude/scheduled_tasks.lock
