@@ -349,7 +349,8 @@ PRESETS: dict[str, Preset] = {
         #  2026-09-29 换代 5.6 → 6（滚动替换）：6 线三兄弟（astra / sol / luna）为现役。
         #  实测：Responses 上 tool_call、收图（纯红）、加密 reasoning 回传均通；
         #  chat completions 带 tools 仍 400，与 5.6 同
-        models=("gpt-6-astra", "gpt-6-sol", "gpt-6-luna"),
+        #  2026-11-09：sol 升级为 6.1，沿用原有协议与推理档位配置。
+        models=("gpt-6-astra", "gpt-6.1-sol", "gpt-6-luna"),
         key_envs=("OPENAI_API_KEY",),
         label="直连 openai",
         #  ⚠️ 必须走 Responses：5.6 起（含 6 线）在 /v1/chat/completions 上带 tools 直接 400
@@ -361,7 +362,7 @@ PRESETS: dict[str, Preset] = {
         #  astra 还不认 none（官方迁移指南：astra 用 low 代替 none）；low~max 全认
         effort_levels=(
             ("gpt-6-astra", ("low", "medium", "high", "xhigh", "max")),
-            ("gpt-6-sol", ("none", "low", "medium", "high", "xhigh", "max")),
+            ("gpt-6.1-sol", ("none", "low", "medium", "high", "xhigh", "max")),
             ("gpt-6-luna", ("none", "low", "medium", "high", "xhigh", "max")),
         ),
         #  2026-08-12 实测 5.6 三兄弟全部收图（红/绿两轮都答对），2026-09-29 在 6 线三兄弟上复测仍通
