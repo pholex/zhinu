@@ -1536,16 +1536,19 @@ class AuthTest(AcpCase):
 
     def unconfigured_env(self) -> dict[str, str]:
         """剥掉一切能组出 provider 的键：XIAOYU_*（含 scripted 桩）、各家
-        *_API_KEY，以及 USER——_read_from_keychain 拿它当 account，剥掉即
+        *_API_KEY、预设声明的凭据变量，以及 USER——_read_from_keychain 拿它当 account，剥掉即
         确定性跳过 macOS Keychain（本机 Keychain 里存着真 key，环境剥不掉）。
         HOME/XDG 仍指进临时目录，用户级 .env 起始为空。
         XIAOYU_ENV_FILE 指向不存在的文件：关掉 .env 自动发现——editable
         安装下 PROJECT_ROOT 就是本仓库，开发机的仓库根 .env 会漏进来。
         （auth 重试路径不受影响：它 explicit 指用户级 .env，不走这个开关。）"""
+        from xiaoyu.providers import PRESETS
+
+        credential_names = {name for preset in PRESETS.values() for name in preset.key_envs}
         env = {
             k: v
             for k, v in self.scripted_env("text: ok\n").items()
-            if not (k.startswith("XIAOYU_") or "API_KEY" in k or k == "USER")
+            if not (k.startswith("XIAOYU_") or "API_KEY" in k or k in credential_names or k == "USER")
         }
         env["XIAOYU_ENV_FILE"] = str(Path(self.tmp) / "不存在.env")
         return env
@@ -1570,7 +1573,13 @@ class AuthTest(AcpCase):
         self.assertTrue(method["name"])
 
     def test_unconfigured_session_new_returns_auth_required_then_recovers(self):
-        acp = self.start_acp("", env=self.unconfigured_env())
+        from unittest import mock
+
+        #  凭据名不一定包含 API_KEY；宿主配置不能把无配置场景变成已配置。
+        with mock.patch.dict(os.environ, {"AWS_BEARER_TOKEN_BEDROCK": "fixture-bearer-token"}):
+            env = self.unconfigured_env()
+        self.assertNotIn("AWS_BEARER_TOKEN_BEDROCK", env)
+        acp = self.start_acp("", env=env)
         self.initialize(acp)
         acp.send(
             {"jsonrpc": "2.0", "id": "n1", "method": "session/new",
