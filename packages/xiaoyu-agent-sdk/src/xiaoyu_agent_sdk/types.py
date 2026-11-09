@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Any, Awaitable, Callable, Literal, TYPE_CHECKING
 
 if TYPE_CHECKING:
+    from xiaoyu.memory import MemoryStore, MemoryScope
     from .questions import QuestionOptions
     from .storage import SessionStore
     from .mcp import McpPool
@@ -162,6 +163,9 @@ class SessionOptions:
     result_transform_timeout: float = 30.0
     questions: QuestionOptions | None = None
     batch_read_guard: bool = True
+    memory_store: MemoryStore | None = field(default=None, repr=False, compare=False)
+    memory_scope: MemoryScope | None = None
+    memory_char_budget: int = 4000
 
 
 class SDKError(Exception):

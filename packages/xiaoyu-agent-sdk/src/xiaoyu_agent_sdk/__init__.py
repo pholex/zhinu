@@ -1,4 +1,10 @@
 """Stable host API for Xiaoyu's in-process workspace execution engine."""
+from .durable import (DurableTaskRunner as DurableTaskRunner, WorkStep as WorkStep,
+    WorkResult as WorkResult, WorkContext as WorkContext, WorkRun as WorkRun, WorkStepSnapshot as WorkStepSnapshot)
+from .learning import MemorySpan as MemorySpan, MemoryExcerpt as MemoryExcerpt, MemoryExtractor as MemoryExtractor
+from xiaoyu.memory import (MemoryStore as MemoryStore, MemoryScope as MemoryScope,
+    MemoryCandidate as MemoryCandidate, MemoryRecord as MemoryRecord, MemoryConflict as MemoryConflict)
+from xiaoyu._state_db import StateError as StateError
 from .monitoring import Observation as Observation, ObservationMonitor as ObservationMonitor
 from ._version import __version__ as __version__
 from .questions import (QuestionOptions as QuestionOptions, QuestionOption as QuestionOption,
@@ -53,6 +59,9 @@ from xiaoyu.session_log import SessionLockedError as SessionLockedError
 from xiaoyu.session_log import SessionInfo as SessionInfo
 
 __all__ = [
+    "DurableTaskRunner", "WorkStep", "WorkResult", "WorkContext", "WorkRun", "WorkStepSnapshot",
+    "MemorySpan", "MemoryExcerpt", "MemoryExtractor", "MemoryStore", "MemoryScope",
+    "MemoryCandidate", "MemoryRecord", "MemoryConflict", "StateError",
     "Observation", "ObservationMonitor",
     "FileArtifact", "ArtifactsReady",
     "QuestionOptions", "QuestionOption", "QuestionItem", "QuestionAnswer", "QuestionSnapshot",

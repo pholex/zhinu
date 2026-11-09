@@ -135,6 +135,7 @@ SUBCOMMANDS: tuple[tuple[tuple[str, ...], str, str, str], ...] = (
     (("sessions",), "sessions_command", "sessions [digest|export|rename|inspect]",
      "列出本机会话；digest 汇总用量、export 导出、rename 起名、inspect 诊断日志"),
     (("send",), "send_command", "send <会话> <消息>", "给另一个会话发一条消息"),
+    (("memory",), "cli_memory.memory_command", "memory --owner <用户> [--project <项目>] <操作>", "管理记忆候选、审核、检索和遗忘"),
     (("mcp",), "cli_mcp.mcp_command", "mcp add|list|remove|probe", "管理 MCP server 声明；probe 不经模型直接探测一个 server"),
     (("term",), "cli_term.term_command", "term install|init|run|command|log|info",
      "shell 集成：term install 一条命令接入（连同 Tab 补全）；之后在自己的 shell 里 @x 提问，带上刚跑过的命令；@c 一句话换一条命令"),

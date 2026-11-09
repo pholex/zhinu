@@ -728,3 +728,26 @@ class ExploreMcpSnapshot(AgentTestCase):
         if MODE == "refresh":
             fixture.write_text(json.dumps(actual, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
         self.assertEqual(actual, json.loads(fixture.read_text(encoding="utf-8", errors="replace")))
+
+
+class MemoryReviewSnapshot(E2ECase):
+    def test_review_then_recall_then_forget(self):
+        env = self.scripted_env("text: unused\n")
+        def command(*args):
+            proc = subprocess.run([sys.executable, "-P", "-m", "xiaoyu", "memory",
+                "--db", str(self.workspace / "memory.db"), "--owner", "snapshot", "--project", "repo", *args],
+                env=env, cwd=self.workspace, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=_TIMEOUT)
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            return proc.stdout.strip()
+        proposed = json.loads(command("propose", "runner", "Use unittest", "--source", "chat#1", "--evidence", "Use unittest"))
+        actual = {"proposed": proposed["status"], "before": command("recall", "unittest")}
+        accepted = json.loads(command("accept", proposed["id"], "--reviewer", "owner"))
+        actual["accepted"] = {k: accepted[k] for k in ("status", "revision", "reviewed_by")}
+        recalled = command("recall", "unittest").replace(proposed["id"], "<id>")
+        actual["recalled_text"] = json.loads(recalled.split("\n", 1)[1])[0]["candidate"]["text"]
+        command("forget", "runner")
+        actual["after"] = command("recall", "unittest")
+        fixture = Path(__file__).parent / "fixtures" / "memory_review.expected.json"
+        if MODE == "refresh":
+            fixture.write_text(json.dumps(actual, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        self.assertEqual(actual, json.loads(fixture.read_text(encoding="utf-8", errors="replace")))

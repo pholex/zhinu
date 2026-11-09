@@ -38,6 +38,8 @@ from .types import (
 from .storage import _StoreLog, session_metadata
 from .questions import QuestionOptions, QuestionManager, AsyncQuestionManager
 from .tasks import TaskAcceptance, TaskManager, TaskSpec, TaskHandle, TaskSnapshot
+from .learning import MemoryExtractor, select_span, extract as extract_memory_span
+from xiaoyu.memory import MemoryRecord, MemoryScope, MemoryStore
 from .types import McpServer
 from .budget import _Ledger, _MeteredClient, BudgetExceededError, CostSnapshot, BudgetOptions
 from .telemetry import _Telemetry
@@ -177,6 +179,7 @@ class Session:
         self._questions: QuestionManager | None = None
         self._has_question_history = False
         self._started = False
+        self._memory_loaded = False
         self._end_hook_sent = False
         self._hook_errors: list[str] = []
         self._context = threading.local()
@@ -203,6 +206,12 @@ class Session:
 
     def _build(self, resume_from: Path | None, resume_id: str | None) -> None:
         options, model = self.options, self.options.model
+        if ((options.memory_store is None) != (options.memory_scope is None)
+                or options.memory_store is not None and not isinstance(options.memory_store, MemoryStore)
+                or options.memory_scope is not None and not isinstance(options.memory_scope, MemoryScope)):
+            raise ConfigurationError("Memory requires an explicit store and scope together")
+        if type(options.memory_char_budget) is not int or not 256 <= options.memory_char_budget <= 64000:
+            raise ConfigurationError("Memory context budget must be 256–64000 characters")
         if options.telemetry is not None:
             self._telemetry = _Telemetry(options.telemetry)
         if options.session_store is not None and (options.session_dir is not None or resume_from is not None):
@@ -697,6 +706,17 @@ class Session:
         assert self._agent is not None
         try:
             self._ensure_started()
+            if not self._memory_loaded and self.options.memory_store is not None:
+                from xiaoyu.media import text_of
+                assert self.options.memory_scope is not None
+                store, scope = self.options.memory_store, self.options.memory_scope
+                budget = self.options.memory_char_budget
+                essentials = store.context(scope, "", char_budget=budget // 2)
+                relevant = store.context(scope, text_of(prompt), char_budget=budget - len(essentials) - 1)
+                context = "\n".join(part for part in (essentials, relevant) if part)
+                if context:
+                    self._agent.notify(context, key="memory:startup:" + uuid.uuid4().hex, wake=False)
+                self._memory_loaded = True
             result = measured_send(self._agent, prompt, output_contract=contract)
             if self._telemetry and (result.interrupted or result.stopped != "done" or result.output_status not in {"valid", "not_requested"}):
                 self._telemetry.fail_current()
@@ -965,7 +985,8 @@ class Session:
         try:
             future.result(timeout=self.options.close_timeout)
         except FutureTimeout:
-            raise CloseTimeoutError("Execution has not stopped yet") from None
+            if not future.done():
+                raise CloseTimeoutError("Execution has not stopped yet") from None
         except Exception:
             # Execution failure is reported by run/stream; cleanup still proceeds.
             pass
@@ -1063,6 +1084,25 @@ class Session:
             self._log.event(kind, **fields)
             if self._log.broken_reason:
                 raise SessionStorageError("Session persistence failed")
+
+    def extract_memory(self, store: MemoryStore, scope: MemoryScope, extractor: MemoryExtractor,
+                       *, start: int = 0, max_chars: int = 16000, timeout: float = 30) -> tuple[MemoryRecord, ...]:
+        """Explicit, idle-only extraction into pending memory; never publishes a rule."""
+        if not callable(extractor) or type(timeout) not in (int, float) or not math.isfinite(timeout) or timeout <= 0:
+            raise ConfigurationError("Memory extraction requires a callback and finite positive timeout")
+        with self._mutex:
+            self._check_idle()
+            span = select_span(self.snapshot(), start, max_chars)
+            self._cancel.clear()
+            self._future = self._executor.submit(extract_memory_span, self, store, scope, span, extractor, timeout)
+            future = self._future
+        return future.result()
+
+    def recall_memory(self, store: MemoryStore, scope: MemoryScope, query: str, *, char_budget: int = 4000) -> str:
+        """Return bounded reference context; the host chooses whether to notify the agent."""
+        with self._mutex:
+            self._check_idle()
+            return store.context(scope, query, char_budget=char_budget)
 
     def _lifecycle(self, event: str, *, blocking: bool = False, **fields: Any) -> None:
         decision = _Hooks(self, self.options.hooks).fire(event, fields)
@@ -1459,6 +1499,16 @@ class AsyncSession:
     ) -> TaskSnapshot:
         self._bind_loop()
         return await asyncio.to_thread(self._session.tasks.evaluate, task_id, evaluator, timeout=timeout)
+
+    async def extract_memory(self, store: MemoryStore, scope: MemoryScope, extractor: MemoryExtractor,
+                             *, start: int = 0, max_chars: int = 16000, timeout: float = 30) -> tuple[MemoryRecord, ...]:
+        self._bind_loop()
+        return await asyncio.to_thread(self._session.extract_memory, store, scope, extractor,
+                                       start=start, max_chars=max_chars, timeout=timeout)
+
+    async def recall_memory(self, store: MemoryStore, scope: MemoryScope, query: str, *, char_budget: int = 4000) -> str:
+        self._bind_loop()
+        return await asyncio.to_thread(self._session.recall_memory, store, scope, query, char_budget=char_budget)
 
     async def retry_task(self, task_id: str, *, allow_uncertain: bool = False, continue_history: bool = False) -> TaskHandle:
         self._bind_loop()

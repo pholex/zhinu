@@ -78,3 +78,8 @@ python examples/sdk/business.py --demo --workspace /same/workspace --resume /pri
 去掉 `--demo` 并显式设置 `SDK_MODEL`、`SDK_API_KEY`、可选的 `SDK_BASE_URL` 可调用
 真实模型。业务示例只提供只读订单查询工具，示例 approver 对它直接批准；实际接入时
 替换为宿主 UI 或授权策略。
+
+
+- `durable_work.py --demo`：执行、等待人工、关闭重开、探测、验收；不重复执行已完成动作。
+- `memory_learning.py --demo`：有界会话提取、原文出处核验、待审候选；不自动发布。
+  不带 `--demo` 时两例均需显式 `--state-dir`，模型使用 SDK_MODEL/SDK_API_KEY 配置。

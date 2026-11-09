@@ -186,3 +186,22 @@ CI 覆盖 Linux/macOS/Windows × Python 3.11/3.14，发布流程以全部通过�
   方法 `observe(observation) -> bool`、`flush() -> int`、`observations()`、`forget(subject)`。
 
 详细状态、持久化及调度边界见 [平台能力](sdk-platform.md)。
+
+
+## 持久工作与记忆接口
+
+- `DurableTaskRunner(path, *, handlers, probes=None, evaluators=None, clock=time.time)`：
+  `create(steps, timeout=86400, max_calls=100)`、`tick(id)`、`get(id)`、`list()`、
+  `history(id)`、`resume(id, allow_uncertain=False)`、`cancel(id)`、`close()`，支持 with。
+- `WorkStep`、`WorkResult`、`WorkContext`、`WorkStepSnapshot`、`WorkRun` 是不可变数据类。
+- `MemoryStore(path, clock=time.time)`、`MemoryScope(owner, project="")`、
+  `MemoryCandidate`、`MemoryRecord`；`MemoryConflict` 是修订冲突，`StateError` 是状态存储错误。
+  存储提供 `propose/accept/reject/get/current/list/recall/context/forget/stage/receipt/export_skill`。
+- `SessionOptions.memory_store=None`、`memory_scope=None`、`memory_char_budget=4000`：
+  显式开启首轮记忆接入；store 与 scope 必须一起提供。
+- `Session.extract_memory(store, scope, extractor, start=0, max_chars=16000, timeout=30)`
+  返回 `tuple[MemoryRecord, ...]`；`MemoryExtractor` 接收 `MemorySpan`，其中每条为 `MemoryExcerpt`。
+- `Session.recall_memory(store, scope, query, char_budget=4000) -> str` 返回参考文本。
+  AsyncSession 的 extract_memory/recall_memory 需要 await。
+
+参数约束、持久化、回调权限和恢复语义以[详细契约](durable-work-memory.md)为准。

@@ -88,6 +88,8 @@ xiaoyu send zhinu-1 "顺便把 lint 跑一下"  # 给另一个终端里的小羽
 xiaoyu send --reliable zhinu-1 "测试通过" # 持久化投递，返回消息 ID
 xiaoyu send --status <消息ID>            # pending / accepted
 xiaoyu send --retry <消息ID> zhinu-2     # 恢复到新会话后，显式重投未接纳消息
+xiaoyu memory --owner me --project my-project list --status pending # 查看记忆候选
+xiaoyu memory --owner me --project my-project recall '测试'         # 检索已确认的经验
 
 xiaoyu mcp add chrome-devtools --scope user npx -y chrome-devtools-mcp@1.12.0 --autoConnect --no-usage-statistics --no-performance-crux
 xiaoyu mcp list                         # 写的就是 .mcp.json / mcp.json
@@ -158,6 +160,11 @@ auto 档**放行的依据是沙箱，不是信任**——沙箱不可用时自�
 服务已部署在专用隔离容器或虚拟机中时，使用 `xiaoyu serve --environment sandbox`
 即可关闭内部命令沙箱并自动放行审批；普通主机用 `--environment host`。
 部署说明见 [HTTP 部署环境](docs/http-api.md#选择部署环境)。
+
+宿主需要跨重启等待外部事件、执行后验收，或让不同会话共享经过确认的经验时，
+可使用 SDK 的 `DurableTaskRunner` 与 `MemoryStore`。持久任务采用串行 tick 推进，
+记忆按作用域隔离、保留来源和修订；提取结果先审核再生效。
+用法与完整示例见[持久任务与跨会话记忆](docs/durable-work-memory.md)。
 
 ## 安全与贡献
 

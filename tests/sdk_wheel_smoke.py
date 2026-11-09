@@ -103,4 +103,13 @@ with tempfile.TemporaryDirectory() as directory:
     monitor.observe(sdk.Observation("job", "running", "started"))
     monitor.observe(sdk.Observation("job", "complete", "finished"))
     assert monitor.flush() == 1 and len(notifications) == 1
+    memory = sdk.MemoryStore(Path(directory) / "memory.sqlite")
+    scope = sdk.MemoryScope("smoke", "project")
+    candidate = memory.propose(scope, sdk.MemoryCandidate("runner", "Use unittest", "lesson", "smoke#1", "Use unittest"))
+    assert not memory.recall(scope, "unittest")
+    memory.accept(scope, candidate.id, reviewer="smoke-test")
+    assert memory.recall(scope, "unittest")[0].revision == 1
+    with sdk.DurableTaskRunner(Path(directory) / "work.sqlite", handlers={"check": lambda ctx: sdk.WorkResult("succeeded", "verified")}) as runner:
+        task = runner.create((sdk.WorkStep("check", "check"),))
+        assert runner.tick(task.id).state == "completed"
 print("Installed SDK smoke passed", sdk.__version__)
