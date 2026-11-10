@@ -12,6 +12,7 @@ import io
 import json
 import os
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -616,6 +617,11 @@ class GracefulStopTest(unittest.TestCase):
         self.assertTrue((self.root / "cleaned").exists(), "trap 里的清理没有跑")
         self.assertFalse((self.root / "lock").exists(), "锁文件残留")
 
+    def assert_killed(self, proc: subprocess.Popen) -> None:
+        # 整组 SIGKILL 时，shell 可能先收割被杀的子进程并返回 128 + 信号，
+        # 也可能自己先被杀而返回负信号。两种调度顺序都表示被 SIGKILL 终止。
+        self.assertIn(proc.wait(5), (-signal.SIGKILL, 128 + signal.SIGKILL))
+
     def test_timed_out_command_gets_to_clean_up(self) -> None:
         output = self.toolbox.run("bash", {"command": TRAP_SCRIPT, "timeout": 1})
         self.assertIn("命令超时", output)
@@ -649,14 +655,14 @@ class GracefulStopTest(unittest.TestCase):
         elapsed = time.monotonic() - started
         self.assertGreaterEqual(elapsed, 0.3)
         self.assertLess(elapsed, 3)
-        self.assertEqual(proc.wait(5), -9)
+        self.assert_killed(proc)
 
     def test_second_stop_request_cuts_the_grace_short(self) -> None:
         proc = self.spawn(DEAF_SCRIPT)
         started = time.monotonic()
         bg.kill_tree(proc, grace=10, stop_requested=lambda: True)
         self.assertLess(time.monotonic() - started, 2)
-        self.assertEqual(proc.wait(5), -9)
+        self.assert_killed(proc)
 
     def test_second_ctrl_c_during_the_grace_still_kills_before_propagating(self) -> None:
         proc = self.spawn(DEAF_SCRIPT)
@@ -668,13 +674,13 @@ class GracefulStopTest(unittest.TestCase):
         with self.assertRaises(KeyboardInterrupt):
             bg.kill_tree(proc, grace=10, stop_requested=second_ctrl_c)
         self.assertLess(time.monotonic() - started, 2)
-        self.assertEqual(proc.wait(5), -9)
+        self.assert_killed(proc)
 
     def test_without_grace_the_kill_is_immediate(self) -> None:
         #  进程退出兜底、批量收场走的就是这条：不等，也就不给清理机会
         proc = self.spawn(TRAP_SCRIPT)
         bg.kill_tree(proc)
-        self.assertEqual(proc.wait(5), -9)
+        self.assert_killed(proc)
         self.assertFalse((self.root / "cleaned").exists())
 
 
