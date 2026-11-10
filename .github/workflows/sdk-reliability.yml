@@ -28,7 +28,7 @@ jobs:
       - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version: ${{ matrix.python }}
-      - run: python -m pip install -e ".[sdk]" -e "packages/xiaoyu-agent-sdk[telemetry]" opentelemetry-sdk==1.45.1 psutil==7.2.2
+      - run: python -m pip install -e ".[sdk]" -e "packages/xiaoyu-agent-sdk[telemetry]" opentelemetry-sdk==1.45.2 psutil==7.2.2
       - run: python -m pip check
       - run: python scripts/sdk_reliability.py --mode ${{ inputs.mode }} --config tests/reliability/${{ inputs.profile }}.json --output reliability-results
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
