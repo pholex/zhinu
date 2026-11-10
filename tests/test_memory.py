@@ -112,10 +112,12 @@ class MemoryTests(unittest.TestCase):
             self.assertEqual(other.read_bytes(), raw)
         import sqlite3
         other.unlink()
-        with sqlite3.connect(other) as db: db.execute("CREATE TABLE other (id TEXT)")
+        with contextlib.closing(sqlite3.connect(other)) as db, db:
+            db.execute("CREATE TABLE other (id TEXT)")
         with self.assertRaises(StateError): MemoryStore(other)
-        with sqlite3.connect(other) as db:
+        with contextlib.closing(sqlite3.connect(other)) as db:
             self.assertEqual(db.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall(), [("other",)])
+        other.unlink()  # Windows rejects removal while any fixture connection is still open.
 
     def test_cli_review_recall_and_forget(self):
         from xiaoyu.cli_memory import memory_command
