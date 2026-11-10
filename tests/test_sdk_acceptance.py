@@ -1,5 +1,6 @@
 """业务验收与执行成功分开，回调异常和重启不会伪报通过。"""
 import asyncio
+from dataclasses import replace
 import threading
 import unittest
 
@@ -61,6 +62,8 @@ class AcceptanceTests(unittest.TestCase):
         finally:
             release.set()
             worker.join(5)
+            # The tiny timeout tests ownership, not the platform's cleanup speed.
+            session.options = replace(session.options, close_timeout=5)
             session.close()
         self.assertFalse(worker.is_alive())
         self.assertEqual(len(results), 1)
