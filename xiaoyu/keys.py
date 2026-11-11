@@ -72,7 +72,8 @@ BINDINGS: tuple[Binding, ...] = (
         INPUT, keys=(("backspace",),),
     ),
     Binding(
-        "input.paste", "粘贴", "大段粘贴折叠成 chip，提交时自动展开回原文；"
+        "input.paste", "粘贴", "大段粘贴折叠成 chip，提交时自动展开回原文"
+        "（光标贴着 chip 按 Ctrl-O 就地展开成可编辑的原文）；"
         "拖图片文件进来（可多个）收成图片 chip",
         INPUT, keys=(("<bracketed-paste>",),), tip=True,
     ),
@@ -91,7 +92,8 @@ BINDINGS: tuple[Binding, ...] = (
         INPUT, keys=(("escape", "escape"),), hint="取回上一条", tip=True,
     ),
     Binding(
-        "app.toggleDetail", "Ctrl-O", "切换工具输出详略；开时先补出上一轮被折叠的输出",
+        "app.toggleDetail", "Ctrl-O", "切换工具输出详略；开时先补出上一轮被折叠的输出。"
+        "光标贴着粘贴 chip 时改为把它就地展开成原文",
         INPUT, keys=(("c-o",),), hint="工具详情", tip=True,
     ),
     Binding(

@@ -837,6 +837,55 @@ class TestTuiFrontend(AgentTestCase):
         self.assertEqual(match.group(0), "[粘贴 #1 · 12 行]")
         self.assertIsNone(_PASTE_REF_TAIL.search("[粘贴 #1 · 12 行]后面还有字"))
 
+    def test_ctrl_o_unfolds_paste_chip_at_cursor(self) -> None:
+        """光标贴着粘贴 chip 时就地展开成可编辑的原文；不贴着就不动、把键让出去。"""
+        from prompt_toolkit.buffer import Buffer
+
+        tui = self.make_tui()
+        body = "一\n二\n三\n四"
+        chip = tui._fold_paste(body)
+        buffer = Buffer()
+        buffer.text = f"看下 {chip} 谢谢"
+        #  光标不贴着 chip：不展开
+        buffer.cursor_position = 1
+        self.assertFalse(tui._unfold_paste_at(buffer))
+        self.assertIn(chip, buffer.text)
+        #  贴着右端：展开，光标落在展开正文之后
+        buffer.cursor_position = len(f"看下 {chip}")
+        self.assertTrue(tui._unfold_paste_at(buffer))
+        self.assertEqual(buffer.text, f"看下 {body} 谢谢")
+        self.assertEqual(buffer.cursor_position, len(f"看下 {body}"))
+        #  已是普通文本，再按不再有可展开的东西
+        self.assertFalse(tui._unfold_paste_at(buffer))
+        #  贴着左端、落在中间同样算紧邻
+        for offset in (0, 3):
+            buffer.text = tui._fold_paste(body)
+            buffer.cursor_position = offset
+            self.assertTrue(tui._unfold_paste_at(buffer))
+            self.assertEqual(buffer.text, body)
+        #  手改坏 / 不存在的 chip 不展开
+        buffer.text = "[粘贴 #99 · 1 行]"
+        buffer.cursor_position = len(buffer.text)
+        self.assertFalse(tui._unfold_paste_at(buffer))
+
+    def test_unfolded_paste_at_line_start_stays_literal(self) -> None:
+        """行首 chip 展开后，贴进来的 `!` 仍不是用户敲的前缀；改过首行则以改后为准。"""
+        from prompt_toolkit.buffer import Buffer
+
+        tui = self.make_tui()
+        buffer = Buffer()
+        buffer.text = tui._fold_paste("!rm -rf /\n" + "y\n" * 5)
+        buffer.cursor_position = len(buffer.text)
+        self.assertTrue(tui._unfold_paste_at(buffer))
+        self.assertTrue(tui._starts_with_unfolded(buffer.text))
+        self.assertFalse(tui._starts_with_unfolded("!ls 用户自己敲的"))
+        #  chip 不在行首：前缀是用户敲的，不记
+        tui._unfolded_head = None
+        buffer.text = "!cat " + tui._fold_paste("a\nb\nc\nd")
+        buffer.cursor_position = len(buffer.text)
+        self.assertTrue(tui._unfold_paste_at(buffer))
+        self.assertFalse(tui._starts_with_unfolded(buffer.text))
+
     def test_tab_inserts_longest_common_prefix_first(self) -> None:
         """Tab 先补到所有候选的最长公共前缀，再按才轮换（readline 直觉）。"""
         from prompt_toolkit.buffer import Buffer

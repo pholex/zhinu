@@ -1933,6 +1933,9 @@ class Tui:
         #  本次提交行首来自粘贴 chip：展开后的 ! / # / 前缀不是用户敲的，路由
         #  按字面发给模型（由 _submit 置位、主循环取走即清）
         self._literal_submit = False
+        #  行首 chip 被 Ctrl-O 就地展开后留下的首行：提交时行首还是它，就仍按
+        #  字面发（见 _unfold_paste_at）
+        self._unfolded_head: str | None = None
         #  图片 chip：编号 → 媒体引用（xiaoyu-media://…）。会话内累加不清理，
         #  用户可能把同一张图在后面几轮里反复引用（Esc-Esc 取回上一条即是）
         self._images: dict[int, str] = {}
@@ -2031,6 +2034,35 @@ class Tui:
         return _PASTE_REF.sub(
             lambda match: self._pastes.get(int(match.group(1)), match.group(0)), text
         )
+
+    def _unfold_paste_at(self, buffer: Any) -> bool:
+        """光标紧邻（贴着两端或落在其中）一颗粘贴 chip 时就地展开成原文。
+
+        展开后就是普通多行文本：能看、能改，不再折回。没有可展开的 chip 返回
+        False，调用方据此把这次按键让给别的用途。
+        """
+        cursor = buffer.cursor_position
+        for match in _PASTE_REF.finditer(buffer.text):
+            if not match.start() <= cursor <= match.end():
+                continue
+            data = self._pastes.get(int(match.group(1)))
+            if data is None:
+                continue
+            head = buffer.text[: match.start()]
+            if not head.strip():
+                #  chip 顶在行首：展开后首行的 ! / # / 前缀同样不是用户敲的。
+                #  记下首行，提交时行首还是它就按字面发；用户改过首行则以改后为准
+                self._unfolded_head = data.split("\n", 1)[0]
+            buffer.save_to_undo_stack()
+            buffer.text = head + data + buffer.text[match.end() :]
+            buffer.cursor_position = len(head) + len(data)
+            return True
+        return False
+
+    def _starts_with_unfolded(self, text: str) -> bool:
+        """行首（忽略空白）是否仍是刚才就地展开的那段粘贴的首行。"""
+        head = self._unfolded_head
+        return bool(head) and text.lstrip().startswith(head)
 
     # ---------- 图片 chip ----------
 
@@ -2207,7 +2239,10 @@ class Tui:
             #  chip 展开回原文再提交；输入历史里存的也是展开后的全文。
             #  展开前先看行首：顶在第 0 位的是 chip 就标记"字面提交"，
             #  否则贴进来的 `!rm -rf` 日志会在展开后被当成 shell 命令跑掉。
-            self._literal_submit = self._starts_with_paste(buffer.text)
+            self._literal_submit = self._starts_with_paste(
+                buffer.text
+            ) or self._starts_with_unfolded(buffer.text)
+            self._unfolded_head = None
             expanded = self._expand_pastes(buffer.text)
             if expanded != buffer.text:
                 buffer.text = expanded
@@ -2259,6 +2294,9 @@ class Tui:
             event.current_buffer.insert_text("\n")
 
         def _toggle_detail(event: Any) -> None:
+            #  同一个"展开看细节"的键：光标贴着粘贴 chip 时先展开它
+            if self._unfold_paste_at(event.current_buffer):
+                return
             self.sink.detail = not self.sink.detail
 
             def _report() -> None:
