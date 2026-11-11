@@ -2,13 +2,16 @@
 
 from __future__ import annotations
 
+import contextlib
 import io
 import json
 import os
+import ssl
 import subprocess
 import sys
 import tempfile
 import unittest
+import urllib.error
 from pathlib import Path
 from unittest import mock
 
@@ -106,6 +109,10 @@ class OsvCheckTest(unittest.TestCase):
     def setUp(self):
         #  结论缓存是模块级的，逐测试清空
         mcp_guard._osv_cache.clear()
+        #  重试间隔在测试里归零，不白等
+        patcher = mock.patch.object(mcp_guard, "_OSV_RETRY_DELAY", 0)
+        patcher.start()
+        self.addCleanup(patcher.stop)
 
     def test_malware_hit_returns_reason(self):
         with mock.patch.object(
@@ -143,7 +150,40 @@ class OsvCheckTest(unittest.TestCase):
         ) as fake:
             self.assertIsNone(mcp_guard.osv_malware_check("npx", ["clean-pkg"]))
             self.assertIsNone(mcp_guard.osv_malware_check("npx", ["clean-pkg"]))
+        #  每次检查各自打满重试次数，第二次检查没有被第一次的失败短路
+        self.assertEqual(fake.call_count, 2 * mcp_guard._OSV_ATTEMPTS)
+
+    def test_transient_connection_failure_retried_once(self):
+        #  握手中途被断这类瞬时失败：重拨一次就通，不该报「预检失败」
+        dropped = urllib.error.URLError(
+            ssl.SSLEOFError(8, "EOF occurred in violation of protocol")
+        )
+        err = io.StringIO()
+        with mock.patch.object(
+            mcp_guard.netproxy,
+            "urlopen",
+            side_effect=[
+                dropped,
+                fake_response({"vulns": [{"id": "MAL-2026-0002", "summary": "后门"}]}),
+            ],
+        ) as fake, contextlib.redirect_stderr(err):
+            reason = mcp_guard.osv_malware_check("npx", ["evil-pkg"])
         self.assertEqual(fake.call_count, 2)
+        self.assertIn("MAL-2026-0002", reason)  # 重试拿到的裁决照常生效
+        self.assertEqual(err.getvalue(), "")
+
+    def test_timeout_and_http_error_not_retried(self):
+        #  超时再等一轮会把启动拖到二十秒；服务端已应答的错误重试也一样
+        answered = urllib.error.HTTPError("https://osv", 503, "busy", None, None)
+        self.addCleanup(answered.close)
+        for failure in (urllib.error.URLError(TimeoutError("timed out")), TimeoutError(), answered):
+            mcp_guard._osv_cache.clear()
+            with mock.patch.object(
+                mcp_guard.netproxy, "urlopen", side_effect=failure
+            ) as fake, contextlib.redirect_stderr(io.StringIO()) as err:
+                self.assertIsNone(mcp_guard.osv_malware_check("npx", ["clean-pkg"]))
+            self.assertEqual(fake.call_count, 1, failure)
+            self.assertIn("预检失败", err.getvalue())
 
     def test_non_runner_no_network(self):
         with mock.patch.object(mcp_guard.netproxy, "urlopen") as fake:

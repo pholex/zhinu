@@ -111,6 +111,10 @@ def endpoint_violation(url: str) -> str | None:
 OSV_ENDPOINT = "https://api.osv.dev/v1/query"
 #  单次查询的 socket 超时。fail-open：查不成不拦启动。
 _OSV_TIMEOUT = 10.0
+#  连接层瞬时失败再试一次：透明代理 / 中间盒偶发掐断握手时，本地看到的是
+#  握手中途 EOF，紧接着重拨基本都通。只多试一次、间隔很短，不拖慢启动。
+_OSV_ATTEMPTS = 2
+_OSV_RETRY_DELAY = 0.3
 _OSV_CACHE_TTL = 3600.0
 
 #  运行器 → OSV 生态名。其它命令（node、python、二进制）不查：
@@ -170,6 +174,20 @@ def osv_package(command: str, args: list[str]) -> tuple[str, str, str] | None:
     return (ecosystem, name, version) if name else None
 
 
+def _osv_transient(exc: BaseException) -> bool:
+    """连接层的瞬时失败（握手中途被断、连接被重置、拨不通）才值得再试。
+
+    服务端已经应答的（HTTPError）重试也是同一个结果；超时不重试——再等
+    一个 `_OSV_TIMEOUT` 会把 MCP 启动拖到二十秒，比漏一次预检更糟。
+    """
+    if isinstance(exc, urllib.error.HTTPError):
+        return False
+    reason = exc.reason if isinstance(exc, urllib.error.URLError) else exc
+    if isinstance(reason, TimeoutError):
+        return False
+    return isinstance(reason, OSError)
+
+
 def osv_malware_check(command: str, args: list[str]) -> str | None:
     """查 OSV 恶意包记录。命中返回原因（fail-closed 由调用方执行）；
     不是包运行器 / 查询失败返回 None（fail-open）。"""
@@ -197,16 +215,23 @@ def osv_malware_check(command: str, args: list[str]) -> str | None:
         },
         method="POST",
     )
-    try:
-        with netproxy.urlopen(request, timeout=_OSV_TIMEOUT) as response:
-            body = json.loads(response.read().decode("utf-8", errors="replace"))
-    except Exception as exc:  # noqa: BLE001 - fail-open：预检失败不拦启动
-        print(f"[MCP OSV 预检失败（放行）：{type(exc).__name__}: {exc}]", file=sys.stderr)
-        if isinstance(exc, urllib.error.HTTPError):
-            #  4xx / 5xx 的异常对象本身就是一个开着的响应，要关
-            with contextlib.suppress(Exception):
-                exc.close()
-        return None
+    attempt = 0
+    while True:
+        attempt += 1
+        try:
+            with netproxy.urlopen(request, timeout=_OSV_TIMEOUT) as response:
+                body = json.loads(response.read().decode("utf-8", errors="replace"))
+            break
+        except Exception as exc:  # noqa: BLE001 - fail-open：预检失败不拦启动
+            if attempt < _OSV_ATTEMPTS and _osv_transient(exc):
+                time.sleep(_OSV_RETRY_DELAY)
+                continue
+            print(f"[MCP OSV 预检失败（放行）：{type(exc).__name__}: {exc}]", file=sys.stderr)
+            if isinstance(exc, urllib.error.HTTPError):
+                #  4xx / 5xx 的异常对象本身就是一个开着的响应，要关
+                with contextlib.suppress(Exception):
+                    exc.close()
+            return None
 
     malicious = [
         vuln
