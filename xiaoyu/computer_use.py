@@ -134,12 +134,20 @@ class Client:
     """一条到辅助进程的连接；断了下次调用自动重连、必要时把 app 拉起来。"""
 
     def __init__(self, path: Path | None = None, launcher=None, timeout: float = 120.0, stop_requested=None):
-        self.path = path or socket_path()
+        #  路径到用的时候才定：构造发生在每个 Agent 初始化里，而默认路径要问家目录——
+        #  家目录定不出来的环境（清空了环境变量的宿主、非 macOS）不该因此起不来。
+        self._path = path
         self._sock: socket.socket | None = None
         self._next_id = 1
         self._launcher = launcher or self._launch
         self.timeout = timeout
         self.stop_requested = stop_requested
+
+    @property
+    def path(self) -> Path:
+        if self._path is None:
+            self._path = socket_path()
+        return self._path
 
     # -- 连接 --
 

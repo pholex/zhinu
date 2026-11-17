@@ -24,6 +24,7 @@ from xiaoyu.config import Config
 from xiaoyu.computer_use import (ACTIONS, API_VERSION, Client, ServiceError, make_computer_use_tool,
                                  tree_delta)
 from xiaoyu.errors import Interrupted
+from xiaoyu.providers import Registry
 from xiaoyu.render import NullSink
 from xiaoyu.tools import Toolbox
 
@@ -127,6 +128,7 @@ def _state(tree: str, shot: bool = True, **extra):
     return result
 
 
+@unittest.skipUnless(hasattr(socket, "AF_UNIX"), "假服务走 unix socket，本平台没有")
 class ServiceCase(unittest.TestCase):
     def setUp(self):
         #  macOS 对 sun_path 限长 104 字节，不能用默认的长临时目录
@@ -533,13 +535,23 @@ class TestDiscovery(unittest.TestCase):
             self.assertEqual(computer_use.socket_path(), Path("/tmp/x.sock"))
 
 
+class TestLazySocketPath(unittest.TestCase):
+    def test_constructing_a_client_does_not_ask_for_the_home_directory(self):
+        #  每个 Agent 初始化都会构造一个 Client；家目录定不出来时构造不能跟着失败
+        with mock.patch.object(computer_use, "socket_path", side_effect=RuntimeError("no home")):
+            client = Client()
+        with mock.patch.object(computer_use, "socket_path", return_value=Path("x.sock")):
+            self.assertEqual(client.path, Path("x.sock"))
+
+
 class TestMounting(unittest.TestCase):
     def _agent(self, **overrides):
         config = Config(base_url="", model="m", workspace=Path("."), enable_web_search=False,
                         enable_web_fetch=False, enable_x_search=False, enable_deep_research=False,
                         enable_browser=False, enable_mcp=False, enable_plugins=False, enable_skills=False,
                         enable_hooks=False, enable_peers=False, **overrides)
-        return Agent(config, sink=NullSink())
+        #  给一个假端点：这里只看工具挂没挂上，不能依赖跑测试的机器上配了模型密钥
+        return Agent(config, sink=NullSink(), registry=Registry.for_client(mock.Mock()))
 
     def test_registered_when_enabled_and_hidden_when_helper_missing(self):
         agent = self._agent()
