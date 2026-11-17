@@ -1148,6 +1148,9 @@ class Agent:
         self._fail_streak = 0
         #  无进展检测：bash 连续失败的输出指纹（抹掉数字/哈希后）与连续次数
         self._stall_fp, self._stall_count = "", 0
+        #  空等检测：本轮 bash 输出的指纹（整段与末行）、"等完结果没变"的次数与合计秒数
+        self._wait_seen: set[str] = set()
+        self._wait_unchanged, self._wait_seconds = 0, 0.0
         #  压缩后的重读比对：压缩发生时 trace 的长度，与剩余的比对次数
         self._post_compact_mark = 0
         self._post_compact_window = 0
@@ -2542,6 +2545,8 @@ class Agent:
         self._exec_evidence = 0
         self._fail_streak_tool, self._fail_streak = "", 0
         self._stall_fp, self._stall_count = "", 0
+        self._wait_seen = set()
+        self._wait_unchanged, self._wait_seconds = 0, 0.0
         self._turn_mutations = 0
         if self.session_log:
             self.session_log.event("clear")
@@ -3473,6 +3478,8 @@ class Agent:
         #  失败流与改动证据同样按轮归零：上一轮的失败/改动不该影响这一轮的判定
         self._fail_streak_tool, self._fail_streak = "", 0
         self._stall_fp, self._stall_count = "", 0
+        self._wait_seen = set()
+        self._wait_unchanged, self._wait_seconds = 0, 0.0
         self._turn_mutations = 0
         self.structured_output = None
         #  UserPromptSubmit hook：block 则本轮不发生（不入历史、不调模型）
@@ -5705,6 +5712,73 @@ class Agent:
             )
         return ""
 
+    #  空等检测：一条前台 bash 里 sleep 合计达到这个秒数，才算"等一会儿再查"
+    _WAIT_MIN_SECONDS = 10
+    #  "等完结果没变"达到这个次数提示 / 要求收敛
+    _WAIT_NOTE = 2
+    _WAIT_CONVERGE = 3
+    #  末行指纹至少要有这么多非空白字符：`]`、`}`、`ok` 这类收尾行谁都长一个样
+    _WAIT_TAIL_MIN = 12
+    _SLEEP = re.compile(r"(?:^|[;&|\n(]|\bdo\b|\bthen\b)\s*sleep\s+(\d+(?:\.\d+)?)([smh]?)(?![\w.])")
+    _LEADING_SLEEP = re.compile(r"^\s*(?:sleep\s+\d+(?:\.\d+)?[smh]?\s*(?:;|&&)\s*)+")
+    _SLEEP_UNITS = {"": 1, "s": 1, "m": 60, "h": 3600}
+
+    @classmethod
+    def _slept_seconds(cls, command: str) -> float:
+        """命令里显式 sleep 的合计秒数（循环体里的只算一次：估的是下限）。"""
+        return sum(
+            float(amount) * cls._SLEEP_UNITS[unit] for amount, unit in cls._SLEEP.findall(command)
+        )
+
+    def _wait_note(self, name: str, args: dict[str, Any], raw: str) -> str:
+        """先 sleep 再查、查到的却和等待前一样时的提示（空等检测）。
+
+        打转检测认参数相同，无进展检测认非零退出码；而"重启后连不上就加长
+        sleep 再连"两头都不沾——每次 sleep 的秒数不同，命令接了管道（`| tail`）
+        退出码又是 0。实测一轮里这样等了三分多钟，结果从第一次起就没变过。
+        判据是结果而不是命令：等完拿到的输出（整段，或有实质内容的末行）
+        在本轮更早的 bash 输出里已经出现过，说明等待没有改变任何东西。
+        只提示、不拦截：真在推进的轮询（末行带进度数字）会被数字抹平误伤，
+        由模型自己判断；要等外部事件本来就该用 run_in_background。
+        """
+        if name != "bash":
+            return ""
+        body = "\n".join(
+            line for line in raw.splitlines()
+            if line.strip() and not re.match(r"(exit_status: -?\d+|stdout:|stderr:)$", line.strip())
+        )
+        prints = set()
+        if body:
+            #  整段只留摘要：一轮里的 bash 输出加起来可以很大
+            prints.add(hashlib.sha1(self._VOLATILE.sub("#", body).encode("utf-8", "replace")).hexdigest())
+            tail = self._VOLATILE.sub("#", body.splitlines()[-1].strip())
+            if len(re.sub(r"\s", "", tail)) >= self._WAIT_TAIL_MIN:
+                prints.add(tail)
+        slept = 0.0 if args.get("run_in_background") else self._slept_seconds(str(args.get("command") or ""))
+        unchanged = slept >= self._WAIT_MIN_SECONDS and bool(prints & self._wait_seen)
+        self._wait_seen |= prints
+        if not unchanged:
+            return ""
+        self._wait_unchanged += 1
+        self._wait_seconds += slept
+        if self._wait_unchanged < self._WAIT_NOTE:
+            return ""
+        lead = (
+            f"\n\n[提示] 本轮你已 {self._wait_unchanged} 次先 sleep 再查（共等了约 "
+            f"{round(self._wait_seconds)} 秒），拿到的结果和等待前一样——等待没有改变它，"
+            "再加长 sleep 多半也不会。"
+        )
+        if self._wait_unchanged >= self._WAIT_CONVERGE:
+            return lead + (
+                "不要再 sleep 重试，请二选一：\n"
+                "1. 现在就向用户说明：已完成什么、卡在哪个现象上、你的判断；\n"
+                "2. 换一种完全不同的方式查原因（不是换个等待时长）。"
+            )
+        return lead + (
+            "先停下来：把已完成的事和这个现象如实告诉用户，或换一种方式查原因；"
+            "确实要等外部事件就用 run_in_background，不要前台 sleep。"
+        )
+
     def _mark_compaction(self) -> None:
         """压缩改写了历史：开启重读比对窗口（见 _reread_note）。"""
         self._post_compact_mark = len(self.trace)
@@ -5891,13 +5965,30 @@ class Agent:
         return ""
 
     def _track_repeat(self, name: str, raw_args: str) -> int:
-        """返回当前连续相同调用的次数（含本次）。"""
-        key = (name, raw_args)
+        """返回当前连续相同调用的次数（含本次）。
+
+        bash 按"去掉开头的 sleep、不看 timeout"比较：`X` → `sleep 40; X` →
+        `sleep 90; X` 是同一条命令在干等，不是换了参数。
+        """
+        key = (name, self._repeat_args(name, raw_args))
         if key == self._last_call_key:
             self._call_repeats += 1
         else:
             self._last_call_key, self._call_repeats = key, 1
         return self._call_repeats
+
+    def _repeat_args(self, name: str, raw_args: str) -> str:
+        if name != "bash":
+            return raw_args
+        try:
+            args = json.loads(raw_args)
+        except ValueError:
+            return raw_args
+        if not isinstance(args, dict) or not isinstance(args.get("command"), str):
+            return raw_args
+        command = self._LEADING_SLEEP.sub("", args["command"]).strip()
+        rest = {k: v for k, v in args.items() if k not in ("command", "timeout")}
+        return json.dumps({"command": command, **rest}, ensure_ascii=False, sort_keys=True)
 
     def _execute(self, call: dict[str, Any]) -> dict[str, Any]:
         """执行一次工具调用。待送达的系统通知搭在结果尾部（见 notify）。
@@ -5982,8 +6073,9 @@ class Agent:
         if repeats >= self._REPEAT_BLOCK:
             return self._tool_message(
                 call,
-                f"ERROR: 你已连续 {repeats} 次用完全相同的参数调用 {name}，"
-                "本次拒绝执行。参数不变结果就不会变——换工具、换参数，"
+                f"ERROR: 你已连续 {repeats} 次用完全相同的参数调用 {name}"
+                + ("（只改开头的 sleep 时长或超时不算换参数）" if name == "bash" else "")
+                + "，本次拒绝执行。参数不变结果就不会变——换工具、换参数，"
                 "或者停下来向用户说明卡在哪里。",
             )
 
@@ -6200,8 +6292,9 @@ class Agent:
             output += f"\n\n（用户批准这次调用时附加了指示，请照此执行：{note}）"
         if repeats >= self._REPEAT_WARN:
             output += (
-                f"\n\n[提示] 这是你连续第 {repeats} 次用相同参数调用 {name}，"
-                "结果和上次一样。如果没有新信息，请换一种方法。"
+                f"\n\n[提示] 这是你连续第 {repeats} 次用相同参数调用 {name}"
+                + ("（只改开头的 sleep 时长或超时不算换参数）" if name == "bash" else "")
+                + "，结果和上次一样。如果没有新信息，请换一种方法。"
             )
         #  PostToolUse hook：工具已执行，block 的理由作为附注拼进结果让模型看到
         #  （拼在 ERROR 判定之后，反馈不改变工具本身的成败归类——见 ok 的注释）
@@ -6228,6 +6321,12 @@ class Agent:
             output += stall_note
             if self.session_log:
                 self.session_log.event("tool_stall", tool=name, count=self._stall_count)
+        if wait_note := self._wait_note(name, args, raw_output):
+            output += wait_note
+            if self.session_log:
+                self.session_log.event(
+                    "tool_wait_stall", count=self._wait_unchanged, seconds=round(self._wait_seconds)
+                )
         if ok and (reread_note := self._reread_note(name, args, raw_output)):
             output += reread_note
         #  首次触达带约定文件的子目录：把那条路径上的约定文件附在结果后面（成败不论——
