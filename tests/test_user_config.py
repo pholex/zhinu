@@ -591,15 +591,15 @@ class MaxOutputTokensEnvTest(unittest.TestCase):
 
 
 class ExploreIterationsEnvTest(unittest.TestCase):
-    """explore 子 agent 的轮次上限（默认 12）要能临时放宽——大仓库上 12 轮不够用。"""
+    """explore 子 agent 的轮次上限（默认 24）要能临时放宽——大仓库上默认轮数不够用。"""
 
     def _from_env(self, value: str) -> config.Config:
         with mock.patch.dict(os.environ, {"XIAOYU_EXPLORE_ITERATIONS": value}):
             return config.Config.from_env(workspace=Path.cwd())
 
-    def test_default_is_twelve(self) -> None:
+    def test_default_is_twenty_four(self) -> None:
         cfg = config.Config(base_url="x", model="x", workspace=Path.cwd())
-        self.assertEqual(cfg.explore_iterations, 12)
+        self.assertEqual(cfg.explore_iterations, 24)
 
     def test_env_override(self) -> None:
         self.assertEqual(self._from_env("40").explore_iterations, 40)
@@ -607,7 +607,7 @@ class ExploreIterationsEnvTest(unittest.TestCase):
     def test_clamped_and_garbage_ignored(self) -> None:
         self.assertEqual(self._from_env("999").explore_iterations, 100)
         self.assertEqual(self._from_env("0").explore_iterations, 1)
-        self.assertEqual(self._from_env("很多").explore_iterations, 12)
+        self.assertEqual(self._from_env("很多").explore_iterations, 24)
 
 
 class VersionFlagTest(unittest.TestCase):

@@ -298,6 +298,18 @@ class HeadroomNoticeTest(AgentTestCase):
         self._send(agent, "继续")
         self.assertEqual(len(self._notes(agent)), 3)
 
+    def test_quiet_sub_agent_keeps_notice_off_screen(self):
+        """子 agent 的余量只给模型看：operator 通道照记，不上用户的屏。"""
+        self.config.max_iterations = 5
+        self.config.turn_extension = 0
+        agent = self.build([
+            read_call(0), read_call(1), read_call(2), read_call(3), text("完成"),
+        ])
+        agent.quiet = True
+        out = self._send(agent)
+        self.assertEqual(len(self._notes(agent)), 2)
+        self.assertNotIn("[余量]", out)
+
     def test_no_notice_when_far_from_limits(self):
         agent = self.build([read_call(0), text("完成")])
         self._send(agent)

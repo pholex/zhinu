@@ -466,8 +466,9 @@ class Config:
     #  投喂指令，两者叠加才是真风险；要开就显式 XIAOYU_ENABLE_PEERS=1。
     enable_peers: bool = True
     #  explore 子 agent 单次检索最多几轮工具调用。
-    #  大仓库/复杂问题嫌 12 轮不够可用 XIAOYU_EXPLORE_ITERATIONS 放宽（上限 100）。
-    explore_iterations: int = 12
+    #  12 轮在跨目录的问题上常撞顶再申请延期（多花一步请求），故默认 24；
+    #  大仓库/复杂问题仍不够可用 XIAOYU_EXPLORE_ITERATIONS 放宽（上限 100）。
+    explore_iterations: int = 24
     #  单轮用户输入内最多允许模型连续调多少轮工具，防跑飞。
     max_iterations: int = 50
     #  单个工具输出的字符上限，超出截断（一次 grep 就能吐爆上下文）。
