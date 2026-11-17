@@ -144,8 +144,15 @@ def inspect_session(
             else:
                 kind = str(event or "unknown")
                 detail = {k: v for k, v in record.items() if k not in ("ts", "event", "replacement", "baseline")}
+                #  检索子 agent 的旁录（explore_*）：失败的工具、出错的请求、没正常
+                #  收尾的检索都算错误，--errors 才筛得出"这次检索卡在哪"
+                explore_failed = (
+                    (kind == "explore_tool" and record.get("ok") is False)
+                    or (kind == "explore_request" and bool(record.get("error")))
+                    or (kind == "explore_end" and record.get("outcome") != "done")
+                )
                 add(line_no, record, kind, json.dumps(_clean(detail), ensure_ascii=False),
-                    failed=kind == "error" or (kind == "compact_end" and (
+                    failed=kind == "error" or explore_failed or (kind == "compact_end" and (
                         record.get("outcome") == "failed" if "outcome" in record
                         else record.get("ok") is False
                     )))

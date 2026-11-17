@@ -1361,6 +1361,7 @@ class Agent:
                     config, self.registry, self.usage, self.sink,
                     approver=self.approver, permissions=self.permissions,
                     toolbox=self.toolbox,
+                    journal=lambda: self.session_log,
                 )
             )
         #  web_search：借厂商 Responses 内置搜索的一次性调用（后端见 XIAOYU_SEARCH_PROVIDER，
