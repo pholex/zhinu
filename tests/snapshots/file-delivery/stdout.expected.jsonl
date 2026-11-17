@@ -1,0 +1,12 @@
+{"kind": "request.started", "model": "snapshot-model", "provider": "_scripted"}
+{"kind": "tool.preparing", "name": "write_file", "index": 0, "argument_chars": 54, "path": "report.txt", "purpose": ""}
+{"kind": "request.ended", "duration_ms": 0, "ttft_ms": 0, "usage": {"prompt_tokens": 150, "completion_tokens": 20, "cached_tokens": 0}, "model": "", "response_id": "", "finish_reason": "", "error": ""}
+{"kind": "tool.pending", "name": "write_file", "args": {"path": "report.txt", "content": "artifact result\n"}}
+{"kind": "tool.running", "name": "write_file", "args": {"path": "report.txt", "content": "artifact result\n"}}
+{"kind": "tool.completed", "name": "write_file", "output": "已创建 report.txt：16 字符 / 1 行", "ok": true, "seconds": 0}
+{"kind": "request.started", "model": "snapshot-model", "provider": "_scripted"}
+{"kind": "text.delta", "text": "report.txt 已生成。"}
+{"kind": "text.end"}
+{"kind": "request.ended", "duration_ms": 0, "ttft_ms": 0, "usage": {"prompt_tokens": 190, "completion_tokens": 20, "cached_tokens": 0}, "model": "", "response_id": "", "finish_reason": "", "error": ""}
+{"kind": "artifacts.ready", "artifacts": [{"id": "<artifact-id>", "path": "report.txt", "size": 16, "sha256": "440a45594fdb052aa73d9d7d374871478cceef49d301ea9e252cd93539867f63", "operation": "created", "source": "file_tool", "status": "complete", "mime_type": "text/plain"}]}
+{"kind": "result", "result": "report.txt 已生成。", "usage": {"turns": 2, "prompt_tokens": 340, "completion_tokens": 40, "by_model": {"_scripted/snapshot-model": {"calls": 2, "prompt_tokens": 340, "completion_tokens": 40}}}, "model": "snapshot-model", "artifacts": [{"id": "<artifact-id>", "path": "report.txt", "size": 16, "sha256": "440a45594fdb052aa73d9d7d374871478cceef49d301ea9e252cd93539867f63", "operation": "created", "source": "file_tool", "status": "complete", "mime_type": "text/plain"}], "session_log": "<session_log>"}

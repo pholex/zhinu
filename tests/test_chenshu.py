@@ -1,0 +1,863 @@
+"""宸枢（编排总控模式）的测试。不打网络。
+
+scope 语义 / init 与收养 / plan 校验 / comms 过滤 / merge 五道闸 /
+写守卫 / worker 线程端到端（假 client 脚本），各卡一处。
+git 级用例需要 git，机器上没有就跳过。
+"""
+
+from __future__ import annotations
+
+import contextlib
+import io
+import json
+import shutil
+import subprocess
+import time
+import unittest
+from pathlib import Path
+from unittest import mock
+
+from xiaoyu import chenshu as chenshu_mod
+from xiaoyu import worktree as worktree_mod
+from xiaoyu.agent import Usage
+from xiaoyu.chenshu import (
+    ChenshuError,
+    ChenshuRuntime,
+    _write_guard,
+    scope_match,
+    scopes_conflict,
+)
+from xiaoyu.providers import Registry, UnknownModel
+from xiaoyu.render import PlainSink
+from xiaoyu.sandbox import _worktree_git_paths
+
+from .test_agent_paths import AgentTestCase, FakeClient, call_fragment, chunk
+
+HAS_GIT = shutil.which("git") is not None
+LONG = "交接：" + "详" * 210
+
+
+def text_turn(text: str) -> list:
+    return [chunk(content=text)]
+
+
+def tool_turn(call_id: str, name: str, args: dict) -> list:
+    return [chunk(tool_calls=[call_fragment(0, call_id, name, json.dumps(args))])]
+
+
+def git(root: Path, *args: str) -> str:
+    result = subprocess.run(
+        ["git", "-c", "user.email=t@t", "-c", "user.name=t", *args],
+        cwd=root, capture_output=True, text=True,
+        encoding="utf-8", errors="replace", check=True,
+    )
+    return result.stdout.strip()
+
+
+class ScopeSemanticsTest(unittest.TestCase):
+    def test_conflict_lattice(self):
+        self.assertTrue(scopes_conflict("src/**", "src/api/"))
+        self.assertTrue(scopes_conflict("src", "src/**"))
+        self.assertFalse(scopes_conflict("src/api/", "src/web/"))
+        self.assertFalse(scopes_conflict("docs/", "src/"))
+        #  空干 = 整仓，保守判冲突
+        self.assertTrue(scopes_conflict("**", "src/"))
+
+    def test_nontrailing_glob_conflicts_by_stem(self):
+        """非尾随通配符（src/**/*.py）的根干是 src——与 src/ 下任何 scope 冲突。
+        评审抓出的双向失效回归：plan 侧不许放过重叠。"""
+        self.assertTrue(scopes_conflict("src/**/*.py", "src/utils/"))
+        self.assertTrue(scopes_conflict("src/a*", "src/abc/"))
+        #  顶层裸 glob 根干为空 = 整仓 → 冲突
+        self.assertTrue(scopes_conflict("*.py", "docs/"))
+
+    def test_scope_match_forms(self):
+        patterns = ("src/api/", "docs/*.md", "Makefile")
+        self.assertTrue(scope_match("src/api/a.py", patterns))
+        self.assertTrue(scope_match("docs/readme.md", patterns))
+        self.assertTrue(scope_match("Makefile", patterns))
+        self.assertFalse(scope_match("src/web/b.py", patterns))
+        self.assertFalse(scope_match("other.txt", patterns))
+
+    def test_nontrailing_glob_matches_by_stem(self):
+        """merge 侧与 plan 侧同一个根干：src/**/*.py 保留的是 src 子树，
+        src/x.py 必须命中（评审抓出的误拒回归）。"""
+        self.assertTrue(scope_match("src/x.py", ("src/**/*.py",)))
+        self.assertTrue(scope_match("src/deep/y.py", ("src/**/*.py",)))
+        #  docs/*.md 的根干是 docs：整个 docs 子树都算它的（与 plan 保留一致）
+        self.assertTrue(scope_match("docs/sub/x.md", ("docs/*.md",)))
+
+
+class ChenshuCase(AgentTestCase):
+    """公共装配：真 git 仓 + runtime（worktree 落在 tmp 配置目录）。"""
+
+    def setUp(self):
+        super().setUp()
+        self.config.sandbox = False  # 测试环境不套 Seatbelt，行为确定
+        self.notices: list[tuple[str, str]] = []
+        self.patches = [
+            mock.patch.object(worktree_mod, "user_config_dir", lambda: self.root / "cfg"),
+        ]
+        for patch in self.patches:
+            patch.start()
+        self.addCleanup(lambda: [p.stop() for p in self.patches])
+
+    def make_runtime(self, script: list | None = None) -> ChenshuRuntime:
+        client = FakeClient(script or [])
+        runtime = ChenshuRuntime(
+            self.config,
+            Registry.for_client(client),
+            Usage(),
+            PlainSink(indent="", verbose=False),
+            None,
+            notify=lambda text, key="": self.notices.append((text, key)),
+        )
+        return runtime
+
+    def init_repo(self):
+        git(self.root, "init", "-q", "-b", "main")
+        #  仓库级 git 身份：CI runner 没有全局身份，worker 的 bash commit 与
+        #  runtime.merge 的 merge commit 都要用（worktree 共享仓库级配置）
+        git(self.root, "config", "user.email", "t@t")
+        git(self.root, "config", "user.name", "t")
+        (self.root / "src").mkdir(exist_ok=True)
+        (self.root / "src" / "a.py").write_text("a = 1\n", encoding="utf-8")
+        git(self.root, "add", "-A")
+        git(self.root, "commit", "-qm", "init")
+        with (self.root / ".git" / "info" / "exclude").open("a", encoding="utf-8") as handle:
+            handle.write("\ncfg/\n")
+
+
+@unittest.skipUnless(HAS_GIT, "机器上没有 git")
+class LifecycleTest(ChenshuCase):
+    def test_init_requires_git_and_commit(self):
+        runtime = self.make_runtime()
+        with self.assertRaises(ChenshuError):
+            runtime.init()  # 不是 git 仓库
+        git(self.root, "init", "-q", "-b", "main")
+        with self.assertRaises(ChenshuError):
+            runtime.init()  # 没有 commit
+
+    def test_init_creates_state_and_exclude(self):
+        self.init_repo()
+        runtime = self.make_runtime()
+        out = runtime.init()
+        self.assertIn("宸枢已启动", out)
+        self.assertTrue((self.root / ".xiaoyu" / "chenshu" / "state.json").is_file())
+        exclude = (self.root / ".git" / "info" / "exclude").read_text(encoding="utf-8")
+        self.assertIn(".xiaoyu/chenshu/", exclude)
+
+    def test_reinit_adopts_and_retires(self):
+        self.init_repo()
+        first = self.make_runtime()
+        first.init()
+        first.plan([{"title": "改 API", "scope": ["src/"]}])
+        with first.lock:
+            first.members.append(
+                __import__("xiaoyu.chenshu", fromlist=["Member"]).Member(
+                    name="w1", kind="worker", mission_id="M1", status="running"
+                )
+            )
+            first._save()
+        second = self.make_runtime()
+        out = second.init()
+        self.assertIn("退役", out)
+        self.assertEqual(second.member("w1").status, "retired")
+        self.assertEqual(len(second.missions), 1)
+
+    def test_unreadable_state_is_kept_as_evidence_not_silently_reset(self):
+        """半个 state.json：不能当成全新启动悄悄覆盖，上次的 mission 没接上得说出来。"""
+        self.init_repo()
+        first = self.make_runtime()
+        first.init()
+        first.plan([{"title": "改 API", "scope": ["src/"]}])
+        state = self.root / ".xiaoyu" / "chenshu" / "state.json"
+        whole = state.read_text(encoding="utf-8")
+        state.write_text(whole[: len(whole) // 2], encoding="utf-8")
+
+        second = self.make_runtime()
+        out = second.init()
+        self.assertIn("读不出来", out)
+        self.assertEqual(second.missions, [])
+        kept = [p for p in state.parent.iterdir() if p.name.startswith("state.json.unreadable-")]
+        self.assertEqual(len(kept), 1)
+        self.assertEqual(kept[0].read_text(encoding="utf-8"), whole[: len(whole) // 2])
+        #  新写下的 state.json 是完整的；提示只报一次
+        json.loads(state.read_text(encoding="utf-8"))
+        self.assertNotIn("读不出来", self.make_runtime().init())
+
+    def test_state_is_written_atomically(self):
+        """写到一半失败：磁盘上留着的还是上一份完整状态。"""
+        from xiaoyu import fsguard
+
+        self.init_repo()
+        runtime = self.make_runtime()
+        runtime.init()
+        runtime.plan([{"title": "改 API", "scope": ["src/"]}])
+        state = self.root / ".xiaoyu" / "chenshu" / "state.json"
+        before = state.read_text(encoding="utf-8")
+        with mock.patch.object(fsguard.os, "replace", side_effect=OSError("磁盘满了")):
+            with self.assertRaises(OSError):
+                runtime._save()
+        self.assertEqual(state.read_text(encoding="utf-8"), before)
+        self.assertEqual([p.name for p in state.parent.iterdir() if p.name.endswith(".tmp")], [])
+
+    def test_plan_validations(self):
+        self.init_repo()
+        runtime = self.make_runtime()
+        runtime.init()
+        with self.assertRaises(ChenshuError):
+            runtime.plan([{"title": "无 scope"}])  # build 缺 scope
+        with self.assertRaises(ChenshuError):
+            runtime.plan([{"title": "整仓", "scope": ["**"]}])
+        runtime.plan([{"title": "改 API", "scope": ["src/api/"]}])
+        with self.assertRaises(ChenshuError):
+            runtime.plan([{"title": "又改 API", "scope": ["src/api/inner/"]}])  # 重叠
+        with self.assertRaises(ChenshuError):
+            runtime.plan([{"title": "依赖不存在", "scope": ["docs/"], "deps": ["M99"]}])
+        out = runtime.plan([{"title": "调研", "kind": "survey"},
+                            {"title": "改文档", "scope": ["docs/"], "deps": ["M1"]}])
+        self.assertIn("M2", out)
+        self.assertIn("M3", out)
+
+    def test_scalar_scope_is_one_item_not_characters(self):
+        """scope 传成单个字符串时不能按字符拆——"src" 拆成 s/r/c 会被静默登记。"""
+        self.init_repo()
+        runtime = self.make_runtime()
+        runtime.init()
+        runtime.plan([{"title": "改 src", "scope": "src"},
+                      {"title": "改文档", "scope": "docs/**", "deps": "M1"}])
+        first, second = runtime.missions
+        self.assertEqual(first.scope, ("src",))
+        self.assertEqual(second.scope, ("docs/**",))
+        self.assertEqual(second.deps, ("M1",))
+
+    def test_json_encoded_arrays_are_decoded(self):
+        self.init_repo()
+        runtime = self.make_runtime()
+        runtime.init()
+        runtime.plan([{"title": "改两处", "scope": '["src/a/", "src/b/"]'}])
+        self.assertEqual(runtime.missions[0].scope, ("src/a/", "src/b/"))
+
+    def test_wrong_typed_list_fields_are_rejected_by_name(self):
+        self.init_repo()
+        runtime = self.make_runtime()
+        runtime.init()
+        for bad in ({"title": "x", "scope": {"path": "src"}},
+                    {"title": "x", "scope": ["src", 3]},
+                    {"title": "x", "scope": ["src/"], "deps": 1}):
+            with self.assertRaises(ChenshuError) as caught:
+                runtime.plan([bad])
+            self.assertRegex(str(caught.exception), "scope|deps")
+        self.assertEqual(runtime.missions, [])
+
+    def test_scope_update_takes_scalar_as_one_item(self):
+        from xiaoyu.chenshu import CHENSHU
+
+        self.init_repo()
+        runtime = self.make_runtime()
+        runtime.init()
+        runtime.plan([{"title": "改 src", "scope": ["src/"]}])
+        runtime.mission_view(CHENSHU, "M1", {"scope": "lib"})
+        self.assertEqual(runtime.missions[0].scope, ("lib",))
+
+    def test_scope_update_goes_through_the_same_checks_as_planning(self):
+        """改 scope 是同一件事的另一个入口：建的时候拦下的，改一下不该就进来了。"""
+        from xiaoyu.chenshu import CHENSHU
+
+        self.init_repo()
+        runtime = self.make_runtime()
+        runtime.init()
+        runtime.plan([{"title": "改 API", "scope": ["src/api/"]},
+                      {"title": "改文档", "scope": ["docs/"]}])
+        for bad, reason in (
+            (["**"], "整个仓库"),
+            ([], "必须给 scope"),
+            (["docs/guide/"], "重叠"),
+            (["src/api/", "docs/"], "重叠"),
+        ):
+            with self.assertRaises(ChenshuError) as caught:
+                runtime.mission_view(CHENSHU, "M1", {"scope": bad})
+            self.assertIn(reason, str(caught.exception), bad)
+        self.assertEqual(runtime.missions[0].scope, ("src/api/",))
+        #  和自己原来的 scope 重叠不算冲突：收窄、放宽到没人占的地方都行
+        runtime.mission_view(CHENSHU, "M1", {"scope": ["src/api/v2/", "src/lib/"]})
+        self.assertEqual(runtime.missions[0].scope, ("src/api/v2/", "src/lib/"))
+
+    def test_plan_tool_accepts_stringified_missions(self):
+        from xiaoyu.chenshu import _object_list
+
+        self.assertEqual(_object_list('[{"title": "a"}]', "missions"), [{"title": "a"}])
+        self.assertEqual(_object_list({"title": "a"}, "missions"), [{"title": "a"}])
+        self.assertEqual(_object_list(None, "missions"), [])
+        with self.assertRaises(ChenshuError):
+            _object_list("改一下 src", "missions")
+
+
+@unittest.skipUnless(HAS_GIT, "机器上没有 git")
+class CommsTest(ChenshuCase):
+    def setUp(self):
+        super().setUp()
+        self.init_repo()
+        self.runtime = self.make_runtime()
+        self.runtime.init()
+        from xiaoyu.chenshu import Member
+
+        with self.runtime.lock:
+            self.runtime.members += [
+                Member(name="w1", kind="worker"), Member(name="w2", kind="worker"),
+            ]
+
+    def test_send_validates_recipient(self):
+        with self.assertRaises(ChenshuError):
+            self.runtime.send("w1", "nobody", "s", "b")
+        with self.assertRaises(ChenshuError):
+            self.runtime.send("w1", "w1", "s", "b")  # 不能发给自己
+
+    def test_mail_to_tower_enters_event_stream_before_completion(self):
+        """成员中途发给总枢的信必须先于它的收工事件被 chenshu_wait 看到，
+        否则总枢可能没读到中途发现就去 merge。"""
+        self.runtime.send("w1", "chenshu", "中途发现", "接口签名要改")
+        self.runtime.send("w2", "all", "广播", "所有人可见")
+        self.runtime.send("w1", "w2", "点对点", "不进总枢事件流")
+        self.runtime.send("chenshu", "w1", "指令", "总枢自己发的不回灌")
+        self.runtime.events.put("w1 完成")  # 收工事件在来信之后入队（worker 线程 finally）
+        events = self.runtime.wait(timeout=1)
+        self.assertIn("接口签名要改", events)
+        self.assertIn("广播", events)
+        self.assertNotIn("点对点", events)
+        self.assertNotIn("总枢自己发的", events)
+        self.assertLess(events.index("中途发现"), events.index("w1 完成"))
+
+    def test_read_filters_by_caller(self):
+        self.runtime.send("w1", "w2", "点对点", "只有 w2 能看")
+        self.runtime.send("w2", "all", "广播", "所有人可见")
+        self.runtime.send("w1", "chenshu", "升级", "给总枢")
+        w2_view = self.runtime.read_inbox("w2")
+        self.assertIn("点对点", w2_view)
+        self.assertIn("广播", w2_view)
+        self.assertNotIn("升级", w2_view)
+        w1_view = self.runtime.read_inbox("w1")
+        self.assertNotIn("点对点", w1_view)
+        tower_view = self.runtime.read_inbox("chenshu")
+        self.assertIn("点对点", tower_view)
+        self.assertIn("升级", tower_view)
+
+    def test_finding_kinds(self):
+        with self.assertRaises(ChenshuError):
+            self.runtime.file_finding("w1", "typo", "t", "b")
+        out = self.runtime.file_finding("w1", "bug", "空指针", "位置与复现")
+        self.assertIn("归档", out)
+        files = list((self.runtime.root / "findings").glob("*.md"))
+        self.assertEqual(len(files), 1)
+
+
+@unittest.skipUnless(HAS_GIT, "机器上没有 git")
+class MergeGateTest(ChenshuCase):
+    """merge 五道闸逐个卡（真 git 仓，分支上真提交）。"""
+
+    def setUp(self):
+        super().setUp()
+        self.init_repo()
+        self.runtime = self.make_runtime()
+        self.runtime.init()
+        self.runtime.plan([{"title": "改 src", "scope": ["src/"]}])
+        self.mission = self.runtime.missions[0]
+
+    def commit_on_branch(self, filename: str, base: str = "main") -> Path:
+        """在 mission 分支的 worktree 里做一笔提交，返回 worktree 路径。"""
+        if self.mission.worktree and Path(self.mission.worktree).is_dir():
+            wt = Path(self.mission.worktree)
+        else:
+            wt = worktree_mod.create_branch(self.root, self.mission.branch, "t", base)
+            self.mission.worktree = str(wt)
+        target = wt / filename
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text("x\n", encoding="utf-8")
+        git(wt, "add", "-A")
+        git(wt, "commit", "-qm", f"add {filename}")
+        return wt
+
+    def test_no_review_blocks(self):
+        self.commit_on_branch("src/new.py")
+        with self.assertRaises(ChenshuError) as ctx:
+            self.runtime.merge("M1")
+        self.assertIn("评审", str(ctx.exception))
+
+    def test_clean_review_merges_and_conflict_scan(self):
+        self.commit_on_branch("src/new.py")
+        self.runtime.submit_review("chenshu", "M1", "clean", "看过了")
+        out = self.runtime.merge("M1")
+        self.assertIn("已合并", out)
+        self.assertTrue((self.root / "src" / "new.py").is_file())
+        self.assertEqual(self.runtime.missions[0].status, "merged")
+
+    def test_not_clean_blocks(self):
+        self.commit_on_branch("src/new.py")
+        self.runtime.submit_review("chenshu", "M1", "p1-2", "两个必须修")
+        with self.assertRaises(ChenshuError) as ctx:
+            self.runtime.merge("M1")
+        self.assertIn("p1-2", str(ctx.exception))
+
+    def test_tip_moved_invalidates_clean(self):
+        self.commit_on_branch("src/new.py")
+        self.runtime.submit_review("chenshu", "M1", "clean", "看过了")
+        self.commit_on_branch("src/more.py")  # 评审后又提交
+        with self.assertRaises(ChenshuError) as ctx:
+            self.runtime.merge("M1")
+        self.assertIn("tip", str(ctx.exception).lower() + "不一致")
+
+    def test_out_of_scope_blocks(self):
+        self.commit_on_branch("docs/outside.md")
+        self.runtime.submit_review("chenshu", "M1", "clean", "看过了")
+        with self.assertRaises(ChenshuError) as ctx:
+            self.runtime.merge("M1")
+        self.assertIn("scope", str(ctx.exception))
+
+    def test_deps_unmerged_blocks(self):
+        self.runtime.plan([{"title": "后置", "scope": ["docs/"], "deps": ["M1"]}])
+        with self.assertRaises(ChenshuError) as ctx:
+            self.runtime.merge("M2")
+        self.assertIn("M1", str(ctx.exception))
+
+    def test_base_mismatch_blocks(self):
+        self.commit_on_branch("src/new.py")
+        self.runtime.submit_review("chenshu", "M1", "clean", "看过了")
+        git(self.root, "checkout", "-q", "-b", "elsewhere")
+        try:
+            with self.assertRaises(ChenshuError) as ctx:
+                self.runtime.merge("M1")
+            self.assertIn("base", str(ctx.exception))
+        finally:
+            git(self.root, "checkout", "-q", "main")
+
+    def test_survey_merges_without_git(self):
+        self.runtime.plan([{"title": "摸底", "kind": "survey"}])
+        self.runtime.mission_view("chenshu", "M2", {"status": "completed"})
+        out = self.runtime.merge("M2")
+        self.assertIn("survey", out)
+        self.assertEqual(self.runtime.mission("M2").status, "merged")
+
+    def test_empty_diff_blocks(self):
+        """分支零改动（worker 没 commit 的典型形态）不许静默合并。"""
+        wt = worktree_mod.create_branch(self.root, self.mission.branch, "t", "main")
+        self.mission.worktree = str(wt)
+        self.runtime.submit_review("chenshu", "M1", "clean", "看过了")
+        with self.assertRaises(ChenshuError) as ctx:
+            self.runtime.merge("M1")
+        self.assertIn("没有任何已提交改动", str(ctx.exception))
+        self.assertEqual(self.runtime.mission("M1").status, "pending")
+
+    def test_review_round_numbering(self):
+        self.commit_on_branch("src/new.py")
+        self.runtime.submit_review("chenshu", "M1", "p1-1", "先挑一个")
+        out = self.runtime.submit_review("chenshu", "M1", "clean", "修好了")
+        self.assertIn("第 2 轮", out)
+
+
+class WriteGuardTest(unittest.TestCase):
+    def setUp(self):
+        import tempfile
+
+        self.tmp = tempfile.TemporaryDirectory()
+        self.wt = Path(self.tmp.name).resolve()
+        self.addCleanup(self.tmp.cleanup)
+        self.guard = _write_guard(self.wt)
+
+    def test_inside_relative_allowed(self):
+        self.assertIs(self.guard("write_file", {"path": "src/a.py"}), True)
+
+    def test_absolute_outside_denied(self):
+        verdict = self.guard("str_replace", {"path": "/etc/hosts"})
+        self.assertIn("越界", verdict.reason)
+
+    def test_dotdot_escape_denied(self):
+        verdict = self.guard("write_file", {"path": "../escape.txt"})
+        self.assertIn("越界", verdict.reason)
+
+    def test_other_tools_pass(self):
+        self.assertIs(self.guard("bash", {"command": "ls"}), True)
+
+
+class SandboxWorktreePointerTest(unittest.TestCase):
+    def test_pointer_parsed_to_minimal_set(self):
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            main_git = root / "repo" / ".git" / "worktrees" / "wt1"
+            main_git.mkdir(parents=True)
+            linked = root / "linked"
+            linked.mkdir()
+            (linked / ".git").write_text(f"gitdir: {main_git}\n", encoding="utf-8")
+            paths = _worktree_git_paths(linked)
+            common = root / "repo" / ".git"
+            self.assertEqual(
+                paths,
+                [main_git, common / "objects", common / "refs", common / "logs"],
+            )
+            #  hooks 与 config 绝不可写：能写 .git/hooks 就是沙箱逃逸
+            self.assertNotIn(common, paths)
+
+    def test_normal_repo_empty(self):
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / ".git").mkdir()
+            self.assertEqual(_worktree_git_paths(root), [])
+
+
+@unittest.skipUnless(HAS_GIT, "机器上没有 git")
+class WorkerEndToEndTest(ChenshuCase):
+    """worker 线程端到端：假 client 脚本驱动 worker 在 worktree 里干活、
+    提交、标记完成；reviewer 过闸；merge 收回主干。"""
+
+    def wait_done(self, runtime: ChenshuRuntime, name: str, timeout: float = 30.0):
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            thread = runtime._threads.get(name)
+            if thread is not None and not thread.is_alive():
+                return
+            time.sleep(0.05)
+        self.fail(f"{name} 没有在 {timeout}s 内收工")
+
+    def test_full_cycle(self):
+        self.init_repo()
+        script = [
+            #  worker：写文件（相对路径落 worktree）→ 提交 → 标记完成 → 交接
+            tool_turn("w1", "write_file", {"path": "src/feature.py", "content": "f = 1\n"}),
+            tool_turn("w2", "bash", {"command": "git add -A && git commit -qm feat"}),
+            tool_turn("w3", "chenshu_mission", {"status": "completed", "note": "写完"}),
+            text_turn(LONG),
+            #  reviewer：提交 clean 评审 → 收尾
+            tool_turn("r1", "chenshu_review",
+                      {"target": "M1", "verdict": "clean", "summary": "无问题"}),
+            text_turn("评审完毕，clean。" + LONG),
+        ]
+        runtime = self.make_runtime(script)
+        with contextlib.redirect_stdout(io.StringIO()):
+            runtime.init()
+            runtime.plan([{"title": "加功能", "scope": ["src/"]}])
+            out = runtime.spawn("bee", "worker", mission_id="M1")
+            self.assertIn("bee", out)
+            self.wait_done(runtime, "bee")
+            events = runtime.wait(timeout=5)
+            self.assertIn("bee 完成", events)
+            self.assertEqual(runtime.member("bee").status, "done")
+            self.assertEqual(runtime.mission("M1").status, "completed")
+            #  worktree 里的提交在分支上，主工作区还没有
+            self.assertFalse((self.root / "src" / "feature.py").exists())
+            runtime.spawn("hawk", "reviewer", review_target="M1")
+            self.wait_done(runtime, "hawk")
+            runtime.wait(timeout=5)
+            merged = runtime.merge("M1")
+        self.assertIn("已合并", merged)
+        self.assertTrue((self.root / "src" / "feature.py").is_file())
+        #  完成通知走了通知轨道
+        self.assertTrue(any("bee" in text for text, _ in self.notices))
+
+    def test_completion_event_reports_what_was_actually_delivered(self):
+        """"完成"是成员自己说的：事件里附上量出来的实况，别等到 merge 闸才发现是空的。"""
+        self.init_repo()
+        script = [
+            tool_turn("w1", "write_file", {"path": "src/feature.py", "content": "f = 1\n"}),
+            text_turn("都做完了。" + LONG),
+        ]
+        runtime = self.make_runtime(script)
+        with contextlib.redirect_stdout(io.StringIO()):
+            runtime.init()
+            runtime.plan([{"title": "加功能", "scope": ["src/"]}])
+            runtime.spawn("bee", "worker", mission_id="M1")
+            self.wait_done(runtime, "bee")
+            events = runtime.wait(timeout=5)
+        self.assertIn("bee 完成", events)
+        self.assertIn("没有提交", events)
+        self.assertIn("改动没提交", events)
+        self.assertIn("状态 active", events)
+
+    def test_member_stopped_by_turn_cap_is_not_announced_as_done(self):
+        self.init_repo()
+        script = [
+            tool_turn("w1", "read_file", {"path": "src/a.py"}),
+            text_turn("只看了一个文件，还没动手。" + LONG),
+        ]
+        runtime = self.make_runtime(script)
+        self.config.turn_extension = 0
+        with mock.patch.object(chenshu_mod, "_WORKER_ITERATIONS", 1):
+            with contextlib.redirect_stdout(io.StringIO()):
+                runtime.init()
+                runtime.plan([{"title": "加功能", "scope": ["src/"]}])
+                runtime.spawn("bee", "worker", mission_id="M1")
+                self.wait_done(runtime, "bee")
+                events = runtime.wait(timeout=5)
+        self.assertIn("bee 停下", events)
+        self.assertIn("撞了轮数上限", events)
+        self.assertNotIn("bee 完成", events)
+
+    def test_spawn_cap_and_teardown_guard(self):
+        self.init_repo()
+        runtime = self.make_runtime([])
+        runtime.init()
+        runtime.plan([{"title": "a", "scope": ["src/"]}])
+        self.config.chenshu_max_workers = 0  # 强制 max(1, 0)=1 后直接占满
+        with mock.patch.object(runtime, "_live_count", lambda: 1):
+            with self.assertRaises(ChenshuError) as ctx:
+                runtime.spawn("bee", "worker", mission_id="M1")
+            self.assertIn("上限", str(ctx.exception))
+
+    def test_worker_requires_mission(self):
+        self.init_repo()
+        runtime = self.make_runtime([])
+        runtime.init()
+        with self.assertRaises(ChenshuError):
+            runtime.spawn("bee", "worker")
+        with self.assertRaises(ChenshuError):
+            runtime.spawn("hawk", "reviewer")  # 缺 review_target
+
+    def test_reserved_names_rejected(self):
+        self.init_repo()
+        runtime = self.make_runtime([])
+        runtime.init()
+        runtime.plan([{"title": "a", "scope": ["src/"]}])
+        for reserved in ("chenshu", "all"):
+            with self.assertRaises(ChenshuError) as ctx:
+                runtime.spawn(reserved, "worker", mission_id="M1")
+            self.assertIn("保留名", str(ctx.exception))
+
+    def test_cjk_titles_get_unique_branches(self):
+        self.init_repo()
+        runtime = self.make_runtime([])
+        runtime.init()
+        runtime.plan([
+            {"title": "改文档", "scope": ["docs/"]},
+            {"title": "改测试", "scope": ["tests/"]},
+        ])
+        branches = [m.branch for m in runtime.missions]
+        self.assertEqual(len(set(branches)), 2, f"分支撞名：{branches}")
+        self.assertTrue(all(b.startswith("feat/m") for b in branches))
+
+    def test_retired_member_can_respawn_and_reassign(self):
+        """重启收养后：原名不带 resume 直接重 spawn；换名接管退役 owner 的
+        mission 也放行（评审抓出的三路死锁回归）。"""
+        self.init_repo()
+        script = [text_turn(LONG), text_turn(LONG)]
+        runtime = self.make_runtime(script)
+        runtime.init()
+        runtime.plan([{"title": "a", "scope": ["src/"]}])
+        from xiaoyu.chenshu import Member
+
+        with runtime.lock:
+            runtime.members.append(
+                Member(name="w1", kind="worker", mission_id="M1", status="retired")
+            )
+            runtime.missions[0].owner = "w1"
+            runtime.missions[0].status = "active"
+        with contextlib.redirect_stdout(io.StringIO()):
+            out = runtime.spawn("w2", "worker", mission_id="M1")  # 换名接管
+        self.assertIn("w2", out)
+        self.wait_done_generic(runtime, "w2")
+        #  原名重 spawn（w1 已退役、mission 已归 w2——用另一个 mission 验证原名路径）
+        runtime.plan([{"title": "b", "scope": ["docs/"]}])
+        with runtime.lock:
+            runtime.members.append(
+                Member(name="w3", kind="worker", mission_id="", status="retired")
+            )
+        with contextlib.redirect_stdout(io.StringIO()):
+            out = runtime.spawn("w3", "worker", mission_id="M2")
+        self.assertIn("w3", out)
+        self.wait_done_generic(runtime, "w3")
+
+    def wait_done_generic(self, runtime, name, timeout: float = 30.0):
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            thread = runtime._threads.get(name)
+            if thread is not None and not thread.is_alive():
+                return
+            time.sleep(0.05)
+        self.fail(f"{name} 没有在 {timeout}s 内收工")
+
+    def test_merge_diff_failure_is_fail_closed(self):
+        self.init_repo()
+        runtime = self.make_runtime([])
+        runtime.init()
+        runtime.plan([{"title": "a", "scope": ["src/"]}])
+        mission = runtime.missions[0]
+        wt = worktree_mod.create_branch(self.root, mission.branch, "t", "main")
+        (wt / "src" / "n.py").parent.mkdir(exist_ok=True)
+        (wt / "src" / "n.py").write_text("x\n", encoding="utf-8")
+        git(wt, "add", "-A")
+        git(wt, "commit", "-qm", "n")
+        runtime.submit_review("chenshu", "M1", "clean", "看过了")
+        import xiaoyu.chenshu as chenshu_mod
+
+        real_git = chenshu_mod._git
+
+        def flaky(args, cwd):
+            if args[0] == "diff":
+                raise subprocess.TimeoutExpired(cmd="git diff", timeout=1)
+            return real_git(args, cwd)
+
+        with mock.patch.object(chenshu_mod, "_git", side_effect=flaky):
+            with self.assertRaises(ChenshuError) as ctx:
+                runtime.merge("M1")
+        self.assertIn("scope 检查失败", str(ctx.exception))
+        self.assertEqual(runtime.mission("M1").status, "pending")
+
+
+if __name__ == "__main__":
+    unittest.main()
+
+
+@unittest.skipUnless(HAS_GIT, "机器上没有 git")
+class MemberTuningAndArchiveTest(ChenshuCase):
+    """成员 model / effort 逐个指定 + 存档落盘跨进程 resume。"""
+
+    def make_runtime(self, script: list | None = None) -> ChenshuRuntime:
+        runtime = super().make_runtime(script)
+        self.sub_client = runtime.registry._clients["gateway"]
+        return runtime
+
+    def wait_done(self, runtime, name, timeout: float = 30.0):
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            thread = runtime._threads.get(name)
+            if thread is not None and not thread.is_alive():
+                return
+            time.sleep(0.05)
+        self.fail(f"{name} 没有在 {timeout}s 内收工")
+
+    def test_model_effort_validated_before_any_side_effect(self):
+        self.init_repo()
+        runtime = self.make_runtime([])
+        runtime.init()
+        runtime.plan([{"title": "a", "scope": ["src/"]}])
+        with self.assertRaises(chenshu_mod.ChenshuError) as ctx:
+            runtime.spawn("w1", "worker", mission_id="M1", effort="ultra")
+        self.assertIn("ultra", str(ctx.exception))
+        with mock.patch.object(
+            runtime.registry, "resolve", side_effect=UnknownModel("没人认领")
+        ), self.assertRaises(chenshu_mod.ChenshuError) as ctx:
+            runtime.spawn("w1", "worker", mission_id="M1", model="ghost")
+        self.assertIn("ghost", str(ctx.exception))
+        #  两次都没登记、没建 worktree、没认领 mission
+        self.assertIsNone(runtime.member("w1"))
+        self.assertEqual(runtime.mission("M1").owner, "")
+        self.assertEqual(runtime.mission("M1").worktree, "")
+
+    def test_model_effort_reach_member_and_state(self):
+        self.init_repo()
+        runtime = self.make_runtime([text_turn(LONG)])
+        runtime.init()
+        runtime.plan([{"title": "a", "scope": ["src/"]}])
+        with contextlib.redirect_stdout(io.StringIO()):
+            out = runtime.spawn("w1", "worker", mission_id="M1", model="cheap-x", effort="Low")
+        self.assertIn("model=cheap-x", out)
+        self.assertIn("effort=low", out)
+        self.wait_done(runtime, "w1")
+        call = self.sub_client.completions.calls[0]
+        self.assertEqual(call["model"], "cheap-x")
+        self.assertEqual(call.get("reasoning_effort"), "low")
+        member = runtime.member("w1")
+        self.assertEqual((member.model, member.effort), ("cheap-x", "low"))
+        state = json.loads((self.root / ".xiaoyu" / "chenshu" / "state.json").read_text("utf-8"))
+        self.assertEqual(state["members"][0]["model"], "cheap-x")
+        self.assertIn("cheap-x", runtime.status())
+
+    def test_archive_survives_restart_and_pins_model(self):
+        self.init_repo()
+        first = self.make_runtime([text_turn("第一轮交接。" + LONG)])
+        first.init()
+        first.plan([{"title": "a", "scope": ["src/"]}])
+        with contextlib.redirect_stdout(io.StringIO()):
+            first.spawn("w1", "worker", mission_id="M1", model="model-one")
+        self.wait_done(first, "w1")
+        archive = self.root / ".xiaoyu" / "chenshu" / "archives" / "w1.json"
+        self.assertTrue(archive.is_file())
+
+        #  模拟重启：全新 runtime 收养同一目录
+        second = self.make_runtime([text_turn("第二轮交接。" + LONG)])
+        with contextlib.redirect_stdout(io.StringIO()):
+            second.init()
+            with self.assertRaises(chenshu_mod.ChenshuError):
+                second.spawn("w1", "worker", mission_id="M1", resume=True, model="model-two")
+            with self.assertRaises(chenshu_mod.ChenshuError):
+                second.spawn("nobody", "worker", mission_id="M1", resume=True)
+            out = second.spawn("w1", "worker", mission_id="M1", resume=True)
+        self.assertIn("model=model-one", out, "resume 不传 model 时钉住存档的模型")
+        self.wait_done(second, "w1")
+        call = self.sub_client.completions.calls[0]
+        self.assertEqual(call["model"], "model-one")
+        self.assertTrue(
+            any("第一轮交接" in str(m.get("content")) for m in call["messages"]),
+            "第二轮请求应带着第一轮的上下文",
+        )
+        data = json.loads(archive.read_text("utf-8"))
+        self.assertTrue(any("第二轮交接" in str(m.get("content")) for m in data))
+
+    def test_retired_member_with_archive_is_announced_on_adopt(self):
+        self.init_repo()
+        first = self.make_runtime([text_turn(LONG)])
+        first.init()
+        first.plan([{"title": "a", "scope": ["src/"]}])
+        with contextlib.redirect_stdout(io.StringIO()):
+            first.spawn("w1", "worker", mission_id="M1")
+        self.wait_done(first, "w1")
+        #  伪造"上个会话中途断掉"：花名册还挂着 running
+        with first.lock:
+            first.member("w1").status = "running"
+            first._save()
+        second = self.make_runtime([])
+        out = second.init()
+        self.assertIn("已退役：w1", out)
+        self.assertIn("resume=true", out)
+
+
+class SurveyNetworkToolsTest(ChenshuCase):
+    """联网只读件只给 survey 成员，且随主会话开关；build worker 与 reviewer 不给。"""
+
+    def wait_done(self, runtime, name, timeout: float = 30.0):
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            thread = runtime._threads.get(name)
+            if thread is not None and not thread.is_alive():
+                return
+            time.sleep(0.05)
+        self.fail(f"{name} 没有在 {timeout}s 内收工")
+
+    def _member_configs(self, enable: bool) -> dict[str, object]:
+        from xiaoyu import agent as agent_mod
+
+        self.init_repo()
+        self.config.enable_web_fetch = enable
+        self.config.enable_web_search = enable
+        seen: list = []
+        real = agent_mod.Agent
+
+        def spy(config, *args, **kwargs):
+            seen.append(config)
+            return real(config, *args, **kwargs)
+
+        runtime = self.make_runtime([text_turn(LONG), text_turn(LONG)])
+        with contextlib.redirect_stdout(io.StringIO()), mock.patch.object(agent_mod, "Agent", spy):
+            runtime.init()
+            runtime.plan([{"title": "摸底", "kind": "survey"},
+                          {"title": "改代码", "scope": ["src/"]}])
+            runtime.spawn("scout", "worker", mission_id="M1")
+            self.wait_done(runtime, "scout")
+            runtime.spawn("bee", "worker", mission_id="M2")
+            self.wait_done(runtime, "bee")
+        self.assertEqual(len(seen), 2)
+        return {"survey": seen[0], "build": seen[1]}
+
+    def test_survey_member_follows_parent_switch(self):
+        configs = self._member_configs(enable=True)
+        self.assertTrue(configs["survey"].enable_web_fetch)
+        self.assertTrue(configs["survey"].enable_web_search)
+        self.assertFalse(configs["build"].enable_web_fetch)
+        self.assertFalse(configs["build"].enable_web_search)
+
+    def test_parent_switch_off_closes_survey_too(self):
+        configs = self._member_configs(enable=False)
+        self.assertFalse(configs["survey"].enable_web_fetch)
+        self.assertFalse(configs["survey"].enable_web_search)

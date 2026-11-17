@@ -1,0 +1,38 @@
+# 注入任务容器的小羽配置（非密钥部分）。密钥按 --model 的 provider 在运行时
+# 从宿主环境读（见 agent.py 的 PROVIDER_SECRETS），不写在这里，也不进生成的配置。
+#
+# 改这里 = 改"参赛的小羽长什么样"。要做 A/B（比如开关 explore 子 agent），
+# 复制一份改开关、或命令行 --env XIAOYU_ENABLE_EXPLORE=0 覆盖，跑成两个 job 再 compare。
+
+env:
+  # 容器里没有 bubblewrap，内核级沙箱本来就起不来；显式关掉，并在命令行加 --no-sandbox
+  XIAOYU_SANDBOX: "0"
+  # 一次性模式用不到、容器里也没有的东西，关掉省一次扫描
+  XIAOYU_ENABLE_PEERS: "0"
+  XIAOYU_ENABLE_SKILLS: "0"
+  XIAOYU_ENABLE_MCP: "0"
+  XIAOYU_ENABLE_WEB_SEARCH: "0"
+  XIAOYU_ENABLE_BROWSER: "0"
+  XIAOYU_ENABLE_PLUGINS: "0"
+  XIAOYU_ENABLE_HOOKS: "0"
+  XIAOYU_UPDATE_CHECK: "0"
+  # 内核能力按出厂默认开着：explore 检索子 agent、声明式子 agent / 七襄、宸枢
+  XIAOYU_ENABLE_EXPLORE: "1"
+  XIAOYU_ENABLE_AGENTS: "1"
+  XIAOYU_ENABLE_CHENSHU: "1"
+  # 轮数：max_iterations 出厂 50，不可从命令行改；延期系数 1.0 = 模型最多再申请 50 轮，
+  # 合计约 100 轮，与同类横评里常用的 100 轮上限对齐
+  XIAOYU_TURN_EXTENSION: "1.0"
+  # 不降级：横评要的是单一模型的成绩
+  XIAOYU_FALLBACK_MODELS: ""
+
+# 追加到 system prompt 的无人值守说明（--append-system-prompt）。留空用 agent.py 的默认文案。
+preamble: |
+  You are running unattended inside a Docker container as one trial of an
+  automated benchmark. Nobody will answer questions, confirm anything, or read
+  progress reports: do not ask, do not wait, and do not stop at a plan. Use your
+  tools to finish the task completely, verify the result yourself, and only then
+  reply with a short summary of what was done.
+
+# 容器里 uv 选解释器的版本约束：系统 python 满足就复用，不满足由 uv 下载
+python_spec: ">=3.11,<3.15"

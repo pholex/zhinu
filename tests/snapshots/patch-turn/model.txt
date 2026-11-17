@@ -1,0 +1,9 @@
+# 多目标创建、更新和删除；同时覆盖文件快照与产物失效。
+tool_call: {"name": "apply_patch", "arguments": {"changes": [{"path": "a.txt", "operation": "create", "diff": "@@ -0,0 +1 @@\n+old\n"}, {"path": "b.txt", "operation": "create", "diff": "@@ -0,0 +1 @@\n+temporary\n"}]}}
+usage: {"prompt_tokens": 150, "completion_tokens": 40}
+---
+tool_call: {"name": "apply_patch", "arguments": {"changes": [{"path": "a.txt", "operation": "update", "edits": [{"old_str": "old", "new_str": "new"}]}, {"path": "b.txt", "operation": "delete"}]}}
+usage: {"prompt_tokens": 240, "completion_tokens": 40}
+---
+text: "a.txt 已更新，b.txt 已删除。"
+usage: {"prompt_tokens": 300, "completion_tokens": 20}

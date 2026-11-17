@@ -1,0 +1,29 @@
+[
+  {
+    "role": "user",
+    "content": "七襄：reader · 2 项"
+  },
+  {
+    "role": "assistant",
+    "content": null,
+    "tool_calls": [
+      {
+        "id": "<HOST_CALL>",
+        "type": "function",
+        "function": {
+          "name": "qixiang",
+          "arguments": "{\"spec\": \"reader\", \"prompt_template\": \"{{item}}\", \"items\": [\"甲\", \"乙\"]}"
+        }
+      }
+    ]
+  },
+  {
+    "role": "tool",
+    "tool_call_id": "<HOST_CALL>",
+    "content": "ERROR: 这次调用命中了用户配置的 deny 权限规则「deny qixiang」，已拦截（deny 规则在任何模式下都生效，包括 --yolo）。请换个做法，或提示用户用 /perm 查看、调整规则。"
+  },
+  {
+    "role": "assistant",
+    "content": "ERROR: 这次调用命中了用户配置的 deny 权限规则「deny qixiang」，已拦截（deny 规则在任何模式下都生效，包括 --yolo）。请换个做法，或提示用户用 /perm 查看、调整规则。"
+  }
+]

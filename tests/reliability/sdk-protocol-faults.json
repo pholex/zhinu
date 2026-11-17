@@ -1,0 +1,38 @@
+{
+  "schema": 1,
+  "profile": "sdk-protocol-faults-v1",
+  "scope": "100 repetitions of six real HTTP fault modes over Chat, Responses and Anthropic, including normalized cache/missing-usage accounting",
+  "seed": 20261001,
+  "contract_repeats": 100,
+  "baseline_trials": 3,
+  "baseline_sessions": 20,
+  "concurrency": 8,
+  "lifecycle_sessions": 1000,
+  "turns_per_session": 10,
+  "soak_seconds": 3600,
+  "soak_min_turns": 10000,
+  "compact_every": 100,
+  "sample_seconds": 10,
+  "warmup_seconds": 600,
+  "stream_capacities": [
+    1,
+    8,
+    128
+  ],
+  "stream_deltas": 10000,
+  "stream_consumer_delay": 0.005,
+  "stream_close_repeats": 100,
+  "thresholds": {
+    "required_success_rate": 1.0,
+    "max_sdk_threads_after_close": 0,
+    "max_fd_growth": 2,
+    "max_python_growth_bytes": 5242880,
+    "max_rss_growth_bytes": 20971520,
+    "max_rss_growth_ratio": 0.1,
+    "max_rss_slope_bytes_per_minute": 1048576
+  },
+  "contract_scenarios": [
+    "R06",
+    "R16"
+  ]
+}

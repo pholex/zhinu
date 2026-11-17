@@ -1,0 +1,36 @@
+{
+  "notices": [
+    "[primary/main-model 因鉴权失败，切换到 gateway/main-model（对话原样继续；/model 可切回）]",
+    "[首选模型 primary/main-model 已恢复，切回]"
+  ],
+  "model_events": [
+    {
+      "event": "model",
+      "model": "gateway/main-model",
+      "from_model": "main-model",
+      "reason": "auth",
+      "from_route": "primary/main-model",
+      "to_route": "gateway/main-model"
+    },
+    {
+      "event": "model",
+      "model": "main-model",
+      "from_model": "gateway/main-model",
+      "reason": "preferred_recovered",
+      "from_route": "gateway/main-model",
+      "to_route": "primary/main-model"
+    },
+    {
+      "event": "model",
+      "model": "chosen-model",
+      "from_model": "main-model",
+      "reason": "manual"
+    }
+  ],
+  "inspect": "会话诊断：<SESSION>\n2 个用户输入段 · 3 次请求 · 显示 3/3 条\n\n用户输入段 1\n! L5 R1 model  primary/main-model → gateway/main-model · 鉴权失败\n\n用户输入段 2\n  L12 R3 model  gateway/main-model → primary/main-model · 首选模型恢复\n  L15 R3 model  main-model → chosen-model · 手动或宿主切换\n",
+  "restored_model": "chosen-model",
+  "requests_by_provider": [
+    2,
+    1
+  ]
+}

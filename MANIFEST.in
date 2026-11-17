@@ -1,0 +1,5 @@
+prune packages
+prune tests
+prune docs
+prune examples
+recursive-include scripts *.py

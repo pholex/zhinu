@@ -1,0 +1,35 @@
+{"cmd": "rm -rf /tmp/x", "guard": "dangerous", "expect": "block", "note": "强制递归删"}
+{"cmd": "rm -fr /tmp/x", "guard": "dangerous", "expect": "block", "note": "flag 顺序颠倒"}
+{"cmd": "rm --force /tmp/x", "guard": "dangerous", "expect": "block", "note": "长 flag"}
+{"cmd": "rm /tmp/x -f", "guard": "dangerous", "expect": "block", "note": "flag 在参数后"}
+{"cmd": "sudo rm -rf /tmp/x", "guard": "dangerous", "expect": "block", "note": "sudo 包裹"}
+{"cmd": "env TARGET=/tmp/x rm -rf /tmp/x", "guard": "dangerous", "expect": "block", "note": "env 赋值包裹"}
+{"cmd": "env -i rm -rf /tmp/x", "guard": "dangerous", "expect": "block", "note": "env -i 清环境"}
+{"cmd": "bash -c 'rm -rf /tmp/x'", "guard": "dangerous", "expect": "block", "note": "bash -c 内联"}
+{"cmd": "bash -lc 'rm -rf /tmp/x'", "guard": "dangerous", "expect": "block", "note": "登录 shell -lc"}
+{"cmd": "nohup rm -rf /tmp/x", "guard": "dangerous", "expect": "block", "note": "nohup 包裹"}
+{"cmd": "timeout 5 rm -rf /tmp/x", "guard": "dangerous", "expect": "block", "note": "timeout 带值参数"}
+{"cmd": "trap 'rm -rf /tmp/x' EXIT", "guard": "dangerous", "expect": "block", "note": "trap 里藏 rm"}
+{"cmd": "xargs rm -rf", "guard": "dangerous", "expect": "block", "note": "xargs 喂 rm"}
+{"cmd": "sudo env A=1 bash -c 'rm -rf /tmp/x'", "guard": "dangerous", "expect": "block", "note": "多层嵌套"}
+{"cmd": "echo hi && rm -rf /tmp/x", "guard": "dangerous", "expect": "block", "note": "&& 复合段"}
+{"cmd": "printf x | xargs rm -rf", "guard": "dangerous", "expect": "block", "note": "管道后段"}
+{"cmd": "rm -r /tmp/x", "guard": "dangerous", "expect": "allow", "note": "无 -f 不算强制"}
+{"cmd": "rm -- -f", "guard": "dangerous", "expect": "allow", "note": "删一个叫 -f 的文件"}
+{"cmd": "rm /tmp/x", "guard": "dangerous", "expect": "allow", "note": "普通删单文件"}
+{"cmd": "echo 'rm -rf /tmp/x'", "guard": "dangerous", "expect": "allow", "note": "字面量不是执行"}
+{"cmd": "trap 'echo done' EXIT", "guard": "dangerous", "expect": "allow", "note": "trap 里是无害命令"}
+{"cmd": "rm $'-rf' build", "guard": "dangerous", "expect": "block", "note": "ANSI-C 引号藏 flag"}
+{"cmd": "rm $'\\x2drf' build", "guard": "dangerous", "expect": "block", "note": "ANSI-C 十六进制转义拼出 -"}
+{"cmd": "rm $'\\055rf' build", "guard": "dangerous", "expect": "block", "note": "ANSI-C 八进制转义拼出 -"}
+{"cmd": "r\\\nm -rf build", "guard": "dangerous", "expect": "block", "note": "命令名中间续行"}
+{"cmd": "echo 'rm -rf build' | sh", "guard": "dangerous", "expect": "block", "note": "echo 喂给 sh"}
+{"cmd": "echo 'rm -rf build' | bash -s", "guard": "dangerous", "expect": "block", "note": "bash -s 从 stdin 读"}
+{"cmd": "printf 'ls\\nrm -rf x\\n' | zsh", "guard": "dangerous", "expect": "block", "note": "printf 多行喂给 zsh"}
+{"cmd": "bash <<< 'rm -rf build'", "guard": "dangerous", "expect": "block", "note": "here-string"}
+{"cmd": "bash <<<'rm -rf build'", "guard": "dangerous", "expect": "block", "note": "here-string 粘连写法"}
+{"cmd": "builtin eval 'rm -rf build'", "guard": "dangerous", "expect": "block", "note": "builtin 点名内建 eval"}
+{"cmd": "echo 'rm -rf x'", "guard": "dangerous", "expect": "allow", "note": "只是打印，没喂给 shell"}
+{"cmd": "echo hi | sh", "guard": "dangerous", "expect": "allow", "note": "喂给 shell 的内容无害"}
+{"cmd": "echo rm -rf x | cat", "guard": "dangerous", "expect": "allow", "note": "下游不是 shell"}
+{"cmd": "echo \"$'-rf'\"", "guard": "dangerous", "expect": "allow", "note": "双引号里的 $' 是字面量"}

@@ -1,0 +1,87 @@
+{
+  "events": [
+    {
+      "kind": "request.started",
+      "model": "main-model",
+      "provider": "gateway"
+    },
+    {
+      "kind": "tool.preparing",
+      "name": "fixture_query",
+      "index": 0,
+      "argument_chars": 2,
+      "path": "",
+      "purpose": ""
+    },
+    {
+      "kind": "request.ended",
+      "duration_ms": 0,
+      "ttft_ms": 0,
+      "usage": {
+        "prompt_tokens": 10,
+        "completion_tokens": 2,
+        "cached_tokens": 0
+      },
+      "model": "",
+      "response_id": "",
+      "finish_reason": "",
+      "error": ""
+    },
+    {
+      "kind": "tool.pending",
+      "name": "fixture_query",
+      "args": {}
+    },
+    {
+      "kind": "tool.running",
+      "name": "fixture_query",
+      "args": {}
+    },
+    {
+      "kind": "tool.completed",
+      "name": "fixture_query",
+      "output": "查询成功\n{\"rows\": [{\"id\": 42, \"status\": \"ready\"}]}",
+      "ok": true,
+      "seconds": 0
+    },
+    {
+      "kind": "request.started",
+      "model": "main-model",
+      "provider": "gateway"
+    },
+    {
+      "kind": "text.delta",
+      "text": "查到记录 42。"
+    },
+    {
+      "kind": "text.end"
+    },
+    {
+      "kind": "request.ended",
+      "duration_ms": 0,
+      "ttft_ms": 0,
+      "usage": {
+        "prompt_tokens": 30,
+        "completion_tokens": 3,
+        "cached_tokens": 0
+      },
+      "model": "",
+      "response_id": "",
+      "finish_reason": "",
+      "error": ""
+    }
+  ],
+  "next_request_tool_results": [
+    "查询成功\n{\"rows\": [{\"id\": 42, \"status\": \"ready\"}]}"
+  ],
+  "instructions": "intro\n\n…（指令文件过长，已截断；省略章节：发布规则；完整约定请 read_file：AGENTS.md）",
+  "coverage": {
+    "transcript_chars": 302,
+    "transcript_sampled_chars": 51,
+    "transcript_omitted_chars": 251,
+    "transcript_records": 3,
+    "transcript_sampled_records": 2,
+    "transcript_partial_records": 2,
+    "transcript_omitted_records": 1
+  }
+}

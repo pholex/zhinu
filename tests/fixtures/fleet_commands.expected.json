@@ -1,0 +1,68 @@
+{
+  "action": "plan",
+  "args": {
+    "missions": [
+      {
+        "kind": "survey",
+        "title": "调研"
+      },
+      {
+        "deps": [
+          "M1"
+        ],
+        "scope": [
+          "src/"
+        ],
+        "title": "实现"
+      }
+    ]
+  },
+  "base_branch": "main",
+  "blockers": [],
+  "board_id": "BOARD",
+  "can_execute": true,
+  "existing": {
+    "members_count": 0,
+    "missions_count": 0,
+    "state_id": "STATE"
+  },
+  "label": "登记 2 个宸枢使命",
+  "member": null,
+  "missions": [
+    {
+      "branch": "",
+      "deps": [],
+      "id": "M1",
+      "kind": "survey",
+      "notes": [],
+      "owner": "",
+      "scope": [],
+      "status": "pending",
+      "title": "调研",
+      "worktree": ""
+    },
+    {
+      "branch": "feat/m2-mission",
+      "deps": [
+        "M1"
+      ],
+      "id": "M2",
+      "kind": "build",
+      "notes": [],
+      "owner": "",
+      "scope": [
+        "src/"
+      ],
+      "status": "pending",
+      "title": "实现",
+      "worktree": ""
+    }
+  ],
+  "preview_token": "TOKEN",
+  "repo_head": "HEAD",
+  "revision": 1,
+  "tool": "chenshu_plan",
+  "warnings": [
+    "预览不授予工具权限；执行时仍按当前权限和审批规则处理。"
+  ]
+}

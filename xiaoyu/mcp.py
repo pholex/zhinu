@@ -1,0 +1,3987 @@
+"""MCP（Model Context Protocol）客户端——只做 stdio transport。
+
+给小羽接上 MCP 生态：声明在 mcp.json 里的 server（文件系统、数据库、内部平台
+工具…）由小羽拉起子进程，其工具以 mcp__<server>__<tool> 的名字挂进 Toolbox。
+设计取舍：
+
+- **只做 stdio**：newline-delimited JSON-RPC 2.0 over stdin/stdout，纯 stdlib
+  （Popen + 一条读线程）就够。不引官方 mcp SDK——那是 anyio 异步栈，塞进
+  小羽的同步主循环要多养一个事件循环线程，为低频能力不值。
+  远端 server 直连 Streamable HTTP（规范 2025-06-18）：url 非空即走 HTTP 传输，
+  与 stdio 共用本模块的全部上层逻辑（熔断、惰性启动、代际事务、指纹基线）。
+  老式 SSE 传输（2024-11-05）不实现——它已被规范标为过时，现役 server 都在
+  Streamable HTTP 上；真遇到老 server 仍可用 mcp-remote 这类桥接当 stdio 跑。
+- **懒加载不阻塞启动**：每个 server 的 spawn → initialize → tools/list 在
+  后台线程跑，REPL 立即可用；工具就绪后在下一次组装 schemas 时追加注册
+  （append-only 不重排已有前缀，prompt cache 只作废尾部）。
+- **stderr 只进独立日志不进终端**：server 的 stderr 直连
+  <用户配置目录>/logs/mcp-<name>.log（每次启动截断），不打花 REPL；
+  /mcp 里给出日志路径，排障去那里看。
+- **确定性命名**：工具名是 (server, 原名) 的**纯函数**——
+  mcp__<server>__<tool> 消毒成 [A-Za-z0-9_-]、封顶 64 字符；消毒或截断改变了
+  名字就追加该二元组的 12 位 sha256 哈希，不同工具永不塌缩同名。连接顺序、
+  重连、re-sync 都不影响命名——权限规则（/allow）和会话历史里的名字跨代有效。
+  同 server 列出重名工具 → 整个列表判非法（整代拒绝）；跨 server 撞名 →
+  后到的一代整体回滚，绝不注册部分集合。两处"撞名"都按 NFKC + casefold 折叠
+  后比较（`Tool` / `tool` / 全角 `ｔｏｏｌ` 算同一个名）：同形异码的名字对模型
+  和看 /allow 规则的人都是一个名，放两个进去就是影蔽——只改判定，不改注册名。
+- **代际事务**：工具集变更（重连 / tools/list_changed）先在注册表外
+  fetch+build 新一代，失败保留上一代原样继续服务；成功才整体 swap（原位替换 +
+  删除 + 追加，顺序稳定）。代际间指纹变化的工具走 rug-pull 隔离（见 mcp_guard），
+  /mcp approve 后换上新声明。
+- **断线自动重连**（预算按 outage 计）：进程意外退出（HTTP：会话失效 / 连接
+  失败 / 中途断开）后指数退避重连（0.5s 起倍增至 30s），一次 outage 内最多
+  10 次；连接存活超过 30s 视为 outage 结束、预算重置。效果：偶发崩溃可无限
+  恢复，崩溃循环（哪怕偶尔连上）仍会耗尽上限整代下线。HTTP 认证被拒不重连、
+  直接停用；超时与 5xx 只报错不判死（分类见 McpError）。XIAOYU_MCP_RECONNECT=0 关闭。
+- **${env:VAR} 展开**：command/args/env 值里的 ${env:VAR}（兼容 ${VAR}）
+  启动时替换成环境变量值。未定义的保留字面量原样：server 拿到
+  明显错误的 ${FOO} 会报出清楚的错，拿到空串只会报玄学 401。
+- **子进程环境是纯白名单**：不是"继承全量再剔除"。
+  os.environ 里躺着 XIAOYU_API_KEY / AWS_* / GITHUB_TOKEN……而 npx/uvx 拉起的
+  第三方包正是供应链投毒最想要这些。基底只给定位/本地化必需项；密钥要给哪个
+  server，在它的 env 块里用 ${env:VAR} 显式点名。
+- **fail-closed 审批**：所有 MCP 工具 requires_approval=True。server 自报的
+  readOnlyHint 等 annotations 是未经验证的第三方声明，不作为放行依据；
+  想免确认用 /allow 权限规则，决定权在用户手里。
+- **熔断**：一个 server 连续 3 次传输层失败后熔断 60 秒，期间调用
+  立即返回并明确告诉模型"不要立刻重试"——同步主循环里每次干等满超时，
+  几个回合就能烧光一轮预算。server 明确答复的错误（JSON-RPC error、HTTP 4xx）
+  不计：那是这一次请求的问题，不是 server 的。
+- **调用停得下来**：tools/call 的超时是整个往返的 wall-clock 总时限；宿主打断
+  （Agent.interrupt）时在飞的调用本地放手。超时与打断都给 server 发
+  notifications/cancelled——但本地放手不等于远端停了，给模型的说明里明说
+  "远端可能仍在执行、结果未知"。
+- **schema 归一**：server 返回的 inputSchema 做最小消毒（可空 type 数组折叠、
+  required 剪掉不存在的属性、裸字符串 schema 替换、缺 type 补 object）——
+  严格校验的端点（Gemini/Kimi/OpenAI strict）会因一个畸形 schema 把整个
+  tools 数组 400，殃及全部工具。
+- **schema 落盘缓存 + 惰性 spawn**：连过一次的
+  server 把工具声明按配置指纹缓存；下次启动零进程直接注册工具，首次真实调用
+  才 spawn，连上后与 live 声明对账（新工具补注册、幽灵工具拦调用）。
+  解掉"懒加载导致首轮模型看不见工具"的鸡生蛋。XIAOYU_MCP_CACHE=0 关闭。
+- **配置准入 / OSV 恶意包预检 / 工具指纹基线（防 rug-pull）**：见 mcp_guard.py。
+  基线变更的工具隔离不注册，隔离时直接摊出相对上次批准的 diff（声明正文存
+  mcp-approved-decls.json），/mcp diff 看全部、/mcp approve [server] 批准（无参 =
+  全部）；server 声明里 `"trustToolChanges": true` 或全局 XIAOYU_MCP_TRUST_CHANGES=1
+  的自动接受并刷新基线（只记一行，见 ServerSpec）。
+  XIAOYU_MCP_OSV=0 关闭预检。
+- **父进程死亡看门狗**：见 mcp_watchdog.py。进程组隔离的另一半——小羽被
+  kill -9 后 server 不再变永久孤儿。XIAOYU_MCP_WATCHDOG=0 关闭。
+"""
+
+from __future__ import annotations
+
+import atexit
+import contextlib
+import hashlib
+import http.client
+import json
+import os
+import re
+import shutil
+import socket
+import subprocess
+import sys
+import threading
+import time
+import unicodedata
+import urllib.error
+import urllib.parse
+import urllib.request
+import weakref
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any, Callable, Iterator
+
+from . import diagnostics, fsguard, mcp_guard, mcp_watchdog, media, netproxy, ui
+from .config import Config, user_config_dir
+from .errors import Interrupted, attach_partial
+from .invisible import strip_invisible
+
+#  活着的 MCP 连接数（stdio 子进程 + HTTP 会话），/diagnostics 与 doctor 可见
+CONNECTIONS_LIVE = diagnostics.Gauge("mcp.connections.live")
+
+#  MCP 规范修订号：initialize 时向 server 请求的版本。server 支持就原样回它，
+#  不支持就回一个自己支持的——最终以回包里的 protocolVersion 为准（协商结果）。
+PROTOCOL_VERSION = "2025-06-18"
+#  客户端接受的协商结果。规范：server 回的版本客户端不支持，就应当断开。
+#  入选标准是"小羽用到的那部分（initialize / tools/list / tools/call / 通知）
+#  在该修订下语义不变"：
+#  - 2024-11-05、2025-03-26：旧修订，数据层是 2025-06-18 的子集（stdio 老 server 大量停在这里）
+#  - 2025-11-25：新修订，对这几个方法只有增量字段，多出来的字段按未知忽略
+#  不在集合里的（含日后改掉握手形态的修订）一律明确报错，不带着猜测连下去。
+SUPPORTED_PROTOCOL_VERSIONS = ("2025-11-25", PROTOCOL_VERSION, "2025-03-26", "2024-11-05")
+
+#  initialize + tools/list 的超时：npx/uvx 首跑要现下包，给足余量。
+INIT_TIMEOUT = 30.0
+#  tools/call 默认超时（秒），可被 mcp.json 里的 timeout 字段逐 server 覆盖。
+CALL_TIMEOUT = 120.0
+
+#  工具描述超长会白吃每轮请求的 token：MCP server 的描述质量参差，硬顶一刀。
+_DESCRIPTION_CAP = 1_000
+
+#  远端 server 不可信：应答读进内存之前先设上限，超了当场拒收。
+#  普通应答整体 10 MiB（有 Content-Length 先看声明，没有就分块累计）；
+#  SSE 按单个事件计 10 MiB（事件结束清零——长流本身不设总量上限）；
+#  错误状态码的应答体只读开头 4 KiB，拿来给报错配个说明就够了。
+_HTTP_BODY_CAP = 10 * 1024 * 1024
+_SSE_EVENT_CAP = 10 * 1024 * 1024
+_HTTP_ERROR_BODY_CAP = 4 * 1024
+#  分块读的块大小（单行不带换行时也按这个粒度读，不会一口吞下整行）
+_READ_CHUNK = 64 * 1024
+
+#  配置文件名：工作区级用 .mcp.json（多家客户端通用的既成事实标准，
+#  同一个仓库配一次全家通用）；用户级放配置目录下的 mcp.json。
+WORKSPACE_FILE = ".mcp.json"
+
+
+#  McpError.kind 的取值 = 出错后的去向。HTTP 传输全部分类；stdio 只分
+#  timeout / dropped / rpc（请求在飞时超时 / 进程退出 / server 答了 error），
+#  其余沿用未分类（空串）。
+#    connect          请求没送到（拒绝连接 / DNS / 建连超时）      → 判断线，走重连
+#    session_expired  带会话的请求被回 404（规范：须重新 initialize）→ 判断线，走重连
+#    dropped          请求发出后连接中断（重置 / 对端关闭 / 进程退出）→ 判断线，走重连；结果不确定
+#    auth             401 / 403                                    → 停用，不重试
+#    timeout          请求发出后等应答超时                          → 只报错；结果不确定
+#    server           5xx                                          → 只报错；结果不确定
+#    malformed        应答解析不了                                  → 只报错；结果不确定
+#    too_large        应答体超过上限（见 _HTTP_BODY_CAP 一组常量）    → 只报错；结果不确定
+#    http             其余 4xx（server 明确拒收，请求没执行）         → 只报错
+#    rpc              JSON-RPC error 应答（参数非法、方法不存在…）     → 只报错；两种传输都有
+#    cancelled        宿主叫停了在等的调用（本地放手，不是 server 出错）→ 只报错；不计熔断；两种传输都有
+_RECONNECT_KINDS = frozenset({"connect", "session_expired", "dropped"})
+#  "结果不确定"：请求已送达 server 却没拿到可信应答——tools/call 的副作用可能
+#  已经发生，自动重试可能把一次写操作做成两次
+_OUTCOME_UNKNOWN_KINDS = frozenset({"dropped", "timeout", "server", "malformed", "too_large"})
+#  "server 给了明确答复"：它在正常收发，错在这一次请求本身（多半是模型把参数
+#  写错了）。不算进熔断的连败，反而证明 server 是健康的
+_ANSWERED_KINDS = frozenset({"rpc", "http"})
+
+#  等应答时隔多久看一眼"有没有人叫停"（秒）
+_STOP_POLL = 0.1
+#  notifications/cancelled 走 HTTP 时的超时：尽力而为的告知，不为它久等
+_CANCEL_NOTIFY_TIMEOUT = 5.0
+#  宿主叫停时给模型的说明。在飞的那种必须把话说全：本地不等了不等于远端停了
+_CANCELLED_IN_FLIGHT = (
+    "宿主请求打断，本地已取消等待——请求已送达 server，远端可能仍在执行，结果未知；"
+    "要用到这个结果时先核实，不要直接重试"
+)
+_CANCELLED_UNSENT = "宿主请求打断，本地已取消——请求还没有发出，server 没有执行"
+
+#  notifications/message 里要上屏的级别（规范的 syslog 八级，warning 起算）；
+#  更低的只进日志文件。单条文本封顶，server 把整个响应体当日志发也刷不了屏
+_LOG_SURFACE_LEVELS = frozenset({"warning", "error", "critical", "alert", "emergency"})
+_LOG_MESSAGE_CAP = 500
+
+#  当前线程上的"有没有人叫停"（见 stop_scope）
+_call_scope = threading.local()
+
+
+@contextlib.contextmanager
+def stop_scope(
+    stop_requested: Callable[[], bool] | None,
+    *,
+    media_owner: Any = None,
+    progress: Callable[[dict[str, Any]], None] | None = None,
+) -> "Iterator[None]":
+    """在当前线程上挂一个"有没有人叫停"，期间发起的 MCP 工具调用会轮询它。
+
+    工具的 handler 是 manager 级的闭包，一个 manager 被父子 agent 的多个工具箱
+    共用；打断标志却是每个 Agent 自己的。所以标志不进 handler 的签名（那里是
+    远端工具的参数），由调用方在调用期间挂到自己的线程上——handler 同步跑在
+    调用方线程里，谁调的就看谁的标志。
+
+    progress 同理：期间发起的 tools/call 会带 progressToken，server 的
+    notifications/progress 经它回到调用方（在读线程上被调用，只许改状态）。
+    """
+    previous = getattr(_call_scope, "stop", None)
+    previous_progress = getattr(_call_scope, "progress", None)
+    _call_scope.stop = stop_requested
+    _call_scope.progress = progress
+    try:
+        with media_scope(media_owner):
+            yield
+    finally:
+        _call_scope.stop = previous
+        _call_scope.progress = previous_progress
+
+
+@contextlib.contextmanager
+def media_scope(owner: Any) -> "Iterator[None]":
+    previous = getattr(_call_scope, "media_owner", None)
+    _call_scope.media_owner = owner
+    try:
+        yield
+    finally:
+        _call_scope.media_owner = previous
+
+
+class McpError(RuntimeError):
+    """MCP 协议层错误（超时 / server 退出 / JSON-RPC error 响应）。
+
+    kind 是错误分类（取值与去向见上表），status 是 HTTP 状态码（非 HTTP 错误为
+    None）。两者都是带默认值的关键字参数：`McpError("文本")` 的老写法原样可用，
+    未分类的错误走旧语义。
+    """
+
+    def __init__(
+        self,
+        message: str = "",
+        *,
+        kind: str = "",
+        status: int | None = None,
+        data: Any = None,
+    ) -> None:
+        super().__init__(message)
+        self.kind = kind
+        self.status = status
+        #  JSON-RPC error 响应里的 data（版本协商失败时 server 在这里列它支持的版本）
+        self.data = data
+
+    @property
+    def outcome_unknown(self) -> bool:
+        return self.kind in _OUTCOME_UNKNOWN_KINDS
+
+
+def _enabled(name: str) -> bool:
+    """环境变量开关：未设置 = 开。XIAOYU_MCP_OSV / _WATCHDOG / _CACHE 共用。"""
+    return os.environ.get(name, "").strip().lower() not in ("0", "false", "no", "off")
+
+
+def _opted_in(name: str) -> bool:
+    """环境变量开关：未设置 = 关。给"放松防线"类开关用（XIAOYU_MCP_TRUST_CHANGES）——
+    这类必须显式打开，不能像功能开关那样默认在。"""
+    return os.environ.get(name, "").strip().lower() in ("1", "true", "yes", "on")
+
+
+# ---------- 配置 ----------
+
+
+@dataclass
+class ServerSpec:
+    """mcp.json 里一个 server 的声明。"""
+
+    name: str
+    command: str
+    args: list[str] = field(default_factory=list)
+    env: dict[str, str] = field(default_factory=dict)
+    #  tools/call 超时（秒）
+    timeout: float = CALL_TIMEOUT
+    disabled: bool = False
+    #  额外从父环境透传给 server 的变量名（或以 * 结尾的前缀，如 "MYAPP_*"）。
+    #  _safe_env 的白名单是给"第三方 server"定的，对**宿主自己的** server 不够：
+    #  它要靠 MYAPP_HOME 之类找到自己的数据目录，拿不到就默默解析成默认路径、
+    #  读错实例的状态（起得来、连得上、答案是别人的——最难查的一类）。
+    #  只透传点名的，不放开白名单本身。
+    inherit_env: list[str] = field(default_factory=list)
+    #  远端 server（Streamable HTTP，规范 2025-06-18）：url 非空即走 HTTP 传输，
+    #  此时 command/args/env/inherit_env 都不适用。headers 是每次请求都带的
+    #  自定义头（Authorization / API key 之类）。
+    url: str = ""
+    headers: dict[str, str] = field(default_factory=dict)
+    #  stdio server 的工作目录（空 = 继承小羽自己的）。文件系统类 server 把"当前目录"
+    #  当根用，宿主由编辑器/systemd 拉起时当前目录是哪儿全看运气；写死在 args 里
+    #  又得每个 server 各记一套写法。启动前先验目录存在：不存在时 Popen 报的是
+    #  一句 FileNotFoundError，看起来像"命令找不到"，排错方向完全错
+    cwd: str = ""
+    #  只暴露名单内的工具（None = 全部）。几十个工具的 server 往往只用两三个：
+    #  其余的既占检索结果又是多余的攻击面（一个 delete_repo 摆在那儿，模型
+    #  调错一次就够了）。名单在注册与调用两处都卡：注册时过滤掉的工具模型看
+    #  不见，调用时再验一次——防止拿着全限定名绕过检索直接点名
+    tools: list[str] | None = None
+    #  跳过 rug-pull 隔离：工具描述/schema 相对基线变化时自动接受并刷新基线，只在
+    #  stderr 记一行，不再等 /mcp approve。给"来源可信、又跟着 @latest 走"的 server
+    #  用（每次上游发版都要重批一遍，防线就成了噪音，用户会顺手全批）。不是默认：
+    #  基线的意义正是让上游悄悄改描述这件事被看见；--yolo 也刻意不覆盖它（执行审批
+    #  与供应链是两条轴）。全局版是环境变量 XIAOYU_MCP_TRUST_CHANGES=1（同样默认关）。
+    trust_tool_changes: bool = False
+    #  结果当可信内容回灌：不套 <untrusted_content> 标记。给"来源就是自己人"的
+    #  内部 server 用（内网 runbook / 工单系统——用户就是想让模型照它说的做）。
+    #  与 trustToolChanges 是两条轴：那个信的是工具声明的变更，这个信的是工具
+    #  返回的内容。网页与联网搜索没有对应开关：它们的来源不是用户能背书的。
+    trust_content: bool = False
+    # SDK-owned OAuth provider. Credentials are evaluated for each request and
+    # never written to the declaration/cache or included in dataclass repr.
+    authorization: Callable[[], str] | None = field(default=None, repr=False, compare=False)
+
+    @property
+    def is_http(self) -> bool:
+        return bool(self.url)
+
+    def allows_tool(self, name: str) -> bool:
+        """这个工具在不在 tools 名单里（没写名单 = 全部放行）。"""
+        return self.tools is None or name in self.tools
+
+
+#  ${env:VAR} 与 ${VAR} 两种写法都认——不同客户端生态各用其一，
+#  用户从哪家抄来的配置都能直接用。未定义的变量展开为空串、不报错：
+#  让 server 自己对缺失值报错，报错进它的 stderr 日志。
+_ENV_PATTERN = re.compile(r"\$\{(?:env:)?([A-Za-z_][A-Za-z0-9_]*)\}")
+
+
+def _from_keychain(name: str) -> str | None:
+    """按变量名去 macOS Keychain 取值（service 与变量名同名）；别的平台恒为 None。"""
+    if sys.platform != "darwin":
+        return None
+    from . import config as config_module
+
+    return config_module._read_from_keychain(name)
+
+
+def _expand(value: str, extra: dict[str, str] | None = None, keychain: bool = False) -> str:
+    #  未定义时保留 ${...} 字面量而非空串。
+    #  extra = 宿主注入的环境（Config.extra_env）：daemon 嵌入场景没有 shell env，
+    #  密钥走 Keychain→extra_env 进来，展开时优先于 os.environ——否则工作区
+    #  .mcp.json 里的 ${VAR} 占位在无人值守进程里永远兑现不了。
+    #  keychain = 环境里都没有时再按同名去 Keychain 找。只给用户亲手写的声明开
+    #  （见 parse_server_mapping）：模型的 key 能放 Keychain，MCP 的令牌却只能
+    #  明文进 .env，说不过去；但这条路不能开给别人写的配置。
+    def lookup(m: re.Match[str]) -> str:
+        name = m.group(1)
+        if extra and name in extra:
+            return extra[name]
+        if (found := os.environ.get(name)) is not None:
+            return found
+        if keychain and (secret := _from_keychain(name)):
+            return secret
+        return m.group(0)
+
+    return _ENV_PATTERN.sub(lookup, value)
+
+
+#  stdio 子进程环境白名单。密钥类一律不进：要传给某个 server 就在配置的
+#  env 块里显式写 ${env:VAR}。XDG_* 前缀放行（Linux 桌面定位类）。
+_SAFE_ENV_KEYS = frozenset(
+    {"PATH", "HOME", "USER", "LOGNAME", "LANG", "LC_ALL", "LC_CTYPE", "TERM", "SHELL", "TMPDIR"}
+)
+_SAFE_ENV_PREFIXES = ("XDG_",)
+#  出网类：代理与自定义 CA。小羽自己出网认这些，server 进程却拿不到的话，
+#  代理环境下 `npx -y <包>` 下不了包、server 连不上它的 API，表象只是初始化超时，
+#  完全指不到"没走代理"上。它们不是 server 的凭据，是"这台机器怎么上网"。
+#  代理地址里可能带账号密码——放行是权衡过的：不放行的代价是整类环境不可用，
+#  而能读到它的 server 本来就是用户点头装上、要靠这条代理出网的。
+#  大小写两种写法各家工具认的不一样，都收。
+_NETWORK_ENV_KEYS = frozenset(
+    {
+        "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY",
+        "SSL_CERT_FILE", "SSL_CERT_DIR", "REQUESTS_CA_BUNDLE", "CURL_CA_BUNDLE",
+        "NODE_EXTRA_CA_CERTS",
+    }
+)
+#  Windows 定位类（大小写不敏感比较）：都是路径/系统信息，不携带秘密
+_SAFE_ENV_KEYS_WINDOWS = frozenset(
+    {
+        "APPDATA", "LOCALAPPDATA", "PROGRAMDATA", "PROGRAMFILES", "PROGRAMFILES(X86)",
+        "SYSTEMROOT", "SYSTEMDRIVE", "COMSPEC", "PATHEXT", "USERPROFILE",
+        "HOMEDRIVE", "HOMEPATH", "TEMP", "TMP", "WINDIR", "OS",
+        "NUMBER_OF_PROCESSORS", "PROCESSOR_ARCHITECTURE",
+    }
+)
+
+
+#  关停每一步等多久；中间隔着看门狗时 terminate 那一步另加它的宽限（见 _shutdown_proc）
+_HANGUP_WAIT = 2.0
+_WATCHDOG_MARGIN = 1.5
+#  关管道句柄最多等多久：还有进程握着写端时，关读端会和读线程争锁
+_CLOSE_WAIT = 2.0
+
+
+def _descendants(pid: int) -> list[int]:
+    """pid 的全部后代（POSIX）。查不了返回空——调用方退化为只杀直接子进程。"""
+    try:
+        listing = subprocess.run(
+            ["ps", "-A", "-o", "pid=,ppid="],
+            capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=5,
+        ).stdout
+    except (OSError, subprocess.SubprocessError):
+        return []
+    children: dict[int, list[int]] = {}
+    for line in listing.splitlines():
+        parts = line.split()
+        if len(parts) == 2 and parts[0].isdigit() and parts[1].isdigit():
+            children.setdefault(int(parts[1]), []).append(int(parts[0]))
+    found: list[int] = []
+    queue = [pid]
+    while queue:
+        for child in children.get(queue.pop(), []):
+            if child not in found:
+                found.append(child)
+                queue.append(child)
+    return found
+
+
+def _kill_with_descendants(proc: subprocess.Popen) -> None:
+    """硬杀，连后代一起。真 server 在看门狗另开的会话里，只杀我们拉起的那个进程
+    （看门狗）够不着它；后代要在动手**之前**查好——父进程一死，孤儿被收养，
+    就再也顺着父子关系找不到了。"""
+    if os.name == "nt":
+        #  taskkill /T 按树杀；Windows 上没有进程组信号可用
+        with contextlib.suppress(Exception):
+            subprocess.run(
+                ["taskkill", "/T", "/F", "/PID", str(proc.pid)],
+                capture_output=True, timeout=10,
+            )
+        with contextlib.suppress(OSError):
+            proc.kill()
+        return
+    import signal
+
+    doomed = _descendants(proc.pid)
+    with contextlib.suppress(OSError):
+        proc.kill()
+    for pid in doomed:
+        with contextlib.suppress(OSError):
+            os.kill(pid, signal.SIGKILL)
+
+
+def _close_streams(proc: subprocess.Popen) -> threading.Thread:
+    """管道句柄显式关掉（留给 GC 会攒出 ResourceWarning），但不无限等。"""
+    def close() -> None:
+        for stream in (proc.stdin, proc.stdout):
+            if stream:
+                with contextlib.suppress(OSError, ValueError):
+                    stream.close()
+
+    worker = threading.Thread(target=close, name="xiaoyu-mcp-close", daemon=True)
+    worker.start()
+    worker.join(_CLOSE_WAIT)
+    return worker
+
+
+def _inherited(names: list[str] | None) -> dict[str, str]:
+    """按点名/前缀从父环境取变量（见 ServerSpec.inherit_env）。取不到的跳过。"""
+    picked: dict[str, str] = {}
+    for name in names or []:
+        if name.endswith("*"):
+            prefix = name[:-1]
+            picked.update(
+                {k: v for k, v in os.environ.items() if prefix and k.startswith(prefix)}
+            )
+        elif (value := os.environ.get(name)) is not None:
+            picked[name] = value
+    return picked
+
+
+def _safe_env(
+    extra: dict[str, str] | None = None, inherit: list[str] | None = None
+) -> dict[str, str]:
+    """从零构造 stdio 子进程环境：白名单基底 + 点名透传 + 配置声明的 env 覆盖。
+
+    三层的覆盖方向固定：白名单 < 点名透传（inherit_env）< 配置声明的 env。
+    越靠近这个 server 自己的声明，优先级越高。
+    """
+    env = {
+        key: value
+        for key, value in os.environ.items()
+        if key in _SAFE_ENV_KEYS
+        or key.upper() in _NETWORK_ENV_KEYS
+        or key.startswith(_SAFE_ENV_PREFIXES)
+        or (os.name == "nt" and key.upper() in _SAFE_ENV_KEYS_WINDOWS)
+    }
+    env.update(_inherited(inherit))
+    #  MCP stdio 协议规定 UTF-8，但 Windows 上 Python 子进程的管道默认用
+    #  locale 编码（cp1252/gbk）——Python 实现的 server（含自家看门狗）一打印
+    #  非 ASCII 就 UnicodeEncodeError 崩掉。只影响 Python 子进程，Node 恒 UTF-8。
+    env.setdefault("PYTHONUTF8", "1")
+    env.setdefault("PYTHONIOENCODING", "utf-8")
+    if extra:
+        env.update(extra)
+    return env
+
+
+def declared_path(env: dict[str, str] | None) -> str:
+    """配置的 env 块里声明的 PATH（Windows 上键名大小写不敏感），没声明返回空串。"""
+    for key, value in (env or {}).items():
+        if key.upper() == "PATH" and isinstance(value, str):
+            return value
+    return ""
+
+
+def find_command(command: str, env: dict[str, str] | None = None) -> str | None:
+    """找 stdio server 的启动命令，返回可执行文件路径；找不到返回 None。
+
+    配置里声明了 PATH 就先按它找，找不到再退回本进程的 PATH。小羽被编辑器
+    （ACP）或 systemd（serve）拉起时自己的 PATH 往往很短，npx / uvx 都不在里面；
+    用户在 env 块里写了 PATH，server 进程拿得到，找启动命令这一步却不看——
+    结果只能把 command 写成绝对路径。退回本进程 PATH 是为了不破坏现状：
+    声明的 PATH 只列了 server 运行时要的目录、启动命令在别处，此前是起得来的。
+    """
+    expanded = os.path.expanduser(command)
+    if (declared := declared_path(env)) and (found := shutil.which(expanded, path=declared)):
+        return found
+    return shutil.which(expanded)
+
+
+#  server 报错文本里的凭据脱敏：server 把请求
+#  原样回显进错误信息是常见毛病，别让 token 经 tool result 进对话历史。
+#  只作用于错误路径——正常输出里的 key=value 可能是用户要的真实数据。
+#  键名：单独成词，或挂在别的词后面（access_token / client_secret / x-api-key）
+_CREDENTIAL_KEY = (
+    r"(?:"
+    r"(?:[A-Za-z0-9]+[_-])*"
+    r"(?:token|api[_-]?key|apikey|password|passwd|secret|authorization|credential)"
+    #  驼峰写法（exaApiKey / tavilyApiKey / accessToken）：前面的词和关键词之间没有
+    #  分隔符，只能靠大写字母认边界，所以这一支区分大小写
+    r"|(?-i:[a-z][A-Za-z0-9]*(?:ApiKey|APIKey|Token|Secret|Password|Credential))"
+    r")"
+)
+_CREDENTIAL_PATTERN = re.compile(
+    #  URL authority 内最后一个 @ 之前都是 userinfo：令牌可以直接当用户名，
+    #  密码也可能含 @。先于令牌前缀匹配，避免只盖住用户名而留下密码。
+    #  不跨路径、查询串、片段或日志引号，免得吃掉 URL 外的邮箱。
+    r"(?<=://)[^/\s?#\"'<>]+(?=@)"
+    #  已知前缀的令牌。sk- 要求左边不是单词字符或路径分隔：`task-…`、`disk-…`、
+    #  `/risk-assessment-…` 这类普通文本不该被吃掉
+    r"|(?<![A-Za-z0-9])(?:ghp|gho|ghu|ghs|ghr)_[A-Za-z0-9]{20,}"
+    r"|(?<![A-Za-z0-9])github_pat_[A-Za-z0-9_]{20,}"
+    r"|(?<![A-Za-z0-9_/.-])sk-[A-Za-z0-9_-]{16,}"
+    r"|Bearer\s+\S+"
+    #  键=值 / 键: 值 / "键": "值"（JSON）。值到空白、引号、逗号、& 为止；值前面
+    #  带认证方案名（Authorization: Bearer xxx）时连方案后面的令牌一起盖掉
+    rf"|(?<![A-Za-z0-9])[\"']?{_CREDENTIAL_KEY}[\"']?\s*[=:]\s*[\"']?"
+    r"(?:(?:Bearer|Basic|Token)\s+)?[^\s\"',&}]+",
+    re.IGNORECASE,
+)
+
+
+def display_url(url: str) -> str:
+    """给人和模型看的 URL：去掉账号密码与查询串，只留"连的是哪儿"。
+
+    远端 server 的凭据常常就写在 URL 里（`?exaApiKey=…`、`user:pass@host`）。
+    报错里带上完整 URL 的话，它会经工具结果进对话历史。
+    """
+    try:
+        parts = urllib.parse.urlsplit(url)
+    except ValueError:
+        return _redact(url)
+    if not parts.scheme or not parts.hostname:
+        return _redact(url)
+    host = parts.hostname + (f":{parts.port}" if parts.port else "")
+    return urllib.parse.urlunsplit((parts.scheme, host, parts.path, "", ""))
+
+
+def _redact(text: str) -> str:
+    """报错文本里的凭据换成 [REDACTED]。必须在截断**之前**做：截断落在令牌
+    中间的话，剩下的半截对不上任何模式，原样漏出去。"""
+    return _CREDENTIAL_PATTERN.sub("[REDACTED]", text)
+
+
+#  报错里附带的日志尾部：行数与每行宽度。够看到最后一条 traceback / 一句
+#  "missing env X"，又不至于把一屏错误塞满
+_LOG_TAIL_LINES = 8
+_LOG_TAIL_WIDTH = 160
+#  只读文件末尾这么多字节：日志可能很大，要的只是最后几行
+_LOG_TAIL_BYTES = 64 * 1024
+
+
+def log_tail(path: Path, lines: int = _LOG_TAIL_LINES, width: int = _LOG_TAIL_WIDTH) -> list[str]:
+    """server 日志的末 N 行（跳过空行，每行脱敏、去控制序列、截断）。读不了返回空。
+
+    "排障看日志：<路径>"是让人再去开一个文件；绝大多数启动失败的原因就在
+    日志最后几行（缺模块、缺环境变量、端口被占），直接带出来省一个来回。
+    脱敏在截断之前做（_redact 的纪律），server 把令牌打进日志也不会随报错外泄。
+    """
+    try:
+        with open(path, "rb") as handle:
+            handle.seek(0, os.SEEK_END)
+            size = handle.tell()
+            handle.seek(max(0, size - _LOG_TAIL_BYTES))
+            data = handle.read()
+    except OSError:
+        return []
+    text = data.decode("utf-8", "replace")
+    tail = [line.rstrip() for line in text.splitlines() if line.strip()][-lines:]
+    shown: list[str] = []
+    for line in tail:
+        line = ui.strip_sequences(_redact(line)).strip()
+        if len(line) > width:
+            line = line[:width] + "…"
+        shown.append(line)
+    return shown
+
+
+def tail_text(path: Path) -> str:
+    """日志末几行的展示形态（空日志 = 空串），接在一句报错后面。"""
+    tail = log_tail(path)
+    if not tail:
+        return ""
+    return f"；日志末 {len(tail)} 行：\n" + "\n".join(f"    | {line}" for line in tail)
+
+
+def log_hint(path: Path) -> str:
+    """"排障看日志"那句话，日志里有内容时顺带附上末几行。"""
+    return f"排障看日志：{path}{tail_text(path)}"
+
+
+def _with_log_hint(text: str, path: Path) -> str:
+    """给一段报错补上日志提示；文本里已经带了（来自 _exit_reason）就不重复。"""
+    if "排障看日志" in text:
+        return text
+    return f"{text}。{log_hint(path)}"
+
+
+def config_paths(workspace: Path) -> list[Path]:
+    """配置文件位置，前面的优先（同名 server 覆盖后面的）。"""
+    return [workspace / WORKSPACE_FILE, user_config_dir() / "mcp.json"]
+
+
+#  `xiaoyu mcp` 的 --scope 取值 → config_paths 的下标。作用域名字对外，
+#  文件名只有这里知道。
+SCOPES = ("project", "user")
+
+
+def scope_path(scope: str, workspace: Path) -> Path:
+    """作用域名 → 配置文件路径。project=工作区 .mcp.json、user=用户级 mcp.json。"""
+    return config_paths(workspace)[SCOPES.index(scope)]
+
+
+def read_config_file(path: Path) -> dict[str, Any]:
+    """读一个配置文件的原始 JSON（顶层其它键原样保留）。不存在返回 {}。
+
+    与 `_parse_config_file` 的容错策略**相反**：那边是运行期读取，坏文件只警告不拦
+    启动；这边是写入路径的第一步，坏文件必须抛——把用户手写的配置当成空 dict，
+    下一步写回就是整文件覆盖。
+    """
+    if not path.is_file():
+        return {}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:  # 坏 JSON、非 UTF-8 字节都是 ValueError
+        raise McpError(f"{path} 读不出来：{exc}") from exc
+    if not isinstance(data, dict):
+        raise McpError(f"{path} 的顶层不是 JSON 对象")
+    return data
+
+
+def write_config_file(path: Path, data: dict[str, Any]) -> None:
+    """写回配置文件（原子写：写到一半崩了也不留半个配置）。
+
+    用户级配置仅本人可读：env / headers 里常写着令牌。工作区级的是仓库文件，
+    权限沿用原样。
+    """
+    private = path.parent == user_config_dir()
+    fsguard.write_atomic(
+        path, json.dumps(data, ensure_ascii=False, indent=2) + "\n", private=private
+    )
+
+
+def load_server_specs(
+    workspace: Path,
+    extra_env: dict[str, str] | None = None,
+    include_project: bool = True,
+) -> list[ServerSpec]:
+    """读全部配置文件，合并出 server 列表。坏文件/坏条目只上 stderr 警告，不拦启动。
+
+    extra_env：宿主注入的环境变量（Config.extra_env），参与 ${VAR} 展开且优先于
+    os.environ——常驻 daemon 这类嵌入宿主把 Keychain 密钥递进来的唯一通道。
+
+    include_project=False = 工作区未通过 folder trust 门（见 folder_trust.py）：
+    只认用户级配置，工作区 .mcp.json 整个跳过——"clone 即拉起进程"正是那道门
+    要堵的洞。跳过时打一行 stderr，静默降级是最坏的失败方式。
+    """
+    merged: dict[str, ServerSpec] = {}
+    #  倒序读（用户级先、工作区级后）：工作区的同名声明覆盖用户级的
+    for path in reversed(config_paths(workspace)):
+        if not include_project and path == workspace / WORKSPACE_FILE:
+            if _present(path):
+                print(
+                    f"[工作区未受信任：{path} 里的 MCP server 不启动]", file=sys.stderr
+                )
+            continue
+        #  Keychain 回落只给用户级文件：工作区那份是仓库作者写的
+        for spec in _parse_config_file(
+            path, extra_env, keychain=path != workspace / WORKSPACE_FILE
+        ):
+            merged[spec.name] = spec
+    specs = []
+    for spec in merged.values():
+        if spec.disabled:
+            continue
+        #  准入三点执行的中间一点（加载期）：前有 `xiaoyu mcp add` 的写入期、
+        #  后有 ensure_started 的启动期——手写进配置文件的、绕过加载路径直接
+        #  构造 spec 的，都还得再过一遍（保存/启动双点缺一不可）
+        reason = (
+            mcp_guard.endpoint_violation(spec.url)
+            if spec.is_http
+            else mcp_guard.admission_violation(spec.command, spec.args, spec.env)
+        )
+        if reason:
+            print(f"[MCP server {spec.name!r} 被安全规则拦截：{reason}，已忽略]", file=sys.stderr)
+            continue
+        specs.append(spec)
+    return specs
+
+
+def _present(path: Path) -> bool:
+    """文件存在与否；探测出错按存在处理（只影响要不要打告警，宁多勿漏）。"""
+    try:
+        return path.is_file()
+    except OSError:
+        return True
+
+
+def spec_fingerprint(spec: ServerSpec) -> str:
+    """schema 缓存的配置指纹：command/args/env/url/headers 任何变化都让缓存失效。
+    env 与 headers 的值也参与（sha256 单向，不泄漏）：换了 token、换了地址就该
+    重新连一次拿新 schema。远端 server 的 command 恒为空——不把 url 算进来的话，
+    所有远端 server 的指纹都一样。"""
+    material = json.dumps(
+        #  cwd 进指纹：文件系统类 server 的工具集可能随根目录变，换了目录缓存就不算数
+        [spec.command, spec.args, spec.env, spec.url, spec.headers, spec.cwd],
+        ensure_ascii=False, sort_keys=True,
+    )
+    return hashlib.sha256(material.encode("utf-8")).hexdigest()[:16]
+
+
+def _parse_config_file(
+    path: Path, extra_env: dict[str, str] | None = None, keychain: bool = False
+) -> list[ServerSpec]:
+    if not path.is_file():
+        return []
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:  # 坏 JSON、非 UTF-8 字节都是 ValueError
+        print(f"[MCP 配置 {path} 解析失败：{exc}]", file=sys.stderr)
+        return []
+    if not isinstance(data, dict):
+        print(f"[MCP 配置 {path} 的顶层不是 JSON 对象，已忽略]", file=sys.stderr)
+        return []
+    servers = data.get("mcpServers")
+    if not isinstance(servers, dict):
+        return []
+    specs, problems = parse_server_mapping(servers, extra_env=extra_env, keychain=keychain)
+    for problem in problems:
+        print(f"[MCP 配置 {path}：{problem}]", file=sys.stderr)
+    return specs
+
+
+def parse_server_mapping(
+    servers: dict[str, Any],
+    *,
+    extra_env: dict[str, str] | None = None,
+    expand: bool = True,
+    keychain: bool = False,
+) -> tuple[list[ServerSpec], list[str]]:
+    """`mcpServers` 形状（name → 声明对象）→ (ServerSpec 列表, 跳过/忽略说明)。
+
+    配置文件与 serve 的 agent 对象（`mcp_servers` 字段）共用这一个解析器：
+    宿主应用往 agent 里写的就是它在 .mcp.json 里写惯的那一段，不另发明形状。
+    `expand=False` 时 `${VAR}` 不兑现（协议通道来的值是对端算好的终值；拿本
+    进程环境去改写它既不合预期、也给了对端一条读服务端环境变量的路——与 acp
+    的 client_server_specs 同一条边界）。
+
+    `keychain=True` 时环境里没有的变量再按同名去 macOS Keychain 找。只该给
+    **用户级配置文件**开：工作区 `.mcp.json` 是仓库作者写的，开了等于让仓库按
+    名字探你的 Keychain。插件包装进来的条目（带 `_plugin` 记号）虽然也在用户级
+    文件里，声明同样出自别人之手，一样不给。
+    """
+    specs: list[ServerSpec] = []
+    problems: list[str] = []
+
+    unresolved: dict[str, None] = {}
+    own_words = False
+
+    def tools_field(name: str, raw: dict[str, Any]) -> list[str] | None:
+        """`tools` 名单：缺省 None = 全部。形状不对按"没写"处理并报出来——
+        写错了静默暴露全部工具，恰恰是用户写名单想避免的事。"""
+        value = raw.get("tools")
+        if value is None:
+            return None
+        if not isinstance(value, list) or not all(
+            isinstance(item, str) and item.strip() for item in value
+        ):
+            problems.append(f"server {name!r}：tools 必须是工具名（字符串）列表，已忽略，暴露全部工具")
+            return None
+        names = list(dict.fromkeys(item.strip() for item in value))
+        if not names:
+            problems.append(f"server {name!r}：tools 是空列表，这个 server 不会暴露任何工具")
+        return names
+
+    def ex(value: Any) -> str:
+        if not expand:
+            return str(value)
+        text = _expand(str(value), extra_env, keychain=keychain and own_words)
+        #  展开之后还在的占位就是没定义的变量：字面量会原样递给 server——写在
+        #  headers 里就是把 "${TOKEN}" 这几个字符当令牌发给远端
+        for variable in _ENV_PATTERN.findall(text):
+            unresolved.setdefault(variable)
+        return text
+
+    for name, raw in servers.items():
+        unresolved.clear()
+        if not isinstance(raw, dict):
+            problems.append(f"{name!r} 不是对象，已忽略")
+            continue
+        own_words = not raw.get("_plugin")
+        kind = raw.get("type")
+        #  形状即类型：有 url 就是远端（Streamable HTTP），有 command 就是 stdio。
+        #  type 字段只用来纠错，不作为唯一判据——各家生态里它时有时无。
+        remote = isinstance(raw.get("url"), str) and bool(raw["url"].strip())
+        if kind == "sse" or (kind == "http" and not remote):
+            #  sse 是 2024-11-05 的老传输，小羽只实现了 Streamable HTTP
+            problems.append(
+                f"server {name!r}：{kind} 传输不支持"
+                f"{'（缺 url）' if kind == 'http' else '（老式 SSE，请改用 Streamable HTTP 的 url）'}，"
+                "已忽略"
+            )
+            continue
+        if not remote and not isinstance(raw.get("command"), str):
+            problems.append(f"{name!r} 既没有 command 也没有 url，已忽略")
+            continue
+        timeout = raw.get("timeout", CALL_TIMEOUT)
+        if not isinstance(timeout, (int, float)) or timeout <= 0:
+            timeout = CALL_TIMEOUT
+        elif timeout >= 1000:
+            #  有的客户端生态里 mcp.json 的 timeout 按毫秒计（默认 120000）。用户
+            #  跨家抄配置很常见，≥1000 一律按毫秒解释——没人需要 17 分钟以上的工具超时。
+            timeout /= 1000
+        tools = tools_field(str(name), raw)
+        if remote:
+            if raw.get("cwd"):
+                problems.append(f"server {name!r}：cwd 只对 stdio server 有意义，已忽略")
+            specs.append(
+                ServerSpec(
+                    name=str(name),
+                    command="",
+                    url=ex(raw["url"]).strip(),
+                    headers={
+                        str(key): ex(value) for key, value in (raw.get("headers") or {}).items()
+                    },
+                    timeout=float(timeout),
+                    disabled=bool(raw.get("disabled", False)),
+                    tools=tools,
+                    trust_tool_changes=bool(raw.get("trustToolChanges", False)),
+                    trust_content=bool(raw.get("trustContent", False)),
+                )
+            )
+            if unresolved:
+                problems.append(
+                    f"server {name!r}：环境变量 {'、'.join(unresolved)} 没有定义，"
+                    "占位符会原样发给远端"
+                )
+            continue
+        specs.append(
+            ServerSpec(
+                name=str(name),
+                command=ex(raw["command"]),
+                args=[ex(item) for item in raw.get("args") or []],
+                env={str(key): ex(value) for key, value in (raw.get("env") or {}).items()},
+                #  cwd 与 url/headers 同一套 ${env:VAR} 展开：`${env:HOME}/data` 这类写法
+                #  跨机器可用
+                cwd=ex(raw["cwd"]).strip() if isinstance(raw.get("cwd"), str) else "",
+                timeout=float(timeout),
+                disabled=bool(raw.get("disabled", False)),
+                inherit_env=[
+                    str(name) for name in raw.get("inheritEnv") or [] if str(name).strip()
+                ],
+                tools=tools,
+                trust_tool_changes=bool(raw.get("trustToolChanges", False)),
+                trust_content=bool(raw.get("trustContent", False)),
+            )
+        )
+        if unresolved:
+            problems.append(
+                f"server {name!r}：环境变量 {'、'.join(unresolved)} 没有定义，"
+                "占位符会原样递给 server"
+            )
+    return specs, problems
+
+
+# ---------- 确定性命名 ----------
+
+_NAME_CLEAN = re.compile(r"[^A-Za-z0-9_-]")
+#  OpenAI function name 的长度上限
+_NAME_CAP = 64
+#  lossy 归一化时追加的身份哈希长度（12 位 hex）
+_NAME_HASH_LEN = 12
+
+
+def public_tool_name(server: str, tool: str) -> str:
+    """(server, tool) → 模型可见名，纯函数。
+
+    干净情形逐字返回 mcp__<server>__<tool>；字符替换或截断**任何一种**改变了
+    名字，就追加二元组身份的 12 位 sha256 哈希——两个不同身份即使归一化后相同，
+    哈希也必不同。没有任何跨调用状态：连接顺序 / 重连 / re-sync 都不影响结果，
+    /allow 权限规则里存的名字因此跨会话、跨代稳定。
+
+    残余碰撞面只剩 server 名自带 __ 的干净拼接（a__b/c 与 a/b__c）——
+    由 swap 阶段的跨 server 冲突预检兜底（整代回滚，绝不静默影蔽）。
+    """
+    joined = f"mcp__{server}__{tool}"
+    normalized = _NAME_CLEAN.sub("_", joined)
+    if normalized == joined and len(normalized) <= _NAME_CAP:
+        return normalized
+    digest = hashlib.sha256(f"{server}\0{tool}".encode()).hexdigest()[:_NAME_HASH_LEN]
+    return normalized[: _NAME_CAP - _NAME_HASH_LEN - 1] + "_" + digest
+
+
+def fold_name(name: str) -> str:
+    """撞名判定用的折叠形：NFKC 归一（全角→半角、组合字符合并）再 casefold。
+
+    只用于比较，注册名仍是 public_tool_name 的确定性结果。
+    """
+    return unicodedata.normalize("NFKC", name).casefold()
+
+
+def conflict_key(server: str, tool: str) -> str:
+    """(server, 原名) 的撞名判定键：折叠后再走同一套确定性命名。
+
+    折叠在命名**之前**：全角字符经消毒会变成下划线加哈希，折叠消毒后的名字
+    已经分不出 `ｔｏｏｌ` 和 `tool` 本是同一个词。server 名自带 __ 的干净拼接
+    （a__b/c 与 a/b__c）照旧在这一步撞上。
+    """
+    return public_tool_name(fold_name(server), fold_name(tool))
+
+
+#  一个工具声明（连同它的 inputSchema）的容器嵌套上限。真实 schema 十几层到头；
+#  成百上千层的只会出自坏掉或恶意的 server——指纹、归一、落盘缓存都要递归走
+#  一遍这棵树，放进来就是在启动线程里栈溢出
+_DECLARATION_DEPTH_CAP = 64
+
+
+def _nested_beyond(node: Any, cap: int) -> bool:
+    """node（JSON 值）的对象/数组嵌套是否超过 cap 层。
+
+    显式栈遍历：量深度的函数自己不能靠递归。
+    """
+    stack = [(node, 1)]
+    while stack:
+        current, depth = stack.pop()
+        if isinstance(current, dict):
+            children: Any = current.values()
+        elif isinstance(current, list):
+            children = current
+        else:
+            continue
+        if depth > cap:
+            return True
+        stack.extend((child, depth + 1) for child in children)
+    return False
+
+
+def declared_violation(declared: list[dict[str, Any]]) -> str | None:
+    """一代工具声明的合法性：同 server 重名、声明嵌套过深 → 整个列表非法。
+
+    重名不是"挑一个注册"能修的：两个声明争一个确定性名字，任选其一都是
+    静默影蔽。嵌套过深同样整代拒绝而不是只丢那一个工具：会发这种声明的
+    server 已经不可信，悄悄少一个工具继续用，用户连出过事都不知道。
+    返回原因文本；合法返回 None。
+    """
+    by_fold: dict[str, list[str]] = {}
+    for item in declared:
+        raw = str(item.get("name", ""))
+        by_fold.setdefault(fold_name(raw), []).append(raw)
+    duplicates = [group for group in by_fold.values() if len(group) > 1]
+    if duplicates:
+        #  原始名都列出来：同形异码的两个名在终端上可能长得一模一样，只给一个
+        #  用户看不出撞在哪
+        shown = ", ".join(" / ".join(group[:3]) for group in duplicates[:3])
+        return f"server 在 tools/list 里重复列出同名（或同形）工具（{shown}），整个工具列表判非法"
+    for item in declared:
+        if _nested_beyond(item, _DECLARATION_DEPTH_CAP):
+            return (
+                f"工具 {str(item.get('name', ''))[:40]!r} 的声明嵌套超过 "
+                f"{_DECLARATION_DEPTH_CAP} 层，整个工具列表判非法"
+            )
+    return None
+
+
+# ---------- 单个 server ----------
+
+
+class _HttpChannel:
+    """MCP Streamable HTTP 传输（规范 2025-06-18）。
+
+    与 stdio 的结构差异（看代码前先知道这三条，否则会觉得少了半个 server）：
+
+    1. **没有常驻读线程**：请求的响应就在这次 POST 的响应体里——`application/json`
+       一条、`text/event-stream` 若干条，读到一条派发一条，读到本次请求的应答
+       就收流（流什么时候关是 server 的事，不等它）。一个 server 的请求是
+       **串行**的（写锁包住整个往返）；stdio 那边靠 id 关联可以多条在飞，这里
+       不做——MCP 调用本来一问一答，为并发引入连接池不值。往返有 wall-clock
+       总时限：socket 超时只管"多久没动静"，server 的心跳行会不断给它续期。
+    2. **server→client 方向要单开一条 GET SSE 长流**：
+       notifications/tools/list_changed（rug-pull 监督的触发源）只走那条。
+       server 回 405 就是"我不提供"，按没有处理，不当失败。
+    3. **会话靠 Mcp-Session-Id 头**：initialize 的响应给一个，此后每次带上；
+       server 回 404 表示会话被回收，等价于 stdio 那边的进程没了。
+    """
+
+    #  出网一律经 netproxy.urlopen：回环直连、代理判定与模型请求同一份策略
+    #  SSE 长流不设读超时（本来就长时间没数据），请求往返用 spec.timeout
+    _STREAM_TIMEOUT = None
+
+    def __init__(self, spec: ServerSpec) -> None:
+        self.spec = spec
+        self.session_id = ""
+        #  initialize 协商出的协议版本，空串 = 还没握手。握手后才带协议版本头
+        #  （规范：initialize 那次还不知道协商结果）。restart 换新通道即清零
+        self.protocol_version = ""
+        self._stream: Any = None
+        self._stream_thread: threading.Thread | None = None
+        self._closed = False
+
+    # ---- 出站 ----
+
+    def _headers(self, accept: str) -> dict[str, str]:
+        headers = {
+            "Accept": accept,
+            "Content-Type": "application/json",
+            "User-Agent": f"xiaoyu/{_version()}",
+        }
+        if self.session_id:
+            headers["Mcp-Session-Id"] = self.session_id
+        if self.protocol_version:
+            #  发协商值而不是本端常量：server 回了 2025-03-26 还发 2025-06-18，
+            #  严格的 server 按规范对不支持的版本头回 400。
+            #  这个头是 2025-06-18 才引入的；协商到更早的修订照样发协商值——
+            #  老 server 不认识的头按规范忽略，多版本 server 没收到头时本来也按
+            #  2025-03-26 处理，发与不发语义一致，统一发省掉按版本分叉
+            headers["MCP-Protocol-Version"] = self.protocol_version
+        #  自定义头最后合并：用户点名的优先（他可能就是要覆盖 UA/Accept）
+        headers.update(self.spec.headers)
+        if self.spec.authorization is not None:
+            try:
+                headers["Authorization"] = self.spec.authorization()
+            except Exception as exc:
+                raise McpError("MCP authorization unavailable", kind="auth") from exc
+        return headers
+
+    def post(
+        self,
+        payload: dict[str, Any],
+        timeout: float,
+        dispatch: Callable[[dict[str, Any]], None] | None = None,
+        exchange: "_Exchange | None" = None,
+    ) -> list[dict[str, Any]]:
+        """发一条 JSON-RPC 消息，收到的消息**边读边交**给 dispatch。
+
+        payload 是请求（带 id）时，读到它的应答就收流返回：SSE 应答的流什么时候
+        关由 server 决定，读到流结束才返回等于把调用的时长交给对端。
+        不给 dispatch 就把消息攒起来返回。exchange 是等待方的遥控器（见
+        _Exchange）：总时限到了或不想等了，由它从别的线程掐断这次往返。
+        timeout 是 socket 的空闲超时，不是总时限——总时限归等待方管。
+        """
+        body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        request = urllib.request.Request(
+            self.spec.url,
+            data=body,
+            headers=self._headers("application/json, text/event-stream"),
+            method="POST",
+        )
+        name = self.spec.name
+        #  两段式异常分类：错误发生在"请求送达之前"还是"之后"，决定了 tools/call
+        #  的结果是否不确定（见 McpError 分类表）。urllib 只把发请求阶段（DNS、
+        #  建连、写请求）的 OSError 包成 URLError；等响应头与读响应体阶段的异常
+        #  原样抛出——这条边界就是"送没送到"的判据。
+        try:
+            response = netproxy.urlopen(request, timeout=timeout, allow_redirects=False)
+        except urllib.error.HTTPError as exc:
+            raise self._http_error(exc) from exc
+        except urllib.error.URLError as exc:
+            raise McpError(f"连接 {name} 失败：{exc.reason}", kind="connect") from exc
+        except TimeoutError as exc:
+            raise McpError(f"等待 {name} 应答超时（{timeout:g}s）", kind="timeout") from exc
+        except (http.client.HTTPException, OSError) as exc:
+            raise McpError(f"与 {name} 的连接在应答前中断：{exc}", kind="dropped") from exc
+        if exchange is not None and not exchange.attach(response):
+            #  等待方已经放手：这条应答没人要了
+            response.close()
+            return []
+        collected: list[dict[str, Any]] = []
+        deliver = dispatch if dispatch is not None else collected.append
+        awaited = payload.get("id") if "method" in payload else None
+        with response:
+            try:
+                for message in self._read_messages(response, exchange):
+                    deliver(message)
+                    if (
+                        awaited is not None
+                        and "method" not in message
+                        and message.get("id") == awaited
+                    ):
+                        break
+                return collected
+            except TimeoutError as exc:
+                raise McpError(f"读取 {name} 的应答超时（{timeout:g}s）", kind="timeout") from exc
+            except (http.client.HTTPException, OSError) as exc:
+                raise McpError(f"读取 {name} 的应答时连接中断：{exc}", kind="dropped") from exc
+            except ValueError as exc:  # JSONDecodeError 是它的子类
+                raise McpError(f"{name} 的应答不是合法 JSON：{exc}", kind="malformed") from exc
+            finally:
+                #  读完了，接下来由本线程自己关：等待方不必再来掐
+                if exchange is not None:
+                    exchange.detach()
+
+    def _read_messages(
+        self, response: Any, exchange: "_Exchange | None" = None
+    ) -> "Iterator[dict[str, Any]]":
+        #  会话 id 只在 initialize 的响应里出现，但每次都读一遍无害
+        if new_id := response.headers.get("Mcp-Session-Id"):
+            self.session_id = new_id
+        kind = (response.headers.get("Content-Type") or "").split(";")[0].strip()
+        if response.status == 202:
+            return  # 通知被接收，无响应体
+        if kind == "text/event-stream":
+            yield from _read_sse(
+                response, None if exchange is None else lambda: exchange.abandoned
+            )
+            return
+        raw = _read_capped(response).decode("utf-8", "replace").strip()
+        if not raw:
+            return
+        message = json.loads(raw)
+        if isinstance(message, dict):
+            yield message
+        elif isinstance(message, list):
+            yield from (item for item in message if isinstance(item, dict))
+
+    def _http_error(self, exc: urllib.error.HTTPError) -> McpError:
+        """非 2xx 状态码 → 分好类的 McpError（去向见 McpError 分类表）。"""
+        code = exc.code
+        detail = ""
+        if exc.fp:
+            #  只读开头：错误体同样来自不可信的远端，展示也只用得上前 200 字
+            with contextlib.suppress(Exception):
+                head = exc.read(_HTTP_ERROR_BODY_CAP)
+                detail = _redact(head.decode("utf-8", "replace"))[:200].strip()
+        with contextlib.suppress(Exception):
+            exc.close()
+        suffix = f"：{detail}" if detail else ""
+        if 300 <= code < 400:
+            #  MCP 端点一律不跟重定向：urllib 跟过去时会把 Authorization、
+            #  Mcp-Session-Id 等全部请求头原样带到新地址（不分跨域），写死在配置
+            #  里的静态凭据就这么泄给了第三方；而且 POST 会被改成 GET、丢掉请求体，
+            #  协议上也走不通。让人把 url 直接改成最终地址
+            target = ""
+            with contextlib.suppress(Exception):
+                target = str(exc.headers.get("Location") or "")
+            where = f"，目标 {_redact(target)[:200]}" if target else ""
+            return McpError(
+                f"server 回了重定向（HTTP {code}{where}）：为防凭据外泄不自动跟随，"
+                "请把这个 server 的 url 改成最终地址",
+                kind="http", status=code,
+            )
+        if code == 404 and self.session_id:
+            return McpError(
+                "远端会话已失效（HTTP 404），需要重新握手", kind="session_expired", status=code
+            )
+        if code in (401, 403):
+            challenge = ""
+            with contextlib.suppress(Exception):
+                challenge = str(exc.headers.get("WWW-Authenticate") or "")
+            if "resource_metadata" in challenge.lower():
+                #  RFC 9728 的受保护资源元数据：server 要的是 OAuth 登录，不是一个
+                #  写死的头。让人去查 headers 是指错了路
+                hint = (
+                    "这个 server 要求 OAuth 登录，小羽目前只支持在 headers 里写静态凭据"
+                    "——改用它提供的长期令牌，或经本地的 OAuth 桥接程序（stdio）接入"
+                )
+            else:
+                hint = "检查 mcp.json 里这个 server 的 headers 凭据"
+            return McpError(
+                f"认证失败（HTTP {code} {exc.reason}）{suffix}——{hint}",
+                kind="auth",
+                status=code,
+            )
+        kind = "server" if code >= 500 else "http"
+        return McpError(f"HTTP {code} {exc.reason}{suffix}", kind=kind, status=code)
+
+    # ---- server→client 长流 ----
+
+    def open_stream(self, dispatch: Callable[[dict[str, Any]], None]) -> None:
+        """尝试开 GET SSE 长流；server 不支持（405）就安静放弃。"""
+        request = urllib.request.Request(
+            self.spec.url, headers=self._headers("text/event-stream"), method="GET"
+        )
+        try:
+            stream = netproxy.urlopen(request, timeout=self._STREAM_TIMEOUT, allow_redirects=False)
+        except urllib.error.HTTPError as exc:
+            #  HTTPError 本身就是一个开着的响应：不关就是把连接留给垃圾回收。
+            #  405 是常态（多数 server 不提供这条流），漏的是每连一个 server 一条
+            with contextlib.suppress(Exception):
+                exc.close()
+            if exc.code in (404, 405, 501):
+                return  # 规范允许不提供这条流
+            print(
+                f"[MCP server {self.spec.name!r} 的事件流打不开：HTTP {exc.code}，"
+                "工具变更通知本次不可用]",
+                file=sys.stderr,
+            )
+            return
+        except (urllib.error.URLError, OSError) as exc:
+            print(
+                f"[MCP server {self.spec.name!r} 的事件流打不开：{exc}，"
+                "工具变更通知本次不可用]",
+                file=sys.stderr,
+            )
+            return
+        self._stream = stream
+        self._stream_thread = threading.Thread(
+            target=self._pump_stream,
+            args=(stream, dispatch),
+            name=f"xiaoyu-mcp-sse-{self.spec.name}",
+            daemon=True,
+        )
+        self._stream_thread.start()
+
+    def _pump_stream(self, stream: Any, dispatch: Callable[[dict[str, Any]], None]) -> None:
+        try:
+            for message in _read_sse(stream):
+                if self._closed:
+                    return
+                dispatch(message)
+        except Exception as exc:  # noqa: BLE001 - 见下：这里只负责安静收场
+            #  长流断了不等于 server 没了（代理超时最常见）：下次 POST 会说话，
+            #  别把一次断流误报成 server 挂了。
+            #  异常类型刻意放到最宽：close() 与本线程的 readline 天然竞态，
+            #  http.client 在竞态瞬间抛什么全看版本（3.14 上是内部 fp 已置空的
+            #  AttributeError，不是 OSError）——按类型枚举必漏，漏了就是每次
+            #  关闭都往 stderr 吐一段 traceback。
+            if not self._closed:
+                print(
+                    f"[MCP server {self.spec.name!r} 的事件流中断：{exc}]", file=sys.stderr
+                )
+            return
+
+    def close(self) -> None:
+        self._closed = True
+        if self._stream is not None:
+            with contextlib.suppress(Exception):
+                self._stream.close()
+            self._stream = None
+        if not self.session_id:
+            return
+        #  规范：客户端应当显式 DELETE 掉会话，让 server 释放资源。尽力而为。
+        try:
+            request = urllib.request.Request(
+                self.spec.url, headers=self._headers("application/json"), method="DELETE"
+            )
+            netproxy.urlopen(request, timeout=5.0, allow_redirects=False).close()
+        except urllib.error.HTTPError as exc:
+            #  不支持 DELETE 的 server 回 405：同样是个开着的响应，要关
+            with contextlib.suppress(Exception):
+                exc.close()
+        except Exception:  # noqa: BLE001 - 尽力而为：关会话失败不该拦住关闭
+            pass
+
+
+def _hang_up(response: Any) -> None:
+    """从别的线程掐断一条正在被读的应答。
+
+    不能直接 close：读线程阻塞在读里时握着缓冲区的锁，close 要等它读完才拿得到
+    ——等于陪它一起卡住。对底层 socket 做 shutdown 不用等谁：阻塞的读随即以
+    "连接已关闭"返回，读线程自己收场、自己关。尽力而为：没掐成（响应已关、
+    平台叫不醒阻塞的读）也有后手——读线程每读到一行都会看等待方是否已放手
+    （见 _read_sse），最迟到 socket 空闲超时。
+    """
+    with contextlib.suppress(Exception):
+        response.fp.raw._sock.shutdown(socket.SHUT_RDWR)
+
+
+class _Exchange:
+    """一次 POST 往返的遥控器。
+
+    读应答的线程阻塞在 socket 上，看不了时钟；等待方（发起请求的线程）看着
+    时钟却够不着连接。往返开始时两边各拿着它：读线程把响应挂上来，等待方
+    不想等了（拿到应答 / 总时限到 / 调用方放弃）就 abandon——连接被掐断，
+    读线程随即收场。先 abandon 后才拿到响应的，attach 返回 False，读线程
+    当场把它关掉。
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._response: Any = None
+        self.abandoned = False
+        #  读线程收场时填（持 server 的条件变量）：finished 立起时 error 已定
+        self.finished = False
+        self.error: McpError | None = None
+
+    def attach(self, response: Any) -> bool:
+        with self._lock:
+            if self.abandoned:
+                return False
+            self._response = response
+            return True
+
+    def detach(self) -> None:
+        with self._lock:
+            self._response = None
+
+    def abandon(self) -> None:
+        with self._lock:
+            self.abandoned = True
+            response, self._response = self._response, None
+        if response is not None:
+            _hang_up(response)
+
+
+def _read_capped(response: Any) -> bytes:
+    """读普通应答体，超过 _HTTP_BODY_CAP 即拒收（McpError kind=too_large）。
+
+    有 Content-Length 的先看声明，超了一个字节都不读；没有（或声明撒谎）就
+    分块累计，越线当场停手——绝不先整个读进内存再量长度。
+    """
+    cap = _HTTP_BODY_CAP
+    declared = (response.headers.get("Content-Length") or "").strip()
+    if declared.isdigit() and int(declared) > cap:
+        raise McpError(
+            f"应答体声明 {int(declared)} 字节，超过上限 {cap} 字节，拒收", kind="too_large"
+        )
+    chunks: list[bytes] = []
+    total = 0
+    while True:
+        #  多要 1 字节：读满上限时还得分得清"正好"与"超了"
+        chunk = response.read(min(_READ_CHUNK, cap + 1 - total))
+        if not chunk:
+            return b"".join(chunks)
+        total += len(chunk)
+        if total > cap:
+            raise McpError(f"应答体超过上限 {cap} 字节，拒收", kind="too_large")
+        chunks.append(chunk)
+
+
+def _read_sse(
+    response: Any, abandoned: Callable[[], bool] | None = None
+) -> "Iterator[dict[str, Any]]":
+    """SSE 流 → JSON-RPC 消息，**边读边吐**（生成器）。
+
+    生成器不是风格选择：GET 长流要的就是"事件到一条派发一条"，先收集再返回
+    等于要等流结束——而那条流本来就不会结束。POST 那边 list() 一下即可。
+
+    多行 data 按规范用 \n 拼接。解析不出 JSON 的块跳过——server 拿注释行做
+    心跳是常见做法，不该把心跳当协议错误。嵌套深到解析器放弃的一块
+    （RecursionError）同样只丢这一块，不连累整条流。
+
+    内存有界：readline 带上限按块读，没有换行的超长行也只会一块一块进来；
+    一个事件（上一个空行之后读到的全部字节）超过 _SSE_EVENT_CAP 即拒收。
+    还没攒到 data 时（心跳、event:/id: 行）计数随行清零，长流挂一整天也不误伤。
+    不用 `for line in response`：那是不限长的 readline，一行不换行就读到内存爆。
+
+    abandoned 给了的话每读到一行问一次，等待方已经放手就不再读下去——只发
+    心跳的流永远吐不出消息，调用方在消息之间看不到这个机会。
+    """
+    buffer: list[str] = []
+    pending = bytearray()  # 当前行已读到、还没见到换行的部分
+    size = 0  # 当前事件已读字节
+    while True:
+        if abandoned is not None and abandoned():
+            return
+        cap = _SSE_EVENT_CAP
+        chunk = response.readline(min(_READ_CHUNK, cap + 1 - size))
+        if chunk:
+            size += len(chunk)
+            if size > cap:
+                raise McpError(f"SSE 单个事件超过上限 {cap} 字节，拒收", kind="too_large")
+            if not chunk.endswith(b"\n"):
+                pending += chunk
+                continue
+            raw = bytes(pending) + chunk
+            pending.clear()
+        elif pending:
+            #  流在一行中间结束：残留的半行照常当最后一行处理
+            raw = bytes(pending)
+            pending.clear()
+        else:
+            break
+        line = raw.decode("utf-8", "replace").rstrip("\r\n")
+        if line == "":
+            if buffer:
+                try:
+                    message = json.loads("\n".join(buffer))
+                except (ValueError, RecursionError):
+                    message = None
+                if isinstance(message, dict):
+                    yield message
+                buffer = []
+            size = 0
+            continue
+        if line.startswith("data:"):
+            buffer.append(line[5:].lstrip())
+        #  注释/心跳与 event:/id: 行都不攒内容：还没开始攒 data 就不累计
+        if not buffer:
+            size = 0
+    if buffer:
+        try:
+            message = json.loads("\n".join(buffer))
+        except (ValueError, RecursionError):
+            message = None
+        if isinstance(message, dict):
+            yield message
+
+
+class McpServer:
+    """一个 stdio MCP server 子进程：拉起、握手、列工具、调工具、关闭。
+
+    线程模型：一条读线程独占 stdout，解析出的响应放进 _responses 由条件变量
+    唤醒等待方；写入方共用 _write_lock。所有公开方法线程安全。
+    """
+
+    def __init__(self, spec: ServerSpec, log_path: Path) -> None:
+        self.spec = spec
+        self.log_path = log_path
+        self._proc: subprocess.Popen[str] | None = None
+        #  远端 server 的传输通道（stdio 型恒为 None）。两种传输共用本类的
+        #  全部上层逻辑：熔断、惰性启动、代际事务、幽灵工具拦截、指纹基线。
+        self._http: _HttpChannel | None = _HttpChannel(spec) if spec.is_http else None
+        self._cond = threading.Condition()
+        self._responses: dict[int, dict[str, Any]] = {}
+        #  正有人在等应答的请求 id。响应槽只为它们留：超时 / 取消之后才到的应答
+        #  没有人会来取，收下就是只增不减
+        self._awaited: set[int] = set()
+        self._next_id = 0
+        self._write_lock = threading.Lock()
+        self._dead = False
+        self._terminate_wait = _HANGUP_WAIT
+        #  熔断状态：连续传输层失败计数 + 熔断截止时刻（monotonic）
+        self._failures = 0
+        self._breaker_until = 0.0
+        #  server 声明的名字/版本（initialize 响应里的 serverInfo），/mcp 展示用
+        self.server_info = ""
+        #  握手拿到的能力表与 instructions（`xiaoyu mcp probe` 展示用；运行期只看
+        #  有没有 tools 这一项）
+        self.capabilities: dict[str, Any] = {}
+        self.instructions = ""
+        #  本代 initialize 协商出的协议版本（空串 = 未握手）；restart 清零重协商
+        self.protocol_version = ""
+        #  在飞的 tools/call 的进度回调：progressToken → 回调。请求带了 token，
+        #  server 的 notifications/progress 才会来；回调在读线程上跑，只许改状态
+        #  不许发请求（与 on_tools_changed 同一条纪律）
+        self._progress_hooks: dict[int, Callable[[dict[str, Any]], None]] = {}
+        self._progress_seq = 0
+        #  on_log(level, text) ← notifications/message 里 warning 及以上的（manager 接线，
+        #  再转给前端）。全部级别都进本 server 的日志文件，这里只管上屏那一部分
+        self.on_log: Callable[[str, str], None] | None = None
+        #  最近一次 call_tool 的图片部件（见 call_tool）：调用方紧接着取走
+        self._call_media = threading.local()
+        #  惰性启动状态：schema 缓存命中的 server 直到第一次真实调用才 spawn
+        self._start_lock = threading.Lock()
+        self.started = False
+        self.start_error: str | None = None
+        #  连上后 server 实际声明的工具（原始 dict + 名字集合，幽灵工具靠它拦）
+        self.live_declared: list[dict[str, Any]] = []
+        self.live_names: set[str] = set()
+        #  代际事务钩子（由 manager 在注册成功后接线；None = 不监督）：
+        #  on_tools_changed ← notifications/tools/list_changed（读线程上发火，
+        #  接线方绝不能在回调里同步发请求——响应正是读线程自己派发的，会自锁死）
+        self.on_tools_changed: Callable[[], None] | None = None
+        #  on_disconnect ← stdout EOF（进程意外退出）/ HTTP 断线类错误（会话失效、
+        #  连接失败、连接中途断开，见 McpError 分类表）。主动 close 不触发。
+        self.on_disconnect: Callable[[], None] | None = None
+        #  on_failure(原因) ← 不可恢复的失败（HTTP 401/403）：不走重连，由 manager
+        #  整代下线并亮出原因。fatal_error 同时记住原因，调用与 check 据此拦截
+        self.on_failure: Callable[[str], None] | None = None
+        self.fatal_error: str | None = None
+        #  manager 的重连线程是否在跑（调用失败的提示据此说真话，不凭钩子是否接线猜）
+        self.reconnecting = False
+        self._closing = False
+        #  是否已计入 CONNECTIONS_LIVE（启动成功 +1、收进程 -1，重启不重复计）
+        self._counted = False
+        self._drain_thread: threading.Thread | None = None
+        self._workers_lock = threading.Lock()
+        self._workers: list[threading.Thread] = []
+        #  重连预算（按 outage 计，见模块 docstring）；归 manager 的重连线程读写
+        self.reconnect_attempts = 0
+        self.connected_at: float | None = None
+
+    #  熔断参数：3 连败开路、60s 后自动半开。
+    #  只数"server 没能好好应答"的失败（超时 / 进程退出 / 连接中断 / 5xx /
+    #  应答解析不了）。server 明确答复的不算：isError 是业务失败，JSON-RPC error
+    #  与 HTTP 4xx 是这一次请求被拒（见 _ANSWERED_KINDS）——模型连着写错三次
+    #  参数，不该把一个健康 server 的全部工具一起关掉 60 秒。
+    _BREAKER_THRESHOLD = 3
+    _BREAKER_COOLDOWN = 60.0
+
+    # ---- 生命周期 ----
+
+    def bootstrap(self) -> list[dict[str, Any]]:
+        """启动并返回原始工具声明列表，失败抛 McpError。"""
+        self.ensure_started()
+        return self.live_declared
+
+    def ensure_started(self) -> None:
+        """幂等启动：准入 → OSV 预检 → spawn → 握手 → tools/list。
+
+        schema 缓存命中的 server 平时不启动，第一次真实工具调用走到这里才 spawn
+        （调用方线程同步等，上限 INIT_TIMEOUT）。失败会记住并在后续调用立即重抛，
+        不反复重试把每次工具调用都拖满超时。
+        """
+        with self._start_lock:
+            if self.started:
+                if self.start_error:
+                    raise McpError(self.start_error)
+                return
+            try:
+                self._start_locked()
+                self._count_live(True)
+            except McpError as exc:
+                self.start_error = str(exc)
+                self.close()
+                raise
+            except Exception as exc:  # noqa: BLE001 - 统一包成 McpError 往上抛
+                self.start_error = f"{type(exc).__name__}: {exc}"
+                self.close()
+                raise McpError(self.start_error) from exc
+            finally:
+                self.started = True
+
+    def _start_locked(self) -> None:
+        spec = self.spec
+        #  准入双点执行的第二点：启动即是最后一道闸。两种传输各有各的判据：
+        #  stdio 判"这条命令像不像攻击"，HTTP 判"这个地址会不会让凭据裸奔"。
+        if spec.is_http:
+            if reason := mcp_guard.endpoint_violation(spec.url):
+                raise McpError(f"地址被安全规则拦截：{reason}")
+        else:
+            if reason := mcp_guard.admission_violation(spec.command, spec.args, spec.env):
+                raise McpError(f"配置被安全规则拦截：{reason}")
+            #  OSV 恶意包预检（fail-open，命中才拦）。必须在 watchdog 包装 argv
+            #  之前基于原始 spec 判断——包装后 argv[0] 是 python，预检会静默失效。
+            #  远端 server 没有包可查，这条不适用。
+            if _enabled("XIAOYU_MCP_OSV"):
+                if reason := mcp_guard.osv_malware_check(spec.command, spec.args):
+                    raise McpError(f"启动被拦截：{reason}")
+        self._spawn()
+        result = self._initialize(PROTOCOL_VERSION)
+        info = result.get("serverInfo") or {}
+        self.server_info = " ".join(
+            str(part) for part in (info.get("name"), info.get("version")) if part
+        )
+        version = result.get("protocolVersion")
+        if not isinstance(version, str) or not version:
+            #  漏回版本字段的 server 不在少数：按我方请求的版本算，不为此拒连
+            version = PROTOCOL_VERSION
+        if version not in SUPPORTED_PROTOCOL_VERSIONS:
+            raise McpError(
+                f"server 协商的协议版本 {version[:40]!r} 不受支持"
+                f"（支持：{', '.join(SUPPORTED_PROTOCOL_VERSIONS)}），按规范断开"
+            )
+        self.protocol_version = version
+        if self._http is not None:
+            #  协商完成的那一刻就要立旗：规范要求 initialize 响应**之后**的每一次
+            #  请求都带 MCP-Protocol-Version，包括紧接着这条 initialized 通知。
+            #  （立旗晚一行，通知就成了唯一漏带的那条——server 严格校验时只有
+            #  这一条被拒，症状是"握手过了但 server 认为没握手"。）
+            self._http.protocol_version = version
+        self._notify("notifications/initialized")
+        if self._http is not None:
+            #  server→client 长流放在 initialized 之后开：server 有权在握手
+            #  完成前拒绝这条 GET
+            self._http.open_stream(self._dispatch)
+        #  没声明 tools capability 的 server（纯 prompts/resources 型）不发
+        #  tools/list：省一次注定报 method-not-found 的往返
+        capabilities = result.get("capabilities") or {}
+        self.capabilities = capabilities if isinstance(capabilities, dict) else {}
+        instructions = result.get("instructions")
+        self.instructions = instructions if isinstance(instructions, str) else ""
+        declared = self._list_tools() if "tools" in capabilities else []
+        self.live_declared = declared
+        self.live_names = {str(item.get("name", "")) for item in declared}
+
+    def _spawn(self) -> None:
+        if self._http is not None:
+            #  HTTP 没有"拉起进程"这一步：连接在第一次 POST 时建立，这里只把
+            #  死标志清掉（restart 会重走这条路）。
+            with self._cond:
+                self._dead = False
+            return
+        #  ~ 展开 + which：Windows 上 npx/uvx 这类 .cmd 入口不经 shell 找不到，
+        #  which 一次全平台通吃。
+        expanded = os.path.expanduser(self.spec.command)
+        command = find_command(self.spec.command, self.spec.env)
+        if command is None:
+            #  不拦的话经看门狗包一层照样起得来，然后立刻退出——报出来的是
+            #  "server 进程已退出"，真因（命令不存在）只在日志文件里
+            searched = [
+                part
+                for source in (declared_path(self.spec.env), os.environ.get("PATH", ""))
+                for part in source.split(os.pathsep)
+                if part
+            ]
+            where = (
+                "文件不存在或不可执行"
+                if os.sep in expanded or (os.altsep and os.altsep in expanded)
+                else f"PATH 的 {len(dict.fromkeys(searched))} 个目录里都没有"
+            )
+            raise McpError(f"找不到启动命令 {self.spec.command!r}（{where}）")
+        #  环境走 _safe_env 白名单（见模块 docstring）；配置里声明的 env 覆盖
+        #  继承值——这个覆盖方向不能反，反了配置值会被父环境静默盖掉。
+        #  加固参数里的 start_new_session 同时解决另一件事：REPL 里 Ctrl-C 打断
+        #  一轮对话时，SIGINT 发给前台进程组——server 不隔离出去会被连带杀掉。
+        #  函数级导入避免与 tools.py 循环引用（tools 在模块层 import mcp）。
+        from .tools import _subprocess_hardening
+
+        self.log_path.parent.mkdir(parents=True, exist_ok=True)
+        #  stderr 直连日志文件（每次启动截断），句柄交给子进程后本端立即关闭。
+        #  不用管道：管道写满会把不 drain 的子进程卡死，文件永远不会。
+        argv = [command, *self.spec.args]
+        #  父进程死亡看门狗（mcp_watchdog.py）：start_new_session 让 server 躲开
+        #  Ctrl-C，副作用是小羽被 kill -9 后它们变永久孤儿——看门狗轮询 ppid
+        #  补上这一半。stdio 全程透传，协议不经手。
+        self._terminate_wait = _HANGUP_WAIT
+        if _enabled("XIAOYU_MCP_WATCHDOG"):
+            self._terminate_wait = mcp_watchdog.TERM_GRACE + _WATCHDOG_MARGIN
+            argv = [
+                sys.executable, "-m", "xiaoyu.mcp_watchdog",
+                "--ppid", str(os.getpid()), "--", *argv,
+            ]
+        #  工作目录先验再交给 Popen：目录不存在时 Popen 抛的 FileNotFoundError 不说
+        #  是哪个路径，看起来和"命令找不到"一模一样
+        cwd = os.path.expanduser(self.spec.cwd) if self.spec.cwd else None
+        if cwd is not None and not os.path.isdir(cwd):
+            raise McpError(f"工作目录不存在：{cwd}（声明里的 cwd）")
+        log = open(self.log_path, "w", encoding="utf-8")  # noqa: SIM115
+        try:
+            self._proc = subprocess.Popen(
+                argv,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=log,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                #  行缓冲：协议就是一行一条消息
+                bufsize=1,
+                cwd=cwd,
+                env=_safe_env(self.spec.env, self.spec.inherit_env),
+                **_subprocess_hardening(),
+            )
+        except OSError as exc:
+            raise McpError(f"无法启动 {self.spec.command}：{exc}") from exc
+        finally:
+            log.close()
+        self._drain_thread = threading.Thread(
+            target=self._drain_stdout,
+            name=f"xiaoyu-mcp-{self.spec.name}",
+            daemon=True,
+        )
+        self._drain_thread.start()
+
+    def alive(self) -> bool:
+        if self._http is not None:
+            #  远端没有进程可查：只要没被判死（会话失效/传输错）就算在线
+            return self.started and not self._dead
+        return self._proc is not None and self._proc.poll() is None
+
+    def close(self) -> None:
+        #  主动关闭：先立旗再收进程，EOF 到来时读线程据此不触发重连
+        self._closing = True
+        self._shutdown_proc()
+        self._join_workers(_CLOSE_WAIT)
+
+    def _start_worker(self, worker: threading.Thread) -> None:
+        with self._workers_lock:
+            self._workers = [thread for thread in self._workers if thread.is_alive()]
+            self._workers.append(worker)
+            worker.start()
+
+    def _join_workers(self, timeout: float) -> None:
+        deadline = time.monotonic() + timeout
+        with self._workers_lock:
+            workers = list(self._workers)
+        if self._drain_thread is not None:
+            workers.append(self._drain_thread)
+        if self._http is not None and self._http._stream_thread is not None:
+            workers.append(self._http._stream_thread)
+        for worker in workers:
+            if worker is not threading.current_thread():
+                worker.join(timeout=max(0, deadline - time.monotonic()))
+
+    def shutdown_pending(self) -> bool:
+        """Local process/readers still owned, even after close was requested."""
+        with self._workers_lock:
+            pending_workers = any(worker.is_alive() for worker in self._workers)
+        return bool(pending_workers or
+            self._proc is not None and self._proc.poll() is None
+            or self._drain_thread is not None and self._drain_thread.is_alive()
+            or self._http is not None and self._http._stream_thread is not None
+            and self._http._stream_thread.is_alive()
+        )
+
+    def restart(self, spec: ServerSpec | None = None) -> list[dict[str, Any]]:
+        """断线后重启一代：收掉旧进程，重置协议状态，重新 spawn → 握手 → 列工具。
+
+        serverName 不变 + 确定性命名 = 新一代的工具名逐字复现。
+        spec 非 None = 声明随这一代一起换（/mcp reconnect 重读配置后的新
+        headers / env / 命令）。成功返回新一代声明并清掉 start_error 与
+        fatal_error；失败抛 McpError（进程已收干净，调用方可按预算再试）。
+        只应由 manager 调用：重连线程与 /mcp reconnect，二者按 server 互斥。
+        """
+        with self._start_lock:
+            if self._closing:
+                raise McpError("server 已关闭，不再重启")
+            self._shutdown_proc()
+            #  等旧读线程退场（进程已收，秒级）：它迟到的 EOF/响应有 `_proc is
+            #  proc` 代际守卫兜底，join 只是把窗口关到零
+            thread = self._drain_thread
+            if thread is not None:
+                thread.join(timeout=5.0)
+            self._join_workers(5.0)
+            if self.shutdown_pending():
+                raise McpError("上一代资源尚未退出，稍后重试重连")
+            if spec is not None:
+                #  旧代按旧声明收干净之后再换：传输类型也可能跟着变了（stdio ↔ HTTP）
+                self.spec = spec
+            with self._cond:
+                self._dead = False
+                self._responses.clear()
+                #  换一张新表而不是清空：上一代还没退场的等待方各自从旧表里除名，
+                #  id 从头编之后撞不到新一代的登记
+                self._awaited = set()
+                self._next_id = 0
+            #  熔断是"进程活着但请求连败"的防线，新一代从零开始
+            self._failures = 0
+            self._breaker_until = 0.0
+            #  协商结果属于上一代：新一代的 server 可能已经升/降级，必须重新协商
+            self.protocol_version = ""
+            #  HTTP 换一条全新通道：会话 id、协商版本、关闭标志都属于上一代。沿用旧会话 id
+            #  去 initialize，严格的 server 回 404（重连永远连不上）；沿用关闭
+            #  标志，新长流上的 list_changed 会被静默丢弃。按（可能已换的）声明判传输
+            self._http = _HttpChannel(self.spec) if self.spec.is_http else None
+            try:
+                self._start_locked()
+            except McpError:
+                self._shutdown_proc()
+                raise
+            except Exception as exc:  # noqa: BLE001 - 统一包成 McpError
+                self._shutdown_proc()
+                raise McpError(f"{type(exc).__name__}: {exc}") from exc
+            if self._closing:
+                #  与 close() 赛跑输了：把刚拉起的新一代收掉，绝不留孤儿
+                self._shutdown_proc()
+                raise McpError("server 已关闭，不再重启")
+            self.started = True
+            self.start_error = None
+            self.fatal_error = None
+            #  收旧进程时已减计数，新一代活了要加回来（否则每重启一次少记一个）
+            self._count_live(True)
+            return self.live_declared
+
+    def _count_live(self, alive: bool) -> None:
+        if alive and not self._counted:
+            self._counted = True
+            CONNECTIONS_LIVE.inc()
+        elif not alive and self._counted:
+            self._counted = False
+            CONNECTIONS_LIVE.dec()
+
+    def _shutdown_proc(self) -> None:
+        self._count_live(False)
+        if self._http is not None:
+            self._http.close()
+            with self._cond:
+                self._dead = True
+                self._cond.notify_all()
+            return
+        proc = self._proc
+        if proc is None:
+            return
+        try:
+            if proc.poll() is None:
+                #  尽量体面：先关 stdin（stdio server 的约定退出信号），
+                #  不走再 terminate，最后整树杀兜底。
+                #  terminate 之后等多久取决于中间有没有看门狗：它收到 TERM 后要先给
+                #  真 server 一段宽限再补 KILL，我们等得比它短的话，会在它补刀之前
+                #  把它杀掉——真 server 就成了没人管的孤儿
+                for hangup, patience in (
+                    (lambda: proc.stdin and proc.stdin.close(), _HANGUP_WAIT),
+                    (proc.terminate, self._terminate_wait),
+                    (lambda: _kill_with_descendants(proc), _HANGUP_WAIT),
+                ):
+                    try:
+                        hangup()
+                        proc.wait(timeout=patience)
+                        return
+                    except (OSError, subprocess.TimeoutExpired, ValueError):
+                        continue
+        finally:
+            worker = _close_streams(proc)
+            with self._workers_lock:
+                self._workers.append(worker)
+
+    # ---- 协议 ----
+
+    def _list_tools(self) -> list[dict[str, Any]]:
+        tools: list[dict[str, Any]] = []
+        cursor: str | None = None
+        seen: set[str] = set()
+        #  分页有界循环：行为不端的 server 无限翻页也拖不死我们
+        for _ in range(50):
+            params: dict[str, Any] = {"cursor": cursor} if cursor else {}
+            result = self._request("tools/list", params, timeout=INIT_TIMEOUT)
+            page = result.get("tools")
+            if isinstance(page, list):
+                tools.extend(item for item in page if isinstance(item, dict))
+            cursor = result.get("nextCursor")
+            #  必须是非空字符串才翻下一页：挡住乱返回的 server
+            if not isinstance(cursor, str) or not cursor:
+                break
+            #  cursor 转圈：再翻只会把同一批工具重拼一遍，50 页后在重名校验上误报成
+            #  "重复列出同名工具"——当场判列表非法，把真实原因说清楚
+            if cursor in seen:
+                raise McpError(
+                    f"server 在 tools/list 翻页时重复返回同一个 cursor（{cursor[:40]!r}），工具列表判非法"
+                )
+            seen.add(cursor)
+        return tools
+
+    @property
+    def last_media(self) -> list[dict[str, Any]]:
+        return getattr(self._call_media, "parts", [])
+
+    @last_media.setter
+    def last_media(self, parts: list[dict[str, Any]]) -> None:
+        self._call_media.parts = parts
+
+    def call_tool(
+        self,
+        tool: str,
+        args: dict[str, Any],
+        stop_requested: Callable[[], bool] | None = None,
+    ) -> str:
+        """tools/call，把 content 各部件拼成回给模型的文本。协议错误也返回文本。
+
+        stop_requested（"有没有人叫停"）给了的话，等应答期间会轮询它：叫停即
+        放手返回，文本里说明远端可能仍在执行。
+
+        图片部件不在返回值里（返回值是"给模型的文本"，形状不能变——它同时是
+        工具结果、trace 记录、审批预览的输入），改挂在 `last_media` 上由调用方
+        紧接着取走。每次调用先清空：上一次的图绝不能粘到这一次的结果上。
+        """
+        self.last_media = []
+        if self.fatal_error:
+            return (
+                f"ERROR: MCP server {self.spec.name} 已停用：{_redact(self.fatal_error)}。"
+                "不会自动重试——不要再调用这个 server 的工具，告知用户修复后执行 "
+                f"/mcp reconnect {self.spec.name} 恢复。"
+            )
+        if not self.alive():
+            #  提示只说真话：重连线程确实在跑才说"正在重连"（HTTP 断线、重连关闭、
+            #  预算耗尽都不是这个状态）
+            hint = (
+                "后台正在自动重连，稍后重试或先做别的事。"
+                if self.reconnecting and not self._closing
+                else ""
+            )
+            if self._http is not None:
+                return (
+                    f"ERROR: MCP server {self.spec.name} 的连接已断开"
+                    f"（{display_url(self.spec.url)}），"
+                    f"无法调用。{hint}"
+                )
+            return (
+                f"ERROR: MCP server {self.spec.name} 进程已退出，无法调用。{hint}"
+                + log_hint(self.log_path)
+            )
+        #  名单的第二道闸（第一道在注册时过滤）：拿着全限定名绕过检索直接点名、
+        #  或旧一代的工具对象还在手里，都到不了 server
+        if not self.spec.allows_tool(tool):
+            return (
+                f"ERROR: MCP server {self.spec.name} 的 {tool} 不在声明的 tools 名单里，"
+                "不可调用。换其它工具，或告知用户把它加进 mcp.json 的 tools。"
+            )
+        #  熔断快速失败：同步主循环里每次干等满超时（默认 120s），模型对着
+        #  一个坏 server 重试几轮就能烧掉十几分钟。开路期间立即返回。
+        now = time.monotonic()
+        if now < self._breaker_until:
+            remaining = int(self._breaker_until - now) + 1
+            return (
+                f"ERROR: MCP server {self.spec.name} 连续失败已熔断，"
+                f"约 {remaining}s 后自动恢复。不要立刻重试这个工具——"
+                "先做别的事，或改用其它工具/告知用户。"
+            )
+        params: dict[str, Any] = {"name": tool, "arguments": args}
+        #  调用方线程上挂了进度回调（progress_scope）才带 progressToken：规范规定
+        #  不带 token 就没有进度通知，没人看的进度不必让 server 白发
+        progress = getattr(_call_scope, "progress", None)
+        token: int | None = None
+        if progress is not None:
+            with self._cond:
+                self._progress_seq += 1
+                token = self._progress_seq
+                self._progress_hooks[token] = progress
+            params["_meta"] = {"progressToken": token}
+        try:
+            result = self._request(
+                "tools/call",
+                params,
+                timeout=self.spec.timeout,
+                stop_requested=stop_requested,
+            )
+        except McpError as exc:
+            if exc.kind == "cancelled":
+                #  本地叫停说明不了 server 的好坏：连败计数不加也不清
+                return f"ERROR: MCP 调用已取消（{self.spec.name}/{tool}）：{exc}"
+            if exc.kind in _ANSWERED_KINDS:
+                self._failures = 0
+            else:
+                self._failures += 1
+                if self._failures >= self._BREAKER_THRESHOLD:
+                    self._breaker_until = time.monotonic() + self._BREAKER_COOLDOWN
+                    self._failures = 0
+            text = f"ERROR: MCP 调用失败（{self.spec.name}/{tool}）：{_redact(str(exc))}"
+            if exc.kind == "auth":
+                return text + (
+                    "。认证被拒，不会自动重试——不要再调用这个 server 的工具，告知用户检查凭据，"
+                    f"修好后执行 /mcp reconnect {self.spec.name} 恢复。"
+                )
+            if exc.outcome_unknown:
+                #  请求已送达却没拿到可信应答：写操作可能已经做了，模型惯性重试
+                #  就是把一次副作用做成两次
+                text += (
+                    "。调用结果不确定：请求可能已送达 server，副作用可能已经发生——"
+                    "不要自动重试，先核实结果或告知用户。"
+                )
+            if self.reconnecting and not self._closing:
+                text += "（连接已断开，后台正在自动重连）"
+            return text
+        finally:
+            if token is not None:
+                with self._cond:
+                    self._progress_hooks.pop(token, None)
+        self._failures = 0
+        text, self.last_media = _render_result(result)
+        return text
+
+    def _initialize(self, version: str) -> dict[str, Any]:
+        """发 initialize；server 以"版本不支持"拒绝并列出它支持的版本时，挑一个
+        双方都认的重试一次。
+
+        规范的正路是 server 在响应里回一个它支持的版本（调用方据此协商），但
+        有的实现直接回错误、把支持的版本放在 error.data.supported 里。只重试
+        一次：第二次还不行就是真不兼容。
+        """
+
+        def call(protocol: str) -> dict[str, Any]:
+            return self._request(
+                "initialize",
+                {
+                    "protocolVersion": protocol,
+                    "capabilities": {},
+                    "clientInfo": {"name": "xiaoyu", "version": _version()},
+                },
+                timeout=INIT_TIMEOUT,
+            )
+
+        try:
+            return call(version)
+        except McpError as exc:
+            offered = exc.data.get("supported") if isinstance(exc.data, dict) else None
+            if not isinstance(offered, list):
+                raise
+            #  SUPPORTED_PROTOCOL_VERSIONS 按我方偏好排序：取第一个对方也认的
+            common = [
+                item for item in SUPPORTED_PROTOCOL_VERSIONS
+                if item != version and item in offered
+            ]
+            if not common:
+                raise
+            return call(common[0])
+
+    def _request(
+        self,
+        method: str,
+        params: dict[str, Any],
+        timeout: float,
+        stop_requested: Callable[[], bool] | None = None,
+    ) -> dict[str, Any]:
+        """发一个请求并等它的应答。timeout 是整个往返的 wall-clock 总时限，
+        两种传输同一个意思。stop_requested 给了就切片等、每片问一次，叫停时抛
+        kind="cancelled"。"""
+        with self._cond:
+            if self._dead:
+                raise McpError(self._exit_reason())
+            self._next_id += 1
+            request_id = self._next_id
+            awaited = self._awaited
+            awaited.add(request_id)
+        payload = {"jsonrpc": "2.0", "id": request_id, "method": method, "params": params}
+        try:
+            if self._http is not None:
+                reply = self._roundtrip(payload, timeout, stop_requested)
+            else:
+                if stop_requested is not None and stop_requested():
+                    raise McpError(_CANCELLED_UNSENT, kind="cancelled")
+                self._send(payload)
+                reply = self._await_reply(
+                    request_id, method, timeout, time.monotonic() + timeout, stop_requested
+                )
+        finally:
+            with self._cond:
+                awaited.discard(request_id)
+                #  不等了就把槽也清掉（应答恰好在放手那一刻落进来的）。换代之后
+                #  槽属于新一代，不碰
+                if self._awaited is awaited:
+                    self._responses.pop(request_id, None)
+        if "error" in reply:
+            error = reply["error"] if isinstance(reply["error"], dict) else {}
+            raise McpError(
+                f"{error.get('message', '未知错误')}（code {error.get('code')}）",
+                kind="rpc",
+                data=error.get("data"),
+            )
+        result = reply.get("result")
+        return result if isinstance(result, dict) else {}
+
+    def _await_reply(
+        self,
+        request_id: int,
+        method: str,
+        timeout: float,
+        deadline: float,
+        stop_requested: Callable[[], bool] | None = None,
+        exchange: _Exchange | None = None,
+    ) -> dict[str, Any]:
+        """等 request_id 的应答落进响应槽，到 deadline 为止。
+
+        走到这里请求已经发出：此后的退出/超时都是"结果不确定"。exchange 是
+        HTTP 往返的读线程状态——它收场了而应答没来，就不必再等。
+        不等了（超时 / 宿主叫停 / Ctrl-C）要告诉 server 一声，见 _notify_cancelled。
+        """
+        try:
+            while True:
+                #  叫停优先于同一时刻到达的应答：调用方已经不要这个结果了，
+                #  "拿到了"和"取消了"只能说一个
+                if stop_requested is not None and stop_requested():
+                    raise McpError(_CANCELLED_IN_FLIGHT, kind="cancelled")
+                with self._cond:
+                    if request_id in self._responses:
+                        return self._responses.pop(request_id)
+                    if exchange is not None and exchange.finished:
+                        #  规范：应答只会出现在这次 POST 自己的响应体里。流正常结束
+                        #  却没有它，等到总时限也不会有
+                        raise exchange.error or McpError(
+                            f"server 结束了应答却没有给出 {method} 的结果", kind="malformed"
+                        )
+                    if self._dead:
+                        raise McpError(self._exit_reason(), kind="dropped")
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise McpError(f"{method} 超时（{timeout:g}s）", kind="timeout")
+                    #  宿主的打断只是置一个标志，叫不醒条件变量：切成小片轮流看
+                    self._cond.wait(
+                        remaining if stop_requested is None else min(_STOP_POLL, remaining)
+                    )
+        except McpError as exc:
+            if exc.kind == "timeout":
+                self._notify_cancelled(request_id, method, "等待应答超时")
+            elif exc.kind == "cancelled":
+                self._notify_cancelled(request_id, method, "调用方已取消")
+            raise
+        except KeyboardInterrupt:
+            self._notify_cancelled(request_id, method, "调用方已取消")
+            raise
+
+    def _notify_cancelled(self, request_id: int, method: str, reason: str) -> None:
+        """已发出的请求不等了：告诉 server 别再算（notifications/cancelled）。
+
+        尽力而为，且绝不拖住调用方：放到独立线程里发——stdin 管道写满、远端
+        不应答时发送本身会阻塞，而调用方此刻正要脱身。失败静默：server 没收到
+        只是白算一场。initialize 按规范不可取消。
+        """
+        if method == "initialize":
+            return
+        payload = {
+            "jsonrpc": "2.0",
+            "method": "notifications/cancelled",
+            "params": {"requestId": request_id, "reason": reason},
+        }
+        channel = self._http
+
+        def send() -> None:
+            try:
+                if channel is not None:
+                    channel.post(payload, _CANCEL_NOTIFY_TIMEOUT)
+                else:
+                    self._send(payload)
+            except Exception:  # noqa: BLE001 - 尽力而为的告知，发不出去不是调用方的事
+                pass
+
+        self._start_worker(threading.Thread(
+            target=send, name=f"xiaoyu-mcp-cancel-{self.spec.name}", daemon=True
+        ))
+
+    def _notify(self, method: str) -> None:
+        self._send({"jsonrpc": "2.0", "method": method})
+
+    def _send(self, payload: dict[str, Any]) -> None:
+        if self._http is not None:
+            self._post(payload)
+            return
+        proc = self._proc
+        if proc is None or proc.stdin is None:
+            raise McpError("server 未启动")
+        line = json.dumps(payload, ensure_ascii=False)
+        try:
+            with self._write_lock:
+                proc.stdin.write(line + "\n")
+                proc.stdin.flush()
+        except (OSError, ValueError) as exc:
+            raise McpError(f"写入 server 失败（多半已退出）：{exc}") from exc
+
+    def _drain_stdout(self) -> None:
+        """读线程：逐行解析 stdout，直到 EOF（server 退出）。
+
+        一切写共享状态/发回调的动作都带 `self._proc is proc` 代际守卫：restart
+        换代后，旧读线程迟到的 EOF 不能把新一代标死，迟到的响应也不能污染
+        新一代的 id 空间（restart 会把 id 归零）。
+
+        不变量：读线程不管怎么离开读循环，都走到下面同一段收尾（判死、唤醒
+        等待方、报断线）。"进程活着、没人读、也没判死"是最坏的状态——在等的
+        请求各自干等到超时，此后每次调用都一样，也没有人去重连。
+        """
+        proc = self._proc
+        assert proc is not None and proc.stdout is not None
+        try:
+            for line in proc.stdout:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    message = json.loads(line)
+                except (ValueError, RecursionError):
+                    #  server 把日志错打到 stdout 是常见毛病，跳过非 JSON 行。
+                    #  嵌套深到解析器放弃的一帧（RecursionError）同样只丢这一帧
+                    continue
+                if not isinstance(message, dict):
+                    continue
+                try:
+                    self._dispatch(message, generation=proc)
+                except Exception:  # noqa: BLE001 - 一帧畸形降级的是这一帧，不是整条连接
+                    continue
+        except Exception:  # noqa: BLE001 - 读不下去了按断线收场，不能让线程带着异常无声退出
+            #  不是 EOF：进程多半还活着，但它的 stdout 已经没人读。收掉它，让
+            #  "进程已退出"成为事实——之后的判死、重连与进程自己崩掉走同一条路
+            if proc.poll() is None:
+                with contextlib.suppress(Exception):
+                    _kill_with_descendants(proc)
+        with self._cond:
+            if self._proc is not proc:
+                return
+            self._dead = True
+            self._cond.notify_all()
+        #  意外退出才报断线（主动 close/restart 不算）；manager 据此起重连线程
+        callback = self.on_disconnect
+        if callback is not None and not self._closing:
+            callback()
+
+    def _dispatch(self, message: dict[str, Any], generation: Any = None) -> None:
+        """一条收到的 JSON-RPC 消息 → 响应槽 / 反向请求应答 / 变更通知。
+
+        stdio 与 HTTP 共用。generation 是 stdio 读线程的代际守卫（restart 换代
+        后，旧线程迟到的响应不能污染新一代的 id 空间）；HTTP 那边的守卫在
+        读线程自己手里（见 _pump_exchange），传 None 即可。
+        """
+        if generation is not None and self._proc is not generation:
+            return
+        if "method" in message:
+            method = message.get("method")
+            if message.get("id") is not None:
+                self._answer_server_request(message)
+            elif method == "notifications/tools/list_changed":
+                #  热更新钩子：只报信，fetch/swap 由 manager 的独立线程做
+                #  （在本线程发请求会自锁死：响应正等着本线程派发）
+                callback = self.on_tools_changed
+                if callback is not None and not self._closing:
+                    callback()
+            elif method == "notifications/progress":
+                self._on_progress(message.get("params"))
+            elif method == "notifications/message":
+                self._on_log_message(message.get("params"))
+            #  其余通知（resources/prompts 的 list_changed…）一律忽略
+            return
+        if "id" in message:
+            response_id = message["id"]
+            #  我方发出去的 id 都是整数：列表、对象这类回来的 id 对不上任何请求，
+            #  还不能当字典键（直接抛 TypeError）。布尔是 int 的子类，一并挡掉
+            if not isinstance(response_id, (int, str)) or isinstance(response_id, bool):
+                return
+            with self._cond:
+                #  只收正在等的 id：迟到的、对不上任何请求的当场丢
+                if response_id in self._awaited:
+                    self._responses[response_id] = message
+                    self._cond.notify_all()
+
+    def _post(self, payload: dict[str, Any]) -> None:
+        """HTTP 传输发一条不等应答的消息（通知、对 server 反向请求的答复）。
+
+        不拿写锁：这类消息没有应答可错配；而答复 server 的反向请求往往就发生在
+        一次请求的往返当中（server 在应答流里夹一个 ping，等我方答了才继续）
+        ——那时写锁正被那次往返握着，再去拿就是自己等自己。
+        """
+        channel = self._http
+        if channel is None:
+            raise McpError("server 未启动")
+        try:
+            channel.post(payload, self.spec.timeout, dispatch=self._dispatch)
+        except McpError as exc:
+            self._http_failed(channel, payload.get("method"), exc)
+            raise
+
+    def _roundtrip(
+        self,
+        payload: dict[str, Any],
+        timeout: float,
+        stop_requested: Callable[[], bool] | None = None,
+    ) -> dict[str, Any]:
+        """HTTP 传输的一次请求往返：POST 出去，等到这个 id 的应答为止。
+
+        写锁包住整个往返：同一个 server 的请求串行（见 _HttpChannel）。往返本身
+        有 timeout 这个总时限，所以排在后面的请求等得再久也有界。
+        读应答放在独立线程里（_pump_exchange），本线程只看响应槽和时钟——
+        应答一到就走，不等流结束；总时限一到也走，不管 server 还在不在发心跳。
+        无论怎么离开都把连接掐掉，读线程不会留在那条流上。宿主叫停也是同一条
+        路：本线程放手、连接掐断；还在排队等写锁时叫停的，请求根本不发。
+        """
+        channel = self._http
+        if channel is None:
+            raise McpError("server 未启动")
+        method = str(payload.get("method"))
+        exchange = _Exchange()
+        try:
+            #  排队也要看打断：占着写锁的可能是别的会话的一次慢调用
+            while not self._write_lock.acquire(
+                timeout=-1 if stop_requested is None else _STOP_POLL
+            ):
+                if stop_requested is not None and stop_requested():
+                    raise McpError(_CANCELLED_UNSENT, kind="cancelled")
+            try:
+                if stop_requested is not None and stop_requested():
+                    raise McpError(_CANCELLED_UNSENT, kind="cancelled")
+                deadline = time.monotonic() + timeout
+                self._start_worker(threading.Thread(
+                    target=self._pump_exchange,
+                    args=(channel, payload, timeout, exchange),
+                    name=f"xiaoyu-mcp-post-{self.spec.name}",
+                    daemon=True,
+                ))
+                try:
+                    return self._await_reply(
+                        payload["id"], method, timeout, deadline, stop_requested, exchange
+                    )
+                finally:
+                    exchange.abandon()
+            finally:
+                self._write_lock.release()
+        except McpError as exc:
+            self._http_failed(channel, method, exc)
+            raise
+
+    def _pump_exchange(
+        self,
+        channel: _HttpChannel,
+        payload: dict[str, Any],
+        timeout: float,
+        exchange: _Exchange,
+    ) -> None:
+        """HTTP 往返的读线程：发出请求，把读到的消息逐条派发，收场时报告结局。"""
+
+        def deliver(message: dict[str, Any]) -> None:
+            #  等待方已经放手、或 restart 换了通道之后才读到的，不再派发
+            if exchange.abandoned or self._http is not channel:
+                return
+            try:
+                self._dispatch(message)
+            except Exception:  # noqa: BLE001 - 一条消息处理出错只丢这一条（与 stdio 读线程同一条规矩）
+                pass
+
+        error: McpError | None = None
+        try:
+            channel.post(payload, timeout, dispatch=deliver, exchange=exchange)
+        except McpError as exc:
+            error = exc
+        except Exception as exc:  # noqa: BLE001 - 读线程不能带着异常无声退场，等待方要有个结局
+            error = McpError(
+                f"读取 {self.spec.name} 的应答时出错：{type(exc).__name__}: {exc}",
+                kind="malformed",
+            )
+        with self._cond:
+            exchange.error = error
+            exchange.finished = True
+            self._cond.notify_all()
+
+    def _http_failed(self, channel: _HttpChannel, method: Any, exc: McpError) -> None:
+        """HTTP 往返出错后的去向，按 exc.kind 分流（见 McpError 分类表）：
+        断线类判死并报断线（manager 走与 stdio 同一套重连与预算）；认证失败
+        判死并报停用（不重试）；其余只往上抛，不判死——一次 5xx 或读超时就
+        永久拉黑整组工具代价太大，连败由 call_tool 的熔断兜底。
+
+        initialize 的错误一律只往上抛：启动失败与 restart 失败各有调用方兜底
+        （后者计入重连预算），这里再报断线会和重连线程自己打架。
+        换代守卫：restart 已换上新通道时，旧通道迟到的失败不能把新一代标死。
+        """
+        if method == "initialize" or self._http is not channel or self._closing:
+            return
+        if exc.kind == "auth":
+            with self._cond:
+                self.fatal_error = str(exc)
+                self._dead = True
+                self._cond.notify_all()
+            failure = self.on_failure
+            if failure is not None:
+                failure(str(exc))
+            return
+        if exc.kind not in _RECONNECT_KINDS:
+            return
+        with self._cond:
+            self._dead = True
+            self._cond.notify_all()
+        callback = self.on_disconnect
+        if callback is not None:
+            callback()
+
+    def _answer_server_request(self, message: dict[str, Any]) -> None:
+        """server 反向发来的请求：ping 回 pong，其余一律 method-not-found。
+
+        不接 sampling/roots/elicitation——那是让 server 反过来使唤客户端的通道，
+        小羽不开放。不回错误响应会让规矩的 server 干等，所以要显式拒绝。
+        """
+        method = message.get("method")
+        if method == "ping":
+            reply: dict[str, Any] = {"jsonrpc": "2.0", "id": message["id"], "result": {}}
+        else:
+            reply = {
+                "jsonrpc": "2.0",
+                "id": message["id"],
+                "error": {"code": -32601, "message": f"xiaoyu 不支持 {method}"},
+            }
+        try:
+            self._send(reply)
+        except McpError:
+            pass
+
+    def _on_progress(self, params: Any) -> None:
+        """notifications/progress → 对应在飞调用的回调。对不上 token 的（调用已
+        返回/超时之后才到的）当场丢。"""
+        if not isinstance(params, dict):
+            return
+        token = params.get("progressToken")
+        if isinstance(token, str) and token.isdigit():
+            token = int(token)
+        if not isinstance(token, int) or isinstance(token, bool):
+            return
+        with self._cond:
+            hook = self._progress_hooks.get(token)
+        if hook is None:
+            return
+        progress = params.get("progress")
+        total = params.get("total")
+        message = params.get("message")
+        info = {
+            "progress": float(progress) if isinstance(progress, (int, float)) and not isinstance(progress, bool) else None,
+            "total": float(total) if isinstance(total, (int, float)) and not isinstance(total, bool) else None,
+            "message": message if isinstance(message, str) else "",
+        }
+        with contextlib.suppress(Exception):
+            hook(info)
+
+    def _on_log_message(self, params: Any) -> None:
+        """notifications/message（server 的日志）：全部级别追加进本 server 的日志
+        文件，warning 及以上再经 on_log 上屏。debug/info 不上屏——那是 server 自己
+        的运行流水，刷到用户眼前只会淹掉真正要紧的那一条。"""
+        if not isinstance(params, dict):
+            return
+        level = str(params.get("level") or "info").lower()
+        data = params.get("data")
+        if isinstance(data, str):
+            text = data
+        else:
+            try:
+                text = json.dumps(data, ensure_ascii=False)
+            except (TypeError, ValueError):
+                text = str(data)
+        logger = params.get("logger")
+        prefix = f"[{level}{' ' + str(logger) if isinstance(logger, str) and logger else ''}]"
+        #  server 发来的文本不可信：控制序列先摘掉再落盘/上屏，长度封顶
+        text = ui.strip_sequences(_redact(text)).strip()
+        if len(text) > _LOG_MESSAGE_CAP:
+            text = text[:_LOG_MESSAGE_CAP] + "…"
+        with contextlib.suppress(OSError):
+            self.log_path.parent.mkdir(parents=True, exist_ok=True)
+            with open(self.log_path, "a", encoding="utf-8") as handle:
+                handle.write(f"{time.strftime('%H:%M:%S')} {prefix} {text}\n")
+        callback = self.on_log
+        if callback is not None and level in _LOG_SURFACE_LEVELS and not self._closing:
+            with contextlib.suppress(Exception):
+                callback(level, text)
+
+    def _exit_reason(self) -> str:
+        if self._http is not None:
+            return f"与远端 server 的连接已断开（{display_url(self.spec.url)}）"
+        code = self._proc.returncode if self._proc else None
+        return f"server 进程已退出（exit {code}）。{log_hint(self.log_path)}"
+
+
+def _version() -> str:
+    from . import __version__
+
+    return __version__
+
+
+def _render_result(result: dict[str, Any]) -> tuple[str, list[dict[str, Any]]]:
+    """tools/call 的 result → (回给模型的文本, 图片部件列表)。
+
+    text/resource 与 structuredContent 并存；仅去掉文字部件中已有的同一份 JSON。
+
+    **图片单独返回、不在这里做取舍**：能不能真的发给模型，取决于当前路由到的
+    型号（见 Registry.sees_images），而协议层不知道也不该知道模型是谁。这里只
+    负责把 base64 落盘换成引用（见 media.store_base64），由 agent 决定是随后
+    附给模型、还是降级成一行说明。audio 仍是纯占位：内核没有音频通路。
+    """
+    parts: list[str] = []
+    images: list[dict[str, Any]] = []
+    for item in result.get("content") or []:
+        if not isinstance(item, dict):
+            continue
+        kind = item.get("type")
+        if kind == "text":
+            parts.append(str(item.get("text", "")))
+        elif kind == "image":
+            ref, problem = media.store_base64(
+                str(item.get("data") or ""), str(item.get("mimeType") or "")
+            )
+            if ref:
+                images.append(media.image_part(ref))
+            else:
+                parts.append(f"[image 内容已省略：{problem}]")
+        elif kind == "audio":
+            parts.append("[audio 内容已省略：无法回灌给文本模型]")
+        elif kind == "resource":
+            resource = item.get("resource") or {}
+            text = resource.get("text")
+            parts.append(
+                str(text)
+                if text is not None
+                else f"[二进制资源已省略：{resource.get('uri', '?')}]"
+            )
+        elif kind == "resource_link":
+            parts.append(f"[资源链接] {item.get('uri', '?')} {item.get('description', '')}".rstrip())
+    structured = result.get("structuredContent")
+    if isinstance(structured, dict):
+        canonical = json.dumps(structured, ensure_ascii=False, sort_keys=True)
+        duplicate = False
+        for item in result.get("content") or []:
+            if not isinstance(item, dict) or item.get("type") != "text":
+                continue
+            try:
+                duplicate = json.dumps(json.loads(item.get("text", "")), ensure_ascii=False, sort_keys=True) == canonical
+            except (ValueError, TypeError):
+                continue
+            if duplicate:
+                break
+        if not duplicate:
+            parts.append(json.dumps(structured, ensure_ascii=False))
+    text = "\n".join(part for part in parts if part) or "(空结果)"
+    #  isError 是"工具执行失败"（参数错、业务失败），前缀 ERROR: 对齐内置工具的
+    #  约定，让主循环的 ok 统计和模型的自愈路径都能识别。错误文本过凭据脱敏：
+    #  server 把带 token 的请求原样回显进报错是常见毛病。
+    if result.get("isError"):
+        #  失败结果里的图片不往上带：模型这一轮该看的是错误原因
+        return f"ERROR: {_redact(text)}", []
+    return text, images
+
+
+#  schema 归一时要递归进去的位置。properties 等的 **key 是用户属性名不是关键字**，
+#  只递归 value 绝不改 key（改了 key 的典型翻车：把名为 definitions 的参数改名，
+#  生成非法属性名，整个 tools 数组 400）。
+_SCHEMA_MAP_KEYS = ("properties", "patternProperties", "$defs", "definitions")
+_SCHEMA_LIST_KEYS = ("anyOf", "oneOf", "allOf", "prefixItems")
+_SCHEMA_ONE_KEYS = ("items", "additionalProperties", "not", "if", "then", "else")
+
+
+def _normalize_schema(node: Any) -> Any:
+    """server 返回的 inputSchema 最小消毒。
+
+    严格校验的端点（Gemini / Kimi / OpenAI strict）会因一个畸形 schema 把整个
+    tools 数组 400——一个坏 server 殃及全部工具。只修四类高频畸形：
+    - 裸字符串 schema（additionalProperties: "object" 这类 server 输出 bug）
+    - type 是数组：["string","null"] 折叠成 "string"（取第一个非 null）
+    - required 里指向不存在属性的项剪掉（Gemini 会 400）
+    - 有 properties 却缺 type 的补 "object"
+    - anyOf / oneOf 全是纯 const 的折叠成 enum（_collapse_const_union）
+    只递归 schema 位置；required/enum/examples 的值不是 schema，不进去
+    （进去会把字面量误当裸字符串 schema 替换掉）。$ref 的内联在它之前单独
+    一遍（_inline_refs），那需要看整棵树。
+    """
+    if isinstance(node, str):
+        return {"type": "object", "properties": {}}
+    if not isinstance(node, dict):
+        return node
+    node = dict(node)  # 浅拷贝：不改 server 给的原对象
+    if isinstance(node.get("description"), str):
+        #  参数描述与工具描述一样是 server 写给模型看的文本
+        node["description"] = strip_invisible(node["description"], "MCP 工具的参数描述")
+    kind = node.get("type")
+    if isinstance(kind, list):
+        non_null = [item for item in kind if item != "null"]
+        node["type"] = non_null[0] if non_null else "null"
+    for key in _SCHEMA_MAP_KEYS:
+        if isinstance(node.get(key), dict):
+            node[key] = {name: _normalize_schema(sub) for name, sub in node[key].items()}
+    for key in _SCHEMA_LIST_KEYS:
+        if isinstance(node.get(key), list):
+            node[key] = [_normalize_schema(sub) for sub in node[key]]
+    for key in _SCHEMA_ONE_KEYS:
+        #  additionalProperties 的合法布尔值不动
+        if key in node and not isinstance(node[key], bool):
+            node[key] = _normalize_schema(node[key])
+    properties = node.get("properties")
+    if "type" not in node and isinstance(properties, dict):
+        node["type"] = "object"
+    if isinstance(node.get("required"), list) and isinstance(properties, dict):
+        node["required"] = [name for name in node["required"] if name in properties]
+    node = _collapse_const_union(node)
+    return node
+
+
+#  const 折叠时 Python 类型 → JSON Schema 类型名。bool 必须排在 int 之前判断
+#  （Python 里 bool 是 int 子类，顺序反了 true/false 会被并进整数枚举）
+_CONST_TYPES: tuple[tuple[type, str], ...] = (
+    (bool, "boolean"),
+    (int, "integer"),
+    (float, "number"),
+    (str, "string"),
+)
+
+
+def _collapse_const_union(node: dict[str, Any]) -> dict[str, Any]:
+    """anyOf / oneOf 全是同型纯 const 时折叠成 enum。
+
+    某些语言生态的 server 把闭集枚举生成为
+    `{"anyOf": [{"const": "red"}, {"const": "green"}]}`（带文档的枚举则是
+    oneOf，每个分支各带一句 description），而严格校验的端点对这种形态要么
+    拒绝要么误处理，property 级 `enum` 才是通行形态。
+    只在**每个非 null 分支都是同一 primitive 类型的纯 const**（分支里除
+    const 外只有注解类键）时才折叠；单个 {"type":"null"} 分支容忍并丢弃
+    ——与上面 type 数组折叠丢 null 的既有取舍一致（运行期报错好过注册期
+    整个 tools 数组 400）。混合 union 原样穿透。分支序保序。
+    分支各自的 description 不能随折叠丢掉——那是模型选值的依据——并进
+    节点 description 里，一值一行。两种键同时存在时不动：那不是枚举。
+    """
+    keys = [key for key in ("anyOf", "oneOf") if isinstance(node.get(key), list) and node[key]]
+    if len(keys) != 1:
+        return node
+    key = keys[0]
+    branches = node[key]
+    values: list[Any] = []
+    notes: list[str] = []
+    kind: str | None = None
+    for branch in branches:
+        if not isinstance(branch, dict):
+            return node
+        if branch.get("type") == "null" and "const" not in branch:
+            continue  # 可空标记：容忍并丢弃
+        if "const" not in branch:
+            return node
+        value = branch["const"]
+        for py_type, name in _CONST_TYPES:
+            if isinstance(value, py_type):
+                if kind is None:
+                    kind = name
+                elif kind != name:
+                    return node  # 跨类型混合：不折叠
+                break
+        else:
+            return node  # 非 primitive const（对象/数组/None）：不折叠
+        #  同型才走到这里，True==1 跨型撞值的坑已被 kind 检查挡在门外
+        if value not in values:
+            values.append(value)
+            if isinstance(branch.get("description"), str) and branch["description"].strip():
+                notes.append(
+                    f"{json.dumps(value, ensure_ascii=False)}: {branch['description'].strip()}"
+                )
+    if kind is None or not values:
+        return node
+    node = dict(node)
+    del node[key]
+    node["type"] = kind
+    node["enum"] = values
+    if notes:
+        head = node.get("description")
+        head = head.strip() if isinstance(head, str) else ""
+        node["description"] = "\n".join(([head] if head else []) + notes)
+    return node
+
+
+#  $ref 只认指向本 schema 顶层定义表的两种写法；外部 URI、指向 properties
+#  深处的 JSON pointer 都不动
+_LOCAL_REF = re.compile(r"^#/(\$defs|definitions)/([^/]+)$")
+#  老方言下 $ref 旁边的键按规范被忽略、定义表叫 definitions 且常带 id 解析：
+#  按新语义内联会改变含义，整个跳过
+_OLD_DIALECT = re.compile(r"draft-0[0-4]\b")
+#  链式引用（A 引 B 引 C）逐遍内联到不动为止的上限；超过说明是环
+_INLINE_PASSES = 8
+
+
+def _inline_refs(schema: dict[str, Any]) -> dict[str, Any]:
+    """把 `$ref: #/$defs/x`（或 definitions）指向的叶子定义就地内联，剪掉没人引用的定义。
+
+    Gemini 的函数声明不认 $ref（见到直接 400）、OpenAI strict 对 $defs 另有
+    规矩，而 pydantic / zod 这类生成器对嵌套模型默认都走 $ref。只内联**叶子**
+    定义（自身不再含 $ref 的）；链式引用多遍收敛；递归定义（自己引自己）永远
+    成不了叶子，原样留着——它本来就表达不成函数声明，不硬拆。引用处与定义
+    合并时引用处的注解（description 等）优先：生成器把字段文档写在引用处。
+    `$schema` 标明 draft-04 及更老方言的整个跳过。
+    """
+    dialect = schema.get("$schema")
+    if isinstance(dialect, str) and _OLD_DIALECT.search(dialect):
+        return schema
+
+    def tables(root: dict[str, Any]) -> dict[str, dict[str, Any]]:
+        found: dict[str, dict[str, Any]] = {}
+        for key in ("$defs", "definitions"):
+            table = root.get(key)
+            if isinstance(table, dict):
+                for name, definition in table.items():
+                    if isinstance(definition, dict):
+                        found[f"#/{key}/{name}"] = definition
+        return found
+
+    def walk(node: Any, leaves: dict[str, dict[str, Any]], seen: set[str]) -> Any:
+        """只沿 schema 位置递归（与 _normalize_schema 同一张键表），记下遇到的 $ref。"""
+        if isinstance(node, list):
+            return [walk(item, leaves, seen) for item in node]
+        if not isinstance(node, dict):
+            return node
+        ref = node.get("$ref")
+        if isinstance(ref, str) and ref in leaves:
+            node = {**leaves[ref], **{key: value for key, value in node.items() if key != "$ref"}}
+        elif isinstance(ref, str):
+            seen.add(ref)
+        node = dict(node)
+        for key in _SCHEMA_MAP_KEYS:
+            if isinstance(node.get(key), dict):
+                node[key] = {name: walk(sub, leaves, seen) for name, sub in node[key].items()}
+        for key in _SCHEMA_LIST_KEYS:
+            if isinstance(node.get(key), list):
+                node[key] = [walk(sub, leaves, seen) for sub in node[key]]
+        for key in _SCHEMA_ONE_KEYS:
+            if key in node and not isinstance(node[key], bool):
+                node[key] = walk(node[key], leaves, seen)
+        return node
+
+    def contains_ref(node: Any) -> bool:
+        probe: set[str] = set()
+        walk(node, {}, probe)
+        return bool(probe)
+
+    if not tables(schema):
+        return schema
+    seen: set[str] = set()
+    for _ in range(_INLINE_PASSES):
+        defs = tables(schema)
+        leaves = {ref: definition for ref, definition in defs.items() if not contains_ref(definition)}
+        seen = set()
+        schema = walk(schema, leaves, seen)
+        if not (seen & set(defs)):
+            break  # 剩下的引用都不指向本地定义（或已无引用）：收敛
+    #  剪掉没人引用的定义（含刚被内联掉的）；表空了整个键去掉
+    for key in ("$defs", "definitions"):
+        table = schema.get(key)
+        if not isinstance(table, dict):
+            continue
+        kept = {name: sub for name, sub in table.items() if f"#/{key}/{name}" in seen}
+        if kept:
+            schema[key] = kept
+        else:
+            del schema[key]
+    return schema
+
+
+# ---------- 远程工具 + 管理器 ----------
+
+
+@dataclass
+class RemoteTool:
+    """一个已就绪的 MCP 工具，字段与 tools.Tool 对齐（由 Toolbox 包装注册）。
+
+    不直接依赖 tools.Tool 类型：mcp.py 不 import tools，避免循环引用。
+    """
+
+    name: str
+    description: str
+    parameters: dict[str, Any]
+    handler: Callable[..., str]
+    check_fn: Callable[[], bool]
+    #  来源 server 名（检索模式按 server 分组/公告用；从消毒后的全限定名
+    #  反解不可靠，这里存原名）
+    server: str = ""
+    #  server 侧原始工具名与声明指纹：代际 swap 靠它们判断原位替换还是保留
+    raw_name: str = ""
+    fingerprint: str = ""
+    #  来源 server 声明了 trustContent：结果不套不可信标记（见 ServerSpec.trust_content）
+    trust_content: bool = False
+
+
+def _make_remote_tool(
+    manager: "McpManager", server: McpServer, declared: dict[str, Any]
+) -> RemoteTool:
+    tool_name = str(declared.get("name", ""))
+    exposed = public_tool_name(server.spec.name, tool_name)
+    #  工具描述是 server 写给模型看的、用户基本不读的文本：隐形字符先剥
+    #  （参数描述在 _normalize_schema 里剥）
+    description = strip_invisible(
+        str(declared.get("description") or "").strip(),
+        f"MCP server {server.spec.name} 的工具描述",
+    ) or "(server 未提供描述)"
+    if len(description) > _DESCRIPTION_CAP:
+        description = description[:_DESCRIPTION_CAP] + "…"
+    #  描述里带上来源：审批框里用户一眼看出这是哪个 server 的能力
+    description = f"[MCP·{server.spec.name}] {description}"
+    schema = declared.get("inputSchema")
+    if isinstance(schema, dict):
+        schema = _normalize_schema(_inline_refs(schema))
+    if not isinstance(schema, dict) or schema.get("type") != "object":
+        #  缺失/畸形 schema 补一个空对象 schema：OpenAI 端点会拒绝非 object 的顶层
+        schema = {"type": "object", "properties": {}}
+
+    def handler(**kwargs: Any) -> str:
+        #  惰性启动：schema 缓存注册的工具在第一次真实调用时才 spawn server
+        try:
+            server.ensure_started()
+        except McpError as exc:
+            return (
+                _with_log_hint(f"ERROR: MCP server {server.spec.name} 启动失败：{exc}", server.log_path)
+                + f"；告知用户修好后执行 /mcp reconnect {server.spec.name} 恢复"
+            )
+        #  缓存与现实对账（每 server 一次）：server 新增的工具补注册
+        manager.reconcile(server)
+        if tool_name not in server.live_names:
+            return (
+                f"ERROR: MCP server {server.spec.name} 的当前版本不再提供 {tool_name}"
+                "（schema 缓存已过期并刷新，该工具随后会从列表消失）。换其它工具。"
+            )
+        stop = getattr(_call_scope, "stop", None)
+        text = server.call_tool(tool_name, kwargs, stop_requested=stop)
+        if stop is not None and stop():
+            #  宿主叫停了：打断照常往上走，不折成一条普通结果让主循环接着跑。
+            #  这次调用的文本挂在异常上、由主循环写进历史——取消的说明，或恰好
+            #  赶在叫停前拿到的结果，模型下一轮都看得到
+            interrupted = Interrupted("宿主请求打断")
+            attach_partial(interrupted, lambda: text)
+            raise interrupted
+        #  图片紧接着取走交给 manager 暂存：工具 handler 的返回值形状是"文本"，
+        #  这条约定不为多模态破例（trace / 审批预览 / 权限规则全靠它）
+        manager.stash_media(server.last_media)
+        return text
+
+    def check() -> bool:
+        if server.start_error or server.fatal_error:
+            return False
+        if not server.started:
+            #  缓存待启动：必须可见，否则模型永远不会发起那第一次调用
+            return True
+        return server.alive() and tool_name in server.live_names
+
+    return RemoteTool(
+        name=exposed,
+        description=description,
+        parameters=schema,
+        handler=handler,
+        check_fn=check,
+        server=server.spec.name,
+        raw_name=tool_name,
+        fingerprint=mcp_guard.tool_fingerprint(declared),
+        trust_content=server.spec.trust_content,
+    )
+
+
+class McpManager:
+    """一组 server 的启动与状态。启动全程后台线程，公开方法只读快照、线程安全。"""
+
+    #  重连预算（类属性便于测试改小）：
+    #  首个延迟 0.5s 逐次翻倍封顶 30s；一次 outage 内最多 10 次；
+    #  连接存活 ≥ RECONNECT_MAX_DELAY（稳定窗 = 退避上限）即视为 outage 结束
+    RECONNECT_INITIAL_DELAY = 0.5
+    RECONNECT_MAX_DELAY = 30.0
+    RECONNECT_MAX_ATTEMPTS = 10
+
+    def __init__(
+        self,
+        specs: list[ServerSpec],
+        spec_loader: Callable[[], list[ServerSpec]] | None = None,
+        *,
+        trust_tool_changes: bool = False,
+        state_dir: Path | None = None,
+        inherit_environment: bool = True,
+        use_cache: bool = True,
+    ) -> None:
+        self._specs = specs
+        #  全局"变更工具不隔离"（Config.mcp_trust_changes：--unguarded 预设的落点）。
+        #  与环境变量 XIAOYU_MCP_TRUST_CHANGES 同义，二者任一即开
+        self._trust_tool_changes = trust_tool_changes
+        self._inherit_environment = inherit_environment
+        #  重读配置的函数（/mcp reconnect 用）：必须是启动时同一条加载路径
+        #  （folder trust 门 + 加载期准入 + ${env:VAR} 展开），由 launch 接线。
+        #  None = 清单是宿主直接给的，热恢复沿用现有声明
+        self._spec_loader = spec_loader
+        self._lock = threading.Lock()
+        self._servers: dict[str, McpServer] = {}
+        self._owned_servers: list[McpServer] = []
+        #  name → "loading" | "ready" | "cached" | "failed: …" | "blocked: …" | "closed"
+        self._states: dict[str, str] = {spec.name: "loading" for spec in specs}
+        #  就绪工具的 append-only 列表：Toolbox 每次组装 schemas 前来同步一次
+        self._tools: list[RemoteTool] = []
+        #  最近一次工具调用产出的图片部件，等 Toolbox 取走（见 take_media）
+        self._media: list[dict[str, Any]] = []
+        self._caller_media = threading.local()
+        self._closed = False
+        #  每个 server 最近一次拿到的完整声明（缓存或 live）与已注册工具原名，
+        #  /mcp approve 与对账去重靠它们
+        self._declared: dict[str, list[dict[str, Any]]] = {}
+        self._registered: dict[str, set[str]] = {}
+        self._quarantined: dict[str, list[str]] = {}
+        self._reconciled: set[str] = set()
+        #  在飞的后台启动线程：close 时逐个 join，收尾必须同步完成
+        self._boot_threads: list[threading.Thread] = []
+        #  代际服务线程（re-sync / 重连）及其调度状态。dirty/running 两集合
+        #  实现通知合并：re-sync 进行中又来通知只置 dirty，循环消化不堆线程
+        self._service_threads: list[threading.Thread] = []
+        self._resync_dirty: set[str] = set()
+        self._resync_running: set[str] = set()
+        self._reconnecting: set[str] = set()
+        #  已不可恢复地失败（认证被拒）的 server：不再立案重连
+        self._failed_hard: set[str] = set()
+        #  tools 名单里 server 没提供的名字，已告警过的（server → 缺的那组）：
+        #  同一组只报一次，换代后缺的变了再报
+        self._tools_warned: dict[str, tuple[str, ...]] = {}
+        #  on_log(server, level, text) ← server 的 notifications/message（warning 及以上）。
+        #  由持有 manager 的顶层工具箱接线到前端；没接线就打 stderr
+        self.on_log: Callable[[str, str, str], None] | None = None
+        #  close 时置位：重连线程的退避等待立即醒来退场
+        self._close_event = threading.Event()
+        #  工具指纹基线（防 rug-pull）与 schema 缓存都放用户配置目录
+        self._state_dir = Path(state_dir) if state_dir is not None else user_config_dir()
+        self._baseline_path = self._state_dir / "mcp-approved.json"
+        self._cache_path = self._state_dir / "cache" / "mcp-schemas.json"
+        self._baseline = mcp_guard.load_baseline(self._baseline_path)
+        #  上次批准/首见时的声明正文（description + inputSchema），/mcp diff 的"上次"。
+        #  与基线同步写；没有它裁决照常，只是 diff 退化成"只能看这次的"
+        self._decls_path = self._state_dir / "mcp-approved-decls.json"
+        self._decls = mcp_guard.load_declarations(self._decls_path)
+        self._cache = self._load_cache() if use_cache and _enabled("XIAOYU_MCP_CACHE") else {}
+
+    def _new_server(self, spec: ServerSpec) -> McpServer:
+        """建一个 server 对象：日志路径 + 日志通知接线，三条创建路径共用。"""
+        server = McpServer(spec, log_path=self._log_path(spec.name, self._state_dir))
+        server.on_log = lambda level, text: self._surface_log(spec.name, level, text)
+        return server
+
+    def _surface_log(self, name: str, level: str, text: str) -> None:
+        callback = self.on_log
+        if callback is not None:
+            callback(name, level, text)
+        else:
+            print(f"[MCP {name} {level}] {text}", file=sys.stderr)
+
+    def _permitted_locked(
+        self, name: str, spec: ServerSpec, declared: list[dict[str, Any]]
+    ) -> list[dict[str, Any]]:
+        """按声明的 tools 名单过滤一代声明。名单里 server 没提供的名字告警一次：
+        多半是拼错了，静默的话用户以为工具在、模型却永远检索不到。"""
+        if spec.tools is None:
+            return declared
+        offered = {str(item.get("name", "")) for item in declared}
+        missing = tuple(tool for tool in spec.tools if tool not in offered)
+        if missing and self._tools_warned.get(name) != missing:
+            self._tools_warned[name] = missing
+            print(
+                f"[MCP {name}：tools 名单里的 {', '.join(missing[:5])}"
+                f"{'…' if len(missing) > 5 else ''} 这个 server 没有提供"
+                f"（它提供 {len(offered)} 个：{', '.join(sorted(offered)[:8])}"
+                f"{'…' if len(offered) > 8 else ''}），核对 mcp.json 里的拼写]",
+                file=sys.stderr,
+            )
+        return [item for item in declared if str(item.get("name", "")) in spec.tools]
+
+    def _load_cache(self) -> dict[str, Any]:
+        try:
+            data = json.loads(self._cache_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return {}
+        if not isinstance(data, dict) or data.get("version") != 1:
+            return {}
+        servers = data.get("servers")
+        return servers if isinstance(servers, dict) else {}
+
+    def start(self) -> None:
+        for spec in self._specs:
+            #  schema 缓存命中：零进程直接注册工具，
+            #  首次真实调用才 spawn——解掉"懒加载导致首轮模型看不见工具"的鸡生蛋。
+            #  配置指纹不匹配 = 缓存作废，走正常后台启动。
+            entry = self._cache.get(spec.name)
+            if (
+                isinstance(entry, dict)
+                and entry.get("fingerprint") == spec_fingerprint(spec)
+                and isinstance(entry.get("tools"), list)
+            ):
+                server = self._new_server(spec)
+                server.server_info = str(entry.get("server_info", ""))
+                with self._lock:
+                    self._owned_servers.append(server)
+                    self._servers[spec.name] = server
+                    error = declared_violation(entry["tools"]) or self._swap_generation_locked(
+                        spec.name, server, entry["tools"]
+                    )
+                    self._states[spec.name] = f"failed: {error}" if error else "cached"
+                continue
+            thread = threading.Thread(
+                target=self._bootstrap_one,
+                args=(spec,),
+                name=f"xiaoyu-mcp-boot-{spec.name}",
+                daemon=True,
+            )
+            self._boot_threads.append(thread)
+            thread.start()
+
+    def _bootstrap_one(self, spec: ServerSpec) -> None:
+        server = self._new_server(spec)
+        with self._lock:
+            self._owned_servers.append(server)
+        try:
+            declared = server.bootstrap()
+        except McpError as exc:
+            server.close()
+            #  stdio 的启动失败原因多半在 server 自己的 stderr 里：状态里直接带日志尾部，
+            #  /mcp 一眼看到，不必再去翻文件
+            reason = str(exc)
+            if not spec.is_http and "排障看日志" not in reason:
+                reason += tail_text(server.log_path)
+            with self._lock:
+                self._states[spec.name] = f"failed: {reason}"
+            return
+        except Exception as exc:  # noqa: BLE001 - 单个 server 崩不拦其它的
+            server.close()
+            with self._lock:
+                self._states[spec.name] = f"failed: {type(exc).__name__}: {exc}"
+            return
+        try:
+            error = declared_violation(declared)
+            with self._lock:
+                #  manager 已被关闭（退出/测试清理）：不注册，把刚拉起的子进程收掉。
+                #  没有这一步，关闭时还在启动中的 server 会变成孤儿进程。
+                if self._closed:
+                    self._states[spec.name] = "closed"
+                else:
+                    error = error or self._swap_generation_locked(spec.name, server, declared)
+                    if error:
+                        self._states[spec.name] = f"failed: {error}"
+                    else:
+                        self._servers[spec.name] = server
+                        #  live 启动的不需要再对账
+                        self._reconciled.add(spec.name)
+                        self._states[spec.name] = "ready"
+                        self._write_cache_locked(spec, server)
+                        self._supervise_locked(server)
+                        return
+        except Exception as exc:  # noqa: BLE001 - 启动线程带着异常退场，状态就永远停在 loading
+            #  注册到一半出的错：这一代不留任何东西（工具、登记、进程），状态
+            #  亮出原因——wait_ready 不必等满超时，close 之后也不会剩下孤儿进程
+            with self._lock:
+                self._drop_generation_locked(spec.name)
+                self._servers.pop(spec.name, None)
+                self._states[spec.name] = f"failed: {type(exc).__name__}: {exc}"
+        server.close()
+
+    def _swap_generation_locked(
+        self, name: str, server: McpServer, declared: list[dict[str, Any]]
+    ) -> str | None:
+        """整代 swap 的落笔阶段：基线裁决 → 冲突预检 → 建好新一代 →
+        落笔（基线、声明存档、与现役代对齐：原位替换 / 删除 / 追加）。持锁调用；幂等。
+
+        fetch 与 declared_violation 校验由调用方在锁外完成——这里
+        只做落笔。注册表就在本进程锁内，所以冲突可以**先检查后落笔**，
+        冲突时上一代原样保留继续服务（先卸旧代再注册的顺序做不到这一点，
+        冲突只能回滚到零）。返回错误原因文本；成功返回 None。
+
+        顺序纪律：保留/替换的工具停在原位（原位替换 = dict 覆盖语义，full-schema
+        模式的 prompt cache 前缀不动），删除只挪后缀，新工具追加在最尾。
+        """
+        #  tools 名单在裁决之前过滤：名单外的工具不进基线也不比对——它们的描述
+        #  怎么变都与本会话无关，不该为此隔离整代
+        declared = self._permitted_locked(name, server.spec, declared)
+        admitted, quarantined, updates = mcp_guard.admit_tools(
+            self._baseline.get(name, {}), declared
+        )
+        trusted_by = (
+            "trustToolChanges"
+            if server.spec.trust_tool_changes
+            else "XIAOYU_MCP_TRUST_CHANGES"
+            if self._trust_tool_changes or (self._inherit_environment and _opted_in("XIAOYU_MCP_TRUST_CHANGES"))
+            else ""
+        )
+        if quarantined and trusted_by:
+            #  信任开关（逐 server 的 trustToolChanges / 全局环境变量）：变更工具照单
+            #  全收、基线跟着刷新，只留一行痕迹。仍走同一条 admit 路径而不是绕过
+            #  基线——基线要持续跟上，日后把开关关掉时才有正确的"上次"可比，
+            #  而不是从开关打开那天起全是陈年指纹。
+            for item in declared:
+                raw = str(item.get("name", ""))
+                if raw in quarantined:
+                    updates[raw] = mcp_guard.tool_fingerprint(item)
+            admitted, accepted, quarantined = list(declared), quarantined, []
+            print(
+                f"[MCP {name}：{len(accepted)} 个工具的描述/schema 相对上次已变化，"
+                f"按 {trusted_by} 自动接受并刷新基线：{', '.join(accepted[:5])}]",
+                file=sys.stderr,
+            )
+        new_decls = {str(item.get("name", "")): item for item in admitted}
+        #  跨 server 冲突预检：确定性命名下冲突只可能是别的 server 占了
+        #  本 server 的命名空间（如 a__b/c 与 a/b__c）——整代拒绝，大声报错
+        #  判定按折叠形（见 conflict_key）：大小写 / 全角 / 组合字符的同形名也算撞
+        owned = {
+            conflict_key(tool.server, tool.raw_name): tool
+            for tool in self._tools if tool.server != name
+        }
+        conflicts = sorted(
+            f"{public_tool_name(name, raw)}（{name} 的 {raw}）≈ {other.name}（{other.server} 的 {other.raw_name}）"
+            for raw in new_decls
+            if (other := owned.get(conflict_key(name, raw))) is not None
+        )
+        if conflicts:
+            return (
+                f"命名空间冲突：{'；'.join(conflicts[:3])} 已被其它 server 注册，"
+                "本代整体回滚（保留上一代），不注册部分集合"
+            )
+        #  对齐现役代：其它 server 的工具原样保留；本 server 的按新一代裁决——
+        #  声明消失/被隔离的删除，指纹没变的保留原对象，变了的原位换新。
+        #  新一代的工具对象在任何落笔之前建好：建到一半出错时，基线、声明存档、
+        #  注册表都还是上一代的样子，没有"基线已写、工具没注册"的半截状态
+        next_tools: list[RemoteTool] = []
+        seen: set[str] = set()
+        for tool in self._tools:
+            if tool.server != name:
+                next_tools.append(tool)
+                continue
+            item = new_decls.get(tool.raw_name)
+            if item is None:
+                continue
+            seen.add(tool.raw_name)
+            if tool.fingerprint == mcp_guard.tool_fingerprint(item):
+                next_tools.append(tool)
+            else:
+                next_tools.append(_make_remote_tool(self, server, item))
+        for raw, item in new_decls.items():
+            if raw not in seen:
+                next_tools.append(_make_remote_tool(self, server, item))
+        self._declared[name] = declared
+        if updates:
+            #  TOFU / 信任接受：并入基线立即落盘，声明正文同步存档
+            self._baseline.setdefault(name, {}).update(updates)
+            self._record_declarations_locked(name, declared, set(updates))
+            self._save_baseline_locked()
+        previously_quarantined = self._quarantined.get(name) or []
+        self._quarantined[name] = quarantined
+        if quarantined and quarantined != previously_quarantined:
+            #  隔离提示直接把变更摊开（最多 3 个工具、每个 cap 行）——批准该是知情的，
+            #  盲批就是把防线当噪音；全部看 /mcp diff，一键批 /mcp approve
+            print(
+                f"[MCP {name}：{len(quarantined)} 个工具的描述/schema 相对上次已变化，"
+                f"已隔离不注册（防 rug-pull）：{', '.join(quarantined[:5])}"
+                f"{'…' if len(quarantined) > 5 else ''}]",
+                file=sys.stderr,
+            )
+            print(
+                self._diff_text_locked(name, limit=3, cap=8)
+                + f"\n  全部差异 /mcp diff {name}；核对无误 /mcp approve {name}",
+                file=sys.stderr,
+            )
+        self._tools = next_tools
+        self._registered[name] = set(new_decls)
+        return None
+
+    def _write_cache_locked(self, spec: ServerSpec, server: McpServer) -> None:
+        if not _enabled("XIAOYU_MCP_CACHE"):
+            return
+        entry = {
+            "fingerprint": spec_fingerprint(spec),
+            "tools": server.live_declared,
+            "server_info": server.server_info,
+        }
+        #  内容没变就不写盘（write-through with skip）
+        if self._cache.get(spec.name) == entry:
+            return
+        self._cache[spec.name] = entry
+        with contextlib.suppress(OSError):
+            mcp_guard.save_json_atomic(
+                self._cache_path, {"version": 1, "servers": self._cache}
+            )
+
+    def reconcile(self, server: McpServer) -> None:
+        """缓存路径懒启动后与 live 声明对账（每 server 只做一次）。
+
+        新增的工具经基线裁决后补注册；消失的"幽灵工具"由 live_names 在
+        check_fn / handler 两处拦住，随 schemas 重组自然消失。最后刷新缓存。
+        """
+        name = server.spec.name
+        with self._lock:
+            if name in self._reconciled:
+                return
+            self._reconciled.add(name)
+            error = declared_violation(server.live_declared) or self._swap_generation_locked(
+                name, server, server.live_declared
+            )
+            if error:
+                #  live 声明整代非法：不 swap，缓存代（最后一个合法代）继续服务，
+                #  状态里亮出原因
+                print(f"[MCP {name}：对账失败，沿用缓存声明：{error}]", file=sys.stderr)
+                self._states[name] = f"degraded: {error}"
+                self._supervise_locked(server)
+                return
+            self._states[name] = "ready"
+            self._write_cache_locked(server.spec, server)
+            self._supervise_locked(server)
+
+    # ---- 代际监督：list_changed 热更新 + 断线重连 ----
+
+    def _supervise_locked(self, server: McpServer) -> None:
+        """server 就绪后接线代际钩子（幂等）。持锁调用。"""
+        server.connected_at = time.monotonic()
+        server.on_tools_changed = lambda: self._schedule_resync(server)
+        #  不可恢复的失败与重连开关无关：关了重连也得把"认证被拒"亮出来
+        server.on_failure = lambda reason: self._fail_permanently(server, reason)
+        if _enabled("XIAOYU_MCP_RECONNECT"):
+            server.on_disconnect = lambda: self._schedule_reconnect(server)
+            if not server.alive() and not server.fatal_error:
+                #  接线前就崩了（EOF 已经过去，回调当时还是 None）：补一枪。
+                #  必须在独立线程发——_schedule_reconnect 要拿本锁
+                threading.Thread(target=server.on_disconnect, daemon=True).start()
+
+    def _spawn_service_locked(self, target: Callable[[], None], name: str) -> None:
+        thread = threading.Thread(target=target, name=name, daemon=True)
+        #  顺手清掉已退场的：service 线程数 = 事件数，长会话别攒僵尸引用
+        self._service_threads = [t for t in self._service_threads if t.is_alive()]
+        self._service_threads.append(thread)
+        thread.start()
+
+    def _schedule_resync(self, server: McpServer) -> None:
+        """tools/list_changed → 独立线程 re-sync。通知风暴合并成 dirty 循环。"""
+        name = server.spec.name
+        with self._lock:
+            if self._closed:
+                return
+            self._resync_dirty.add(name)
+            #  重连（后台或 /mcp reconnect）在动这个 server：只记 dirty 不起线程，
+            #  换代完成后由重连方补发（见 _resume_resync_locked）——两边同时
+            #  fetch/swap 同一个 server 正是要避免的
+            if name in self._resync_running or name in self._reconnecting:
+                return
+            self._resync_running.add(name)
+            self._spawn_service_locked(
+                lambda: self._resync_worker(server), f"xiaoyu-mcp-resync-{name}"
+            )
+
+    def _resume_resync_locked(self, server: McpServer) -> None:
+        """重连期间被压下的 list_changed：换代成功后补一次 re-sync。持锁调用。"""
+        name = server.spec.name
+        if self._closed or name not in self._resync_dirty or name in self._resync_running:
+            return
+        self._resync_running.add(name)
+        self._spawn_service_locked(
+            lambda: self._resync_worker(server), f"xiaoyu-mcp-resync-{name}"
+        )
+
+    def _resync_worker(self, server: McpServer) -> None:
+        """代际事务的动态变更侧：fetch 新一代（锁外）→ swap（锁内）。
+
+        fetch 失败/列表非法 → 上一代原样保留继续服务（re-sync 永远
+        不能把一个好代换成坏代）。循环直到 dirty 消化干净。
+        """
+        name = server.spec.name
+        while True:
+            with self._lock:
+                if self._closed or name not in self._resync_dirty:
+                    self._resync_running.discard(name)
+                    return
+                self._resync_dirty.discard(name)
+            try:
+                declared = server._list_tools()
+            except McpError as exc:
+                print(f"[MCP {name}：工具列表刷新失败，保留上一代：{exc}]", file=sys.stderr)
+                continue
+            if reason := declared_violation(declared):
+                print(f"[MCP {name}：{reason}，保留上一代]", file=sys.stderr)
+                continue
+            server.live_declared = declared
+            server.live_names = {str(item.get("name", "")) for item in declared}
+            with self._lock:
+                if self._closed:
+                    self._resync_running.discard(name)
+                    return
+                if error := self._swap_generation_locked(name, server, declared):
+                    print(f"[MCP {name}：{error}]", file=sys.stderr)
+                else:
+                    self._write_cache_locked(server.spec, server)
+
+    def _fail_permanently(self, server: McpServer, reason: str) -> None:
+        """不可恢复的失败（认证被拒）：整代下线、状态亮原因、解除监督，不重试。
+
+        幂等：同一次失败可能从两条路到达（restart 里 tools/list 被拒触发钩子，
+        restart 随后抛错又经重连线程再报一次），只有第一次落笔并提示。
+        """
+        name = server.spec.name
+        reason = _redact(reason)
+        with self._lock:
+            if self._closed or name in self._failed_hard:
+                return
+            self._failed_hard.add(name)
+            server.fatal_error = reason
+            self._drop_generation_locked(name)
+            self._states[name] = f"failed: {reason}（不会自动重试；修好后 /mcp reconnect {name}）"
+        server.on_disconnect = None
+        server.on_tools_changed = None
+        server.on_failure = None
+        print(
+            f"[MCP {name}：{reason}。工具已整代下线，不会自动重试；"
+            f"修好后 /mcp reconnect {name} 恢复]",
+            file=sys.stderr,
+        )
+
+    def _schedule_reconnect(self, server: McpServer) -> None:
+        """断线（进程意外退出 / HTTP 断线类错误）→ 重连线程（每 server 同时至多
+        一个 = 一次 outage）。"""
+        name = server.spec.name
+        with self._lock:
+            if self._closed or name in self._reconnecting or name in self._failed_hard:
+                return
+            self._reconnecting.add(name)
+            server.reconnecting = True
+            self._states[name] = "reconnecting"
+            self._spawn_service_locked(
+                lambda: self._reconnect_worker(server), f"xiaoyu-mcp-reconnect-{name}"
+            )
+
+    def _reconnect_worker(self, server: McpServer) -> None:
+        """一次 outage 的重连循环：指数退避，预算按 outage 计。
+
+        进门先判上一段连接是否"稳定"（存活 ≥ 退避上限）：稳定 → 上一次 outage
+        已了结，预算清零；不稳定 → 沿用累计——崩溃循环哪怕每次都短暂连上，
+        也会耗尽预算整代下线，不会永远重启。
+        """
+        name = server.spec.name
+        now = time.monotonic()
+        if (
+            server.connected_at is not None
+            and now - server.connected_at >= self.RECONNECT_MAX_DELAY
+        ):
+            server.reconnect_attempts = 0
+        server.connected_at = None
+        succeeded = False
+        try:
+            while True:
+                server.reconnect_attempts += 1
+                attempt = server.reconnect_attempts
+                if attempt > self.RECONNECT_MAX_ATTEMPTS:
+                    with self._lock:
+                        self._drop_generation_locked(name)
+                        self._states[name] = (
+                            f"failed: 连续 {self.RECONNECT_MAX_ATTEMPTS} 次重连失败，"
+                            f"已放弃（工具已整代下线；修好 server 后 /mcp reconnect {name}）"
+                        )
+                    #  解除监督：耗尽后不再对这个进程尸体反复立案
+                    server.on_disconnect = None
+                    server.on_tools_changed = None
+                    print(
+                        f"[MCP {name}：连续 {self.RECONNECT_MAX_ATTEMPTS} 次重连失败，"
+                        f"工具已整代下线。{log_hint(server.log_path)}]",
+                        file=sys.stderr,
+                    )
+                    return
+                delay = min(
+                    self.RECONNECT_MAX_DELAY,
+                    self.RECONNECT_INITIAL_DELAY * 2 ** (attempt - 1),
+                )
+                with self._lock:
+                    if self._closed:
+                        return
+                    self._states[name] = (
+                        f"reconnecting: 断线重连中（第 {attempt}/"
+                        f"{self.RECONNECT_MAX_ATTEMPTS} 次，{delay:g}s 后）"
+                    )
+                if self._close_event.wait(delay):
+                    return
+                try:
+                    declared = server.restart()
+                except McpError as exc:
+                    if exc.kind == "auth":
+                        #  重连撞上认证被拒（凭据过期/被吊销）：再试多少次都一样，
+                        #  立即停手，不烧预算也不刷屏
+                        self._fail_permanently(server, str(exc))
+                        return
+                    print(
+                        f"[MCP {name}：重连失败"
+                        f"（第 {attempt}/{self.RECONNECT_MAX_ATTEMPTS} 次）：{exc}]",
+                        file=sys.stderr,
+                    )
+                    continue
+                if reason := declared_violation(declared):
+                    #  连上了但列表非法：按失败尝试计，绝不拿非法代换掉上一代
+                    print(f"[MCP {name}：重连后{reason}，按失败计]", file=sys.stderr)
+                    continue
+                with self._lock:
+                    if self._closed:
+                        return
+                    server.connected_at = time.monotonic()
+                    if error := self._swap_generation_locked(name, server, declared):
+                        self._states[name] = f"degraded: {error}"
+                    else:
+                        self._states[name] = "ready"
+                        self._write_cache_locked(server.spec, server)
+                succeeded = True
+                print(f"[MCP {name}：已重连（第 {attempt} 次尝试）]", file=sys.stderr)
+                return
+        finally:
+            with self._lock:
+                self._reconnecting.discard(name)
+                server.reconnecting = False
+                if succeeded:
+                    self._resume_resync_locked(server)
+            #  成功与 discard 之间的窄窗：新进程立刻又崩，EOF 回调被
+            #  _reconnecting 挡掉——这里补判一次，两种时序都兜住
+            if succeeded and not server.alive() and not self._closed:
+                self._schedule_reconnect(server)
+
+    def _drop_generation_locked(self, name: str) -> None:
+        """一个 server 的现役代整体下线（重连预算耗尽）。持锁调用。"""
+        self._tools = [tool for tool in self._tools if tool.server != name]
+        self._registered[name] = set()
+        self._quarantined.pop(name, None)
+
+    def approve(self, name: str | None = None) -> str:
+        """/mcp approve [server]：把 server 当前声明的指纹整体写进基线，解除隔离。
+        不给名字 = 批准所有有隔离工具的 server（"一键批准"——看过 diff 之后用）。"""
+        with self._lock:
+            if name is None:
+                pending = [n for n, names in self._quarantined.items() if names]
+                if not pending:
+                    return "没有被隔离的工具，无需批准"
+                return "\n".join(self._approve_locked(n) for n in pending)
+            return self._approve_locked(name)
+
+    def _approve_locked(self, name: str) -> str:
+        declared = self._declared.get(name)
+        server = self._servers.get(name)
+        if declared is None or server is None:
+            known = ", ".join(self._declared) or "（无）"
+            return f"没有名为 {name!r} 的已连接 server。已知：{known}"
+        count = len(self._quarantined.get(name) or [])
+        if not count:
+            return f"{name} 没有被隔离的工具，无需批准"
+        self._baseline[name] = {
+            str(item.get("name", "")): mcp_guard.tool_fingerprint(item) for item in declared
+        }
+        #  整体批准 = 整体存档：声明里已经消失的工具记录一并清掉
+        self._decls[name] = {}
+        self._record_declarations_locked(name, declared, set(self._baseline[name]))
+        self._save_baseline_locked()
+        #  整代重 swap：解除隔离的注册进来，之前已注册但声明变过的原位换上
+        #  新 schema/描述（否则模型照着旧 schema 调新工具）
+        if error := self._swap_generation_locked(name, server, declared):
+            return f"批准失败：{error}"
+        return f"已批准 {name} 的当前工具集（解除隔离 {count} 个）"
+
+    def diff(self, name: str | None = None) -> str:
+        """/mcp diff [server]：被隔离工具相对上次批准的变更，给人核对用。"""
+        with self._lock:
+            if name is None:
+                pending = [n for n, names in self._quarantined.items() if names]
+                if not pending:
+                    return "没有被隔离的工具"
+                return "\n".join(self._diff_text_locked(n) for n in pending)
+            if name not in self._declared:
+                known = ", ".join(self._declared) or "（无）"
+                return f"没有名为 {name!r} 的已连接 server。已知：{known}"
+            if not self._quarantined.get(name):
+                return f"{name} 没有被隔离的工具"
+            return self._diff_text_locked(name)
+
+    def _diff_text_locked(self, name: str, *, limit: int | None = None, cap: int = 12) -> str:
+        quarantined = self._quarantined.get(name) or []
+        current = {str(item.get("name", "")): item for item in self._declared.get(name) or []}
+        previous = self._decls.get(name, {})
+        shown = quarantined if limit is None else quarantined[:limit]
+        lines = [f"  {name}：{len(quarantined)} 个工具变更"]
+        for raw in shown:
+            lines.append(f"  · {raw}")
+            lines += mcp_guard.describe_change(previous.get(raw), current.get(raw) or {}, cap=cap)
+        if len(shown) < len(quarantined):
+            lines.append(f"  · …另 {len(quarantined) - len(shown)} 个未展开")
+        return "\n".join(lines)
+
+    def _record_declarations_locked(
+        self, name: str, declared: list[dict[str, Any]], tools: set[str]
+    ) -> None:
+        bucket = self._decls.setdefault(name, {})
+        for item in declared:
+            raw = str(item.get("name", ""))
+            if raw in tools:
+                bucket[raw] = mcp_guard.slim_declaration(item)
+
+    def _save_baseline_locked(self) -> None:
+        with contextlib.suppress(OSError):
+            mcp_guard.save_json_atomic(self._baseline_path, self._baseline)
+        with contextlib.suppress(OSError):
+            mcp_guard.save_json_atomic(self._decls_path, self._decls)
+
+    # ---- 热恢复：/mcp reconnect ----
+
+    def reconnect(self, name: str | None = None) -> str:
+        """/mcp reconnect [server]：修好凭据/配置后不重启会话就能恢复的入口。
+
+        重读这一个 server 的声明（与启动同一条加载路径，门一道不少）→ 重建通道 →
+        走与后台重连同一套代际事务：成功整代 swap、基线裁决照旧（变更工具照样
+        隔离）；失败不换进坏代，状态亮出新原因，再次认证被拒仍标停用。
+        认证被拒停用的、重连预算耗尽整代下线的、启动即失败的都能手动拉起；
+        对在线的 server 做一次干净重启。不给名字 = 重连全部失败的 server。
+
+        在调用方线程同步执行（握手上限 INIT_TIMEOUT）。与后台重连、re-sync、
+        另一次手动重连按 server 互斥：已有人在动就直接拒绝，不排队也不并发 restart。
+        """
+        if name is None:
+            with self._lock:
+                targets = [
+                    spec.name for spec in self._specs if self._needs_recovery_locked(spec.name)
+                ]
+            if not targets:
+                return "没有处于失败状态的 server，无需重连（重启在线的 server：/mcp reconnect <server>）"
+            return "\n".join(self._reconnect_one(target) for target in targets)
+        return self._reconnect_one(name)
+
+    def _needs_recovery_locked(self, name: str) -> bool:
+        """无参 /mcp reconnect 的挑选口径：失败态、懒启动失败、或进程已退却没人在重连。"""
+        state = self._states.get(name, "")
+        server = self._servers.get(name)
+        if state.startswith("failed") or (server is not None and server.start_error):
+            return True
+        #  自动重连关着（XIAOYU_MCP_RECONNECT=0）时，进程退出后状态停在 ready
+        return state == "ready" and server is not None and not server.alive()
+
+    def _reload_spec(self, name: str) -> tuple[ServerSpec | None, str]:
+        """重读配置取这一个 server 的最新声明 → (spec, 附注)；拿不到时 spec 为 None、
+        附注是给用户的原因。
+
+        加载函数就是启动时那一个（launch 接线）：folder trust 门、加载期准入
+        规则、${env:VAR} 重新展开一样不少，启动期准入与 OSV 预检随后在 restart
+        里再过一遍——热恢复不是绕开这些闸的后门。只刷新点名的这一个；配置里
+        新增的 server 不在这里拉起（本会话的 server 清单在启动时定）。
+        """
+        with self._lock:
+            current = next((spec for spec in self._specs if spec.name == name), None)
+            known = ", ".join(spec.name for spec in self._specs) or "（无）"
+        if current is None:
+            return None, f"没有名为 {name!r} 的 server。已知：{known}"
+        if self._spec_loader is None:
+            return current, ""
+        try:
+            latest = {spec.name: spec for spec in self._spec_loader()}
+        except Exception as exc:  # noqa: BLE001 - 配置读坏了只拒绝这一次重连
+            return None, f"{name}：重读 MCP 配置失败（{type(exc).__name__}: {exc}），未重连"
+        spec = latest.get(name)
+        if spec is None:
+            return None, (
+                f"{name}：配置里已找不到可用的声明（被删除、disabled、被安全规则拦截，"
+                "或工作区未受信任——原因见上方提示），未重连"
+            )
+        return spec, "" if spec == current else "配置已更新"
+
+    def _reconnect_one(self, name: str) -> str:
+        spec, note = self._reload_spec(name)
+        if spec is None:
+            return note
+        with self._lock:
+            if self._closed:
+                return f"{name}：MCP 已关闭，不再重连"
+            #  互斥：_reconnecting 兼作手动重连的占位——占住期间后台重连不立案、
+            #  list_changed 只记 dirty；反过来别人占着就拒绝，绝不两个 restart 并发
+            if name in self._reconnecting:
+                return f"{name} 正在重连中（{self._states.get(name, '')}），稍后用 /mcp 看结果"
+            if name in self._resync_running:
+                return f"{name} 正在刷新工具列表，稍后再试"
+            self._reconnecting.add(name)
+            server = self._servers.get(name)
+            was_live = server is not None and server.alive() and not server.fatal_error
+            if server is not None:
+                #  摘掉代际钩子：旧代收尾的 EOF、握手期间的认证失败都由本流程收口，
+                #  不许另起重连线程或重复落笔停用
+                server.on_disconnect = None
+                server.on_tools_changed = None
+                server.on_failure = None
+                #  懒启动失败时 ensure_started 会 close 它，关闭标志会让 restart 拒绝。
+                #  锁内确认 manager 未关闭后复位是安全的：close() 先在锁内立 _closed、
+                #  之后才逐个 close server，这里的复位必然在那之前
+                server._closing = False
+            self._failed_hard.discard(name)
+            self._states[name] = "reconnecting: 手动重连中"
+            self._specs = [spec if item.name == name else item for item in self._specs]
+        if server is None:
+            #  从未登记过（启动即失败 / 首代被回滚）：没有旧代工具绑在旧对象上，新建即可
+            server = self._new_server(spec)
+            with self._lock:
+                self._owned_servers.append(server)
+        succeeded = False
+        try:
+            try:
+                declared = server.restart(spec)
+                if reason := declared_violation(declared):
+                    server._shutdown_proc()
+                    raise McpError(reason)
+            except McpError as exc:
+                return self._recover_failed(name, server, exc)
+            succeeded = True
+            return self._recover_succeeded(name, server, spec, declared, note, was_live)
+        finally:
+            with self._lock:
+                self._reconnecting.discard(name)
+                if succeeded:
+                    self._resume_resync_locked(server)
+
+    def _recover_succeeded(
+        self,
+        name: str,
+        server: McpServer,
+        spec: ServerSpec,
+        declared: list[dict[str, Any]],
+        note: str,
+        was_live: bool,
+    ) -> str:
+        with self._lock:
+            closed = self._closed
+            if not closed:
+                self._servers[name] = server
+                #  手动恢复 = 新的一段连接，重连预算从头计
+                server.reconnect_attempts = 0
+                self._reconciled.add(name)
+                error = self._swap_generation_locked(name, server, declared)
+                if error:
+                    #  冲突预检不过：与后台重连同口径，上一代（若还在）原样保留
+                    self._states[name] = f"degraded: {error}"
+                else:
+                    self._states[name] = "ready"
+                    self._write_cache_locked(spec, server)
+                self._supervise_locked(server)
+                count = len(self._registered.get(name) or ())
+                held = len(self._quarantined.get(name) or ())
+        if closed:
+            #  与 close() 赛跑输了：刚拉起的新一代收掉，不留孤儿
+            server.close()
+            return f"{name}：MCP 已关闭，不再重连"
+        detail = "，".join(part for part in (f"{count} 个工具", note) if part)
+        text = f"{'已重启' if was_live else '已恢复'} {name}（{detail}）"
+        if error:
+            text += f"，但本代未能挂载：{error}"
+        if held:
+            text += (
+                f"\n{held} 个工具因描述/schema 变更被隔离——/mcp diff {name} 看变更，"
+                f"核对后 /mcp approve {name}"
+            )
+        return text
+
+    def _recover_failed(self, name: str, server: McpServer, exc: McpError) -> str:
+        reason = _redact(str(exc))
+        auth = exc.kind == "auth"
+        with self._lock:
+            if self._closed:
+                return f"{name}：MCP 已关闭，不再重连"
+            #  旧代已在 restart 里收掉：下线登记、失败原因一并落笔。对象留在表里，
+            #  下次 /mcp reconnect 复用它（绑在它上面的旧工具对象跟着原位复活）
+            self._servers[name] = server
+            self._drop_generation_locked(name)
+            server.fatal_error = reason if auth else None
+            if auth:
+                self._failed_hard.add(name)
+            if server.start_error:
+                server.start_error = reason
+            self._states[name] = (
+                f"failed: {reason}（{'不会自动重试；' if auth else ''}修好后 /mcp reconnect {name}）"
+            )
+        text = f"{name} 重连失败：{reason}"
+        if auth:
+            text += (
+                "。认证仍被拒：核对 mcp.json 里这个 server 的 headers / env。凭据走 ${env:VAR} 的，"
+                "在别的终端 export 的变量本进程看不到，.env 的改动也只在启动时读——"
+                "把凭据写进配置文件，或设好后重启会话"
+            )
+        elif not server.spec.is_http:
+            text = _with_log_hint(text, server.log_path)
+        return text
+
+    def command(self, parts: list[str]) -> str:
+        """/mcp 子命令统一入口（TUI 与 ACP 共用）：无参 = 状态；approve [名]；diff [名]；
+        reconnect [名]。"""
+        if not parts:
+            return self.describe()
+        verb, rest = parts[0], parts[1:]
+        if verb == "approve":
+            return self.approve(rest[0] if rest else None)
+        if verb == "diff":
+            return self.diff(rest[0] if rest else None)
+        if verb == "reconnect":
+            return self.reconnect(rest[0] if rest else None)
+        return (
+            f"未知子命令 {verb!r}。用法：/mcp（状态）· /mcp diff [server]（看隔离工具的变更）"
+            "· /mcp approve [server]（批准，解除隔离；不给名字 = 全部）"
+            "· /mcp reconnect [server]（修好后重读配置热恢复；不给名字 = 全部失败的）"
+        )
+
+    @staticmethod
+    def _log_path(name: str, directory: Path | None = None) -> Path:
+        safe = _NAME_CLEAN.sub("_", name)
+        return (directory if directory is not None else user_config_dir()) / "logs" / f"mcp-{safe}.log"
+
+    def runtime_inventory(self) -> dict[str, Any]:
+        """内存中的最近已知状态；只投影允许公开的字段，不输出配置与错误正文。"""
+        with self._lock:
+            servers = []
+            tools = []
+            for spec in self._specs:
+                status = self._states.get(spec.name, "unknown").split(":", 1)[0]
+                if spec.disabled:
+                    status = "disabled"
+                elif self._closed:
+                    status = "closed"
+                elif status not in {"ready", "cached", "loading", "failed", "blocked", "closed", "reconnecting"}:
+                    status = "unknown"
+                registered = self._registered.get(spec.name, set())
+                servers.append({
+                    "name": spec.name, "status": status,
+                    "registered_tool_count": len(registered),
+                    "quarantined_tool_count": len(self._quarantined.get(spec.name, [])),
+                })
+                tools.extend({"name": public_tool_name(spec.name, raw), "server": spec.name,
+                              "server_status": status} for raw in sorted(registered))
+            return {"servers": servers, "tools": tools}
+
+    def ready_tools(self) -> list[RemoteTool]:
+        """当前已就绪的全部工具（append-only 快照，顺序稳定）。"""
+        with self._lock:
+            return list(self._tools)
+
+    def loading(self) -> bool:
+        """还有 server 在握手中（检索模式回给模型 status: partial 用）。"""
+        with self._lock:
+            return any(state == "loading" for state in self._states.values())
+
+    def stash_media(self, parts: list[dict[str, Any]]) -> None:
+        if parts:
+            owner = getattr(_call_scope, "media_owner", None)
+            if owner is None:
+                current = getattr(self._caller_media, "parts", [])
+                self._caller_media.parts = [*current, *parts]
+            else:
+                if not hasattr(self._caller_media, "owners"):
+                    self._caller_media.owners = weakref.WeakKeyDictionary()
+                owners = self._caller_media.owners
+                owners.setdefault(owner, []).extend(parts)
+
+    def take_media(self) -> list[dict[str, Any]]:
+        """取走暂存的图片部件（取完即清）。
+
+        一次工具调用可能返回多张图，一批 tool_calls 也可能有好几个都返回图，
+        所以是累加 + 一次取走，由 agent 在这批工具跑完后统一附给模型。
+        """
+        owner = getattr(_call_scope, "media_owner", None)
+        if owner is not None:
+            owners = getattr(self._caller_media, "owners", {})
+            return owners.pop(owner, [])
+        parts = getattr(self._caller_media, "parts", [])
+        self._caller_media.parts = []
+        return parts
+
+    def wait_ready(self, timeout: float) -> None:
+        """等所有 server 出结果（就绪或失败），最多等 timeout 秒。
+
+        通用等待面（不只是测试/一次性模式用）：嵌入宿主自建 manager 后要等
+        工具清单齐了再开工，用它，别照 loading() 自己写轮询——真发生过。
+        """
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            with self._lock:
+                if all(state != "loading" for state in self._states.values()):
+                    return
+            time.sleep(0.05)
+
+    def close(self) -> None:
+        with self._lock:
+            self._closed = True
+        #  重连线程的退避等待立即醒来，看到 _closed 退场
+        self._close_event.set()
+        #  join 而不是限时等状态：启动中的 server 由 _bootstrap_one 发现 _closed
+        #  后自行收尾，必须等它做完——异步收尾意味着 close 返回时子进程可能还
+        #  活着，Windows 上删不掉被占用的日志文件（临时目录清理 WinError 32）。
+        #  正常路径线程秒级结束；真卡死的（INIT_TIMEOUT=30 内）最多等 15 秒放弃，
+        #  孤儿由看门狗按父进程死亡兜底回收。
+        for thread in self._boot_threads:
+            thread.join(timeout=15.0)
+        with self._lock:
+            servers = list(dict.fromkeys([*self._owned_servers, *self._servers.values()]))
+        for server in servers:
+            server.close()
+        #  最后收代际服务线程：server 进程已死，卡在 fetch 里的请求立即报错返回
+        with self._lock:
+            service = list(self._service_threads)
+        for thread in service:
+            thread.join(timeout=15.0)
+        with self._lock:
+            self._boot_threads = [thread for thread in self._boot_threads if thread.is_alive()]
+            self._service_threads = [thread for thread in self._service_threads if thread.is_alive()]
+            # Retain server handles until their process and readers really finish.
+            self._owned_servers = [server for server in dict.fromkeys([*self._owned_servers, *servers]) if server.shutdown_pending()]
+            self._servers = {name: server for name, server in self._servers.items() if server in self._owned_servers}
+        if not self.shutdown_pending():
+            with contextlib.suppress(ValueError):
+                _extra_managers.remove(self)
+
+    def shutdown_pending(self) -> tuple[str, ...]:
+        with self._lock:
+            threads = [*self._boot_threads, *self._service_threads]
+            servers = list(self._owned_servers)
+        return tuple(thread.name for thread in threads if thread.is_alive()) + tuple(
+            server.spec.name for server in servers if server.shutdown_pending()
+        )
+
+    def server_states(self) -> dict[str, str]:
+        """声明过的每个 server 此刻的状态字（ready / cached / loading / failed / …）。
+
+        只给状态的第一个词：冒号后面的细节是 server 自己报的错误文本，不该被
+        带进别处的提示里。
+        """
+        with self._lock:
+            states = dict(self._states)
+            closed = self._closed
+        if closed:
+            state = "closing" if self.shutdown_pending() else "closed"
+            return {spec.name: state for spec in self._specs if not spec.disabled}
+        return {
+            spec.name: states.get(spec.name, "loading").split(":", 1)[0].strip()
+            for spec in self._specs
+            if not spec.disabled
+        }
+
+    def describe(self) -> str:
+        """/mcp 的状态输出。"""
+        if not self._specs:
+            return self.usage_hint()
+        with self._lock:
+            states = dict(self._states)
+            counts = {name: len(registered) for name, registered in self._registered.items()}
+            quarantined = {name: list(names) for name, names in self._quarantined.items() if names}
+            servers = dict(self._servers)
+        lines = []
+        for spec in self._specs:
+            name = spec.name
+            state = states.get(name, "loading")
+            server = servers.get(name)
+            detail = f"{counts.get(name, 0)} 个工具"
+            if server and server.server_info:
+                detail += f" · {server.server_info}"
+            if server and server.start_error and not state.startswith("reconnecting"):
+                lines.append(
+                    f"  {name}: 启动失败: {server.start_error}（修好后 /mcp reconnect {name}）"
+                )
+            elif state == "ready":
+                if server and not server.alive():
+                    detail += "（连接已断开）" if server.spec.is_http else "（进程已退出）"
+                    detail += f"—— /mcp reconnect {name} 手动拉起"
+                lines.append(f"  {name}: 就绪 · {detail}")
+            elif state == "cached":
+                lines.append(f"  {name}: 就绪（schema 缓存，进程按首次调用启动）· {detail}")
+            elif state == "loading":
+                lines.append(f"  {name}: 启动中…（就绪后工具自动挂载）")
+            else:
+                if state.startswith("failed") and "/mcp reconnect" not in state:
+                    #  启动即失败等老路径的原因里没带入口：统一补上
+                    state += f"（修好后 /mcp reconnect {name}）"
+                lines.append(f"  {name}: {state}")
+            if name in quarantined:
+                shown = ", ".join(quarantined[name][:5])
+                lines.append(
+                    f"    ⚠ {len(quarantined[name])} 个工具因描述/schema 变更被隔离"
+                    f"（{shown}）—— /mcp diff {name} 看变更，核对后 /mcp approve {name}"
+                )
+            lines.append(f"    日志：{self._log_path(name, self._state_dir)}")
+        return "\n".join(lines)
+
+    @staticmethod
+    def usage_hint() -> str:
+        return (
+            "未配置 MCP server。最省事的加法（写的就是下面那两个文件）：\n"
+            "  xiaoyu mcp add <名字> [--scope user] <命令> [参数…]\n"
+            "  例：xiaoyu mcp add chrome-devtools --scope user npx -y chrome-devtools-mcp@latest\n"
+            "也可以直接手写（工作区级优先）：\n"
+            f"  <工作区>/{WORKSPACE_FILE}\n"
+            f"  {user_config_dir() / 'mcp.json'}\n"
+            '格式（与多家客户端的 mcp.json 通用）：{"mcpServers": {"名字": '
+            '{"command": "npx", "args": ["-y", "某个包"], "env": {"KEY": "${env:VAR}"}}}}\n'
+            '远端 server 用 --url 直连（Streamable HTTP）：xiaoyu mcp add 名字 --url https://…'
+        )
+
+
+class McpView:
+    """父会话 MCP manager 的 server 级筛选视图（子 agent 继承用）。
+
+    不持有任何进程——生命周期归父 manager；接口与 Toolbox 消费 manager 的
+    子集对齐（ready_tools / loading / take_media）。server 精确名筛选外，
+    tool_names 可进一步按工具完整名称取交集；None 不限制，空元组不选任何工具。
+    引用不存在的名字不报错（过滤后少一个而已）。
+
+    media 暂存按调用线程及 Toolbox 所有者隔离；并发子 agent 和复用 worker
+    的后续任务不会接收其他工具箱尚未消费的结果。
+    """
+
+    def __init__(self, manager: McpManager, mode: str = "all", names: tuple[str, ...] = (),
+                 *, tool_names: tuple[str, ...] | None = None) -> None:
+        self._manager = manager
+        self._mode = mode  # all | named | except
+        self._names = set(names)
+        self._tool_names = None if tool_names is None else frozenset(tool_names)
+
+    def _allows(self, server: str) -> bool:
+        if self._mode == "named":
+            return server in self._names
+        if self._mode == "except":
+            return server not in self._names
+        return True
+
+    def runtime_inventory(self) -> dict[str, Any]:
+        snapshot = self._manager.runtime_inventory()
+        return {
+            "servers": [s for s in snapshot["servers"] if self._allows(s["name"])],
+            "tools": [t for t in snapshot["tools"] if self._allows(t["server"])],
+        }
+
+    def ready_tools(self) -> list[RemoteTool]:
+        return [remote for remote in self._manager.ready_tools()
+                if self._allows(remote.server)
+                and (self._tool_names is None or remote.name in self._tool_names)]
+
+    def unavailable(self) -> list[str]:
+        """这个视图本该看得到、此刻却用不了的 server 名字（只给名字）。
+
+        点了名却没配置的、配置了但起不来的都算；还在启动的不算（工具就绪后
+        会自动挂上）。引用不存在的名字在筛选时不报错是对的——但得有人告诉
+        子 agent 它少了什么，不然它只会对着工具表反复搜到轮数用尽。
+        """
+        states_of = getattr(self._manager, "server_states", None)
+        states = states_of() if callable(states_of) else {}
+        down = [
+            name
+            for name, state in states.items()
+            if self._allows(name) and state in ("failed", "closed")
+        ]
+        if self._mode == "named":
+            down += [name for name in sorted(self._names) if name not in states]
+        return down
+
+    def loading(self) -> bool:
+        return self._manager.loading()
+
+    def take_media(self) -> list[dict[str, Any]]:
+        return self._manager.take_media()
+
+
+# ---------- 进程级单例 ----------
+
+#  按工作区缓存 manager：同一进程里反复构造 Toolbox（REPL + explore 已关掉 MCP，
+#  正常只有一次，但测试会多次）不重复拉起子进程。
+_managers: dict[Path, McpManager] = {}
+#  不按工作区缓存、但仍要被 at-exit 兜底关掉的 manager（显式 specs 起的那种，
+#  见 launch_specs）。缓存键是工作区，而这些 manager 的清单是按会话/宿主来的，
+#  同一工作区的两个会话可以有不同清单——共用一份会串台，所以只登记不复用。
+_extra_managers: list[McpManager] = []
+_atexit_registered = False
+
+
+def _ensure_atexit() -> None:
+    global _atexit_registered
+    if not _atexit_registered:
+        atexit.register(shutdown_all)
+        _atexit_registered = True
+
+
+def launch(config: Config, extra_specs: list[ServerSpec] | None = None) -> McpManager | None:
+    """按配置拉起（或复用）本工作区的 MCP manager。没配置任何 server 返回 None。
+
+    extra_specs：配置发现之外再挂几条 server（ACP client 随会话下发的那种）。
+    **同名以 extra_specs 为准**——它是用户在编辑器里亲手配的，比配置文件里
+    的同名条目更贴近此刻的意图。带 extra_specs 时走不缓存的路径（理由见
+    _extra_managers），返回的 manager 由调用方 close，at-exit 也会兜底。
+    """
+    def discover() -> list[ServerSpec]:
+        #  每次调用现读现判：/mcp reconnect 重读配置走的也是这里，trust 门与准入
+        #  规则与启动时同一份，不另写一套
+        return load_server_specs(
+            config.workspace,
+            config.extra_env,
+            #  getattr 兜底：嵌入宿主可能拿旧版 Config 对象构造（没有这个字段）
+            include_project=getattr(config, "workspace_trusted", True),
+        )
+
+    if extra_specs:
+        extras = {spec.name: spec for spec in extra_specs}
+
+        def merged() -> list[ServerSpec]:
+            specs = {spec.name: spec for spec in discover()}
+            specs.update(extras)
+            return list(specs.values())
+
+        #  信任开关照传：带 extra_specs 走的是不缓存的路径，漏传的话
+        #  Config.mcp_trust_changes（--unguarded 的落点）在这类会话里不生效
+        return launch_specs(
+            merged(), spec_loader=merged,
+            trust_tool_changes=bool(getattr(config, "mcp_trust_changes", False)),
+        )
+    manager = _managers.get(config.workspace)
+    if manager is not None:
+        return manager
+    specs = discover()
+    if not specs:
+        return None
+    manager = McpManager(
+        specs,
+        spec_loader=discover,
+        #  getattr 兜底同上：旧版 Config 对象没有这个字段
+        trust_tool_changes=bool(getattr(config, "mcp_trust_changes", False)),
+    )
+    manager.start()
+    _managers[config.workspace] = manager
+    _ensure_atexit()
+    return manager
+
+
+def launch_specs(
+    specs: list[ServerSpec],
+    spec_loader: Callable[[], list[ServerSpec]] | None = None,
+    trust_tool_changes: bool = False,
+) -> McpManager:
+    """按给定 specs 现起一个 manager 并登记到 at-exit 清扫。
+
+    嵌入宿主自带 server 清单时的入口：自己 `McpManager(specs)` 也能跑，但那份
+    不在任何登记表里——进程退出时无人 close，子进程要靠看门狗兜底回收。走这里
+    就有兜底。**不复用、不缓存**：调用方拿到的永远是新的一份，用完自己 close
+    （提前 close 过的，at-exit 再关一次是幂等的）。
+
+    **空清单也返回真 manager，不返回 None**：第一版对空清单返回 None，第一个
+    真实消费者就踩了——嵌入方拿它造 McpView 时顺手往下传，而 `Toolbox(mcp_view=None)`
+    的语义是"回到配置发现"，于是操作者自己 mcp.json 里的 server 泄进了一个
+    本不该看到它们的会话。空 manager 不起任何子进程，代价为零；让"零个 server"
+    与"没有指定视图"这两件事在类型上就分得开，比在 docstring 里叮嘱可靠。
+
+    spec_loader：/mcp reconnect 重读声明用的函数（见 McpManager）；不给则热恢复
+    沿用这份清单里的声明。
+    """
+    manager = McpManager(
+        specs, spec_loader=spec_loader, trust_tool_changes=trust_tool_changes
+    )
+    manager.start()
+    _extra_managers.append(manager)
+    _ensure_atexit()
+    return manager
+
+
+def shutdown_all() -> None:
+    """关掉全部 server 子进程（atexit 兜底；测试也直接调）。"""
+    for manager in list(_managers.values()) + list(_extra_managers):
+        manager.close()
+    _managers.clear()
+    _extra_managers.clear()

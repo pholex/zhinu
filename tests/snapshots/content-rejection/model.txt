@@ -1,0 +1,2 @@
+# 明确的内容拒绝不能因同时出现 429 就进入重试。
+error: data_inspection_failed: data may contain inappropriate content (429)

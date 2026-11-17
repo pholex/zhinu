@@ -1,0 +1,7 @@
+{"url": "http://evil.example/mcp", "guard": "endpoint", "expect": "block", "note": "明文 http 非回环=凭据裸奔"}
+{"url": "ftp://host/x", "guard": "endpoint", "expect": "block", "note": "非 http/https 协议"}
+{"url": "file:///etc/passwd", "guard": "endpoint", "expect": "block", "note": "file:// 到不了 server"}
+{"url": "https:///mcp", "guard": "endpoint", "expect": "block", "note": "缺主机名"}
+{"url": "https://api.example.com/mcp", "guard": "endpoint", "expect": "allow", "note": "https 公网正常"}
+{"url": "http://127.0.0.1:8080/mcp", "guard": "endpoint", "expect": "allow", "note": "明文但回环放行"}
+{"url": "http://localhost:3000/mcp", "guard": "endpoint", "expect": "allow", "note": "localhost 回环放行"}

@@ -1,0 +1,759 @@
+"""snapshot 套件：真子进程 + 录制回放 fixture + golden 对比
+（设计与纪律见 docs/test_snapshot.md）。
+
+与 test_e2e_scripted 的分工：那边是"手写脚本 + 手写期望"锁单点行为，
+期望短、能表达"为什么该是这个序列"；这边是"fixture + golden"锁**整个
+可见表面**——归一化后的完整 stream-json 事件流、完整会话 JSONL、
+pinned header（system prompt / tool schemas）。改动只要碰到任何可见面，
+golden 的 diff 就会把它摆出来。
+
+三模式（XIAOYU_SNAPSHOT 环境变量：record/replay/refresh）：
+- 缺省 = replay：keyless，用提交的 model.txt 驱动，逐面与 golden 比对；
+- refresh：keyless，重写 golden 与 pin sidecar（改了 prompt/事件面之后跑
+  一次，diff 审阅后提交；refresh 完跑一遍默认模式验证）；
+- record：真 API 重录 model.txt（花真钱，只覆盖 recorded=True 的场景；
+  用真机配置的默认模型，XIAOYU_SNAPSHOT_MODEL 可指定），录完自动做一遍
+  refresh——录出来的 fixture 当场证明能回放。
+
+assertConsumed 双向都响亮：多调模型 → ScriptedExhausted 浮出为
+结构化错误；少调模型 → XIAOYU_SCRIPTED_STRICT 在子进程退出时向 stderr 打
+ScriptedUnconsumed，本套件断言 stderr 干净。
+
+pin 纪律：恰好一个场景钉住完整 system prompt 与
+tool schemas（sidecar 文件），其余场景只做一致性核对——改一次 prompt 只
+churn 一处。机器相关段已被归一化成 token（见 snapshot_support），sidecar
+锁的是 xiaoyu 自己控制的模板内容；Windows 上跳过 pin 对比（posix 语气的
+shell 注记/工具面不同），stdout 与会话 golden 照常全平台比。
+"""
+
+from __future__ import annotations
+
+import contextlib
+import io
+import json
+import os
+import subprocess
+import sys
+import unittest
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any
+from unittest import mock
+
+from xiaoyu.scripted import CAPTURE_ENV, STRICT_ENV, SCRIPTED_ENV, load_scripts
+from xiaoyu.snapshot import RECORD_ENV
+
+from .snapshot_support import (
+    normalize_event,
+    normalize_session_lines,
+    normalize_system_prompt,
+    normalize_tool_schemas,
+)
+from .test_e2e_scripted import _TIMEOUT, E2ECase
+from .test_agent_paths import AgentTestCase, call_fragment, chunk, usage_chunk
+
+MODE = os.environ.get("XIAOYU_SNAPSHOT", "").strip() or "replay"
+if MODE not in ("replay", "record", "refresh"):
+    raise RuntimeError(f"未知的 XIAOYU_SNAPSHOT 模式：{MODE}（合法：replay/record/refresh）")
+
+SNAPSHOTS = Path(__file__).resolve().parent / "snapshots"
+#  回放用固定模型名：scripted 桩接住任何名字，事件与 golden 里因此是常量
+REPLAY_MODEL = "snapshot-model"
+
+
+@dataclass(frozen=True)
+class Scenario:
+    name: str
+    prompt: str
+    args: tuple[str, ...] = ()
+    pins_header: bool = False  # 恰好一个场景为 True（钉住完整请求头）
+    recorded: bool = True  # False = 纯手写 fixture（错误时序真 API 录不出来）
+    expect_exit: int = 0
+
+
+SCENARIOS = (
+    Scenario("text-turn", "打个招呼", pins_header=True),
+    Scenario("tool-turn", "用 bash 运行 echo snapshot-ok，然后汇报结果", args=("--yolo",)),
+    Scenario("error-retry", "试试限流恢复", recorded=False),
+    Scenario("error-fatal", "撞一个致命错误", recorded=False, expect_exit=1),
+    Scenario("invalid-tool-arguments", "验证错误参数不会写文件", args=("--yolo",), recorded=False),
+    Scenario("stale-file-version", "读取后尝试覆盖文件，发现外部修改就停止", args=("--yolo",), recorded=False),
+    Scenario("cancel-before-tool", "尝试写文件，执行前中断", args=("--yolo",), recorded=False, expect_exit=130),
+    Scenario("bounded-hook-output", "验证长钩子输出", recorded=False),
+    Scenario("content-rejection", "处理服务端内容拒绝", recorded=False, expect_exit=1),
+    Scenario("patch-turn", "创建并修改两份文件，删除其中一份", args=("--yolo",), recorded=False),
+    Scenario("file-delivery", "生成 report.txt 并交付", args=("--yolo",), recorded=False),
+    Scenario("runtime-status", "当前会话加载了哪些 MCP？", recorded=False),
+)
+
+_PIN = next(sc for sc in SCENARIOS if sc.pins_header)
+
+
+class BatchReadSnapshot(AgentTestCase):
+    def test_scenario(self) -> None:
+        agent = self.build([
+            [chunk(tool_calls=[
+                call_fragment(0, "read", "read_file", '{"path":"calc.py"}'),
+                call_fragment(1, "write", "write_file", '{"path":"calc.py","content":"guessed"}'),
+            ])],
+            [chunk(content="已看到读取结果，请下一步再修改。")],
+        ])
+        with mock.patch.object(agent, "emit"):
+            agent.send("读文件再改")
+        actual = {
+            "results": [m["content"] for m in agent.messages if m.get("role") == "tool"],
+            "file": (self.root / "calc.py").read_text(encoding="utf-8", errors="replace"),
+        }
+        fixture = Path(__file__).parent / "fixtures" / "batch_read.expected.json"
+        if MODE == "refresh":
+            fixture.write_text(json.dumps(actual, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        self.assertEqual(actual, json.loads(fixture.read_text(encoding="utf-8", errors="replace")))
+        self.assertIn("尚未看到", actual["results"][1])
+
+
+class ApiKeyReferenceSnapshot(E2ECase):
+    """缺失的显式引用在配置诊断里报出，不能悄悄使用备用凭据。"""
+
+    def test_scenario(self) -> None:
+        if MODE == "record":
+            self.skipTest("密钥引用诊断不调用真实模型")
+        path = Path(self.tmp) / "reference.env"
+        path.write_text("XIAOYU_API_KEY=${env:SNAPSHOT_MISSING_TOKEN}\n", encoding="utf-8")
+        env = self.env_for(SNAPSHOTS / "text-turn" / "model.txt")
+        env.pop("XIAOYU_API_KEY", None)
+        env.update({
+            SCRIPTED_ENV: "", "XIAOYU_ENV_FILE": str(path),
+            "XIAOYU_PROVIDERS": "gateway", "XIAOYU_BASE_URL": "http://127.0.0.1:1/v1",
+            "SNAPSHOT_MISSING_TOKEN": "", "LITELLM_API_KEY": "unrelated-fixture-secret",
+            "USER": "",  # 禁止访问本机钥匙串
+        })
+        proc = subprocess.run(
+            [sys.executable, "-m", "xiaoyu", "config", "--show", "--json"],
+            env=env, cwd=self.tmp, stdin=subprocess.DEVNULL, capture_output=True,
+            text=True, encoding="utf-8", errors="replace", timeout=_TIMEOUT,
+        )
+        output = json.loads(proc.stdout)
+        output["user_env_path"] = "<USER_ENV_PATH>"
+        actual = {"exit_code": proc.returncode, "stdout": output, "stderr": proc.stderr}
+        fixture = Path(__file__).parent / "fixtures" / "api_key_reference.expected.json"
+        if MODE == "refresh":
+            fixture.write_text(json.dumps(actual, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        self.assertEqual(actual, json.loads(fixture.read_text(encoding="utf-8", errors="replace")))
+        self.assertEqual(proc.returncode, 1)
+        self.assertNotIn("unrelated-fixture-secret", proc.stdout + proc.stderr)
+
+
+class RuntimeIntegritySnapshot(AgentTestCase):
+    """真实工具结果进入下一次模型请求；转写损失与指令缺口的可见面一起钉住。"""
+
+    def test_scenario(self) -> None:
+        from xiaoyu import compaction, mcp
+        from xiaoyu.agent import collect_project_docs
+        from xiaoyu.tools import Tool
+
+        agent = self.build([
+            [chunk(tool_calls=[call_fragment(0, "query", "fixture_query", "{}")]), usage_chunk(10, 2)],
+            [chunk(content="查到记录 42。"), usage_chunk(30, 3)],
+        ])
+        agent.toolbox.register(Tool("fixture_query", "查询", {}, lambda: mcp._render_result({
+            "content": [{"type": "text", "text": "查询成功"}],
+            "structuredContent": {"rows": [{"id": 42, "status": "ready"}]},
+        })[0], requires_approval=False))
+        with mock.patch.object(agent, "emit") as emitted:
+            agent.send("查记录")
+        path = self.root / "AGENTS.md"
+        path.write_text("intro\n## 发布规则\n发布前验证\n", encoding="utf-8")
+        with mock.patch("xiaoyu.agent.project_levels", return_value=[self.root]):
+            docs = collect_project_docs(self.root, ("AGENTS.md",), cap=6)
+        actual = {
+            "events": [normalize_event(c.args[0].to_dict(), str(self.root)) for c in emitted.call_args_list],
+            "next_request_tool_results": [m["content"] for m in self.client.completions.calls[-1]["messages"] if m["role"] == "tool"],
+            "instructions": docs[0][1].replace(str(self.root), "<WORKSPACE>").replace("\\", "/"),
+            "coverage": compaction.transcript_coverage(["甲" * 100, "乙" * 100, "丙" * 100], 80),
+        }
+        fixture = Path(__file__).parent / "fixtures" / "runtime_integrity.expected.json"
+        if MODE == "refresh":
+            fixture.write_text(json.dumps(actual, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        self.assertEqual(actual, json.loads(fixture.read_text(encoding="utf-8", errors="replace")))
+        self.assertIn('"id": 42', actual["next_request_tool_results"][0])
+
+
+class AskUserCancelSnapshot(AgentTestCase):
+    """终端问答的 keyless 场景；headless CLI 不暴露 asker，故在此注入真实明文前端。"""
+
+    def test_scenario(self) -> None:
+        from xiaoyu.cli import text_ask_questions
+        from xiaoyu.embedding import measured_send
+        from xiaoyu.render import NullSink
+
+        if MODE == "record":
+            self.skipTest("取消交互使用确定性 fixture，不调用真实模型")
+        questions = [
+            {"question": "给谁用？", "options": ["客户", "内部同事"]},
+            {"question": "先做什么？", "options": ["展示产品", "收集反馈"]},
+        ]
+        agent = self.build([
+            [chunk(tool_calls=[call_fragment(0, "ask", "ask_user", json.dumps({"questions": questions}))]),
+             usage_chunk(10, 5)],
+        ], asker=text_ask_questions, sink=NullSink())
+        shown = io.StringIO()
+        replies = iter(["1", "0"])
+
+        def answer(prompt):
+            reply = next(replies)
+            print(prompt + reply)
+            return reply
+
+        with (
+            contextlib.redirect_stdout(shown),
+            mock.patch("builtins.input", side_effect=answer),
+            mock.patch("xiaoyu.ui._ENABLED", False),
+        ):
+            with mock.patch.object(agent, "emit") as emitted:
+                result = measured_send(agent, "先问我网站需求")
+        actual = {
+            "terminal": shown.getvalue(),
+            "events": [normalize_event(call.args[0].to_dict(), str(self.root)) for call in emitted.call_args_list],
+            "tool_results": [m for m in agent.messages if m["role"] == "tool"],
+            "stopped": result.stopped,
+            "model_requests": len(self.client.completions.calls),
+        }
+        path = Path(__file__).parent / "fixtures" / "ask_user_cancel.expected.json"
+        if MODE == "refresh":
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(json.dumps(actual, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        self.assertEqual(actual, json.loads(path.read_text(encoding="utf-8", errors="replace")))
+        self.assertTrue(result.interrupted)
+        self.assertEqual(actual["model_requests"], 1)
+
+
+class ModelSwitchSnapshot(AgentTestCase):
+    """跨服务降级、首选恢复与手动切换，在线提示和落盘诊断一起回放。"""
+
+    def test_scenario(self) -> None:
+        import openai
+
+        from xiaoyu.events import Notice
+        from xiaoyu.providers import Provider, Registry
+        from xiaoyu.session_inspect import inspect_session, render_report
+        from xiaoyu.session_log import SessionLog, last_model
+        from .test_agent_paths import FakeClient
+        from .test_errors import _response
+
+        if MODE == "record":
+            self.skipTest("模型切换使用确定性 fixture，不调用真实模型")
+        primary = FakeClient([
+            openai.AuthenticationError("bad key", response=_response(401), body=None),
+            [chunk(content="主服务恢复"), usage_chunk(10, 2)],
+        ])
+        backup = FakeClient([[chunk(content="备用答复"), usage_chunk(10, 2)]])
+        agent = self.build([])
+        agent.registry = Registry([
+            Provider("primary", "http://unused", "", ("main-model",), "主服务"),
+            Provider("gateway", "http://unused", "", (), "备用服务"),
+        ], clients={"primary": primary, "gateway": backup})
+        log = SessionLog.create(str(self.root), "main-model", directory=self.root / "sessions")
+        self.addCleanup(log.release)
+        agent.session_log = log
+        with (mock.patch.object(agent, "emit") as emitted,
+              mock.patch.object(agent.world_state, "diff", return_value=None),
+              mock.patch.object(agent, "_sleep") as sleep):
+            agent.send("开始")
+            agent._preferred_retry_at = 0.0
+            agent.send("继续")
+            agent.switch_model("chosen-model")
+        sleep.assert_not_called()
+        records = [json.loads(line) for line in log.path.read_text(encoding="utf-8", errors="replace").splitlines()]
+        actual = {
+            "notices": [call.args[0].text for call in emitted.call_args_list if isinstance(call.args[0], Notice)],
+            "model_events": [{k: v for k, v in record.items() if k != "ts"}
+                             for record in records if record.get("event") == "model"],
+            "inspect": render_report(inspect_session(log.path, kinds=("model",))).replace(str(log.path), "<SESSION>"),
+            "restored_model": last_model(log.path),
+            "requests_by_provider": [len(primary.completions.calls), len(backup.completions.calls)],
+        }
+        path = Path(__file__).parent / "fixtures" / "model_switch.expected.json"
+        if MODE == "refresh":
+            path.write_text(json.dumps(actual, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        self.assertEqual(actual, json.loads(path.read_text(encoding="utf-8", errors="replace")))
+        self.assertEqual(actual["requests_by_provider"], [2, 1])
+
+
+class ContextSourcesSnapshot(AgentTestCase):
+    """项目规则在启动后变更，诊断仍反映装入会话的原文与懒加载结果。"""
+
+    def test_scenario(self) -> None:
+        from xiaoyu.agent import Agent
+        from xiaoyu.cli import handle_slash
+        from xiaoyu.render import NullSink
+
+        if MODE == "record":
+            self.skipTest("上下文诊断使用确定性 fixture，不调用真实模型")
+        from xiaoyu.cli import user_memo
+
+        memo_agent = self.build([])
+        self.assertEqual(user_memo(memo_agent, "root instructions exceed budget"), "AGENTS.md")
+        (self.root / "CLAUDE.md").write_text("extra", encoding="utf-8")
+        (self.root / "api").mkdir()
+        (self.root / "api/AGENTS.md").write_text("nested rules", encoding="utf-8")
+        (self.root / "api/CLAUDE.md").write_text("nested extra", encoding="utf-8")
+        (self.root / "api/code.py").write_text("pass", encoding="utf-8")
+        #  消除机器身份、日期与安装路径对字符数的影响，项目指令走真实构建路径。
+        with (mock.patch("xiaoyu.agent.SYSTEM_PROMPT", "测试核心身份。"),
+              mock.patch("xiaoyu.agent.envprobe.block", return_value=""),
+              mock.patch("xiaoyu.agent.world_state.today", return_value="2026-01-01"),
+              mock.patch("xiaoyu.agent.__file__", str(self.root / "agent.py")),
+              mock.patch.object(Agent, "_PROJECT_DOC_CAP", 10)):
+            agent = self.build([
+                [chunk(tool_calls=[call_fragment(0, "read", "read_file", '{"path":"api/code.py"}')]),
+                 usage_chunk(10, 5)],
+                [chunk(content="读完了。"), usage_chunk(15, 5)],
+            ], sink=NullSink())
+        with mock.patch.object(agent.world_state, "diff", return_value=None):
+            agent.send("读一下代码")
+        before = agent.context_breakdown()
+        (self.root / "AGENTS.md").write_text("changed", encoding="utf-8")
+        (self.root / "api/AGENTS.md").unlink()
+        shown = io.StringIO()
+        with (contextlib.redirect_stdout(shown), mock.patch("xiaoyu.ui._ENABLED", False),
+              mock.patch.object(agent, "context_tokens", return_value=100)):
+            handle_slash(agent, "/context")
+        actual = {"terminal": shown.getvalue(), "model_requests": len(self.client.completions.calls)}
+        path = Path(__file__).parent / "fixtures" / "context_sources.expected.json"
+        if MODE == "refresh":
+            path.write_text(json.dumps(actual, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        self.assertEqual(actual, json.loads(path.read_text(encoding="utf-8", errors="replace")))
+        self.assertEqual(agent.context_breakdown(), before)
+        self.assertEqual(actual["model_requests"], 2)
+
+
+class RewindPreviewSnapshot(AgentTestCase):
+    """真实文件工具写入后，CLI 显示预览并确认恢复；不调用网络。"""
+
+    def test_scenario(self) -> None:
+        from xiaoyu.cli import _rewind_flow
+        from xiaoyu.render import NullSink
+
+        if MODE == "record":
+            self.skipTest("回滚交互使用确定性 fixture，不调用真实模型")
+        agent = self.build([
+            [chunk(tool_calls=[call_fragment(0, "write", "write_file", json.dumps(
+                {"path": "draft.txt", "content": "Draft report.\n"}))]), usage_chunk(10, 5)],
+            [chunk(content="草稿已写入。"), usage_chunk(15, 5)],
+        ], sink=NullSink())
+        agent.send("生成草稿")
+        shown = io.StringIO()
+        replies = iter(["3", "y"])
+
+        def answer(prompt):
+            reply = next(replies)
+            print(prompt + reply)
+            return reply
+
+        with (contextlib.redirect_stdout(shown), mock.patch("builtins.input", side_effect=answer),
+              mock.patch("xiaoyu.cli.time.strftime", return_value="12:00"),
+              mock.patch("xiaoyu.ui._ENABLED", False)):
+            _rewind_flow(agent, ["1"])
+        actual = {"terminal": shown.getvalue(), "file_exists": (self.root / "draft.txt").exists(),
+                  "checkpoints": [p.index for p in agent.toolbox.rewind.points()],
+                  "model_requests": len(self.client.completions.calls)}
+        path = Path(__file__).parent / "fixtures" / "rewind_preview.expected.json"
+        if MODE == "refresh":
+            path.write_text(json.dumps(actual, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        self.assertEqual(actual, json.loads(path.read_text(encoding="utf-8", errors="replace")))
+        self.assertFalse(actual["file_exists"])
+        self.assertEqual(actual["model_requests"], 2)
+
+
+def _scenario_dir(name: str) -> Path:
+    return SNAPSHOTS / name
+
+
+class SnapshotCase(E2ECase):
+    """场景驱动器：一次回放跑出四个捕获面（stdout / 会话 / 请求头 / stderr）。"""
+
+    maxDiff = None
+
+    #  —— 驱动 ——
+
+    def replay_run(self, sc: Scenario) -> dict[str, Any]:
+        capture_dir = Path(self.tmp) / "capture"
+        env = self.env_for(_scenario_dir(sc.name) / "model.txt")
+        env[CAPTURE_ENV] = str(capture_dir)
+        env[STRICT_ENV] = "1"
+        proc = subprocess.run(
+            [
+                sys.executable, "-m", "xiaoyu", sc.prompt,
+                "--output-format", "stream-json",
+                "--workspace", str(self.workspace),
+                "--model", REPLAY_MODEL,
+                *sc.args,
+            ],
+            stdin=subprocess.DEVNULL,  # 见 test_e2e_scripted 里的同款说明
+            capture_output=True, text=True, encoding="utf-8", errors="replace",
+            timeout=_TIMEOUT, env=env, cwd=self.tmp,
+        )
+        self.assertEqual(proc.returncode, sc.expect_exit, proc.stderr)
+        self.assertNotIn(
+            "ScriptedUnconsumed", proc.stderr,
+            f"场景比 fixture 少驱动了几次模型调用：\n{proc.stderr}",
+        )
+        stdout_lines = [
+            json.dumps(normalize_event(json.loads(line), self.tmp), ensure_ascii=False)
+            for line in proc.stdout.splitlines() if line.strip()
+        ]
+        session_files = sorted((Path(self.tmp) / "config").rglob("*.jsonl"))
+        self.assertEqual(len(session_files), 1, f"应恰好落一个会话文件：{session_files}")
+        records = [
+            json.loads(line)
+            for line in session_files[0].read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ]
+        captures = [
+            json.loads(path.read_text(encoding="utf-8"))
+            for path in sorted(capture_dir.glob("request-*.json"),
+                               key=lambda p: int(p.stem.split("-")[1]))
+        ]
+        self.assertTrue(captures, "回放至少应捕获一次请求头")
+        return {
+            "stdout": stdout_lines,
+            "session": normalize_session_lines(records, self.tmp),
+            "captures": captures,
+        }
+
+    #  —— 三模式的场景主流程 ——
+
+    def check_scenario(self, sc: Scenario) -> None:
+        directory = _scenario_dir(sc.name)
+        if MODE == "record":
+            if not sc.recorded:
+                self.skipTest("纯手写 fixture（错误时序），record 不覆盖")
+            self._record(sc, directory)
+        run = self.replay_run(sc)
+        if MODE in ("refresh", "record"):
+            self._write_goldens(sc, directory, run)
+        self._compare_goldens(sc, directory, run)
+
+    def _write_goldens(self, sc: Scenario, directory: Path, run: dict[str, Any]) -> None:
+        (directory / "stdout.expected.jsonl").write_text(
+            "\n".join(run["stdout"]) + "\n", encoding="utf-8"
+        )
+        (directory / "session.expected.jsonl").write_text(
+            "\n".join(run["session"]) + "\n", encoding="utf-8"
+        )
+        if sc.pins_header:
+            first = run["captures"][0]
+            (directory / "system-prompt.expected.md").write_text(
+                normalize_system_prompt(first["system"], self.tmp), encoding="utf-8"
+            )
+            tools = next((c["tools"] for c in run["captures"] if c["tools"]), None)
+            self.assertIsNotNone(tools, "pin 场景至少要有一次带工具的调用")
+            (directory / "tool-schemas.expected.json").write_text(
+                normalize_tool_schemas(tools, self.tmp) + "\n", encoding="utf-8"
+            )
+
+    def _compare_goldens(self, sc: Scenario, directory: Path, run: dict[str, Any]) -> None:
+        expected_stdout = (directory / "stdout.expected.jsonl").read_text(
+            encoding="utf-8"
+        ).splitlines()
+        self.assertEqual(run["stdout"], expected_stdout, "stream-json 事件流偏离 golden")
+        expected_session = (directory / "session.expected.jsonl").read_text(
+            encoding="utf-8"
+        ).splitlines()
+        self.assertEqual(run["session"], expected_session, "会话 JSONL 偏离 golden")
+        #  pin 对比：pin 场景在所有模式比（refresh 刚重写，比对是自证）；
+        #  非 pin 场景只在 replay 比（refresh 模式下 sidecar 可能尚未按用例
+        #  顺序重写，全量 refresh 后跑一遍默认模式即补上核对）
+        if os.name == "nt" or (not sc.pins_header and MODE != "replay"):
+            return
+        pin_dir = _scenario_dir(_PIN.name)
+        expected_system = (pin_dir / "system-prompt.expected.md").read_text(encoding="utf-8")
+        expected_tools = (pin_dir / "tool-schemas.expected.json").read_text(encoding="utf-8")
+        for index, capture in enumerate(run["captures"], start=1):
+            self.assertEqual(
+                normalize_system_prompt(capture["system"], self.tmp),
+                expected_system,
+                f"第 {index} 次调用的 system prompt 偏离 pin（改了 prompt 请跑 refresh）",
+            )
+            if capture["tools"]:
+                self.assertEqual(
+                    normalize_tool_schemas(capture["tools"], self.tmp) + "\n",
+                    expected_tools,
+                    f"第 {index} 次调用的 tool schemas 偏离 pin（改了工具面请跑 refresh）",
+                )
+
+    def _record(self, sc: Scenario, directory: Path) -> None:
+        """真 API 重录（串行、花真钱）：真机配置 + 真密钥，只圈住工作区。"""
+        env = {**os.environ, RECORD_ENV: str(directory)}
+        model = os.environ.get("XIAOYU_SNAPSHOT_MODEL", "").strip()
+        proc = subprocess.run(
+            [
+                sys.executable, "-m", "xiaoyu", sc.prompt,
+                "--output-format", "stream-json",
+                "--workspace", str(self.workspace),
+                *(["--model", model] if model else []),
+                *sc.args,
+            ],
+            stdin=subprocess.DEVNULL,  # 见 test_e2e_scripted 里的同款说明
+            capture_output=True, text=True, encoding="utf-8", errors="replace",
+            timeout=_TIMEOUT, env=env, cwd=self.tmp,
+        )
+        self.assertEqual(proc.returncode, 0, f"录制失败：\n{proc.stderr}\n{proc.stdout}")
+        self.assertTrue((directory / "model.txt").is_file(), "录制没有产出 model.txt")
+        #  录制期的请求头 dump 含真模型名与机器路径，属易变副产物：
+        #  pin sidecar 由紧随其后的回放捕获重写，这些直接清掉、不入库
+        for leftover in directory.glob("request-*.json"):
+            leftover.unlink()
+
+
+class TextTurnSnapshot(SnapshotCase):
+    def test_scenario(self) -> None:
+        self.check_scenario(SCENARIOS[0])
+
+
+class ToolTurnSnapshot(SnapshotCase):
+    def test_scenario(self) -> None:
+        self.check_scenario(SCENARIOS[1])
+
+
+class ErrorRetrySnapshot(SnapshotCase):
+    def test_scenario(self) -> None:
+        self.check_scenario(SCENARIOS[2])
+
+
+class ErrorFatalSnapshot(SnapshotCase):
+    def test_scenario(self) -> None:
+        self.check_scenario(SCENARIOS[3])
+
+
+class InvalidToolArgumentsSnapshot(SnapshotCase):
+    def test_scenario(self) -> None:
+        self.check_scenario(SCENARIOS[4])
+        self.assertFalse((self.workspace / "must-not-exist.txt").exists())
+
+
+class StaleFileVersionSnapshot(SnapshotCase):
+    def env_for(self, script_path: Path) -> dict[str, str]:
+        env = super().env_for(script_path)
+        env["XIAOYU_ENABLE_HOOKS"] = "1"
+        return env
+
+    def test_scenario(self) -> None:
+        target = self.workspace / "owner.txt"
+        target.write_bytes(b"owner=A\n")
+        # 读取已登记后模拟外部编辑；时间、大小不变，只有内容指纹能识别。
+        script = Path(self.tmp) / "change.py"
+        script.write_text(
+            "import os\nfrom pathlib import Path\n"
+            "p = Path('owner.txt')\ns = p.stat()\n"
+            "p.write_bytes(b'owner=B\\n')\n"
+            "os.utime(p, ns=(s.st_atime_ns, s.st_mtime_ns))\n",
+            encoding="utf-8",
+        )
+        config = Path(self.tmp) / "config" / "xiaoyu"
+        config.mkdir(exist_ok=True)
+        command = f'"{sys.executable}" "{script}"'
+        (config / "hooks.toml").write_text(
+            '[[hooks]]\nevent = "PostToolUse"\nmatcher = "^read_file$"\n'
+            f"command = {json.dumps(command)}\ntimeout = 5\n",
+            encoding="utf-8",
+        )
+        self.check_scenario(SCENARIOS[5])
+        self.assertEqual(target.read_bytes(), b"owner=B\n")
+
+
+@unittest.skipIf(os.name == "nt", "信号中断快照依赖 POSIX；宿主 interrupt 回归全平台运行")
+class CancelBeforeToolSnapshot(SnapshotCase):
+    def env_for(self, script_path: Path) -> dict[str, str]:
+        env = super().env_for(script_path)
+        env["XIAOYU_ENABLE_HOOKS"] = "1"
+        return env
+
+    def test_scenario(self) -> None:
+        script = Path(self.tmp) / "cancel.py"
+        script.write_text(
+            "import os, signal\nos.kill(os.getppid(), signal.SIGINT)\n",
+            encoding="utf-8",
+        )
+        config = Path(self.tmp) / "config" / "xiaoyu"
+        config.mkdir(exist_ok=True)
+        # exec 去掉中间 shell，信号只发给本测试的 CLI 父进程。
+        command = f'exec "{sys.executable}" "{script}"'
+        (config / "hooks.toml").write_text(
+            '[[hooks]]\nevent = "PreToolUse"\nmatcher = "^write_file$"\n'
+            f"command = {json.dumps(command)}\ntimeout = 5\n",
+            encoding="utf-8",
+        )
+        self.check_scenario(SCENARIOS[6])
+        self.assertFalse((self.workspace / "cancelled.txt").exists())
+
+
+class BoundedHookOutputSnapshot(SnapshotCase):
+    def env_for(self, script_path: Path) -> dict[str, str]:
+        env = super().env_for(script_path)
+        env["XIAOYU_ENABLE_HOOKS"] = "1"
+        return env
+
+    def replay_run(self, sc: Scenario) -> dict[str, Any]:
+        run = super().replay_run(sc)
+        # 告警包含命令；仅归一化当前解释器的位置，保留截断语义和脚本路径。
+        executable = json.dumps(sys.executable, ensure_ascii=False)[1:-1]
+        for surface in ("stdout", "session"):
+            run[surface] = [line.replace(executable, "<python>") for line in run[surface]]
+        self.assertTrue(any("首行上下文" in line for line in run["session"]))
+        self.assertNotIn("x" * 100, str(run["session"]))
+        return run
+
+    def test_scenario(self) -> None:
+        script = Path(self.tmp) / "output.py"
+        script.write_text("print('首行上下文')\nprint('x' * 1048576)\n", encoding="utf-8")
+        config = Path(self.tmp) / "config" / "xiaoyu"
+        config.mkdir(exist_ok=True)
+        command = f'"{sys.executable}" "{script}"'
+        (config / "hooks.toml").write_text(
+            '[[hooks]]\nevent = "UserPromptSubmit"\n'
+            f"command = {json.dumps(command)}\ntimeout = 5\n", encoding="utf-8",
+        )
+        self.check_scenario(SCENARIOS[7])
+
+
+class ContentRejectionSnapshot(SnapshotCase):
+    def test_scenario(self) -> None:
+        self.check_scenario(SCENARIOS[8])
+
+
+class FileDeliverySnapshot(SnapshotCase):
+    def test_scenario(self) -> None:
+        self.check_scenario(next(sc for sc in SCENARIOS if sc.name == "file-delivery"))
+        self.assertEqual((self.workspace / "report.txt").read_bytes(), b"artifact result\n")
+
+
+class PatchSnapshot(SnapshotCase):
+    def test_scenario(self) -> None:
+        self.check_scenario(next(sc for sc in SCENARIOS if sc.name == "patch-turn"))
+        self.assertEqual((self.workspace / "a.txt").read_bytes(), b"new\n")
+        self.assertFalse((self.workspace / "b.txt").exists())
+
+
+class RuntimeStatusSnapshot(SnapshotCase):
+    def test_scenario(self) -> None:
+        self.check_scenario(next(sc for sc in SCENARIOS if sc.name == "runtime-status"))
+
+
+class UnconsumedGuardTest(SnapshotCase):
+    """strict 未耗尽告警本身要证明会红：故意多给一轮，stderr 必须出现标记。"""
+
+    def test_leftover_turns_complain_on_stderr(self) -> None:
+        script = Path(self.tmp) / "over.txt"
+        script.write_text("text: 只用这轮\n---\ntext: 多出来的一轮\n", encoding="utf-8")
+        env = self.env_for(script)
+        env[STRICT_ENV] = "1"
+        proc = subprocess.run(
+            [sys.executable, "-m", "xiaoyu", "说句话", "--output-format", "stream-json",
+             "--workspace", str(self.workspace)],
+            stdin=subprocess.DEVNULL,  # 见 test_e2e_scripted 里的同款说明
+            capture_output=True, text=True, encoding="utf-8", errors="replace",
+            timeout=_TIMEOUT, env=env, cwd=self.tmp,
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("ScriptedUnconsumed", proc.stderr)
+        self.assertIn("剩 1 轮", proc.stderr)
+
+
+class FixtureGuardTest(unittest.TestCase):
+    """fixture 守卫：孤儿目录、缺文件、多 pin、易变副产物入库都拒绝。"""
+
+    def test_exactly_one_pin(self) -> None:
+        self.assertEqual(sum(1 for sc in SCENARIOS if sc.pins_header), 1)
+
+    def test_scenario_dirs_match_table(self) -> None:
+        names = {sc.name for sc in SCENARIOS}
+        on_disk = {p.name for p in SNAPSHOTS.iterdir() if p.is_dir()}
+        self.assertEqual(on_disk, names, "snapshots/ 下的目录必须与场景表一一对应")
+
+    def test_required_files_present_and_no_strays(self) -> None:
+        for sc in SCENARIOS:
+            directory = _scenario_dir(sc.name)
+            expected = {"model.txt", "stdout.expected.jsonl", "session.expected.jsonl"}
+            if sc.pins_header:
+                expected |= {"system-prompt.expected.md", "tool-schemas.expected.json"}
+            with self.subTest(scenario=sc.name):
+                self.assertEqual(
+                    {p.name for p in directory.iterdir() if p.is_file()},
+                    expected,
+                    "缺 golden 或混入了不该入库的文件（如录制留下的 request-*.json）",
+                )
+
+    def test_fixtures_parse_as_scripted_dsl(self) -> None:
+        for sc in SCENARIOS:
+            with self.subTest(scenario=sc.name):
+                turns = load_scripts(str(_scenario_dir(sc.name) / "model.txt"))
+                self.assertTrue(turns, "fixture 至少要有一轮")
+
+    def test_env_names_stay_wired(self) -> None:
+        #  常量拼写走真源头 import：套件与产品侧的开关名永远同步
+        self.assertEqual(SCRIPTED_ENV, "XIAOYU_SCRIPTED_SCRIPTS")
+        self.assertEqual(RECORD_ENV, "XIAOYU_SNAPSHOT_RECORD")
+
+
+if __name__ == "__main__":
+    unittest.main()
+
+
+class ExploreMcpSnapshot(AgentTestCase):
+    """明确选中的代码查询工具进入子上下文，其余工具不进入。"""
+
+    def test_scenario(self):
+        from xiaoyu.agent import Agent
+        from xiaoyu.mcp import McpView
+        from xiaoyu.providers import Registry
+        from xiaoyu.tools import Toolbox
+        from .test_agent_paths import FakeClient
+        from .test_subagent_knobs import FakeManager, remote, tool_turn, text_turn
+
+        self.config.enable_mcp = False
+        self.config.mcp_tool_search = True
+        self.config.explore_mcp_tools = ["mcp__code__definition"]
+        manager = FakeManager([remote("code", "definition"), remote("code", "rename")])
+        box = Toolbox(self.config, mcp_view=McpView(manager))
+        client = FakeClient([
+            tool_turn("query", "use_tool", {"tool_name": "mcp__code__definition"}),
+            text_turn("已找到定义"),
+        ])
+        Agent(self.config, box, registry=Registry.for_client(client))
+        with contextlib.redirect_stdout(io.StringIO()):
+            result = box.get("explore").handler(question="查定义")
+        first, last = client.completions.calls
+        actual = {
+            "system": normalize_system_prompt(first["messages"][0]["content"], str(self.root)),
+            "tools": [t["function"]["name"] for t in first["tools"]],
+            "results": [m["content"] for m in last["messages"] if m["role"] == "tool"],
+            "answer": result,
+        }
+        fixture = Path(__file__).parent / "fixtures" / "explore_mcp.expected.json"
+        if MODE == "refresh":
+            fixture.write_text(json.dumps(actual, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        self.assertEqual(actual, json.loads(fixture.read_text(encoding="utf-8", errors="replace")))
+
+
+class MemoryReviewSnapshot(E2ECase):
+    def test_review_then_recall_then_forget(self):
+        env = self.scripted_env("text: unused\n")
+        def command(*args):
+            proc = subprocess.run([sys.executable, "-P", "-m", "xiaoyu", "memory",
+                "--db", str(self.workspace / "memory.db"), "--owner", "snapshot", "--project", "repo", *args],
+                env=env, cwd=self.workspace, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=_TIMEOUT)
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            return proc.stdout.strip()
+        proposed = json.loads(command("propose", "runner", "Use unittest", "--source", "chat#1", "--evidence", "Use unittest"))
+        actual = {"proposed": proposed["status"], "before": command("recall", "unittest")}
+        accepted = json.loads(command("accept", proposed["id"], "--reviewer", "owner"))
+        actual["accepted"] = {k: accepted[k] for k in ("status", "revision", "reviewed_by")}
+        recalled = command("recall", "unittest").replace(proposed["id"], "<id>")
+        actual["recalled_text"] = json.loads(recalled.split("\n", 1)[1])[0]["candidate"]["text"]
+        command("forget", "runner")
+        actual["after"] = command("recall", "unittest")
+        fixture = Path(__file__).parent / "fixtures" / "memory_review.expected.json"
+        if MODE == "refresh":
+            fixture.write_text(json.dumps(actual, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        self.assertEqual(actual, json.loads(fixture.read_text(encoding="utf-8", errors="replace")))

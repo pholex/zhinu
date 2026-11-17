@@ -1,0 +1,6 @@
+# content 错传数组：在写入前拒绝，下一步让模型修正或说明
+tool_call: {"name": "write_file", "arguments": {"path": "must-not-exist.txt", "content": []}}
+usage: {"prompt_tokens": 150, "completion_tokens": 20}
+---
+text: "参数类型错误，本次没有写入文件。"
+usage: {"prompt_tokens": 190, "completion_tokens": 12}

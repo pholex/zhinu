@@ -1,0 +1,26 @@
+{
+  "action": "merge",
+  "blockers": [
+    {
+      "code": "review_missing",
+      "message": "尚未提交评审。"
+    }
+  ],
+  "can_execute": false,
+  "changed_files": [
+    "src/new.py"
+  ],
+  "conflict_check": "not_checked",
+  "diff": {
+    "available": true,
+    "note": "仅显示前 64 KiB。",
+    "truncated": true
+  },
+  "preview_token": "",
+  "review": {
+    "current": false,
+    "reviewed_commit": "",
+    "round": 0,
+    "verdict": ""
+  }
+}

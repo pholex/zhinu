@@ -1,0 +1,1075 @@
+"""把 OpenAI 的 Responses API 包成 chat completions 的形状。
+
+**为什么必须有这一层**：gpt-5.6 起的推理线（现役 gpt-6 astra / sol / luna）在 `/v1/chat/completions`
+上「带 tools 就 400」，报错原文明确给了两条路——改走 `/v1/responses`，或者
+`reasoning_effort='none'`。小羽是 agent，每一轮都带工具 schema，第二条等于把 5.6
+永久降级成非推理档；所以只剩第一条。
+
+**为什么不动内核**：`Registry.client()` 返回的本来就是鸭子型对象（调用面只有
+`chat.completions.create`，见 providers.py 的注释），scripted 测试桩早就是第二只
+鸭子。这里加的是第三只：外面看是 chat completions，里面说 Responses。于是
+
+- `agent.messages` 仍是 chat-completions 形态（tool_calls 配对不变量、压缩切点、
+  历史修复、会话日志、网关同名兜底全部照旧）；
+- 同一份历史可以在两种 wire format 之间来回切——因为翻译发生在**发出去的那一刻**，
+  不落进历史。websearch.py 当年判「双 transport 不值」，说的是让内核学第二种消息
+  形态；翻译层不改内核形态，所以那个结论不适用于这里。
+
+**reasoning item 回传**：这是 Responses 相对 chat completions 唯一的**能力增量**，
+也是唯一需要内核配合的地方。推理模型在多轮工具循环里，若每轮都从零重新推理，
+既烧 reasoning token 又容易在长任务里丢线索。`store=False` 下拿回它的办法是
+`include=["reasoning.encrypted_content"]`——服务端把推理状态加密成一个不透明串
+交给客户端保管，下一轮原样送回即可续上。
+
+存放方式是**挂在 assistant 消息上的私有键 `_reasoning`**（不是另起一张边表）：
+消息被压缩丢弃时它跟着一起走、会话日志落盘时它跟着一起存、fork/resume 天然带上，
+一个"记得同步清理"的地方都不需要。代价是历史里多了一个只有 Responses 认识的键，
+所以出网前必须摘掉——这正是 `Transport` 把 chat 协议也一并包住的原因：
+出网口只有一个，就不存在"哪天新加一条路径忘了摘"。
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import re
+from dataclasses import dataclass, field
+from typing import Any, Iterator
+
+from . import media
+from .errors import StreamFailed
+
+#  协议名。也是通用兜底 provider 的 XIAOYU_PROVIDER_<NAME>_PROTOCOL 取值
+CHAT = "chat"
+RESPONSES = "responses"
+ANTHROPIC = "anthropic"
+
+#  输出 token 上限的默认值。Messages 协议 max_tokens 必填（chat / Responses 可省，
+#  上游按自家默认），所以三条协议里只有它默认就带。流式给大：Claude 5 线
+#  thinking 默认开启且计入 max_tokens，余量要留足；非流式（摘要/收尾）给小：
+#  SDK 对超大的非流式请求有 ~10 分钟护栏会直接拒。用户设了
+#  XIAOYU_MAX_OUTPUT_TOKENS 时三条协议都带上（见 _Completions._dispatch）
+STREAM_MAX_TOKENS = 64_000
+SYNC_MAX_TOKENS = 16_000
+
+#  "整家都说 Responses" 的写法。协议是**按型号**声明的，因为同一家常常只有部分
+#  型号开了这条路——deepseek 就是 v4-flash 通、v4-pro 明确回"稍后开放"，
+#  而 v4-pro 恰恰是默认主模型，按家切会当场切死。
+WILDCARD = "*"
+
+#  assistant 消息上的私有键：存这一轮的 reasoning item。下划线开头 = 内核私有，
+#  绝不出网（见 strip_private）。值的形状是 {"model": 产出它的模型, "items": [...]}
+REASONING_KEY = "_reasoning"
+#  user 消息上的私有键：标记"这条是 harness/宿主以 operator 身份说的，不是用户
+#  原话"（plan 进出说明、nudge、系统通知…）。内核形态仍是 role=user（压缩 /
+#  fork / 回放的全部判据不变）；出网时 Anthropic 支持的型号翻成会话中
+#  `role: system`（operator 权威通道，且不破缓存前缀），其余协议照旧当 user 发
+OPERATOR_KEY = "_operator"
+
+#  assistant 消息上的私有键：存这一轮 tool_calls 随流带回的 extra_content
+#  （目前只有 Gemini 用它带 thought_signature——Gemini 3 起工具调用重放时必须
+#  原样带回，缺了当前轮直接 400）。形状是
+#  {"model": 产出模型, "provider": 产出 provider, "extras": {call_id: extra_content}}。
+#  与 _reasoning 同一套纪律：模型私有状态，只在产出它的那条路由上还原，
+#  出网前统一被摘掉（见 restore_tool_extras / strip_private）
+TOOL_EXTRAS_KEY = "_tool_extras"
+
+#  跨模型迁移历史的占位签名（Google 官方文档给的逃生舱）：会话中途切到签名
+#  型号时，历史里别家产的 tool_calls 没有签名，上游会把**当前轮**缺签名的
+#  function call 400 拒收（非当前轮容忍，2026-08-24 实测）；补这个占位串即通过
+DUMMY_SIGNATURE = "context_engineering_is_the_way_to_go"
+
+#  请求参数上的私有键：本会话稳定的缓存路由键。Responses 一路翻成标准字段
+#  `prompt_cache_key`——同一会话的请求被路由到同一台服务器，缓存命中才稳定
+#  （xAI 官方"强烈建议"：不带时常落到缓存冷的机器上全价付输入；OpenAI 同名字段
+#  同样用于缓存路由）。chat / Messages 两路没有对应物，在 _dispatch 入口摘掉
+CACHE_KEY = "_cache_key"
+
+#  拿回 reasoning 状态所必须的 include。实测 xai / qwen / deepseek 的 Responses
+#  端点都容得下这个参数（不支持推理的模型只是不回而已），所以无条件发。
+_REASONING_INCLUDE = ["reasoning.encrypted_content"]
+
+
+def strip_private(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """摘掉所有下划线私有键。没有私有键的消息原样复用，不做无谓的拷贝。
+
+    为什么必须摘（2026-08-12 实测：openai / anthropic / deepseek / zhipu /
+    moonshot / xai / qwen 的 chat 端点**目前都容忍**这个未知键，所以理由不是"会 400"）：
+
+    1. **钱**——一个 reasoning item 的加密串实测约 1000 字符，对 chat 端点是纯废话，
+       却要作为 input token 在**其后每一轮**重复计费。这是确定的浪费，不是假设；
+    2. **各家宽严不一且会变**，赌"大家都宽容"没有好处；
+    3. 私有键就该止于内核边界——历史是我们的数据结构，wire 是协议。
+    """
+    cleaned: list[dict[str, Any]] = []
+    for message in messages:
+        if any(key.startswith("_") for key in message):
+            message = {k: v for k, v in message.items() if not k.startswith("_")}
+        cleaned.append(message)
+    return cleaned
+
+
+#  网关位的 provider 名（与 providers.GATEWAY 同值；这里不能 import providers——
+#  它反过来 import 本模块。有测试钉两者相等）
+GATEWAY_PROVIDER = "gateway"
+#  网关下 Claude 后端的缓存断点。Anthropic 的 prompt cache 不是自动的：没有
+#  cache_control 的请求一个 token 都不缓存——2026-10-02 对自建 LiteLLM 网关实测
+#  （claude-sonnet-5.5，15k 前缀）：不带断点连发两次 cached_tokens 全为 0；
+#  带断点第二次 cache_read 15360。直连 Anthropic 一路在 messages.py 里打断点，
+#  但经网关走的是 chat 载荷，那一层碰不到。LiteLLM 把 chat 消息里的 cache_control
+#  原样翻给上游：system 的 text block、user 的 text block、tool 消息的消息级字段、
+#  tools 条目顶层字段四处都实测透传并命中（流式也一样）。
+#  只按型号名猜后端（含 claude / anthropic）：网关的模型表不告诉我们后端是谁；
+#  不是 LiteLLM 的网关可能拒收这个字段，XIAOYU_GATEWAY_CACHE_CONTROL=0 关掉
+CHAT_CACHE_CONTROL: dict[str, str] = {"type": "ephemeral"}
+CHAT_CACHE_ENV = "XIAOYU_GATEWAY_CACHE_CONTROL"
+#  次锚点与尾锚点之间至少隔这么多条消息：上游只往每个断点之前回看约 20 个
+#  block 找命中，一轮里塞进 20 条以上工具往返时尾断点就够不着上一轮的前缀；
+#  次锚点钉在更早处兜住这段。Anthropic 的断点上限是 4：tools、system、次锚、尾锚
+CHAT_CACHE_ANCHOR_GAP = 20
+_CHAT_CACHE_MARKERS = ("claude", "anthropic")
+
+
+def chat_cache_eligible(provider: str, model: str) -> bool:
+    """这条 chat 请求要不要打缓存断点：网关位 + 型号名像 Claude + 开关没关。"""
+    if provider != GATEWAY_PROVIDER:
+        return False
+    lowered = model.lower()
+    if not any(marker in lowered for marker in _CHAT_CACHE_MARKERS):
+        return False
+    return os.environ.get(CHAT_CACHE_ENV, "").strip().lower() not in ("0", "false", "no", "off")
+
+
+def _with_text_cache(message: dict[str, Any]) -> dict[str, Any] | None:
+    """给 user / system 消息的最后一个 text block 打断点；打不上返回 None。只改副本。"""
+    content = message.get("content")
+    if isinstance(content, str):
+        if not content:
+            return None
+        return {**message, "content": [{"type": "text", "text": content, "cache_control": dict(CHAT_CACHE_CONTROL)}]}
+    if not isinstance(content, list) or not content:
+        return None
+    blocks = list(content)
+    for index in range(len(blocks) - 1, -1, -1):
+        block = blocks[index]
+        if isinstance(block, dict) and block.get("type") == "text":
+            blocks[index] = {**block, "cache_control": dict(CHAT_CACHE_CONTROL)}
+            return {**message, "content": blocks}
+    return None
+
+
+def _with_message_cache(message: dict[str, Any]) -> dict[str, Any] | None:
+    """消息级断点：tool 结果用消息级字段（LiteLLM 认，content 保持原样）；
+    user 消息则落到 text block 上。assistant 不打——tool_calls 消息的翻译
+    形态不受我们控制，断点落在它后面那条 tool 上效果相同。"""
+    role = message.get("role")
+    if role == "tool":
+        if not message.get("content"):
+            return None
+        return {**message, "cache_control": dict(CHAT_CACHE_CONTROL)}
+    if role == "user":
+        return _with_text_cache(message)
+    return None
+
+
+def apply_chat_cache_control(
+    messages: list[dict[str, Any]], tools: list[dict[str, Any]] | None
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]] | None]:
+    """chat 载荷打缓存断点：tools 末尾、system、尾部可缓存消息、次锚点。只改发送副本。
+
+    尾锚随轮次后移（多轮增量缓存）；次锚点钉在尾锚之前 ≥ CHAT_CACHE_ANCHOR_GAP
+    条消息处的最近一条 user/tool 上。打不上断点的位置（空内容、全是图片）跳过，
+    不补位——断点少一个只是少命中一段，补错位置可能把 4 个的上限撑爆。
+    """
+    sent = list(messages)
+    if tools:
+        tools = [*tools[:-1], {**tools[-1], "cache_control": dict(CHAT_CACHE_CONTROL)}]
+    if sent and sent[0].get("role") == "system":
+        if (patched := _with_text_cache(sent[0])) is not None:
+            sent[0] = patched
+    cacheable = [
+        index for index, message in enumerate(sent)
+        if index > 0 and message.get("role") in ("user", "tool")
+    ]
+    if not cacheable:
+        return sent, tools
+    tail = cacheable[-1]
+    anchors = [tail]
+    earlier = [index for index in cacheable if index <= tail - CHAT_CACHE_ANCHOR_GAP]
+    if earlier:
+        anchors.append(earlier[-1])
+    for index in anchors:
+        if (patched := _with_message_cache(sent[index])) is not None:
+            sent[index] = patched
+    return sent, tools
+
+
+#  回放时顶替空工具名的占位：只出现在发送副本里，不对应任何真实工具
+NAMELESS_TOOL = "unnamed_tool"
+#  顶替不合规工具名的占位，同样只出现在发送副本里
+MALFORMED_TOOL = "malformed_tool_name"
+
+#  函数名的合规写法，取各家文档里最严的那一条。模型偶尔会写出
+#  `multi_tool_use.parallel`、`bash run` 这类名字；上游是否一律拒收没有逐家实测过，
+#  按最严的规整：合规的名字一个字节不动，规整只落在本来就没有对应工具的调用上
+_TOOL_NAME = re.compile(r"[a-zA-Z0-9_-]{1,64}")
+
+
+def _declared_names(tools: list[dict[str, Any]] | None) -> frozenset[str]:
+    """这次请求的工具表里出现的名字（chat 的嵌套形态与平铺形态都认）。"""
+    names: set[str] = set()
+    for tool in tools or []:
+        if not isinstance(tool, dict):
+            continue
+        function = tool.get("function")
+        name = function.get("name") if isinstance(function, dict) else tool.get("name")
+        if isinstance(name, str):
+            names.add(name)
+    return frozenset(names)
+
+
+def _name_placeholder(name: Any, declared: frozenset[str]) -> str | None:
+    """一个 tool_call 的工具名出网前要换成的占位；原样可发返回 None。
+
+    工具表里真有的名字不动：宿主注册的工具名即使不合这条最严的写法，调用与
+    工具表也得对得上——上游认不认这个名字，由工具表那一头决定。
+    """
+    if not (isinstance(name, str) and name.strip()):
+        return NAMELESS_TOOL
+    if _TOOL_NAME.fullmatch(name) or name in declared:
+        return None
+    return MALFORMED_TOOL
+
+
+def _repaired_arguments(raw: Any) -> str | None:
+    """一个 tool_call 的 arguments 出网前的修复结果；原样可发返回 None。
+
+    合法 JSON 对象原样；`strict=False` 能读（字符串里夹了裸换行/制表符这类控制
+    字符）就重新序列化；再不行、或读出来不是对象，一律 "{}"。
+    """
+    if isinstance(raw, dict):
+        return json.dumps(raw, ensure_ascii=False)
+    if not isinstance(raw, str):
+        return "{}"
+    try:
+        if isinstance(json.loads(raw), dict):
+            return None
+    except ValueError:
+        pass
+    try:
+        loaded = json.loads(raw, strict=False)
+    except ValueError:
+        return "{}"
+    return json.dumps(loaded, ensure_ascii=False) if isinstance(loaded, dict) else "{}"
+
+
+def repair_tool_arguments(
+    messages: list[dict[str, Any]], tools: list[dict[str, Any]] | None = None
+) -> list[dict[str, Any]]:
+    """历史里 assistant tool_calls 的坏 arguments 修成合法 JSON 对象串、空的或
+    不合规的工具名换成占位（出网前调用）。
+
+    模型吐过一次非法 JSON 参数后，那次调用已经回了 ERROR 结果，但原串还留在
+    历史里：chat 原样回放、Responses 的 function_call 也原样带上，严格解析
+    tool_calls 的端点（Ollama / vLLM 等）每次回放都 400，会话就此卡死。
+    tool 结果里的 ERROR 保留不动——模型仍知道那次调用失败了。
+
+    工具名同理（见 _name_placeholder）；tools 是这次请求的工具表，表里有的名字不动。
+
+    只改发送副本：历史是共享数据结构、会话日志要保留模型原话，改动都发生在
+    拷贝上；没有坏参数的消息原样复用，不做无谓的拷贝。
+    """
+    declared = _declared_names(tools)
+    out: list[dict[str, Any]] = []
+    for message in messages:
+        calls = message.get("tool_calls")
+        if not calls:
+            out.append(message)
+            continue
+        new_calls: list[Any] | None = None
+        for position, call in enumerate(calls):
+            if not isinstance(call, dict):
+                continue
+            function = call.get("function") or {}
+            fixed = _repaired_arguments(function.get("arguments"))
+            placeholder = _name_placeholder(function.get("name"), declared)
+            if fixed is None and placeholder is None:
+                continue
+            patched = dict(function)
+            if fixed is not None:
+                patched["arguments"] = fixed
+            if placeholder is not None:
+                #  没写工具名、或名字不合规的调用同理：那次已经回了"未知工具"，但原名
+                #  留在历史里，校验函数名的端点每次回放都拒
+                patched["name"] = placeholder
+            if new_calls is None:
+                new_calls = list(calls)
+            new_calls[position] = {**call, "function": patched}
+        out.append(message if new_calls is None else {**message, "tool_calls": new_calls})
+    return out
+
+
+def restore_tool_extras(
+    messages: list[dict[str, Any]], model: str, provider: str, sign_missing: bool
+) -> list[dict[str, Any]]:
+    """把 `_tool_extras` 私有键还原成 tool_calls[].extra_content（chat 出网前调用）。
+
+    还原纪律同 `_reasoning`：**产出它的那条路由**（provider+model 都对上）才还原，
+    任一对不上整条跳过——thought_signature 是模型私有状态，跨模型塞回去是喂错东西。
+    原样还原，不多不少：并行调用只有第一路有签名（2026-08-24 实测），
+    给其余调用补签名反而偏离模型的原始输出。
+
+    sign_missing（签名型号，见 Provider.signature_models）时，**没有任何可还原
+    签名**的 tool_calls 消息给每路调用补占位签名：这些是别家模型产的历史
+    （会话中途切模型 / 降级链落过来），上游对当前轮缺签名的 function call
+    直接 400——不补，切到签名型号这件事本身就是坏的。
+
+    不改传入的消息（历史是共享数据结构），改动都发生在拷贝上。
+    """
+    out: list[dict[str, Any]] = []
+    for message in messages:
+        calls = message.get("tool_calls")
+        if not calls:
+            out.append(message)
+            continue
+        info = message.get(TOOL_EXTRAS_KEY) or {}
+        extras: dict[str, Any] = {}
+        if info.get("model") == model and (info.get("provider") or "") == provider:
+            extras = info.get("extras") or {}
+        #  "有签名可还原"以**盖到这条消息的 call id** 为准，不是 extras 非空：
+        #  id 漂移（历史修复/fork 改写）或捕获缺口下 extras 可能非空却一个都
+        #  对不上——那等于没有签名，得走占位分支，否则当前轮整条不带签名出网，
+        #  正好撞上占位分支要防的那个 400。盖到一部分则只还原盖到的：并行调用
+        #  只有第一路有签名是上游的原始形状，其余留白即原样
+        if extras.keys() & {call.get("id") for call in calls}:
+            new_calls = [
+                {**call, "extra_content": extras[call.get("id")]}
+                if call.get("id") in extras
+                else call
+                for call in calls
+            ]
+        elif sign_missing:
+            placeholder = {"google": {"thought_signature": DUMMY_SIGNATURE}}
+            new_calls = [{**call, "extra_content": placeholder} for call in calls]
+        else:
+            out.append(message)
+            continue
+        out.append({**message, "tool_calls": new_calls})
+    return out
+
+
+# ---------- 请求方向：chat completions → Responses ----------
+
+
+def to_input(
+    messages: list[dict[str, Any]], model: str = "", provider: str = ""
+) -> list[dict[str, Any]]:
+    """messages → Responses 的 input 列表。
+
+    形态差异只有四处，其余角色原样透传：
+    1. assistant 的 `tool_calls` 不是消息的属性，而是**平级的 function_call item**；
+    2. `role: tool` 的结果同样是平级 item（function_call_output）；
+    3. 两者靠 `call_id` 配对——正好就是 chat 侧的 `tool_calls[].id` / `tool_call_id`，
+       所以往返无损，不需要额外的 id 映射表；
+    4. `_reasoning` 里的 reasoning item 还原到**这条消息的最前面**——服务端要求
+       reasoning item 排在它引出的 message / function_call 之前，顺序反了就不认。
+
+    reasoning 只在**产出它的那条路由**上回放（provider+model 都对上才回，
+    任一对不上整段跳过）：加密串是模型/服务侧的私有状态，`/model` 切了模型
+    不能塞回去；降级链让**同名模型跑在两家上**（直连 vs 网关），跨家回放
+    同样是喂错东西。旧会话的存量 reasoning 没有 provider 标签，按不匹配
+    处理（安全方向：丢 reasoning 永远无害，只是少省一点）。
+    """
+    items: list[dict[str, Any]] = []
+    for message in messages:
+        role = message.get("role")
+        content = message.get("content")
+        reasoning = message.get(REASONING_KEY) or {}
+        if reasoning.get("model") == model and (reasoning.get("provider") or "") == provider:
+            items.extend(reasoning.get("items") or [])
+        if role == "tool":
+            items.append(
+                {
+                    "type": "function_call_output",
+                    "call_id": message.get("tool_call_id", ""),
+                    "output": content or "",
+                }
+            )
+            continue
+        #  content 为 None 是合法的（只带 tool_calls 的 assistant），此时不发消息 item：
+        #  Responses 不接受空 content 的 assistant 消息
+        if content:
+            items.append({"role": role, "content": _to_parts(role, content)})
+        for call in message.get("tool_calls") or []:
+            function = call.get("function") or {}
+            items.append(
+                {
+                    "type": "function_call",
+                    "call_id": call.get("id", ""),
+                    "name": function.get("name", ""),
+                    "arguments": function.get("arguments") or "{}",
+                }
+            )
+    return items
+
+
+def _to_parts(role: Any, content: Any) -> Any:
+    """chat 的内容部件 → Responses 的内容部件。纯文本原样返回（不无谓地展开）。
+
+    两边的部件名不同：`text` → `input_text` / `output_text`（按角色分，
+    assistant 的历史正文必须是 output_text，用 input_text 会被拒），
+    `image_url` 从"嵌套对象"拍平成"URL 字符串"。图片只可能出现在 user 侧。
+    """
+    if not isinstance(content, list):
+        return content
+    text_type = "output_text" if role == "assistant" else "input_text"
+    parts: list[dict[str, Any]] = []
+    for part in content:
+        if not isinstance(part, dict):
+            continue
+        if part.get("type") == "image_url":
+            url = (part.get("image_url") or {}).get("url", "")
+            if url:
+                parts.append({"type": "input_image", "image_url": url})
+        else:
+            parts.append({"type": text_type, "text": str(part.get("text") or "")})
+    return parts
+
+
+def to_tools(tools: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """工具 schema：chat 的嵌套 `{"function": {...}}` 拍平成 Responses 的平铺形态。
+
+    `strict` 显式给 False：Responses 侧它默认为 True，而 True 要求 schema 满足
+    结构化输出的全部约束（每个对象都要 `additionalProperties: false`、required 必须
+    列全）。小羽的工具 schema 是按 chat 的宽松规则写的，不显式关掉会整批被拒。
+    """
+    converted: list[dict[str, Any]] = []
+    for tool in tools:
+        if tool.get("type") != "function" or "function" not in tool:
+            #  已经是 Responses 形态（或 web_search 这类内置工具）：原样透传
+            converted.append(tool)
+            continue
+        function = tool["function"]
+        converted.append(
+            {
+                "type": "function",
+                "name": function.get("name", ""),
+                "description": function.get("description", ""),
+                "parameters": function.get("parameters") or {},
+                "strict": function.get("strict", False),
+            }
+        )
+    return converted
+
+
+#  chat completions 参数名 → Responses 参数名。没列出的原样透传：
+#  与其静默丢弃一个调用方以为生效了的参数，不如让上游 400 出来。
+_PARAM_ALIASES = {
+    "max_completion_tokens": "max_output_tokens",
+    "max_tokens": "max_output_tokens",
+}
+
+
+def to_request(
+    model: str,
+    messages: list[dict[str, Any]],
+    tools: list[dict[str, Any]] | None,
+    extra: dict[str, Any],
+    provider: str = "",
+) -> dict[str, Any]:
+    """拼出 responses.create 的完整参数。
+
+    `store=False`：与 chat completions 行为对齐（不在服务端留存这次对话）。
+    Responses 默认 store=True，不显式关掉等于偷偷改变了用户的数据留存面。
+    """
+    request: dict[str, Any] = {
+        "model": model,
+        "input": to_input(messages, model, provider),
+        "store": False,
+        "include": _REASONING_INCLUDE,
+    }
+    if tools:
+        request["tools"] = to_tools(tools)
+    for key, value in extra.items():
+        if key == "reasoning_effort":
+            #  chat 的平铺 reasoning_effort → Responses 的 reasoning.effort 对象
+            if value:
+                request["reasoning"] = {**(request.get("reasoning") or {}), "effort": value}
+            continue
+        request[_PARAM_ALIASES.get(key, key)] = value
+    return request
+
+
+# ---------- 响应方向：Responses → chat completions ----------
+#
+#  下面这几个是刻意手写的最小鸭子型：只长出 agent._consume_stream 与 _summarize
+#  真正读到的那几个属性。用 SDK 的 ChatCompletionChunk 反而要凑满一堆必填字段
+#  （id/created/object/…），噪音大于收益。
+
+
+@dataclass
+class Function:
+    name: str | None = None
+    arguments: str | None = None
+
+
+@dataclass
+class ToolCallFragment:
+    index: int
+    id: str | None = None
+    function: Function | None = None
+
+
+@dataclass
+class Delta:
+    content: str | None = None
+    tool_calls: list[ToolCallFragment] | None = None
+
+
+@dataclass
+class Choice:
+    delta: Delta
+    #  与 chat chunk 同名字段：目前只在内容过滤时填（内核据此区分"拒答"与"断流"）
+    finish_reason: str | None = None
+
+
+@dataclass
+class PromptTokenDetails:
+    cached_tokens: int = 0
+    cache_creation_tokens: int = 0
+
+
+@dataclass
+class Usage:
+    prompt_tokens: int = 0
+    completion_tokens: int = 0
+    prompt_tokens_details: PromptTokenDetails | None = None
+    reported: bool = True
+
+
+@dataclass
+class Chunk:
+    choices: list[Choice] = field(default_factory=list)
+    usage: Usage | None = None
+    #  chat 协议没有的东西，内核用 getattr 取（真 SDK 的 chunk 上取不到 = None）
+    reasoning: list[dict[str, Any]] | None = None
+
+
+@dataclass
+class Message:
+    content: str | None = None
+    role: str = "assistant"
+    tool_calls: list[dict[str, Any]] | None = None
+
+
+@dataclass
+class NonStreamChoice:
+    message: Message
+    #  与 chat 非流式 choice 同名字段：截断时为 "length"（摘要调用据此拒收半截摘要）
+    finish_reason: str | None = None
+
+
+@dataclass
+class Completion:
+    choices: list[NonStreamChoice]
+    usage: Usage | None = None
+
+
+def _dump(item: Any) -> dict[str, Any]:
+    """SDK 的 item → 纯 dict（原样回传用）。已经是 dict 的直接过。"""
+    if isinstance(item, dict):
+        return item
+    if hasattr(item, "model_dump"):
+        return item.model_dump(exclude_none=True)
+    return dict(item)
+
+
+def _replayable(item: dict[str, Any]) -> dict[str, Any] | None:
+    """只留**能回放**的 reasoning item：带非空 `encrypted_content` 的那种。
+
+    各家给的东西不一样（2026-08-12 实测）：openai / xai 给加密状态（回传能真的
+    接上思路）；deepseek 给明文 `content`、qwen 给明文 `summary`，都没有加密串。
+    明文那种不留，两个理由：
+
+    1. **回传了也没用**——实测把明文 reasoning item 塞回去，input_tokens 只从
+       97 涨到 101，服务端根本没吃它；
+    2. **不该落盘**——那是模型的原始思维链，存进会话日志只是让日志变大。
+
+    于是"哪家该开回传"这个判断不需要写死名单：给得出加密状态的自然生效，
+    给不出的自然为空，日后哪家补上了也自动跟着生效。
+    """
+    return item if item.get("encrypted_content") else None
+
+
+def _usage(raw: Any) -> Usage | None:
+    """Responses 的 usage 字段名与 chat 不同（input/output_tokens）。"""
+    if raw is None:
+        return None
+    return Usage(
+        prompt_tokens=getattr(raw, "input_tokens", 0) or 0,
+        completion_tokens=getattr(raw, "output_tokens", 0) or 0,
+        prompt_tokens_details=PromptTokenDetails(
+            cached_tokens=getattr(getattr(raw, "input_tokens_details", None), "cached_tokens", 0) or 0),
+        reported=all(type(getattr(raw, key, None)) is int for key in ("input_tokens", "output_tokens")),
+    )
+
+
+def _text_chunk(text: str) -> Chunk:
+    return Chunk(choices=[Choice(Delta(content=text))])
+
+
+def _tool_chunk(index: int, **kwargs: Any) -> Chunk:
+    return Chunk(choices=[Choice(Delta(tool_calls=[ToolCallFragment(index, **kwargs)]))])
+
+
+class _ResponseCalls:
+    """按输出槽对账完成态；只补缺失后缀，绝不把整份参数重复拼进内核。
+
+    item id 可以变化，call id 可以迟到；已有非空身份或参数互相矛盾时拒绝这次
+    响应，不能把两个动作拼成一个。分片用列表保存，避免大文件参数的平方级复制。
+    """
+
+    def __init__(self) -> None:
+        self.slots: dict[int, dict[str, Any]] = {}
+        self.identities: dict[str, int] = {}
+
+    def feed(self, event: Any, *, final: bool = False) -> Chunk:
+        item = getattr(event, "item", None)
+        call_id = getattr(item, "call_id", None) or ""
+        item_id = getattr(item, "id", None) or getattr(event, "item_id", None) or ""
+        index = getattr(event, "output_index", None)
+        if type(index) is not int or index < 0:
+            index = self.identities.get("call:" + call_id) if call_id else None
+            if index is None and item_id:
+                index = self.identities.get("item:" + item_id)
+        if index is None:
+            raise StreamFailed("工具调用缺少可关联的输出槽或身份")
+        slot = self.slots.setdefault(index, {"id": "", "name": "", "parts": []})
+        name = getattr(item, "name", None) or ""
+        for key, value in (("id", call_id), ("name", name)):
+            if value and slot[key] and value != slot[key]:
+                raise StreamFailed("工具调用的完成态与已收到的身份不一致")
+            if value:
+                slot[key] = value
+        for key in (["call:" + call_id] if call_id else []) + (["item:" + item_id] if item_id else []):
+            if key in self.identities and self.identities[key] != index:
+                raise StreamFailed("工具调用身份指向不同输出槽")
+            self.identities[key] = index
+        suffix = ""
+        if final:
+            complete = getattr(item if item is not None else event, "arguments", None)
+            if isinstance(complete, str):
+                previous = "".join(slot["parts"])
+                if not complete.startswith(previous):
+                    raise StreamFailed("工具调用的完成态参数与流式分片不一致")
+                suffix = complete[len(previous):]
+        else:
+            suffix = getattr(event, "delta", "") or ""
+        if suffix:
+            slot["parts"].append(suffix)
+        return _tool_chunk(index, id=call_id or None, function=Function(name=name or None, arguments=suffix))
+
+
+def stream_chunks(events: Iterator[Any]) -> Iterator[Chunk]:
+    """Responses 事件流 → chat completions chunk 流。
+
+    分片下标用 `output_index`：Responses 的 output 是一串 item（reasoning、message、
+    function_call 混排），function_call 的 output_index 天然唯一且保序，正好当
+    `tool_calls[].index` 使——内核那边按 index 攒分片、按 index 排序，语义一致。
+
+    完成态补迟到的身份和缺失参数；reasoning 只在 done 保存，内置工具事件忽略。
+    """
+    calls = _ResponseCalls()
+    for event in events:
+        kind = getattr(event, "type", "")
+        if kind == "response.output_text.delta":
+            yield _text_chunk(event.delta)
+        elif kind == "response.output_item.added":
+            item = event.item
+            if getattr(item, "type", "") == "function_call":
+                #  name 在 item 加进来时就给全了（chat 侧也是一次给全），
+                #  arguments 随后分片累加
+                yield calls.feed(event)
+        elif kind == "response.output_item.done":
+            item = getattr(event, "item", None)
+            if getattr(item, "type", "") == "function_call":
+                yield calls.feed(event, final=True)
+            elif getattr(item, "type", "") == "reasoning":
+                #  必须等 done：added 时 encrypted_content 还是半截的（实测 932 vs
+                #  1124 字符）。存 dict 而不是 pydantic 对象——会话日志要能 json 落盘
+                if dumped := _replayable(_dump(item)):
+                    yield Chunk(reasoning=[dumped])
+        elif kind == "response.function_call_arguments.delta":
+            yield calls.feed(event)
+        elif kind == "response.function_call_arguments.done":
+            yield calls.feed(event, final=True)
+        elif kind in ("response.completed", "response.incomplete"):
+            if kind == "response.completed":
+                #  部分端点省略 item.done，只在终帧给完整 output。索引仍是整个
+                #  output（含 reasoning/message）里的位置，不能只数 function_call。
+                from types import SimpleNamespace
+
+                for index, item in enumerate(getattr(event.response, "output", None) or []):
+                    if getattr(item, "type", "") == "function_call":
+                        yield calls.feed(SimpleNamespace(output_index=index, item=item), final=True)
+            #  usage 只在收尾事件里给一次，choices 留空——内核见空 choices 就跳过，
+            #  和 OpenAI chat 流最后那个纯 usage chunk 形状一致。
+            #  incomplete（截断、内容过滤）同样走这里而不是抛异常：chat completions
+            #  遇到 finish_reason=length 也是正常返回半截正文，抛了反而把已经吐出来的
+            #  内容全丢掉——两种协议在这一点上必须表现一致
+            details = getattr(event.response, "incomplete_details", None)
+            if getattr(details, "reason", None) == "content_filter":
+                #  内容过滤翻译成 chat 的 finish_reason：不透传的话内核只看到
+                #  "一个字没有"，会当成断流原样重发
+                yield Chunk(choices=[Choice(Delta(), finish_reason="content_filter")])
+            elif getattr(details, "reason", None) == "max_output_tokens":
+                #  截断同理：内核靠 length 丢弃残缺工具调用、提示用户，而不是当断流重发
+                yield Chunk(choices=[Choice(Delta(), finish_reason="length")])
+            elif getattr(event.response, "usage", None) is None:
+                #  收尾事件是内核认"流正常结束"的唯一信号，平时由 usage chunk 带过去；
+                #  个别兼容端点不回 usage，就补一个 stop，免得被当成断流重发
+                yield Chunk(choices=[Choice(Delta(), finish_reason="stop")])
+            yield Chunk(usage=_usage(getattr(event.response, "usage", None)))
+        elif kind in ("response.failed", "error"):
+            #  真失败才抛。类型用 StreamFailed 而不是裸 RuntimeError：这条路径上没有
+            #  HTTP 状态码可判，裸异常会被 classify 兜底成 fatal——一次容量抖动就
+            #  不退避不换路由地打死整轮。StreamFailed 仍照常按文本判（额度/鉴权各归
+            #  各位），只是全没命中时兜底成 transient。上游原文照带：这条路径上
+            #  "到底哪儿炸了"只有这一句话可看
+            raise StreamFailed(f"Responses 流失败：{_failure(event)}")
+
+
+def _failure(event: Any) -> str:
+    """失败原因的文本。错误码一并带上：分类器只拿得到这句话，而码比措辞稳——
+    超限的文案是 "exceeds the context window"，码是 context_length_exceeded。"""
+    if message := getattr(event, "message", None):  # error 事件自带 message
+        return _with_code(str(message), getattr(event, "code", None))
+    response = getattr(event, "response", None)
+    for attr in ("error", "incomplete_details"):
+        if detail := getattr(response, attr, None):
+            text = str(getattr(detail, "message", None) or getattr(detail, "reason", detail))
+            return _with_code(text, getattr(detail, "code", None))
+    return str(getattr(event, "type", "unknown"))
+
+
+def _with_code(text: str, code: Any) -> str:
+    if isinstance(code, (str, int)) and not isinstance(code, bool) and str(code):
+        if str(code).lower() not in text.lower():
+            return f"{text}（{code}）"
+    return text
+
+
+def to_completion(response: Any) -> Completion:
+    """非流式响应 → chat completions 形状（`_summarize` 走这条路）。
+
+    截断（incomplete: max_output_tokens）与流式一路同样翻成 finish_reason=length。"""
+    details = getattr(response, "incomplete_details", None)
+    finish = "length" if getattr(details, "reason", None) == "max_output_tokens" else None
+    return Completion(
+        choices=[
+            NonStreamChoice(
+                Message(content=getattr(response, "output_text", "") or ""), finish_reason=finish
+            )
+        ],
+        usage=_usage(getattr(response, "usage", None)),
+    )
+
+
+# ---------- 鸭子型 client ----------
+
+
+class _Completions:
+    def __init__(
+        self,
+        inner: Any,
+        speaks_responses: Any,
+        speaks_anthropic: Any,
+        anthropic_client: Any,
+        provider: str = "",
+        text_tools: Any = None,
+        signs_tools: Any = None,
+        max_output_tokens: int | None = None,
+    ) -> None:
+        self._inner = inner
+        self._speaks_responses = speaks_responses
+        #  用户显式设的单次输出上限（Config.max_output_tokens）。None = 不干预：
+        #  chat / Responses 不传、Messages 用常量，与从前一个字节不差
+        self._max_output_tokens = max_output_tokens
+        self._speaks_anthropic = speaks_anthropic
+        #  型号 → 是否走文本工具协议（见 textcalls.py）。None = 全部原生
+        self._text_tools = text_tools or (lambda _model: False)
+        #  型号 → 工具调用重放是否必须带 thought_signature（见 restore_tool_extras）
+        self._signs_tools = signs_tools or (lambda _model: False)
+        #  零参 callable：懒构造并缓存（见 Transport.anthropic_client）
+        self._anthropic_client = anthropic_client
+        #  本传输层所属的 provider：reasoning 回放判定要用（provider+model
+        #  都对上才回，见 to_input 的注释）
+        self._provider = provider
+
+    def create(
+        self,
+        *,
+        model: str,
+        messages: list[dict[str, Any]],
+        stream: bool = False,
+        stream_options: dict[str, Any] | None = None,
+        tools: list[dict[str, Any]] | None = None,
+        **extra: Any,
+    ) -> Any:
+        #  媒体引用展开成 data URL 也在这一层，和私有键净化同一个理由：出网口只有
+        #  一个，"记得展开"就不必成为一条要人记住的纪律。三条协议都要，所以在分支之前
+        messages = media.inline(messages)
+        #  历史里的坏工具参数同理在这个唯一出网口修：chat / Responses 原样回放
+        #  坏串会让严格端点每轮 400（Messages 一路 _load_arguments 本就兜成 {}，
+        #  先修也无害）。空的、不合规的工具名也在这里换成占位，三条协议同一份结果。
+        #  只改发送副本，历史与会话日志保留模型原话
+        messages = repair_tool_arguments(messages, tools)
+        #  文本工具协议（textcalls.py）包在协议分派**外面**：它改的是消息内容与
+        #  tools 的有无，不挑 wire protocol——哪条协议都能跑。出网前把历史改写成
+        #  纯文本、tools 拿掉；回来时把正文里的调用块翻回 tool_calls 分片
+        if self._text_tools(model):
+            from . import textcalls
+
+            messages = textcalls.to_text_messages(messages, tools)
+            result = self._dispatch(model, messages, stream, stream_options, None, extra)
+            from .streaming import translate_stream
+
+            return translate_stream(result, textcalls.stream_chunks) if stream else textcalls.to_completion(result)
+        return self._dispatch(model, messages, stream, stream_options, tools, extra)
+
+    def _dispatch(
+        self,
+        model: str,
+        messages: list[dict[str, Any]],
+        stream: bool,
+        stream_options: dict[str, Any] | None,
+        tools: list[dict[str, Any]] | None,
+        extra: dict[str, Any],
+    ) -> Any:
+        #  只有 Responses 一路用得上，先摘出来，别漏成另两路的未知参数
+        extra = dict(extra)
+        cache_key = extra.pop(CACHE_KEY, None)
+        if self._max_output_tokens and not any(
+            key in extra for key in ("max_tokens", "max_completion_tokens")
+        ):
+            #  统一用 chat 的名字出内核，三路各自翻译：chat 原样 max_tokens、
+            #  Responses 经 _PARAM_ALIASES 成 max_output_tokens、Messages 的
+            #  to_request 摘走当 max_tokens。调用方显式给了的不碰；同步请求
+            #  （摘要/收尾）取 min(设值, 常量)——上限是"最多"，不是"至少"
+            cap = self._max_output_tokens
+            extra["max_tokens"] = cap if stream else min(cap, SYNC_MAX_TOKENS)
+        if self._speaks_anthropic(model):
+            #  ⚠️ 和 Responses 一路同理，**不能**先 strip_private：`_reasoning`
+            #  正是 to_request 要消费的东西。净化是结构性的——逐块重建，
+            #  私有键没有出口。懒 import：不配 Claude 直连的进程不付这份成本
+            from . import messages as anthro
+
+            request = anthro.to_request(model, messages, tools, stream, extra, self._provider)
+            client = self._anthropic_client()
+            #  带 betas 的请求走 beta 命名空间（beta 参数 / 未知 block 类型都只有
+            #  那里的类型认）；不带则照旧走正式面，与从前一个字节不差
+            api = client.beta.messages if request.get("betas") else client.messages
+            if not stream:
+                return anthro.to_completion(api.create(**request))
+            from .streaming import translate_stream
+
+            return translate_stream(api.create(stream=True, **request), anthro.stream_chunks)
+        #  服务端压缩只有 Anthropic 一路认；chat / Responses 两路在此摘掉私有键，
+        #  别让它漏成上游 400（Responses 的 compact_threshold 是另一套，待接）
+        extra = {k: v for k, v in extra.items() if k not in ("_compaction", "_task_budget")}
+        if not self._speaks_responses(model):
+            #  签名还原要在净化**之前**（_tool_extras 正是它要消费的东西）
+            messages = restore_tool_extras(messages, model, self._provider, self._signs_tools(model))
+            #  这里是内核私有键唯一的净化点（为什么必须摘：见 strip_private）
+            return self._chat(model, strip_private(messages), stream, stream_options, tools, extra)
+        #  ⚠️ Responses 这一路**不能**先 strip：`_reasoning` 正是 to_input 要消费的
+        #  东西，先摘掉等于回传功能整个失效（而且不报错，只是悄悄变慢变贵）。
+        #  它的净化是结构性的——to_input 逐字段重建 item，私有键根本没有出口。
+        #  stream_options 只有 include_usage 一个用途，Responses 的 usage 一定随
+        #  response.completed 回来，不需要开关；吃掉即可
+        request = to_request(model, messages, tools, extra, self._provider)
+        if cache_key:
+            request["prompt_cache_key"] = cache_key
+        if not stream:
+            return to_completion(self._inner.responses.create(**request))
+        from .streaming import translate_stream
+
+        return translate_stream(self._inner.responses.create(stream=True, **request), stream_chunks)
+
+    def _chat(
+        self,
+        model: str,
+        messages: list[dict[str, Any]],
+        stream: bool,
+        stream_options: dict[str, Any] | None,
+        tools: list[dict[str, Any]] | None,
+        extra: dict[str, Any],
+    ) -> Any:
+        """原路直发。可选参数为空就**不传**，而不是传 None——
+        真 SDK 把显式 None 当"发个 null 上去"，有的端点会因此 400。"""
+        if chat_cache_eligible(self._provider, model):
+            #  网关下的 Claude 后端：chat 载荷不打断点就一个 token 都不缓存
+            #  （见 apply_chat_cache_control）。只改发送副本，历史原样
+            messages, tools = apply_chat_cache_control(messages, tools)
+        request: dict[str, Any] = {"model": model, "messages": messages, **extra}
+        if stream:
+            request["stream"] = True
+        if stream_options is not None:
+            request["stream_options"] = stream_options
+        if tools is not None:
+            request["tools"] = tools
+        return self._inner.chat.completions.create(**request)
+
+
+class _Chat:
+    def __init__(
+        self,
+        inner: Any,
+        speaks_responses: Any,
+        speaks_anthropic: Any,
+        anthropic_client: Any,
+        provider: str = "",
+        text_tools: Any = None,
+        signs_tools: Any = None,
+        max_output_tokens: int | None = None,
+    ) -> None:
+        self.completions = _Completions(
+            inner,
+            speaks_responses,
+            speaks_anthropic,
+            anthropic_client,
+            provider,
+            text_tools,
+            signs_tools,
+            max_output_tokens,
+        )
+
+
+class Transport:
+    """**唯一的出网口**：外面看是 OpenAI client，里面按型号决定说哪种协议。
+
+    chat 协议也包（而不是"只包 responses、chat 用裸 client"）：净化私有键这件事
+    必须是结构性的。留一条不经过这里的出网路径，就等于把"记得摘掉 `_reasoning`"
+    变成一条需要人记住的纪律——而它一旦被忘掉，症状是**每轮多付一千字符的钱、
+    不报任何错**，最不容易被发现的那一类。
+
+    第三条协议（Anthropic Messages，见 messages.py）的 client 是懒构造的：
+    工厂由 providers.Registry 注入，首次遇到 Messages 协议请求才建、建完缓存。
+
+    其余属性（`responses`、`models`…）直接委托给被包的真 client：
+    web_search 工具就是拿 `client.responses.create` 直接发的，不能被这层挡住。
+    """
+
+    def __init__(
+        self,
+        inner: Any,
+        responses_models: tuple[str, ...] = (),
+        anthropic_models: tuple[str, ...] = (),
+        anthropic_factory: Any = None,
+        provider: str = "",
+        text_tool_models: tuple[str, ...] = (),
+        signature_models: tuple[str, ...] = (),
+        max_output_tokens: int | None = None,
+    ) -> None:
+        self._inner = inner
+        self.responses_models = tuple(responses_models)
+        #  单次输出 token 上限覆写（XIAOYU_MAX_OUTPUT_TOKENS）；None = 不干预
+        self.max_output_tokens = max_output_tokens
+        self.anthropic_models = tuple(anthropic_models)
+        #  走文本工具协议的型号（`*` = 整家）。与 wire protocol 正交：它说的是
+        #  "这个型号不会 function calling"，不是"说哪种协议"。见 textcalls.py
+        self.text_tool_models = tuple(text_tool_models)
+        #  工具调用重放必须带 thought_signature 的型号（`*` = 整家）。
+        #  声明纪律同 responses_models。见 restore_tool_extras
+        self.signature_models = tuple(signature_models)
+        #  with_options 副本要原样带走（⚠️ 丢了不是少个标签：副本上 provider
+        #  变 ""，restore_tool_extras 的路由比对永远不中，签名型号的历史会被
+        #  占位签名整段盖掉——真签名换假签名，比不还原更糟）
+        self._provider = provider
+        self._anthropic_factory = anthropic_factory
+        self._anthropic: Any = None
+        self.chat = _Chat(
+            inner,
+            self.speaks_responses,
+            self.speaks_anthropic,
+            self.anthropic_client,
+            provider,
+            self.uses_text_tools,
+            self.signs_tools,
+            max_output_tokens,
+        )
+
+    def uses_text_tools(self, model: str) -> bool:
+        """这个型号的工具调用走不走文本协议。声明纪律同 responses_models。"""
+        return WILDCARD in self.text_tool_models or model in self.text_tool_models
+
+    def signs_tools(self, model: str) -> bool:
+        """这个型号的工具调用重放是否必须带 thought_signature。"""
+        return WILDCARD in self.signature_models or model in self.signature_models
+
+    def tool_mode_for(self, model: str) -> str:
+        from .textcalls import NATIVE, TEXT
+
+        return TEXT if self.uses_text_tools(model) else NATIVE
+
+    def speaks_responses(self, model: str) -> bool:
+        """这个型号走不走 Responses。裸名比对——全限定名在解析时早已剥掉前缀。"""
+        return WILDCARD in self.responses_models or model in self.responses_models
+
+    def speaks_anthropic(self, model: str) -> bool:
+        """这个型号走不走 Anthropic Messages。声明纪律同 responses_models。"""
+        return WILDCARD in self.anthropic_models or model in self.anthropic_models
+
+    def protocol_for(self, model: str) -> str:
+        if self.speaks_anthropic(model):
+            return ANTHROPIC
+        return RESPONSES if self.speaks_responses(model) else CHAT
+
+    def anthropic_client(self) -> Any:
+        """懒构造 + 缓存。没配工厂却声明了 anthropic_models 是装配 bug，
+        当场炸出来比发一个必然失败的请求好排查。"""
+        if self._anthropic is None:
+            if self._anthropic_factory is None:  # pragma: no cover - 装配错误
+                raise RuntimeError("该 provider 未注入 anthropic client 工厂")
+            self._anthropic = self._anthropic_factory()
+        return self._anthropic
+
+    def with_options(self, **kwargs: Any) -> "Transport":
+        #  超时等选项要落到内层，但返回的仍须是包过的——否则 with_options 之后
+        #  就悄悄退回裸 client 了。协议表和工厂都要带上（懒 client 在副本上重建，
+        #  可接受：with_options 只用于通配 provider 的 models.list 探测）
+        return Transport(
+            self._inner.with_options(**kwargs),
+            self.responses_models,
+            self.anthropic_models,
+            self._anthropic_factory,
+            provider=self._provider,
+            text_tool_models=self.text_tool_models,
+            signature_models=self.signature_models,
+            max_output_tokens=self.max_output_tokens,
+        )
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._inner, name)
+
+
+def wrap(
+    client: Any,
+    responses_models: tuple[str, ...],
+    anthropic_models: tuple[str, ...] = (),
+    anthropic_factory: Any = None,
+    provider: str = "",
+    text_tool_models: tuple[str, ...] = (),
+    signature_models: tuple[str, ...] = (),
+    max_output_tokens: int | None = None,
+) -> Transport:
+    return Transport(
+        client,
+        responses_models,
+        anthropic_models,
+        anthropic_factory,
+        provider,
+        text_tool_models,
+        signature_models,
+        max_output_tokens,
+    )

@@ -1,0 +1,870 @@
+"""后台任务：bash run_in_background 与 monitor 的进程表、完成通知、事件限流。
+
+后台三件套，按小羽的同步架构裁剪：
+
+- **后台命令**：bash 工具的 `run_in_background=true`。立即返回 task id，输出
+  落盘到日志文件，watcher 线程等进程退出后经通知轨道（Agent.notify →
+  下一条工具结果的 <system-reminder>）告知模型——模型不用轮询。
+- **monitor**：长驻观察进程，stdout 每行是一个事件，tail 线程把新行批量转成
+  通知。没有 until-condition——条件语义写在命令自己的脚本里（工具描述
+  强约束"只打印 DONE/FAILED"来代替条件表达式）。
+- **事件限流**：令牌桶 10 个、每 2s 补 1 个；被压制的
+  事件计数，恢复时补一条说明；持续压制超 30s 直接击杀 monitor——
+  刷屏的监控脚本只会把上下文灌满，救不回来。
+
+进程策略（argv 怎么拼、套不套沙箱、环境白名单）都留在 tools.py：这里只收
+现成的 spawn 参数，管生命周期。kill_tree 定义在本模块（tools 也用它）——
+安全函数只此一份，不复制——复制出去的副本迟早跟不上加固。
+"""
+
+from __future__ import annotations
+
+import contextlib
+import os
+import re
+import subprocess
+import threading
+import time
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any, Callable
+
+from . import diagnostics, tempdirs
+
+#  仍在跑的后台任务数（monitor + command），/diagnostics 可见
+TASKS_LIVE = diagnostics.Gauge("background.tasks.live")
+
+#  单行/单批事件的字符上限
+_LINE_CAP = 500
+_BATCH_CAP = 3000
+#  monitor tail 的轮询间隔
+_POLL_SECONDS = 0.2
+#  令牌桶：容量 / 补充间隔（秒/个）
+_BUCKET_CAPACITY = 10
+_BUCKET_REFILL_SECONDS = 2.0
+#  持续压制这么久还在刷 → 击杀 monitor
+_AUTO_KILL_SECONDS = 30.0
+#  monitor 默认寿命（10 小时）
+MONITOR_DEFAULT_TIMEOUT = 36_000
+#  后台任务输出日志的上限与巡检间隔：前台命令的输出有界，后台这条路此前没有
+MAX_LOG_BYTES = 1024 * 1024 * 1024
+LOG_CHECK_INTERVAL = 5.0
+#  取输出时最多读进内存多少（头尾各一半）
+OUTPUT_READ_BYTES = 2 * 1024 * 1024
+
+
+#  记在 Popen 对象上的进程组 id（见 mark_group_leader）
+_GROUP_ATTR = "_xiaoyu_pgid"
+
+
+def mark_group_leader(proc: subprocess.Popen) -> None:
+    """登记"这个子进程是自己那个进程组的组长"（用 start_new_session 拉起的）。
+
+    进程组 id 必须在 spawn 当场记下：组长一旦被 wait() 收割，getpgid(pid) 就
+    查不到了，而组里的孙进程（`sleep 30 &`）还活着、还握着管道。kill_tree 靠
+    这份登记在组长已退之后照样整组杀。Windows 没有进程组语义，不登记。
+    """
+    if os.name != "nt":
+        setattr(proc, _GROUP_ATTR, proc.pid)
+
+
+def _group_of(proc: subprocess.Popen) -> int | None:
+    """kill_tree 该对哪个进程组发信号；拿不准就返回 None（退化为只杀直接子进程）。"""
+    if proc.returncode is None:
+        with contextlib.suppress(OSError):
+            return os.getpgid(proc.pid)
+    #  组长已被收割：pid 不再属于它，拿这个 pid 现查只会查不到、或查到别人。
+    #  只认 spawn 时的登记——组里还有成员时组 id 不会被系统复用
+    return getattr(proc, _GROUP_ATTR, None)
+
+
+#  先礼后兵的宽限：SIGTERM 之后最多等这么久再 SIGKILL。够一个 trap 删掉锁文件、
+#  够测试框架跑完 teardown；再长，"停下"就不像是停下了
+TERM_GRACE_SECONDS = 1.0
+#  宽限期内查看"退干净了没有 / 有没有人再催"的间隔
+_TERM_POLL_SECONDS = 0.02
+
+
+def _group_gone(pgid: int) -> bool:
+    """进程组里是不是一个成员都不剩了；拿不准（无权探测等）按还在算。"""
+    try:
+        os.killpg(pgid, 0)
+    except ProcessLookupError:
+        return True
+    except OSError:
+        return False
+    return False
+
+
+def _terminate_gracefully(
+    proc: subprocess.Popen,
+    pgid: int | None,
+    grace: float,
+    stop_requested: Callable[[], bool] | None,
+) -> bool:
+    """发 SIGTERM 并有界等待；返回"已经退干净、不必再 SIGKILL"。
+
+    pgid 为 None = 只能管直接子进程（见 kill_tree 里同组的那条注释）。
+    """
+    import signal
+
+    if pgid is not None:
+        os.killpg(pgid, signal.SIGTERM)
+    else:
+        proc.terminate()
+    deadline = time.monotonic() + grace
+    while True:
+        #  顺手收掉已退出的组长：僵尸仍算组员，不收的话整组永远"还在"
+        exited = proc.poll() is not None
+        if exited and (pgid is None or _group_gone(pgid)):
+            return True
+        if time.monotonic() >= deadline:
+            return False
+        if stop_requested is not None and stop_requested():
+            return False
+        time.sleep(_TERM_POLL_SECONDS)
+
+
+def kill_tree(
+    proc: subprocess.Popen,
+    grace: float = 0.0,
+    stop_requested: Callable[[], bool] | None = None,
+) -> None:
+    """整树终止（从 tools.py 移入，那边 import 这里的）。
+
+    只杀 shell 会留下孙进程握着管道不放；Windows 用 taskkill /T 按树杀，
+    POSIX 靠 start_new_session 建立的进程组整组杀。组长先退、孙进程还在的
+    形态靠 mark_group_leader 的登记覆盖。
+
+    grace > 0（仅 POSIX）：先整组 SIGTERM，最多等 grace 秒——整组退干净就立刻
+    返回——再 SIGKILL 收尾。直接 SIGKILL 的话，被杀的命令 trap 里的清理不会跑：
+    锁文件、临时目录、起到一半的容器都留在原地。宽限由调用方按场合给：有人在
+    等的打断 / 超时给；进程退出时的兜底、批量收场不给（那些路径有自己的总时长
+    约定）。宽限期内 stop_requested() 为真、或等待被 Ctrl-C 打断，都立刻转入
+    SIGKILL——催第二次的人不该再等。
+    """
+    if os.name == "nt":
+        with contextlib.suppress(Exception):
+            subprocess.run(
+                ["taskkill", "/T", "/F", "/PID", str(proc.pid)],
+                capture_output=True,
+                timeout=10,
+            )
+        with contextlib.suppress(Exception):
+            proc.kill()
+        return
+
+    import signal
+
+    pgid: int | None = None
+    with contextlib.suppress(ProcessLookupError, PermissionError, OSError):
+        group = _group_of(proc)
+        #  子进程与我们同组（调用方没开 start_new_session）时绝不能 killpg——
+        #  那会把自己整组带走。这种情况下退化为只杀直接子进程。
+        if group is not None and group != os.getpgid(0):
+            pgid = group
+    done = False
+    try:
+        if grace > 0:
+            with contextlib.suppress(ProcessLookupError, PermissionError, OSError):
+                done = _terminate_gracefully(proc, pgid, grace, stop_requested)
+    finally:
+        #  放在 finally：宽限等待被第二次 Ctrl-C 打断时，也得先杀干净再上抛
+        if not done:
+            if pgid is not None:
+                with contextlib.suppress(ProcessLookupError, PermissionError, OSError):
+                    os.killpg(pgid, signal.SIGKILL)
+            with contextlib.suppress(Exception):
+                proc.kill()
+
+
+#  任务 id 的形态（TaskManager.start 里生成），以及历史里点名它的那些文案都带的
+#  字眼：启动回执、完成通知、monitor 事件、task_output / kill_task 的调用参数
+_TASK_ID = re.compile(r"\btask-(\d+)\b")
+_TASK_CONTEXT = re.compile(r"后台任务|monitor|task_output|kill_task|task_ids?")
+
+
+def mentioned_task_numbers(text: str) -> set[int]:
+    """一段历史文本里点到名的后台任务编号。
+
+    只认与后台任务字眼同一行的 task-N：grep 结果、用户自己的工单号里碰巧出现的
+    task-12 不算。
+    """
+    found: set[int] = set()
+    if "task-" not in text:
+        return found
+    for line in text.splitlines():
+        if _TASK_CONTEXT.search(line):
+            found.update(int(number) for number in _TASK_ID.findall(line))
+    return found
+
+
+def _size_of(path: Path) -> int:
+    try:
+        return path.stat().st_size
+    except OSError:
+        return 0
+
+
+@dataclass
+class BackgroundTask:
+    task_id: str
+    kind: str  # "command" | "monitor"
+    command: str
+    description: str
+    log_path: Path
+    proc: subprocess.Popen
+    started: float = field(default_factory=time.monotonic)
+    done: threading.Event = field(default_factory=threading.Event)
+    exit_code: int | None = None
+    #  kill_task 明确终止的任务不再发完成通知（kill 的返回值已经告知模型）
+    killed: bool = False
+    #  被我们自己叫停的原因（超时 / 日志超限）；空串 = 自然结束
+    stopped_for: str = ""
+    interactive: bool = False
+    input_fd: int | None = None
+    input_eof: bool = False
+    input_lock: threading.Lock = field(default_factory=threading.Lock)
+    output_thread: threading.Thread | None = None
+
+    @property
+    def status(self) -> str:
+        if not self.done.is_set():
+            return "running"
+        if self.killed:
+            return "cancelled"
+        return "completed" if self.exit_code == 0 else "failed"
+
+    def elapsed(self) -> float:
+        return time.monotonic() - self.started
+
+
+class _RepeatFilter:
+    """把与上一行一模一样的行折掉；换了内容（或收尾）时补一句重复了几次。
+
+    只折**连续**的重复：A B A 三行各是各的事件。计数不丢——模型知道那一行
+    后来又出现过多少次，只是不为每一次单独醒来。
+    """
+
+    def __init__(self) -> None:
+        self.last: str | None = None
+        self.count = 0
+
+    def filter(self, lines: list[str], flush: bool = False) -> list[str]:
+        fresh: list[str] = []
+        for line in lines:
+            if line == self.last:
+                self.count += 1
+                continue
+            if self.count:
+                fresh.append(self._note())
+            fresh.append(line)
+            self.last = line
+        if flush and self.count:
+            fresh.append(self._note())
+        return fresh
+
+    def _note(self) -> str:
+        note = f"（上一行又原样出现了 {self.count} 次）"
+        self.count = 0
+        return note
+
+
+class _RateLimiter:
+    """monitor 事件的令牌桶。allow() 返回 (放行?, 恢复时要补的说明)。"""
+
+    def __init__(self) -> None:
+        self.tokens = float(_BUCKET_CAPACITY)
+        self.last_refill = time.monotonic()
+        self.suppressed = 0
+        self.suppressing_since: float | None = None
+
+    def allow(self) -> tuple[bool, str]:
+        now = time.monotonic()
+        self.tokens = min(
+            float(_BUCKET_CAPACITY),
+            self.tokens + (now - self.last_refill) / _BUCKET_REFILL_SECONDS,
+        )
+        self.last_refill = now
+        if self.tokens < 1.0:
+            self.suppressed += 1
+            if self.suppressing_since is None:
+                self.suppressing_since = now
+            return False, ""
+        self.tokens -= 1.0
+        note = ""
+        if self.suppressed:
+            note = (
+                f"[输出过快，期间有 {self.suppressed} 条事件被丢弃。"
+                "考虑 kill_task 后换一条过滤更狠的 monitor 命令。]\n"
+            )
+        self.suppressed = 0
+        self.suppressing_since = None
+        return True, note
+
+    def should_auto_kill(self) -> bool:
+        return (
+            self.suppressing_since is not None
+            and time.monotonic() - self.suppressing_since > _AUTO_KILL_SECONDS
+        )
+
+#  一个会话同时在跑的后台任务（含 monitor）上限。终止中的也占名额，进程真正
+#  退出才释放——否则"kill 完立刻再起"能绕过上限，残留进程照样堆积
+MAX_RUNNING_TASKS = 10
+
+
+class TaskManager:
+    """一个会话的后台任务表。notify 由 Agent 注入（见 agent.__init__）。
+
+    notify 为 None 时任务照跑，只是没有"搭便车"通知——task_output 仍可查询
+    （headless 嵌入宿主不接通知轨道时的退化形态）。
+    """
+
+    #  收场时等被杀的进程退出的总上限（秒，全部任务合计）
+    SHUTDOWN_REAP_SECONDS = 3.0
+
+    def __init__(self) -> None:
+        self.notify: Callable[[str, str], None] | None = None
+        self._tasks: dict[str, BackgroundTask] = {}
+        self._lock = threading.Lock()
+        self._counter = 0
+        self._log_dir: Path | None = None
+        self._atexit_registered = False
+        self._threads: list[threading.Thread] = []
+
+    # ---------- 启动 ----------
+
+    def reserve_ids(self, highest: int) -> None:
+        """新任务的编号从 highest 之后起编（只升不降）。
+
+        编号是每个进程从 1 起编的。接回来的历史里那句"task-1 完成会通知你"说的
+        是上一个进程的任务——这边新起的再叫 task-1，模型会把两者当成同一个。
+        """
+        with self._lock:
+            self._counter = max(self._counter, highest)
+
+    def _log_file(self, task_id: str) -> Path:
+        if self._log_dir is None:
+            #  进程拥有的目录：退出时连日志一起删（理由见 tempdirs 模块说明——
+            #  task id 只在本进程的任务表里可寻址，resume 后查不到）
+            self._log_dir = tempdirs.make_dir("xiaoyu-bg-")
+        return self._log_dir / f"{task_id}.log"
+
+    def start(
+        self,
+        argv: list[str],
+        *,
+        command: str,
+        kind: str = "command",
+        description: str = "",
+        cwd: str | None = None,
+        env: dict[str, str] | None = None,
+        timeout: float | None = None,
+        popen_extra: dict[str, Any] | None = None,
+        interactive: bool = False,
+        tty: bool = False,
+    ) -> "BackgroundTask | str":
+        """拉起后台进程。成功返回任务；失败返回错误文本（交给模型自愈）。"""
+        if tty and (os.name == "nt" or not interactive):
+            return "ERROR: tty 需要 POSIX 平台与 interactive=true；Windows 请使用普通交互管道。"
+        with self._lock:
+            running = [task for task in self._tasks.values() if not task.done.is_set()]
+            if len(running) >= MAX_RUNNING_TASKS:
+                listed = "；".join(f"{task.task_id}（{task.description}）" for task in running)
+                return (
+                    f"ERROR: 本会话已有 {len(running)} 个后台任务在跑（上限 {MAX_RUNNING_TASKS}，"
+                    f"终止中的也算）：{listed}。先用 kill_task 结束不再需要的，再起新的。"
+                )
+            self._counter += 1
+            task_id = f"task-{self._counter}"
+            if not self._atexit_registered:
+                import atexit
+
+                atexit.register(self.shutdown)
+                self._atexit_registered = True
+        log_path = self._log_file(task_id)
+        try:
+            log_handle = log_path.open("wb")
+        except OSError as exc:
+            return f"ERROR: 无法创建后台任务日志文件：{exc}"
+        master = slave = None
+        try:
+            if tty:
+                import pty
+
+                master, slave = pty.openpty()
+                os.set_blocking(master, False)
+            proc = subprocess.Popen(
+                argv,
+                stdin=slave if tty else subprocess.PIPE if interactive else subprocess.DEVNULL,
+                stdout=slave if tty else log_handle,
+                stderr=slave if tty else subprocess.STDOUT,
+                cwd=cwd,
+                env=env,
+                **(popen_extra or {}),
+            )
+        except OSError as exc:
+            if master is not None:
+                os.close(master)
+            log_handle.close()
+            return f"ERROR: 无法启动后台任务：{exc}"
+        finally:
+            if slave is not None:
+                os.close(slave)
+            #  子进程已继承文件描述符，父进程这份立即关掉（Windows 上不关会锁文件）
+            with contextlib.suppress(OSError):
+                log_handle.close()
+        if (popen_extra or {}).get("start_new_session"):
+            mark_group_leader(proc)
+        task = BackgroundTask(
+            task_id=task_id,
+            kind=kind,
+            command=command,
+            description=description or command,
+            log_path=log_path,
+            proc=proc,
+            interactive=interactive, input_fd=master,
+        )
+        with self._lock:
+            self._tasks[task_id] = task
+        if tty:
+            reader = threading.Thread(target=self._drain_terminal,
+                                      args=(task, os.dup(master)), daemon=True,
+                                      name=f"xiaoyu-{task_id}-terminal")
+            task.output_thread = reader
+            self._threads.append(reader)
+            reader.start()
+        TASKS_LIVE.inc()
+        watcher = threading.Thread(
+            target=self._watch, args=(task, timeout), daemon=True, name=f"xiaoyu-{task_id}"
+        )
+        self._threads.append(watcher)
+        watcher.start()
+        if kind == "monitor":
+            tail = threading.Thread(
+                target=self._tail_monitor, args=(task,), daemon=True,
+                name=f"xiaoyu-{task_id}-tail",
+            )
+            self._threads.append(tail)
+            tail.start()
+        return task
+
+    @staticmethod
+    def _drain_terminal(task: BackgroundTask, fd: int) -> None:
+        import select
+
+        try:
+            with task.log_path.open("ab") as output:
+                while True:
+                    ready, _, _ = select.select([fd], [], [], 0.1)
+                    if ready:
+                        try:
+                            data = os.read(fd, 65536)
+                        except BlockingIOError:
+                            continue
+                        if not data:
+                            break
+                        output.write(data)
+                        output.flush()
+                        if output.tell() > MAX_LOG_BYTES:
+                            task.stopped_for = "输出日志超过上限，已终止"
+                            kill_tree(task.proc)
+                            break
+                    elif task.proc.poll() is not None:
+                        break
+        except OSError:
+            pass  # 终端关闭常以 EIO 表示 EOF
+        finally:
+            os.close(fd)
+
+    @staticmethod
+    def _close_input(task: BackgroundTask) -> None:
+        with task.input_lock:
+            if task.input_fd is not None:
+                with contextlib.suppress(OSError):
+                    os.close(task.input_fd)
+                task.input_fd = None
+            if task.proc.stdin is not None:
+                with contextlib.suppress(OSError):
+                    task.proc.stdin.close()
+
+    def send_input(self, task_id: str, text: str = "", *, eof: bool = False) -> str:
+        task = self.get(task_id)
+        if task is None:
+            return f"ERROR: 未知任务 {task_id}，任务不能跨会话或 resume 继续输入。"
+        if not task.interactive:
+            return "ERROR: 该任务启动时未设置 interactive=true。"
+        data = text.encode("utf-8", errors="replace")
+        if len(data) > 4096:
+            return "ERROR: 单次输入最多 4096 字节，请分段发送。"
+        with task.input_lock:
+            if task.proc.poll() is not None or task.done.is_set():
+                return "ERROR: 任务已经结束，未发送输入。"
+            if text == "\x03" and not eof:
+                if os.name == "nt":
+                    return "ERROR: 此平台不支持输入中断信号，请用 kill_task 终止。"
+                import signal
+
+                group = _group_of(task.proc)
+                try:
+                    if group is not None and group != os.getpgid(0):
+                        os.killpg(group, signal.SIGINT)
+                    else:
+                        task.proc.send_signal(signal.SIGINT)
+                except OSError as exc:
+                    return f"ERROR: 无法中断任务：{exc}"
+                return f"已向 {task_id} 发送中断信号"
+            if task.input_eof or (task.input_fd is None and (task.proc.stdin is None or task.proc.stdin.closed)):
+                return "ERROR: 任务的输入已关闭。"
+            #  写管道也可能阻塞；独立短命写线程 + 有界等待，超时终止任务，不能卡住主循环。
+            failure: list[Exception] = []
+            def write() -> None:
+                try:
+                    if task.input_fd is not None:
+                        import select
+
+                        payload = data + (b"\x04" if eof else b"")
+                        sent = 0
+                        deadline = time.monotonic() + 1.0
+                        while sent < len(payload):
+                            if time.monotonic() >= deadline:
+                                raise TimeoutError("终端暂时不能接受更多输入")
+                            _, ready, _ = select.select([], [task.input_fd], [], 0.05)
+                            if ready:
+                                try:
+                                    sent += os.write(task.input_fd, payload[sent:])
+                                except BlockingIOError:
+                                    continue
+                    else:
+                        task.proc.stdin.write(data)
+                        task.proc.stdin.flush()
+                        if eof:
+                            task.proc.stdin.close()
+                except (OSError, ValueError) as exc:
+                    failure.append(exc)
+            writer = threading.Thread(target=write, daemon=True, name=f"xiaoyu-{task_id}-input")
+            writer.start()
+            writer.join(timeout=1.5)
+            if writer.is_alive():
+                task.stopped_for = "输入阻塞超时，已终止；部分输入可能已送达"
+                kill_tree(task.proc)
+                writer.join(timeout=1.0)
+                self._threads.append(writer)
+                return "ERROR: " + task.stopped_for
+            if failure:
+                return f"ERROR: 输入未完整送达：{failure[0]}；请检查任务输出，勿盲目重发。"
+            if eof:
+                task.input_eof = True
+        return f"已向 {task_id} 发送 {len(data)} 字节" + ("，已发送 EOF" if eof else "")
+
+    # ---------- 生命周期 ----------
+
+    def _watch(self, task: BackgroundTask, timeout: float | None) -> None:
+        deadline = None if timeout is None else time.monotonic() + timeout
+        try:
+            while True:
+                slice_s = LOG_CHECK_INTERVAL
+                if deadline is not None:
+                    slice_s = min(slice_s, max(0.0, deadline - time.monotonic()))
+                try:
+                    task.proc.wait(timeout=slice_s)
+                    break
+                except subprocess.TimeoutExpired:
+                    pass
+                if deadline is not None and time.monotonic() >= deadline:
+                    #  被杀的进程退出码是 -9，不写明原因的话完成通知读起来像
+                    #  "它自己跑完了、只是失败了"。刚好踩着点自己退出的不算
+                    if task.proc.poll() is None:
+                        task.stopped_for = (
+                            f"已到最长观察时间 {timeout:g}s"
+                            if task.kind == "monitor"
+                            else f"运行超过启动时设定的 {timeout:g}s 超时上限，没有跑完"
+                        )
+                    self._stop(task)
+                    break
+                if _size_of(task.log_path) > MAX_LOG_BYTES:
+                    #  失控打印、或跑了几小时的服务：日志没有上限的话会把磁盘写满
+                    task.stopped_for = (
+                        f"输出日志超过 {MAX_LOG_BYTES / 1048576:.0f} MiB 上限，已终止"
+                        "（要长期运行就把输出重定向到别处，或让它少打印）"
+                    )
+                    self._stop(task)
+                    break
+        except Exception:  # noqa: BLE001 - watcher 线程绝不能带着异常死掉
+            pass
+        self._close_input(task)
+        if task.output_thread is not None:
+            task.output_thread.join(timeout=1.0)
+        task.exit_code = task.proc.returncode
+        task.done.set()
+        TASKS_LIVE.dec()
+        self._announce_completion(task)
+
+    @staticmethod
+    def _stop(task: BackgroundTask) -> None:
+        #  watcher 线程里等，不挡任何人：给足宽限
+        kill_tree(task.proc, grace=TERM_GRACE_SECONDS)
+        with contextlib.suppress(Exception):
+            task.proc.wait(timeout=10)
+
+    def _announce_completion(self, task: BackgroundTask) -> None:
+        if self.notify is None or task.killed:
+            return
+        seconds = task.elapsed()
+        if task.stopped_for:
+            self.notify(
+                f'后台任务 "{task.task_id}" 被终止：{task.stopped_for}。\n'
+                f"命令：{task.command} | 用时 {seconds:.1f}s\n"
+                f'用 task_output(task_ids=["{task.task_id}"]) 查看输出的头尾。',
+                f"task-done-{task.task_id}",
+            )
+            return
+        if task.kind == "monitor":
+            text = (
+                f'monitor "{task.task_id}" 已结束（exit {task.exit_code}）。\n'
+                f"描述：{task.description}\n"
+                f'用时 {seconds:.1f}s。用 task_output(task_ids=["{task.task_id}"]) 查看完整输出。'
+            )
+        else:
+            #  自伤诊断：秒退多半是 pkill 匹配到了自己之类的问题
+            hint = ""
+            if task.exit_code not in (0, None) and seconds < 1.0:
+                hint = "\n（不到 1 秒就退出了：检查命令是否有误、或 kill 模式是否匹配到了自己。）"
+            text = (
+                f'后台任务 "{task.task_id}" 已完成（exit {task.exit_code}）。\n'
+                f"命令：{task.command} | 用时 {seconds:.1f}s\n"
+                f'用 task_output(task_ids=["{task.task_id}"]) 查看完整输出。{hint}'
+            )
+        self.notify(text, f"task-done-{task.task_id}")
+
+    def _tail_monitor(self, task: BackgroundTask) -> None:
+        """轮询日志文件，把新行批量转成通知（文件游标是唯一的增量语义）。"""
+        offset = 0
+        pending = ""
+        limiter = _RateLimiter()
+        repeats = _RepeatFilter()
+        while True:
+            finished = task.done.is_set()
+            chunk, offset = self._read_new(task.log_path, offset, flush=finished)
+            pending += chunk
+            lines, pending = self._split_lines(pending, flush=finished)
+            #  原样重复的行不是新事件：每 30 秒打一行"还在跑"的轮询脚本永远碰不到
+            #  限流，却每一行都要唤醒模型一次
+            lines = repeats.filter(lines, flush=finished)
+            if lines and self.notify is not None:
+                allowed, note = limiter.allow()
+                if allowed:
+                    batch = "\n".join(lines)
+                    if len(batch) > _BATCH_CAP:
+                        batch = batch[:_BATCH_CAP] + "\n…（本批过长已截断）"
+                    self.notify(
+                        f'<monitor-event task_id="{task.task_id}" '
+                        f'description="{_sanitize(task.description)}">\n'
+                        f"{note}{batch}\n</monitor-event>",
+                        "",
+                    )
+                elif limiter.should_auto_kill():
+                    task.killed = True
+                    kill_tree(task.proc)
+                    self.notify(
+                        f'[monitor "{task.task_id}" 已被自动终止——脚本输出太快'
+                        f"（{limiter.suppressed} 条事件被丢弃）。请换一条过滤更狠的命令："
+                        "管道接 grep --line-buffered / awk，只输出你真正要等的那几行。]",
+                        "",
+                    )
+                    return
+            if finished:
+                return
+            time.sleep(_POLL_SECONDS)
+
+    @staticmethod
+    def _read_new(
+        path: Path, offset: int, flush: bool = False, chunk: int = 1_048_576
+    ) -> tuple[str, int]:
+        """从 offset 读一块新字节解码；偏移只推进到完整 UTF-8 字符边界。
+
+        按字节块读，中文这类多字节字符很容易横跨读块或两次轮询的边界，
+        直接 errors="replace" 会把它切成 �。尾部未完成的序列留到下次再读；
+        flush=True（进程已结束的最后一读）后半截再也等不来，照有损解码全部交出。
+        """
+        try:
+            with path.open("rb") as handle:
+                handle.seek(offset)
+                #  块长至少 4：装得下最长的 UTF-8 字符，否则尾巴永远收不齐、偏移原地踏步
+                data = handle.read(max(4, chunk))
+        except OSError:
+            return "", offset
+        if not flush:
+            data = data[: len(data) - _incomplete_utf8_tail(data)]
+        return data.decode("utf-8", errors="replace"), offset + len(data)
+
+    @staticmethod
+    def _split_lines(pending: str, flush: bool) -> tuple[list[str], str]:
+        """完整行出队（单行截断），残行留在缓冲；flush=True 时残行也算一行。"""
+        parts = pending.split("\n")
+        remainder = parts.pop()
+        if flush and remainder.strip():
+            parts.append(remainder)
+            remainder = ""
+        lines = []
+        for line in parts:
+            line = line.strip()
+            if not line:
+                continue
+            if len(line) > _LINE_CAP:
+                line = line[:_LINE_CAP] + "…（单行过长已截断）"
+            lines.append(line)
+        return lines, remainder
+
+    # ---------- 查询 / 终止 ----------
+
+    def get(self, task_id: str) -> BackgroundTask | None:
+        with self._lock:
+            return self._tasks.get(task_id)
+
+    def all(self) -> list[BackgroundTask]:
+        with self._lock:
+            return list(self._tasks.values())
+
+    def running(self) -> list[BackgroundTask]:
+        return [task for task in self.all() if not task.done.is_set()]
+
+    def known_ids(self) -> list[str]:
+        with self._lock:
+            return list(self._tasks)
+
+    def kill(self, task_id: str) -> str:
+        task = self.get(task_id)
+        if task is None:
+            known = ", ".join(self.known_ids()) or "（本会话还没有后台任务）"
+            return f"ERROR: 没有名为 {task_id!r} 的后台任务。已知：{known}"
+        if task.done.is_set():
+            return f"{task_id} 早已结束（exit {task.exit_code}），无需终止。"
+        task.killed = True
+        #  点名终止的多半是开发服务器、watch 这类会认 SIGTERM 的长驻进程
+        kill_tree(task.proc, grace=TERM_GRACE_SECONDS)
+        return f"已终止 {task_id}（{task.description}）。"
+
+    def output_of(self, task: BackgroundTask) -> str:
+        """任务输出。日志很大时只读头尾各一段——整份读进内存的话，几十兆的日志
+        查几次就是几百兆，而回给模型的反正只有几万字符。"""
+        try:
+            size = task.log_path.stat().st_size
+            with task.log_path.open("rb") as handle:
+                if size <= OUTPUT_READ_BYTES:
+                    data, omitted = handle.read(), 0
+                else:
+                    half = OUTPUT_READ_BYTES // 2
+                    head = handle.read(half)
+                    handle.seek(size - half)
+                    tail = handle.read(half)
+                    omitted = size - 2 * half
+                    data = (
+                        head
+                        + (
+                            f"\n…（中间省略 {omitted} 字节；中段用 task_output 的 "
+                            f"offset={half}、limit 按字节分段续读，或 grep / tail "
+                            f"完整日志 {task.log_path}）…\n"
+                        ).encode("utf-8")
+                        + tail
+                    )
+        except OSError as exc:
+            return f"（日志读取失败：{exc}）"
+        text = data.decode("utf-8", errors="replace")
+        return text if text.strip() else "（暂无输出）"
+
+    def output_slice(
+        self, task: BackgroundTask, offset: int, limit: int
+    ) -> tuple[str, int, int]:
+        """从字节 offset 起读最多 limit 字节，返回 (文本, next_offset, 日志总字节数)。
+
+        头尾各一段的 output_of 看不到中段、再查也只是同一份内容；分段读让模型
+        按 next_offset 接着往下读，拼起来就是全文。偏移只推进到完整 UTF-8 字符
+        边界（与 monitor 的 _read_new 同一条路），尾部半个字留给下一段；任务已
+        结束且这一段读到了文件末尾时才照有损解码交出——后半截再也等不来了。
+        """
+        try:
+            size = task.log_path.stat().st_size
+        except OSError as exc:
+            return f"（日志读取失败：{exc}）", offset, 0
+        offset = min(max(offset, 0), size)
+        flush = task.done.is_set() and offset + limit >= size
+        text, next_offset = self._read_new(task.log_path, offset, flush=flush, chunk=limit)
+        return text, next_offset, size
+
+    def still_running_line(self) -> str:
+        """轮次结束后的状态行；没有在跑的返回空串。"""
+        running = self.running()
+        if not running:
+            return ""
+        commands = sum(1 for task in running if task.kind == "command")
+        monitors = len(running) - commands
+        parts = []
+        if commands:
+            parts.append(f"{commands} 个后台任务")
+        if monitors:
+            parts.append(f"{monitors} 个 monitor")
+        return " · ".join(parts) + " 仍在运行（/tasks 查看，task_output 取输出）"
+
+    def shutdown(self) -> None:
+        """会话结束整体回收（atexit / 显式调用均幂等）：先杀进程，再删日志目录。"""
+        killed = []
+        for task in self.all():
+            if not task.done.is_set():
+                task.killed = True
+                #  不给宽限：每个任务各等一秒的话，下面"合计有界"的约定就破了
+                kill_tree(task.proc)
+                killed.append(task)
+        #  杀只是发信号，还得等它们真的退出：不等的话进程以僵尸形态挂着，日志
+        #  句柄也没松开（下面删目录在 Windows 上因此删不掉）。平时这一步由各任务
+        #  的 watcher 线程做，但收场的两个时机都轮不到它——进程退出时 daemon
+        #  线程不再得到运行机会，子 agent 收工时调用方紧接着就往下走了。
+        #  整体有界：等不到就放手，收场不能因此卡住
+        deadline = time.monotonic() + self.SHUTDOWN_REAP_SECONDS
+        for task in killed:
+            with contextlib.suppress(Exception):
+                task.proc.wait(timeout=max(0.0, deadline - time.monotonic()))
+        for task in self.all():
+            self._close_input(task)
+        for thread in self._threads:
+            if thread is not threading.current_thread():
+                thread.join(timeout=max(0.0, deadline - time.monotonic()))
+        self._threads = [thread for thread in self._threads if thread.is_alive()]
+        if self._log_dir is not None and not self.shutdown_pending():
+            #  Windows 上刚被杀的进程可能还没松开日志句柄，删不掉由 discard 吞掉，
+            #  留给下次启动清扫
+            tempdirs.discard(self._log_dir)
+            self._log_dir = None
+
+    def shutdown_pending(self) -> tuple[str, ...]:
+        """Resources still owned after a bounded shutdown attempt."""
+        tasks = tuple(task.task_id for task in self.all() if task.proc.poll() is None)
+        return tasks + tuple(thread.name for thread in self._threads if thread.is_alive())
+
+
+def _incomplete_utf8_tail(data: bytes) -> int:
+    """data 尾部未完成的 UTF-8 序列字节数（0~3）。
+
+    只认合法形态：从尾部往回最多看 3 个字节，跳过续字节（10xxxxxx）找到
+    前导字节，它声明的长度比实际拿到的多才算"没收齐"。ASCII、孤立续字节、
+    非法前导一律返回 0——垃圾字节照常推进交给有损解码，绝不卡住偏移。
+    """
+    for back in range(1, min(3, len(data)) + 1):
+        byte = data[-back]
+        if 0x80 <= byte <= 0xBF:
+            continue
+        if 0xC2 <= byte <= 0xDF:
+            need = 2
+        elif 0xE0 <= byte <= 0xEF:
+            need = 3
+        elif 0xF0 <= byte <= 0xF4:
+            need = 4
+        else:
+            return 0
+        return back if need > back else 0
+    return 0
+
+
+def _sanitize(description: str) -> str:
+    """事件标签里的描述：引号与换行替换掉，别把 XML 形状搅坏。"""
+    return description.replace('"', "'").replace("\n", " ").replace("\r", " ")

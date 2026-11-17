@@ -1,0 +1,158 @@
+# 发布：推 v* tag → 等同一提交的 CI 结论（不重跑）→ 构建 → 发布到 PyPI → GitHub Release。
+#
+# 鉴权走 PyPI Trusted Publishing（OIDC，无需长期 token）：
+# 先在 https://pypi.org/manage/project/xiaoyu-agent/settings/publishing/
+# 添加 GitHub 仓库为 trusted publisher（workflow 名填 release.yml），
+# 之后 `git push --atomic origin main vX.Y.Z` 即完成发布（scripts/release.py 打的 tag）。
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+
+jobs:
+  #  发版前必须过 CI。这一层是 2026-08-12 补的：在那之前 release 与 ci 是两个
+  #  互不相干的 workflow，tag 一推就发、CI 红不红都拦不住——v0.29.0 就是这么
+  #  带着两个红着的 Windows job 发上 PyPI 的，Windows 上"拖文件进终端"整个
+  #  功能是死的，没人拦。
+  #
+  #  2026-10-15 起不再把 CI 重跑一遍：tag 指向的提交同时推上了 main，ci.yml / sdk.yml
+  #  已经在跑，这里（scripts/ci_gate.py）等它们的结论——绿就跳过下面两个 job，
+  #  红就停在这里（版本号烧掉，换个号再发）；一次运行都没有（只改文档的发版，
+  #  路径过滤没触发 CI）才自己跑一遍。
+  gate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    permissions:
+      contents: read
+      actions: read
+    outputs:
+      ci: ${{ steps.ci.outputs.result }}
+      sdk: ${{ steps.sdk.outputs.result }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.12"
+      - id: ci
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python scripts/ci_gate.py --repo "$GITHUB_REPOSITORY" --sha "$GITHUB_SHA" --workflow ci.yml
+      - id: sdk
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python scripts/ci_gate.py --repo "$GITHUB_REPOSITORY" --sha "$GITHUB_SHA" --workflow sdk.yml
+
+  test:
+    needs: gate
+    if: needs.gate.outputs.ci != 'verified'
+    uses: ./.github/workflows/ci.yml
+
+  sdk-test:
+    needs: gate
+    if: needs.gate.outputs.sdk != 'verified'
+    uses: ./.github/workflows/sdk.yml
+
+  artifacts:
+    needs: [gate, test, sdk-test]
+    #  test / sdk-test 被 gate 跳过时 result 是 skipped，也算过；gate 红或任一测试红都不往下走
+    if: >-
+      ${{ !cancelled()
+          && needs.gate.result == 'success'
+          && contains(fromJSON('["success","skipped"]'), needs.test.result)
+          && contains(fromJSON('["success","skipped"]'), needs.sdk-test.result) }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.12"
+      - name: 版本一致性检查（tag 必须等于 __version__）
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          version=$(python -c "import xiaoyu; print(xiaoyu.__version__)")
+          if [ "$tag" != "$version" ]; then
+            echo "::error::tag v$tag 与 __version__ $version 不一致"
+            exit 1
+          fi
+      - run: pip install build twine
+      - run: python scripts/build_sdk.py
+      - run: python scripts/sdk_release.py verify dist/sdk-release --commit "$GITHUB_SHA" --version "${GITHUB_REF_NAME#v}"
+      - run: twine check dist/sdk-release/kernel/* dist/sdk-release/sdk/*
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: sdk-release-${{ github.sha }}
+          path: dist/sdk-release/
+          if-no-files-found: error
+          retention-days: 90
+
+  publish:
+    needs: artifacts
+    #  不写 if 时默认要求链路上游全部 success，gate 跳过的 test / sdk-test 算 skipped，
+    #  publish 会跟着被跳过（v0.72.0 就是这样空跑了一次）。只看 artifacts 的结论。
+    if: ${{ !cancelled() && needs.artifacts.result == 'success' }}
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      id-token: write
+      #  write：末尾用 gh 建 GitHub Release（之前只读）。只在 publish 这一个 job 放开
+      contents: write
+      actions: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.12"
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: sdk-release-${{ github.sha }}
+          path: dist/sdk-release
+      - run: python scripts/sdk_release.py verify dist/sdk-release --commit "$GITHUB_SHA" --version "${GITHUB_REF_NAME#v}"
+      # Stage only missing files. Existing files must match the saved SHA-256.
+      - id: kernel
+        run: python scripts/sdk_release.py stage dist/sdk-release --package kernel --destination upload/kernel
+      - if: steps.kernel.outputs.pending != '0'
+        uses: pypa/gh-action-pypi-publish@7245906fb61fa33a13554f9d5fb856fe61758086 # v1.14.3
+        with:
+          packages-dir: upload/kernel/
+      - run: python scripts/sdk_release.py wait dist/sdk-release --package kernel
+      - id: sdk
+        run: python scripts/sdk_release.py stage dist/sdk-release --package sdk --destination upload/sdk
+      - if: steps.sdk.outputs.pending != '0'
+        uses: pypa/gh-action-pypi-publish@7245906fb61fa33a13554f9d5fb856fe61758086 # v1.14.3
+        with:
+          packages-dir: upload/sdk/
+      - run: python scripts/sdk_release.py wait dist/sdk-release --package sdk
+      - run: python -m venv /tmp/released-sdk
+      #  上面的 wait 已等到 /simple/ 列出新版，但 CDN 各节点刷新有先后，pip 仍可能撞上旧页面：
+      #  隔 15 秒重试，最多 6 次（约一分半）
+      - run: |
+          for attempt in 1 2 3 4 5 6; do
+            /tmp/released-sdk/bin/python -m pip install --no-cache-dir "xiaoyu-agent-sdk==${GITHUB_REF_NAME#v}" && exit 0
+            echo "::warning::第 $attempt 次装不到 xiaoyu-agent-sdk==${GITHUB_REF_NAME#v}，15 秒后重试"
+            sleep 15
+          done
+          exit 1
+      - run: /tmp/released-sdk/bin/python -m pip check
+      - run: /tmp/released-sdk/bin/python -I tests/sdk_wheel_smoke.py
+      - name: GitHub Release（docs/releases/<版本>.md 存在就用它，否则自动生成说明）
+        #  放在 PyPI 发布与装回冒烟之后：包没发出去就不该有 Release。
+        #  发版说明由 scripts/release.py 在打 tag 时生成并提交（见 AGENTS.md「发版」）；
+        #  忘了生成就退回 GitHub 的 --generate-notes，不拦发版。已存在（rerun）则跳过
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag="$GITHUB_REF_NAME"
+          notes="docs/releases/${tag#v}.md"
+          if gh release view "$tag" --repo "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
+            echo "Release $tag 已存在，跳过"
+            exit 0
+          fi
+          if [ -f "$notes" ]; then
+            gh release create "$tag" --repo "$GITHUB_REPOSITORY" --title "$tag" --notes-file "$notes"
+          else
+            echo "::warning::没有 $notes，改用自动生成的说明（scripts/release.py 会生成）"
+            gh release create "$tag" --repo "$GITHUB_REPOSITORY" --title "$tag" --generate-notes
+          fi

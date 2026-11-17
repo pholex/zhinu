@@ -1,0 +1,344 @@
+"""wire 协议黑盒 e2e（真子进程 + scripted 桩，不打网络）。
+
+驱动方式：Popen 双向管道，后台线程逐行收 JSON（Windows 管道没有 select，
+线程读是唯一跨平台姿势）。
+环境隔离与归一化复用 test_e2e_scripted.E2ECase。
+"""
+
+from __future__ import annotations
+
+import collections
+import contextlib
+import json
+import os
+import queue
+import signal
+import subprocess
+import sys
+import threading
+import unittest
+from pathlib import Path
+from typing import Any
+
+from .test_e2e_scripted import E2ECase
+
+_READ_TIMEOUT = 60.0
+#  stderr 只留最后这么多行：够装下 faulthandler 的全线程栈
+_STDERR_KEEP = 400
+
+
+class WireProcess:
+    def __init__(self, proc: subprocess.Popen) -> None:
+        self.proc = proc
+        self._lines: queue.Queue[str | None] = queue.Queue()
+        self._reader = threading.Thread(target=self._pump, daemon=True)
+        self._reader.start()
+        #  stderr 也得有人读：没人读的管道写满（Linux 64K）子进程就卡在 write
+        #  上退不出。只留尾部——它是子进程挂住时唯一的现场（见 wait）
+        self._stderr: collections.deque[str] = collections.deque(maxlen=_STDERR_KEEP)
+        self._stderr_reader: threading.Thread | None = None
+        if proc.stderr is not None:
+            self._stderr_reader = threading.Thread(target=self._pump_stderr, daemon=True)
+            self._stderr_reader.start()
+
+    def _pump(self) -> None:
+        assert self.proc.stdout is not None
+        for line in self.proc.stdout:
+            self._lines.put(line)
+        self._lines.put(None)  # EOF 哨兵
+
+    def _pump_stderr(self) -> None:
+        assert self.proc.stderr is not None
+        for line in self.proc.stderr:
+            self._stderr.append(line)
+
+    def stderr_tail(self) -> str:
+        return "".join(self._stderr)
+
+    def wait(self, timeout: float) -> int:
+        """等子进程自己退出。超时 = 挂住：先取全部线程栈再收掉，栈与 stderr
+        尾部一起进失败消息，不再只剩一句 TimeoutExpired。
+
+        取栈靠子进程 CLI 入口（crash_guard）装的 faulthandler：SIGABRT 触发它
+        把所有线程的 Python 栈写到 stderr，由上面的线程收下。不往被测进程里
+        加任何测试专用钩子。Windows 没有这条路，只附 stderr。
+        """
+        try:
+            return self.proc.wait(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            pass
+        #  取栈之前先拍信号现场（Linux）：SigPnd/ShdPnd 里还挂着 = 信号被屏蔽没送达；
+        #  已不在其中而处理器没跑 = 信号送达时主线程不在字节码上、之后又阻塞进了系统调用
+        signal_state = self._proc_signal_state()
+        if os.name != "nt":
+            with contextlib.suppress(OSError):
+                self.proc.send_signal(signal.SIGABRT)
+        try:
+            self.proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            self.proc.kill()
+            self.proc.wait(timeout=5)
+        if self._stderr_reader is not None:
+            self._stderr_reader.join(timeout=5)
+        raise AssertionError(
+            f"子进程 {timeout:g}s 内没有退出（已 SIGABRT 取栈后收掉）。\n"
+            f"信号现场：{signal_state}\nstderr 尾部：\n"
+            + self.stderr_tail()
+        )
+
+    def _proc_signal_state(self) -> str:
+        """挂住那一刻 /proc/<pid>/status 里的信号位图与内核等待点（只有 Linux 读得到）。"""
+        base = Path(f"/proc/{self.proc.pid}")
+        try:
+            fields = [
+                line.strip()
+                for line in (base / "status").read_text(encoding="ascii", errors="replace").splitlines()
+                if line.startswith(("SigPnd", "ShdPnd", "SigBlk", "SigIgn", "SigCgt"))
+            ]
+        except OSError:
+            return "（无 /proc，非 Linux）"
+        with contextlib.suppress(OSError):
+            fields.append("wchan: " + (base / "wchan").read_text(encoding="ascii", errors="replace").strip())
+        return " · ".join(fields)
+
+    def send(self, message: dict[str, Any]) -> None:
+        assert self.proc.stdin is not None
+        self.proc.stdin.write(json.dumps(message, ensure_ascii=False) + "\n")
+        self.proc.stdin.flush()
+
+    def read_json(self, timeout: float = _READ_TIMEOUT) -> dict[str, Any]:
+        line = self._lines.get(timeout=timeout)
+        if line is None:
+            raise AssertionError("wire 进程已关闭 stdout（提前退出？）")
+        return json.loads(line)
+
+    def read_until(self, predicate, timeout: float = _READ_TIMEOUT) -> tuple[dict, list[dict]]:
+        """读到第一条满足条件的消息，返回 (命中消息, 途中略过的消息)。"""
+        skipped: list[dict[str, Any]] = []
+        while True:
+            message = self.read_json(timeout)
+            if predicate(message):
+                return message, skipped
+            skipped.append(message)
+
+    def close(self) -> None:
+        if self.proc.stdin is not None:
+            try:
+                self.proc.stdin.close()
+            except OSError:
+                pass
+        try:
+            self.proc.wait(timeout=15)
+        except subprocess.TimeoutExpired:
+            self.proc.kill()
+            self.proc.wait(timeout=5)
+        self._reader.join(timeout=5)
+        if self._stderr_reader is not None:
+            self._stderr_reader.join(timeout=5)
+        for stream in (self.proc.stdout, self.proc.stderr):
+            if stream is not None:
+                try:
+                    stream.close()
+                except OSError:
+                    pass
+
+
+class WireCase(E2ECase):
+    """公共驱动：写脚本 → 起 --wire 子进程。"""
+
+    def start_wire(self, script: str, extra_args: list[str] | None = None) -> WireProcess:
+        env = self.scripted_env(script)
+        proc = subprocess.Popen(
+            [
+                sys.executable,
+                "-m",
+                "xiaoyu",
+                "--wire",
+                "--workspace",
+                str(self.workspace),
+                *(extra_args or []),
+            ],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            #  wire 是双向管道：不指定编码时，Windows 上写中文请求会
+            #  UnicodeEncodeError（cp1252），读中文事件会 UnicodeDecodeError
+            encoding="utf-8",
+            errors="replace",
+            env=env,
+            cwd=self.tmp,
+        )
+        wire = WireProcess(proc)
+        self.addCleanup(wire.close)
+        return wire
+
+    @staticmethod
+    def is_response(req_id: str):
+        return lambda m: m.get("id") == req_id and "method" not in m
+
+    @staticmethod
+    def is_approval(m: dict) -> bool:
+        return m.get("method") == "request" and m.get("params", {}).get("type") == "approval"
+
+    @staticmethod
+    def event_kinds(messages: list[dict]) -> list[str]:
+        return [
+            m["params"]["kind"]
+            for m in messages
+            if m.get("method") == "event" and "kind" in m.get("params", {})
+        ]
+
+
+_TOOL_SCRIPT = (
+    'tool_call: {"name": "bash", "arguments": {"command": "echo wire-ok"}}\n'
+    "---\n"
+    "text: 完成\n"
+)
+
+
+class HandshakeTest(WireCase):
+    def test_initialize(self):
+        wire = self.start_wire("text: ok\n")
+        wire.send({"jsonrpc": "2.0", "id": "1", "method": "initialize"})
+        response, _ = wire.read_until(self.is_response("1"))
+        result = response["result"]
+        self.assertEqual(result["protocol_version"], "1.0")
+        self.assertEqual(result["server"]["name"], "xiaoyu")
+        self.assertTrue(result["workspace"].endswith("ws"))
+
+    def test_unknown_method_and_bad_json(self):
+        wire = self.start_wire("text: ok\n")
+        wire.send({"jsonrpc": "2.0", "id": "1", "method": "teleport"})
+        response, _ = wire.read_until(self.is_response("1"))
+        self.assertEqual(response["error"]["code"], -32601)
+        assert wire.proc.stdin is not None
+        wire.proc.stdin.write("这不是 json\n")
+        wire.proc.stdin.flush()
+        response = wire.read_json()
+        self.assertEqual(response["error"]["code"], -32700)
+
+
+class PromptTest(WireCase):
+    def test_text_turn_events_then_response(self):
+        wire = self.start_wire("text: 你好世界\n")
+        wire.send({"jsonrpc": "2.0", "id": "p1", "method": "prompt", "params": {"text": "打个招呼"}})
+        response, skipped = wire.read_until(self.is_response("p1"))
+        kinds = self.event_kinds(skipped)
+        self.assertEqual(kinds[0], "request.started")
+        self.assertIn("text.delta", kinds)
+        self.assertEqual(kinds[-1], "request.ended")
+        self.assertEqual(response["result"]["status"], "finished")
+        self.assertEqual(response["result"]["result"], "你好世界")
+
+    def test_prompt_while_busy_is_invalid_state(self):
+        wire = self.start_wire(_TOOL_SCRIPT + "---\ntext: 没人看\n")
+        wire.send({"jsonrpc": "2.0", "id": "p1", "method": "prompt", "params": {"text": "干活"}})
+        #  审批请求挂起 = 本轮确定还在跑
+        approval, _ = wire.read_until(self.is_approval)
+        wire.send({"jsonrpc": "2.0", "id": "p2", "method": "prompt", "params": {"text": "再来"}})
+        response, _ = wire.read_until(self.is_response("p2"))
+        self.assertEqual(response["error"]["code"], -32000)
+        #  收尾：放行让本轮跑完
+        wire.send({"jsonrpc": "2.0", "id": approval["id"], "result": {"verdict": "allow"}})
+        wire.read_until(self.is_response("p1"))
+
+
+class ApprovalTest(WireCase):
+    def test_allow_executes_tool(self):
+        wire = self.start_wire(_TOOL_SCRIPT)
+        wire.send({"jsonrpc": "2.0", "id": "p1", "method": "prompt", "params": {"text": "干活"}})
+        approval, _ = wire.read_until(self.is_approval)
+        payload = approval["params"]["payload"]
+        self.assertEqual(payload["name"], "bash")
+        self.assertEqual(payload["args"]["command"], "echo wire-ok")
+        wire.send({"jsonrpc": "2.0", "id": approval["id"], "result": {"verdict": "allow"}})
+        response, skipped = wire.read_until(self.is_response("p1"))
+        kinds = self.event_kinds(skipped)
+        self.assertIn("tool.running", kinds)
+        self.assertIn("tool.completed", kinds)
+        self.assertEqual(response["result"]["status"], "finished")
+        self.assertEqual(response["result"]["result"], "完成")
+
+    def test_deny_with_reason_feeds_back(self):
+        wire = self.start_wire(_TOOL_SCRIPT)
+        wire.send({"jsonrpc": "2.0", "id": "p1", "method": "prompt", "params": {"text": "干活"}})
+        approval, _ = wire.read_until(self.is_approval)
+        wire.send(
+            {"jsonrpc": "2.0", "id": approval["id"],
+             "result": {"verdict": "deny", "reason": "只许只读"}}
+        )
+        response, skipped = wire.read_until(self.is_response("p1"))
+        kinds = self.event_kinds(skipped)
+        self.assertIn("tool.denied", kinds)
+        self.assertNotIn("tool.running", kinds)
+        self.assertEqual(response["result"]["status"], "finished")
+
+    def test_allow_with_updated_args_rewrites_command(self):
+        wire = self.start_wire(_TOOL_SCRIPT)
+        wire.send({"jsonrpc": "2.0", "id": "p1", "method": "prompt", "params": {"text": "干活"}})
+        approval, _ = wire.read_until(self.is_approval)
+        wire.send(
+            {"jsonrpc": "2.0", "id": approval["id"],
+             "result": {"verdict": "allow", "updated_args": {"command": "echo rewritten"}}}
+        )
+        response, skipped = wire.read_until(self.is_response("p1"))
+        completed = [
+            m["params"] for m in skipped
+            if m.get("method") == "event" and m["params"].get("kind") == "tool.completed"
+        ]
+        self.assertEqual(len(completed), 1)
+        self.assertIn("rewritten", completed[0]["output"])
+        self.assertEqual(response["result"]["status"], "finished")
+
+
+class SteerCancelTest(WireCase):
+    def test_pending_steer_can_be_edited_or_retracted_by_id(self):
+        wire = self.start_wire(_TOOL_SCRIPT)
+        wire.send({"jsonrpc": "2.0", "id": "p", "method": "prompt", "params": {"text": "干活"}})
+        approval, _ = wire.read_until(self.is_approval)
+        def request(ident, method, params):
+            wire.send({"jsonrpc": "2.0", "id": ident, "method": method, "params": params})
+            response, _ = wire.read_until(self.is_response(ident))
+            self.assertNotIn("error", response)
+            return response["result"]
+        removed = request("q1", "steer/queue", {"text": "撤回这句"})["id"]
+        kept = request("q2", "steer/queue", {"text": "旧内容"})["id"]
+        self.assertTrue(request("edit", "steer/replace", {"id": kept, "text": "新内容"})["replaced"])
+        self.assertTrue(request("remove", "steer/retract", {"id": removed})["retracted"])
+        self.assertEqual(request("list", "steer/list", {})["items"], [{"id": kept, "text": "新内容"}])
+        wire.send({"jsonrpc": "2.0", "id": approval["id"], "result": {"verdict": "allow"}})
+        _, events = wire.read_until(self.is_response("p"))
+        accepted = [e["params"]["text"] for e in events if e.get("method") == "event" and e.get("params", {}).get("kind") == "steer.accepted"]
+        self.assertEqual(accepted, ["新内容"])
+        self.assertFalse(request("late", "steer/retract", {"id": kept})["retracted"])
+
+    def test_steer_lands_in_running_turn(self):
+        """用审批挂起当同步点：插话必然在工具批次收尾后被消费。"""
+        wire = self.start_wire(_TOOL_SCRIPT)
+        wire.send({"jsonrpc": "2.0", "id": "p1", "method": "prompt", "params": {"text": "干活"}})
+        approval, _ = wire.read_until(self.is_approval)
+        wire.send({"jsonrpc": "2.0", "id": "s1", "method": "steer", "params": {"text": "顺便看下 README"}})
+        wire.read_until(self.is_response("s1"))
+        wire.send({"jsonrpc": "2.0", "id": approval["id"], "result": {"verdict": "allow"}})
+        response, skipped = wire.read_until(self.is_response("p1"))
+        kinds = self.event_kinds(skipped)
+        self.assertIn("steer.accepted", kinds)
+        self.assertEqual(response["result"]["status"], "finished")
+
+    def test_cancel_interrupts_turn_and_denies_approval(self):
+        wire = self.start_wire(_TOOL_SCRIPT + "---\ntext: 不会被看到\n")
+        wire.send({"jsonrpc": "2.0", "id": "p1", "method": "prompt", "params": {"text": "干活"}})
+        wire.read_until(self.is_approval)
+        wire.send({"jsonrpc": "2.0", "id": "c1", "method": "cancel"})
+        #  tool.denied 由工作线程发（_cancel_turn 先 event.set() 放开它），
+        #  cancel 响应由主线程发，两者顺序不定——Windows 调度下实测是反过来的。
+        #  所以两段读到的事件都要收，别假定 denied 一定在 c1 响应之后。
+        _, before = wire.read_until(self.is_response("c1"))
+        response, after = wire.read_until(self.is_response("p1"))
+        self.assertEqual(response["result"]["status"], "interrupted")
+        self.assertIn("tool.denied", self.event_kinds(before + after))
+
+
+if __name__ == "__main__":
+    unittest.main()

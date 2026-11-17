@@ -1,0 +1,129 @@
+{
+  "active": true,
+  "activity": [
+    {
+      "action": "init",
+      "actor": "chenshu",
+      "at": "2026-01-01T00:00:00Z",
+      "details": {
+        "base": "main"
+      },
+      "details_truncated": false,
+      "id": "ACTIVITY-0"
+    },
+    {
+      "action": "plan",
+      "actor": "chenshu",
+      "at": "2026-01-01T00:00:00Z",
+      "details": {
+        "kind": "survey",
+        "mission": "M1",
+        "title": "调研"
+      },
+      "details_truncated": false,
+      "id": "ACTIVITY-1"
+    },
+    {
+      "action": "plan",
+      "actor": "chenshu",
+      "at": "2026-01-01T00:00:00Z",
+      "details": {
+        "kind": "build",
+        "mission": "M2",
+        "title": "实现"
+      },
+      "details_truncated": false,
+      "id": "ACTIVITY-2"
+    },
+    {
+      "action": "finding.file",
+      "actor": "chenshu",
+      "at": "2026-01-01T00:00:00Z",
+      "details": {
+        "title": "补充验收",
+        "type": "idea"
+      },
+      "details_truncated": false,
+      "id": "ACTIVITY-3"
+    }
+  ],
+  "base_branch": "main",
+  "board_id": "BOARD",
+  "controls": [],
+  "findings": [
+    {
+      "body": "实现前明确验收范围。",
+      "body_truncated": false,
+      "from": "chenshu",
+      "id": "FINDING",
+      "kind": "idea",
+      "mission_id": "",
+      "recorded_at": "2026-01-01T00:00:00Z",
+      "title": "补充验收",
+      "title_truncated": false
+    }
+  ],
+  "gaps": [
+    "mission 状态来自协作协议，不等于成员执行完整性或合并许可。",
+    "评审仅记录提交时的 commit；当前分支 tip 未重新核对，不表示现在可合并。",
+    "成员沿用宸枢自己的工具与写入守卫；主轮停止不表示成员已停止。"
+  ],
+  "kind": "chenshu.updated",
+  "limits": {
+    "activity": 0,
+    "controls": 0,
+    "findings": 0,
+    "members": 0,
+    "missions": 0,
+    "reviews": 0
+  },
+  "members": [],
+  "missions": [
+    {
+      "branch": "",
+      "deps": [],
+      "deps_truncated": false,
+      "id": "M1",
+      "kind": "survey",
+      "notes": [],
+      "notes_truncated": false,
+      "owner": "",
+      "scope": [],
+      "scope_truncated": false,
+      "status": "pending",
+      "title": "调研",
+      "title_truncated": false,
+      "worktree": ""
+    },
+    {
+      "branch": "feat/m2-mission",
+      "deps": [
+        "M1"
+      ],
+      "deps_truncated": false,
+      "id": "M2",
+      "kind": "build",
+      "notes": [],
+      "notes_truncated": false,
+      "owner": "",
+      "scope": [
+        "src/"
+      ],
+      "scope_truncated": false,
+      "status": "pending",
+      "title": "实现",
+      "title_truncated": false,
+      "worktree": ""
+    }
+  ],
+  "observed_at": "2026-01-01T00:00:00Z",
+  "reviews": [],
+  "revision": 3,
+  "source": {
+    "origin": "new",
+    "protocol_root": "WORKSPACE/.xiaoyu/chenshu",
+    "runtime_id": "BOARD",
+    "state_id": "STATE",
+    "workspace": "WORKSPACE"
+  }
+}

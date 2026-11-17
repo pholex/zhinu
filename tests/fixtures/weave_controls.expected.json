@@ -1,0 +1,39 @@
+{
+  "batch_id": "BATCH",
+  "controls": [
+    {
+      "batch_id": "BATCH",
+      "created_at": "TIME",
+      "execution_id": "EXECUTION",
+      "item_id": "ITEM",
+      "kind": "message",
+      "operation_id": "message-1",
+      "reason": "执行已结束，消息未进入上下文",
+      "status": "not_consumed",
+      "text": "补充核对",
+      "updated_at": "TIME"
+    },
+    {
+      "batch_id": "BATCH",
+      "created_at": "TIME",
+      "execution_id": "EXECUTION",
+      "item_id": "ITEM",
+      "kind": "stop",
+      "operation_id": "stop-1",
+      "reason": "执行实例已结束",
+      "status": "settled",
+      "text": "",
+      "updated_at": "TIME"
+    }
+  ],
+  "controls_omitted": 0,
+  "execution_id": "EXECUTION",
+  "execution_phase": "primary",
+  "execution_state": "settled",
+  "item_id": "ITEM",
+  "live": false,
+  "model": "main-model",
+  "revision": 5,
+  "stop_requested": true,
+  "workspace": "WORKSPACE"
+}

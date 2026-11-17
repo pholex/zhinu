@@ -1,0 +1,6 @@
+# 文件产物、文件快照与流式收尾的端到端契约。
+tool_call: {"name": "write_file", "arguments": {"path": "report.txt", "content": "artifact result\n"}}
+usage: {"prompt_tokens": 150, "completion_tokens": 20}
+---
+text: "report.txt 已生成。"
+usage: {"prompt_tokens": 190, "completion_tokens": 20}

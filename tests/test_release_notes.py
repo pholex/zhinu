@@ -1,0 +1,220 @@
+"""scripts/release_notes.py 的纯函数与退化路径（不调模型、不打网络）。"""
+
+from __future__ import annotations
+
+import datetime as dt
+import importlib.util
+import json
+import os
+import subprocess
+import sys
+import tempfile
+import unittest
+from pathlib import Path
+from unittest import mock
+
+REPO = Path(__file__).resolve().parent.parent
+_SPEC = importlib.util.spec_from_file_location("release_notes", REPO / "scripts" / "release_notes.py")
+release_notes = importlib.util.module_from_spec(_SPEC)
+assert _SPEC.loader is not None
+_SPEC.loader.exec_module(release_notes)
+
+
+class ParseSubjectTest(unittest.TestCase):
+    def test_conventional_prefixes(self):
+        self.assertEqual(release_notes.parse_subject("feat(serve): 新端点"), ("feat", "serve：新端点"))
+        self.assertEqual(release_notes.parse_subject("fix: 修了"), ("fix", "修了"))
+        self.assertEqual(release_notes.parse_subject("docs(ci): 补一句"), ("docs", "ci：补一句"))
+        self.assertEqual(release_notes.parse_subject("chore(release): 0.61.0"), ("chore", "release：0.61.0"))
+
+    def test_breaking_marker_and_unknown_types(self):
+        self.assertEqual(release_notes.parse_subject("feat!: 破坏性"), ("feat", "破坏性"))
+        self.assertEqual(release_notes.parse_subject("refactor(x): 整理"), ("other", "x：整理"))
+        self.assertEqual(release_notes.parse_subject("没有前缀的提交"), ("other", "没有前缀的提交"))
+        #  冒号后没空格 / 大写类型都不算 conventional：原样进其它
+        self.assertEqual(release_notes.parse_subject("Feat: 大写"), ("other", "Feat: 大写"))
+
+
+class RenderTest(unittest.TestCase):
+    def test_groups_in_fixed_order_and_skips_empty(self):
+        commits = [
+            {"sha": "a" * 40, "subject": "fix: 二", "body": ""},
+            {"sha": "b" * 40, "subject": "feat(tui): 一", "body": "第一段\n两行\n\n第二段不要"},
+            {"sha": "c" * 40, "subject": "test: 三", "body": ""},
+        ]
+        text = release_notes.render_plain(release_notes.group_commits(commits))
+        self.assertEqual(
+            text,
+            "## 变化\n\n- 新增：一（bbbbbbb）\n- 修复：二（aaaaaaa）\n- 改动：三（ccccccc）\n",
+        )
+        #  scope（tui）不进列表行；没有任何提交时整节不出现
+        self.assertNotIn("tui", text)
+        self.assertEqual(release_notes.render_plain(release_notes.group_commits([])), "")
+        # 正文一个字都不进列表：一个提交一行
+        self.assertNotIn("第一段", text)
+        self.assertNotIn("第二段", text)
+
+    def test_document_header(self):
+        doc = release_notes.render_document("0.61.0", "v0.60.0", "## 修复\n\n- x\n", today=dt.date(2026, 10, 2))
+        self.assertTrue(doc.startswith("# 0.61.0（2026-10-02）\n\n自 v0.60.0 以来的变化。\n\n## 修复"))
+
+    def test_document_ends_with_validation_section_even_without_record(self):
+        doc = release_notes.render_document("0.61.0", "v0.60.0", "## 修复\n\n- x\n", today=dt.date(2026, 10, 2))
+        self.assertTrue(doc.endswith("## 修复\n\n- x\n\n## 本版验证\n\n- 未附自测记录\n"), doc)
+
+
+class ValidationSectionTest(unittest.TestCase):
+    """「本版验证」：吃 self_test.md 的收尾对象，缺文件 / 形态不对都退化为「未附自测记录」。"""
+
+    RECORD = {
+        "result": "done", "model": "deepseek-flash", "platform": "Darwin arm64",
+        "output": {
+            "total": 18, "passed": 16, "skipped": 1, "rate": 16 / 17,
+            "items": [
+                {"id": "P1-1", "status": "pass", "evidence": "工具返回成功"},
+                {"id": "P5-1", "status": "skip", "evidence": "无 mcp.json"},
+                {"id": "P6-3", "status": "fail", "evidence": "输出含 ESCAPED"},
+            ],
+        },
+    }
+
+    def _write(self, data) -> Path:
+        self.tmp = tempfile.TemporaryDirectory(prefix="release-validation-")
+        self.addCleanup(self.tmp.cleanup)
+        path = Path(self.tmp.name) / "self_test.json"
+        path.write_text(data if isinstance(data, str) else json.dumps(data, ensure_ascii=False), encoding="utf-8")
+        return path
+
+    def test_loads_result_object_and_bare_listing(self):
+        record = release_notes.load_validation(self._write(self.RECORD))
+        self.assertEqual((record["model"], record["platform"], record["total"], record["passed"], record["skipped"]),
+                         ("deepseek-flash", "Darwin arm64", 18, 16, 1))
+        bare = release_notes.load_validation(self._write(self.RECORD["output"]))
+        self.assertEqual((bare["model"], bare["total"], len(bare["items"])), ("", 18, 3))
+
+    def test_missing_or_malformed_record_is_none(self):
+        self.assertIsNone(release_notes.load_validation(None))
+        self.assertIsNone(release_notes.load_validation(Path(tempfile.gettempdir()) / "no-such-self-test.json"))
+        self.assertIsNone(release_notes.load_validation(self._write("not json")))
+        self.assertIsNone(release_notes.load_validation(self._write({"output": {"total": "18"}})))
+        self.assertIsNone(release_notes.load_validation(self._write([1, 2])))
+
+    def test_section_lists_counts_failures_and_skips(self):
+        text = release_notes.render_validation(release_notes.load_validation(self._write(self.RECORD)))
+        self.assertEqual(
+            text,
+            "## 本版验证\n\n- 模型：deepseek-flash\n- 平台：Darwin arm64\n"
+            "- 第一人称自测（tests_ai/self_test.md）：16/17 项通过，1 项未跑\n"
+            "- 未通过：P6-3（输出含 ESCAPED）\n- 未跑：P5-1（无 mcp.json）\n",
+        )
+
+    def test_section_without_record(self):
+        self.assertEqual(release_notes.render_validation(None), "## 本版验证\n\n- 未附自测记录\n")
+        text = release_notes.render_validation(release_notes.load_validation(self._write(
+            {"output": {"total": 3, "passed": 3, "skipped": 0, "items": []}})))
+        self.assertIn("- 模型：未记录\n- 平台：未记录\n", text)
+        self.assertIn("3/3 项通过\n", text)
+        self.assertNotIn("未通过", text)
+
+
+class BehaviorNotesTest(unittest.TestCase):
+    """「行为变化」从提交正文的 footer 抽，不再手写。"""
+
+    def test_footer_forms(self):
+        body = "正文一段。\n\n行为变化: 默认不再自动重试\n续一行\n\nBREAKING CHANGE: 去掉了 --old\n"
+        self.assertEqual(release_notes.behavior_notes("fix: x", body), ["默认不再自动重试 续一行", "去掉了 --old"])
+        self.assertEqual(release_notes.behavior_notes("fix: x", "行为变化：中文冒号也认"), ["中文冒号也认"])
+        self.assertEqual(release_notes.behavior_notes("fix: x", "没有 footer"), [])
+
+    def test_bang_subject_without_footer(self):
+        self.assertEqual(release_notes.behavior_notes("feat(cli)!: 改默认值", ""), ["cli：改默认值"])
+        #  有 footer 就以 footer 为准，不重复
+        self.assertEqual(release_notes.behavior_notes("feat!: 改默认值", "行为变化: 说清楚"), ["说清楚"])
+        self.assertTrue(release_notes.is_breaking_subject("fix!: x"))
+        self.assertFalse(release_notes.is_breaking_subject("fix: x!"))
+
+    def test_section_first_and_footer_not_repeated_in_items(self):
+        commits = [
+            {"sha": "a" * 40, "subject": "fix: 二", "body": "行为变化: 变了\n\n第二段"},
+            {"sha": "b" * 40, "subject": "feat: 一", "body": "正文\n\n行为变化: 又变了"},
+            {"sha": "c" * 40, "subject": "docs: 三", "body": ""},
+        ]
+        text = release_notes.render_body(commits)
+        self.assertTrue(text.startswith("## 行为变化（升级前看一眼）\n\n- 变了（aaaaaaa）\n- 又变了（bbbbbbb）\n\n## 变化"), text)
+        self.assertIn("- 新增：一（bbbbbbb）\n", text)
+        self.assertNotIn("正文", text)
+        self.assertNotIn("  行为变化", text)
+        self.assertIn("- 修复：二（aaaaaaa）\n", text)
+        self.assertNotIn("第二段", text)
+        self.assertEqual(release_notes.render_body([commits[2]]), "## 变化\n\n- 文档：三（ccccccc）\n")
+
+
+class AutoValidationTest(unittest.TestCase):
+    """默认读 nightly 的 latest.json；记录带时间与源码就写进节里，太旧标出来。"""
+
+    def test_dir_follows_xdg_and_latest_lookup(self):
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.dict(os.environ, {"XDG_CONFIG_HOME": tmp, "APPDATA": tmp}):
+            self.assertEqual(release_notes.self_test_dir(), Path(tmp) / "xiaoyu" / "self-test")
+            self.assertIsNone(release_notes.latest_record_path())
+            self.assertEqual(release_notes.resolve_validation("auto"), (None, None))
+            self.assertEqual(release_notes.resolve_validation("none"), (None, None))
+            latest = Path(tmp) / "xiaoyu" / "self-test" / "latest.json"
+            latest.parent.mkdir(parents=True)
+            latest.write_text(json.dumps({"output": {"total": 2, "passed": 2, "skipped": 0, "items": []},
+                                          "model": "m", "recorded_at": "2026-10-01T03:30:00",
+                                          "source": {"version": "0.71.1", "branch": "main", "commit": "0123456789"}}),
+                              encoding="utf-8")
+            path, record = release_notes.resolve_validation(None)
+            self.assertEqual(path, latest)
+            self.assertEqual(record["source"]["version"], "0.71.1")
+            text = release_notes.render_validation(record, today=dt.date(2026, 10, 15))
+            self.assertIn("- 记录：2026-10-01 03:30，源码 0.71.1（main@0123456），已 14 天\n", text)
+            fresh = release_notes.render_validation(record, today=dt.date(2026, 10, 2))
+            self.assertIn("- 记录：2026-10-01 03:30，源码 0.71.1（main@0123456）\n", fresh)
+            self.assertEqual(release_notes.record_age_days(record, dt.date(2026, 10, 15)), 14)
+            self.assertIsNone(release_notes.record_age_days(None))
+
+
+class GitAndFallbackTest(unittest.TestCase):
+    """临时仓库：两个 tag 之间的非 merge 提交；模型不可用时退化为分组列表。"""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory(prefix="release-notes-")
+        self.repo = Path(self.tmp.name)
+        env = {**os.environ, "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@x", "GIT_COMMITTER_NAME": "t",
+               "GIT_COMMITTER_EMAIL": "t@x", "HOME": self.tmp.name, "GIT_CONFIG_GLOBAL": os.devnull}
+
+        def git(*args):
+            subprocess.run(["git", "-C", str(self.repo), *args], check=True, capture_output=True, env=env)
+
+        git("init", "-q", "-b", "main")
+        (self.repo / "f").write_text("0", encoding="utf-8")
+        git("add", "f")
+        git("commit", "-q", "-m", "chore: 起点")
+        git("tag", "v0.1.0")
+        (self.repo / "f").write_text("1", encoding="utf-8")
+        git("commit", "-q", "-am", "feat(cli): 新开关\n\n正文第一段。")
+        (self.repo / "f").write_text("2", encoding="utf-8")
+        git("commit", "-q", "-am", "fix: 修一个坑")
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_collect_between_tag_and_head(self):
+        commits = release_notes.collect_commits("v0.1.0", repo=self.repo)
+        self.assertEqual([c["subject"] for c in commits], ["feat(cli): 新开关", "fix: 修一个坑"])
+        self.assertEqual(commits[0]["body"], "正文第一段。")
+        self.assertEqual(len(commits[0]["sha"]), 40)
+
+    def test_polish_fails_open_to_plain_list(self):
+        #  把 xiaoyu 换成一个必失败的解释器调用：polish 必须返回 None 而不是抛
+        real = sys.executable
+        try:
+            sys.executable = "/nonexistent/python"
+            self.assertIsNone(release_notes.polish("## 修复\n\n- x\n", None, timeout=5))
+        finally:
+            sys.executable = real
+
+
+if __name__ == "__main__":
+    unittest.main()

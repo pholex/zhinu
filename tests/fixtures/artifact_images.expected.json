@@ -1,0 +1,32 @@
+{
+  "changed": {
+    "available": true,
+    "data_url": "data:image/jpeg;base64,/9j/2wBDAAEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQH/wAALCAABAAEBAREA/8QAJgABAAAAAAAAAAAAAAAAAAAAABABAAAAAAAAAAAAAAAAAAAAAP/aAAgBAQAAPwA//9k=",
+    "height": 1,
+    "mime_type": "image/jpeg",
+    "note": "当前文件已变化；此图不代表原交付版本。",
+    "sha256": "d7e98b662c74dcc8fd2a62381df06a4baf558919188bea95c09f06ee8da7a737",
+    "version": "current_changed",
+    "width": 1
+  },
+  "delivered": {
+    "available": true,
+    "data_url": "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGP4z8DwHwAFAAH/iZk9HQAAAABJRU5ErkJggg==",
+    "height": 1,
+    "mime_type": "image/png",
+    "note": "交付版本（指纹一致）。",
+    "sha256": "4ff6ab670a58c14270e034e2090d9a432caa263a14e0a25785386b0c12f880b5",
+    "version": "delivered",
+    "width": 1
+  },
+  "missing": {
+    "available": false,
+    "data_url": "",
+    "height": 0,
+    "mime_type": "",
+    "note": "当前文件不可读取；未保存历史图片快照。",
+    "sha256": "",
+    "version": "missing",
+    "width": 0
+  }
+}

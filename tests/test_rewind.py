@@ -1,0 +1,423 @@
+"""rewind 快照的测试：首写获胜、恢复/删除、冲突检测、对话截断、resume 重放。"""
+
+from __future__ import annotations
+
+import os
+import stat
+import tempfile
+import unittest
+from pathlib import Path
+from unittest import mock
+
+from xiaoyu import rewind as rw
+from xiaoyu.config import Config
+from xiaoyu.tools import Toolbox
+
+from .fifo_support import call_bounded, needs_fifo
+
+
+class StoreTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name).resolve()
+        self.store = rw.RewindStore()
+
+    def path(self, name: str, content: str | None = None) -> Path:
+        target = self.root / name
+        if content is not None:
+            target.write_text(content, encoding="utf-8")
+        return target
+
+    def test_first_write_wins_within_turn(self):
+        target = self.path("a.txt", "v0")
+        self.store.begin("改 a")
+        self.store.record(target, b"v0")
+        target.write_text("v1", encoding="utf-8")
+        self.store.record(target, b"v1")  # 同轮第二次：忽略
+        target.write_text("v2", encoding="utf-8")
+        self.store.finish()
+        ok, _ = self.store.rewind_files(1)
+        self.assertTrue(ok)
+        self.assertEqual(target.read_text(encoding="utf-8"), "v0")
+
+    def test_restore_across_turns_and_delete_created(self):
+        existing = self.path("keep.txt", "old")
+        created = self.root / "new.txt"
+        self.store.begin("第一轮")
+        self.store.record(existing, b"old")
+        existing.write_text("turn1", encoding="utf-8")
+        self.store.finish()
+        self.store.begin("第二轮")
+        self.store.record(created, None)
+        created.write_text("hello", encoding="utf-8")
+        self.store.record(existing, b"turn1")
+        existing.write_text("turn2", encoding="utf-8")
+        self.store.finish()
+        #  回到第 1 轮前：existing 取"最早"的 before（old），created 删除
+        ok, summary = self.store.rewind_files(1)
+        self.assertTrue(ok, summary)
+        self.assertEqual(existing.read_text(encoding="utf-8"), "old")
+        self.assertFalse(created.exists())
+        self.assertEqual(self.store.points(), [])
+
+    def test_partial_rewind_keeps_earlier_points(self):
+        target = self.path("a.txt", "v0")
+        for turn in ("一", "二"):
+            self.store.begin(turn)
+            before = target.read_bytes()
+            self.store.record(target, before)
+            target.write_text(f"after-{turn}", encoding="utf-8")
+            self.store.finish()
+        ok, _ = self.store.rewind_files(2)
+        self.assertTrue(ok)
+        self.assertEqual(target.read_text(encoding="utf-8"), "after-一")
+        self.assertEqual([p.index for p in self.store.points()], [1])
+
+    def test_conflict_detection_on_external_edit(self):
+        target = self.path("a.txt", "v0")
+        self.store.begin("改")
+        self.store.record(target, b"v0")
+        target.write_text("v1", encoding="utf-8")
+        self.store.finish()
+        self.assertEqual(self.store.conflicts(1), [])
+        target.write_text("外部改动", encoding="utf-8")
+        self.assertEqual(self.store.conflicts(1), [str(target)])
+
+    def test_oversized_file_skipped(self):
+        target = self.path("big.txt", "x")
+        self.store.begin("大文件")
+        self.store.record(target, b"y" * (rw.MAX_FILE_BYTES + 1))
+        self.store.finish()
+        self.assertEqual(self.store.points()[0].files, {})
+        self.assertEqual(self.store.skipped_from(1), [str(target)])
+
+    def test_record_outside_turn_is_noop(self):
+        self.store.record(self.path("a.txt", "v0"), b"v0")
+        self.assertEqual(self.store.points(), [])
+
+    def test_cap_evicts_oldest(self):
+        for turn in range(rw.MAX_POINTS + 5):
+            self.store.begin(str(turn))
+            self.store.finish()
+        points = self.store.points()
+        self.assertEqual(len(points), rw.MAX_POINTS)
+        self.assertEqual(points[0].index, 6)
+
+
+@needs_fifo
+class SpecialFileTest(unittest.TestCase):
+    """追踪的路径在轮次之外被换成 FIFO：收尾、冲突检测、恢复都不许挂死。"""
+
+    def test_tracked_file_swapped_for_fifo(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            target = Path(tmp).resolve() / "a.txt"
+            target.write_text("v0", encoding="utf-8")
+            store = rw.RewindStore()
+            store.begin("改")
+            store.record(target, b"v0")
+            #  模型写完后又用 bash 把它换成了命名管道
+            target.unlink()
+            os.mkfifo(target)
+            call_bounded(self, store.finish, target)
+            #  工具只写普通文件，变成 FIFO 必是外部改动
+            self.assertEqual(call_bounded(self, lambda: store.conflicts(1), target), [str(target)])
+            ok, summary = call_bounded(self, lambda: store.rewind_files(1), target)
+            self.assertFalse(ok)
+            self.assertIn("FIFO", summary)
+            #  原样不动、快照保留：移走之后可以重试
+            self.assertTrue(stat.S_ISFIFO(os.stat(target).st_mode))
+            self.assertEqual(len(store.points()), 1)
+            target.unlink()
+            ok, summary = store.rewind_files(1)
+            self.assertTrue(ok, summary)
+            self.assertEqual(target.read_text(encoding="utf-8"), "v0")
+
+
+class AllOrNothingTest(unittest.TestCase):
+    """文件恢复中途失败时，已经写回的要还原——停在半截的工作区比不回滚更糟。"""
+
+    def make(self, tmp: str):
+        root = Path(tmp).resolve()
+        first, second = root / "a.txt", root / "b.txt"
+        first.write_text("A0", encoding="utf-8")
+        second.write_text("B0", encoding="utf-8")
+        created = root / "new.txt"
+        store = rw.RewindStore()
+        store.begin("改三处")
+        store.record(first, b"A0")
+        store.record(created, None)
+        store.record(second, b"B0")
+        first.write_text("A1", encoding="utf-8")
+        created.write_text("N1", encoding="utf-8")
+        second.write_text("B1", encoding="utf-8")
+        store.finish()
+        return store, first, created, second
+
+    def failing_write(self, victim: Path):
+        real = Path.write_bytes
+
+        def write(path: Path, data: bytes, *args, **kwargs):
+            if path == victim and data == b"B0":
+                raise PermissionError(13, "被别的程序占用", str(path))
+            return real(path, data, *args, **kwargs)
+
+        return mock.patch.object(Path, "write_bytes", write)
+
+    def test_failure_midway_leaves_the_workspace_as_it_was(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store, first, created, second = self.make(tmp)
+            with self.failing_write(second):
+                ok, summary = store.rewind_files(1)
+            self.assertFalse(ok)
+            self.assertIn("保持原样", summary)
+            self.assertIn("b.txt", summary)
+            self.assertEqual(first.read_text(encoding="utf-8"), "A1")
+            self.assertEqual(created.read_text(encoding="utf-8"), "N1")
+            self.assertEqual(second.read_text(encoding="utf-8"), "B1")
+            #  快照保留；而且没有哪个文件被当成"外部改动"
+            self.assertEqual(len(store.points()), 1)
+            self.assertEqual(store.conflicts(1), [])
+
+    def test_retry_after_the_obstacle_is_gone_succeeds(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store, first, created, second = self.make(tmp)
+            with self.failing_write(second):
+                store.rewind_files(1)
+            ok, summary = store.rewind_files(1)
+            self.assertTrue(ok, summary)
+            self.assertEqual(first.read_text(encoding="utf-8"), "A0")
+            self.assertEqual(second.read_text(encoding="utf-8"), "B0")
+            self.assertFalse(created.exists())
+            self.assertEqual(store.points(), [])
+
+    def test_special_file_blocks_before_anything_is_touched(self):
+        if not hasattr(os, "mkfifo"):
+            self.skipTest("平台没有 mkfifo")
+        with tempfile.TemporaryDirectory() as tmp:
+            store, first, created, second = self.make(tmp)
+            second.unlink()
+            os.mkfifo(second)
+            ok, summary = store.rewind_files(1)
+            self.assertFalse(ok)
+            self.assertIn("FIFO", summary)
+            self.assertEqual(first.read_text(encoding="utf-8"), "A1")
+            self.assertTrue(created.exists())
+
+    def test_half_rolled_state_is_said_out_loud(self):
+        """还原本身也失败：这时工作区确实停在半截，必须明说，不能报成"保持原样"。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            store, first, created, second = self.make(tmp)
+            real = Path.write_bytes
+
+            def write(path: Path, data: bytes, *args, **kwargs):
+                if (path == second and data == b"B0") or (path == first and data == b"A1"):
+                    raise PermissionError(13, "占用", str(path))
+                return real(path, data, *args, **kwargs)
+
+            with mock.patch.object(Path, "write_bytes", write):
+                ok, summary = store.rewind_files(1)
+            self.assertFalse(ok)
+            self.assertIn("半回滚", summary)
+            self.assertIn("a.txt", summary)
+
+
+class ToolboxCaptureTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name).resolve()
+        config = Config(
+            base_url="x", model="x", workspace=self.root,
+            enable_plugins=False, enable_mcp=False,
+        )
+        self.box = Toolbox(config)
+
+    def test_write_and_replace_capture_before_content(self):
+        self.box.rewind.begin("一轮")
+        self.box.run("write_file", {"path": "a.txt", "content": "v1\n"})
+        self.box.run("read_file", {"path": "a.txt"})
+        self.box.run("str_replace", {"path": "a.txt", "old_str": "v1", "new_str": "v2"})
+        self.box.rewind.finish()
+        point = self.box.rewind.points()[0]
+        #  新建文件的 before 是 None（首写获胜：str_replace 不覆盖它）
+        self.assertEqual(point.files, {str(self.root / "a.txt"): None})
+        ok, _ = self.box.rewind.rewind_files(1)
+        self.assertTrue(ok)
+        self.assertFalse((self.root / "a.txt").exists())
+
+    def test_replace_existing_captures_original(self):
+        target = self.root / "b.txt"
+        target.write_text("原文\n", encoding="utf-8")
+        self.box.rewind.begin("一轮")
+        self.box.run("read_file", {"path": "b.txt"})
+        self.box.run("str_replace", {"path": "b.txt", "old_str": "原文", "new_str": "新文"})
+        self.box.rewind.finish()
+        ok, _ = self.box.rewind.rewind_files(1)
+        self.assertTrue(ok)
+        self.assertEqual(target.read_text(encoding="utf-8"), "原文\n")
+
+
+class AgentRewindTest(unittest.TestCase):
+    """不跑真模型：手工搭历史 + 快照点，验证 rewind_to 的截断与匹配语义。"""
+
+    def make_agent(self):
+        import tempfile as tf
+
+        from xiaoyu.agent import Agent
+        from xiaoyu.providers import Provider, Registry
+
+        self.tmp = tf.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        config = Config(
+            base_url="http://localhost:9", model="deepseek-flash",
+            workspace=Path(self.tmp.name).resolve(),
+            enable_plugins=False, enable_mcp=False, enable_skills=False,
+            enable_explore=False, enable_web_search=False,
+            enable_agents=False, enable_hooks=False,
+        )
+        registry = Registry([Provider(name="g", base_url="http://localhost:9", api_key="k")])
+        return Agent(config, registry=registry)
+
+    def turn(self, agent, text: str) -> None:
+        agent.toolbox.rewind.begin(text)
+        agent.messages.append({"role": "user", "content": text})
+        agent.messages.append({"role": "assistant", "content": f"回复 {text}"})
+        agent.toolbox.rewind.finish()
+
+    def test_conversation_truncated_to_point(self):
+        agent = self.make_agent()
+        self.turn(agent, "第一件事")
+        self.turn(agent, "第二件事")
+        self.turn(agent, "第三件事")
+        result = agent.rewind_to(2, files=False)
+        self.assertIn("回滚到第 2 轮", result)
+        texts = [m.get("content") for m in agent.messages if m.get("role") == "user"]
+        self.assertEqual(texts, ["第一件事"])
+
+    def test_conversation_is_kept_when_files_cannot_be_restored(self):
+        """对话截断会落盘、不可撤：文件回不去时对话也不动。"""
+        agent = self.make_agent()
+        target = agent.config.workspace / "a.txt"
+        target.write_text("v0", encoding="utf-8")
+        agent.toolbox.rewind.begin("第一轮")
+        agent.messages.append({"role": "user", "content": "第一轮"})
+        agent.toolbox.rewind.record(target, b"v0")
+        target.write_text("v1", encoding="utf-8")
+        agent.messages.append({"role": "assistant", "content": "改好了"})
+        agent.toolbox.rewind.finish()
+        before = list(agent.messages)
+
+        with mock.patch.object(Path, "write_bytes", side_effect=PermissionError(13, "占用")):
+            result = agent.rewind_to(1)
+        self.assertIn("文件恢复出错", result)
+        self.assertIn("对话没有回滚", result)
+        self.assertEqual(agent.messages, before)
+        self.assertEqual(target.read_text(encoding="utf-8"), "v1")
+
+        result = agent.rewind_to(1)
+        self.assertIn("对话已回滚", result)
+        self.assertEqual(len(agent.messages), len(before) - 2)
+        self.assertEqual(target.read_text(encoding="utf-8"), "v0")
+
+    def test_duplicate_prompts_match_by_occurrence(self):
+        agent = self.make_agent()
+        self.turn(agent, "再来一次")
+        self.turn(agent, "再来一次")
+        agent.rewind_to(2, files=False)
+        texts = [m.get("content") for m in agent.messages if m.get("role") == "user"]
+        self.assertEqual(texts, ["再来一次"])
+
+    def test_compacted_turn_falls_back_to_files_only(self):
+        agent = self.make_agent()
+        self.turn(agent, "会被压缩掉的轮次")
+        #  模拟压缩改写：用户原话从历史里消失
+        agent.messages = [agent.messages[0], {"role": "user", "content": "[摘要]"}]
+        result = agent.rewind_to(1, conversation=True, files=True)
+        self.assertIn("已被压缩合并", result)
+
+    def test_rewound_turn_prompt_is_handed_back_for_prefill(self):
+        """对话回退后，被截掉那一轮的原话经 RewindResult.prompt_text 交给前端预填。"""
+        agent = self.make_agent()
+        self.turn(agent, "第一件事")
+        #  带图片的一轮：媒体部件只取文本
+        content = [{"type": "text", "text": "看这张图改一下"}, {"type": "image_url", "image_url": {"url": "data:x"}}]
+        from xiaoyu import media
+
+        agent.toolbox.rewind.begin(media.text_of(content))  # 与 send() 开点的写法一致
+        agent.messages.append({"role": "user", "content": content})
+        agent.messages.append({"role": "assistant", "content": "改了"})
+        agent.toolbox.rewind.finish()
+        self.turn(agent, "第三件事")
+        result = agent.rewind_result(2, conversation=True, files=False, check_conflicts=False)
+        self.assertTrue(result.conversation_rewound)
+        self.assertEqual(result.prompt_text, "看这张图改一下")
+        #  只回文件不回对话：没有原话可预填
+        self.turn(agent, "第四件事")
+        result = agent.rewind_result(3, conversation=False, files=True, check_conflicts=False)
+        self.assertFalse(result.conversation_rewound)
+        self.assertEqual(result.prompt_text, "")
+        #  压缩后对话回不去（退化成只回文件）：同样不给原话
+        agent.messages = [agent.messages[0], {"role": "user", "content": "[摘要]"}]
+        result = agent.rewind_result(1, conversation=True, files=True, check_conflicts=False)
+        self.assertFalse(result.conversation_rewound)
+        self.assertEqual(result.prompt_text, "")
+
+    def test_slash_rewind_prefills_the_original_wording(self):
+        """/rewind 流程：回退对话 → 原话进预填通道（drain_steers）；仅文件 → 不预填。"""
+        import contextlib
+        import io
+        from unittest import mock
+
+        from xiaoyu.cli import _rewind_flow
+
+        agent = self.make_agent()
+        self.turn(agent, "第一件事")
+        self.turn(agent, "第二件事")
+        self.turn(agent, "第三件事")
+        #  仅文件（scope 3）：不预填
+        with mock.patch("builtins.input", side_effect=["3", "y"]), contextlib.redirect_stdout(io.StringIO()):
+            _rewind_flow(agent, ["3"])
+        self.assertEqual(agent.drain_steers(), [])
+        #  仅对话（scope 2）：第二轮原话预填，可改可直接回车
+        with mock.patch("builtins.input", side_effect=["2", "y"]), contextlib.redirect_stdout(io.StringIO()):
+            _rewind_flow(agent, ["2"])
+        self.assertEqual(agent.drain_steers(), ["第二件事"])
+        texts = [m.get("content") for m in agent.messages if m.get("role") == "user"]
+        self.assertEqual(texts, ["第一件事"])
+
+    def test_unknown_point(self):
+        agent = self.make_agent()
+        self.assertIn("没有编号为 9", agent.rewind_to(9))
+
+
+class ReplayTest(unittest.TestCase):
+    def test_load_messages_applies_rewind_replacement(self):
+        import json
+
+        from xiaoyu.session_log import load_messages
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "s.jsonl"
+            lines = [
+                {"event": "meta", "format": 2},
+                {"role": "user", "content": "一"},
+                {"role": "assistant", "content": "答一"},
+                {"role": "user", "content": "二"},
+                {"event": "rewind", "target": 2,
+                 "replacement": [{"role": "user", "content": "一"},
+                                 {"role": "assistant", "content": "答一"}]},
+                {"role": "user", "content": "新的二"},
+            ]
+            path.write_text(
+                "\n".join(json.dumps(line, ensure_ascii=False) for line in lines) + "\n",
+                encoding="utf-8",
+            )
+            messages = load_messages(path)
+            self.assertEqual(
+                [m["content"] for m in messages], ["一", "答一", "新的二"]
+            )
+
+
+if __name__ == "__main__":
+    unittest.main()

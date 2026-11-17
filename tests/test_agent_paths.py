@@ -1,0 +1,2248 @@
+"""主循环、中断恢复、摘要回退链、REPL 命令的测试。
+
+这些路径此前只在真实运行里"看起来没问题"，没有测试锁住。
+用假 client 注入，不打网络。
+"""
+
+from __future__ import annotations
+
+import contextlib
+import io
+import json
+import tempfile
+import types
+import unittest
+from pathlib import Path
+from unittest import mock
+
+import httpx2
+import openai
+
+from xiaoyu.agent import Agent
+from xiaoyu.cli import handle_slash
+from xiaoyu.config import Config
+from xiaoyu.providers import Provider, Registry
+from xiaoyu.tools import Toolbox
+
+
+# ---------- 假 client ----------
+
+
+def chunk(content: str | None = None, tool_calls=None, usage=None):
+    """造一个流式 chunk。字段形状对齐 openai SDK 实际用到的那几个。"""
+    delta = types.SimpleNamespace(content=content, tool_calls=tool_calls)
+    choice = types.SimpleNamespace(delta=delta)
+    return types.SimpleNamespace(choices=[choice], usage=usage)
+
+
+def usage_chunk(prompt: int, completion: int):
+    return types.SimpleNamespace(
+        choices=[],
+        usage=types.SimpleNamespace(prompt_tokens=prompt, completion_tokens=completion),
+    )
+
+
+def call_fragment(index: int, call_id: str | None, name: str | None, arguments: str | None):
+    function = types.SimpleNamespace(name=name, arguments=arguments)
+    return types.SimpleNamespace(index=index, id=call_id, function=function)
+
+
+class FakeCompletions:
+    def __init__(self, script: list) -> None:
+        #  script 里每一项是 list[chunk]（流式）、Exception（抛错）或普通 response 对象
+        self.script = list(script)
+        self.calls: list[dict] = []
+
+    def create(self, **kwargs):
+        self.calls.append(kwargs)
+        if not self.script:
+            raise AssertionError("假 client 的脚本用完了，说明调用次数超出预期")
+        item = self.script.pop(0)
+        if isinstance(item, Exception):
+            raise item
+        return iter(item) if isinstance(item, list) else item
+
+
+class FakeClient:
+    def __init__(self, script: list) -> None:
+        self.completions = FakeCompletions(script)
+        self.chat = types.SimpleNamespace(completions=self.completions)
+
+
+def text_response(content: str, prompt: int = 100, completion: int = 20):
+    message = types.SimpleNamespace(content=content)
+    return types.SimpleNamespace(
+        choices=[types.SimpleNamespace(message=message)],
+        usage=types.SimpleNamespace(prompt_tokens=prompt, completion_tokens=completion),
+    )
+
+
+def truncated_response(content: str):
+    """撞输出上限的非流式响应：正文照常返回，finish_reason=length。"""
+    response = text_response(content)
+    response.choices[0].finish_reason = "length"
+    return response
+
+
+class AgentTestCase(unittest.TestCase):
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        #  临时目录走 addCleanup（后进先出）：用例里登记的 SessionLog.release 先跑，
+        #  Windows 上被持有的 .jsonl.lock 删不掉——tearDown 里删会先于 release
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name).resolve()
+        (self.root / "calc.py").write_text("def add(a, b):\n    return a + b\n", encoding="utf-8")
+        self.config = Config(
+            base_url="http://unused",
+            model="main-model",
+            summary_model="cheap-model",
+            explore_model="cheap-model",
+            workspace=self.root,
+            auto_approve=True,
+            #  基座钉在确认档：这里的测试测的是"该问的都问了"，不能跟着出厂
+            #  起始档（auto）漂；auto 的放行矩阵在 test_modes 里单独锁
+            mode="default",
+            #  测试必须与跑测试机器上装的技能库/插件隔离
+            enable_skills=False,
+            enable_agents=False,
+            enable_hooks=False,
+            enable_plugins=False,
+        )
+
+    def build(self, script: list, **kwargs) -> Agent:
+        client = FakeClient(script)
+        agent = Agent(self.config, Toolbox(self.config), registry=Registry.for_client(client), **kwargs)
+        self.client = client
+        return agent
+
+
+class TestAskRule(AgentTestCase):
+    """ask 规则：自动放行的模式下，点了名的那几样照样要问。"""
+
+    def run_bash(self, command: str, rules: list[str], approve: bool, **config):
+        from xiaoyu.permissions import Permissions, parse_rule
+
+        for key, value in config.items():
+            setattr(self.config, key, value)
+        asked: list = []
+
+        def approver(name, args):
+            asked.append((name, args.get("command")))
+            return approve
+
+        script = [
+            [chunk(tool_calls=[call_fragment(0, "c1", "bash", json.dumps({"command": command}))]),
+             usage_chunk(10, 5)],
+            [chunk(content="完"), usage_chunk(10, 1)],
+        ]
+        agent = self.build(
+            script, approver=approver,
+            permissions=Permissions(self.root, [parse_rule(line) for line in rules]),
+        )
+        buffer = io.StringIO()
+        with contextlib.redirect_stdout(buffer):
+            agent.send("干活")
+        (result,) = [m for m in agent.messages if m["role"] == "tool"]
+        return asked, result["content"], buffer.getvalue()
+
+    def test_named_command_is_asked_even_when_everything_is_auto_approved(self) -> None:
+        asked, result, shown = self.run_bash(
+            "git push origin main", ["ask bash(git push*)"], approve=False, auto_approve=True
+        )
+        self.assertEqual(asked, [("bash", "git push origin main")])
+        self.assertIn("拒绝", result)
+        self.assertIn("ask bash(git push*)", shown)
+
+    def test_everything_else_still_runs_without_asking(self) -> None:
+        asked, result, _ = self.run_bash(
+            "echo hello", ["ask bash(git push*)"], approve=False, auto_approve=True
+        )
+        self.assertEqual(asked, [])
+        self.assertIn("hello", result)
+
+    def test_a_wider_allow_rule_does_not_override_it(self) -> None:
+        asked, _, _ = self.run_bash(
+            "git push", ["allow bash(git *)", "ask bash(git push*)"], approve=False,
+        )
+        self.assertEqual(asked, [("bash", "git push")])
+
+    def test_unattended_releases_it_like_the_other_must_asks(self) -> None:
+        asked, _, _ = self.run_bash(
+            "echo pushed", ["ask bash(echo *)"], approve=False,
+            auto_approve=True, unattended=True,
+        )
+        self.assertEqual(asked, [])
+
+
+class TestInterruptedToolLeavesItsReport(AgentTestCase):
+    """批量委托被打断时把已收束各项的报告挂在异常上：主循环要把它作为这次调用的
+    结果写进历史，下一轮模型才看得到"完成了哪几项、句柄是什么"。"""
+
+    def build_with(self, handler):
+        from xiaoyu.tools import Tool
+
+        script = [[chunk(tool_calls=[call_fragment(0, "call_1", "batch", "{}")]), usage_chunk(10, 5)]]
+        agent = self.build(script)
+        agent.toolbox.register(
+            Tool(name="batch", description="d", parameters={"type": "object", "properties": {}},
+                 handler=handler, requires_approval=False)
+        )
+        return agent
+
+    def test_partial_report_becomes_the_tool_result(self) -> None:
+        from xiaoyu.errors import Interrupted, attach_partial
+
+        def handler() -> str:
+            exc = Interrupted("宿主请求打断")
+            attach_partial(exc, lambda: "[report · 被打断] 完成 3/6\nresume_from: abcd1234")
+            raise exc
+
+        agent = self.build_with(handler)
+        with contextlib.redirect_stdout(io.StringIO()), self.assertRaises(Interrupted):
+            agent.send("跑一批")
+        tool_messages = [m for m in agent.messages if m["role"] == "tool"]
+        self.assertEqual(len(tool_messages), 1)
+        self.assertEqual(tool_messages[0]["tool_call_id"], "call_1")
+        self.assertIn("resume_from: abcd1234", tool_messages[0]["content"])
+        #  之后的通用兜底不能再补一条占位把它挤掉
+        agent.close_open_tool_calls("用户中断")
+        self.assertEqual(len([m for m in agent.messages if m["role"] == "tool"]), 1)
+
+    def test_plain_interrupt_still_gets_the_generic_filler(self) -> None:
+        from xiaoyu.errors import Interrupted
+
+        def handler() -> str:
+            raise Interrupted("宿主请求打断")
+
+        agent = self.build_with(handler)
+        with contextlib.redirect_stdout(io.StringIO()), self.assertRaises(Interrupted):
+            agent.send("跑一批")
+        self.assertEqual([m for m in agent.messages if m["role"] == "tool"], [])
+        agent.close_open_tool_calls("用户中断")
+        (filler,) = [m for m in agent.messages if m["role"] == "tool"]
+        self.assertIn("用户中断", filler["content"])
+
+    def test_failing_report_builder_never_masks_the_interrupt(self) -> None:
+        from xiaoyu.errors import PARTIAL_OUTPUT, Interrupted, attach_partial
+
+        exc = Interrupted("x")
+
+        def broken() -> str:
+            raise RuntimeError("聚合炸了")
+
+        attach_partial(exc, broken)
+        self.assertFalse(hasattr(exc, PARTIAL_OUTPUT))
+
+
+# ---------- 主循环 ----------
+
+
+class TestToolCallLoop(AgentTestCase):
+    def test_streamed_tool_call_fragments_are_assembled(self) -> None:
+        """arguments 是分片下发的，拼错就会 JSON 解析失败 —— 这是流式最易错的一环。"""
+        first = [
+            chunk(tool_calls=[call_fragment(0, "call_1", "read_file", '{"pa')]),
+            chunk(tool_calls=[call_fragment(0, None, None, 'th": "cal')]),
+            chunk(tool_calls=[call_fragment(0, None, None, 'c.py"}')]),
+            usage_chunk(500, 30),
+        ]
+        second = [chunk(content="文件里有 add 函数"), usage_chunk(700, 40)]
+        agent = self.build([first, second])
+
+        with contextlib.redirect_stdout(io.StringIO()):
+            agent.send("看一下 calc.py")
+
+        self.assertEqual([entry["tool"] for entry in agent.trace], ["read_file"])
+        self.assertTrue(agent.trace[0]["ok"])
+        self.assertIn("def add", agent.trace[0]["output"])
+        #  消息序列：system, user, assistant(tool_calls), tool, assistant
+        self.assertEqual(
+            [m["role"] for m in agent.messages],
+            ["system", "user", "assistant", "tool", "assistant"],
+        )
+        self.assertEqual(agent.messages[3]["tool_call_id"], "call_1")
+        self.assertEqual(agent.usage.by_model["gateway/main-model"].calls, 2)
+        self.assertEqual(agent.usage.prompt_tokens, 1200)
+
+    def test_many_argument_fragments_assemble_identically(self) -> None:
+        """参数改为分片进 list、流末 join：拆成逐字符的上千片、两路交错下发，
+        拼出来必须与整串一字不差（含多字节字符）。"""
+        big = json.dumps({"path": "big.txt", "content": "写大文件\n" * 300}, ensure_ascii=False)
+        small = json.dumps({"path": "calc.py"})
+        fragments = [chunk(tool_calls=[call_fragment(0, "w", "write_file", "")])]
+        fragments.append(chunk(tool_calls=[call_fragment(1, "r", "read_file", "")]))
+        for position in range(max(len(big), len(small))):
+            if position < len(big):
+                fragments.append(chunk(tool_calls=[call_fragment(0, None, None, big[position])]))
+            if position < len(small):
+                fragments.append(chunk(tool_calls=[call_fragment(1, None, None, small[position])]))
+        fragments.append(usage_chunk(100, 10))
+        agent = self.build([fragments, [chunk(content="写好了"), usage_chunk(100, 5)]])
+        with contextlib.redirect_stdout(io.StringIO()):
+            agent.send("写个大文件")
+        calls = next(m for m in agent.messages if m.get("tool_calls"))["tool_calls"]
+        self.assertEqual([c["function"]["arguments"] for c in calls], [big, small])
+        #  私有攒片状态不许漏进落定的 tool_call（它会随历史出网）
+        self.assertEqual(sorted(calls[0]), ["function", "id", "type"])
+        self.assertEqual((self.root / "big.txt").read_text(encoding="utf-8"), "写大文件\n" * 300)
+
+    def test_interrupted_stream_still_joins_argument_fragments(self) -> None:
+        """中断打在流中途：pending 里的 arguments 仍是已收到分片 join 后的完整串，
+        与逐片 += 时的语义一致（调用方据此丢弃残缺调用）。"""
+
+        def interrupted():
+            yield chunk(tool_calls=[call_fragment(0, "c1", "write_file", '{"pa')])
+            yield chunk(tool_calls=[call_fragment(0, None, None, 'th": "a.p')])
+            raise KeyboardInterrupt
+
+        agent = self.build([])
+        pending: dict = {}
+        with self.assertRaises(KeyboardInterrupt):
+            agent._consume_stream(agent.model_chain()[0], interrupted(), [], pending, [])
+        self.assertEqual(pending[0]["function"]["arguments"], '{"path": "a.p')
+
+    def test_parallel_tool_calls(self) -> None:
+        first = [
+            chunk(
+                tool_calls=[
+                    call_fragment(0, "a", "read_file", '{"path": "calc.py"}'),
+                    call_fragment(1, "b", "list_files", '{"pattern": "*.py"}'),
+                ]
+            )
+        ]
+        agent = self.build([first, [chunk(content="都看完了")]])
+        with contextlib.redirect_stdout(io.StringIO()):
+            agent.send("并行看两个")
+        self.assertEqual([entry["tool"] for entry in agent.trace], ["read_file", "list_files"])
+        self.assertEqual([m["role"] for m in agent.messages][-3:], ["tool", "tool", "assistant"])
+
+    def test_indexless_fragments_group_by_id(self) -> None:
+        """Gemini 兼容层的分片不带 index（每路调用整只到齐）：必须按 id 各成一路，
+        否则并行调用的 arguments 会被拼成一坨坏 JSON（2026-08-24 实测形状）。"""
+        first = [
+            chunk(tool_calls=[call_fragment(None, "a", "read_file", '{"path": "calc.py"}')]),
+            chunk(tool_calls=[call_fragment(None, "b", "list_files", '{"pattern": "*.py"}')]),
+        ]
+        agent = self.build([first, [chunk(content="都看完了")]])
+        with contextlib.redirect_stdout(io.StringIO()):
+            agent.send("并行看两个")
+        self.assertEqual([entry["tool"] for entry in agent.trace], ["read_file", "list_files"])
+        calls = agent.messages[2]["tool_calls"]
+        self.assertEqual(
+            [call["function"]["arguments"] for call in calls],
+            ['{"path": "calc.py"}', '{"pattern": "*.py"}'],
+        )
+
+    def test_indexless_fragment_without_id_continues_last_slot(self) -> None:
+        """无 index 也无 id 的分片是续传：接到最近一路上，不另起新调用。"""
+        first = [
+            chunk(tool_calls=[call_fragment(None, "a", "read_file", '{"pa')]),
+            chunk(tool_calls=[call_fragment(None, None, None, 'th": "calc.py"}')]),
+        ]
+        agent = self.build([first, [chunk(content="好")]])
+        with contextlib.redirect_stdout(io.StringIO()):
+            agent.send("看一下")
+        self.assertEqual([entry["tool"] for entry in agent.trace], ["read_file"])
+        self.assertTrue(agent.trace[0]["ok"])
+
+    def test_tool_call_extra_content_lands_in_private_key(self) -> None:
+        """Gemini 的 thought_signature 随分片挂在 extra_content 上：要挪进
+        _tool_extras 私有键（带产出路由标签），tool_calls 本体必须干净。"""
+        from xiaoyu.responses import TOOL_EXTRAS_KEY
+
+        signed = call_fragment(0, "call_1", "read_file", '{"path": "calc.py"}')
+        signed.extra_content = {"google": {"thought_signature": "SIG"}}
+        agent = self.build([[chunk(tool_calls=[signed])], [chunk(content="好")]])
+        with contextlib.redirect_stdout(io.StringIO()):
+            agent.send("看一下")
+        assistant = agent.messages[2]
+        self.assertEqual(
+            assistant[TOOL_EXTRAS_KEY],
+            {
+                "model": "main-model",
+                "provider": "gateway",
+                "extras": {"call_1": {"google": {"thought_signature": "SIG"}}},
+            },
+        )
+        #  签名不许留在 tool_call 里：strip_private 只摘消息级键，留着就漏上网
+        self.assertEqual(
+            sorted(assistant["tool_calls"][0]), ["function", "id", "type"]
+        )
+
+    def test_indexless_late_id_adopts_open_slot(self) -> None:
+        """首分片没给 id、id 随后一片才到：认领已开的空 id 槽续接，不劈成两路
+        ——劈开的两半一半配不上 tool result，一半 arguments 是残缺 JSON。"""
+        first = [
+            chunk(tool_calls=[call_fragment(None, None, "read_file", '{"pa')]),
+            chunk(tool_calls=[call_fragment(None, "a", None, 'th": "calc.py"}')]),
+        ]
+        agent = self.build([first, [chunk(content="好")]])
+        with contextlib.redirect_stdout(io.StringIO()):
+            agent.send("看一下")
+        self.assertEqual([entry["tool"] for entry in agent.trace], ["read_file"])
+        self.assertTrue(agent.trace[0]["ok"])
+        self.assertEqual(agent.messages[3]["tool_call_id"], "a")
+
+    def test_indexless_continuation_follows_last_touched_slot(self) -> None:
+        """带 id 的分片把写入点拉回旧格后，无 id 续片必须跟"最近写过的一格"——
+        跟"编号最大的一格"会把两路调用的 arguments 拼串成坏 JSON。"""
+        first = [
+            chunk(tool_calls=[call_fragment(None, "a", "read_file", '{"pa')]),
+            chunk(tool_calls=[call_fragment(None, "b", "list_files", '{"pattern": "*.py"}')]),
+            chunk(tool_calls=[call_fragment(None, "a", None, 'th": "ca')]),
+            chunk(tool_calls=[call_fragment(None, None, None, 'lc.py"}')]),
+        ]
+        agent = self.build([first, [chunk(content="都看完了")]])
+        with contextlib.redirect_stdout(io.StringIO()):
+            agent.send("并行看两个")
+        calls = agent.messages[2]["tool_calls"]
+        self.assertEqual(
+            [call["function"]["arguments"] for call in calls],
+            ['{"path": "calc.py"}', '{"pattern": "*.py"}'],
+        )
+        self.assertEqual([entry["ok"] for entry in agent.trace], [True, True])
+
+    def test_idless_call_gets_local_id_and_keeps_signature(self) -> None:
+        """id 从头到尾没来的调用：落定时补本地 id——tool result 配对与签名存取
+        都靠 id 做键，空 id 时签名会被静默丢弃、重放反被占位签名顶替。"""
+        from xiaoyu.responses import TOOL_EXTRAS_KEY
+
+        orphan = call_fragment(None, None, "read_file", '{"path": "calc.py"}')
+        orphan.extra_content = {"google": {"thought_signature": "SIG"}}
+        agent = self.build([[chunk(tool_calls=[orphan])], [chunk(content="好")]])
+        with contextlib.redirect_stdout(io.StringIO()):
+            agent.send("看一下")
+        assistant = agent.messages[2]
+        call_id = assistant["tool_calls"][0]["id"]
+        self.assertTrue(call_id)
+        self.assertEqual(
+            assistant[TOOL_EXTRAS_KEY]["extras"],
+            {call_id: {"google": {"thought_signature": "SIG"}}},
+        )
+        self.assertEqual(agent.messages[3]["tool_call_id"], call_id)
+        self.assertTrue(agent.trace[0]["ok"])
+
+    def test_tool_call_extra_content_first_wins(self) -> None:
+        """签名实测只随首个分片来一次：后续分片再挂个 truthy 的 extra_content
+        不能把真签名冲掉（同 name 的先到先得纪律）。"""
+        from xiaoyu.responses import TOOL_EXTRAS_KEY
+
+        signed = call_fragment(0, "call_1", "read_file", '{"path": ')
+        signed.extra_content = {"google": {"thought_signature": "REAL"}}
+        noisy = call_fragment(0, None, None, '"calc.py"}')
+        noisy.extra_content = {"noise": True}
+        agent = self.build(
+            [[chunk(tool_calls=[signed]), chunk(tool_calls=[noisy])], [chunk(content="好")]]
+        )
+        with contextlib.redirect_stdout(io.StringIO()):
+            agent.send("看一下")
+        self.assertEqual(
+            agent.messages[2][TOOL_EXTRAS_KEY]["extras"],
+            {"call_1": {"google": {"thought_signature": "REAL"}}},
+        )
+
+    def test_signature_model_without_signature_warns(self) -> None:
+        """签名型号的调用一枚签名都没捕到＝捕获回归的第一现场，必须出声——
+        重放会被占位签名悄悄顶替（能跑），不出声就是静默丢思维连续性。
+        正常捕到签名则不许有这条噪音。"""
+        from xiaoyu.responses import wrap
+
+        def transport_agent(fragment) -> Agent:
+            inner = FakeClient([[chunk(tool_calls=[fragment])], [chunk(content="好")]])
+            transport = wrap(inner, (), provider="gateway", signature_models=("*",))
+            return Agent(
+                self.config, Toolbox(self.config), registry=Registry.for_client(transport)
+            )
+
+        bare = call_fragment(0, "call_1", "read_file", '{"path": "calc.py"}')
+        with contextlib.redirect_stdout(io.StringIO()) as buffer:
+            transport_agent(bare).send("看一下")
+        self.assertIn("thought_signature", buffer.getvalue())
+
+        signed = call_fragment(0, "call_1", "read_file", '{"path": "calc.py"}')
+        signed.extra_content = {"google": {"thought_signature": "SIG"}}
+        with contextlib.redirect_stdout(io.StringIO()) as buffer:
+            transport_agent(signed).send("看一下")
+        self.assertNotIn("没带回 thought_signature", buffer.getvalue())
+
+    def test_malformed_arguments_are_reported_not_crashed(self) -> None:
+        #  带 usage 收尾：流正常结束、坏 JSON 是模型自己写的，走报错路径。
+        #  没有任何收尾信号的同形状是断流，会被原地重发（见 test_errors 的 StreamTruncationTest）
+        first = [
+            chunk(tool_calls=[call_fragment(0, "x", "read_file", "{不是合法 JSON")]),
+            usage_chunk(100, 10),
+        ]
+        agent = self.build([first, [chunk(content="我重试")]])
+        with contextlib.redirect_stdout(io.StringIO()):
+            agent.send("试试")
+        self.assertIn("不是合法 JSON", agent.messages[3]["content"])
+
+    def test_accept_note_rides_the_tool_result(self) -> None:
+        """approver 返回 (True, 附言)（TUI 确认框的 Tab）：附言拼进本次
+        tool result 回灌模型——不另插 user 消息（那会破坏 tool 结果与
+        tool_calls 的相邻不变量）。"""
+        self.config.auto_approve = False
+        first = [
+            chunk(tool_calls=[call_fragment(0, "c1", "bash", '{"command": "echo hello-note"}')])
+        ]
+        agent = self.build(
+            [first, [chunk(content="好")]],
+            approver=lambda name, args: (True, "顺带留意退出码"),
+        )
+        with contextlib.redirect_stdout(io.StringIO()):
+            agent.send("跑一下")
+        tool_message = agent.messages[3]
+        self.assertEqual(tool_message["role"], "tool")
+        self.assertIn("hello-note", tool_message["content"])
+        self.assertIn("顺带留意退出码", tool_message["content"])
+        #  消息序列没有被附言打乱：system, user, assistant(tool_calls), tool, assistant
+        self.assertEqual(
+            [m["role"] for m in agent.messages],
+            ["system", "user", "assistant", "tool", "assistant"],
+        )
+
+    def test_max_iterations_wraps_up_with_summary(self) -> None:
+        #  模型一直要求调工具，必须被轮次上限刹住，且要产出收尾总结而不是静默截断
+        self.config.max_iterations = 3
+        self.config.turn_extension = 0  # 不许延期：撞顶即收尾（延期路径见 test_budget_pacing）
+        forever = [
+            [chunk(tool_calls=[call_fragment(0, f"c{n}", "read_file", '{"path": "calc.py"}')])]
+            for n in range(3)
+        ]
+        wrapup = [chunk(content="已完成 A，剩 B，建议继续")]
+        agent = self.build(forever + [wrapup])
+        buffer = io.StringIO()
+        with contextlib.redirect_stdout(buffer):
+            agent.send("无限循环")
+        self.assertIn("已达到单轮工具调用上限", buffer.getvalue())
+        self.assertEqual(agent.last_assistant_text(), "已完成 A，剩 B，建议继续")
+        #  收尾调用必须不带 tools——只许说话不许继续干活
+        self.assertNotIn("tools", self.client.completions.calls[-1])
+
+    def test_repeated_identical_calls_warned_then_blocked(self) -> None:
+        """打转检测：相同 (工具, 参数) 连续第 3 次附加提示，第 5 次拒绝执行。"""
+        agent = self.build([])
+        call = {
+            "id": "c1",
+            "function": {"name": "list_files", "arguments": '{"pattern": "*.py"}'},
+        }
+        outputs = []
+        with contextlib.redirect_stdout(io.StringIO()):
+            for _ in range(5):
+                outputs.append(agent._execute(call)["content"])
+        self.assertNotIn("[提示]", outputs[1])
+        self.assertIn("连续第 3 次", outputs[2])
+        self.assertIn("拒绝执行", outputs[4])
+        #  换了参数就重置
+        other = {
+            "id": "c2",
+            "function": {"name": "list_files", "arguments": '{"pattern": "*.md"}'},
+        }
+        with contextlib.redirect_stdout(io.StringIO()):
+            fresh = agent._execute(other)["content"]
+        self.assertNotIn("拒绝执行", fresh)
+        self.assertNotIn("[提示]", fresh)
+
+
+# ---------- 中断恢复 ----------
+
+
+class TestInterruptRecovery(AgentTestCase):
+    def test_dangling_tool_calls_are_closed(self) -> None:
+        """Ctrl-C 打在工具执行前时，assistant 的 tool_calls 没有对应结果，
+        下一次请求会直接 400。close_open_tool_calls 必须补齐。"""
+        agent = self.build([])
+        agent.messages.append({"role": "user", "content": "改点东西"})
+        agent.messages.append(
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [
+                    {"id": "t1", "type": "function", "function": {"name": "bash", "arguments": "{}"}},
+                    {"id": "t2", "type": "function", "function": {"name": "bash", "arguments": "{}"}},
+                ],
+            }
+        )
+        agent.close_open_tool_calls("用户按 Ctrl-C 中断了本轮。")
+
+        tool_messages = [m for m in agent.messages if m["role"] == "tool"]
+        self.assertEqual([m["tool_call_id"] for m in tool_messages], ["t1", "t2"])
+        self.assertIn("中断", tool_messages[0]["content"])
+
+    def test_noop_when_nothing_dangling(self) -> None:
+        agent = self.build([])
+        agent.messages.append({"role": "assistant", "content": "说完了"})
+        before = len(agent.messages)
+        agent.close_open_tool_calls("中断")
+        self.assertEqual(len(agent.messages), before, "没有悬空调用时不该乱加消息")
+
+    def test_mid_batch_interrupt_repaired(self) -> None:
+        """中断打在批量工具执行到一半：t1 已有结果、t2 悬空，
+        此时最后一条是 tool 消息——只看最后一条 assistant 的旧实现修不了这种。"""
+        agent = self.build([])
+        agent.messages.append({"role": "user", "content": "改点东西"})
+        agent.messages.append(
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [
+                    {"id": "t1", "type": "function", "function": {"name": "bash", "arguments": "{}"}},
+                    {"id": "t2", "type": "function", "function": {"name": "bash", "arguments": "{}"}},
+                ],
+            }
+        )
+        agent.messages.append({"role": "tool", "tool_call_id": "t1", "content": "已完成"})
+        agent.close_open_tool_calls("用户中断")
+
+        tool_messages = [m for m in agent.messages if m["role"] == "tool"]
+        self.assertEqual([m["tool_call_id"] for m in tool_messages], ["t1", "t2"])
+        #  已有的结果不许被动
+        self.assertEqual(tool_messages[0]["content"], "已完成")
+        #  补的结果必须紧跟在 tool 段末尾（相邻性），不能落在别处
+        roles = [m["role"] for m in agent.messages]
+        self.assertEqual(roles[-2:], ["tool", "tool"])
+
+    def test_repair_scans_all_history_not_just_tail(self) -> None:
+        """悬空调用在历史中段（后面已经又有别的消息）也要补齐。"""
+        agent = self.build([])
+        agent.messages.append({"role": "user", "content": "第一轮"})
+        agent.messages.append(
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [
+                    {"id": "old", "type": "function", "function": {"name": "bash", "arguments": "{}"}}
+                ],
+            }
+        )
+        #  悬空之后又插入了一条 user（比如历史被手工修补过）
+        agent.messages.append({"role": "user", "content": "第二轮"})
+        agent.close_open_tool_calls("补齐")
+        roles = [m["role"] for m in agent.messages]
+        self.assertEqual(roles, ["system", "user", "assistant", "tool", "user"])
+        self.assertEqual(agent.messages[3]["tool_call_id"], "old")
+
+    def test_partial_stream_interrupt_keeps_spoken_text(self) -> None:
+        """Ctrl-C 打在流式中途：已经说出的半截话必须入历史，不能整轮消失。"""
+
+        def interrupted_stream():
+            yield chunk(content="我先分析一下")
+            raise KeyboardInterrupt
+
+        agent = self.build([interrupted_stream()])
+        with contextlib.redirect_stdout(io.StringIO()):
+            with self.assertRaises(KeyboardInterrupt):
+                agent.send("做点什么")
+
+        last = agent.messages[-1]
+        self.assertEqual(last["role"], "assistant")
+        self.assertIn("我先分析一下", last["content"])
+        self.assertIn("被用户中断", last["content"])
+        self.assertNotIn("tool_calls", last, "拼了一半的 tool_calls 必须丢弃")
+
+    def test_can_continue_after_interrupt(self) -> None:
+        """补齐之后必须能继续对话（序列合法）。"""
+        agent = self.build([[chunk(content="继续")]])
+        agent.messages.append({"role": "user", "content": "第一轮"})
+        agent.messages.append(
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [
+                    {"id": "t1", "type": "function", "function": {"name": "bash", "arguments": "{}"}}
+                ],
+            }
+        )
+        agent.close_open_tool_calls("用户中断")
+        with contextlib.redirect_stdout(io.StringIO()):
+            agent.send("第二轮")
+        roles = [m["role"] for m in agent.messages]
+        #  每个 assistant(tool_calls) 后面都紧跟 tool 结果
+        for index, role in enumerate(roles):
+            if role == "assistant" and agent.messages[index].get("tool_calls"):
+                self.assertEqual(roles[index + 1], "tool")
+
+
+# ---------- 自扩展指南（"文档即能力"） ----------
+
+
+class TestExtendingDoc(AgentTestCase):
+    def test_doc_ships_with_package_and_prompt_points_to_it(self) -> None:
+        """扩展格式不靠模型的训练记忆：指南随包分发，system prompt 只放
+        绝对路径。文件必须真实存在（打包漏了这里当场红），提示里给的
+        必须是它的完整路径（模型要能直接 read_file）。"""
+        import xiaoyu
+
+        doc = Path(xiaoyu.__file__).parent / "docs" / "extending.md"
+        self.assertTrue(doc.is_file(), "扩展指南没随包带上")
+        content = doc.read_text(encoding="utf-8")
+        #  四条通道都要覆盖（漏一条，模型对那条就只能瞎猜）
+        for keyword in ("SKILL.md", "xiaoyu.tools", "mcpServers", "hooks.toml"):
+            self.assertIn(keyword, content)
+        agent = self.build([])
+        self.assertIn(str(doc), agent.messages[0]["content"])
+        self.assertIn("扩展指南", agent.messages[0]["content"])
+
+
+# ---------- 项目级指令文件 ----------
+
+
+class TestProjectInstructions(AgentTestCase):
+    def test_agents_md_enters_system_prompt(self) -> None:
+        (self.root / "AGENTS.md").write_text("跑测试用 make check", encoding="utf-8")
+        agent = self.build([])
+        self.assertIn("跑测试用 make check", agent.messages[0]["content"])
+        self.assertIn("AGENTS.md", agent.messages[0]["content"])
+
+    def test_both_files_loaded_with_sources_and_conflict_policy(self) -> None:
+        (self.root / "AGENTS.md").write_text("A 文件", encoding="utf-8")
+        (self.root / "CLAUDE.md").write_text("C 文件", encoding="utf-8")
+        agent = self.build([])
+        self.assertIn("A 文件", agent.messages[0]["content"])
+        self.assertIn("C 文件", agent.messages[0]["content"])
+        self.assertIn("【AGENTS.md】", agent.messages[0]["content"])
+        self.assertIn("【CLAUDE.md】", agent.messages[0]["content"])
+        self.assertIn("向用户确认", agent.messages[0]["content"])
+        self.assertIn("拼接顺序不代表优先级", agent.messages[0]["content"])
+
+    def test_claude_md_as_fallback(self) -> None:
+        (self.root / "CLAUDE.md").write_text("C 文件", encoding="utf-8")
+        agent = self.build([])
+        self.assertIn("C 文件", agent.messages[0]["content"])
+
+    def test_no_doc_no_section(self) -> None:
+        agent = self.build([])
+        self.assertNotIn("项目指令", agent.messages[0]["content"])
+
+    def _nested_workspace(self) -> Path:
+        """root(.git + AGENTS.md) / sub / ws(CLAUDE.md)，返回 ws。"""
+        (self.root / ".git").mkdir(exist_ok=True)
+        (self.root / "AGENTS.md").write_text("根目录总规范", encoding="utf-8")
+        ws = self.root / "sub" / "ws"
+        ws.mkdir(parents=True)
+        (ws / "CLAUDE.md").write_text("子项目细则", encoding="utf-8")
+        return ws
+
+    def test_multi_level_collects_root_to_leaf(self) -> None:
+        """monorepo 子目录启动：根规范 + 本地细则都进 prompt，深层靠后。"""
+        self.config.workspace = self._nested_workspace()
+        agent = self.build([])
+        content = agent.messages[0]["content"]
+        self.assertIn("根目录总规范", content)
+        self.assertIn("子项目细则", content)
+        self.assertLess(content.index("根目录总规范"), content.index("子项目细则"))
+        self.assertIn("更深层目录的规则优先", content)
+
+    def test_leaf_first_budget_never_squeezes_deep_doc(self) -> None:
+        from xiaoyu.agent import collect_project_docs
+
+        ws = self._nested_workspace()
+        (self.root / "AGENTS.md").write_text("规" * 20_000, encoding="utf-8")
+        docs = collect_project_docs(ws, ("AGENTS.md", "CLAUDE.md"), cap=12_000)
+        self.assertEqual(len(docs), 2)
+        #  深层完整保留；浅层被截断而不是反过来
+        self.assertEqual(docs[1][1], "子项目细则")
+        self.assertIn("已截断", docs[0][1])
+        self.assertEqual(len(docs[0][1].split("\n…", 1)[0]), 12_000 - len("子项目细则"))
+        self.assertIn("../AGENTS.md", docs[0][1])
+
+    def test_budget_exhausted_shallow_doc_omitted_with_note(self) -> None:
+        from xiaoyu.agent import collect_project_docs
+
+        ws = self._nested_workspace()
+        (ws / "CLAUDE.md").write_text("细" * 12_000, encoding="utf-8")
+        docs = collect_project_docs(ws, ("AGENTS.md", "CLAUDE.md"), cap=12_000)
+        self.assertEqual(len(docs), 2)
+        self.assertIn("整体省略", docs[0][1])
+        self.assertNotIn("规", docs[0][1])
+
+    def test_never_walks_past_git_root(self) -> None:
+        from xiaoyu.agent import collect_project_docs
+
+        #  root 没有 .git：层链就是工作区自己，root 的 AGENTS.md 不该被捡
+        (self.root / "AGENTS.md").write_text("越界内容", encoding="utf-8")
+        ws = self.root / "sub"
+        ws.mkdir()
+        (ws / "AGENTS.md").write_text("本地内容", encoding="utf-8")
+        docs = collect_project_docs(ws, ("AGENTS.md",), cap=12_000)
+        self.assertEqual([text for _, text in docs], ["本地内容"])
+
+
+# ---------- 宿主注入的身份/人格（--append-system-prompt） ----------
+
+
+class TestAppendSystemPrompt(AgentTestCase):
+    def test_appended_when_set(self) -> None:
+        self.config.append_system_prompt = "你现在是小助手，用户的私人助理"
+        agent = self.build([])
+        self.assertIn("你现在是小助手，用户的私人助理", agent.messages[0]["content"])
+
+    def test_unset_leaves_prompt_unchanged(self) -> None:
+        agent = self.build([])
+        self.assertNotIn("小助手", agent.messages[0]["content"])
+
+    def test_appears_before_project_instructions(self) -> None:
+        """人格先于项目指令：宿主身份注入排在"我是谁"这一段，不是项目备注。"""
+        (self.root / "AGENTS.md").write_text("跑测试用 make check", encoding="utf-8")
+        self.config.append_system_prompt = "你现在是小助手"
+        agent = self.build([])
+        content = agent.messages[0]["content"]
+        self.assertLess(content.index("你现在是小助手"), content.index("项目指令"))
+
+    def test_oversized_doc_truncated(self) -> None:
+        (self.root / "AGENTS.md").write_text("规" * 20_000, encoding="utf-8")
+        agent = self.build([])
+        self.assertIn("已截断", agent.messages[0]["content"])
+        self.assertLess(len(agent.messages[0]["content"]), 20_000)
+
+
+# ---------- 自定义 system prompt（--system-prompt-file） ----------
+
+
+class TestCustomSystemPrompt(AgentTestCase):
+    def test_default_prompt_is_the_three_parts_joined(self) -> None:
+        """拆分不改默认输出：三段相连就是原来那一整份。"""
+        from xiaoyu.agent import (
+            SYSTEM_HARNESS_RULES,
+            SYSTEM_IDENTITY,
+            SYSTEM_PROMPT,
+            SYSTEM_STYLE,
+        )
+
+        self.assertEqual(
+            SYSTEM_PROMPT, f"{SYSTEM_IDENTITY}\n\n{SYSTEM_HARNESS_RULES}\n\n{SYSTEM_STYLE}"
+        )
+        labels = [label for label, _ in self.build([])._system_segments()]
+        self.assertEqual(labels[0], "核心身份")
+        self.assertNotIn("自定义身份", labels)
+
+    def test_replaces_identity_and_style_but_keeps_harness_rules(self) -> None:
+        self.config.system_prompt = "你是炉匠 Cinder，专写短篇小说。"
+        content = self.build([]).messages[0]["content"]
+        self.assertTrue(content.startswith("你是炉匠 Cinder"))
+        self.assertNotIn("你是小羽", content)
+        self.assertNotIn("一律用中文", content)
+        #  运行纪律不随身份让位：工具用法、注入防线、环境约束都还在
+        self.assertIn("str_replace", content)
+        self.assertIn("<untrusted_content>", content)
+        self.assertIn(f"工作区根目录：{self.root}", content)
+
+    def test_braces_in_custom_text_are_literal(self) -> None:
+        """用户文本不过 format：模板占位符与代码花括号原样保留，不炸。"""
+        self.config.system_prompt = "Name: {{NAME}}\nint main() { return 0; } {workspace}"
+        content = self.build([]).messages[0]["content"]
+        self.assertIn("Name: {{NAME}}", content)
+        self.assertIn("int main() { return 0; } {workspace}", content)
+
+    def test_append_and_project_docs_still_follow(self) -> None:
+        (self.root / "AGENTS.md").write_text("跑测试用 make check", encoding="utf-8")
+        self.config.system_prompt = "你是炉匠"
+        self.config.append_system_prompt = "署名用 [C]"
+        content = self.build([]).messages[0]["content"]
+        self.assertLess(content.index("你是炉匠"), content.index("str_replace"))
+        self.assertLess(content.index("str_replace"), content.index("署名用 [C]"))
+        self.assertLess(content.index("署名用 [C]"), content.index("make check"))
+
+    def test_segments_sum_to_prompt_length(self) -> None:
+        self.config.system_prompt = "你是炉匠"
+        agent = self.build([])
+        total = sum(len(text) for _, text in agent._system_segments())
+        self.assertEqual(total, len(agent.messages[0]["content"]))
+
+    def test_blank_custom_prompt_falls_back_to_builtin(self) -> None:
+        self.config.system_prompt = "  \n"
+        self.assertIn("你是小羽", self.build([]).messages[0]["content"])
+
+    def test_survives_reset(self) -> None:
+        self.config.system_prompt = "你是炉匠"
+        agent = self.build([])
+        agent.reset()
+        self.assertTrue(agent.messages[0]["content"].startswith("你是炉匠"))
+
+    def test_recorded_in_session_log_once(self) -> None:
+        from xiaoyu.session_log import SessionLog, load_system_prompt
+
+        self.config.system_prompt = "你是炉匠"
+        path = self.root / "session.jsonl"
+        log = SessionLog(path)
+        self.addCleanup(log.release)
+        self.build([], session_log=log)
+        self.assertEqual(load_system_prompt(path), "你是炉匠")
+        #  同一个文件再起一个 agent（--session-id 续写）：不重复记
+        self.build([], session_log=log)
+        self.assertEqual(path.read_text(encoding="utf-8").count('"system_prompt"'), 1)
+
+    def test_builtin_prompt_not_recorded(self) -> None:
+        from xiaoyu.session_log import SessionLog, load_system_prompt
+
+        path = self.root / "session.jsonl"
+        log = SessionLog(path)
+        self.addCleanup(log.release)
+        self.build([], session_log=log)
+        self.assertIsNone(load_system_prompt(path))
+
+    def test_deferred_log_stays_off_disk(self) -> None:
+        """前言事件不算"发生过什么"：延迟落盘的会话不因它落盘。"""
+        from xiaoyu.session_log import SessionLog, load_system_prompt
+
+        self.config.system_prompt = "你是炉匠"
+        log = SessionLog.create("m", str(self.root), directory=self.root / "s", defer=True)
+        self.addCleanup(log.release)
+        self.build([], session_log=log)
+        self.assertFalse(log.path.exists())
+        log.append({"role": "user", "content": "hi"})
+        self.assertEqual(load_system_prompt(log.path), "你是炉匠")
+
+
+# ---------- 摘要回退链 ----------
+
+#  过退化门（MIN_SUMMARY_CHARS）的合格摘要桩：真实摘要都远超这个长度
+GOOD_SUMMARY = "这是摘要。" + "内容详实：任务目标、关键事实、文件改动、错误修复与后续计划俱全。" * 10
+
+
+class TestSummaryFallback(AgentTestCase):
+    def test_chain_order(self) -> None:
+        agent = self.build([])
+        self.assertEqual(
+            [route.qualified for route in agent.summary_models()],
+            ["gateway/cheap-model", "gateway/main-model"],
+        )
+
+    def test_falls_back_to_main_model_when_cheap_one_fails(self) -> None:
+        agent = self.build([RuntimeError("网关 502"), text_response(GOOD_SUMMARY)])
+        buffer = io.StringIO()
+        with contextlib.redirect_stdout(buffer):
+            summary = agent._summarize("一段历史")
+
+        self.assertEqual(summary, GOOD_SUMMARY)
+        self.assertIn("回退", buffer.getvalue())
+        #  两次调用分别用了两个模型，且都记了账
+        used = [call["model"] for call in self.client.completions.calls]
+        self.assertEqual(used, ["cheap-model", "main-model"])
+        self.assertIn("gateway/main-model", agent.usage.by_model)
+
+    def test_empty_summary_also_triggers_fallback(self) -> None:
+        agent = self.build([text_response("   "), text_response(GOOD_SUMMARY)])
+        with contextlib.redirect_stdout(io.StringIO()):
+            summary = agent._summarize("一段历史")
+        self.assertEqual(summary, GOOD_SUMMARY)
+
+    def test_degenerate_short_summary_also_triggers_fallback(self) -> None:
+        """非空但几十个字的应付式摘要与空摘要同罪。"""
+        agent = self.build([text_response("摘要：修了个 bug。"), text_response(GOOD_SUMMARY)])
+        with contextlib.redirect_stdout(io.StringIO()):
+            summary = agent._summarize("一段历史")
+        self.assertEqual(summary, GOOD_SUMMARY)
+
+    def test_all_degenerate_raises_for_compaction_ladder(self) -> None:
+        """全链退化时抛错——compact 的降级阶梯（砍半重试）靠这个异常触发。"""
+        agent = self.build([text_response("太短"), text_response("还是太短")])
+        with contextlib.redirect_stdout(io.StringIO()):
+            with self.assertRaises(RuntimeError) as ctx:
+                agent._summarize("一段历史")
+        self.assertIn("退化摘要", str(ctx.exception))
+
+    def test_raises_when_all_models_fail(self) -> None:
+        agent = self.build([RuntimeError("挂了1"), RuntimeError("挂了2")])
+        with contextlib.redirect_stdout(io.StringIO()):
+            with self.assertRaises(RuntimeError):
+                agent._summarize("一段历史")
+
+    def test_compaction_survives_total_summary_failure(self) -> None:
+        """摘要全挂时，压缩必须放弃并保住历史，而不是把内容丢掉。"""
+        agent = self.build([RuntimeError("挂了1"), RuntimeError("挂了2")])
+        for index in range(10):
+            agent.messages.append({"role": "user", "content": f"第 {index} 轮"})
+            agent.messages.append({"role": "assistant", "content": f"回答 {index}"})
+        before = list(agent.messages)
+        with contextlib.redirect_stdout(io.StringIO()):
+            agent.maybe_compact(force=True)
+        self.assertEqual(agent.messages, before)
+
+    def test_truncated_summary_triggers_fallback(self) -> None:
+        """撞输出上限的半截摘要再长也不算成功：换下一条路由。
+
+        增量交接说明会被下一轮当"此前摘要"继续维护，半截落盘的丢失会逐轮累积。
+        """
+        half = GOOD_SUMMARY * 20
+        agent = self.build([truncated_response(half), text_response(GOOD_SUMMARY)])
+        buffer = io.StringIO()
+        with contextlib.redirect_stdout(buffer):
+            summary = agent._summarize("一段历史")
+        self.assertEqual(summary, GOOD_SUMMARY)
+        self.assertIn("截断", buffer.getvalue())
+
+    def test_all_truncated_keeps_history(self) -> None:
+        """全链截断：放弃本次压缩、历史原样保留（与摘要全挂同一出口）。"""
+        #  长度远超退化下限、又比被压原文短：不看 finish_reason 就会被当成功摘要落盘
+        half = GOOD_SUMMARY * 3
+        #  降级阶梯两次 ×（便宜腿 1 + 主模型重放腿 1 + 主模型转写腿 1）= 六次，全部截断
+        agent = self.build([truncated_response(half) for _ in range(6)])
+        for index in range(10):
+            agent.messages.append({"role": "user", "content": f"第 {index} 轮"})
+            agent.messages.append({"role": "assistant", "content": f"回答 {index}" + "阿" * 1500})
+        before = list(agent.messages)
+        with contextlib.redirect_stdout(io.StringIO()):
+            note = agent.maybe_compact(force=True)
+        self.assertEqual(agent.messages, before)
+        self.assertIn("压缩失败", note)
+        self.assertNotIn(half, str(agent.messages))
+
+
+# ---------- REPL 斜杠命令 ----------
+
+
+class TestSlashCommands(AgentTestCase):
+    def run_slash(self, agent: Agent, line: str) -> tuple[bool, str]:
+        buffer = io.StringIO()
+        with contextlib.redirect_stdout(buffer):
+            should_exit = handle_slash(agent, line)
+        return should_exit, buffer.getvalue()
+
+    def test_exit(self) -> None:
+        agent = self.build([])
+        self.assertTrue(self.run_slash(agent, "/exit")[0])
+        self.assertTrue(self.run_slash(agent, "/quit")[0])
+
+    def test_help_and_tools(self) -> None:
+        agent = self.build([])
+        _, out = self.run_slash(agent, "/help")
+        self.assertIn("/context", out)
+        _, out = self.run_slash(agent, "/tools")
+        for name in ("read_file", "str_replace", "bash", "explore"):
+            self.assertIn(name, out)
+
+    def test_model_switch(self) -> None:
+        agent = self.build([])
+        _, out = self.run_slash(agent, "/model")
+        self.assertIn("main-model", out)
+        self.run_slash(agent, "/model 另一个模型")
+        self.assertEqual(agent.config.model, "另一个模型")
+
+    def test_model_switch_rejects_unknown_and_shows_route(self) -> None:
+        """/model 先解析再切：没人接的名字报错、原模型不动；接住的打出走哪家。"""
+        agent = self.build([])
+        agent.registry = Registry(
+            [Provider("xai", "", "", ("grok-4.7",), "直连 xai")],
+            clients={"xai": self.client},
+        )
+        _, out = self.run_slash(agent, "/model grok")
+        self.assertIn("没有 provider 提供模型 grok", out)
+        self.assertEqual(agent.config.model, "main-model", "解析失败不该切换")
+        _, out = self.run_slash(agent, "/model grok-4.7")
+        self.assertIn("已切换到 grok-4.7（直连 xai）", out)
+        self.assertEqual(agent.config.model, "grok-4.7")
+
+    def test_model_switch_on_gateway_prechecks_remote_listing(self) -> None:
+        """通配 provider 什么名字都接：切换后现场探清单，不在里面就告警但仍切换。"""
+
+        class ListingClient(FakeClient):
+            def with_options(self, **kwargs):
+                return self
+
+            @property
+            def models(self):
+                page = [types.SimpleNamespace(id=name) for name in ("grok-4.7", "deepseek-flash")]
+                return types.SimpleNamespace(list=lambda: page)
+
+        agent = self.build([])
+        client = ListingClient([])
+        agent.registry = Registry([Provider("gw", "", "", (), "网关")], clients={"gw": client})
+        _, out = self.run_slash(agent, "/model grok")
+        self.assertIn("已切换到 grok（网关）", out)
+        self.assertIn("网关清单里没有 grok", out)
+        self.assertEqual(agent.config.model, "grok", "只告警不拦：网关清单未必全")
+        _, out = self.run_slash(agent, "/model grok-4.7")
+        self.assertIn("已切换到 grok-4.7（网关）", out)
+        self.assertNotIn("清单里没有", out)
+        #  清单探不到：说明无法预检，仍切换
+        agent.registry = Registry([Provider("gw", "", "", (), "网关")], clients={"gw": FakeClient([])})
+        _, out = self.run_slash(agent, "/model whatever")
+        self.assertIn("清单获取失败", out)
+        self.assertEqual(agent.config.model, "whatever")
+
+    def test_context_reports_budget_and_calibration(self) -> None:
+        agent = self.build([])
+        _, out = self.run_slash(agent, "/context")
+        self.assertIn("压缩阈值", out)
+        self.assertIn("摘要模型链", out)
+        self.assertIn("cheap-model", out)
+
+    def test_usage_before_any_call(self) -> None:
+        agent = self.build([])
+        _, out = self.run_slash(agent, "/usage")
+        self.assertIn("还没有", out)
+
+    def test_clear_keeps_system_prompt(self) -> None:
+        agent = self.build([])
+        agent.messages.append({"role": "user", "content": "一些历史"})
+        self.run_slash(agent, "/clear")
+        self.assertEqual(len(agent.messages), 1)
+        self.assertEqual(agent.messages[0]["role"], "system")
+
+    def test_compact_when_nothing_to_compact(self) -> None:
+        agent = self.build([])
+        _, out = self.run_slash(agent, "/compact")
+        self.assertIn("跳过", out)
+
+    def test_unknown_command(self) -> None:
+        agent = self.build([])
+        _, out = self.run_slash(agent, "/不存在")
+        self.assertIn("未知命令", out)
+
+
+class TestUpdatePlan(AgentTestCase):
+    """update_plan：存储 + 固定返回；状态机约束靠 prompt 不靠代码。"""
+
+    def plan_call(self, agent, arguments: str) -> str:
+        call = {"id": "p1", "function": {"name": "update_plan", "arguments": arguments}}
+        with contextlib.redirect_stdout(io.StringIO()):
+            return agent._execute(call)["content"]
+
+    def test_registered_by_default(self) -> None:
+        agent = self.build([])
+        self.assertIsNotNone(agent.toolbox.get("update_plan"))
+
+    def test_happy_path_stores_and_returns_constant(self) -> None:
+        agent = self.build([])
+        content = self.plan_call(
+            agent,
+            '{"plan": [{"step": "读懂现有实现", "status": "completed"},'
+            ' {"step": "改压缩逻辑", "status": "in_progress"},'
+            ' {"step": "跑测试", "status": "pending"}]}',
+        )
+        #  返回恒为固定短语：不回显计划，不给模型复读的诱因
+        self.assertEqual(content, "已更新计划")
+        self.assertEqual(len(agent.plan), 3)
+        self.assertEqual(agent.plan[1]["status"], "in_progress")
+
+    def test_invalid_status_rejected(self) -> None:
+        agent = self.build([])
+        content = self.plan_call(agent, '{"plan": [{"step": "x", "status": "done"}]}')
+        self.assertIn("ERROR", content)
+        self.assertEqual(agent.plan, [])
+
+    def test_unknown_fields_rejected(self) -> None:
+        #  deny_unknown_fields：多传字段直接报错，逼模型守约
+        agent = self.build([])
+        content = self.plan_call(
+            agent, '{"plan": [{"step": "x", "status": "pending", "note": "y"}]}'
+        )
+        self.assertIn("ERROR", content)
+        content = self.plan_call(
+            agent, '{"plan": [{"step": "x", "status": "pending"}], "priority": 1}'
+        )
+        self.assertIn("ERROR", content)
+
+    def test_empty_plan_rejected(self) -> None:
+        agent = self.build([])
+        self.assertIn("ERROR", self.plan_call(agent, '{"plan": []}'))
+
+    def test_clear_resets_plan(self) -> None:
+        agent = self.build([])
+        self.plan_call(agent, '{"plan": [{"step": "x", "status": "pending"}]}')
+        agent.reset()
+        self.assertEqual(agent.plan, [])
+
+
+class TestRepairHistory(AgentTestCase):
+    """发请求前的惰性历史修复：悬空补齐、孤儿删除。"""
+
+    def test_dangling_tool_call_filled_before_request(self) -> None:
+        script = [[chunk(content="继续"), usage_chunk(100, 10)]]
+        agent = self.build(script)
+        #  模拟中断残局：assistant 带 tool_calls 但没有 tool 结果
+        agent.messages.append(
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [
+                    {"id": "orphan_call", "type": "function",
+                     "function": {"name": "bash", "arguments": "{}"}}
+                ],
+            }
+        )
+        with contextlib.redirect_stdout(io.StringIO()):
+            agent.send("继续吧")
+        roles = [m["role"] for m in agent.messages]
+        #  修复后 assistant(tool_calls) 后面必须紧跟 tool 结果
+        index = next(i for i, m in enumerate(agent.messages) if m.get("tool_calls"))
+        self.assertEqual(agent.messages[index + 1]["role"], "tool")
+        self.assertEqual(agent.messages[index + 1]["tool_call_id"], "orphan_call")
+        self.assertNotIn("assistant", roles[index + 1 : index + 2])
+
+    def test_orphan_tool_message_removed(self) -> None:
+        script = [[chunk(content="好"), usage_chunk(100, 10)]]
+        agent = self.build(script)
+        #  孤儿 tool 消息（对应的 assistant 被压缩/改写掉了）会让请求 400
+        agent.messages.append({"role": "tool", "tool_call_id": "ghost", "content": "旧结果"})
+        with contextlib.redirect_stdout(io.StringIO()):
+            agent.send("hi")
+        self.assertNotIn(
+            "ghost", [m.get("tool_call_id") for m in agent.messages if m.get("role") == "tool"]
+        )
+
+
+class NoToolsReplyTest(AgentTestCase):
+    """无工具请求（收尾/摘要）收到 tool_calls：当场剥掉，不留悬空调用。"""
+
+    def _call(self):
+        return call_fragment(0, "c1", "bash", '{"command": "ls"}')
+
+    def _notices(self, agent):
+        seen: list[str] = []
+        original = agent.emit
+
+        def spy(event):
+            seen.append(getattr(event, "text", ""))
+            return original(event)
+
+        agent.emit = spy  # type: ignore[method-assign]
+        return seen
+
+    def test_text_with_tool_calls_keeps_only_text(self) -> None:
+        script = [[chunk(content="收尾说明"), chunk(tool_calls=[self._call()]), usage_chunk(100, 10)]]
+        agent = self.build(script)
+        notices = self._notices(agent)
+        with contextlib.redirect_stdout(io.StringIO()):
+            message = agent._stream_once(agent._main_route(), with_tools=False)
+        self.assertEqual(message["content"], "收尾说明")
+        self.assertNotIn("tool_calls", message)
+        self.assertTrue(any("已忽略" in text and "bash" in text for text in notices))
+
+    def test_empty_text_with_tool_calls_gets_fixed_note(self) -> None:
+        from xiaoyu.agent import NO_TOOLS_TOOL_CALL_NOTE
+
+        script = [[chunk(tool_calls=[self._call()]), usage_chunk(100, 10)]]
+        agent = self.build(script)
+        with contextlib.redirect_stdout(io.StringIO()):
+            message = agent._stream_once(agent._main_route(), with_tools=False)
+        self.assertEqual(message["content"], NO_TOOLS_TOOL_CALL_NOTE)
+        self.assertNotIn("tool_calls", message)
+        #  入历史后没有悬空调用：_repair_history 无事可做
+        agent._record_reply(message)
+        before = list(agent.messages)
+        agent._repair_history()
+        self.assertEqual(agent.messages, before)
+        self.assertFalse(any(m.get("role") == "tool" for m in agent.messages))
+        self.assertFalse(any(m.get("tool_calls") for m in agent.messages))
+
+    def test_with_tools_request_still_records_tool_calls(self) -> None:
+        """对照：带工具的请求不受影响。"""
+        script = [[chunk(tool_calls=[self._call()]), usage_chunk(100, 10)]]
+        agent = self.build(script)
+        with contextlib.redirect_stdout(io.StringIO()):
+            message = agent._stream_once(agent._main_route(), with_tools=True)
+        self.assertEqual(len(message["tool_calls"]), 1)
+
+
+class TestTokenAnchor(AgentTestCase):
+    """token 记账：服务端 usage 锚点 + 只估算其后新增。"""
+
+    def test_no_anchor_falls_back_to_estimate(self) -> None:
+        agent = self.build([])
+        self.assertIsNone(agent._anchor)
+        self.assertGreater(agent.context_tokens(), 0)
+        self.assertIn("纯本地估算", agent.context_source())
+
+    def test_anchor_set_from_usage_and_used(self) -> None:
+        script = [[chunk(content="好的"), usage_chunk(5000, 20)]]
+        agent = self.build(script)
+        with contextlib.redirect_stdout(io.StringIO()):
+            agent.send("hi")
+        self.assertIsNotNone(agent._anchor)
+        anchor_tokens, anchor_index = agent._anchor
+        self.assertEqual(anchor_tokens, 5000)
+        #  锚点覆盖发请求时的消息数（system + user）
+        self.assertEqual(anchor_index, 2)
+        #  context = 锚点 + 之后新增（assistant 回复）的估算，必然 >= 5000
+        self.assertGreaterEqual(agent.context_tokens(), 5000)
+        self.assertIn("锚点", agent.context_source())
+
+    def test_history_rewrite_invalidates_anchor(self) -> None:
+        script = [[chunk(content="好的"), usage_chunk(5000, 20)]]
+        agent = self.build(script)
+        with contextlib.redirect_stdout(io.StringIO()):
+            agent.send("hi")
+        agent.reset()
+        self.assertIsNone(agent._anchor)
+
+
+class PurposeParamAgentTest(AgentTestCase):
+    """__tool_use_purpose 在 agent 侧的两件事：执行前剥离、审批前展示。"""
+
+    def test_purpose_stripped_before_handler(self) -> None:
+        #  handler 收到未知 kwarg 会 TypeError——目的参数必须在执行前剥掉
+        first = [
+            chunk(
+                tool_calls=[
+                    call_fragment(
+                        0,
+                        "c1",
+                        "read_file",
+                        '{"path": "calc.py", "__tool_use_purpose": "看看加法函数"}',
+                    )
+                ]
+            )
+        ]
+        agent = self.build([first, [chunk(content="看完了")]])
+        with contextlib.redirect_stdout(io.StringIO()):
+            agent.send("看文件")
+        self.assertTrue(agent.trace[0]["ok"], agent.trace[0]["output"])
+        self.assertNotIn("__tool_use_purpose", agent.trace[0]["args"])
+
+    def test_purpose_shown_before_approval(self) -> None:
+        self.config.auto_approve = False
+        first = [
+            chunk(
+                tool_calls=[
+                    call_fragment(
+                        0,
+                        "c1",
+                        "bash",
+                        '{"command": "echo hi", "__tool_use_purpose": "验证回显是否正常"}',
+                    )
+                ]
+            )
+        ]
+        agent = self.build([first, [chunk(content="好了")]], approver=lambda n, a: True)
+        buffer = io.StringIO()
+        with contextlib.redirect_stdout(buffer):
+            agent.send("跑一下")
+        self.assertIn("验证回显是否正常", buffer.getvalue())
+
+
+class EmptyReplyGuardTest(AgentTestCase):
+    """空回复护栏：content 空且无 tool_calls 不能静默结束整轮。
+
+    真实会话里 deepseek 改完 8 处代码后返回 content=null，用户面前一片空白、
+    等了 27 分钟才试探性追问——这轮体验崩坏必须由 agent 兜住。
+    """
+
+    def test_empty_completion_retried_in_place(self) -> None:
+        """第一层防线：空补全原地重发，不入历史、没有 nudge。"""
+        agent = self.build([[chunk(content=None)], [chunk(content="重发后的结论")]])
+        with contextlib.redirect_stdout(io.StringIO()):
+            agent.send("改一下代码")
+        self.assertEqual(len(self.client.completions.calls), 2)
+        user_texts = [
+            str(m.get("content")) for m in agent.messages if m.get("role") == "user"
+        ]
+        self.assertFalse(any("回复是空的" in text for text in user_texts))
+        #  空的 assistant 消息没有被记进历史
+        empties = [
+            m for m in agent.messages
+            if m.get("role") == "assistant" and not m.get("content") and not m.get("tool_calls")
+        ]
+        self.assertEqual(empties, [])
+        self.assertEqual(agent.last_assistant_text(), "重发后的结论")
+
+    def test_empty_reply_gets_nudged_after_retries(self) -> None:
+        """原地重试耗尽（3 次全空）才轮到 nudge 这层兜底。"""
+        empty = [chunk(content=None)]
+        agent = self.build([empty, empty, empty, [chunk(content="补上的结论")]])
+        with contextlib.redirect_stdout(io.StringIO()):
+            agent.send("改一下代码")
+        self.assertEqual(len(self.client.completions.calls), 4)
+        user_texts = [
+            str(m.get("content")) for m in agent.messages if m.get("role") == "user"
+        ]
+        self.assertTrue(any("回复是空的" in text for text in user_texts))
+        self.assertEqual(agent.last_assistant_text(), "补上的结论")
+
+    def test_persistent_empty_reply_ends_turn_loudly(self) -> None:
+        empty = [chunk(content=None)]
+        #  两个 send 层回合 × 各 3 次原地重试全空 → 显式告警收场
+        agent = self.build([empty] * 6)
+        buffer = io.StringIO()
+        with contextlib.redirect_stdout(buffer):
+            agent.send("改一下代码")
+        self.assertEqual(len(self.client.completions.calls), 6)
+        self.assertIn("空回复", buffer.getvalue())
+
+
+class EmptyCompletionRecoveryTest(AgentTestCase):
+    """空补全重发的两条修正：绕开网关响应缓存、确定性空补全直接换路由。
+
+    网关开着响应缓存时，一次空补全会被缓存住，原样重发只拿回同一个空结果；
+    流式命中还会把 usage 改写成 completion_tokens=0（2026-09-15 实测）。
+    """
+
+    def build_on(self, script: list, *, response_cache: bool) -> Agent:
+        client = FakeClient(script)
+        provider = Provider("gateway", "https://gw.example/v1", "k", (), "网关", response_cache=response_cache)
+        registry = Registry([provider], clients={"gateway": client})
+        self.client = client
+        return Agent(self.config, Toolbox(self.config), registry=registry)
+
+    def test_gateway_retry_bypasses_response_cache(self) -> None:
+        """只有重发带绕过参数：首发照常可命中缓存，不改变正常请求的成本面。"""
+        agent = self.build_on([[chunk(content=None)], [chunk(content="重发拿到的")]], response_cache=True)
+        with contextlib.redirect_stdout(io.StringIO()):
+            agent.send("hi")
+        first, second = self.client.completions.calls
+        self.assertNotIn("extra_body", first)
+        self.assertEqual(second["extra_body"], {"cache": {"no-cache": True}})
+        self.assertEqual(agent.last_assistant_text(), "重发拿到的")
+
+    def test_gateway_refusing_bypass_field_falls_back_without_it(self) -> None:
+        """网关位默认猜它认绕过字段；猜错（严格兼容端点 400）时本会话停带、不计次原样重发。"""
+        rejected = openai.BadRequestError(
+            "Unrecognized request argument supplied: cache",
+            response=httpx2.Response(400, request=httpx2.Request("POST", "https://gw.example/v1")),
+            body=None,
+        )
+        empty = [chunk(content=None)]
+        agent = self.build_on(
+            [empty, rejected, [chunk(content="不带字段重发成功")], empty, [chunk(content="第二轮")]],
+            response_cache=True,
+        )
+        buffer = io.StringIO()
+        with contextlib.redirect_stdout(buffer):
+            agent.send("hi")
+            self.assertEqual(agent.last_assistant_text(), "不带字段重发成功")
+            agent.send("再来")
+        calls = self.client.completions.calls
+        self.assertEqual(len(calls), 5)
+        self.assertEqual(calls[1]["extra_body"], {"cache": {"no-cache": True}})
+        self.assertNotIn("extra_body", calls[2])
+        #  同一会话后续的空补全重发也不再携带
+        self.assertNotIn("extra_body", calls[4])
+        self.assertIn("不接受跳过响应缓存", buffer.getvalue())
+        self.assertEqual(agent.last_assistant_text(), "第二轮")
+
+    def test_direct_provider_retry_sends_no_cache_field(self) -> None:
+        """没有响应缓存能力的端点（直连厂商）绝不发这个字段：未知请求体字段可能 400。"""
+        empty = [chunk(content=None)]
+        agent = self.build_on([empty, empty, [chunk(content="好了")]], response_cache=False)
+        with contextlib.redirect_stdout(io.StringIO()):
+            agent.send("hi")
+        self.assertEqual(len(self.client.completions.calls), 3)
+        for call in self.client.completions.calls:
+            self.assertNotIn("extra_body", call)
+
+    def test_two_zero_token_empties_switch_route(self) -> None:
+        """连续两次 completion_tokens=0 的空补全：不再原地发第三次，直接进降级链。"""
+        self.config.fallback_models = ["backup-model"]
+        empty = [chunk(content=None), usage_chunk(100, 0)]
+        agent = self.build_on(
+            [empty, empty, [chunk(content="备用顶上"), usage_chunk(100, 5)]], response_cache=True
+        )
+        buffer = io.StringIO()
+        with contextlib.redirect_stdout(buffer):
+            agent.send("hi")
+        models = [call["model"] for call in self.client.completions.calls]
+        self.assertEqual(models, ["main-model", "main-model", "backup-model"])
+        self.assertEqual(agent.last_assistant_text(), "备用顶上")
+        #  换到新路由是首发，不带绕过参数
+        self.assertNotIn("extra_body", self.client.completions.calls[2])
+
+    def test_empty_without_usage_keeps_retry_count(self) -> None:
+        """没有 usage 判不出是不是确定性空补全：维持原地重试 3 次，不提前换路由。"""
+        self.config.fallback_models = ["backup-model"]
+        empty = [chunk(content=None)]
+        agent = self.build([empty, empty, empty, [chunk(content="补上的结论")]])
+        with contextlib.redirect_stdout(io.StringIO()):
+            agent.send("hi")
+        models = [call["model"] for call in self.client.completions.calls]
+        self.assertEqual(models, ["main-model"] * 4)
+        self.assertEqual(agent.last_assistant_text(), "补上的结论")
+
+    def test_empty_with_nonzero_tokens_keeps_retry_count(self) -> None:
+        """产出过 token 的空补全（例如推理吃掉了输出）不算确定性，照常原地重试。"""
+        self.config.fallback_models = ["backup-model"]
+        empty = [chunk(content=None), usage_chunk(100, 16)]
+        agent = self.build([empty, empty, empty, [chunk(content="补上的结论")]])
+        with contextlib.redirect_stdout(io.StringIO()):
+            agent.send("hi")
+        models = [call["model"] for call in self.client.completions.calls]
+        self.assertEqual(models, ["main-model"] * 4)
+
+    def test_deterministic_empty_on_last_route_falls_back_to_nudge(self) -> None:
+        """链上没有下一条路由：空消息交回 send() 的空回复护栏，而不是抛错。"""
+        empty = [chunk(content=None), usage_chunk(100, 0)]
+        agent = self.build([empty, empty, [chunk(content="补上的结论")]])
+        with contextlib.redirect_stdout(io.StringIO()):
+            agent.send("hi")
+        self.assertEqual(len(self.client.completions.calls), 3)
+        user_texts = [str(m.get("content")) for m in agent.messages if m.get("role") == "user"]
+        self.assertTrue(any("回复是空的" in text for text in user_texts))
+        self.assertEqual(agent.last_assistant_text(), "补上的结论")
+
+
+class PlanClaimGuardTest(AgentTestCase):
+    """「宣称完成」护栏：验证类步骤标 completed 但没执行过任何命令时要被追问。"""
+
+    def _plan(self, agent, plan):
+        with contextlib.redirect_stdout(io.StringIO()):
+            return agent._update_plan(plan)
+
+    def test_unverified_test_step_is_challenged(self) -> None:
+        agent = self.build([])
+        result = self._plan(
+            agent,
+            [
+                {"step": "编写HTML", "status": "completed"},
+                {"step": "测试验证", "status": "completed"},
+            ],
+        )
+        self.assertIn("[注意]", result)
+        self.assertIn("测试验证", result)
+
+    def test_verified_step_passes_quietly(self) -> None:
+        agent = self.build([])
+        self._plan(agent, [{"step": "测试验证", "status": "in_progress"}])
+        agent._exec_evidence = 1  # 模拟这期间跑过一次 bash
+        result = self._plan(agent, [{"step": "测试验证", "status": "completed"}])
+        self.assertNotIn("[注意]", result)
+
+    def test_non_verify_steps_never_challenged(self) -> None:
+        agent = self.build([])
+        result = self._plan(agent, [{"step": "编写解析器", "status": "completed"}])
+        self.assertNotIn("[注意]", result)
+
+    def test_already_completed_step_not_rechallenged(self) -> None:
+        agent = self.build([])
+        self._plan(agent, [{"step": "测试验证", "status": "completed"}])
+        #  第二次更新时该步骤已是 completed：不算"新标完成"，不重复追问
+        result = self._plan(agent, [{"step": "测试验证", "status": "completed"}])
+        self.assertNotIn("[注意]", result)
+
+
+class SkillLoadPathTest(AgentTestCase):
+    """skill 加载结果必须带基准目录：正文里的相对路径模型无从知道相对谁。"""
+
+    def _agent_with_skill(self):
+        from xiaoyu.skills import Skill
+
+        skill_dir = self.root / "myskill"
+        skill_dir.mkdir()
+        (skill_dir / "SKILL.md").write_text(
+            "---\nname: myskill\ndescription: 测试技能\n---\n"
+            "看 [参考](references/deep.md)。\n",
+            encoding="utf-8",
+        )
+        agent = self.build([])
+        agent.skills = [
+            Skill(name="myskill", description="测试技能", path=skill_dir / "SKILL.md")
+        ]
+        return agent, skill_dir
+
+    def test_skill_body_carries_base_dir(self) -> None:
+        agent, skill_dir = self._agent_with_skill()
+        result = agent._load_skill("myskill")
+        self.assertIn("技能目录", result)
+        self.assertIn(str(skill_dir), result)
+        self.assertIn("references/deep.md", result)
+
+    def test_repeat_load_is_flagged(self) -> None:
+        agent, _ = self._agent_with_skill()
+        agent._load_skill("myskill")
+        second = agent._load_skill("myskill")
+        self.assertIn("已加载过", second)
+        #  重复加载仍返回完整正文：上下文可能已被压缩，拒发正文会把模型困死
+        self.assertIn("references/deep.md", second)
+
+    def test_unknown_skill_unchanged(self) -> None:
+        agent, _ = self._agent_with_skill()
+        self.assertTrue(agent._load_skill("nope").startswith("ERROR:"))
+
+
+class VanishedToolsTest(unittest.TestCase):
+    """resume 预警：历史里用过、现已不在注册表里的工具要点名。"""
+
+    def test_reports_missing_tools(self) -> None:
+        from xiaoyu.cli import vanished_tools
+
+        loaded = [
+            {
+                "role": "assistant",
+                "tool_calls": [
+                    {"id": "1", "function": {"name": "bash", "arguments": "{}"}},
+                    {"id": "2", "function": {"name": "feishu_send", "arguments": "{}"}},
+                ],
+            },
+            {"role": "tool", "tool_call_id": "2", "content": "ok"},
+        ]
+        self.assertEqual(vanished_tools(loaded, ["bash", "read_file"]), ["feishu_send"])
+        self.assertEqual(vanished_tools(loaded, ["bash", "feishu_send"]), [])
+        self.assertEqual(vanished_tools([], ["bash"]), [])
+
+
+class TestPrefixReplaySummary(AgentTestCase):
+    """前缀重放式摘要：主模型腿逐字重放会话前缀。"""
+
+    PREFIX = [
+        {"role": "system", "content": "sys"},
+        {"role": "user", "content": "任务"},
+        {"role": "assistant", "content": "好的"},
+    ]
+
+    def test_main_model_leg_replays_prefix(self) -> None:
+        #  便宜模型挂了 → 主模型腿用前缀重放
+        agent = self.build([RuntimeError("502"), text_response(GOOD_SUMMARY)])
+        with contextlib.redirect_stdout(io.StringIO()):
+            summary = agent._summarize("一段历史", list(self.PREFIX))
+        self.assertEqual(summary, GOOD_SUMMARY)
+        replay = self.client.completions.calls[1]
+        self.assertEqual(replay["model"], "main-model")
+        #  逐字重放前缀 + 指令作为最后一条 user 消息
+        self.assertEqual(replay["messages"][: len(self.PREFIX)], self.PREFIX)
+        self.assertEqual(replay["messages"][-1]["role"], "user")
+        self.assertIn("以上对话", replay["messages"][-1]["content"])
+        #  带工具 schema 对齐缓存前缀，但禁止真的调用
+        self.assertTrue(replay.get("tools"))
+        self.assertEqual(replay.get("tool_choice"), "none")
+
+    def test_cheap_leg_keeps_transcript_posture(self) -> None:
+        """便宜摘要模型窗口小、也没有本会话缓存：维持渲染转写，不重放。"""
+        agent = self.build([text_response(GOOD_SUMMARY)])
+        with contextlib.redirect_stdout(io.StringIO()):
+            agent._summarize("一段历史", list(self.PREFIX))
+        call = self.client.completions.calls[0]
+        self.assertEqual(call["model"], "cheap-model")
+        self.assertEqual(len(call["messages"]), 1)
+        self.assertIn("一段历史", call["messages"][0]["content"])
+        self.assertNotIn("tools", call)
+
+    def test_replay_failure_falls_back_to_transcript_on_same_route(self) -> None:
+        """重放姿势失败（个别网关不认 tool_choice）退回转写姿势，不作废整条路由。"""
+        agent = self.build(
+            [
+                RuntimeError("502"),
+                RuntimeError("tool_choice 不识别"),
+                text_response(GOOD_SUMMARY),
+            ]
+        )
+        with contextlib.redirect_stdout(io.StringIO()):
+            summary = agent._summarize("一段历史", list(self.PREFIX))
+        self.assertEqual(summary, GOOD_SUMMARY)
+        used = [call["model"] for call in self.client.completions.calls]
+        self.assertEqual(used, ["cheap-model", "main-model", "main-model"])
+
+    def test_truncated_replay_falls_back_to_transcript_on_same_route(self) -> None:
+        """重放姿势被截断与退化同罪：掉回转写姿势再试本路由（转写输入更短）。"""
+        agent = self.build(
+            [
+                RuntimeError("502"),
+                truncated_response(GOOD_SUMMARY * 20),
+                text_response(GOOD_SUMMARY),
+            ]
+        )
+        with contextlib.redirect_stdout(io.StringIO()):
+            summary = agent._summarize("一段历史", list(self.PREFIX))
+        self.assertEqual(summary, GOOD_SUMMARY)
+        self.assertEqual(len(self.client.completions.calls[2]["messages"]), 1)
+
+    def test_no_prefix_means_no_replay(self) -> None:
+        """不带前缀（compact 降级阶梯等）时主模型腿也走转写姿势。"""
+        agent = self.build([RuntimeError("502"), text_response(GOOD_SUMMARY)])
+        with contextlib.redirect_stdout(io.StringIO()):
+            agent._summarize("一段历史")
+        main_call = self.client.completions.calls[1]
+        self.assertEqual(len(main_call["messages"]), 1)
+
+
+class TestRestoreRepair(AgentTestCase):
+    """resume 崩溃恢复：未配对调用补"结果未知"。"""
+
+    def test_unpaired_call_gets_unknown_outcome(self) -> None:
+        agent = self.build([])
+        history = [
+            {"role": "user", "content": "跑一下测试"},
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "c1",
+                        "type": "function",
+                        "function": {"name": "bash", "arguments": "{}"},
+                    }
+                ],
+            },
+        ]
+        with contextlib.redirect_stdout(io.StringIO()):
+            agent.restore(history)
+        last = agent.messages[-1]
+        self.assertEqual(last["role"], "tool")
+        self.assertEqual(last["tool_call_id"], "c1")
+        #  措辞必须是"结果未知、先核实"，不是"已放弃"——工具可能已经执行过
+        self.assertIn("结果未知", last["content"])
+        self.assertIn("核实", last["content"])
+
+    def test_clean_history_untouched(self) -> None:
+        agent = self.build([])
+        history = [
+            {"role": "user", "content": "hi"},
+            {"role": "assistant", "content": "好"},
+        ]
+        with contextlib.redirect_stdout(io.StringIO()):
+            agent.restore(history)
+        self.assertEqual(agent.messages[-1]["content"], "好")
+
+    def test_orphan_compact_lock_is_reported(self) -> None:
+        """来源文件死在压缩中途（孤儿 compact_start）：resume 时提示一句。"""
+        path = self.root / "dead.jsonl"
+        path.write_text(
+            json.dumps({"event": "meta", "format": 2})
+            + "\n"
+            + json.dumps({"event": "compact_start", "trigger": "auto"})
+            + "\n",
+            encoding="utf-8",
+        )
+        agent = self.build([])
+        buffer = io.StringIO()
+        with contextlib.redirect_stdout(buffer):
+            agent.restore([], source=str(path))
+        self.assertIn("压缩进行中异常终止", buffer.getvalue())
+
+    def test_compact_attempt_is_bracketed_by_lock_events(self) -> None:
+        """maybe_compact 的尝试被 compact_start/compact_end 括号包住：
+        锁最后释放，正常路径永远不留孤儿 start。"""
+        from xiaoyu.session_log import SessionLog, has_orphan_compact
+
+        log_path = self.root / "log.jsonl"
+        log = SessionLog(log_path)
+        self.addCleanup(log.release)
+        agent = self.build([], session_log=log)
+        with contextlib.redirect_stdout(io.StringIO()):
+            agent.maybe_compact(force=True)
+        text = log_path.read_text(encoding="utf-8")
+        self.assertIn('"compact_start"', text)
+        self.assertIn('"compact_end"', text)
+        self.assertFalse(has_orphan_compact(log_path))
+
+    def test_paired_compact_lock_is_silent(self) -> None:
+        path = self.root / "ok.jsonl"
+        path.write_text(
+            json.dumps({"event": "compact_start"})
+            + "\n"
+            + json.dumps({"event": "compact_end", "ok": True})
+            + "\n",
+            encoding="utf-8",
+        )
+        agent = self.build([])
+        buffer = io.StringIO()
+        with contextlib.redirect_stdout(buffer):
+            agent.restore([], source=str(path))
+        self.assertNotIn("压缩进行中异常终止", buffer.getvalue())
+
+
+class TestEscalationApproval(AgentTestCase):
+    """沙箱升权必须人工批准：allow 规则与 auto_approve（--yolo）都不放行。"""
+
+    def _bash_call_script(self, args: str) -> list:
+        first = [
+            chunk(
+                tool_calls=[call_fragment(0, "e1", "bash", args)]
+            )
+        ]
+        return [first, [chunk(content="收到")]]
+
+    def test_escalated_bash_asks_even_under_yolo(self) -> None:
+        asked: list[str] = []
+
+        def approver(name: str, args: dict) -> bool:
+            asked.append(name)
+            return False
+
+        script = self._bash_call_script(
+            '{"command": "true", "sandbox_permissions": "danger-full-access",'
+            ' "justification": "测试"}'
+        )
+        #  auto_approve=True（harness 默认）等价 --yolo：普通 bash 不会问
+        with mock.patch("xiaoyu.tools.sandbox.available", return_value=True):
+            agent = self.build(script, approver=approver)
+            with contextlib.redirect_stdout(io.StringIO()):
+                agent.send("升权跑一下")
+        self.assertEqual(asked, ["bash"], "升权调用必须走人工确认")
+        self.assertIn("拒绝", agent.messages[-2]["content"])
+
+    def test_plain_bash_stays_auto_approved(self) -> None:
+        asked: list[str] = []
+
+        def approver(name: str, args: dict) -> bool:
+            asked.append(name)
+            return True
+
+        script = self._bash_call_script('{"command": "echo hi"}')
+        with mock.patch("xiaoyu.tools.sandbox.available", return_value=True):
+            agent = self.build(script, approver=approver)
+            with contextlib.redirect_stdout(io.StringIO()):
+                agent.send("跑一下")
+        self.assertEqual(asked, [], "--yolo 下普通 bash 不该弹确认")
+
+
+class TestContextBreakdown(AgentTestCase):
+    """上下文归因必须对应已装入会话的提示词，不随磁盘内容漂移。"""
+
+    def test_disk_changes_do_not_rebuild_loaded_segments(self) -> None:
+        agent = self.build([])
+        original = agent.messages[0]["content"]
+        rows = agent.context_breakdown()
+        (self.root / "AGENTS.md").write_text("会话启动后才出现的约定", encoding="utf-8")
+        self.assertEqual(agent.context_breakdown(), rows)
+        self.assertEqual(sum(n for _, n in agent.context_breakdown()), len(original))
+
+    def test_diagnostics_use_loaded_snapshot_without_disk_reads(self) -> None:
+        path = self.root / "AGENTS.md"
+        path.write_text("original", encoding="utf-8")
+        agent = self.build([])
+        rows = agent.context_breakdown()
+        sources = agent.context_instruction_sources()
+        self.assertEqual(sources, [("AGENTS.md", "system：已加载 · 正文 8/8 字符")])
+        path.write_text("changed instructions", encoding="utf-8")
+        #  仅构建但没有装入会话的新 prompt，不得覆盖已有的来源快照。
+        agent._system_prompt()
+        path.unlink()
+        with (mock.patch.object(Path, "read_text", side_effect=AssertionError("不应读磁盘")),
+              mock.patch("xiaoyu.agent.world_state.today", return_value="2099-01-01")):
+            self.assertEqual(agent.context_breakdown(), rows)
+            self.assertEqual(agent.context_instruction_sources(), sources)
+
+    def test_explicit_prompt_rebuild_refreshes_sources(self) -> None:
+        agent = self.build([])
+        path = self.root / "AGENTS.md"
+        path.write_text("new", encoding="utf-8")
+        for action, text in ((agent.reload_skills, "new"), (agent.reset, "reset")):
+            path.write_text(text, encoding="utf-8")
+            action()
+            self.assertIn(text, agent.messages[0]["content"])
+            self.assertEqual(agent.context_instruction_sources(), [
+                ("AGENTS.md", f"system：已加载 · 正文 {len(text)}/{len(text)} 字符")])
+            self.assertEqual(sum(n for _, n in agent.context_breakdown()), len(agent.messages[0]["content"]))
+
+    def test_external_system_replacement_does_not_reuse_provenance(self) -> None:
+        (self.root / "AGENTS.md").write_text("old", encoding="utf-8")
+        agent = self.build([])
+        agent.messages[0] = {"role": "system", "content": "replacement"}
+        agent.messages.append({"role": "user", "content": "hello"})
+        self.assertEqual(agent.context_breakdown(), [("system:未分段", 11), ("消息:user", 5)])
+        self.assertEqual(agent.context_instruction_sources(), [("system", "已被替换或移除，原来源记录不适用")])
+        agent.messages.pop(0)
+        self.assertEqual(agent.context_breakdown(), [("消息:user", 5)])
+        agent.messages.clear()
+        self.assertEqual(agent.context_breakdown(), [])
+
+    def test_source_budget_tracks_both_files(self) -> None:
+        from xiaoyu.agent import collect_project_docs
+
+        child = self.root / "pkg"
+        child.mkdir()
+        (self.root / "AGENTS.md").write_text("parent rules", encoding="utf-8")
+        (child / "AGENTS.md").write_text("1234567890", encoding="utf-8")
+        (child / "CLAUDE.md").write_text("extra", encoding="utf-8")
+        sources = []
+        with mock.patch("xiaoyu.agent.project_levels", return_value=[self.root, child]):
+            docs = collect_project_docs(child, ("AGENTS.md", "CLAUDE.md"), 5, sources=sources)
+        self.assertEqual([(s.path, s.status, s.included, s.total) for s in sources], [
+            (self.root / "AGENTS.md", "预算省略", 0, 12),
+            (child / "AGENTS.md", "预算省略", 0, 10),
+            (child / "CLAUDE.md", "已加载", 5, 5),
+        ])
+        self.assertIn("整体省略", docs[0][1])
+        self.assertIn("整体省略", docs[1][1])
+        self.assertEqual(docs[2], ("CLAUDE.md", "extra"))
+
+    def test_empty_unreadable_and_disabled_sources(self) -> None:
+        path = self.root / "AGENTS.md"
+        path.touch()
+        agent = self.build([])
+        self.assertIn("未加载（空文件）", agent.context_instruction_sources()[0][1])
+        original_read = Path.read_text
+
+        def read(file, *args, **kwargs):
+            if file == path:
+                raise OSError("unreadable")
+            return original_read(file, *args, **kwargs)
+
+        with mock.patch.object(Path, "read_text", read):
+            agent.reload_skills()
+        self.assertEqual(agent.context_instruction_sources(), [("AGENTS.md", "system：未加载（读取失败）")])
+        agent.config.load_project_instructions = False
+        agent.reset()
+        self.assertEqual(agent.context_instruction_sources(), [("system", "项目指令加载已关闭")])
+
+    def test_segments_join_equals_system_prompt(self) -> None:
+        agent = self.build([])
+        joined = "".join(text for _label, text in agent._system_segments())
+        self.assertEqual(joined, agent._system_prompt())
+
+    def test_system_rows_sum_equals_prompt_length(self) -> None:
+        #  各 system 段字符数之和 == system prompt 长度（连接符记在后段头上，
+        #  不漏字节、不重复计）——这是归因不漂移的结构保证
+        agent = self.build([])
+        rows = agent.context_breakdown()
+        sys_chars = sum(chars for label, chars in rows if label.startswith("system:"))
+        self.assertEqual(sys_chars, len(agent._system_prompt()))
+
+    def test_core_identity_always_present(self) -> None:
+        agent = self.build([])
+        labels = [label for label, _ in agent.context_breakdown()]
+        self.assertIn("system:核心身份", labels)
+
+    def test_messages_counted_by_role(self) -> None:
+        agent = self.build([[chunk(content="答复")]])
+        with contextlib.redirect_stdout(io.StringIO()):
+            agent.send("问题")
+        rows = dict(agent.context_breakdown())
+        #  user + assistant 各贡献一条消息的字符（system 那条不在消息计里，
+        #  它按 system 段拆过了）
+        self.assertIn("消息:user", rows)
+        self.assertIn("消息:assistant", rows)
+        self.assertEqual(rows["消息:user"], len("问题"))
+
+
+class TestCrystallizeNudge(AgentTestCase):
+    """收尾轻推：反复整写同一文件 + 反复执行的解题迭代，收尾时请模型评估沉淀。
+
+    阈值刻意保守（同一文件 write_file ≥3 且 bash ≥3）：宁可漏推不可唠叨——
+    常规开发（str_replace 精修、少量整写）不该被问"要不要沉淀"。
+    """
+
+    def iteration_step(self, index: int, path: str = "scratch.py"):
+        """一步"整写脚本 + 跑一遍"——解题迭代的最小单元。"""
+        return [
+            chunk(
+                tool_calls=[
+                    call_fragment(
+                        0,
+                        f"w{index}",
+                        "write_file",
+                        json.dumps({"path": path, "content": f"print({index})\n"}),
+                    ),
+                    call_fragment(
+                        1, f"b{index}", "bash", json.dumps({"command": "echo run"})
+                    ),
+                ]
+            )
+        ]
+
+    def nudge_messages(self, agent: Agent) -> list[dict]:
+        from xiaoyu.agent import CRYSTALLIZE_NUDGE
+
+        return [
+            m
+            for m in agent.messages
+            if m.get("role") == "user" and m.get("content") == CRYSTALLIZE_NUDGE
+        ]
+
+    def test_iterative_solving_gets_nudged_once(self) -> None:
+        script = [
+            self.iteration_step(1),
+            self.iteration_step(2),
+            self.iteration_step(3),
+            [chunk(content="问题解决了")],
+            [chunk(content="无需沉淀")],
+        ]
+        agent = self.build(script)
+        with contextlib.redirect_stdout(io.StringIO()):
+            agent.send("修好这个脚本")
+        self.assertEqual(len(self.nudge_messages(agent)), 1)
+        #  轻推排在首次收尾正文之后，模型的答复是本轮最后一条
+        self.assertEqual(agent.messages[-1]["role"], "assistant")
+        self.assertEqual(agent.messages[-1]["content"], "无需沉淀")
+        self.assertEqual(self.client.completions.script, [], "轻推该恰好多跑一步")
+
+    def test_suppressed_second_nudge_logs_gate_skip(self) -> None:
+        """"每会话一次"压掉第二次够格迭代时必须落 gate_skip 事件——静默拒绝
+        运行的功能和坏掉的功能在会话日志里要可区分，事后才答得了"为什么没推"。
+        """
+        script = [
+            self.iteration_step(1),
+            self.iteration_step(2),
+            self.iteration_step(3),
+            [chunk(content="问题解决了")],
+            [chunk(content="无需沉淀")],
+            #  第二轮：又一次够格的解题迭代，但本会话的一次机会已用掉
+            self.iteration_step(4),
+            self.iteration_step(5),
+            self.iteration_step(6),
+            [chunk(content="又解决了")],
+        ]
+        events: list[tuple[str, dict]] = []
+
+        class FakeLog:
+            def event(self, kind: str, **fields: object) -> None:
+                events.append((kind, fields))
+
+            def append(self, message: dict) -> None:  # _record 也会写消息，收下即可
+                pass
+
+        agent = self.build(script)
+        agent.session_log = FakeLog()
+        with contextlib.redirect_stdout(io.StringIO()):
+            agent.send("修好这个脚本")
+            agent.send("再修另一个问题")
+        self.assertEqual(len(self.nudge_messages(agent)), 1, "每会话仍只推一次")
+        skips = [f for k, f in events if k == "gate_skip"]
+        self.assertEqual(
+            skips,
+            [{"gate": "crystallize_nudge", "reason": "already_nudged_this_session"}],
+        )
+
+    def test_below_threshold_stays_quiet(self) -> None:
+        #  两轮整写：正常"建文件 + 改一处"的形态，不该被问
+        script = [
+            self.iteration_step(1),
+            self.iteration_step(2),
+            [chunk(content="好了")],
+        ]
+        agent = self.build(script)
+        with contextlib.redirect_stdout(io.StringIO()):
+            agent.send("小改一下")
+        self.assertEqual(self.nudge_messages(agent), [])
+        self.assertEqual(self.client.completions.script, [])
+
+    def test_scattered_writes_do_not_count_as_iteration(self) -> None:
+        #  三个不同文件各写一次 + 跑三次 = 常规多文件开发，不是解题迭代
+        script = [
+            self.iteration_step(1, "a.py"),
+            self.iteration_step(2, "b.py"),
+            self.iteration_step(3, "c.py"),
+            [chunk(content="改完了")],
+        ]
+        agent = self.build(script)
+        with contextlib.redirect_stdout(io.StringIO()):
+            agent.send("三个文件各改一处")
+        self.assertEqual(self.nudge_messages(agent), [])
+
+    def test_nudges_at_most_once_per_session(self) -> None:
+        turn = [
+            self.iteration_step(1),
+            self.iteration_step(2),
+            self.iteration_step(3),
+        ]
+        script = [
+            *turn,
+            [chunk(content="第一轮解决")],
+            [chunk(content="无需沉淀")],
+            *turn,
+            [chunk(content="第二轮解决")],  # 同样的迭代特征，但不再追问
+        ]
+        agent = self.build(script)
+        with contextlib.redirect_stdout(io.StringIO()):
+            agent.send("修一次")
+            agent.send("再修一次")
+        self.assertEqual(len(self.nudge_messages(agent)), 1)
+        self.assertEqual(self.client.completions.script, [])
+
+    def test_nudge_text_is_synthetic(self) -> None:
+        #  注入文案必须进 SYNTHETIC_USER_TEXTS：压缩不当用户原话、fork 不当轮次开头
+        from xiaoyu.agent import CRYSTALLIZE_NUDGE, SYNTHETIC_USER_TEXTS
+
+        self.assertIn(CRYSTALLIZE_NUDGE, SYNTHETIC_USER_TEXTS)
+        self.assertTrue(CRYSTALLIZE_NUDGE.startswith("[系统提示]"))
+
+
+class PhantomEditGuardTest(AgentTestCase):
+    """产物对账护栏：收尾正文宣称"已创建/修改 X"，本轮却没有一次成功的改动类
+    工具——追问一次（每轮最多一次），有真实改动证据时不问。"""
+
+    def _nudges(self, agent) -> list[dict]:
+        from xiaoyu.agent import PHANTOM_EDIT_NUDGE
+
+        return [m for m in agent.messages if m.get("role") == "user" and m.get("content") == PHANTOM_EDIT_NUDGE]
+
+    def test_claim_without_mutation_is_challenged_once(self) -> None:
+        script = [
+            [chunk("我已经创建了 `foo.py` 并修改了 bar.md。"), usage_chunk(10, 5)],
+            #  模型坚持己见：不再追问第二次，本轮到此结束
+            [chunk("我确实已经创建了 foo.py。"), usage_chunk(10, 5)],
+        ]
+        agent = self.build(script)
+        with contextlib.redirect_stdout(io.StringIO()):
+            agent.send("建个文件")
+        self.assertEqual(len(self._nudges(agent)), 1)
+        self.assertEqual(len(self.client.completions.calls), 2)
+        self.assertFalse((self.root / "foo.py").exists())
+
+    def test_real_write_is_evidence(self) -> None:
+        script = [
+            [
+                chunk(
+                    tool_calls=[
+                        call_fragment(
+                            0, "c1", "write_file", json.dumps({"path": "foo.py", "content": "x = 1\n"})
+                        )
+                    ]
+                ),
+                usage_chunk(10, 5),
+            ],
+            [chunk("已创建 `foo.py`。"), usage_chunk(10, 5)],
+        ]
+        agent = self.build(script)
+        with contextlib.redirect_stdout(io.StringIO()):
+            agent.send("建个文件")
+        self.assertEqual(self._nudges(agent), [])
+        self.assertEqual(len(self.client.completions.calls), 2)
+
+    def test_read_only_tools_are_not_evidence(self) -> None:
+        script = [
+            [
+                chunk(tool_calls=[call_fragment(0, "c1", "read_file", json.dumps({"path": "calc.py"}))]),
+                usage_chunk(10, 5),
+            ],
+            [chunk("我已经修改了 calc.py，加了减法。"), usage_chunk(10, 5)],
+            [chunk("抱歉，实际上还没改。"), usage_chunk(10, 5)],
+        ]
+        agent = self.build(script)
+        with contextlib.redirect_stdout(io.StringIO()):
+            agent.send("加个减法")
+        self.assertEqual(len(self._nudges(agent)), 1)
+
+    def test_plain_reply_not_challenged(self) -> None:
+        agent = self.build([[chunk("这个文件没有修改 calc.py 的必要，版本是 1.2.3。"), usage_chunk(10, 5)]])
+        with contextlib.redirect_stdout(io.StringIO()):
+            agent.send("看看")
+        self.assertEqual(self._nudges(agent), [])
+        self.assertEqual(len(self.client.completions.calls), 1)
+
+    def test_nudge_is_registered_as_synthetic(self) -> None:
+        from xiaoyu.agent import PHANTOM_EDIT_NUDGE, SYNTHETIC_USER_TEXTS
+
+        self.assertIn(PHANTOM_EDIT_NUDGE, SYNTHETIC_USER_TEXTS)
+
+
+class PromiseWithoutActionTest(AgentTestCase):
+    """「只说不做」轻推：收尾正文只是一句"我这就去做/一口气跑完"的行动意图、本轮
+    零工具调用——顶回一次让它立即开始或如实收尾（每轮最多一次）。"""
+
+    def _nudges(self, agent) -> list[dict]:
+        from xiaoyu.agent import PROMISE_WITHOUT_ACTION_NUDGE
+
+        return [
+            m
+            for m in agent.messages
+            if m.get("role") == "user" and m.get("content") == PROMISE_WITHOUT_ACTION_NUDGE
+        ]
+
+    def test_intent_only_reply_is_nudged_then_continues(self) -> None:
+        script = [
+            [chunk("好，我现在一口气把剩余所有检查跑完。"), usage_chunk(10, 5)],
+            #  被顶回后真正给出结论：本轮结束
+            [chunk("已完成，共发现 2 个高危问题。"), usage_chunk(10, 5)],
+        ]
+        agent = self.build(script)
+        with contextlib.redirect_stdout(io.StringIO()):
+            agent.send("你不用停下来等我，完整做完")
+        self.assertEqual(len(self._nudges(agent)), 1)
+        self.assertEqual(len(self.client.completions.calls), 2)
+
+    def test_longer_intent_with_targets_is_nudged(self) -> None:
+        #  列出要抓的目标时空承诺会更长（截图实测 58 字，一度被 cap=45 漏过）：
+        #  cap 放宽到 100 后照样顶回
+        script = [
+            [
+                chunk("一口气跑完。先把首屏完整 HTML 和 robots/sitemap 抓全，同时开始 PbootCMS 已知漏洞面。"),
+                usage_chunk(10, 5),
+            ],
+            [chunk("已抓完首屏，未发现异常。"), usage_chunk(10, 5)],
+        ]
+        agent = self.build(script)
+        with contextlib.redirect_stdout(io.StringIO()):
+            agent.send("一口气跑完")
+        self.assertEqual(len(self._nudges(agent)), 1)
+        self.assertEqual(len(self.client.completions.calls), 2)
+
+    def test_nudged_at_most_once_per_turn(self) -> None:
+        script = [
+            [chunk("好，我现在一口气把剩余所有检查跑完。"), usage_chunk(10, 5)],
+            #  模型再 narration 一次：不再顶第二次，放它收尾，不成死循环
+            [chunk("好，继续一口气跑完。"), usage_chunk(10, 5)],
+        ]
+        agent = self.build(script)
+        with contextlib.redirect_stdout(io.StringIO()):
+            agent.send("继续")
+        self.assertEqual(len(self._nudges(agent)), 1)
+        self.assertEqual(len(self.client.completions.calls), 2)
+
+    def test_substantive_reply_not_nudged(self) -> None:
+        agent = self.build([[chunk("`answer` 的值是 42。"), usage_chunk(10, 5)]])
+        with contextlib.redirect_stdout(io.StringIO()):
+            agent.send("answer 是多少")
+        self.assertEqual(self._nudges(agent), [])
+        self.assertEqual(len(self.client.completions.calls), 1)
+
+    def test_advice_to_user_is_a_legit_yield(self) -> None:
+        #  "接下来你可以…"是把决定权交回用户，不是卡壳：不顶回
+        agent = self.build([[chunk("接下来你可以先跑一下测试，再决定要不要修。"), usage_chunk(10, 5)]])
+        with contextlib.redirect_stdout(io.StringIO()):
+            agent.send("下一步")
+        self.assertEqual(self._nudges(agent), [])
+        self.assertEqual(len(self.client.completions.calls), 1)
+
+    def test_real_tool_call_never_reaches_the_guard(self) -> None:
+        #  同一句意图，但这轮真发了工具调用：走的是执行路径，压根不进 not-calls 分支
+        script = [
+            [
+                chunk(tool_calls=[call_fragment(0, "c1", "read_file", json.dumps({"path": "calc.py"}))]),
+                usage_chunk(10, 5),
+            ],
+            [chunk("已读完，结论是 X。"), usage_chunk(10, 5)],
+        ]
+        agent = self.build(script)
+        with contextlib.redirect_stdout(io.StringIO()):
+            agent.send("看看")
+        self.assertEqual(self._nudges(agent), [])
+
+    def test_nudge_is_registered_as_synthetic(self) -> None:
+        from xiaoyu.agent import PROMISE_WITHOUT_ACTION_NUDGE, SYNTHETIC_USER_TEXTS
+
+        self.assertIn(PROMISE_WITHOUT_ACTION_NUDGE, SYNTHETIC_USER_TEXTS)
+        self.assertTrue(PROMISE_WITHOUT_ACTION_NUDGE.startswith("[系统提示]"))
+
+
+class ToolFailureStreakTest(AgentTestCase):
+    """失败流：同一工具连续 ERROR（参数各异）第 3 次给"先分析再换道"提示，
+    第 5 次起强制收敛；成功或换工具即归零。"""
+
+    def _fail(self, agent, index: int, tool: str = "str_replace") -> str:
+        args = {"path": f"missing{index}.py", "old_str": "a", "new_str": "b"}
+        call = {"id": f"f{index}", "function": {"name": tool, "arguments": json.dumps(args)}}
+        with contextlib.redirect_stdout(io.StringIO()):
+            return agent._execute(call)["content"]
+
+    def test_reflect_then_converge(self) -> None:
+        agent = self.build([])
+        outputs = [self._fail(agent, i) for i in range(6)]
+        for text in outputs:
+            self.assertTrue(text.startswith("ERROR:"), "附注不改变成败归类")
+        self.assertNotIn("[提示]", outputs[1])
+        self.assertIn("连续第 3 次失败", outputs[2])
+        self.assertNotIn("[提示]", outputs[3], "两档之间不唠叨")
+        self.assertIn("三选一", outputs[4])
+        self.assertIn("三选一", outputs[5], "收敛档之后每次都提醒")
+
+    def test_success_resets(self) -> None:
+        agent = self.build([])
+        self._fail(agent, 0)
+        self._fail(agent, 1)
+        ok = {"id": "ok", "function": {"name": "write_file", "arguments": json.dumps({"path": "fresh.py", "content": "x = 1\n"})}}
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertFalse(agent._execute(ok)["content"].startswith("ERROR:"))
+        self.assertNotIn("[提示]", self._fail(agent, 2))
+
+    def test_switching_tool_resets(self) -> None:
+        agent = self.build([])
+        self._fail(agent, 0)
+        self._fail(agent, 1)
+        other = {"id": "s", "function": {"name": "read_file", "arguments": json.dumps({"path": "nope.py"})}}
+        with contextlib.redirect_stdout(io.StringIO()):
+            out = agent._execute(other)["content"]
+        self.assertTrue(out.startswith("ERROR:"))
+        self.assertNotIn("[提示]", out)
+        self.assertNotIn("[提示]", self._fail(agent, 2), "换过工具后 str_replace 重新从 1 数")
+
+    def test_streak_resets_per_turn(self) -> None:
+        agent = self.build([[chunk("好"), usage_chunk(10, 5)]])
+        self._fail(agent, 0)
+        self._fail(agent, 1)
+        with contextlib.redirect_stdout(io.StringIO()):
+            agent.send("新的一轮")
+        self.assertNotIn("[提示]", self._fail(agent, 2))
+
+
+if __name__ == "__main__":
+    unittest.main()

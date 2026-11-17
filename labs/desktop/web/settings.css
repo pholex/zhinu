@@ -1,0 +1,145 @@
+body {font-size:var(--ui-font-size,14px)}
+.work-area {display:flex;min-width:0;height:100%;overflow:hidden;background:var(--surface);border-radius:0 12px 12px 0}
+.sidebar-collapsed .work-area {border-radius:12px}
+.work-area>#workspace {flex:1;min-width:0;container-type:inline-size}
+.work-area>#workspace-panes {flex:none;border-left:1px solid var(--line)}
+.work-area.panes-expanded>#workspace {display:none}
+.content-panel,.side-conversation {padding:18px;min-width:0}
+.side-chat-history {max-height:50vh;overflow:auto}
+.unread-dot {font-size:9px;color:var(--accent);margin-left:6px}
+.search-target {outline:2px solid var(--accent);outline-offset:6px;border-radius:8px}
+
+/* Settings use one reading surface; separators establish the hierarchy. */
+.thread:has(.settings-layout) {max-width:none;padding:0;height:100%}
+.settings-layout {background:linear-gradient(to right,var(--sidebar) 184px,var(--surface) 184px);display:grid;grid-template-columns:184px minmax(0,1fr);min-height:100%;font-size:13px}
+.settings-nav {align-self:start;position:sticky;top:0;display:flex;flex-direction:column;gap:16px;min-width:0;max-height:100dvh;overflow:auto;padding:20px 12px;background:var(--canvas);border-right:1px solid var(--line)}
+.settings-section-picker {display:none}
+.settings-nav input {min-height:32px;height:32px;padding:6px 10px;background:var(--surface);border:1px solid var(--line);border-radius:8px;font-size:12px}
+.settings-nav-group {display:flex;flex-direction:column;gap:2px}
+.settings-nav-label {padding:0 10px 6px;color:var(--muted);font-size:12px;font-weight:500;line-height:18px}
+.settings-nav button {display:flex;align-items:center;gap:10px;width:100%;min-height:34px;padding:7px 10px;text-align:left;border:0;border-radius:8px;background:transparent;color:var(--text-secondary,var(--text));font-size:13px;line-height:20px}
+.settings-nav button .ui-icon {width:16px;height:16px;color:var(--muted)}
+.settings-nav button span {min-width:0}
+.settings-nav button[aria-current=page] .ui-icon {color:var(--accent)}
+.settings-nav button:hover {background:var(--hover);color:var(--text)}
+.settings-nav button[aria-current=page] {background:var(--accent-soft);color:var(--accent);font-weight:600}
+.settings-nav>.note {padding:0 8px;font-size:12px}
+.settings-content {align-self:start;min-width:0;width:100%;max-width:800px;margin:0 auto;padding:40px clamp(24px,4cqw,48px) 48px}
+.settings-page-heading {margin-bottom:24px;padding-bottom:24px;border-bottom:1px solid var(--line)}
+.settings-page-heading h2 {font-size:20px;line-height:28px;font-weight:600;letter-spacing:-.025em}
+.settings-page-heading p {margin-top:8px;color:var(--muted);font-size:13px;line-height:20px}
+.preferences-fields {min-width:0;margin:0;padding:0;border:0}
+.setting-row {display:flex;align-items:center;justify-content:space-between;gap:24px;min-width:0;min-height:68px;padding:16px 0;border-bottom:1px solid var(--line)}
+.setting-label {flex:1;min-width:0}
+.setting-label>strong {font-size:13px;line-height:20px;font-weight:500}
+.setting-row p {max-width:440px;margin-top:4px;color:var(--muted);font-size:12px;line-height:19px;overflow-wrap:anywhere}
+.setting-row>select,.setting-row>input:not([type=checkbox]) {flex:0 1 208px;width:208px;max-width:48%;min-height:34px;padding:7px 10px;font-size:13px}
+.setting-row>button {flex:none;max-width:48%;font-size:12px}
+.settings-destination {display:inline-flex;align-items:center;justify-content:center;gap:6px}
+.settings-destination .ui-icon {width:15px;height:15px;color:var(--muted)}
+.settings-destination:hover .ui-icon {color:var(--text)}
+.setting-row>span {text-align:right;font-size:12px;color:var(--text-secondary,var(--text))}
+.setting-row>code {max-width:50%;overflow-wrap:anywhere;font-size:12px;text-align:right}
+.setting-row dl {max-width:45%;margin:0;font-size:12px;overflow-wrap:anywhere;text-align:right}
+.setting-row dt {color:var(--muted)}
+.setting-row dd {margin:2px 0 8px;color:var(--text)}
+.setting-row dd:last-child {margin-bottom:0}
+.setting-row-information {min-height:0}
+.setting-row-information p {max-width:none}
+.setting-row kbd {padding:4px 8px;border:1px solid var(--line);border-radius:6px;background:var(--canvas);font-size:12px;white-space:nowrap}
+.setting-row>.setting-switch {position:relative;flex:none;appearance:none;-webkit-appearance:none;width:34px;height:20px;margin:0;padding:0;border:1px solid var(--line);border-radius:999px;background:var(--hover);cursor:pointer;transition:background .15s,border-color .15s}
+.setting-switch::after {position:absolute;top:2px;left:2px;content:"";width:14px;height:14px;border-radius:50%;background:var(--surface);box-shadow:0 1px 3px #0002;transition:transform .15s}
+.setting-row>.setting-switch:checked {background:var(--accent);border-color:var(--accent)}
+.setting-switch:checked::after {transform:translateX(14px);background:#fff}
+.setting-switch:disabled {opacity:.45;cursor:default}
+.settings-status {margin:0 0 16px;padding:12px 16px;border-radius:8px;background:var(--canvas);font-size:12px;line-height:20px}
+.settings-save {display:flex;flex-direction:column;align-items:flex-start;gap:12px;padding:24px 0 8px;background:var(--surface)}
+.settings-save-actions {display:flex;flex-wrap:wrap;align-items:center;gap:8px;min-width:0}
+.settings-save button {min-height:32px;padding:6px 12px;font-size:12px}
+.settings-save button[data-settings-reset] {border-color:transparent;background:transparent;color:var(--muted)}
+.settings-save button[data-settings-reset]:hover {background:var(--hover);color:var(--text)}
+.settings-save span {font-size:12px;color:var(--muted)}
+.settings-unsaved {display:flex;align-items:center;gap:6px}
+.settings-unsaved::before {content:"";width:5px;height:5px;border-radius:50%;background:var(--accent)}
+.nav-preferences {display:flex;flex-direction:column;gap:8px;max-width:64%;min-width:0}
+.nav-preferences>div {display:flex;flex-wrap:wrap;align-items:center;gap:6px}
+.nav-preferences span {min-width:40px;font-size:12px}
+.nav-preferences button {min-height:26px;padding:2px 6px;font-size:12px}
+.nav-preferences label {display:flex;align-items:center;gap:4px;margin:0;font-size:12px}
+.nav-preferences span,.nav-preferences label,.nav-preferences button {white-space:nowrap}
+
+/* Secondary settings retain their independent forms and save actions. */
+.settings-content>section {min-width:0;margin-top:32px;padding-top:24px;border-top:1px solid var(--line)}
+.settings-content>section>h3 {margin-bottom:8px;font-size:15px;font-weight:600}
+.settings-content>section>p {margin:8px 0 16px;color:var(--muted);font-size:12px;line-height:20px;overflow-wrap:anywhere}
+.settings-content>section>button {margin-bottom:12px;font-size:12px}
+.settings-content table {table-layout:fixed;width:100%;margin:16px 0;font-size:12px;text-align:left;border-collapse:collapse}
+.settings-content td,.settings-content th {padding:12px 8px;border-bottom:1px solid var(--line);overflow-wrap:anywhere;vertical-align:top}
+.settings-content th {background:var(--canvas);font-weight:500;color:var(--muted)}
+.settings-content th:first-child,.settings-content td:first-child {padding-left:12px}
+.settings-content td:not(:first-child),.settings-content th:not(:first-child) {font-variant-numeric:tabular-nums;text-align:right}
+.settings-content form label {display:block;margin:0;font-size:12px;font-weight:500;line-height:20px}
+.settings-content form label>input,.settings-content form label>select,.settings-content form label>textarea {display:block;margin-top:6px;font-size:13px;font-weight:400}
+.settings-content form label>input[type=checkbox] {display:inline-block;margin-right:6px}
+.settings-content .nav-preferences label {display:flex;font-weight:400}
+.settings-content .nav-preferences label>input {margin:0}
+.provider-settings>div>article {display:grid;grid-template-columns:1fr auto;gap:4px 16px;min-width:0;padding:16px 0;border-bottom:1px solid var(--line)}
+.provider-settings article h4 {margin:0;font-size:13px;font-weight:600}
+.provider-settings article p {grid-column:1;color:var(--muted);font-size:12px;overflow-wrap:anywhere}
+.provider-settings article button {grid-column:2;grid-row:1 / span 4;align-self:center;font-size:12px}
+.provider-settings form,.data-settings form {margin-top:24px;padding-top:24px;border-top:1px solid var(--line)}
+.provider-settings form fieldset {display:grid;grid-template-columns:1fr 1fr;gap:16px}
+.provider-settings form fieldset>p {grid-column:1 / -1;color:var(--muted);font-size:12px;line-height:20px}
+.provider-settings form fieldset>button {justify-self:start;font-size:12px}
+.data-settings form {display:grid;gap:16px}
+.data-settings form h4 {margin:0;font-size:14px;font-weight:600}
+.data-settings form>button {justify-self:start}
+.data-settings>div {display:flex;flex-wrap:wrap;gap:8px;margin-top:16px}
+.shortcut-settings>div:not(.actions) {margin:16px 0 24px}
+.shortcut-settings>div>label {display:flex;align-items:center;justify-content:space-between;gap:16px;padding:12px 0;border-bottom:1px solid var(--line);font-size:13px}
+.shortcut-settings label input {width:208px;max-width:50%;min-height:32px;padding:6px 10px;font-family:var(--mono);font-size:12px}
+.settings-content .actions {display:flex;flex-wrap:wrap;gap:8px}
+.settings-content details {margin-top:16px;font-size:12px}
+.settings-content details summary {padding:8px 0;color:var(--text-secondary,var(--text));cursor:pointer}
+.settings-content details p {margin:8px 0;line-height:20px;overflow-wrap:anywhere}
+
+.feature-intro {padding:42px 0}
+.feature-intro h2 {margin-bottom:14px}
+.feature-intro p {color:var(--muted);max-width:560px;margin-bottom:16px}
+.workspace-actions {display:flex;gap:8px;flex-wrap:wrap;margin-top:22px}
+.session-unread {display:inline-block;width:6px;height:6px;border-radius:50%;background:var(--accent);margin-right:6px}
+.content-workspace .actions {flex-wrap:wrap}
+.content-workspace .actions>button {flex:none;white-space:normal;min-width:100px}
+.reduce-motion * {transition:none!important;animation:none!important;scroll-behavior:auto!important}
+:root[data-theme=dark] {color-scheme:dark;--rail:#191c22;--rail-hover:#303742;--sidebar:#20242b;--canvas:#1d2026;--surface:#242830;--surface-raised:#2b3039;--text:#e9edf3;--text-secondary:#bdc4cf;--muted:#969fac;--line:#363d48;--hover:#303742;--accent:#97b9e6;--accent-soft:#2d3c53;--warning:#d9b578;--warning-bg:#403523;--error:#edaaa5;--error-bg:#492c2c}
+@media(prefers-color-scheme:dark){:root[data-theme=system] {color-scheme:dark;--rail:#191c22;--rail-hover:#303742;--sidebar:#20242b;--canvas:#1d2026;--surface:#242830;--surface-raised:#2b3039;--text:#e9edf3;--text-secondary:#bdc4cf;--muted:#969fac;--line:#363d48;--hover:#303742;--accent:#97b9e6;--accent-soft:#2d3c53;--warning:#d9b578;--warning-bg:#403523;--error:#edaaa5;--error-bg:#492c2c}}
+@container(max-width:740px){
+  .settings-layout {background:linear-gradient(to right,var(--sidebar) 164px,var(--surface) 164px);grid-template-columns:164px minmax(0,1fr)}
+  .settings-content {padding:32px 24px}
+  .setting-row {gap:16px;flex-wrap:wrap}
+  .setting-row>.setting-label {flex:1;min-width:140px}
+  .setting-row>select,.setting-row>input:not([type=checkbox]) {flex:0 1 180px;max-width:100%}
+  .nav-preferences {max-width:100%}
+  .provider-settings form fieldset {grid-template-columns:1fr}
+}
+@container(max-width:540px){
+  .settings-layout {display:block;background:var(--surface)}
+  .settings-nav {position:static;display:flex;flex-direction:row;gap:12px;align-items:center;padding:12px 20px;border-right:0;border-bottom:1px solid var(--line)}
+  .settings-section-picker {display:block;flex:1;min-width:0}
+  .settings-section-picker select {margin:0;font-size:13px}
+  .settings-nav #settings-search,.settings-nav-group {display:none}
+  .settings-content {padding:24px 20px 32px}
+  .settings-page-heading {margin-bottom:8px;padding-bottom:16px}
+  .setting-row>select,.setting-row>input:not([type=checkbox]) {flex-basis:100%;width:100%;max-width:100%}
+  .setting-row>code,.setting-row dl {max-width:100%;text-align:left}
+  .setting-row>code {flex-basis:100%}
+  .nav-preferences {flex-basis:100%}
+  .settings-save-actions {gap:8px}
+  .settings-save button {max-width:100%;text-align:left}
+  .settings-content table {font-size:12px}
+  .settings-content th,.settings-content td {padding:10px 6px}
+}
+
+
+#workspace.settings-navigation-collapsed .settings-layout {display:block;background:var(--surface)}
+#workspace.settings-navigation-collapsed .settings-nav {display:none}

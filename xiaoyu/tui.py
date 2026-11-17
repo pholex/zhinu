@@ -1,0 +1,3061 @@
+"""TUI 前端（第 2 步）：prompt_toolkit 输入层 + rich 渲染层。
+
+可选依赖（pip install "xiaoyu-agent[tui]"）；缺包时 import 本模块会
+ImportError，cli 捕获后自动退回明文 REPL。
+
+设计约束（与全屏 TUI 的分界线）：
+- **不进 alt-screen**：对话留在终端原生 scrollback 里，可滚动、可复制、可 grep。
+  受控区域只有输入行（含补全/历史）、工具执行中的
+  spinner 活区（transient，结束即消失）和确认菜单（erase_when_done）。
+- **没有常驻状态栏**：bottom_toolbar 只在输入行挂起时存在，模型一跑就消失，
+  时隐时现反而像 bug（试过，拆了）。模型/上下文/token 走 /model /context /usage 查。
+- **改不了 scrollback，但可以补打**：折叠内容全部留底（RichSink.folded），
+  Ctrl-O 开详情时回放上一轮被折叠的输出——"还有 N 行"是可兑现的承诺。
+- **agent 保持全同步**：流式输出发生在没有 prompt 挂起的时刻，
+  不需要 patch_stdout、不需要线程（rich Status 自带的刷新线程只画活区一行）。
+- **流式正文不重绘，只做行级轻渲染**：inline 模式做 markdown 重绘会污染
+  scrollback，已滚出屏幕的内容也无法和最终渲染保持一致。所以每个字符只打一次：
+  代码围栏内按行语法着色，围栏外只给行内 `代码`、**粗体**、# 标题变色，
+  标记符保留原样只弱化——复制出去的文本与模型原文逐字一致（_StreamStyler）。
+
+核心交互三块：
+1. 工具调用渐进式披露：pending 一行锚点 → running 活区 spinner →
+   completed 折叠一行（出错自动展开、Ctrl-O 切换详略）→ denied 一行定格；
+2. 权限确认三选项菜单：允许一次 / 本会话不再问 / 总是允许（写规则）/
+   拒绝并给替代指令，str_replace 预览升级为 unified diff；
+3. 输入行前缀语义：/ 命令补全带说明、! 直跑 shell 且输出进上下文、
+   @ 模糊补全文件路径、# 记项目备忘、双击 Esc 取回上一条、Ctrl-C×2 退出。
+
+工具与确认框的细节打磨：
+- 连续只读工具（read_file/grep/list_files）折叠成一行汇总，结果统一 ⎿ 缩进，
+  终态按 成功绿/失败红/拒绝黄 着色；detail 模式（Ctrl-O）成功输出不再截断；
+- 没经确认框预览就放行的编辑（auto / --yolo / allow 规则）：完成行带 +N −M，
+  diff 当作这次调用的详情折叠进留底（Ctrl-O 回放带红绿）。write_file 的改前内容
+  在 pending 时读磁盘（工具动手之前）；确认框预览过的不重复补；
+- 确认框：问句带宾语（"要修改 foo.py 吗？"）、「总是允许」的规则写入前可编辑、
+  Tab = 批准并附言（附言随 tool result 回灌模型）、diff 预览加配对行词级高亮
+  （变化占比超 40% 回退整行红绿）；
+- 输入行：大段粘贴折叠成 chip（旁路存储 + 占位符 + 退格原子删除 + 提交展开）、
+  Tab 先补最长公共前缀再轮换（readline 直觉）。
+  ↑↓ 的「视觉行 → 逻辑行 → 历史」三级回退经核实 prompt_toolkit 自带
+  （buffer.auto_up/auto_down），不重复造。
+
+窄终端与长会话的适配：
+- 配色抽成语义 token：渲染处只说意图，颜色住在 theme.py，深浅两套表。
+  附带解决了浅色终端上黄色警告近乎隐形的问题；
+- 一切宽度按终端实际列数算：原先写死的 160 在 80 列终端上会把
+  "折叠成一行"折成两行；
+- 折叠提示在一轮收尾统一提一次：溢出是整轮的一个状态，不是每个折叠行
+  各自的属性。行内只说藏了多少；
+- 按键收进 keys.py 的绑定表，注册与帮助同源；
+- spinner 三段式：安静 → 轮播上手提示 → 报超时预算；
+- 等待期的抢跑输入主动接住再预填（只预填不自动提交）；
+- 第三方 warn/log 收进事件流，但**不劫持 stdout**——流式正文就是裸 print，
+  劫持会把自己的正文吃掉；
+- 等模型期间的活区指示：以前从提交到首个 token 之间一个事件都没有，
+  屏幕停在用户刚敲的那行不动。协议补了 request.started/ended 一对，
+  前端才有东西可画。
+
+**活区与裸 print 的次序**：rich 的 Live 启动时会接管 sys.stdout / sys.stderr，
+停止时还原成启动那一刻的对象。所以首个 TextDelta 必须**先**收活区再 print，
+否则两者抢同一片屏幕；测试里若把 redirect_stdout 套在 Live 内部，stop() 会
+把那层 redirect 一并冲掉。
+
+整屏 TUI 常见的那套（全量重绘、虚拟列表、鼠标捕获、vim 缓冲区）刻意不做：
+那些都是"自己接管整屏渲染"的代价，与本文件开头的 inline 约束相反。
+kitty 键盘协议也不开：prompt_toolkit 3.0.53 的 vt100 解析器不认 CSI-u，
+开了会让整个输入层失灵；Shift+Enter 改由 editor_setup 从编辑器那侧解决。
+"""
+
+from __future__ import annotations
+
+import contextlib
+import difflib
+import itertools
+import os
+import re
+import subprocess
+import sys
+import threading
+import time
+from pathlib import Path
+from typing import Any, Callable, Iterable, Sequence
+
+from prompt_toolkit import PromptSession
+from prompt_toolkit.application import Application, get_app_or_none, run_in_terminal
+from prompt_toolkit.application.current import set_app
+from prompt_toolkit.auto_suggest import AutoSuggest, AutoSuggestFromHistory, Suggestion
+from prompt_toolkit.buffer import Buffer
+from prompt_toolkit.completion import CompleteEvent, Completer, Completion
+from prompt_toolkit.document import Document
+from prompt_toolkit.history import FileHistory
+from prompt_toolkit.key_binding import KeyBindings
+from prompt_toolkit.layout import Layout, Window
+from prompt_toolkit.layout.controls import FormattedTextControl
+from prompt_toolkit.lexers import Lexer
+from prompt_toolkit.styles import Style
+from rich.console import Console
+from rich.syntax import Syntax
+from rich.text import Text
+from rich.theme import Theme as RichTheme
+
+from . import attention, command_check, keys, media, modes, suggest, theme, ui
+from .agent import Agent, _CancelledAnswers
+from .config import user_config_dir
+from .events import (
+    ArtifactsReady,
+    Notice,
+    NoticeLevel,
+    PlanUpdated,
+    RequestEnded,
+    RequestStarted,
+    SteerAccepted,
+    Suggestions,
+    TextDelta,
+    TextEnd,
+    ToolCompleted,
+    ToolDenied,
+    ToolPending,
+    ToolPreparing,
+    ToolProgress,
+    ToolPurpose,
+    ToolRunning,
+    UIEvent,
+)
+from .permissions import Permissions, parse_rule, suggest_allow_rule, suggest_deny_rule
+from .session_log import _ensure_private_dir, _open_private
+from . import render
+from .render import args_preview
+
+#  计划状态的显示符号与 render.PlainSink 保持一致；样式一律走 theme 的语义 token
+_PLAN_STYLES = {
+    "completed": ("✔", "text.secondary"),
+    "in_progress": ("▶", "text.accent"),
+    "pending": ("○", "text.primary"),
+}
+_NOTICE_STYLES: dict[str, str] = {
+    "info": "text.secondary",
+    "warn": "status.warning",
+    "error": "status.error",
+}
+
+#  str_replace 确认预览的 diff 行数上限：看得出改了什么就够，不是代码审查。
+#  真正的上限还要跟终端高度取小——预览比屏幕还高的话，最该看的开头会被顶走。
+_DIFF_CAP = 40
+#  确认框里 diff 之外的固定开销（标题、上下框线、选项菜单）
+_CONFIRM_CHROME = 12
+#  diff 比对的输入上限（新旧两边行数之和）：超过就不跑 difflib，见 _diff_rows
+_DIFF_INPUT_LINES = 1500
+#  write_file 覆盖已有文件时为了算 diff 读原文的体积上限：再大就只报新内容行数
+_EDIT_SNAPSHOT_CAP = 2 * 1024 * 1024
+#  完成行上补 diff 的工具：没经确认框预览（auto / --yolo / allow 规则放行）时，
+#  这是用户看到"改了什么"的唯一机会
+_EDIT_TOOLS = ("write_file", "str_replace")
+
+
+def _diff_counts(rows: list[list[tuple[str, str]]]) -> tuple[int, int]:
+    """diff 行里的 +N / −M（按行首记号数，词级高亮行的首片段同样带记号）。"""
+    added = removed = 0
+    for row in rows:
+        first = row[0][1] if row else ""
+        if first.startswith("+"):
+            added += 1
+        elif first.startswith("-"):
+            removed += 1
+    return added, removed
+
+
+def _word_fragments(old: str, new: str) -> tuple[list[tuple[str, str]], list[tuple[str, str]]]:
+    """配对 -/+ 行的词级高亮：
+    变化字符占比超过阈值就放弃词级、回退整行红绿——大改写时词级反而花。
+    返回的两行片段都带 -/+ 前缀。"""
+    _WHOLE_LINE = 0.4
+    matcher = difflib.SequenceMatcher(None, old, new)
+    opcodes = matcher.get_opcodes()
+    changed = sum(max(i2 - i1, j2 - j1) for tag, i1, i2, j1, j2 in opcodes if tag != "equal")
+    if changed / max(len(old), len(new), 1) > _WHOLE_LINE:
+        return [("diff.removed", f"-{old}")], [("diff.added", f"+{new}")]
+    removed: list[tuple[str, str]] = [("diff.removed", "-")]
+    added: list[tuple[str, str]] = [("diff.added", "+")]
+    for tag, i1, i2, j1, j2 in opcodes:
+        if tag == "equal":
+            removed.append(("diff.removed", old[i1:i2]))
+            added.append(("diff.added", new[j1:j2]))
+            continue
+        if i2 > i1:
+            removed.append(("diff.removed.word", old[i1:i2]))
+        if j2 > j1:
+            added.append(("diff.added.word", new[j1:j2]))
+    return removed, added
+
+
+def _diff_rows(
+    old: str, new: str, width: int, cap: int | None = _DIFF_CAP
+) -> list[list[tuple[str, str]]]:
+    """str_replace 确认预览：每行是 (样式, 文本) 片段序列的 unified diff
+    （带 2 行上下文），相邻的 -/+ 行配对做词级高亮——大段替换时用户真正
+    要看的是变了哪几个词，而不是两坨对不上位置的文本。
+
+    `width` 是这一行留给 diff 文本的列数（调用方已扣掉 "  │ " 前缀）；
+    带 -/+ 记号的行再自扣一列。
+    """
+    rows: list[list[tuple[str, str]]] = []
+    inner = max(width - 1, 20)
+    #  空串是"没有这一侧"（新建文件 / 整段删除），不是"一行空行"——否则新建文件
+    #  会多出一行假的 "-"，计数也跟着错一
+    old_lines = old.split("\n") if old else []
+    new_lines = new.split("\n") if new else []
+    if len(old_lines) + len(new_lines) > _DIFF_INPUT_LINES:
+        #  有界：difflib 在两坨几千行且彼此相似的文本上是平方级的，确认框会卡在
+        #  "算 diff"上没有任何回显。改动这么大时逐行比对也没人看得过来——
+        #  直接按"全删 / 全增"给出，仍然完整、仍然可用 Ctrl-O 看全文，只是不配对
+        rows.append(
+            [("text.secondary", f"改动过大（删 {len(old_lines)} 行、增 {len(new_lines)} 行），未逐行比对")]
+        )
+        rows.extend([("diff.removed", f"-{ui.preview(line, inner)}")] for line in old_lines)
+        rows.extend([("diff.added", f"+{ui.preview(line, inner)}")] for line in new_lines)
+        if cap is not None and len(rows) > cap:
+            remainder = len(rows) - cap
+            rows = rows[:cap] + [[("text.secondary", f"…还有 {remainder} 行")]]
+        return rows
+    raw = [
+        line
+        for line in difflib.unified_diff(old_lines, new_lines, n=2, lineterm="")
+        if not line.startswith(("---", "+++"))
+    ]
+    index = 0
+    while index < len(raw):
+        line = raw[index]
+        if line.startswith("@@"):
+            rows.append([("diff.hunk", ui.preview(line, width))])
+            index += 1
+            continue
+        if line.startswith("-"):
+            end_minus = index
+            while end_minus < len(raw) and raw[end_minus].startswith("-"):
+                end_minus += 1
+            end_plus = end_minus
+            while end_plus < len(raw) and raw[end_plus].startswith("+"):
+                end_plus += 1
+            minus_lines = raw[index:end_minus]
+            plus_lines = raw[end_minus:end_plus]
+            for offset, minus_line in enumerate(minus_lines):
+                old_text = ui.preview(minus_line[1:], inner)
+                if offset < len(plus_lines):
+                    new_text = ui.preview(plus_lines[offset][1:], inner)
+                    removed, added = _word_fragments(old_text, new_text)
+                    rows.append(removed)
+                    rows.append(added)
+                else:
+                    rows.append([("diff.removed", f"-{old_text}")])
+            for plus_line in plus_lines[len(minus_lines) :]:
+                rows.append([("diff.added", f"+{ui.preview(plus_line[1:], inner)}")])
+            index = end_plus
+            continue
+        style = "diff.added" if line.startswith("+") else "text.secondary"
+        rows.append([(style, ui.preview(line, width))])
+        index += 1
+    if cap is not None and len(rows) > cap:
+        remainder = len(rows) - cap
+        rows = rows[:cap] + [[("text.secondary", f"…还有 {remainder} 行")]]
+    return rows
+
+
+#  粘贴 chip 占位符：
+#  任意位置匹配用于提交前展开；行尾匹配用于退格原子删除
+_PASTE_REF = re.compile(r"\[粘贴 #(\d+) · \d+ 行\]")
+_PASTE_REF_TAIL = re.compile(r"\[粘贴 #\d+ · \d+ 行\]$")
+
+#  图片 chip：与文本 chip 同一套"旁路存储 + 占位符 + 退格原子删除"，但**提交时
+#  不展开成文本**——它要变成 content 里的一个图片部件（见 Tui._content_of）。
+#  文本 chip 那半是既有实现，这里只加媒体半边
+_IMAGE_REF = re.compile(r"\[图片 #(\d+)[^\]]*\]")
+_IMAGE_REF_TAIL = re.compile(r"\[图片 #\d+[^\]]*\]$")
+
+
+#  非按键类的轮播补充：收录标准与 keys.tips() 相同（"不主动说就没人会发现"），
+#  但主题不是键位、进不了按键绑定表，在这里独立维护。保持短句。
+_EXTRA_TIPS = (
+    "常用 auto 档？xiaoyu config --set XIAOYU_MODE=auto 设为个人默认",
+)
+
+#  轮播起点逐实例推进：单次运行的展示窗口（_QUIET→_LONG）只够放三四条，
+#  恒从表头开始的话表尾的提示永远轮不到——12+ 条里只有前 4 条见过天日
+_TIP_START = itertools.count()
+
+
+class _RunningLine:
+    """活区 spinner 的文案：rich 的刷新线程每帧重新渲染它，耗时随之跳动。
+
+    三段式：
+
+    - 前 `_QUIET` 秒只报名字和耗时。绝大多数工具一闪而过，在那半秒里插花活
+      纯属打扰；
+    - 之后开始轮播上手提示，把等待时间变成教学位——Ctrl-O、@、# 这些功能
+      没人会主动去发现，而这正是用户闲着盯屏幕的时刻。按键类提示取自
+      按键绑定表，非按键类（环境变量一类）在 _EXTRA_TIPS 补充；起点
+      逐实例推进（_TIP_START），跨运行轮完整张表；
+    - 超过 `_LONG` 秒改报"已跑多久 / 上限多久"。"长时间没有输出就另行提示"
+      的思路在这里不成立（工具是同步执行、结果一次性返回的，执行期间本就
+      没有输出），但它想解决的问题——用户不知道该不该继续等——是真的。
+      对 bash 来说，剩余的超时预算才是能回答这个问题的信息。
+    """
+
+    _QUIET = 4.0  # 这之前不打扰
+    _CYCLE = 8.0  # 每条提示停留多久
+    _LONG = 30.0  # 这之后换成耗时/上限
+
+    def __init__(self, name: str, timeout: int | None = None, verb: str = "运行中") -> None:
+        self.name = name
+        self.timeout = timeout
+        self.verb = verb
+        #  见 _TIP_START：跨运行把整张提示表轮完，而不是每次都从头四条开始
+        self._tip_start = next(_TIP_START)
+        self.started = time.monotonic()
+        #  工具自报的进度（tool.progress 事件写入，刷新线程读）：有它就顶掉轮播
+        #  提示——"第 3/10 步 · 正在下载"比上手提示更回答"还要等多久"
+        self.progress = ""
+
+    def __rich__(self) -> Text:
+        elapsed = time.monotonic() - self.started
+        suffix = self.progress or self._suffix(elapsed)
+        return Text(
+            f"{self.name} {self.verb} · {elapsed:.0f}s · {suffix}",
+            style="text.secondary",
+        )
+
+    def _suffix(self, elapsed: float) -> str:
+        if elapsed >= self._LONG:
+            budget = f"上限 {self.timeout}s · " if self.timeout else ""
+            return f"{budget}Ctrl-C 中断"
+        if elapsed < self._QUIET:
+            return "Ctrl-C 中断"
+        rotation = [*keys.tips(), *_EXTRA_TIPS]
+        if not rotation:
+            return "Ctrl-C 中断"
+        index = (self._tip_start + int((elapsed - self._QUIET) // self._CYCLE)) % len(rotation)
+        return rotation[index]
+
+
+#  连续的只读探索工具折叠成一行汇总：
+#  coding agent 一半调用是这类，逐条打印会把真正的正文和写操作淹掉
+_RO_TOOLS = {"read_file": "读文件", "grep": "搜索", "list_files": "列目录"}
+
+#  标记 Console 已挂过语义主题，避免子 agent 共用 Console 时重复入栈
+_THEMED = "_xiaoyu_themed"
+
+
+def _syntax_theme() -> str:
+    """代码着色用的 pygments 主题跟随深浅模式：monokai 的亮字在白底上发灰。"""
+    return "monokai" if theme.mode() == "dark" else "default"
+
+
+def _restyle_tabs(line: str, row: Text) -> Text | None:
+    """把着色结果套回原行。rich 的 Syntax.highlight 会把 tab 展成空格（按单元格
+    位置对齐、tab 宽 4），而正文要逐字一致地打出去——Makefile / Go 里的 tab 换成
+    空格就不是原文了。没有 tab 时直接用着色行；有 tab 就把样式区间按单元格
+    位置映射回原行。映射对不上（rich 换了算法）返回 None，调用方退回明文。"""
+    if "\t" not in line:
+        return row if row.plain == line else None
+    from rich.cells import cell_len
+
+    #  expanded[i] = 原行第 i 个字符在展开后的起始下标；末尾补一个终点
+    expanded: list[int] = []
+    cell = 0
+    cursor = 0
+    for ch in line:
+        expanded.append(cursor)
+        if ch == "\t":
+            width = 1
+            remainder = (cell + 1) % _TAB_SIZE
+            if remainder:
+                width += _TAB_SIZE - remainder
+            cell += width
+            cursor += width
+        else:
+            cell += cell_len(ch)
+            cursor += 1
+    expanded.append(cursor)
+    if cursor != len(row.plain):
+        return None
+    #  展开后的下标 → 原行下标（tab 展出来的那几格都算回那个 tab）
+    back = [0] * (cursor + 1)
+    for original, start in enumerate(expanded[:-1]):
+        for offset in range(start, expanded[original + 1]):
+            back[offset] = original
+    back[cursor] = len(line)
+    out = Text(line)
+    for span in row.spans:
+        out.stylize(span.style, back[span.start], back[min(span.end, cursor)])
+    return out
+
+
+#  rich Syntax 展开 tab 的宽度（它的默认值），_restyle_tabs 据此反推位置
+_TAB_SIZE = 4
+
+
+class _StreamStyler:
+    """流式正文的行级轻渲染：每个字符只打一次、不重绘，scrollback 上永远稳定。
+
+    做的事（刻意少）：
+    - 代码围栏（``` / ~~~）内按行语法着色。着色拿整块已到的行做上下文（多行
+      字符串、块注释跨行时颜色才对），上限 _CODE_CONTEXT 行滑动窗口，成本有界；
+    - 围栏外：行内 `代码` 着 text.code、**粗体** 着 text.strong、# 标题整行
+      text.heading。标记符（反引号、星号、井号）**保留并弱化**而不是删掉——流式下
+      删了标记、后面发现没配对就改不回来；保留则复制出去的文本与模型原文逐字一致。
+
+    不做：列表符替换、链接、表格、斜体（单星 / 下划线在中文与代码路径里误伤太多）、
+    跨行的行内标记（换行即重置行内状态）。
+
+    缓冲只在三处短暂发生：行首定性（最多攒到看清是不是围栏 / 标题，通常 1–3 个
+    字符）、反引号 / 星号串的末尾（分片可能把标记切成两半）、围栏内攒到换行
+    （代码行短，为的是整行一起着色）。其余字符到了就打，流式手感与裸 print 一致。
+    """
+
+    _FENCE = re.compile(r"^ {0,3}(`{3,}|~{3,})[ \t]*([\w+#.-]*)")
+    #  行首还可能长成围栏 / 标题的前缀：再等几个字符
+    _MAYBE_FENCE = re.compile(r"^ {0,3}[`~]{1,2}$")
+    _HEADING = re.compile(r"^ {0,3}#{1,6} ")
+    _MAYBE_HEADING = re.compile(r"^ {0,3}#{1,6}$")
+    _CODE_CONTEXT = 200
+
+    def __init__(self, console: Console) -> None:
+        self.console = console
+        self._pending = ""
+        #  None = 行首未定性；"prose" / "heading" 两种行；围栏内看 _fence
+        self._kind: str | None = None
+        self._fence: str | None = None  # 围栏标记（``` 或 ~~~，可更长）
+        self._syntax: Syntax | None = None
+        self._code_lines: list[str] = []
+        self._span = 0  # 行内代码打开时的反引号数，0 = 没打开
+        self._strong = False
+
+    # ---------- 入口 ----------
+
+    def feed(self, text: str) -> None:
+        self._pending += text
+        self._drain(final=False)
+
+    def finish(self) -> None:
+        """正文结束 / 中断：把攒着的半行按当前状态打出去，并复位。"""
+        self._drain(final=True)
+        self._pending = ""
+        self._kind = None
+        self._fence = None
+        self._syntax = None
+        self._code_lines = []
+        self._span = 0
+        self._strong = False
+
+    # ---------- 状态机 ----------
+
+    def _drain(self, final: bool) -> None:
+        while self._pending:
+            newline = self._pending.find("\n")
+            if self._fence is not None:
+                if newline < 0 and not final:
+                    return
+                line, self._pending = self._split(newline)
+                self._code_line(line, complete=newline >= 0)
+                continue
+            if self._kind is None:
+                if not self._classify(newline, final):
+                    return
+                continue  # 定性后重新取行：围栏行已整行吃掉，prose / heading 走下面
+            head = self._pending if newline < 0 else self._pending[:newline]
+            complete = newline >= 0 or final
+            if self._kind == "heading":
+                self._emit(head, "text.heading")
+                consumed = len(head)
+            else:
+                consumed = self._prose(head, complete)
+            if newline < 0:
+                self._pending = head[consumed:]
+                return
+            self._pending = self._pending[newline + 1 :]
+            self._emit("\n")
+            self._kind = None
+            self._span = 0
+            self._strong = False
+
+    def _split(self, newline: int) -> tuple[str, str]:
+        if newline < 0:
+            return self._pending, ""
+        return self._pending[:newline], self._pending[newline + 1 :]
+
+    def _classify(self, newline: int, final: bool) -> bool:
+        """行首定性。返回 False 表示还看不出来、要等更多字符。"""
+        head = self._pending if newline < 0 else self._pending[:newline]
+        whole = newline >= 0 or final
+        match = self._FENCE.match(head)
+        if match is not None:
+            if not whole:
+                return False  # 围栏行要整行（语言名在后面）
+            self._emit(head, "text.secondary")
+            self._emit("\n")
+            self._pending = "" if newline < 0 else self._pending[newline + 1 :]
+            self._open_fence(match.group(1), match.group(2))
+            return True
+        if not whole and (self._MAYBE_FENCE.match(head) or self._MAYBE_HEADING.match(head)):
+            return False
+        self._kind = "heading" if self._HEADING.match(head) else "prose"
+        return True
+
+    def _open_fence(self, marker: str, lang: str) -> None:
+        self._fence = marker
+        self._code_lines = []
+        self._kind = None
+        try:
+            self._syntax = Syntax("", lang or "text", theme=_syntax_theme(), background_color="default")
+        except Exception:  # noqa: BLE001 - 认不得的语言名退回明文，不能因样式而炸
+            self._syntax = None
+
+    def _code_line(self, line: str, complete: bool) -> None:
+        assert self._fence is not None
+        closing = re.fullmatch(
+            r" {0,3}" + re.escape(self._fence[0]) + "{" + str(len(self._fence)) + r",}[ \t]*", line
+        )
+        if complete and closing is not None:
+            self._emit(line, "text.secondary")
+            self._emit("\n")
+            self._fence = None
+            self._syntax = None
+            self._code_lines = []
+            return
+        self._code_lines.append(line)
+        if len(self._code_lines) > self._CODE_CONTEXT:
+            del self._code_lines[: -self._CODE_CONTEXT]
+        row: Text | None = None
+        if self._syntax is not None:
+            try:
+                rows = self._syntax.highlight("\n".join(self._code_lines)).split("\n")
+                index = len(self._code_lines) - 1
+                if index < len(rows):
+                    row = _restyle_tabs(line, rows[index])
+            except Exception:  # noqa: BLE001 - 着色失败退回明文
+                row = None
+        self._write(row if row is not None else Text(line))
+        if complete:
+            self._emit("\n")
+
+    def _prose(self, head: str, complete: bool) -> int:
+        """围栏外的一行：边流边变色。返回消费了多少字符——行末的反引号 / 星号串
+        可能被分片切成两半，没看到串尾（且行没完）就留给下一片。"""
+        i, n = 0, len(head)
+        while i < n:
+            ch = head[i]
+            if ch == "`":
+                j = i
+                while j < n and head[j] == "`":
+                    j += 1
+                if j == n and not complete:
+                    break
+                run = j - i
+                if self._span == 0:
+                    self._span = run
+                    self._emit(head[i:j], "text.secondary")
+                elif self._span == run:
+                    self._span = 0
+                    self._emit(head[i:j], "text.secondary")
+                else:
+                    self._emit(head[i:j], "text.code")
+                i = j
+                continue
+            if ch == "*" and self._span == 0:
+                if i + 1 == n and not complete:
+                    break
+                if head[i + 1 : i + 2] == "*":
+                    self._strong = not self._strong
+                    self._emit("**", "text.secondary")
+                    i += 2
+                    continue
+            j = i + 1
+            while j < n and head[j] not in "`*":
+                j += 1
+            if self._span:
+                style = "text.code"
+            elif self._strong:
+                style = "text.strong"
+            else:
+                style = ""
+            self._emit(head[i:j], style)
+            i = j
+        return i
+
+    def _emit(self, text: str, style: str = "") -> None:
+        if not text:
+            return
+        fragment = Text(text)
+        if style:
+            #  以 span 而不是 Text(style=) 挂样式：Text.render 没有 span 时走快路径，
+            #  基础样式会被整个略过
+            fragment.stylize(style)
+        self._write(fragment)
+
+    def _write(self, text: Text) -> None:
+        """把带样式的片段原样写到终端。不走 console.print：rich 渲染时会把 tab
+        展成空格（Makefile / Go 的 tab 变空格就不是原文了），这里只借它把样式
+        片段编成 ANSI 码，字符本身一个不动。旧式 Windows 控制台不认 ANSI 码，
+        仍交给 rich 自己翻译（那里 tab 展开是可接受的代价）。"""
+        if self.console.legacy_windows:
+            self.console.print(text, end="", soft_wrap=True)
+            return
+        color_system = self.console._color_system  # noqa: SLF001 - rich 没有公开的枚举取法
+        parts = [
+            segment.style.render(segment.text, color_system=color_system)
+            if segment.style and color_system is not None
+            else segment.text
+            for segment in text.render(self.console, end="")
+        ]
+        self.console.file.write("".join(parts))
+        self.console.file.flush()
+
+
+class NoticeCapture:
+    """把 warnings 与 logging 收进事件流。
+
+    第三方库（httpx、urllib3…）随手 warn/log 是直接打到 stderr 的，而 stderr
+    不经过 Console，正好插进 spinner 活区把它搅花，还可能落在半行正文中间。
+    收口成 Notice 事件，交给 sink 统一在活区之上打印。
+
+    **刻意不劫持 stdout**：小羽自己的流式正文就是裸 print（见
+    RichSink._text_delta，那是为了绕开 rich 的按行渲染），全局劫持 stdout
+    会把自己的正文吃掉——整屏渲染的 TUI 才劫持得起，因为它们的正文
+    不走 stdout。
+
+    logging 只在根 logger 没有任何 handler 时接管：那种情况下日志会经
+    lastResort 打到 stderr（正是要拦的）；一旦宿主自己配过 logging，
+    那是人家的输出编排，不该抢。
+    """
+
+    def __init__(self, sink: "RichSink") -> None:
+        self.sink = sink
+        self._saved_showwarning: Any = None
+        self._handler: Any = None
+
+    def __enter__(self) -> "NoticeCapture":
+        import logging
+        import warnings
+
+        self._saved_showwarning = warnings.showwarning
+        warnings.showwarning = self._on_warning
+
+        root = logging.getLogger()
+        if not root.handlers:
+            self._handler = _NoticeHandler(self.sink)
+            root.addHandler(self._handler)
+        return self
+
+    def __exit__(self, *exc: Any) -> None:
+        import logging
+        import warnings
+
+        warnings.showwarning = self._saved_showwarning
+        if self._handler is not None:
+            logging.getLogger().removeHandler(self._handler)
+            self._handler = None
+
+    def _on_warning(self, message, category, filename, lineno, file=None, line=None) -> None:  # noqa: ANN001
+        #  只留"哪个类别、说了什么"：调用栈位置对用户没有意义，
+        #  真要排查的人会开 -W error
+        self.sink.emit(Notice(f"  {category.__name__}: {message}", "warn"))
+
+
+class _NoticeHandler:
+    """把 LogRecord 转成 Notice 的 logging handler。
+
+    不继承 logging.Handler 是为了让本模块在没装 tui 依赖时也别多拖一个
+    import——这里只需要 handle/level 这几个鸭子接口。
+    """
+
+    level = 0
+
+    def __init__(self, sink: "RichSink") -> None:
+        self.sink = sink
+
+    def handle(self, record: Any) -> None:
+        import logging
+
+        level: NoticeLevel = "info"
+        if record.levelno >= logging.ERROR:
+            level = "error"
+        elif record.levelno >= logging.WARNING:
+            level = "warn"
+        self.sink.emit(Notice(f"  {record.name}: {record.getMessage()}", level))
+
+    #  logging 在派发时会摸这几个属性
+    def createLock(self) -> None:  # noqa: N802 - logging 的接口名
+        pass
+
+    def acquire(self) -> None:
+        pass
+
+    def release(self) -> None:
+        pass
+
+
+class DedupedHistory(FileHistory):
+    """输入历史去重。
+
+    只去**连续**重复：反复回车重跑同一条指令是常态，不去重的话 ↑ 要按十几次
+    才能翻过上一批。间隔出现的相同输入保留——那里头有时序信息（"我又跑了一次
+    它"本身是事实），全局去重会把它抹掉。
+
+    读取时也去一遍：改这条之前写下的历史文件里已经堆了重复。
+    """
+
+    def load_history_strings(self) -> Iterable[str]:
+        previous: str | None = None
+        for item in super().load_history_strings():
+            if item != previous:
+                yield item
+            previous = item
+
+    def append_string(self, string: str) -> None:
+        #  _loaded_strings 是 prompt_toolkit 的"最近在前"缓存，第 0 项即上一条。
+        #  在这一层拦截而不是拦 store_string：否则文件去重了、本次会话的内存
+        #  历史里还留着重复，↑ 照样要多按几下。
+        recent = self._loaded_strings[0] if self._loaded_strings else None  # noqa: SLF001
+        if string == recent:
+            return
+        super().append_string(string)
+
+
+def _register(handlers: dict[str, Any], *categories: str) -> KeyBindings:
+    """按绑定表注册一组按键。
+
+    表与实现必须严丝合缝：表里带 keys 却没实现，帮助就在承诺一个按不动的键；
+    实现了却没进表，用户永远发现不了它。两种情况都当场抛，不留给运行期。
+    """
+    wanted = keys.registered_in(*categories)
+    if wanted != handlers.keys():
+        missing = ", ".join(sorted(wanted - handlers.keys())) or "无"
+        extra = ", ".join(sorted(handlers.keys() - wanted)) or "无"
+        raise RuntimeError(f"按键表与实现不一致：表里缺实现 [{missing}]，实现未进表 [{extra}]")
+    bindings = KeyBindings()
+    for item in keys.BINDINGS:
+        handler = handlers.get(item.command)
+        if handler is None:
+            continue
+        for combo in item.keys:
+            bindings.add(*combo)(handler)
+    return bindings
+
+
+def _enter_is_pasted(event: Any) -> bool:
+    """这个回车是不是粘贴里夹带的换行（而不是人按的提交）。
+
+    正常终端靠 bracketed paste 把整段粘贴包成一个事件；tmux 未透传、部分
+    输入法与远程终端下这层包装丢了，粘贴里的换行就以回车按键到达，逐行提交。
+    判据是"回车后面还有同一批到达的输入"：终端一次交付的字节在
+    prompt_toolkit 里会整批 feed 进 key_processor 的队列再逐键处理，人手按键
+    间隔远大于一次读取，回车跑到这里时队列必然已空；只有粘贴、程序化输入
+    才会让回车身后还排着按键。
+
+    - 队列里的光标位置应答（CPR）是终端对重绘的回话，不算输入；
+    - 大段粘贴会被分成多次 read（每次 1024 字节），回车恰好落在一批末尾时
+      队列是空的：posix 下再无等待地看一眼 stdin 是否仍可读，可读就照
+      prompt_toolkit 自己的路径读进来排进队列再判——零等待，正常回车不多耽搁
+      一毫秒；
+    - Windows 的输入层自带粘贴识别（同批里夹换行的文本合成一次粘贴事件），
+      只做队列判断，不碰 stdin。
+    """
+    from prompt_toolkit.keys import Keys
+
+    processor = event.key_processor
+
+    def queued() -> bool:
+        return any(press.key != Keys.CPRResponse for press in processor.input_queue)
+
+    if queued():
+        return True
+    if os.name != "posix":
+        return False
+    app_input = event.app.input
+    try:
+        import select
+
+        if not select.select([app_input.fileno()], [], [], 0)[0]:
+            return False
+        processor.feed_multiple(app_input.read_keys())
+    except Exception:  # noqa: BLE001 - 看不了就按普通回车提交，绝不能吞掉用户的回车
+        return False
+    return queued()
+
+
+def apply_theme(console: Console) -> None:
+    """把语义 token 挂到 Console 上，之后 `style="status.error"` 才认得。
+
+    对传进来的 Console 也要挂（测试和调用方都可能自带 Console），所以用标记
+    位保证栈深恒为 1。`theme.set_mode()` 之后重新调用即可换肤——已经打出去的
+    内容改不了，换肤只对之后的输出生效。
+    """
+    if getattr(console, _THEMED, False):
+        console.pop_theme()
+    console.push_theme(RichTheme(theme.rich_theme()))
+    setattr(console, _THEMED, True)
+
+
+def inline_select(
+    title: str,
+    options: list[tuple[Any, str, str]],
+    amend: bool = True,
+    expand: Callable[[], None] | None = None,
+) -> Any:
+    """不进 alt-screen 的行内单选菜单（确认框与会话选择共用的通用件）。
+
+    按键由 keys.BINDINGS 的「确认菜单」分类驱动（底部提示也从表渲染）。
+    options 每项 (返回值, 标签, 快捷键)；数字直选只绑前 9 项（"10" 会被
+    prompt_toolkit 当成 1、0 两键序列，让 "1" 陷入歧义等待）。
+    amend=True 时 Tab 返回 ("amend", 选中值)（确认框的"批准并附言"）；
+    amend=False 时 Tab 等同 Enter，提示行也不再承诺附言。
+    expand 非空时 Ctrl-O 调它补打全文（确认框预览被截断时传入；打进
+    scrollback 定格，菜单原地重画——刻意不进 pager/alt-screen，
+    保持与 Ctrl-O 详情回放同构的补打形态）；为 None 则该键 no-op
+    且提示行不承诺它。
+    取消返回 None。菜单退出即擦除（erase_when_done），决定由调用方回显
+    一行定格进 scrollback。
+    """
+    selected = 0
+    expanded = False
+
+    def _up(event: Any) -> None:
+        nonlocal selected
+        selected = (selected - 1) % len(options)
+
+    def _down(event: Any) -> None:
+        nonlocal selected
+        selected = (selected + 1) % len(options)
+
+    def _accept(event: Any) -> None:
+        event.app.exit(result=options[selected][0])
+
+    def _amend(event: Any) -> None:
+        if amend:
+            event.app.exit(result=("amend", options[selected][0]))
+        else:
+            event.app.exit(result=options[selected][0])
+
+    def _cancel(event: Any) -> None:
+        event.app.exit(result=None)
+
+    def _expand(event: Any) -> None:
+        #  一次性：全文已定格进 scrollback，再按只会重复倾倒同一坨
+        nonlocal expanded
+        if expand is None or expanded:
+            return
+        expanded = True
+        run_in_terminal(expand)
+
+    bindings = _register(
+        {
+            "menu.up": _up,
+            "menu.down": _down,
+            "menu.accept": _accept,
+            "menu.amend": _amend,
+            #  Space 勾选只属于提问面板的多选题；确认菜单里按下不能有任何效果
+            #  （若当确认键，误触空格=误批准）
+            "menu.toggle": lambda event: None,
+            "menu.expand": _expand,
+            "menu.cancel": _cancel,
+        },
+        keys.MENU,
+    )
+
+    def bind_choice(value: Any):
+        def handler(event: Any) -> None:
+            event.app.exit(result=value)
+
+        return handler
+
+    for index, (value, _label, shortcut) in enumerate(options):
+        if index < 9:
+            bindings.add(str(index + 1))(bind_choice(value))
+        if shortcut:
+            bindings.add(shortcut)(bind_choice(value))
+
+    #  提示行不承诺没有效果的键：无附言语义剔 Tab、无全文可看剔 Ctrl-O、
+    #  敲字过滤只属于会话选择器（search_select）
+    exclude = ["menu.toggle", "menu.filter"] if amend else ["menu.amend", "menu.toggle", "menu.filter"]
+    if expand is None:
+        exclude.append("menu.expand")
+    hint = keys.menu_hint(exclude=tuple(exclude))
+
+    def fragments() -> list[tuple[str, str]]:
+        #  class 名是 theme 的 token 把点换成横杠（ptk 的 class 不能带点）
+        rows: list[tuple[str, str]] = [("class:menu-title", f"  {title}\n")]
+        for index, (_value, label, shortcut) in enumerate(options):
+            marks = [str(index + 1)] if index < 9 else []
+            if shortcut:
+                marks.append(shortcut)
+            tail = f"  ({'/'.join(marks)})" if marks else ""
+            if index == selected:
+                rows.append(("class:menu-selected", f"  ❯ {label}{tail}\n"))
+            else:
+                rows.append(("", f"    {label}{tail}\n"))
+        rows.append(("class:menu-hint", f"    {hint}"))
+        return rows
+
+    window = Window(
+        FormattedTextControl(fragments, focusable=True, show_cursor=False),
+        height=len(options) + 2,
+        always_hide_cursor=True,
+    )
+    application: Application = Application(
+        layout=Layout(window),
+        key_bindings=bindings,
+        full_screen=False,
+        erase_when_done=True,
+        style=Style.from_dict(theme.ptk_style()),
+    )
+    return application.run()
+
+
+def search_select(
+    title: str, options: list[tuple[Any, str, str]], visible: int = 10
+) -> Any:
+    """带过滤的行内单选（会话选择器用）：敲字即按词过滤，↑↓ 选、Enter 定、Esc 取消。
+
+    与 inline_select 同一套菜单键（表驱动，底部提示同源），差别只在"敲字"：
+    - 所有可打印字符进过滤串（空格分词、每个词都命中才显示，不分大小写），
+      Backspace 删字；过滤规则在 ui.matches_query，明文 REPL 的编号输入同一条；
+    - 因此**没有数字直选**——会话列表里时间戳、序号都是数字，敲 "0809" 是在找
+      8 月 9 日的会话而不是跳到第 0 项。行前的序号沿用原列表的编号，过滤后不变，
+      `/resume <序号>` 照旧有效；
+    - 只显示 `visible` 行，更多的说"还有 N 个，继续输入缩小范围"，选中项超出
+      窗口时整窗跟着滚；高度恒定，不随匹配数跳。
+    options 每项 (返回值, 标签, 快捷键)，快捷键在这里忽略（字母都进过滤串）。
+    """
+    from prompt_toolkit.keys import Keys
+
+    query = ""
+    selected = 0
+    numbered = [(index + 1, value, label) for index, (value, label, _shortcut) in enumerate(options)]
+
+    def matches() -> list[tuple[int, Any, str]]:
+        return [item for item in numbered if ui.matches_query(item[2], query)]
+
+    def _move(delta: int) -> None:
+        nonlocal selected
+        count = len(matches())
+        if count:
+            selected = (min(selected, count - 1) + delta) % count
+
+    def _accept(event: Any) -> None:
+        found = matches()
+        if found:
+            event.app.exit(result=found[min(selected, len(found) - 1)][1])
+
+    def _cancel(event: Any) -> None:
+        event.app.exit(result=None)
+
+    def _typed(text: str) -> None:
+        nonlocal query, selected
+        if text and text.isprintable():
+            query += text
+            selected = 0
+
+    def _backspace(event: Any) -> None:
+        nonlocal query, selected
+        query = query[:-1]
+        selected = 0
+
+    bindings = _register(
+        {
+            "menu.up": lambda event: _move(-1),
+            "menu.down": lambda event: _move(1),
+            "menu.accept": _accept,
+            "menu.amend": _accept,  # 纯单选，Tab 等同 Enter
+            "menu.toggle": lambda event: _typed(" "),  # 空格是过滤串的分词符
+            "menu.expand": lambda event: None,
+            "menu.cancel": _cancel,
+        },
+        keys.MENU,
+    )
+    bindings.add("backspace")(_backspace)
+    #  其余单键一律当输入（Keys.Any 排在精确绑定之后，不会抢走 ↑↓ / Enter / Esc）
+    bindings.add(Keys.Any)(lambda event: _typed(event.data))
+
+    hint = keys.menu_hint(exclude=("menu.amend", "menu.toggle", "menu.expand"))
+
+    def fragments() -> list[tuple[str, str]]:
+        rows: list[tuple[str, str]] = [
+            ("class:menu-title", f"  {title}\n"),
+            ("", f"  过滤：{query}"),
+            ("class:menu-hint", "▏\n"),
+        ]
+        found = matches()
+        current = min(selected, max(len(found) - 1, 0))
+        start = max(0, current - visible + 1)
+        shown = found[start : start + visible]
+        for offset, (number, _value, label) in enumerate(shown):
+            if start + offset == current:
+                rows.append(("class:menu-selected", f"  ❯ {number:>2}. {label}\n"))
+            else:
+                rows.append(("", f"    {number:>2}. {label}\n"))
+        if not found:
+            rows.append(("class:menu-hint", "    （没有匹配项，Backspace 删字）\n"))
+        #  补空行把高度撑恒定：匹配数变了菜单不跳
+        for _ in range(visible - len(shown) - (0 if found else 1)):
+            rows.append(("", "\n"))
+        hidden = len(found) - len(shown)
+        more = f"…还有 {hidden} 个，继续输入缩小范围 · " if hidden else ""
+        rows.append(("class:menu-hint", f"    {more}{hint}"))
+        return rows
+
+    window = Window(
+        FormattedTextControl(fragments, focusable=True, show_cursor=False),
+        height=visible + 3,
+        always_hide_cursor=True,
+    )
+    application: Application = Application(
+        layout=Layout(window),
+        key_bindings=bindings,
+        full_screen=False,
+        erase_when_done=True,
+        style=Style.from_dict(theme.ptk_style()),
+    )
+    return application.run()
+
+
+#  提问面板自动附加的自由输入项（模型不许自己造「其他」，
+#  系统统一加，保证它永远存在且行为一致）
+OTHER_LABEL = "其他（自由输入）"
+CANCEL_QUESTION_LABEL = "取消提问，返回对话"
+
+
+def question_select(
+    title: str,
+    options: list[tuple[str, str]],
+    multi: bool = False,
+    checked: set[int] | None = None,
+    selected: int = 0,
+    cancel_index: int | None = None,
+) -> int | list[int] | None:
+    """ask_user 的行内选择面板（inline 形态）。
+
+    与 inline_select 的差异：options 是 (标签, 说明) 而非 (值, 标签, 快捷键)
+    ——说明另起一行淡色显示（模型给的选项没有快捷键可言，数字直选就够）；
+    multi=True 时 Space/数字是勾选开关、Enter 提交勾选集合。
+    返回：单选 → 选中项下标；多选 → 勾选下标列表（显示顺序）；取消 → None。
+    cancel_index 指向取消操作行，单选与多选下都立即取消，不作为答案提交。
+    面板退出即擦除，答案由调用方回显一行定格进 scrollback（与确认框同一纪律）。
+    """
+    marked: set[int] = set(checked or ())
+    cursor = min(max(selected, 0), len(options) - 1)
+
+    def _up(event: Any) -> None:
+        nonlocal cursor
+        cursor = (cursor - 1) % len(options)
+
+    def _down(event: Any) -> None:
+        nonlocal cursor
+        cursor = (cursor + 1) % len(options)
+
+    def _accept(event: Any) -> None:
+        if cursor == cancel_index:
+            event.app.exit(result=None)
+        elif multi:
+            event.app.exit(result=sorted(marked))
+        else:
+            event.app.exit(result=cursor)
+
+    def _toggle(event: Any) -> None:
+        if cursor == cancel_index:
+            event.app.exit(result=None)
+        elif multi:
+            marked.symmetric_difference_update({cursor})
+
+    def _cancel(event: Any) -> None:
+        event.app.exit(result=None)
+
+    bindings = _register(
+        {
+            "menu.up": _up,
+            "menu.down": _down,
+            "menu.accept": _accept,
+            #  这里没有"批准并附言"语义，Tab 等同 Enter（与纯单选菜单一致）
+            "menu.amend": _accept,
+            "menu.toggle": _toggle,
+            #  提问面板没有被截断的预览，Ctrl-O 无事可做
+            "menu.expand": lambda event: None,
+            "menu.cancel": _cancel,
+        },
+        keys.MENU,
+    )
+
+    def bind_digit(index: int):
+        def handler(event: Any) -> None:
+            nonlocal cursor
+            cursor = index
+            if index == cancel_index:
+                event.app.exit(result=None)
+            elif multi:
+                marked.symmetric_difference_update({index})
+            else:
+                event.app.exit(result=index)
+
+        return handler
+
+    for index in range(min(len(options), 9)):
+        bindings.add(str(index + 1))(bind_digit(index))
+
+    exclude = (
+        ("menu.amend", "menu.expand", "menu.filter")
+        if multi
+        else ("menu.amend", "menu.toggle", "menu.expand", "menu.filter")
+    )
+    hint = keys.menu_hint(exclude=exclude)
+
+    def fragments() -> list[tuple[str, str]]:
+        rows: list[tuple[str, str]] = [("class:menu-title", f"  {title}\n")]
+        for index, (label, description) in enumerate(options):
+            mark = f"[{'✓' if index in marked else ' '}] " if multi and index != cancel_index else ""
+            tail = f"  ({index + 1})" if index < 9 else ""
+            if index == cursor:
+                rows.append(("class:menu-selected", f"  ❯ {mark}{label}{tail}\n"))
+            else:
+                rows.append(("", f"    {mark}{label}{tail}\n"))
+            if description:
+                rows.append(("class:menu-hint", f"      {'    ' if multi else ''}{description}\n"))
+        rows.append(("class:menu-hint", f"    {hint}"))
+        return rows
+
+    height = 2 + len(options) + sum(1 for _label, description in options if description)
+    window = Window(
+        FormattedTextControl(fragments, focusable=True, show_cursor=False),
+        height=height,
+        always_hide_cursor=True,
+    )
+    application: Application = Application(
+        layout=Layout(window),
+        key_bindings=bindings,
+        full_screen=False,
+        erase_when_done=True,
+        style=Style.from_dict(theme.ptk_style()),
+    )
+    return application.run()
+
+
+def ask_questions(questions: list[dict[str, Any]], console: Console) -> dict[str, str]:
+    """ask_user 工具的 TUI 侧交互：顺序逐题问，返回 {问题: 答案}。
+
+    多题刻意**不做 Tab 分页**：行内面板 erase_when_done、一次一屏，
+    顺序逐题 + 答完回显一行定格，才是"补打 scrollback"哲学下的自然形态
+    （分页属于常驻面板的交互，与 inline 约束相反）。题号进标题（"（1/3）"）。
+
+    「其他」项自动附加在每题末尾；选中后转行内自由输入，Esc 放弃输入退回
+    面板，已敲的草稿保留、下次进入预填。
+    多选题勾了「其他」时，提交前先问自由输入，与勾选项合并成一个答案。
+    面板上 Esc / Ctrl-C / 取消项 = 结束本轮并返回对话，已答部分交给工具层保留。
+    """
+    answers: dict[str, str] = {}
+    total = len(questions)
+    session: PromptSession | None = None
+
+    def prompt_other(draft: str) -> str | None:
+        """自由输入一行；Esc/Ctrl-C/EOF → None（退回面板，草稿由调用方保留）。"""
+        nonlocal session
+        if session is None:
+            session = PromptSession()
+        try:
+            return session.prompt(
+                [(theme.ptk("menu.title"), "  自由回答：")], default=draft
+            ).strip()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            return None
+
+    for number, item in enumerate(questions, start=1):
+        #  问题与选项是模型写的：显示前去掉控制字符（见 ui.strip_controls）。
+        #  答案字典的键仍用问题原文——_ask_user 按原文判定哪些题被跳过
+        rows = [
+            (ui.strip_controls(str(option.get("label", ""))),
+             ui.strip_controls(str(option.get("description", ""))))
+            for option in item["options"]
+        ]
+        rows.append((OTHER_LABEL, ""))
+        other_index = len(rows) - 1
+        rows.append((CANCEL_QUESTION_LABEL, "结束本轮，保留已答内容"))
+        cancel_index = len(rows) - 1
+        multi = bool(item.get("multi_select"))
+        title = ui.strip_controls(item["question"]) + (f"（{number}/{total}）" if total > 1 else "")
+        draft = ""
+        checked: set[int] = set()
+        cursor = 0
+        answer: str | None = None
+        while True:
+            try:
+                result = question_select(
+                    title, rows, multi=multi, checked=checked, selected=cursor,
+                    cancel_index=cancel_index,
+                )
+            except Exception:  # noqa: BLE001 - 非常规终端起不了面板：退回文本问答，提问永远可用
+                from .cli import ask_one_text
+
+                result = None
+                answer = ask_one_text(item, position=f"{number}/{total}" if total > 1 else "")
+                break
+            if result is None:
+                break  # Esc：剩余问题不问了
+            if multi:
+                checked = set(result)
+                labels = [rows[i][0] for i in sorted(checked) if i != other_index]
+                if other_index in checked:
+                    text = prompt_other(draft)
+                    if text is None:
+                        cursor = other_index
+                        continue
+                    draft = text
+                    if not text and not labels:
+                        continue  # 只勾了「其他」却没写内容：留在面板
+                    answer = ", ".join([*labels, text] if text else labels)
+                    break
+                if not labels:
+                    continue  # 空提交无意义，留在面板
+                answer = ", ".join(labels)
+                break
+            if result == other_index:
+                text = prompt_other(draft)
+                if not text:
+                    draft = text if text is not None else draft
+                    cursor = other_index
+                    continue
+                answer = text
+                break
+            answer = rows[result][0]
+            break
+        if answer is None:
+            return _CancelledAnswers(answers)
+        answers[item["question"]] = answer
+        console.print(
+            Text(f"  ✔ {ui.strip_controls(item['question'])}：{ui.strip_controls(answer)}",
+                 style="text.secondary")
+        )
+    return answers
+
+
+class RichSink:
+    """rich 渲染的 UISink：四态工具生命周期的渐进式披露。
+
+    - tool.pending   一行 ● 锚点（权限确认也发生在它下面）；
+                     连续只读工具不逐条打，攒进折叠组
+    - tool.running   活区 spinner（rich Status，transient：结束即消失，
+                     scrollback 不留刷新残迹）
+    - tool.completed 折叠成一行 ⎿ 摘要（绿）+ 耗时；出错 ✗（红）自动展开头几行；
+                     detail 开关（输入行按 Ctrl-O）打开时成功输出完整展开不截断；
+                     只读折叠组在非终结事件到来时汇成一行 ⎿ 读文件 ×2 · 搜索 ×1
+    - tool.denied    一行 ⨯ 定格（黄；deny 规则拦截 / 用户拒绝）
+
+    indent/verbose 语义与 PlainSink 的 quiet 子 agent 对齐。子 agent 必须共用
+    同一个 Console（quiet_child）：rich 的 Live 只能把**同一个** Console 的
+    输出抬到活区上方，子 agent 自建 Console 或裸 print 会把 spinner 搅花。
+
+    全部走 Text 对象拼装，不吃 rich markup——工具参数里出现 `[` 不会炸样式。
+    """
+
+    _ERROR_LINES = 8  # 出错时自动展开的行数
+    _REPLAY_LINES = 200  # 回放留底时单项上限（防一次 read_file 大文件把终端打爆）
+
+    def __init__(self, console: Console | None = None, indent: str = "", verbose: bool = True) -> None:
+        #  highlight=False：不要 rich 的自动语法猜测把路径/数字染得花花绿绿；
+        #  soft_wrap=True：长行交给终端换行，不按面板宽度硬折（与 print 行为一致）
+        self.console = console or Console(highlight=False, soft_wrap=True)
+        apply_theme(self.console)
+        self.indent = indent
+        self.verbose = verbose
+        #  Ctrl-O 切换。inline 模式改不了已滚出的 scrollback，开关只对之后的输出生效
+        self.detail = False
+        #  本轮是否有输出被折叠。提示不在每个折叠行后面重复，而是攒到这一轮
+        #  收尾统一提一次（溢出是
+        #  一个全局状态，不是每行的属性）
+        self.truncated = False
+        #  被折叠内容的留底：(锚点行, 正文行)。inline 模式改不了已打出的
+        #  scrollback，但可以往后补打——Ctrl-O 开详情时回放这份留底，
+        #  "还有 N 行"才不是一句永远兑现不了的空话
+        #  正文行是 str，或 (样式, 文本) 片段序列（编辑工具的 diff 行要带红绿）
+        self.folded: list[tuple[str, list[Any]]] = []
+        #  折叠组内只读调用的参数预览（顺序执行，pending→completed 严格配对，
+        #  单格暂存即可）：回放时锚点行要能自报家门
+        self._pending_ro = ""
+        #  编辑类工具 pending 时拍的快照 (路径, 改前, 改后)：完成时据此算 +N −M 与 diff。
+        #  write_file 的"改前"要在工具动手之前读磁盘，所以必须在 pending 时取。
+        #  确认框已经把 diff 预览打进 scrollback 的，note_previewed 会清掉它，不重复补
+        self._edit: tuple[str, str, str] | None = None
+        #  相对路径按工作区解析（Tui.run 回填）；没有就按当前目录
+        self.workspace: Path | None = None
+        #  超时上限（Tui.run 拿到 agent 后回填）：spinner 跑久了要报预算，
+        #  "还剩多少"才是用户判断该不该继续等的依据
+        self.bash_timeout: int | None = None
+        self.request_timeout: int | None = None
+        self._status: Any | None = None
+        #  活区正在画的那一行（tool.progress 往上面写进度；spinner 收掉即清）
+        self._running_line: _RunningLine | None = None
+        self._preparing_request = False
+        self._preparing_index: int | None = None
+        self._ro_counts: dict[str, int] = {}
+        #  当前正文块是否已打开 OSC 133 锚点（TextEnd 负责收束配对），
+        #  语义与 PlainSink 对齐，见 render.OSC133_TEXT_START 的注释
+        self._osc133_open = False
+        #  流式正文的行级轻渲染器：只在真终端上起用（管道 / 测试的 StringIO
+        #  仍是逐字节直出），TextEnd 与中断路径负责把它手里的半行冲出去
+        self._styler: _StreamStyler | None = None
+        self._handlers = {
+            RequestStarted: self._request_started,
+            RequestEnded: self._request_ended,
+            TextDelta: self._text_delta,
+            TextEnd: self._text_end,
+            ToolPending: self._tool_pending,
+            ToolPreparing: self._tool_preparing,
+            ToolPurpose: self._tool_purpose,
+            ToolRunning: self._tool_running,
+            ToolProgress: self._tool_progress,
+            ToolCompleted: self._tool_completed,
+            ToolDenied: self._tool_denied,
+            PlanUpdated: self._plan,
+            SteerAccepted: self._steer,
+            Notice: self._notice,
+            ArtifactsReady: self._artifacts,
+            Suggestions: self._suggestions,
+        }
+        #  轮末「接着问」的接手方（Tui 接线）：它知道提示符挂没挂着、怎么喂输入行的
+        #  幽灵建议。没人接手就只打一行
+        self.on_suggestions: Callable[[list[str]], None] | None = None
+
+    def emit(self, event: UIEvent) -> None:
+        handler = self._handlers.get(type(event))
+        if handler is not None:
+            #  终端注入面：模型正文与工具输出可能夹带转义序列（见 ui.strip_controls）
+            handler(render.sanitize_event(event))
+
+    def _artifacts(self, event: ArtifactsReady) -> None:
+        if self.verbose:
+            self._notice(Notice(render.artifact_summary(event)))
+
+    def quiet_child(self, indent: str = "    ") -> "RichSink":
+        """给子 agent 的静默 sink：共用 Console、带缩进、不刷正文、不开 spinner。"""
+        return RichSink(self.console, indent=indent, verbose=False)
+
+    def interrupt(self) -> None:
+        """中断/异常路径的清扫：spinner 若还在转就停掉，折叠组落盘，避免悬空。"""
+        self._stop_status()
+        self._preparing_request = False
+        self._edit = None
+        self._flush_text()
+        self._flush_ro_group()
+
+    def note_previewed(self) -> None:
+        """确认框已把这次编辑的预览（diff / 新内容）打进 scrollback：完成行不再补。"""
+        self._edit = None
+
+    def _flush_text(self) -> None:
+        """把行级渲染器攒着的半行打出去（TextEnd / 中断都要调：没有换行的末行
+        不能跟着中断一起消失）。"""
+        if self._styler is not None:
+            self._styler.finish()
+
+    def begin_turn(self) -> None:
+        """一轮开始：清掉上一轮的折叠标记与留底（收尾的 Ctrl-O 提示据此判断）。"""
+        self.truncated = False
+        self.folded = []
+
+    def _budget(self, reserve: int) -> int:
+        """本行留给正文的列数。以 Console 的宽度为准（它知道自己写到哪去了，
+        管道/测试里也有确定值），不去问 shutil。"""
+        return ui.budget(len(self.indent) + reserve, self.console.width)
+
+    def _stop_status(self) -> None:
+        if self._status is not None:
+            with contextlib.suppress(Exception):
+                self._status.stop()
+            self._status = None
+        self._running_line = None
+
+    def _flush_ro_group(self) -> None:
+        """只读折叠组落盘：遇到任何非只读事件（或一轮结束）时汇成一行。
+
+        折叠组里只收 ok 的只读调用；出错的不进组（错误必须展开可见）。
+        """
+        if not self._ro_counts:
+            return
+        parts = [f"{_RO_TOOLS[name]} ×{count}" for name, count in self._ro_counts.items()]
+        self._ro_counts = {}
+        if not self.detail:
+            self.truncated = True
+        self.console.print(
+            Text(f"{self.indent}  ⎿ {' · '.join(parts)}", style="text.secondary")
+        )
+
+    def _request_started(self, event: RequestStarted) -> None:
+        """等模型的活区指示。补上"请求已发出、还没有任何输出"这段空白——
+        以前这里什么都不画，用户无从判断它在干活还是卡死了。"""
+        self._preparing_request = True
+        self._preparing_index = None
+        self._flush_ro_group()
+        if not self.verbose or not self.console.is_terminal:
+            return
+        self._stop_status()
+        self._status = self.console.status(
+            _RunningLine(event.model, self.request_timeout, verb="思考中"), spinner="dots"
+        )
+        with contextlib.suppress(Exception):
+            self._status.start()
+
+    def _request_ended(self, event: RequestEnded) -> None:
+        #  兜底：正常路径上活区早在首个正文/工具行时就收掉了，这里管的是
+        #  "一个字都没吐出来就结束"（空响应、异常、Ctrl-C）
+        self._stop_status()
+        self._preparing_request = False
+        self._preparing_index = None
+
+    def _tool_preparing(self, event: ToolPreparing) -> None:
+        if not self._preparing_request or not self.verbose or not self.console.is_terminal:
+            return
+        if self._running_line is None or self._preparing_index != event.index:
+            self._stop_status()
+            self._preparing_index = event.index
+            self._running_line = _RunningLine(event.name, verb="生成参数中")
+            self._status = self.console.status(self._running_line, spinner="dots")
+            with contextlib.suppress(Exception):
+                self._status.start()
+        self._running_line.progress = ui.fit(render.preparation_text(event), width=self.console.width)
+
+    def _text_delta(self, event: TextDelta) -> None:
+        #  正文是裸 print，活区必须先收掉，否则 rich 的刷新线程会和它抢同一片
+        #  屏幕（RichSink 文档注释里那条"裸 print 会把 spinner 搅花"）
+        self._stop_status()
+        self._flush_ro_group()
+        if not self.verbose:
+            return
+        if not self._osc133_open and self.console.is_terminal:
+            #  正文块起点的零宽锚点：终端把每段回复当可导航的"提示块"
+            print(end=render.OSC133_TEXT_START)
+            self._osc133_open = True
+        if self.console.is_terminal:
+            #  真终端：行级轻渲染（代码围栏着色、行内代码/粗体/标题变色），
+            #  每个字符仍只打一次，不重绘
+            if self._styler is None:
+                self._styler = _StreamStyler(self.console)
+            self._styler.feed(event.text)
+            return
+        #  非终端：流式分片直出，绕过 rich（它按行工作，逐分片 print 会插换行）
+        print(event.text, end="", flush=True)
+
+    def _text_end(self, event: TextEnd) -> None:
+        self._flush_ro_group()
+        if self.verbose:
+            self._flush_text()
+            if self._osc133_open:
+                print(end=render.OSC133_TEXT_END)
+                self._osc133_open = False
+            print()
+
+    def _tool_pending(self, event: ToolPending) -> None:
+        #  模型决定调工具了，"思考中"到此为止（接下来是工具自己的 spinner）
+        self._stop_status()
+        if event.name in _RO_TOOLS and not self.detail:
+            #  进折叠组，等 completed 计数、汇总时一起出；spinner 照常给活信号。
+            #  参数预览先记下：回放留底时锚点行要说清读的是哪个文件/搜的是什么
+            self._pending_ro = args_preview(
+                event.name, event.args, len(self.indent) + len(event.name) + 3, self.console.width
+            )
+            return
+        self._flush_ro_group()
+        self._edit = self._edit_snapshot(event.name, event.args) if event.name in _EDIT_TOOLS else None
+        #  "● 工具名 " 之后才是参数预览，预算要把这一截先扣掉
+        preview = args_preview(
+            event.name, event.args, len(self.indent) + len(event.name) + 3, self.console.width
+        )
+        self.console.print(
+            Text.assemble(
+                (f"{self.indent}● {event.name}", "text.accent"),
+                (f" {preview}", "text.secondary"),
+            )
+        )
+
+    def _edit_snapshot(self, name: str, args: dict[str, Any]) -> tuple[str, str, str] | None:
+        """编辑动手之前记下 (路径, 改前, 改后)。str_replace 两边都在参数里；
+        write_file 的改前要读磁盘——读不到（不存在 = 新建）按空处理，太大或不是
+        普通文件就放弃 diff（完成行照旧，只是没有 +N −M）。"""
+        path = str(args.get("path", ""))
+        if name == "str_replace":
+            return (path, str(args.get("old_str", "")), str(args.get("new_str", "")))
+        content = str(args.get("content", ""))
+        target = Path(path).expanduser()
+        if not target.is_absolute():
+            target = (self.workspace or Path.cwd()) / target
+        try:
+            if not target.exists():
+                return (path, "", content)
+            if not target.is_file() or target.stat().st_size > _EDIT_SNAPSHOT_CAP:
+                return None
+            previous = target.read_bytes().decode("utf-8", errors="replace")
+        except OSError:
+            return None
+        #  只比内容不比换行符：工具覆盖时沿用原文件的换行（CRLF 文件写回仍是 CRLF），
+        #  模型给的 content 却是 \n——不归一化的话 Windows 上每一行都算改过
+        return (path, previous.replace("\r\n", "\n").replace("\r", "\n"), content)
+
+    def _tool_purpose(self, event: ToolPurpose) -> None:
+        self._flush_ro_group()
+        self.console.print(Text(f"{self.indent}  目的：{event.purpose}", style="text.secondary"))
+
+    def _tool_running(self, event: ToolRunning) -> None:
+        #  只有顶层 sink 开 spinner：同一 Console 同时只允许一个 Live；
+        #  非终端（管道/测试）没有"活区"可言，静默跳过
+        if not self.verbose or not self.console.is_terminal:
+            return
+        self._stop_status()
+        line = _RunningLine(event.name, self._timeout_for(event))
+        self._running_line = line
+        self._status = self.console.status(line, spinner="dots")
+        with contextlib.suppress(Exception):
+            self._status.start()
+
+    def _tool_progress(self, event: ToolProgress) -> None:
+        """工具自报的进度写进活区那一行（没有活区就丢：进度是可覆盖的状态，
+        不值得在 scrollback 里各占一行）。读线程上来的调用，只改一个字符串。"""
+        line = self._running_line
+        if line is None:
+            return
+        line.progress = render.progress_text(event.progress, event.total, event.message)
+
+    def _timeout_for(self, event: ToolRunning) -> int | None:
+        """这次调用的超时上限（只有 bash 有）：显式传的优先，否则用配置默认值。
+        跑久了的时候，"还剩多少预算"才是用户判断要不要继续等的依据。"""
+        if event.name != "bash":
+            return None
+        explicit = event.args.get("timeout")
+        return int(explicit) if explicit else self.bash_timeout
+
+    def _tool_completed(self, event: ToolCompleted) -> None:
+        self._stop_status()
+        if event.name in _RO_TOOLS and not self.detail and event.ok:
+            self._ro_counts[event.name] = self._ro_counts.get(event.name, 0) + 1
+            anchor = f"● {event.name} {self._pending_ro}".rstrip()
+            self.folded.append((anchor, event.output.split("\n")))
+            return
+        self._flush_ro_group()
+        lines = event.output.split("\n")
+        duration = f" · {event.seconds:.1f}s" if event.seconds >= 0.05 else ""
+        edit, self._edit = self._edit, None
+        if event.ok:
+            #  没经确认框预览就放行的编辑：完成行带 +N −M，diff 当作这次调用的详情
+            #  （折叠进留底 / detail 下直接展开），顶掉工具输出里"改动后上下文"那几行——
+            #  那是给模型看的，用户看 diff 更直接
+            diff_rows: list[list[tuple[str, str]]] = []
+            counts = ""
+            if edit is not None and event.name in _EDIT_TOOLS:
+                diff_rows = _diff_rows(edit[1], edit[2], self._budget(4), cap=None)
+                added, removed = _diff_counts(diff_rows)
+                counts = f" · +{added} −{removed}"
+            head = Text()
+            head.append(f"{self.indent}  ")
+            head.append("⎿ ", style="status.success")
+            #  预算扣掉 "  ⎿ " 与耗时后缀，摘要才真的是一行
+            summary = ui.preview(lines[0], self._budget(4 + len(duration) + len(counts)))
+            head.append(f"{summary}{counts}{duration}", style="text.secondary")
+            rest: list[Any] = diff_rows if diff_rows else lines[1:]
+            #  还有内容被折叠时说清藏了多少（…+N 行）；
+            #  「怎么看」不在这里重复，攒到一轮收尾统一提一次
+            if rest and not self.detail:
+                head.append(f" · 还有 {len(rest)} 行", style="text.secondary")
+                self.truncated = True
+                self.folded.append((f"⎿ {summary}{counts}{duration}", rest))
+            self.console.print(head)
+            if self.detail and self.verbose:
+                self._expand(rest, None)
+        else:
+            #  出错自动展开：错误详情是用户必须看的，不该藏在折叠行后面
+            first = ui.preview(lines[0], self._budget(4 + len(duration)))
+            self.console.print(
+                Text(f"{self.indent}  ✗ {first}{duration}", style="status.error")
+            )
+            if not self.detail and len(lines) - 1 > self._ERROR_LINES:
+                self.folded.append((f"✗ {first}{duration}", lines[1:]))
+            self._expand(lines[1:], None if self.detail else self._ERROR_LINES)
+
+    def replay_folded(self) -> None:
+        """回放本轮被折叠的留底（Ctrl-O 开详情时调用）。
+
+        一次性动作：打完即清空，再开关不会重复刷屏。detail 已置 True，
+        之后的输出本来就是展开的，留底只服务"已经打出去的那些"。
+        """
+        items, self.folded = self.folded, []
+        for anchor, rows in items:
+            self.console.print(Text(f"{self.indent}  {anchor}", style="text.secondary"))
+            budget = self._budget(4)
+            for row in rows[: self._REPLAY_LINES]:
+                self.console.print(self._folded_row(row, budget))
+            if len(rows) > self._REPLAY_LINES:
+                hidden = len(rows) - self._REPLAY_LINES
+                self.console.print(
+                    Text(f"{self.indent}    …还有 {hidden} 行", style="text.secondary")
+                )
+
+    def _folded_row(self, row: Any, budget: int) -> Text:
+        """留底里的一行：普通输出是 str（弱化显示），diff 行是 (样式, 文本) 片段序列
+        （已按宽度截过，红绿原样）。"""
+        if isinstance(row, str):
+            return Text(f"{self.indent}    {ui.preview(row, budget)}", style="text.secondary")
+        return Text.assemble((f"{self.indent}    ", ""), *[(text, style) for style, text in row])
+
+    def _expand(self, rows: list[Any], cap: int | None) -> None:
+        shown = rows if cap is None else rows[:cap]
+        budget = self._budget(4)
+        for row in shown:
+            self.console.print(self._folded_row(row, budget))
+        if len(rows) > len(shown):
+            self.truncated = True
+            self.console.print(
+                Text(f"{self.indent}    …还有 {len(rows) - len(shown)} 行", style="text.secondary")
+            )
+
+    def _tool_denied(self, event: ToolDenied) -> None:
+        self._stop_status()
+        self._edit = None
+        self._flush_ro_group()
+        word = "命中 deny 规则被拦截" if event.by == "rule" else "被用户拒绝"
+        self.console.print(Text(f"{self.indent}  ⨯ {event.name} {word}，未执行", style="status.warning"))
+
+    def _plan(self, event: PlanUpdated) -> None:
+        self._flush_ro_group()
+        if not self.verbose:
+            return
+        if event.explanation:
+            self.console.print(
+                Text(f"  ✎ {ui.preview(event.explanation, self._budget(4))}", style="text.secondary")
+            )
+        for item in event.plan:
+            mark, style = _PLAN_STYLES[item["status"]]
+            self.console.print(Text(f"  {mark} {item['step']}", style=style))
+
+    def _steer(self, event: SteerAccepted) -> None:
+        #  插话被消费的确认（用户敲字时只有 tty 回显）：不打这行就无从分辨
+        #  "生效了"还是"丢了"。从 agent 线程（主线程）发出，与 Live 无竞争。
+        self._flush_ro_group()
+        self.console.print(
+            Text(f"{self.indent}  ↳ 插话已加入本轮：{event.text}", style="text.secondary")
+        )
+
+    def _notice(self, event: Notice) -> None:
+        self._flush_ro_group()
+        self.console.print(Text(event.text, style=_NOTICE_STYLES[event.level]))
+
+    def _suggestions(self, event: Suggestions) -> None:
+        if not event.items:
+            return
+        if self.on_suggestions is not None:
+            self.on_suggestions(list(event.items))
+        else:
+            self.console.print(Text(f"  {suggest.render_line(event.items)}", style="text.secondary"))
+
+
+class NextStepSuggest(AutoSuggest):
+    """输入行的幽灵建议：先看轮末「接着问」，再退回历史。
+
+    空行 → 第一条建议整条浮现（→ 接受）；敲了几个字 → 哪条建议以它开头就补那条
+    的剩余（这就是选中第二、三条的方式）；都不中 → 与原来一样按历史补。
+    建议列表由 Tui 持有、按轮更新，这里只拿一个取值函数，不持有状态。
+    """
+
+    def __init__(self, items: Callable[[], list[str]]) -> None:
+        self._items = items
+        self._history = AutoSuggestFromHistory()
+
+    def get_suggestion(self, buffer: Buffer, document: Document) -> Suggestion | None:
+        text = document.text
+        items = self._items()
+        if not text:
+            return Suggestion(items[0]) if items else None
+        for item in items:
+            if item.startswith(text) and item != text:
+                return Suggestion(item[len(text):])
+        return self._history.get_suggestion(buffer, document)
+
+
+#  行首前缀 → 着色 token。只给那一个字符上色，正文保持默认：颜色是在提醒
+#  "这一行不是发给模型的"，`!` 用警告色——它绕过模型直接执行。
+_PREFIX_TOKENS = {"shell": "status.warning", "slash": "text.accent", "memo": "text.secondary"}
+
+
+class PrefixLexer(Lexer):
+    """输入行的着色：行首的 `!` / `/` / `#` 按 keys.classify_input 的判定上色。
+
+    判定复用提交路由那一个函数，着色与行为永远一致：`/Users/…` 这种路径形态
+    不算命令，也就不上色；敲了前缀还没敲正文（"用法"提示那一态）同样上色，
+    人一眼知道这个字符已经被认成了前缀。只看第一行，续行与正文中间的符号不动。
+    """
+
+    def lex_document(self, document: Document) -> Callable[[int], list[tuple[str, str]]]:
+        lines = document.lines
+
+        def get_line(lineno: int) -> list[tuple[str, str]]:
+            text = lines[lineno] if lineno < len(lines) else ""
+            if lineno == 0 and text[:1] in ("!", "/", "#"):
+                kind = keys.classify_input(text).kind
+                if kind == "usage":
+                    #  前缀对了还没敲正文：按首字符归类，颜色先亮起来
+                    kind = {"!": "shell", "#": "memo"}.get(text[0], "slash")
+                if (token := _PREFIX_TOKENS.get(kind)) is not None:
+                    return [(theme.ptk(token), text[:1]), ("", text[1:])]
+            return [("", text)]
+
+        return get_line
+
+
+class SlashCompleter(Completer):
+    """输入行补全：/ 补命令（带一行说明），@ 模糊补工作区文件路径，
+    /model 的第二个词补降级链里的模型名。"""
+
+    #  @ 补全时最多展示的候选数：再多就该继续打字缩小范围了
+    _FILE_CANDIDATES = 20
+
+    def __init__(self, tui: "Tui") -> None:
+        self.tui = tui
+
+    def get_completions(
+        self, document: Document, complete_event: Any
+    ) -> Iterable[Completion]:
+        text = document.text_before_cursor
+        #  @ 文件引用：光标前最后一个以 @ 开头的词（可出现在消息任意位置）
+        if match := re.search(r"(?:^|\s)(@\S*)$", text):
+            yield from self._file_completions(match.group(1))
+            return
+        if not text.startswith("/"):
+            return
+        parts = text.split(" ")
+        if len(parts) == 1:
+            yield from self._command_completions(parts[0])
+        elif parts[0] == "/model" and len(parts) == 2 and self.tui.agent is not None:
+            word = parts[1]
+            for model in self.tui.agent.switchable_models():
+                if model.startswith(word):
+                    yield Completion(model, start_position=-len(word))
+        elif parts[0] == "/search" and len(parts) == 2:
+            from .websearch import SEARCH_BACKENDS
+
+            word = parts[1]
+            for name, backend in SEARCH_BACKENDS.items():
+                if name.startswith(word):
+                    yield Completion(name, start_position=-len(word), display_meta=backend.model)
+
+    #  技能补全的 meta 长度：描述是给索引写的、动辄几百字，菜单里一行放不下
+    _SKILL_META_CAP = 60
+
+    def _command_completions(self, word: str) -> Iterable[Completion]:
+        from .cli import SLASH_COMMANDS, SKILL_SLASH_PREFIX, skill_shadowed
+
+        #  内建命令在前（名字空间里内建优先，菜单顺序也这么说），技能在后；
+        #  各自内部前缀命中排前面，子串命中（/ctx 打错也能找到 /context）殿后
+        candidates: list[tuple[str, str]] = [
+            #  `/<技能名>` 这种占位行只给 /help 看，补全菜单里列的是真名字
+            (command, description) for command, description in SLASH_COMMANDS.items() if "<" not in command
+        ]
+        if self.tui.agent is not None:
+            for skill in getattr(self.tui.agent, "skills", []):
+                command = f"{SKILL_SLASH_PREFIX}{skill.name}" if skill_shadowed(skill.name) else f"/{skill.name}"
+                meta = skill.description or "技能"
+                if len(meta) > self._SKILL_META_CAP:
+                    meta = meta[: self._SKILL_META_CAP] + "…"
+                candidates.append((command, f"技能：{meta}"))
+        substring_hits: list[tuple[str, str]] = []
+        for command, description in candidates:
+            if command.startswith(word):
+                yield Completion(command, start_position=-len(word), display_meta=description)
+            elif len(word) > 1 and word[1:] in command:
+                substring_hits.append((command, description))
+        for command, description in substring_hits:
+            yield Completion(command, start_position=-len(word), display_meta=description)
+
+    def _file_completions(self, token: str) -> Iterable[Completion]:
+        word = token[1:].lower()
+        starts: list[str] = []
+        contains: list[str] = []
+        for path in self.tui.workspace_files():
+            base = path.rsplit("/", 1)[-1].lower()
+            if base.startswith(word) or path.lower().startswith(word):
+                starts.append(path)
+            elif word in path.lower():
+                contains.append(path)
+        for path in (starts + contains)[: self._FILE_CANDIDATES]:
+            #  保留 @ 前缀进文本：模型看到 @路径 知道这是文件引用
+            yield Completion(f"@{path}", start_position=-len(token), display=path)
+
+
+class SteerPoller:
+    """模型作答期间的后台 stdin 行读取：整行（按过回车）→ `agent.steer()`。
+
+    小羽全同步，`agent.send()` 期间主线程被占住，没有任何输入循环在跑——
+    这个小线程补上"运行中还能说话"的通道（配 pause/resume 纪律）。要点：
+
+    - 终端处于规范模式：select 只在**整行完成**（用户按了回车）时可读，
+      半截输入留在内核行缓冲，既不会被这里偷走，也照常出现在下一轮 prompt；
+    - **审批确认框期间必须 pause()**——确认菜单是 prompt_toolkit Application
+      在主线程接管终端，这里不停手就会吃掉用户的选择按键；
+    - 线程自己不打印任何东西（rich Live 归主线程独占）：确认反馈由
+      steer.accepted 事件在消费点（agent 线程=主线程）打出，敲字时的即时
+      回显本来就有 tty echo；
+    - 斜杠命令不特判：运行中敲 `/...` 也会作为插话交给模型（提示语义上
+      它就是"对模型说的话"；命令请等本轮结束）；
+    - 多行粘贴合并成一条：规范模式逐行交付，窗口内连着到达的行并成整段；
+    - Windows 没有 select-on-stdin：整个 poller 禁用，保留旧的"收尾预填"路径。
+    """
+
+    _POLL = 0.1
+    #  粘贴合并窗口：读到一行后这么久内还有数据，就并进同一条插话
+    _PASTE_WINDOW = 0.05
+
+    def __init__(self, agent: Agent) -> None:
+        self.agent = agent
+        self._stop = threading.Event()
+        self._paused = threading.Event()
+        self._thread: threading.Thread | None = None
+
+    @staticmethod
+    def supported() -> bool:
+        if os.name != "posix" or not sys.stdin.isatty():
+            return False
+        try:
+            import select  # noqa: F401
+
+            return True
+        except ImportError:  # pragma: no cover - posix 必有 select
+            return False
+
+    def start(self) -> None:
+        if not self.supported() or self._thread is not None:
+            return
+        self._thread = threading.Thread(target=self._loop, daemon=True, name="steer-poller")
+        self._thread.start()
+
+    def stop(self) -> None:
+        if self._thread is None:
+            return
+        self._stop.set()
+        self._thread.join(timeout=1.0)
+        self._thread = None
+
+    def pause(self) -> None:
+        self._paused.set()
+
+    def resume(self) -> None:
+        self._paused.clear()
+
+    def _loop(self) -> None:
+        import select
+
+        fd = sys.stdin.fileno()
+        while not self._stop.is_set():
+            if self._paused.is_set():
+                time.sleep(self._POLL)
+                continue
+            try:
+                readable, _, _ = select.select([fd], [], [], self._POLL)
+                if not readable or self._paused.is_set() or self._stop.is_set():
+                    #  select 返回后再查一次 pause/stop：确认框刚接管终端时
+                    #  宁可把这行留给它，也不能抢读
+                    continue
+                data = os.read(fd, 4096)
+            except Exception:  # noqa: BLE001 - 读不动就收工，绝不能拖垮主循环
+                return
+            if not data:
+                return
+            data, eof = self._gather_burst(fd, data)
+            self._deliver(data)
+            if eof:
+                return
+
+    def _gather_burst(self, fd: int, data: bytes) -> tuple[bytes, bool]:
+        """读到一行后，窗口内还有数据就接着读，返回 (合并后的字节, 是否已 EOF)。
+
+        规范模式下每次 read 最多交出一行：粘贴 N 行会连着到达，逐次 steer 就成了
+        N 条插话。人手敲完一行再敲下一行远慢于窗口，正常交互只多等这一个窗口。
+        窗口期间被 pause/stop 就停手，已读到的照常交付。
+        """
+        import select
+
+        while not self._paused.is_set() and not self._stop.is_set():
+            try:
+                readable, _, _ = select.select([fd], [], [], self._PASTE_WINDOW)
+                if not readable:
+                    return data, False
+                more = os.read(fd, 4096)
+            except Exception:  # noqa: BLE001 - 读不动就交付已有的并收工
+                return data, True
+            if not more:
+                return data, True
+            data += more
+        return data, False
+
+    def _deliver(self, data: bytes) -> None:
+        """整段作为**一条**插话：保留内部换行（含空行），只去首尾空行。"""
+        text = data.decode("utf-8", errors="replace")
+        lines = text.replace("\r\n", "\n").replace("\r", "\n").split("\n")
+        while lines and not lines[0].strip():
+            lines.pop(0)
+        while lines and not lines[-1].strip():
+            lines.pop()
+        if lines:
+            self.agent.steer("\n".join(lines))
+
+
+class Tui:
+    """交互前端：持有 sink、确认函数与 REPL 循环。
+
+    构造顺序上先于 Agent 创建（Agent 需要 approver 与 sink），
+    agent 引用在 run() 里回填；PromptSession 惰性创建（构造它需要真实终端，
+    提前建会让测试环境炸在 import 之外的地方）。
+    """
+
+    #  两次 Ctrl-C 间隔在此秒数内才退出（单次 Ctrl-C 防误触）
+    _EXIT_WINDOW = 2.0
+    #  工作区文件清单缓存秒数（@ 补全用；逐键重扫是浪费）
+    _FILES_TTL = 10.0
+    _FILES_CAP = 5000
+    #  粘贴折叠成 chip 的阈值：超 800 字符或超过约 3 行——
+    #  大段粘贴撑爆输入区还把每次重绘拖慢，折叠后正文旁路存储、提交时展开
+    _PASTE_CHAR_CAP = 800
+    _PASTE_LINE_CAP = 2
+
+    def __init__(self, permissions: Permissions, console: Console | None = None) -> None:
+        self.permissions = permissions
+        self.sink = RichSink(console)
+        self.console = self.sink.console
+        self.agent: Agent | None = None
+        self._session: PromptSession | None = None
+        self._confirm_session: PromptSession | None = None
+        self._last_input = ""
+        self._files_cache: list[str] | None = None
+        self._files_cache_at = 0.0
+        self._pastes: dict[int, str] = {}
+        self._paste_id = 0
+        #  本次提交行首来自粘贴 chip：展开后的 ! / # / 前缀不是用户敲的，路由
+        #  按字面发给模型（由 _submit 置位、主循环取走即清）
+        self._literal_submit = False
+        #  行首 chip 被 Ctrl-O 就地展开后留下的首行：提交时行首还是它，就仍按
+        #  字面发（见 _unfold_paste_at）
+        self._unfolded_head: str | None = None
+        #  图片 chip：编号 → 媒体引用（xiaoyu-media://…）。会话内累加不清理，
+        #  用户可能把同一张图在后面几轮里反复引用（Esc-Esc 取回上一条即是）
+        self._images: dict[int, str] = {}
+        self._image_id = 0
+        #  运行期插话线程（run() 里按轮起停）；confirm() 靠它 pause/resume
+        self._poller: SteerPoller | None = None
+        #  "切进 auto 但沙箱不可用"只提醒一次，别每次按键都刷一行
+        self._warned_no_sandbox = False
+        #  轮末「接着问」（见 suggest.py）：本轮的几条建议 + 正挂着的 prompt app
+        #  （后台线程往它的事件循环里投递）。每轮开始清空
+        self._suggestions: list[str] = []
+        self._app: Application | None = None
+        self.sink.on_suggestions = self._on_suggestions
+
+    # ---------- 轮末「接着问」 ----------
+
+    def _prime_prompt(self) -> None:
+        """prompt 刚起来（pre_run）：记住 app 给后台线程投递用；建议已经在手就把
+        幽灵先亮出来——AutoSuggest 只在文本变化时才被问，空行起手得自己点一下。"""
+        app = get_app_or_none()
+        self._app = app
+        if app is not None and self._suggestions and not app.current_buffer.text:
+            app.current_buffer.suggestion = Suggestion(self._suggestions[0])
+
+    def _on_suggestions(self, items: list[str]) -> None:
+        """后台线程送来的「接着问」：打一行弱化文字，再喂给输入行的幽灵建议。
+
+        跨线程纪律：提示符挂着时不能直接往终端写（会打花正在编辑的行），要投到
+        prompt_toolkit 的事件循环里、在 `set_app` 之下 `run_in_terminal`——那个
+        contextvar 在别的线程里是空的。模型已在跑下一轮（poller 活着）就作废。
+        """
+        if self._poller is not None:
+            return
+        self._suggestions = items
+        line = Text(f"  {suggest.render_line(items)}", style="text.secondary")
+        app = self._app
+        if app is None or not app.is_running or app.loop is None:
+            self.console.print(line)
+            return
+
+        def on_loop() -> None:
+            with set_app(app):
+                run_in_terminal(lambda: self.console.print(line))
+                buffer = app.current_buffer
+                if not buffer.text and self._suggestions:
+                    buffer.suggestion = Suggestion(self._suggestions[0])
+                app.invalidate()
+
+        app.loop.call_soon_threadsafe(on_loop)
+
+    def _on_notification(self, item: dict[str, Any]) -> None:
+        """后台事件（研究完成、后台任务结束）在会话空闲时到达：打一行告诉人。
+
+        通知是给模型看的，要到下一步才送达；空闲时没有下一步，不提示的话人只能
+        干等或自己来问。模型正在跑（poller 活着）就不打——它会随下一条工具结果
+        送到；捎带型公告（wake=False）不值一行。跨线程纪律同 `_on_suggestions`。
+        """
+        if not item.get("wake") or self._poller is not None:
+            return
+        lines = str(item.get("text", "")).strip().splitlines()
+        if not lines:
+            return
+        line = Text(f"  ⟲ {lines[0]}（发下一条消息时送达模型）", style="text.secondary")
+        app = self._app
+        if app is None or not app.is_running or app.loop is None:
+            self.console.print(line)
+            return
+
+        def on_loop() -> None:
+            with set_app(app):
+                run_in_terminal(lambda: self.console.print(line))
+
+        app.loop.call_soon_threadsafe(on_loop)
+
+    # ---------- 输入 ----------
+
+    def _fold_paste(self, data: str) -> str:
+        """大段粘贴折叠成 chip 占位符，正文旁路存储（输入区不被大段粘贴
+        撑爆，每次击键的重绘也不被拖慢）。
+        返回要插入输入框的文本；小粘贴原样返回。"""
+        data = data.replace("\r\n", "\n").replace("\r", "\n")
+        lines = data.count("\n") + 1
+        if len(data) <= self._PASTE_CHAR_CAP and lines <= self._PASTE_LINE_CAP + 1:
+            return data
+        self._paste_id += 1
+        self._pastes[self._paste_id] = data
+        return f"[粘贴 #{self._paste_id} · {lines} 行]"
+
+    def _starts_with_paste(self, text: str) -> bool:
+        """行首（忽略空白）是否是一个真实存在的粘贴 chip。"""
+        match = _PASTE_REF.match(text.lstrip())
+        return bool(match) and int(match.group(1)) in self._pastes
+
+    def _expand_pastes(self, text: str) -> str:
+        """提交前把 chip 占位符展开回原文（被手改坏的占位符按字面保留）。"""
+        return _PASTE_REF.sub(
+            lambda match: self._pastes.get(int(match.group(1)), match.group(0)), text
+        )
+
+    def _unfold_paste_at(self, buffer: Any) -> bool:
+        """光标紧邻（贴着两端或落在其中）一颗粘贴 chip 时就地展开成原文。
+
+        展开后就是普通多行文本：能看、能改，不再折回。没有可展开的 chip 返回
+        False，调用方据此把这次按键让给别的用途。
+        """
+        cursor = buffer.cursor_position
+        for match in _PASTE_REF.finditer(buffer.text):
+            if not match.start() <= cursor <= match.end():
+                continue
+            data = self._pastes.get(int(match.group(1)))
+            if data is None:
+                continue
+            head = buffer.text[: match.start()]
+            if not head.strip():
+                #  chip 顶在行首：展开后首行的 ! / # / 前缀同样不是用户敲的。
+                #  记下首行，提交时行首还是它就按字面发；用户改过首行则以改后为准
+                self._unfolded_head = data.split("\n", 1)[0]
+            buffer.save_to_undo_stack()
+            buffer.text = head + data + buffer.text[match.end() :]
+            buffer.cursor_position = len(head) + len(data)
+            return True
+        return False
+
+    def _starts_with_unfolded(self, text: str) -> bool:
+        """行首（忽略空白）是否仍是刚才就地展开的那段粘贴的首行。"""
+        head = self._unfolded_head
+        return bool(head) and text.lstrip().startswith(head)
+
+    # ---------- 图片 chip ----------
+
+    def _fold_image(self, ref: str) -> str:
+        """收下一张图，返回要插进输入行的 chip 占位符。
+
+        标签带尺寸（`1920×1080 · 42 KB`）而不只是体积：贴完一眼能确认贴对了
+        没有——尺寸比字节数更像"那张图"。解析不出尺寸时自动退回只报体积。
+        """
+        self._image_id += 1
+        self._images[self._image_id] = ref
+        return f"[图片 #{self._image_id} · {media.label(ref)}]"
+
+    def _warn(self, text: str) -> None:
+        """按键处理里打一行提示。
+
+        `run_in_terminal` 是在输入行挂起时打字的正确姿势（不打花正在编辑的行），
+        但它要求有正在跑的 prompt_toolkit app——测试与非交互路径下没有，
+        那时直接 print 即可，不能因为提示打不出来就把整个粘贴动作弄崩。
+        先问 `get_app_or_none()` 而不是 try/except：run_in_terminal 在没有事件
+        循环时是**先造好协程再抛**，接住异常也已经留下一个 never awaited 警告。
+        """
+        def _print() -> None:
+            self.console.print(Text(f"  {text}", style="status.warning"))
+
+        if get_app_or_none() is None:
+            _print()
+        else:
+            run_in_terminal(_print)
+
+    def _take_image(self, data: bytes, source: str = "") -> str | None:
+        """字节 → chip 文本；不合格时打一行原因并返回 None。
+
+        原因一定要打出来：粘贴失败最烦人的形态是"按了没反应"，用户无从判断
+        是键没生效、剪贴板没图、还是图太大。
+        """
+        ref, problem = media.accept(data, source)
+        if problem:
+            self._warn(problem)
+            return None
+        return self._fold_image(ref)
+
+    def _paths_to_text(self, paths: Sequence[Path]) -> str:
+        """一组文件路径 → 插进输入行的文本：图片折成 chip，其余原样给路径。"""
+        pieces: list[str] = []
+        for path in paths:
+            if not media.is_image_path(path):
+                pieces.append(str(path))
+                continue
+            ref, problem = media.accept_file(path)
+            if ref:
+                pieces.append(self._fold_image(ref))
+            else:
+                self._warn(problem)
+        return " ".join(pieces)
+
+    def _content_of(self, text: str) -> Any:
+        """提交的一行 → 发给模型的 content。没有图片时返回原字符串。
+
+        chip 占位符**原样留在文本里**（"[图片 #1 · 42 KB]"），图片部件追加在
+        后面：模型既看得到图，也看得到用户把它插在句子的哪个位置——
+        "这两张图哪个更好"如果只剩两张裸图，指代关系就丢了。
+
+        当前模型看不了图时不静默丢弃，也不改文本：告诉用户换模型，图片留在
+        chip 表里，切完 /model 重发即可（Esc-Esc 就能取回上一条）。配了代读模型
+        （XIAOYU_VISION_FALLBACK）则先把图换成文字随本条一起发——**但提示照打**：
+        代读是有损的，"能凑合看懂"和"真看见了"必须让用户分得清，而原图始终只有
+        `/model` 换视觉模型这一条路。
+        """
+        refs = [
+            self._images[int(match.group(1))]
+            for match in _IMAGE_REF.finditer(text)
+            if int(match.group(1)) in self._images
+        ]
+        if not refs:
+            return text
+        agent = self.agent
+        model = agent.config.model if agent is not None else ""
+        parts = [media.image_part(ref) for ref in refs]
+        if agent is not None and not agent.registry.sees_images(model):
+            #  代读要发一次网络请求，但这里已经在提交之后（全同步 REPL，
+            #  紧接着就是 agent.send 阻塞整轮），不额外卡住任何输入循环
+            block, notice = agent.caption_images(parts, guide=text)
+            if block:
+                self.console.print(Text(notice, style="status.warning"))
+                return f"{text}\n\n{block}"
+            self.console.print(
+                Text(
+                    f"  当前模型 {model} 不接受图片输入，这条只发文字。"
+                    "/model 换一个支持视觉的再重发（Esc Esc 取回上一条）",
+                    style="status.warning",
+                )
+            )
+            return text
+        return [media.text_part(text), *parts]
+
+    def _tab_complete(self, buffer: Any) -> None:
+        """Tab 先补到所有候选的最长公共前缀、再按才轮换（readline 直觉）。
+        菜单已打开时维持轮换语义。"""
+        if buffer.complete_state is not None:
+            buffer.complete_next()
+            return
+        if buffer.completer is None:
+            return
+        document = buffer.document
+        completions = list(
+            buffer.completer.get_completions(document, CompleteEvent(completion_requested=True))
+        )
+        if not completions:
+            return
+        if len(completions) == 1:
+            buffer.apply_completion(completions[0])
+            return
+        before = document.text_before_cursor
+        candidates = [before[: item.start_position] + item.text for item in completions]
+        prefix = os.path.commonprefix(candidates)
+        if len(prefix) > len(before):
+            #  只补到公共前缀就停手（不在此开菜单：start_completion 需要正在运行的
+            #  应用事件循环，且 readline 语义本来就是"再按一次才出候选"）
+            buffer.insert_text(prefix[len(before) :])
+        else:
+            buffer.complete_next()
+
+    def _input_session(self) -> PromptSession:
+        if self._session is None:
+            history_dir = user_config_dir()
+            #  历史里是用户敲过 / 贴过的原文，可能带密钥：与会话日志同一口径——
+            #  新建的目录层 0700，文件在 FileHistory 按 umask 建出 0644 之前先以 0600
+            #  预建（旧版留下的宽权限顺手收紧）。Windows 上权限无语义，失败忽略
+            _ensure_private_dir(history_dir)
+            history_file = history_dir / "input_history"
+            with contextlib.suppress(OSError):
+                os.close(_open_private(history_file, os.O_WRONLY | os.O_APPEND))
+            self._session = PromptSession(
+                history=DedupedHistory(str(history_file)),
+                completer=SlashCompleter(self),
+                #  行首前缀着色（! 警告色、/ 强调色、# 弱化）
+                lexer=PrefixLexer(),
+                #  幽灵建议：空行浮现轮末「接着问」的第一条，敲到一半按前缀匹配建议或
+                #  最近一条历史，行尾按 →（或 Ctrl-E / Ctrl-F）接受。按键由 prompt_toolkit
+                #  自带，表里只登记
+                auto_suggest=NextStepSuggest(lambda: self._suggestions),
+                key_bindings=self._key_bindings(),
+                multiline=True,
+                #  续行不打标记、只按提示符实际宽度补空格对齐。
+                #  宽度必须动态取：确认档之外提示符带模式标记，比 "› " 宽。
+                prompt_continuation=lambda width, line_number, is_soft_wrap: " " * width,
+                #  prompt_toolkit 自带的 Ctrl-X Ctrl-E：长指令拉到 $EDITOR 里改
+                enable_open_in_editor=True,
+            )
+        return self._session
+
+    def _key_bindings(self) -> KeyBindings:
+        """按 keys.BINDINGS 那张表注册输入行的按键。
+
+        每个键"按了会怎样"写在表里而不是这儿：首屏速览和 /keys 帮助都从同一张
+        表渲染，加了键忘改文案（或反过来）不再可能。Enter 一律提交是 bash 直觉
+        ——补全菜单只是展示，Tab 轮换时文本已进了行内，行里是什么就提交什么。
+        """
+
+        def _submit(event: Any) -> None:
+            buffer = event.current_buffer
+            if _enter_is_pasted(event):
+                #  粘贴里的换行（bracketed paste 失效时以回车按键到达）：
+                #  插成换行，整段粘贴完才由最后那个回车提交
+                buffer.insert_text("\n")
+                return
+            state = buffer.complete_state
+            if state and state.current_completion:
+                #  菜单里有选中的候选：先把它落定成真实文本再提交。
+                #  不能直接把 complete_state 置 None——那等于取消补全，
+                #  Tab 轮换插入的文本会被回退成原输入。
+                buffer.apply_completion(state.current_completion)
+            #  chip 展开回原文再提交；输入历史里存的也是展开后的全文。
+            #  展开前先看行首：顶在第 0 位的是 chip 就标记"字面提交"，
+            #  否则贴进来的 `!rm -rf` 日志会在展开后被当成 shell 命令跑掉。
+            self._literal_submit = self._starts_with_paste(
+                buffer.text
+            ) or self._starts_with_unfolded(buffer.text)
+            self._unfolded_head = None
+            expanded = self._expand_pastes(buffer.text)
+            if expanded != buffer.text:
+                buffer.text = expanded
+                buffer.cursor_position = len(expanded)
+            buffer.validate_and_handle()
+
+        def _tab(event: Any) -> None:
+            self._tab_complete(event.current_buffer)
+
+        def _paste(event: Any) -> None:
+            #  拖文件进终端 = 终端把路径当文本粘进来，拖多个就是空格分隔的多条。
+            #  整段每一项都是真实文件时按文件收：图片折成 chip，其余留路径给模型
+            #  自己 read_file（判据收得很紧，见 media.split_paths）。收不下时
+            #  _paths_to_text 已经报过原因，这里照常按普通文本粘，至少留下路径。
+            if paths := media.split_paths(event.data):
+                if text := self._paths_to_text(paths):
+                    event.current_buffer.insert_text(text)
+                    return
+            event.current_buffer.insert_text(self._fold_paste(event.data))
+
+        def _paste_image(event: Any) -> None:
+            clip = media.clipboard()
+            if clip.problem:
+                self._warn(clip.problem)
+                return
+            #  位图（截图）与文件清单可能同时有；文件里的非图片原样插成路径，
+            #  模型拿到路径能自己 read_file，比我们替它判"这个格式没用"强
+            parts = [
+                chip
+                for data in clip.images
+                if (chip := self._take_image(data, "剪贴板里的图片"))
+            ]
+            if text := self._paths_to_text(clip.files):
+                parts.append(text)
+            if parts:
+                event.current_buffer.insert_text(" ".join(parts))
+
+        def _backspace(event: Any) -> None:
+            buffer = event.current_buffer
+            #  光标紧邻 chip 占位符时整颗删除（chip 是原子，不进内部逐字删）
+            before = buffer.document.text_before_cursor
+            match = _PASTE_REF_TAIL.search(before) or _IMAGE_REF_TAIL.search(before)
+            if match:
+                buffer.delete_before_cursor(len(match.group(0)))
+            else:
+                buffer.delete_before_cursor(1)
+
+        def _newline(event: Any) -> None:
+            event.current_buffer.insert_text("\n")
+
+        def _toggle_detail(event: Any) -> None:
+            #  同一个"展开看细节"的键：光标贴着粘贴 chip 时先展开它
+            if self._unfold_paste_at(event.current_buffer):
+                return
+            self.sink.detail = not self.sink.detail
+
+            def _report() -> None:
+                if self.sink.detail:
+                    #  开：先把上一轮折叠掉的补打出来——用户按 Ctrl-O 十有八九
+                    #  就是想看刚才那条"还有 N 行"，不能只许诺以后
+                    self.console.print(
+                        Text("  工具输出详情：开（展开完整输出）", style="text.secondary")
+                    )
+                    self.sink.replay_folded()
+                else:
+                    self.console.print(
+                        Text(
+                            "  工具输出详情：关（每个工具折叠一行），对之后的输出生效",
+                            style="text.secondary",
+                        )
+                    )
+
+            run_in_terminal(_report)
+
+        def _recall(event: Any) -> None:
+            if self._last_input:
+                buffer = event.current_buffer
+                buffer.text = self._last_input
+                buffer.cursor_position = len(buffer.text)
+
+        def _cycle_mode(event: Any) -> None:
+            if self.agent is None:
+                return
+            self.agent.set_mode(modes.next_mode(self.agent.mode))
+            #  提示符是 callable，invalidate 就地重画成 "⏵⏵ auto ›"，不脏 scrollback
+            event.app.invalidate()
+            #  唯一例外：切进 auto 却没有沙箱兜底。这时 auto 只剩"改文件免确认"，
+            #  bash 照旧逐条问——静默降级会让人以为按键没生效，必须打一次
+            if (
+                self.agent.mode == modes.AUTO
+                and not self.agent.sandbox_ready()
+                and not self._warned_no_sandbox
+            ):
+                self._warned_no_sandbox = True
+                text = modes.describe(modes.AUTO, sandbox_ready=False)
+                run_in_terminal(
+                    lambda: self.console.print(Text(f"  {text}", style="status.warning"))
+                )
+
+        return _register(
+            {
+                "input.submit": _submit,
+                "input.newline": _newline,
+                "input.complete": _tab,
+                "input.backspace": _backspace,
+                "input.paste": _paste,
+                "input.pasteImage": _paste_image,
+                "input.recall": _recall,
+                "app.toggleDetail": _toggle_detail,
+                "app.cycleMode": _cycle_mode,
+            },
+            keys.INPUT,
+        )
+
+    def _prompt_fragments(self) -> list[tuple[str, str]]:
+        """输入行提示符。确认档之外在 `›` 前面挂一个模式标记。
+
+        做成 callable 而不是固定字符串：Shift+Tab 切档后 `app.invalidate()`
+        就能就地重画。**不做常驻状态栏**——bottom_toolbar 只在输入行挂起时存在、
+        模型一跑就消失，那条路做过又拆了（见模块开头）。提示符本来就只在
+        "轮到你说话"时出现，模式标记长在它上面不会时隐时现。
+        """
+        mode = modes.get(self.agent.mode if self.agent is not None else modes.DEFAULT)
+        fragments: list[tuple[str, str]] = []
+        if mode.marker:
+            fragments.append((theme.ptk(mode.style), f"{mode.marker} {mode.label} "))
+        fragments.append((theme.ptk("prompt"), "› "))
+        return fragments
+
+    def _drain_typeahead(self) -> str:
+        """取走用户在模型作答期间敲进终端缓冲的整行输入。
+
+        小羽是全同步的：`agent.send()` 期间没有 prompt 挂着，这段时间的按键
+        会一直躺在 tty 缓冲里，等下一轮 prompt 起来时被 prompt_toolkit 一次
+        读掉——**连同其中的回车**，于是那句话在用户还没看到上一轮结果时就
+        自动发出去了。这里抢先取走，改成预填进输入行，让人看一眼再决定。
+
+        **只预填不自动提交**：异步架构里排队提交是自然语义；
+        小羽同步，把用户"盲打"的内容直接发出去
+        风险更大——他可能正是看到中途输出才要改口。
+
+        终端处于规范模式，`os.read` 只会给出已经按过回车的完整行；没按回车的
+        半截输入留在内核缓冲里，下一轮 prompt 会照常显示，不会误提交。
+        Windows 没有 select on tty，直接返回空串。
+        """
+        if not sys.stdin.isatty():
+            return ""
+        try:
+            import select
+
+            fd = sys.stdin.fileno()
+            chunks: list[bytes] = []
+            while select.select([fd], [], [], 0)[0]:
+                data = os.read(fd, 4096)
+                if not data:
+                    break
+                chunks.append(data)
+        except Exception:  # noqa: BLE001 - 抽不动就算了，绝不能影响主循环
+            return ""
+        text = b"".join(chunks).decode("utf-8", errors="replace")
+        #  多行就用换行连起来（用户确实敲了多行，保留原样让他自己看）
+        lines = [line for line in text.replace("\r\n", "\n").replace("\r", "\n").split("\n")]
+        return "\n".join(lines).strip()
+
+    def _print_expand_hint(self) -> None:
+        """折叠过输出就在一轮收尾提一次 Ctrl-O（溢出是整轮的一个状态，
+        不是每个折叠行各自的属性）。
+
+        原先挂在 bottom_toolbar 上，但那条栏只在输入行挂起时存在、模型一跑
+        就消失，时隐时现像 bug；收尾打进 scrollback 则紧跟着被折叠的输出，
+        且只在"当下还能展开"时出现。
+        """
+        if self.sink.truncated and not self.sink.detail:
+            self.console.print(Text("  Ctrl-O 展开被折叠的输出", style="text.secondary"))
+
+    def workspace_files(self) -> list[str]:
+        """@ 补全的候选文件（工作区相对路径，带 TTL 缓存）。
+
+        优先 git ls-files（快、天然吃 .gitignore、含未跟踪新文件）；
+        不是 git 仓库再退回带剪枝的目录遍历。
+        """
+        now = time.monotonic()
+        if self._files_cache is not None and now - self._files_cache_at < self._FILES_TTL:
+            return self._files_cache
+        root = self.permissions.workspace
+        files: list[str] = []
+        with contextlib.suppress(Exception):
+            from . import gitsafe
+
+            #  敲 @ 就会跑：仓库自带的 core.fsmonitor 等不能借机执行（见 gitsafe）
+            argv, env = gitsafe.prepare(["ls-files", "--cached", "--others", "--exclude-standard"], root)
+            proc = subprocess.run(
+                argv,
+                cwd=root, env=env, capture_output=True, text=True,
+                #  git 输出恒 UTF-8；Windows 的 locale 编码解非 ASCII 文件名会抛，
+                #  抛了会被外层 suppress 吞掉、悄悄退化成 os.walk（更慢且少剪枝）
+                encoding="utf-8", errors="replace", timeout=5,
+            )
+            if proc.returncode == 0:
+                files = [line for line in proc.stdout.splitlines() if line]
+        if not files:
+            skip = {"node_modules", "__pycache__", "dist", "build", "target", "venv"}
+            for dirpath, dirnames, filenames in os.walk(root):
+                dirnames[:] = [d for d in dirnames if d not in skip and not d.startswith(".")]
+                for filename in filenames:
+                    if filename.startswith("."):
+                        continue
+                    relative = os.path.relpath(os.path.join(dirpath, filename), root)
+                    files.append(relative.replace(os.sep, "/"))
+                    if len(files) >= self._FILES_CAP:
+                        break
+                if len(files) >= self._FILES_CAP:
+                    break
+        self._files_cache, self._files_cache_at = files, now
+        return files
+
+    # ---------- 确认框 ----------
+
+    def confirm(self, name: str, args: dict[str, Any]) -> bool | str | tuple[bool, str]:
+        """交互确认（Agent 的 approver）：行内单选菜单。
+
+        允许一次 / 本会话不再问 / 总是允许（规则写入前可编辑）/
+        拒绝并告诉小羽下一步怎么做 / 以后都拒绝（写 deny 规则，同样可编辑）。
+        Tab = 批准并附言：附言随 tool result
+        回灌模型（拒绝理由走同一条通道，拒绝只是附言的特例）。
+        返回值：(True, 附言) 也是批准——附言由 Agent 拼进 tool result。
+        """
+        #  确认交互期间必须停掉插话线程：确认菜单在主线程接管终端，
+        #  poller 不停手会把用户的选择按键当成插话吃掉
+        if self._poller is not None:
+            self._poller.pause()
+        #  审批挂起 = 轮次卡在等人：铃（opt-in）与状态钩子把切走的人叫回来
+        attention.waiting(attention.WAITING_APPROVAL)
+        try:
+            return self._confirm_inner(name, args)
+        finally:
+            #  答完就回到运行中：标题上的"等审批"不能留到下一次等人
+            attention.running()
+            if self._poller is not None:
+                self._poller.resume()
+
+    def ask(self, questions: list[dict[str, Any]]) -> dict[str, str]:
+        """交互提问（Agent 的 asker，ask_user 工具在 handler 里调它）。
+
+        与 confirm 同一纪律：插话线程 pause（否则面板按键被偷走）。
+        另外要先收掉工具 spinner——ask_user 的 handler 跑在 tool.running
+        之后，rich Status 的刷新线程还在画活区，不停掉会和面板抢屏幕。
+        """
+        if self._poller is not None:
+            self._poller.pause()
+        self.sink._stop_status()  # noqa: SLF001 - 同模块前端搭档
+        attention.waiting(attention.WAITING_INPUT)
+        try:
+            return ask_questions(questions, self.console)
+        finally:
+            attention.running()
+            if self._poller is not None:
+                self._poller.resume()
+
+    def secret_prompt(self, prompt: str, command: str) -> str | None:
+        """sudo 要密码（askpass 通道，见 askpass.py）：遮罩输入一行。
+
+        与 ask 同一纪律：停插话线程、收 spinner。密码只回给 sudo，不回显、不进
+        会话记录、不打进 scrollback；Esc / Ctrl-C / EOF = 取消，这次 sudo 失败。
+        """
+        if self._poller is not None:
+            self._poller.pause()
+        self.sink._stop_status()  # noqa: SLF001 - 同模块前端搭档
+        attention.waiting(attention.WAITING_INPUT)
+        try:
+            self.console.print(
+                Text(
+                    f"sudo 要密码（{prompt or 'Password:'}），正在跑：{ui.strip_controls(command)[:120]}"
+                    "——密码只交给 sudo，不记录；Esc 取消",
+                    style="text.secondary",
+                )
+            )
+            if self._confirm_session is None:
+                self._confirm_session = PromptSession()
+            try:
+                return self._confirm_session.prompt(
+                    [(theme.ptk("menu.title"), "  密码：")], is_password=True
+                )
+            except (EOFError, KeyboardInterrupt):
+                print()
+                return None
+        finally:
+            attention.running()
+            if self._poller is not None:
+                self._poller.resume()
+
+    def _confirm_inner(self, name: str, args: dict[str, Any]) -> bool | str | tuple[bool, str]:
+        #  预览被截断时拿到"补打全文"闭包，挂到菜单的 Ctrl-O 上——
+        #  "还有 N 行"在确认框里同样得是可兑现的承诺，不能逼人盲批
+        expand: Callable[[], None] | None = None
+        #  预览只用清洗过的副本：写入内容/替换文本是模型给的，可能夹带转义序列；
+        #  授权判定（会话授权、规则建议）仍用原参数
+        shown = render.clean_value(args)
+        if name == "write_file":
+            expand = self._preview_write(str(shown.get("path", "")), str(shown.get("content", "")))
+            self.sink.note_previewed()
+        elif name == "str_replace":
+            expand = self._preview_replace(
+                str(shown.get("path", "")),
+                str(shown.get("old_str", "")),
+                str(shown.get("new_str", "")),
+            )
+            self.sink.note_previewed()
+        elif name in {"apply_patch", "task_input"}:
+            from .patches import preview
+
+            content = preview(shown) if name == "apply_patch" else (
+                f"向 {shown.get('task_id')} 输入（可能执行代码）：\n"
+                f"{args.get('text', '')!r}\nEOF={bool(args.get('eof'))}"
+            )
+            rows = render.clean_value(content).splitlines()
+            self.console.print(Text("\n".join(rows[:80])))
+            if len(rows) > 80:
+                self.console.print(Text(f"还有 {len(rows) - 80} 行，Ctrl-O 展开全文"))
+                expand = lambda: self.console.print(Text("\n".join(rows)))
+        elif name == "bash":
+            #  升权申请先于命令风险点名：按下"允许"批的是"这次不套沙箱"，
+            #  而不只是这条命令本身，用户得在按键前看到
+            for line in ui.escalation_notice(args):
+                self.console.print(Text(f"  ⚠ {line}", style="status.warning"))
+            if reason := command_check.command_risk(str(args.get("command", ""))):
+                self.console.print(Text(f"  ⚠ 注意：{reason}", style="status.warning"))
+
+        options: list[tuple[str, str, str]] = [("once", "允许一次", "y")]
+        #  bash 的会话授权按命令头记（git status / rg…），推不出头的调用没有这个选项
+        if (scope := self.permissions.session_grant_label(name, args)) is not None:
+            options.append(("session", f"本会话内 {scope} 都允许，不再询问", "a"))
+        rule = suggest_allow_rule(name, args, self.permissions.workspace)
+        if rule is not None:
+            options.append(("always", f"总是允许（规则写入前可编辑：{rule}）", "!"))
+        options.append(("deny", "拒绝，并告诉小羽下一步怎么做", "n"))
+        #  与「总是允许」对称的持久拒绝：写的是 deny 规则，任何模式（含 --yolo）都拦
+        deny_rule = suggest_deny_rule(name, args, self.permissions.workspace)
+        if deny_rule is not None:
+            options.append(("never", f"以后都拒绝（规则写入前可编辑：{deny_rule}）", "x"))
+
+        try:
+            choice = self._inline_select(self._confirm_title(name, shown), options, expand)
+        except Exception:  # noqa: BLE001 - 非常规终端起不了菜单：退回文本问答，确认永远可用
+            return self._confirm_text(name, args)
+
+        amend = False
+        if isinstance(choice, tuple):  # Tab 按下：批准并附言
+            amend, choice = True, choice[1]
+
+        if choice == "once":
+            return self._accept("✔ 已允许（仅此一次）", amend)
+        if choice == "session":
+            scope = self.permissions.grant_session_call(name, args)
+            return self._accept(f"✔ 本会话内 {scope} 不再逐次确认（/perm 可查看）", amend)
+        if choice == "always":
+            assert rule is not None  # 只有推导出规则才有这个选项
+            edited = self._ask_rule(str(rule))
+            if edited is None:  # Esc / Ctrl-C：规则不写了，本次也不执行
+                self._echo_verdict("⨯ 已拒绝")
+                return False
+            edited = edited.strip()
+            if not edited:
+                return self._accept("✔ 未写入规则，仅本次允许", amend)
+            parsed = parse_rule(edited)
+            if parsed is None:
+                self.console.print(
+                    Text(f"  规则格式无法解析：{edited}（应为 allow bash(git *) 这类）", style="status.error")
+                )
+                return False
+            try:
+                path = self.permissions.add_persistent(parsed)
+            except ValueError as exc:
+                self.console.print(Text(f"  规则被拒绝：{exc}", style="status.error"))
+                return False
+            return self._accept(f"✔ 已写入 {path}：{parsed}", amend)
+        if choice == "deny":
+            reason = self._ask_reason()
+            self._echo_verdict("⨯ 已拒绝" + (f"：{reason}" if reason else ""))
+            return reason or False
+        if choice == "never":
+            assert deny_rule is not None  # 只有推导出规则才有这个选项
+            edited = self._ask_rule(str(deny_rule), empty_means="仅本次拒绝")
+            #  取消或置空都退化成普通拒绝：这一次总归是不执行的
+            parsed = parse_rule(edited.strip()) if edited and edited.strip() else None
+            if edited is not None and edited.strip() and parsed is None:
+                self.console.print(
+                    Text(f"  规则格式无法解析：{edited.strip()}（应为 deny bash(curl *) 这类）", style="status.error")
+                )
+            elif parsed is not None and parsed.behavior != "deny":
+                #  这个入口只写 deny：改成 allow 等于把"拒绝"按成了"放行"，不收
+                self.console.print(
+                    Text(f"  这里只写 deny 规则，{parsed} 未写入", style="status.error")
+                )
+                parsed = None
+            if parsed is None:
+                self._echo_verdict("⨯ 已拒绝")
+                return False
+            try:
+                path = self.permissions.add_persistent(parsed)
+            except ValueError as exc:
+                self.console.print(Text(f"  规则被拒绝：{exc}", style="status.error"))
+                self._echo_verdict("⨯ 已拒绝")
+                return False
+            self._echo_verdict(f"⨯ 已拒绝，并写入 {path}：{parsed}")
+            #  拒绝理由回灌模型：说明这是持久规则，同类调用不必再试
+            return f"用户已拒绝，并写入持久规则「{parsed}」——以后同类调用都会被拦，换别的办法"
+        #  Esc / Ctrl-C：普通拒绝
+        self._echo_verdict("⨯ 已拒绝")
+        return False
+
+    def _accept(self, verdict_text: str, amend: bool) -> bool | tuple[bool, str]:
+        """批准路径的统一收尾：回显定格进 scrollback；amend 时追问附言。"""
+        if amend:
+            note = self._ask_note()
+            if note:
+                self._echo_verdict(f"{verdict_text}，附言：{note}")
+                return (True, note)
+        self._echo_verdict(verdict_text)
+        return True
+
+    @staticmethod
+    def _confirm_title(name: str, args: dict[str, Any]) -> str:
+        """确认框问句带具体宾语：「要修改 foo.py 吗？」
+        比泛泛的「允许执行吗？」信息密度高。"""
+        if name == "bash":
+            if str(args.get("sandbox_permissions") or "").strip():
+                return "要升权执行这条命令吗？"
+            return "要执行这条命令吗？"
+        if name in ("write_file", "str_replace"):
+            verb = "写入" if name == "write_file" else "修改"
+            base = str(args.get("path", "")).rsplit("/", 1)[-1]
+            return f"要{verb} {base} 吗？"
+        return f"允许执行 {name} 吗？"
+
+    def _ask_rule(self, rule: str, empty_means: str = "仅本次允许") -> str | None:
+        """「总是允许」/「以后都拒绝」的规则写入前可编辑（选项预填推导出的规则）。
+        回车接受原文；置空 = 不写规则、只按本次的判定走；Esc/Ctrl-C = 取消。"""
+        if self._confirm_session is None:
+            self._confirm_session = PromptSession()
+        try:
+            return self._confirm_session.prompt(
+                [(theme.ptk("menu.title"), f"  规则（可编辑，置空 = {empty_means}）：")], default=rule
+            )
+        except (EOFError, KeyboardInterrupt):
+            print()
+            return None
+
+    def _ask_note(self) -> str:
+        """Tab 附言：批准的同时给模型一句
+        指示，随这次 tool result 回灌。空输入 = 不附言。"""
+        if self._confirm_session is None:
+            self._confirm_session = PromptSession()
+        try:
+            return self._confirm_session.prompt(
+                [(theme.ptk("menu.title"), "  附加指示（回车跳过）：")]
+            ).strip()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            return ""
+
+    def _inline_select(
+        self,
+        title: str,
+        options: list[tuple[str, str, str]],
+        expand: Callable[[], None] | None = None,
+    ) -> Any:
+        """确认框的行内单选：通用件 inline_select 的带附言（Tab）形态。"""
+        return inline_select(title, options, amend=True, expand=expand)
+
+    def _ask_reason(self) -> str:
+        """拒绝之后追问一句"下一步怎么做"：拒绝即改指令，不让模型干猜。"""
+        if self._confirm_session is None:
+            self._confirm_session = PromptSession()
+        try:
+            return self._confirm_session.prompt(
+                [(theme.ptk("menu.title"), "  下一步该怎么做？（回车 = 仅拒绝）")]
+            ).strip()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            return ""
+
+    def _echo_verdict(self, text: str) -> None:
+        self.console.print(Text(f"  {text}", style="text.secondary"))
+
+    def _confirm_text(self, name: str, args: dict[str, Any]) -> bool | str:
+        """菜单起不来时的回退：与 cli.make_confirm 相同的文本问答语义。"""
+        from .cli import GRANT_SESSION, interpret_confirm_answer
+
+        if self._confirm_session is None:
+            self._confirm_session = PromptSession()
+        escalation = bool(ui.escalation_notice(args)) if name == "bash" else False
+        verb = "升权执行" if escalation else "执行"
+        session_option = (
+            "/a=本会话都允许"
+            if self.permissions.session_grant_label(name, args) is not None else ""
+        )
+        try:
+            answer = self._confirm_session.prompt(
+                [
+                    (
+                        theme.ptk("menu.title"),
+                        f"  允许{verb} {name}? [y/N{session_option}；ok/好/做 等也算 y，其它输入=拒绝理由] ",
+                    )
+                ]
+            )
+        except (EOFError, KeyboardInterrupt):
+            print()
+            return False
+
+        verdict = interpret_confirm_answer(answer)
+        if verdict is GRANT_SESSION:
+            scope = self.permissions.grant_session_call(name, args)
+            note = (
+                f"  （本次会话内 {scope} 不再逐次确认；/perm 可查看）"
+                if scope is not None
+                else "  （沙箱升权仅本次允许）" if escalation
+                else "  （这条命令推不出会话授权范围，仅本次允许）"
+            )
+            self.console.print(Text(note, style="text.secondary"))
+            return True
+        return verdict
+
+    #  write_file 预览行数与明文版一致
+    _WRITE_HEAD = 12
+
+    def _body_width(self) -> int:
+        """确认框内正文的可用列数（"  │ " 前缀已扣）。"""
+        return ui.budget(4, self.console.width)
+
+    def _diff_cap(self) -> int:
+        """diff 预览的行数上限：跟终端高度取小。预览比屏幕还高的话，最该先看到的
+        开头会被自己的后半截顶出屏幕，那就白预览了。"""
+        return max(min(_DIFF_CAP, ui.term_size()[1] - _CONFIRM_CHROME), 6)
+
+    def _preview_write(self, path: str, content: str) -> Callable[[], None] | None:
+        """打印头部预览；被截断时返回"补打全文"的闭包（确认菜单 Ctrl-O 调），
+        没截断返回 None——菜单据此决定提示行里许不许诺"看全文"。"""
+        head_lines = content.split("\n")[: self._WRITE_HEAD]
+        self.console.print(Text(f"  ┌ 将写入：{path}", style="text.secondary"))
+        self._print_code(path, "\n".join(head_lines))
+        if content.count("\n") < self._WRITE_HEAD:
+            return None
+        remainder = content.count("\n") - self._WRITE_HEAD + 1
+        self.console.print(Text(f"  └ …还有 {remainder} 行", style="text.secondary"))
+
+        def show_full() -> None:
+            #  与 Ctrl-O 详情回放同一契约：整体重打而非只补尾巴，读者不用
+            #  跨着截断线自己拼接两截
+            self.console.print(Text(f"  ┌ 全文：{path}", style="text.secondary"))
+            self._print_code(path, content)
+            self.console.print(Text("  └", style="text.secondary"))
+
+        return show_full
+
+    def _print_code(self, path: str, text: str) -> None:
+        try:
+            lexer = Syntax.guess_lexer(path, code=text)
+            block = Syntax(
+                text, lexer, theme=_syntax_theme(), background_color="default", word_wrap=True
+            )
+            self.console.print(block, no_wrap=False)
+        except Exception:  # noqa: BLE001 - 高亮失败退回明文，预览不能因样式而炸
+            for row in text.split("\n"):
+                self.console.print(
+                    Text(f"  │ {ui.preview(row, self._body_width())}", style="text.secondary")
+                )
+
+    def _preview_replace(self, path: str, old: str, new: str) -> Callable[[], None] | None:
+        """打印 diff 预览；被截断时返回"补打完整 diff"的闭包，同 _preview_write。"""
+        rows = _diff_rows(old, new, self._body_width(), cap=None)
+        cap = self._diff_cap()
+        shown = rows
+        if len(rows) > cap:
+            shown = rows[:cap] + [[("text.secondary", f"…还有 {len(rows) - cap} 行")]]
+        self.console.print(Text(f"  ┌ 将修改：{path}", style="text.secondary"))
+        self._print_diff_rows(shown)
+        self.console.print(Text("  └", style="text.secondary"))
+        if len(rows) <= cap:
+            return None
+
+        def show_full() -> None:
+            self.console.print(Text(f"  ┌ 完整 diff：{path}", style="text.secondary"))
+            self._print_diff_rows(rows)
+            self.console.print(Text("  └", style="text.secondary"))
+
+        return show_full
+
+    def _print_diff_rows(self, rows: list[list[tuple[str, str]]]) -> None:
+        for fragments in rows:
+            #  _diff_rows 的片段是 (样式, 文本)，Text.assemble 吃 (文本, 样式)
+            self.console.print(
+                Text.assemble(
+                    ("  │ ", "text.secondary"), *[(text, style) for style, text in fragments]
+                )
+            )
+
+    # ---------- 输入行前缀动作 ----------
+
+    def _run_shell(self, command: str) -> None:
+        """! 前缀外壳：调核心（cli.user_shell）+ rich 打印。
+
+        不过权限、不进沙箱的理由见核心 docstring；空命令由 classify_input 拦住。
+        """
+        from .cli import user_shell
+
+        agent = self.agent
+        assert agent is not None
+        self.console.print(Text(f"$ {command}", style="text.accent"))
+        try:
+            result = user_shell(agent, command)
+        except KeyboardInterrupt:
+            self.console.print(Text("[命令被 Ctrl-C 中断，输出未能捕获]", style="status.warning"))
+            return
+        if result.stdout:
+            print(result.stdout, end="" if result.stdout.endswith("\n") else "\n")
+        if result.stderr:
+            self.console.print(Text(result.stderr.rstrip("\n"), style="status.error"))
+        self.console.print(
+            Text(f"  （退出码 {result.returncode}，输出已进入上下文）", style="text.secondary")
+        )
+
+    def _note_memory(self, note: str) -> None:
+        """# 前缀外壳：调核心（cli.user_memo）+ rich 打印。
+
+        指令文件选择与"文件管以后、灌话管这轮"的语义见核心 docstring。
+        """
+        from .cli import user_memo
+
+        agent = self.agent
+        assert agent is not None
+        try:
+            target = user_memo(agent, note)
+        except OSError as exc:
+            self.console.print(Text(f"  写入失败：{exc}", style="status.error"))
+            return
+        self.console.print(
+            Text(f"  已记入 {target}（本会话即刻生效，之后的会话自动加载）", style="text.secondary")
+        )
+
+    # ---------- REPL ----------
+
+    def run(self, agent: Agent) -> int:
+        """交互循环。与明文 repl 的差异：Ctrl-C 需在 2 秒内按两次才退出
+        （单次防误触），Ctrl-D 仍即刻退出；多出 @ 文件补全与 Ctrl-O 等按键
+        （! / # 前缀两个前端已对齐，路由同走 keys.classify_input）。"""
+        #  窗口标题随会话走（具名会话用名字），退出时还原——任何退出路径
+        #  （Ctrl-D、/exit、异常）都要还
+        attention.set_title(agent.config.workspace, session=attention.session_label(agent.session_log))
+        try:
+            return self._run_loop(agent)
+        finally:
+            attention.clear_title()
+
+    def _run_loop(self, agent: Agent) -> int:
+        from .cli import handle_slash, skill_prompt
+
+        self.agent = agent
+        #  空闲时到达的后台事件：打一行提示，不替用户开新的一轮
+        agent.on_notification = self._on_notification
+        self.sink.bash_timeout = agent.config.bash_timeout
+        self.sink.request_timeout = int(agent.config.request_timeout)
+        self.sink.workspace = Path(agent.config.workspace)
+        if agent.config.unguarded:
+            from . import guardrails
+
+            self.console.print(Text(guardrails.notice(agent.config), style="status.error"))
+        elif agent.config.auto_approve:
+            self.console.print(
+                Text("--yolo 已开启：写文件和执行命令都不会再问你", style="status.error")
+            )
+        #  --yolo 下 auto 档那句"bash 仍逐条确认"不成立（全放行盖过了 auto 的放行矩阵），
+        #  不打；plan 档仍要说——只读承诺不受 --yolo 影响
+        if agent.mode != modes.DEFAULT and not (
+            agent.config.auto_approve and agent.mode == modes.AUTO
+        ):
+            #  --mode auto 起手：提示符上的标记不解释"这一档会不会问你"，开场说一次
+            self.console.print(
+                Text(
+                    modes.describe(agent.mode, sandbox_ready=agent.sandbox_ready()),
+                    style="status.warning",
+                )
+            )
+            self._warned_no_sandbox = True
+        #  速览行从绑定表渲染，全部按键见 /keys
+        self.console.print(Text(f"  {keys.hint_line()} · /keys 看全部", style="text.secondary"))
+        #  resume 回放若折叠过工具输出，进循环前提一次 Ctrl-O——留底还在，
+        #  这是它被 begin_turn 清掉之前唯一的展开窗口
+        self._print_expand_hint()
+
+        session = self._input_session()
+        last_interrupt = 0.0
+        #  等待期敲的整行输入：预填进下一轮输入行，不自动提交
+        queued = ""
+        while True:
+            try:
+                line = session.prompt(
+                    self._prompt_fragments,
+                    default=queued,
+                    pre_run=self._prime_prompt,
+                ).strip()
+                queued = ""
+            except EOFError:
+                print()
+                return 0
+            except KeyboardInterrupt:
+                now = time.monotonic()
+                if now - last_interrupt < self._EXIT_WINDOW:
+                    print()
+                    return 0
+                last_interrupt = now
+                #  Ctrl-C 清掉的半截输入先存进 Esc-Esc 的取回槽：误按一下不该让敲了
+                #  一半的话凭空消失，也不为此加新键。prompt_toolkit 要到下一次
+                #  prompt() 才重置 buffer，此刻正文还在
+                draft = session.default_buffer.text.strip()
+                hint = "  再按一次 Ctrl-C 退出"
+                if draft:
+                    self._last_input = draft
+                    hint += "（刚才的输入 Esc Esc 可取回）"
+                self.console.print(Text(hint, style="text.secondary"))
+                continue
+
+            #  提交路由单点在 keys.classify_input：TUI 与明文 REPL 同一张表
+            literal, self._literal_submit = self._literal_submit, False
+            action = keys.classify_input(line, literal=literal)
+            if action.kind == "empty":
+                continue
+            if action.kind == "usage":
+                self.console.print(Text(f"  {action.hint}", style="text.secondary"))
+                continue
+            recall = action.args
+            items, self._suggestions = self._suggestions, []
+            if action.kind == "send" and not literal:
+                selected = suggest.resolve_selection(action.args, items)
+                if selected != action.args:
+                    self.console.print(Text(f"  ↳ {selected}", style="text.secondary"))
+                    action = keys.InputAction("send", selected)
+                    #  取回已选择的正文，避免下一轮的同一编号指向另一条建议。
+                    recall = selected
+            if action.kind == "slash":
+                #  /<技能名> 参数… 展开成本轮提示（与明文 REPL 同一个入口）；
+                #  不是技能的才交给内建命令表
+                expanded = skill_prompt(agent, action.args)
+                if expanded is None:
+                    #  /resume 这类需要列表选择的命令用带过滤的行内菜单（纯单选，无附言）
+                    if handle_slash(agent, action.args, select=search_select):
+                        return 0
+                    #  /rewind 把被回退那一轮的原话放进了插话队列：取出来预填进
+                    #  下一轮输入行（与"没赶上本轮的插话"同一条路），不自动提交
+                    queued = "\n".join(agent.drain_steers()).strip()
+                    if queued:
+                        self.console.print(
+                            Text("  （已把该轮原话填回输入行，可改可直接回车发送）", style="text.secondary")
+                        )
+                    continue
+                if not expanded:
+                    continue
+                action = keys.InputAction("send", expanded)
+            if action.kind == "shell":
+                self._run_shell(action.args)
+                continue
+            if action.kind == "memo":
+                self._note_memory(action.args)
+                continue
+
+            line = action.args
+            #  Esc-Esc 取回的是用户敲的那行（/deploy prod），不是展开后的几千字
+            self._last_input = recall
+            self.sink.begin_turn()
+            attention.running()
+            #  运行期插话（steer）：整行回车即在 step 边界进入本轮。
+            #  poller 起不来（Windows/非 tty）时自动退回旧的"收尾预填"体验
+            self._poller = SteerPoller(agent)
+            try:
+                with NoticeCapture(self.sink):
+                    self._poller.start()
+                    agent.send(self._content_of(line))
+                #  一轮结束只读折叠组可能还攒着（收尾回复没有正文时就没人触发落盘）
+                self.sink._flush_ro_group()  # noqa: SLF001 - 同模块前端搭档
+            except KeyboardInterrupt:
+                self.sink.interrupt()
+                agent.close_open_tool_calls("用户按 Ctrl-C 中断了本轮。")
+                self.console.print(Text("\n[已中断，可以继续输入]", style="status.warning"))
+            except Exception as exc:  # noqa: BLE001 - REPL 不该因为一次请求失败就退出
+                self.sink.interrupt()
+                if agent.session_log:
+                    agent.session_log.event("error", error=f"{type(exc).__name__}: {exc}")
+                self.console.print(
+                    Text(f"\n请求失败：{type(exc).__name__}: {exc}", style="status.error")
+                )
+            finally:
+                self._poller.stop()
+                self._poller = None
+            #  still-running 状态行：inline 架构没有常驻状态栏，
+            #  轮次结束打一行即走，与明文 REPL 同一份文案（cli.background_status）
+            from .cli import background_status
+
+            if note := background_status(agent):
+                self.console.print(Text(note, style="text.secondary"))
+            from .cli import turn_stats_line
+
+            if stats := turn_stats_line(agent, interactive=True):
+                self.console.print(Text(f"  {stats}", style="text.secondary"))
+            self._print_expand_hint()
+            #  一轮收尾 = 回到"等人"：铃（opt-in）+ 状态钩子，把切去别处的人叫回来
+            attention.waiting(attention.WAITING_INPUT)
+            #  没赶上本轮的插话（模型收尾后才按的回车）+ 等待期敲的其余内容：
+            #  都转成下一轮输入行的预填——用户的话绝不凭空消失，也绝不自动提交
+            leftover = agent.drain_steers()
+            typed = self._drain_typeahead()
+            queued = "\n".join(part for part in [*leftover, typed] if part).strip()
+            if queued:
+                self.console.print(
+                    Text("  （已接住你刚才输入的内容，确认后回车发送）", style="text.secondary")
+                )
+            print()

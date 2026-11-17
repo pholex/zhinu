@@ -1,0 +1,394 @@
+# 嵌入面：把小羽当库用
+
+新增的独立发行包 `xiaoyu-agent-sdk` 提供 `Session` / `AsyncSession`、资源关闭和
+严格结构化结果契约，见 [Python SDK 指南](sdk.md)。本文记录的 `import xiaoyu`
+公开 API 继续兼容；已有宿主不需要立即迁移。
+
+> 面向"把 xiaoyu 当执行引擎嵌进自己进程"的宿主：聊天机器人常驻进程、内部平台、
+> 行业 agent 的壳。三张脸的选型见 [platform.md](platform.md)；本文只讲
+> **Python 进程内嵌入**这一张，以及跨语言时的 `--wire` 协议。
+
+## 稳定性承诺
+
+**`xiaoyu.__all__` 列出的名字就是公开 API**——从顶层 `import xiaoyu` 拿到的
+对象，按下面的规则维护；其余模块路径（`xiaoyu.agent`、`xiaoyu.tools`、……）
+是内部实现，随时可能重构，宿主别吃。
+
+- **版本号**：0.x 阶段，**minor 版本承担 semver 的 major 语义**（0.45 → 0.46
+  可以含破坏性变更），patch 版本只修 bug、不改契约。
+- **弃用期**：公开面的破坏性变更（删名字、改签名、改返回形态语义、改事件既有
+  字段）**先在一个 minor 版本里发 `DeprecationWarning` 并在发版说明写明替代
+  写法，至少隔一个 minor 版本再移除**——0.45 弃用，最早 0.47 拿掉。
+- **不算破坏性**：新增导出名、新增可选参数、`RunResult` / 事件新增字段、新增
+  事件 `kind`。消费事件流的宿主对不认识的 `kind` 跳过即可（前向兼容）。
+- **不在承诺范围**：内部模块路径、`Agent` 的下划线属性、CLI 输出文案、system
+  prompt 内容、工具 schema 细节、会话 JSONL 的逐字段格式（`load_messages` 是
+  读它的公开入口，格式本身不是契约）。
+
+导出表在 `xiaoyu/__init__.py` 的 `_EXPORTS`；`tests/test_public_api.py` 锁住
+"表里每个名字可导入、本文清单与表双向一致、`import xiaoyu` 不拖起内核"三件事。
+
+## 宿主控制技能可用性
+
+`Config.disabled_skill_names` 是默认空的精确技能名称元组。宿主可在创建 Agent 前设置，
+也可在 Agent 空闲时更新后调用 `agent.reload_skills()`。被停用的技能不进入索引，
+按名称重新扫描也不会绕过此设置。已进入对话历史的说明不会被撤回，工具权限不受影响。
+执行中的 Agent 不应被宿主直接修改配置；桌面宿主在下一轮开始前同步保存的技能设置。
+
+## 最小可用示例
+
+```python
+from pathlib import Path
+import xiaoyu
+
+xiaoyu.load_dotenv()                                  # 用户级 ~/.config/xiaoyu/.env 等，已有环境变量不覆盖
+config = xiaoyu.Config.from_env(workspace=Path("/srv/repo"))
+
+def approve(name: str, args: dict):
+    """审批回调：在工作线程里被同步调用。返回形态见下节。"""
+    if name == "bash" and args.get("command", "").startswith("git push"):
+        return xiaoyu.Deny("不许推远端")                # 理由回灌模型 = 改指令
+    return True
+
+agent = xiaoyu.Agent(config, approver=approve)
+result = xiaoyu.measured_send(agent, "把 README 的安装一节翻成英文")
+print(result.text)          # 本轮交付正文
+print(result.usage)         # 本轮 usage 增量：turns / prompt_tokens / completion_tokens / by_model
+print(result.stopped)       # done / turn_cap / budget / truncated / interrupted
+```
+
+宿主可通过 `Config.additional_workspaces` 传入已授权且规范化的绝对 `Path` 元组（默认空）。
+这些目录纳入文件工具工作范围和命令沙箱可写范围；`workspace` 仍是默认执行目录，
+附加目录不会自动加载其配置、指令或技能。配置保护、deny 和符号链接检查仍生效。
+宿主应在创建会话前确认这些目录，并在会话持续期间保持范围稳定。
+
+同一个 `Agent` 实例可以被反复 `measured_send()`，上下文自动接上——常驻宿主
+不必每轮重建。不注入 `approver` 时默认**全放行**（等价 `--yolo`），只在
+可信环境这么用。
+
+宿主自己是 asyncio 程序（飞书 bot、FastAPI 服务）时用 `AsyncAgent`，
+它把同步内核放进工作线程，不堵事件循环：
+
+```python
+import asyncio
+import xiaoyu
+
+async def approve(name: str, args: dict):
+    card = await send_approval_card(name, args)       # 可以 await 任何依赖事件循环的东西
+    return await wait_for_click(card)
+
+async def main() -> None:
+    loop = asyncio.get_running_loop()
+    agent = xiaoyu.Agent(
+        config,
+        approver=xiaoyu.AsyncApprover(approve, loop, timeout=90),   # 超时/异常 = 拒绝（fail closed）
+    )
+    async_agent = xiaoyu.AsyncAgent(agent)
+    result = await async_agent.send("用户第一句话")
+    await async_agent.send("用户第二句话")             # 同一实例，上下文接上
+    async_agent.interrupt()                            # 任意时刻、任意线程可调，非阻塞
+    async_agent.recycle()                              # 清对话重开，对象不重建
+```
+
+⚠️ 把 `async def` 直接传给 `Agent(approver=...)` 是错的：调出来的是没被
+await 的协程对象，永远等不到答复——`Agent` 构造时直接抛 `TypeError`。异步审批
+必须经 `AsyncApprover`。
+
+`interrupt()` 在工具与模型请求启动前、运行中的流式检查点以及 hook 返回后
+生效。取消发生在 `PreToolUse` 期间时，该工具以 `ToolDenied` 收尾且不执行；
+发生在 `PostToolUse` / `ToolFailed` 期间时，已执行的工具结果先保留，再结束
+本轮，不继续请求模型。运行中的命令 hook 每 50 毫秒检查取消，随后终止并回收
+进程及管道；POSIX 下先给进程组最多 1 秒收尾，再强制终止。同一事件余下的
+hook 不再启动。子任务生命周期 hook 同样响应取消，收尾时保留子任务结果；
+`SessionEnd` 不受上一轮取消标志影响，仍按自身超时执行。宿主自定义的进程内
+hook 需自行实现运行中取消。已发生的工具副作用不会自动回滚。
+
+## 审批契约
+
+`approver(tool_name, args)` 在**工作线程**里同步调用，返回：
+
+| 返回值 | 含义 |
+|---|---|
+| `True` | 批准 |
+| `(True, "附言")` / `Allow(note="附言")` | 批准，附言随工具结果回灌模型 |
+| `Allow(updated_args={...})` | 批准并**整体替换**本次参数（宿主"包沙箱再放行"的通道） |
+| `False` / `""` / `None` | 拒绝 |
+| `"理由"` / `(False, "理由")` / `Deny("理由")` | 拒绝并把理由回灌模型——拒绝即改指令 |
+
+**批准只认 `True` 本身或 `Allow`**。表里没有的形状（字典、自定义结果对象、
+数字、协程对象……）一律按拒绝处理，并发一条告警说明返回值无法识别——审批是闸，
+看不懂的答复不按真值猜。
+
+规则：`Allow.updated_args` 改写后的参数**仍要过一遍 deny 规则**（deny 的
+bypass-immune 承诺对审批改写同样成立）；`normalize_verdict()` 是把这些形态归一
+的公开函数，宿主要在自己这边先做一层裁决时可复用。
+
+审批之前还有两道闸，宿主可各自注入：
+
+- **权限规则** `Permissions`：`allow` / `deny` 规则（`parse_rule("deny bash(git push*)")`），
+  `Permissions.load(workspace)` 读用户级 + 工作区级规则文件，或
+  `Permissions(workspace, rules=[...])` 显式构造。deny 规则任何模式下都不可绕过，
+  命中 allow 的调用不再问 approver。`suggest_allow_rule` / `banned_allow_reason` /
+  `user_rules_path` / `workspace_rules_path` 是"把用户这次的放行记成常批"要用的
+  一组助手。
+- **模式** `agent.set_mode("default" | "auto" | "plan")`：auto 档工作区内改文件、
+  沙箱内跑命令免确认；plan 档只读规划。
+
+`ask_user` 工具（模型向用户提选择题）走同款注入通道 `Agent(asker=...)`，签名见
+`Asker`；不注入时工具不进 schema，模型看不见它。
+
+## 事件消费
+
+两条路，别同时依赖：
+
+**① `stream()`**——逐事件驱动一轮，最后一个事件永远是 `RunCompleted(result=RunResult)`：
+
+```python
+import contextlib
+
+async with contextlib.aclosing(async_agent.stream("任务")) as events:
+    async for event in events:
+        match event:
+            case xiaoyu.TextDelta(text=t): ...           # 正文分片
+            case xiaoyu.ToolRunning(name=n): ...         # 工具开跑
+            case xiaoyu.RunCompleted(result=r): ...      # 收尾：元数据在这
+```
+
+提前退出要用 `contextlib.aclosing()` 包住再 `break`——裸 `break` 不会立刻关闭
+异步生成器，退出即 `interrupt()` 这条保证只在 aclosing 下成立。`stream()`
+进行中会临时接管 sink，事件只进迭代器。
+
+**② `sink`**——构造时注入一个实现 `UISink` 协议（`emit(event) -> None`）的
+对象，适合事件常年单向转发的宿主；`Agent.sink` 也可事后替换。
+
+事件词汇（`UIEvent` 子类，`to_dict()` 即 `--output-format stream-json` 与
+`--wire` 的线上形态，`kind` 是判别字段）：
+
+| 事件 | kind | 字段 |
+|---|---|---|
+| `RequestStarted` | `request.started` | `model` |
+| `RequestEnded` | `request.ended` | `duration_ms`、`ttft_ms`（首个 chunk 延迟；一个都没等到为 `null`）、`usage`（这次调用的 `prompt_tokens` / `completion_tokens` / `cached_tokens`；上游没回 usage 为 `{}`） |
+| `TextDelta` / `TextEnd` | `text.delta` / `text.end` | `text` |
+| `ToolPreparing` | `tool.preparing` | `name`, `index`, `argument_chars`, `path`, `purpose`（参数生成中的临时预览） |
+| `ToolPending` | `tool.pending` | `name`, `args` |
+| `ToolPurpose` | `tool.purpose` | `name`, `purpose` |
+| `ToolRunning` | `tool.running` | `name`, `args` |
+| `ToolProgress` | `tool.progress` | `name`, `message`, `progress`, `total`（running 与终态之间零到多次；目前只有 MCP 的 `notifications/progress` 会发；不在顶层导出面，按 `kind` 消费） |
+| `ToolCompleted` | `tool.completed` | `name`, `output`, `ok`, `seconds` |
+| `ToolDenied` | `tool.denied` | `name`, `by`（`rule` / `user`） |
+| `SteerAccepted` | `steer.accepted` | `text` |
+| `PlanUpdated` | `plan.updated` | `plan`, `explanation` |
+| `Notice` | `notice` | `text`, `level`（`info` / `warn` / `error`） |
+| `RunCompleted` | `run.completed` | `result`（仅 `stream()` 产出） |
+
+不变量：每个 `tool.pending` 最终恰好收到一个终态（`completed` 或 `denied`）；
+每个 `request.started` 恰好对应一个 `request.ended`。
+
+`tool.preparing` 在模型流内、`tool.pending` 之前产生。用当前请求与 `index`
+关联预览；`argument_chars` 是累计原始 JSON 字符数，不是 token 或文件字节数。
+`path` / `purpose` 仅展示已闭合且不超过 2048 原始字符的顶层字符串；其他参数不外发。
+元信息变化立即发，只有字符数变化时最多每秒十次，结束时补齐最后计数。
+收到 `request.ended` 后必须清除该请求的全部预览，包括异常、中断与重试。
+预览不表示工具已获准或一定执行；审批与执行仍只使用收齐、解析后的参数。
+
+## 后台事件：会话空闲时也要知道
+
+模型把长命令放到后台跑之后照常收尾，任务完成时会话多半已经空闲。完成通知
+（`Agent.notify` 投递的那些）是给模型看的，要等下一轮才送得到。宿主想知道
+"有事件在等"，注册一个回调：
+
+```python
+def on_notification(item):          # {"key": ..., "text": ..., "wake": bool}
+    if item["wake"]:
+        loop.create_task(host.send("后台任务有结果了，接着做"))
+
+host.watch_notifications(on_notification)   # 在事件循环里调用；传 None 取消
+```
+
+- 回调在**注册时所在的事件循环**里执行，可以直接动宿主自己的状态。直接用同步
+  `Agent` 的宿主设 `agent.on_notification`，回调在**投递通知的那个线程**里执行
+  （多半是后台任务的监视线程），要自己保证线程安全。
+- `wake=True` 是值得为它开一轮的事件（后台任务完成、monitor 有新输出）；
+  `wake=False` 是捎带的公告，不值得专门叫醒模型。
+- **只告知，不会自己开一轮**：要不要 `send()` 由宿主定。
+- `pending_notifications()` 随时给出还没送达模型的通知；下一轮开跑、送达之后为空。
+- 同一个 `key` 整个会话只告知一次、只送达一次，宿主重复投递幂等事件不会刷屏。
+
+## 可撤回的插话
+
+`Agent` / `AsyncAgent` 的 `queue_steer(text)` 返回插话 ID（空白输入返回空串），
+`pending_steers()` 返回按顺序排列的 `(id, text)` 元组快照。
+`retract_steer(id)` 返回成功取回的正文，已消费或不存在时返回 `None`；
+`replace_steer(id, text)` 原位修改尚未消费的正文，返回是否成功，空白正文抛 `ValueError`。
+撤回与批次消费共用一把锁，消费先取得正文后便不能撤回。队列仅在内存中，
+轮末仍可用 `drain_steers()` 回收；原 `steer()` 的返回值与行为保持不变。
+
+## 单轮结算 `RunResult`
+
+`measured_send()` / `AsyncAgent.send()` 返回；`stream()` 在 `RunCompleted.result` 里给：
+
+| 字段 | 含义 |
+|---|---|
+| `text` | 本轮最后一条 assistant 正文（只在本轮新增消息里取，不会把上一轮交付误报成本轮） |
+| `usage` | **本轮增量**：`turns` / `prompt_tokens` / `completion_tokens` / `by_model`（按 `provider/model` 分列，含子 agent 与摘要调用） |
+| `duration_seconds` | 墙钟耗时 |
+| `context_tokens` | 跑完后的上下文水位，宿主据此决定何时 `recycle()` |
+| `interrupted` | 被 `interrupt()` 收掉为 `True`——打断是宿主自己的动作，不以异常弹回 |
+| `stopped` | `done` / `turn_cap` / `budget` / `truncated`（回复撞了输出长度上限，自动续写 3 次后仍没说完） / `interrupted` |
+| `output` | 带 `output_schema` 跑的那一轮，模型交回的结构化对象；否则 `None` |
+| `artifacts` | 本轮文件交付的 `FileArtifact` 元组；无文件时为空。文件工具自动记录，进程内业务工具可调用 `Toolbox.report_artifact(path)` 显式交付 |
+
+真正的错误（网络、配置、bug）照常抛出；`Interrupted` 只在直接调 `Agent.send()`
+时会看到，经 `measured_send` 已吸收。
+
+`FileArtifact` 包含轮内稳定的 `id`、工作区相对 `path`、`size`、`sha256`、`mime_type`、
+`operation`（created / updated / reported）、`source`（file_tool / tool）及 `status`
+（complete / incomplete）。状态只表示这轮是否正常收尾，不代表产物通过业务验收。
+同一文件一轮只交付一次，文件工具取首写前与末次写后的净变化；被删除、被外部改写、
+改回原样的文件不列入。只收工作区普通文件，不扫描目录、不从正文猜路径；bash、MCP
+或子任务生成的文件需由宿主业务工具显式交付。显式交付可以引用已有文件。
+
+非空清单同时经 `ArtifactsReady`（`artifacts.ready`）发布并记入会话日志；HTTP 的
+`result.artifacts` 与 SDK 结果相同，CLI JSON/stream-json 的非空结果也带 `artifacts`。
+该协议不提供文件内容或下载权限；宿主提供下载时仍需自行校验路径、权限和文件指纹。
+
+**结构化收尾**：`measured_send(agent, task, output_schema={...JSON Schema...})`
+（`AsyncAgent.send/stream` 同参）只对这一轮挂 `structured_output` 工具，结果在
+`RunResult.output`；轮末自动撤掉，下一轮不受影响。
+
+## 会话：resume / recycle / 落盘
+
+`agent.preview_rewind(index, conversation=True, files=True)` 返回只读 `RewindPreview`；
+`agent.rewind_result(index, ..., preview=preview)` 校验预览仍对应当前状态后执行。
+文件条目为 `RewindFilePreview`，包含恢复/删除/冲突/跳过操作与有界文本差异。
+完整字段、冲突和范围契约见 [SDK 回滚预览](sdk.md#本地恢复分叉和回滚)。
+
+- **落盘**：`Agent(session_log=xiaoyu.SessionLog.create(model, str(workspace), directory=自己的目录))`。
+  常驻宿主**显式传 `directory`**，与用户 CLI 手动会话彻底隔离；缺省落在按工作区
+  分区的公共目录。
+- **resume**：重启后 `messages = xiaoyu.load_messages(path)`，
+  `agent.restore(messages, source=str(path))`——与 CLI `xiaoyu resume` 同一条路径；
+  默认把历史复制进新会话文件（新文件自包含），`copy=False` 表示续写历史所在的
+  那个文件，只接上下文不再抄一遍。`list_sessions(workspace=...)` 列可续的会话。
+  `load_messages` 同时携带活动文件检查点；直接交给 `restore` 可在同工作区接回
+  `/rewind` 快照。复制到新日志时快照记录也独立复制；切片或转成普通 list 会丢掉
+  快照元数据，适合只复制对话的 fork。旧日志没有快照记录时不补造。
+- **写锁**：`SessionLog` 构造即对日志旁的 `<日志>.lock` 加跨进程排他锁（内核锁，进程
+  死亡自动释放），同一会话文件同一时刻只允许一个写句柄——另一个进程（或本进程里
+  另一个 `SessionLog`）已持有时抛 `SessionLockedError`（`.pid` 是持有者，消息可直接
+  给用户看）。`close()` 写 exit 后放锁，`release()` 只放锁不写 exit，放锁后的写入
+  一律丢弃；读（`load_messages`、`list_sessions`）不受锁影响。同进程要在同一个文件
+  上换新句柄，先 `release()` 旧的。
+- **坏行**：`load_messages` 的返回值是 `list` 子类，`corrupt_lines` 属性记着中段解析
+  失败被跳过的行号（最后一行的半行是崩溃常态，静默不计）。`restore()` 看到非空会经
+  sink 发一条 warn 级 `Notice`；自己切片再 restore 的，切片会丢掉这个属性。
+- **recycle**：`AsyncAgent.recycle()` / `Agent.reset()`——清对话重开，对象 /
+  registry / config 都不重建，trace、已加载技能等状态一并归零。
+- **打断与插话**（线程安全、非阻塞，任意线程可调）：`interrupt()` 在下一个 chunk
+  边界收尾、半截话入历史；`steer(text)` 让模型在下一个 step 边界看到这句话再继续
+  （本轮已结束时下一次 `send()` 开头丢弃，要保留用 `agent.drain_steers()`）；
+  `notify(text, key="")` 投递系统通知，搭下一条工具结果送达、同 key 只送一次。
+  `wake=False` 的公告在下一次已确定要发送的模型请求前捎带送达；不会单独触发
+  一次请求。MCP 晚连接或恢复后的上线公告也遵守此规则。
+- **并发纪律**：同一个 `Agent` 同时只能有一轮在跑；`AsyncAgent` 的每轮入口会
+  先等上一轮工作线程真正收尾，宿主不必自己等。要并发就开多个实例。
+- `Agent.messages` / `Agent.usage` / `Agent.trace` 都持久在实例上，宿主随时可读。
+
+## 工具面：`Toolbox` 与 MCP
+
+`Agent(config, toolbox=xiaoyu.Toolbox(config))`；不传就按 config 构造。
+`Toolbox(config, only=[...])` 得到受限子集；宿主把业务动作包成 MCP server 挂上去
+（`Toolbox(mcp_view=...)`）的做法见 [platform.md](platform.md)「把业务动作交给 agent：宿主自有工具」与 [examples/ops-console](../examples/ops-console/)——那一层的
+`ServerSpec` / `launch_specs` 暂**不在**冻结面里，用时按 platform.md 的写法走。
+
+`Config` 的 `enable_skills` / `enable_agents` / `enable_hooks` / `enable_plugins` /
+`enable_mcp` / `enable_explore` 开关决定内核挂哪些能力；嵌入宿主要"行为确定"
+（测试、审计）时逐个关掉。
+
+核心工具执行前会按声明还原可识别的数字、布尔值与容器参数，再检查基础约束：
+`type`（含类型列表）、`required`、`enum` / `const`、`properties`、
+`additionalProperties` 与 `items`。错误作为工具结果返回，不进入 handler；
+审批通过 `Allow.updated_args` 改写的参数也经过此检查。额外字段默认保留；
+`additionalProperties: false` 拒绝额外字段，声明为 schema 时检查其值，
+绝不静默删字段。
+MCP 的全量注册与 `use_tool` 检索调用走同一检查。
+内置工具中以 `None` 表示未指定的可选参数接受 JSON `null`；单个类型加 `null`
+的声明仍支持上述字符串转换，多种非空类型的联合声明不猜测转换方向。
+
+这是基础输入检查，不是完整 JSON Schema 验证：`$ref` 节点、组合分支、
+正则及数值范围等复杂约束仍由工具实现或 MCP server 负责；存在
+`patternProperties` 时，额外字段也交给工具判定。独立 SDK 的业务工具继续
+使用其严格校验器，保留原始参数，不走上述类型转换。
+
+`write_file` 与 `str_replace` 在编辑前核对上次读取的文件时间、大小和原始字节
+指纹；即使外部修改保持时间与大小不变，也需要重新读取。分段阅读只在同一
+内容版本内累计。核对与替换之间没有跨进程文件锁，不能保证并发写入的事务隔离。
+
+两种编辑工具先写同目录临时文件，再原子替换目标。写入或替换
+失败时保留原文件，并清理临时文件；新文件写入失败时不留下半个文件。已有文件
+仍检查写权限，保留权限位及工具原有的编码、换行处理。符号链接按解析后的目标
+写入，链接本身保留。成功替换会更换 inode，硬链接的其他路径不会随之改写；
+这不提供断电持久性保证，也不承诺保留 ACL 等额外文件元数据。
+
+## 跨语言：`--wire` 的 JSON-RPC 契约
+
+宿主不是 Python 时，起 `xiaoyu --wire` 子进程，stdin/stdout 一行一条 JSON-RPC 2.0
+（协议 version `1.0`）。**单进程、无常驻 server、无 HTTP**。
+
+client → server（request，带 `id`）：
+
+| 方法 | 参数 | 返回 |
+|---|---|---|
+| `initialize` | `{}` | `{protocol_version, server:{name,version}, model, workspace, messages}`（`messages` = 已在场的历史条数） |
+| `prompt` | `{text}` | 整轮结束后 `{status, result, usage}`，`status ∈ finished \| interrupted \| error`；一次只跑一轮，忙时错误码 `-32000` |
+| `steer` | `{text}` | `{}` |
+| `steer/queue` | `{text}` | `{id}`，仍遵守运行中插话的轮次语义 |
+| `steer/list` | `{}` | `{items: [{id, text}]}` |
+| `steer/retract` | `{id}` | `{retracted, text}`；已消费时为 `false, null` |
+| `steer/replace` | `{id, text}` | `{replaced}` |
+| `cancel` | `{}` | `{}`；打断当前轮并把挂起审批全按拒绝解决 |
+
+server → client：
+
+- **事件**（notification，无 id）：`{"method":"event","params":{"kind":"text.delta",...}}`，
+  `params` 就是上表事件的 `to_dict()`。
+- **审批**（request，带 id，等响应）：
+  `{"id":"srv-1","method":"request","params":{"type":"approval","payload":{"name":"bash","args":{...}}}}`，
+  client 回 `{"id":"srv-1","result":{"verdict":"allow"|"deny","note":…,"reason":…,"updated_args":{…}}}`
+  ——语义与 `Allow` / `Deny` 完全对齐；回包缺失或畸形一律按拒绝处理。
+
+EOF / 连接关闭：挂起审批全部拒绝、打断当前轮、等工作线程收尾。
+`--session-id` 让子进程续上命名会话。完整说明见 `xiaoyu/wire.py` 模块 docstring，
+黑盒用例在 `tests/test_e2e_wire.py`。
+
+## 公开面清单
+
+`xiaoyu.__all__`，按用途分组（改表必须同步本清单）：
+
+- **内核对象**：`Agent`、`AsyncAgent`、`Config`、`Toolbox`
+- **审批 / 提问**：`Allow`、`Deny`、`Approver`、`Asker`、`AsyncApprover`、`normalize_verdict`
+- **单轮结算**：`RunResult`、`RunCompleted`、`FileArtifact`、`measured_send`、`Interrupted`
+- **事件**：`UIEvent`、`UISink`、`RequestStarted`、`RequestEnded`、`TextDelta`、
+  `TextEnd`、`ToolPreparing`、`ToolPending`、`ToolPurpose`、`ToolRunning`、`ToolCompleted`、
+  `ToolDenied`、`SteerAccepted`、`PlanUpdated`、`ArtifactsReady`、`Notice`
+- **会话**：`SessionLog`、`SessionLockedError`、`load_messages`、`list_sessions`、`RewindPreview`、`RewindFilePreview`
+- **权限**：`Permissions`、`Rule`、`parse_rule`、`suggest_allow_rule`、
+  `banned_allow_reason`、`user_rules_path`、`workspace_rules_path`
+- **配置**：`load_dotenv`、`user_env_path`、`MissingConfig`、`MissingApiKey`
+- **版本**：`__version__`
+
+`Agent` 上属于契约的方法与属性：`send` / `interrupt` / `steer` / `drain_steers` /
+`queue_steer` / `pending_steers` / `retract_steer` / `replace_steer` /
+`notify` / `pending_notifications` / `reset` / `restore` / `set_output_schema` /
+`set_mode` / `switch_model` / `set_budget_tokens` / `context_tokens` /
+`last_assistant_text`，以及
+`messages` / `usage` / `trace` / `sink` / `approver` / `structured_output` /
+`on_notification`。
+`AsyncAgent` 上：`send` / `stream` / `interrupt` / `steer` / `notify` /
+`queue_steer` / `pending_steers` / `retract_steer` / `replace_steer` /
+`pending_notifications` / `watch_notifications` / `recycle`（`reset` 同义）/
+`restore` / `agent`。
+
+
+SDK 的 `McpServer.cwd` 可为 STDIO 子进程显式指定启动目录，默认空字符串沿用宿主目录。
+HTTP 服务不使用该字段；`env` 和 `headers` 仍由宿主提供，SDK 不自行扩展未指定的环境变量。

@@ -1,0 +1,1263 @@
+"""多 provider 路由：合并、优先级、影子兜底、显式寻址。不打网络。"""
+
+from __future__ import annotations
+
+import contextlib
+import io
+import os
+import tempfile
+import unittest
+from pathlib import Path
+from unittest import mock
+
+import httpx2
+import openai
+
+from xiaoyu import providers
+from xiaoyu.agent import Agent, Usage
+from xiaoyu.config import Config, MissingConfig, find_api_key, load_dotenv
+from xiaoyu.providers import GATEWAY, Provider, Registry, Route, UnknownModel
+from xiaoyu.responses import Transport
+
+from .test_agent_paths import FakeClient, chunk, usage_chunk
+from .test_errors import _response
+
+GW = "https://gw.example/v1"
+DS_MODELS = providers.PRESETS["deepseek"].models
+
+#  clear=True 只为隔离 provider 探测相关的环境变量，它模拟的应是"没配任何
+#  provider 变量"，而不是"操作系统身份也被抹掉"——真实机器的环境从来不会
+#  真空。两类必须保留：
+#  ① 配置目录隔离基线（tests/__init__ 设的 XDG_CONFIG_HOME/APPDATA）——
+#     清掉它，Windows 上 user_config_dir() 退到 Path.home()（环境被清空时抛
+#     RuntimeError），posix 上漏读开发机真实 ~/.config/xiaoyu；
+#  ② Windows 系统级变量——OpenSSL 3.x 初始化要 SYSTEMROOT，缺了构造 OpenAI
+#     client 时 SSLContext 直接 SSLError 0xa080024（py3.14 实测，py3.11 的老
+#     OpenSSL 不踩），临时目录要 TEMP/TMP。与 xiaoyu/mcp.py 给子进程保留
+#     系统变量的清单是同一个道理。
+_KEEP = (
+    "XDG_CONFIG_HOME", "APPDATA",
+    "SYSTEMROOT", "SYSTEMDRIVE", "WINDIR", "COMSPEC", "PATHEXT", "OS",
+    "TEMP", "TMP", "PROCESSOR_ARCHITECTURE", "NUMBER_OF_PROCESSORS",
+)
+_ISOLATION = {key: os.environ[key] for key in _KEEP if key in os.environ}
+
+
+def isolated_env(extra: dict[str, str] | None = None):
+    """clear=True 的替身：环境清空但保留配置目录隔离基线。"""
+    return mock.patch.dict(os.environ, {**_ISOLATION, **(extra or {})}, clear=True)
+
+
+def config(**kw) -> Config:
+    kw.setdefault("base_url", GW)
+    kw.setdefault("model", "deepseek-flash")
+    kw.setdefault("workspace", Path.cwd())
+    #  与其他测试文件同一纪律：不扫测试机的技能库/插件。这里以前没关——
+    #  构造 Agent 会经 scan_skills() 摸 Path.home()，在环境被清空的 Windows
+    #  上直接炸（CI 红了三轮的另一半根因），posix 上则静默混入开发机技能。
+    kw.setdefault("enable_skills", False)
+    kw.setdefault("enable_plugins", False)
+    return Config(**kw)
+
+
+class ProviderTestCase(unittest.TestCase):
+    """每个用例都在干净的环境里跑，且绝不真的去读本机 Keychain。"""
+
+    ENV: dict[str, str] = {}
+
+    def setUp(self) -> None:
+        #  不打桩的话 find_api_key 会真的 shell out 去 security 里翻——
+        #  慢，而且开发机上真有 key 时用例会莫名其妙地"通过"。
+        patcher = mock.patch("xiaoyu.config._read_from_keychain", return_value=None)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        env = isolated_env(self.ENV)
+        env.start()
+        self.addCleanup(env.stop)
+
+
+class TestApiKeyReferences(ProviderTestCase):
+    def test_dotenv_reference_reaches_sdk_without_rewriting_environment(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / ".env"
+            path.write_text('XIAOYU_API_KEY="${env:TEST_GATEWAY_TOKEN}"\n', encoding="utf-8")
+            with isolated_env({"TEST_GATEWAY_TOKEN": "fixture-secret"}):
+                load_dotenv(path)
+                registry = providers.build(config())
+                with mock.patch("xiaoyu.providers.OpenAI") as sdk:
+                    registry.client(GATEWAY)
+                self.assertEqual(sdk.call_args.kwargs["api_key"], "fixture-secret")
+                self.assertEqual(os.environ["XIAOYU_API_KEY"], "${env:TEST_GATEWAY_TOKEN}")
+                self.assertNotIn("fixture-secret", path.read_text(encoding="utf-8", errors="replace"))
+
+    def test_reference_prefers_environment_then_same_name_keychain(self):
+        for reference in ("${env:TEST_GATEWAY_TOKEN}", "${TEST_GATEWAY_TOKEN}"):
+            for value in ("fixture-env", "", "   "):
+                with self.subTest(reference=reference, empty=not value.strip()), isolated_env({
+                    "XIAOYU_API_KEY": reference, "TEST_GATEWAY_TOKEN": value,
+                }), mock.patch("xiaoyu.config._read_from_keychain", return_value="fixture-keychain") as keychain:
+                    self.assertEqual(find_api_key(("XIAOYU_API_KEY",)), value.strip() or "fixture-keychain")
+                    if value.strip():
+                        keychain.assert_not_called()
+                    else:
+                        keychain.assert_called_once_with("TEST_GATEWAY_TOKEN")
+
+    def test_direct_provider_uses_referenced_keychain_secret(self):
+        with isolated_env({"AWS_BEARER_TOKEN_BEDROCK": "${env:TEST_BEDROCK_TOKEN}"}), mock.patch(
+            "xiaoyu.config._read_from_keychain",
+            side_effect=lambda name: "fixture-bedrock" if name == "TEST_BEDROCK_TOKEN" else None,
+        ):
+            registry = providers.build(config(base_url=""))
+            self.assertEqual(registry.get("bedrock").api_key, "fixture-bedrock")
+
+    def test_reference_chain_resolves_and_cycles_fail(self):
+        with isolated_env({"XIAOYU_API_KEY": "${env:FIRST}", "FIRST": "${SECOND}", "SECOND": "fixture-secret"}):
+            self.assertEqual(find_api_key(("XIAOYU_API_KEY",)), "fixture-secret")
+            os.environ["SECOND"] = "${FIRST}"
+            with self.assertRaisesRegex(MissingConfig, "循环引用"):
+                find_api_key(("XIAOYU_API_KEY",))
+        with isolated_env({"XIAOYU_API_KEY": "${env:XIAOYU_API_KEY}"}):
+            with self.assertRaisesRegex(MissingConfig, "循环引用"):
+                find_api_key(("XIAOYU_API_KEY",))
+
+    def test_missing_reference_does_not_select_another_credential(self):
+        with isolated_env({"XIAOYU_API_KEY": "${env:MISSING_TOKEN}", "LITELLM_API_KEY": "unrelated-secret"}), mock.patch(
+            "xiaoyu.config._read_from_keychain",
+            side_effect=lambda name: "unrelated-secret" if name == "XIAOYU_API_KEY" else None,
+        ):
+            with self.assertRaisesRegex(MissingConfig, "MISSING_TOKEN"):
+                providers.build(config())
+
+    def test_malformed_reference_does_not_echo_value(self):
+        for value in ("prefix-secret${env:TOKEN}", "${env:}", "${env:TOKEN", "${A}${B}"):
+            with self.subTest(value=value), isolated_env({"XIAOYU_API_KEY": value}):
+                with self.assertRaisesRegex(MissingConfig, "引用格式") as caught:
+                    find_api_key(("XIAOYU_API_KEY",))
+                self.assertNotIn(value, str(caught.exception))
+
+    def test_literal_name_and_empty_key_keep_existing_behavior(self):
+        with isolated_env({"XIAOYU_API_KEY": "TEST_GATEWAY_TOKEN", "TEST_GATEWAY_TOKEN": "fixture-env"}):
+            self.assertEqual(find_api_key(("XIAOYU_API_KEY",)), "TEST_GATEWAY_TOKEN")
+        with isolated_env({"XIAOYU_API_KEY": ""}), mock.patch("xiaoyu.config._read_from_keychain", return_value="fixture-keychain") as keychain:
+            self.assertEqual(find_api_key(("XIAOYU_API_KEY",)), "fixture-keychain")
+            keychain.assert_called_once_with("XIAOYU_API_KEY")
+
+    def test_doctor_reports_invalid_reference_without_crashing(self):
+        from xiaoyu.diagnostics import check_providers
+
+        for name in ("XIAOYU_API_KEY", "DEEPSEEK_API_KEY"):
+            with self.subTest(name=name), isolated_env({name: "${env:MISSING_TOKEN}"}):
+                check = check_providers()
+                self.assertEqual(check.status, "fail")
+                self.assertIn("MISSING_TOKEN", "\n".join(check.details))
+
+
+# ---------- 只有网关：必须与改动前完全等价 ----------
+
+
+class TestGatewayOnly(ProviderTestCase):
+    """Step 1 的回归闸门：单端点形态下，路由层不许改变任何行为。"""
+
+    ENV = {"XIAOYU_API_KEY": "k"}
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.registry = providers.build(config())
+
+    def test_only_gateway_registered(self) -> None:
+        self.assertEqual([p.name for p in self.registry.providers], [GATEWAY])
+
+    def test_any_model_falls_to_gateway(self) -> None:
+        for name in ("deepseek-flash", "gateway-only-model", "没见过的模型"):
+            route = self.registry.resolve(name)
+            self.assertEqual(route.provider, GATEWAY)
+            self.assertEqual(route.model, name, "透传给网关的必须是原始名字")
+
+    def test_no_backups_so_chain_equals_old_behaviour(self) -> None:
+        """旧 model_chain 是「主模型 + fallback_models 去重」，这里必须一模一样。"""
+        self.assertEqual(self.registry.backups("deepseek-flash"), [])
+        cfg = config(fallback_models=["b", "deepseek-flash", "c"])
+        agent = Agent(cfg, registry=self.registry, usage=Usage())
+        self.assertEqual(
+            [route.model for route in agent.model_chain()],
+            ["deepseek-flash", "b", "c"],
+            "重复项要去掉，顺序要保持——和旧实现同一份语义",
+        )
+
+    def test_sticky_name_stays_bare(self) -> None:
+        """只有一家时粘性降级写回的必须还是裸名，/model 显示不该变样。"""
+        route = self.registry.resolve("backup-model")
+        self.assertEqual(self.registry.sticky_name(route), "backup-model")
+
+    def test_gateway_without_key_is_not_registered(self) -> None:
+        with isolated_env({}):
+            with self.assertRaises(MissingConfig):
+                providers.build(config())
+
+
+# ---------- 直连 + 网关：合并与优先级 ----------
+
+
+class TestMerge(ProviderTestCase):
+    ENV = {"XIAOYU_API_KEY": "gw", "DEEPSEEK_API_KEY": "ds"}
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.registry = providers.build(config())
+
+    def test_direct_first(self) -> None:
+        self.assertEqual([p.name for p in self.registry.providers], ["deepseek", GATEWAY])
+
+    def test_direct_wins_for_claimed_models(self) -> None:
+        for name in DS_MODELS:
+            self.assertEqual(self.registry.resolve(name).provider, "deepseek")
+
+    def test_gateway_keeps_everything_else(self) -> None:
+        self.assertEqual(self.registry.resolve("gateway-only-model").provider, GATEWAY)
+
+    def test_shadow_backup_only_for_shared_names(self) -> None:
+        shared = [route.provider for route in self.registry.backups(DS_MODELS[0])]
+        self.assertEqual(shared, [GATEWAY], "同名模型的网关那份要留作兜底")
+        self.assertEqual(
+            self.registry.backups("gateway-only-model"),
+            [],
+            "网关自己就是最后一家，后面没人可兜底",
+        )
+
+    def test_listing_dedupes_by_first_owner(self) -> None:
+        entries = self.registry.listing()
+        self.assertEqual([e.model for e in entries], list(DS_MODELS))
+        self.assertTrue(all(e.owner == "deepseek" for e in entries))
+        self.assertTrue(all(e.backups == (GATEWAY,) for e in entries))
+
+    def test_describe_shows_source_and_backup(self) -> None:
+        text = self.registry.describe()
+        self.assertIn("直连 deepseek", text)
+        self.assertIn("兜底", text)
+        self.assertIn("其余任意模型名", text, "通配 provider 无法枚举，但必须告诉用户它在")
+
+    def test_chain_puts_backup_right_after_primary(self) -> None:
+        cfg = config(fallback_models=["gateway-only-model"])
+        agent = Agent(cfg, registry=self.registry, usage=Usage())
+        self.assertEqual(
+            [route.qualified for route in agent.model_chain()],
+            [
+                "deepseek/deepseek-flash",
+                f"{GATEWAY}/deepseek-flash",
+                f"{GATEWAY}/gateway-only-model",
+            ],
+        )
+
+    def test_chain_dedupes_by_provider_and_model(self) -> None:
+        """备用链里重复写了主模型/兜底目标时不该重复尝试。"""
+        cfg = config(fallback_models=["deepseek-flash", f"{GATEWAY}/deepseek-flash"])
+        agent = Agent(cfg, registry=self.registry, usage=Usage())
+        self.assertEqual(
+            [route.qualified for route in agent.model_chain()],
+            ["deepseek/deepseek-flash", f"{GATEWAY}/deepseek-flash"],
+        )
+
+    def test_unknown_fallback_is_skipped_not_fatal(self) -> None:
+        """备用链里写错一个名字，不该让每次请求都炸——网关通配时本来也不会走到这。"""
+        registry = Registry([Provider("deepseek", "u", "k", DS_MODELS, "直连 deepseek")])
+        agent = Agent(
+            config(model="deepseek-flash", fallback_models=["打错的名字"]),
+            registry=registry,
+            usage=Usage(),
+        )
+        self.assertEqual([r.model for r in agent.model_chain()], ["deepseek-flash"])
+
+    def test_unknown_primary_raises(self) -> None:
+        """主模型解析不了是必须立刻看见的配置错误，不能静默。"""
+        registry = Registry([Provider("deepseek", "u", "k", DS_MODELS, "直连 deepseek")])
+        agent = Agent(config(model="打错的名字"), registry=registry, usage=Usage())
+        with self.assertRaises(UnknownModel):
+            agent.model_chain()
+
+
+# ---------- 显式寻址 ----------
+
+
+class TestExplicitAddressing(ProviderTestCase):
+    ENV = {"XIAOYU_API_KEY": "gw", "DEEPSEEK_API_KEY": "ds"}
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.registry = providers.build(config())
+
+    def test_prefix_pins_the_provider(self) -> None:
+        route = self.registry.resolve(f"{GATEWAY}/deepseek-flash")
+        self.assertEqual(route.provider, GATEWAY)
+        self.assertEqual(route.model, "deepseek-flash", "前缀不能跟着发给上游")
+
+    def test_unknown_prefix_passes_through_whole_name(self) -> None:
+        """网关上真有 anthropic/claude-x 这种自带斜杠的模型名，不许误切。"""
+        route = self.registry.resolve("anthropic/claude-x")
+        self.assertEqual(route.provider, GATEWAY)
+        self.assertEqual(route.model, "anthropic/claude-x")
+
+    def test_pinned_route_gets_no_backup(self) -> None:
+        self.assertEqual(self.registry.backups(f"{GATEWAY}/deepseek-flash"), [])
+
+    def test_sticky_name_qualifies_only_when_needed(self) -> None:
+        gw = self.registry.resolve(f"{GATEWAY}/deepseek-flash")
+        #  裸名会被直连抢走，所以必须写全限定名，否则 /model 显示的和实际跑的对不上
+        self.assertEqual(self.registry.sticky_name(gw), f"{GATEWAY}/deepseek-flash")
+        direct = self.registry.resolve("deepseek-flash")
+        self.assertEqual(self.registry.sticky_name(direct), "deepseek-flash")
+
+
+# ---------- 顺序覆盖、key 解析、通用兜底 ----------
+
+
+class TestOrderAndKeys(ProviderTestCase):
+    def test_xiaoyu_providers_overrides_order(self) -> None:
+        env = {
+            "XIAOYU_API_KEY": "gw",
+            "DEEPSEEK_API_KEY": "ds",
+            "XIAOYU_PROVIDERS": f"{GATEWAY},deepseek",
+        }
+        with isolated_env(env):
+            registry = providers.build(config())
+        self.assertEqual([p.name for p in registry.providers], [GATEWAY, "deepseek"])
+        #  网关通配且排在前面，于是它把所有名字都吃掉——这正是默认不这么排的理由
+        self.assertEqual(registry.resolve("deepseek-flash").provider, GATEWAY)
+        #  清单的归属必须跟着翻转，否则 /model 显示的和实际跑的对不上
+        entry = next(e for e in registry.listing() if e.model == "deepseek-flash")
+        self.assertEqual(entry.owner, GATEWAY)
+        self.assertEqual(entry.backups, ("deepseek",), "反过来之后直连成了兜底")
+
+    def test_direct_only_needs_no_gateway(self) -> None:
+        """"只填一个 key 就能跑"——本次改动最主要的动机。
+
+        键名就是厂商原生的 DEEPSEEK_API_KEY：用户机器上常常早就配过了，直接复用。
+        """
+        with isolated_env({"DEEPSEEK_API_KEY": "ds"}):
+            registry = providers.build(config(base_url=""))
+        self.assertEqual(registry.resolve("deepseek-flash").provider, "deepseek")
+        with self.assertRaises(UnknownModel):
+            registry.resolve("gateway-only-model")
+
+    def test_gateway_accepts_litellm_env_name(self) -> None:
+        """网关 key 也认 LiteLLM 生态惯用的 LITELLM_API_KEY——为别的工具配过的直接复用。"""
+        with isolated_env({"LITELLM_API_KEY": "gw"}):
+            registry = providers.build(config())
+        self.assertEqual([p.name for p in registry.providers], [GATEWAY])
+
+    def test_provider_without_key_is_dropped(self) -> None:
+        """没 key 就不注册——否则配置错误会推迟到用户已经开始对话之后才炸。"""
+        with isolated_env({"XIAOYU_API_KEY": "gw"}):
+            registry = providers.build(config())
+        self.assertEqual([p.name for p in registry.providers], [GATEWAY])
+
+    def test_local_gateway_needs_no_key(self) -> None:
+        """本机端点（vLLM / SGLang / Ollama）多半不鉴权：loopback 地址缺 key 时
+        给占位符照常注册，用户不必为 localhost 编一个假 key。"""
+        for url in ("http://localhost:8000/v1", "http://127.0.0.1:11434/v1", "http://[::1]:8000/v1"):
+            with self.subTest(url=url), isolated_env():
+                registry = providers.build(config(base_url=url))
+            self.assertEqual([p.name for p in registry.providers], [GATEWAY])
+            self.assertEqual(registry.get(GATEWAY).api_key, providers.LOCAL_PLACEHOLDER_KEY)
+
+    def test_remote_gateway_still_needs_key(self) -> None:
+        """放开的只有 loopback：远端地址缺 key 仍不注册——漏配 key 的远端端点
+        正是"启动期拦配置错误"要拦的那种，主机名里带 localhost 字样也不算。"""
+        for url in (GW, "https://localhost.example.com/v1", "http://notlocalhost:8000/v1"):
+            with self.subTest(url=url), isolated_env(), self.assertRaises(MissingConfig):
+                providers.build(config(base_url=url))
+
+    def test_local_generic_provider_needs_no_key(self) -> None:
+        """通用 env provider 同一规则：XIAOYU_PROVIDER_LOCAL_BASE_URL 指向本机就免 key，
+        显式给了 key 则以给的为准（本机也可能挂了鉴权反代）。"""
+        env = {
+            "XIAOYU_PROVIDER_LOCAL_BASE_URL": "http://localhost:8000/v1",
+            "XIAOYU_PROVIDER_LOCAL_MODELS": "qwen3-8-27b-fp8",
+        }
+        with isolated_env(env):
+            registry = providers.build(config(base_url=""))
+        self.assertEqual([p.name for p in registry.providers], ["local"])
+        self.assertEqual(registry.resolve("qwen3-8-27b-fp8").provider, "local")
+        self.assertEqual(registry.get("local").api_key, providers.LOCAL_PLACEHOLDER_KEY)
+        with isolated_env({**env, "XIAOYU_PROVIDER_LOCAL_API_KEY": "real"}):
+            registry = providers.build(config(base_url=""))
+        self.assertEqual(registry.get("local").api_key, "real")
+
+    def test_gateway_signature_models_env_override(self) -> None:
+        """网关后面挂着 Gemini 系签名型号：XIAOYU_SIGNATURE_MODELS 点名放行。
+        道理同 XIAOYU_VISION_MODELS——网关后挂了什么只有用户知道，没有这个
+        开关，签名型号走网关路由只能整个换成通用 env provider 重配。"""
+        env = {"XIAOYU_API_KEY": "gw", "XIAOYU_SIGNATURE_MODELS": "gemini-3.7-flash"}
+        with isolated_env(env):
+            registry = providers.build(config())
+            transport = registry.client(GATEWAY)
+        self.assertTrue(transport.signs_tools("gemini-3.7-flash"))
+        self.assertFalse(transport.signs_tools("deepseek-flash"))
+
+    def test_gateway_response_cache_bypass_detection(self) -> None:
+        """空补全重发绕网关缓存的能力判定：远端网关默认开；网关位指向官方直连
+        端点或本机端点默认关；XIAOYU_GATEWAY_CACHE_BYPASS 显式指定时优先。"""
+        vendor = providers.PRESETS["deepseek"].base_url
+        cases = [
+            (GW, {}, True),
+            (vendor, {}, False),
+            ("http://localhost:8000/v1", {}, False),
+            (GW, {"XIAOYU_GATEWAY_CACHE_BYPASS": "0"}, False),
+            (vendor, {"XIAOYU_GATEWAY_CACHE_BYPASS": "1"}, True),
+        ]
+        for url, env, expected in cases:
+            with self.subTest(url=url, env=env), isolated_env({"XIAOYU_API_KEY": "gw", **env}):
+                registry = providers.build(config(base_url=url))
+                self.assertEqual(registry.get(GATEWAY).response_cache, expected)
+                body = registry.cache_bypass(Route(GATEWAY, "deepseek-flash"))
+                self.assertEqual(body, {"cache": {"no-cache": True}} if expected else None)
+
+    def test_direct_provider_never_bypasses_cache(self) -> None:
+        """直连厂商没有这项能力：官方端点对未知请求体字段可能 400。"""
+        with isolated_env({"DEEPSEEK_API_KEY": "ds", "XIAOYU_API_KEY": "gw"}):
+            registry = providers.build(config())
+        self.assertFalse(registry.get("deepseek").response_cache)
+        self.assertIsNone(registry.cache_bypass(Route("deepseek", "deepseek-flash")))
+
+    def test_generic_signatures_ignored_loudly_on_non_chat_protocol(self) -> None:
+        """签名的捕获/还原只在 chat 一路存在：_SIGNATURES 配上 PROTOCOL=responses/
+        anthropic 若静默收下，用户会拿着一个不生效的开关去排查每轮 400——
+        必须出声丢弃。"""
+        env = {
+            "XIAOYU_PROVIDER_MINIMAX_BASE_URL": "https://mm.example/v1",
+            "XIAOYU_PROVIDER_MINIMAX_API_KEY": "mm",
+            "XIAOYU_PROVIDER_MINIMAX_PROTOCOL": "responses",
+            "XIAOYU_PROVIDER_MINIMAX_SIGNATURES": "*",
+        }
+        with isolated_env(env), contextlib.redirect_stderr(io.StringIO()) as err:
+            registry = providers.build(config(base_url=""))
+        provider = registry.get("minimax")
+        assert provider is not None
+        self.assertEqual(provider.signature_models, ())
+        self.assertIn("只在 chat 协议生效", err.getvalue())
+
+    def test_generic_env_provider_is_discovered(self) -> None:
+        #  minimax 是"未内置厂商"的例子（moonshot 已升级为内置 preset，不能再当例子用）
+        env = {
+            "XIAOYU_API_KEY": "gw",
+            "XIAOYU_PROVIDER_MINIMAX_BASE_URL": "https://mm.example/v1",
+            "XIAOYU_PROVIDER_MINIMAX_API_KEY": "mm",
+            "XIAOYU_PROVIDER_MINIMAX_MODELS": "minimax-m2, minimax-m2-turbo",
+        }
+        with isolated_env(env):
+            registry = providers.build(config())
+        self.assertEqual([p.name for p in registry.providers], ["minimax", GATEWAY])
+        self.assertEqual(registry.resolve("minimax-m2").provider, "minimax")
+        self.assertEqual([r.provider for r in registry.backups("minimax-m2")], [GATEWAY])
+
+    def test_domestic_presets_register_from_vendor_env_names(self) -> None:
+        """moonshot / qwen / zhipu 三家 preset：厂商原生键名即插即用。"""
+        env = {
+            "MOONSHOT_API_KEY": "ms",
+            "QWEN_API_KEY": "qw",
+            "ZHIPU_API_KEY": "zp",
+        }
+        with isolated_env(env):
+            registry = providers.build(config(base_url=""))
+        self.assertEqual(
+            [p.name for p in registry.providers], ["moonshot", "qwen", "zhipu"]
+        )
+        self.assertEqual(registry.resolve("kimi-k3").provider, "moonshot")
+        self.assertEqual(registry.resolve("qwen3.8-max").provider, "qwen")
+        self.assertEqual(registry.resolve("glm-5.3").provider, "zhipu")
+
+    def test_qwen_accepts_dashscope_env_name(self) -> None:
+        """阿里生态惯用 DASHSCOPE_API_KEY——为别的工具配过的直接复用。"""
+        with isolated_env({"DASHSCOPE_API_KEY": "ds"}):
+            registry = providers.build(config(base_url=""))
+        self.assertEqual([p.name for p in registry.providers], ["qwen"])
+
+    def test_overseas_presets_register_from_vendor_env_names(self) -> None:
+        """openai / anthropic 海外 preset：厂商原生键名即插即用。"""
+        env = {
+            "OPENAI_API_KEY": "oa",
+            "ANTHROPIC_API_KEY": "an",
+        }
+        with isolated_env(env):
+            registry = providers.build(config(base_url=""))
+        self.assertEqual([p.name for p in registry.providers], ["anthropic", "openai"])
+        self.assertEqual(registry.resolve("gpt-6.1-sol").provider, "openai")
+        self.assertEqual(registry.resolve("claude-opus-5-5").provider, "anthropic")
+
+    def test_openai_client_speaks_responses_protocol(self) -> None:
+        """openai 直连必须说 Responses：gpt-5.6 线在 chat completions 上带 tools
+        就 400，接错等于每一轮都炸。anthropic 直连说原生 Messages（OpenAI 兼容
+        端点是评估用的：无缓存、effort 被忽略、thinking 不回传，见 messages.py）。
+        两家都仍要过 Transport——出网口只有一个，私有键才摘得干净。"""
+        with isolated_env({"OPENAI_API_KEY": "oa", "ANTHROPIC_API_KEY": "an"}):
+            registry = providers.build(config(base_url=""))
+            self.assertEqual(
+                registry.client("openai").protocol_for("gpt-6.1-sol"), "responses"
+            )
+            anthropic = registry.client("anthropic")
+            self.assertEqual(anthropic.protocol_for("claude-opus-5-5"), "anthropic")
+            self.assertIsInstance(anthropic._inner, openai.OpenAI)
+
+    def test_deepseek_flash_stays_on_chat(self) -> None:
+        """官方 Responses 不回 encrypted reasoning、include/store 等不支持——走它没有收益，
+        deepseek-flash 留在 chat（没声明 responses_models 即 chat）。"""
+        with isolated_env({"DEEPSEEK_API_KEY": "ds"}):
+            client = providers.build(config(base_url="")).client("deepseek")
+            self.assertEqual(client.protocol_for("deepseek-flash"), "chat")
+        self.assertEqual(providers.PRESETS["deepseek"].responses_models, ())
+
+    def test_deepseek_flash_sees_images(self) -> None:
+        """vision_models 只写实测过的：deepseek-flash 四象限图两路四色全中（2026-09-14）；
+        没声明的名字仍 fail-closed（误声明=工具回图时每轮 400）。"""
+        with isolated_env({"DEEPSEEK_API_KEY": "ds"}):
+            registry = providers.build(config(base_url=""))
+            self.assertTrue(registry.sees_images("deepseek-flash"))
+            self.assertFalse(registry.sees_images("没声明的型号"))
+
+    def test_deepseek_preset_is_single_flash(self) -> None:
+        """官方模型表收敛后只内置 deepseek-flash（2026-09-14）。"""
+        self.assertEqual(providers.PRESETS["deepseek"].models, ("deepseek-flash",))
+
+    def test_generic_provider_can_opt_into_responses(self) -> None:
+        """未内置的厂商也能自救：PROTOCOL=responses，不必等我们补 preset。"""
+        env = {
+            "XIAOYU_PROVIDER_ACME_BASE_URL": "https://acme.example/v1",
+            "XIAOYU_PROVIDER_ACME_API_KEY": "k",
+            "XIAOYU_PROVIDER_ACME_PROTOCOL": "responses",
+        }
+        with isolated_env(env):
+            registry = providers.build(config(base_url=""))
+            self.assertEqual(registry.client("acme").protocol_for("任意型号"), "responses")
+
+    def test_generic_provider_can_opt_into_anthropic(self) -> None:
+        """PROTOCOL=anthropic：Bedrock Mantle 一类"Claude 只挂原生协议"端点的逃生舱。"""
+        env = {
+            "XIAOYU_PROVIDER_MANTLE_BASE_URL": "https://mantle.example/v1",
+            "XIAOYU_PROVIDER_MANTLE_API_KEY": "k",
+            "XIAOYU_PROVIDER_MANTLE_PROTOCOL": "anthropic",
+        }
+        with isolated_env(env):
+            registry = providers.build(config(base_url=""))
+            self.assertEqual(registry.client("mantle").protocol_for("任意型号"), "anthropic")
+
+    def test_keychain_service_name_equals_env_name(self) -> None:
+        """Keychain service 名 = 变量名本身：.env / 环境变量 / Keychain 三处同名。
+
+        网关的 XIAOYU_API_KEY 恰好也是历史 service 名，老用户存的 key 天然有效。
+        """
+        with isolated_env({}), mock.patch(
+            "xiaoyu.config._read_from_keychain",
+            side_effect=lambda service: {"DEEPSEEK_API_KEY": "kc"}.get(service),
+        ):
+            self.assertEqual(find_api_key(providers.PRESETS["deepseek"].key_envs), "kc")
+            self.assertIsNone(find_api_key(("XIAOYU_API_KEY",)), "网关查的是自己的名字")
+
+    def test_env_beats_keychain(self) -> None:
+        with isolated_env({"DEEPSEEK_API_KEY": "env"}), mock.patch(
+            "xiaoyu.config._read_from_keychain", return_value="kc"
+        ):
+            self.assertEqual(find_api_key(providers.PRESETS["deepseek"].key_envs), "env")
+
+    def test_missing_everything_hints_the_short_path(self) -> None:
+        with isolated_env({}):
+            with self.assertRaises(MissingConfig) as caught:
+                providers.build(config(base_url=""))
+        self.assertIn("DEEPSEEK_API_KEY", str(caught.exception))
+
+
+# ---------- /model 无参的网关现场探测 ----------
+
+
+def _models_client(ids: list[str]):
+    """带 /v1/models 的假 client：with_options 返回自身，list 返回带 .id 的对象。"""
+    import types
+
+    client = types.SimpleNamespace()
+    client.with_options = lambda **kw: client
+    client.models = types.SimpleNamespace(
+        list=lambda: [types.SimpleNamespace(id=i) for i in ids]
+    )
+    return client
+
+
+class TestRemoteModels(ProviderTestCase):
+    """现场探测只问通配 provider；失败降级为 None，绝不把异常抛进 REPL。"""
+
+    def registry_with(self, gateway_client) -> Registry:
+        #  直连 provider 的 client 故意放个裸 object：remote_models 若碰它必炸，
+        #  用例通过即证明"只探测通配 provider"
+        return Registry(
+            [
+                Provider("deepseek", "u", "k", DS_MODELS, "直连 deepseek"),
+                Provider(GATEWAY, "u", "k", (), "网关"),
+            ],
+            clients={"deepseek": object(), GATEWAY: gateway_client},
+        )
+
+    def test_probes_only_wildcards_and_sorts(self) -> None:
+        registry = self.registry_with(_models_client(["b-model", "a-model"]))
+        self.assertEqual(
+            registry.remote_models(), [("网关", ["a-model", "b-model"], "")]
+        )
+
+    def test_failure_degrades_with_reason(self) -> None:
+        """失败要带一句原因：预算 429 和网关挂了对用户是完全不同的两件事。"""
+        broken = _models_client([])
+        broken.models.list = mock.Mock(side_effect=RuntimeError("Budget has been exceeded"))
+        registry = self.registry_with(broken)
+        self.assertEqual(
+            registry.remote_models(), [("网关", None, "Budget has been exceeded")]
+        )
+
+    def test_probe_feeds_completion_cache(self) -> None:
+        """探测成功后清单进缓存，/model 补全才补得出网关模型。"""
+        registry = self.registry_with(_models_client(["b-model", "a-model"]))
+        self.assertEqual(registry.remote_cached(), [], "未探测时缓存为空")
+        registry.remote_models()
+        self.assertEqual(registry.remote_cached(), ["a-model", "b-model"])
+
+    def test_probe_failure_keeps_stale_cache(self) -> None:
+        """失败不清旧缓存：补全候选宁可略旧也别突然清零。"""
+        client = _models_client(["a-model"])
+        registry = self.registry_with(client)
+        registry.remote_models()
+        client.models.list = mock.Mock(side_effect=RuntimeError("boom"))
+        registry.remote_models()
+        self.assertEqual(registry.remote_cached(), ["a-model"])
+
+
+# ---------- Route / client 缓存 ----------
+
+
+# ---------- 跨 provider 兜底真的会发生 ----------
+
+
+class TestCrossProviderFallback(ProviderTestCase):
+    """网关从单点变成兜底——这是整件事最大的收益，必须有用例锁住。"""
+
+    ENV = {"XIAOYU_API_KEY": "gw", "DEEPSEEK_API_KEY": "ds"}
+
+    def build(self, direct_script: list, gateway_script: list) -> tuple[Agent, FakeClient]:
+        direct, gateway = FakeClient(direct_script), FakeClient(gateway_script)
+        registry = Registry(
+            [
+                Provider("deepseek", "u", "k", DS_MODELS, "直连 deepseek"),
+                Provider(GATEWAY, "u", "k", (), "网关"),
+            ],
+            clients={"deepseek": direct, GATEWAY: gateway},
+        )
+        cfg = config(auto_approve=True, enable_skills=False, enable_plugins=False)
+        return Agent(cfg, registry=registry, usage=Usage()), gateway
+
+    def _run(self, agent: Agent) -> None:
+        with mock.patch("xiaoyu.agent.Agent._sleep"), contextlib.redirect_stdout(io.StringIO()):
+            agent.send("hi")
+
+    def test_rate_limited_direct_falls_to_gateway(self) -> None:
+        limited = openai.RateLimitError("429", response=_response(429), body=None)
+        agent, gateway = self.build([limited] * 3, [[chunk(content="网关顶上")]])
+        self._run(agent)
+        self.assertEqual(agent.last_assistant_text(), "网关顶上")
+        self.assertEqual(gateway.completions.calls[0]["model"], "deepseek-flash")
+        #  粘性写回必须是全限定名，否则裸名又会被直连抢走，等于没切
+        self.assertEqual(agent.config.model, f"{GATEWAY}/deepseek-flash")
+
+    def test_dead_direct_key_falls_to_gateway(self) -> None:
+        """直连 key 过期 / 额度用光——鉴权错误同一家换模型没用，换一家才有用。"""
+        dead = openai.AuthenticationError("401", response=_response(401), body=None)
+        agent, gateway = self.build([dead], [[chunk(content="网关顶上")]])
+        self._run(agent)
+        self.assertEqual(agent.last_assistant_text(), "网关顶上")
+        self.assertEqual(len(gateway.completions.calls), 1)
+
+    def test_quota_exhausted_direct_falls_to_gateway(self) -> None:
+        """直连额度用尽（quota，非限流）：同家重试无解，跨家兜底该顶上，
+        且不该在直连上退避重试——额度等不来。"""
+        quota = openai.RateLimitError(
+            "You exceeded your current quota, please check your plan and billing details.",
+            response=_response(429),
+            body=None,
+        )
+        agent, gateway = self.build([quota], [[chunk(content="网关顶上")]])
+        self._run(agent)
+        self.assertEqual(agent.last_assistant_text(), "网关顶上")
+        #  直连只被打了一次（无退避重试），网关一次成功
+        self.assertEqual(len(gateway.completions.calls), 1)
+
+    def test_insufficient_balance_402_direct_falls_to_gateway(self) -> None:
+        """直连余额不足（DeepSeek 的 402）归 quota：不在直连上退避，切网关兜底。
+        以前落进 fatal，降级链直接不放行、整轮报错。"""
+        broke = openai.APIStatusError("Insufficient Balance", response=_response(402), body=None)
+        agent, gateway = self.build([broke], [[chunk(content="网关顶上")]])
+        with mock.patch("xiaoyu.agent.Agent._sleep") as fake_sleep, contextlib.redirect_stdout(io.StringIO()):
+            agent.send("hi")
+        self.assertEqual(agent.last_assistant_text(), "网关顶上")
+        self.assertEqual(len(gateway.completions.calls), 1)
+        fake_sleep.assert_not_called()
+
+    def test_auth_failure_on_last_provider_still_raises(self) -> None:
+        """没有别家可试时鉴权错误照旧直接抛——那是配置问题，不该假装在恢复。"""
+        dead = openai.AuthenticationError("401", response=_response(401), body=None)
+        registry = Registry.for_client(FakeClient([dead]))
+        agent = Agent(config(model="m"), registry=registry, usage=Usage())
+        with self.assertRaises(openai.AuthenticationError):
+            self._run(agent)
+
+    def test_usage_is_split_by_provider(self) -> None:
+        """同名模型跑在两家上，账必须分开——否则"直连省了多少"根本算不出来。"""
+        limited = openai.RateLimitError("429", response=_response(429), body=None)
+        agent, _ = self.build(
+            [limited] * 3, [[chunk(content="ok"), usage_chunk(100, 10)]]
+        )
+        self._run(agent)
+        self.assertEqual(list(agent.usage.by_model), [f"{GATEWAY}/deepseek-flash"])
+
+
+class TestBedrock(ProviderTestCase):
+    """Bedrock 直连：没有 key，激活信号是区域变量；client 走 AWS 凭证链。不出网。"""
+
+    MODEL = "global.anthropic.claude-fable-5-1"
+
+    def test_not_registered_without_region(self) -> None:
+        with isolated_env({"XIAOYU_API_KEY": "k"}):
+            registry = providers.build(config())
+        self.assertNotIn("bedrock", [p.name for p in registry.providers])
+
+    def test_region_activates_without_any_key(self) -> None:
+        """只有 XIAOYU_BEDROCK_REGION、没有任何 key 也能建起 Registry。"""
+        with isolated_env({"XIAOYU_BEDROCK_REGION": "us-west-2"}):
+            registry = providers.build(config(base_url=""))
+        bedrock = registry.get("bedrock")
+        assert bedrock is not None
+        self.assertEqual(bedrock.aws_region, "us-west-2")
+        self.assertEqual(bedrock.base_url, "https://bedrock-runtime.us-west-2.amazonaws.com")
+        self.assertIn("us-west-2", bedrock.display)
+        self.assertEqual(bedrock.models, (self.MODEL,))
+        route = registry.resolve(self.MODEL)
+        self.assertEqual((route.provider, route.model), ("bedrock", self.MODEL))
+        self.assertTrue(registry.sees_images(self.MODEL))
+        self.assertEqual(route.client.protocol_for(self.MODEL), providers.ANTHROPIC)
+
+    def test_shorthand_means_default_region(self) -> None:
+        for raw in ("1", "true", "Default"):
+            with isolated_env({"XIAOYU_BEDROCK_REGION": raw}):
+                self.assertEqual(providers.bedrock_region(), "us-east-1", raw)
+        with isolated_env({"XIAOYU_BEDROCK_REGION": "  "}):
+            self.assertEqual(providers.bedrock_region(), "")
+
+    def test_explicit_addressing_reaches_other_profiles(self) -> None:
+        """未内置的推理 profile / ARN 用 bedrock/ 前缀点名即可，不必进清单。"""
+        with isolated_env({"XIAOYU_BEDROCK_REGION": "us-east-1"}):
+            registry = providers.build(config(base_url=""))
+        for name in (
+            "us.anthropic.claude-opus-5-5",
+            "arn:aws:bedrock:us-east-1:1:inference-profile/global.anthropic.claude-opus-5-5",
+        ):
+            route = registry.resolve(f"bedrock/{name}")
+            self.assertEqual((route.provider, route.model), ("bedrock", name))
+        #  裸名仍归 anthropic 直连/网关，Bedrock 不抢
+        with self.assertRaises(UnknownModel):
+            registry.resolve("claude-opus-5-5")
+
+    def test_factory_builds_sigv4_client_not_api_key_client(self) -> None:
+        with isolated_env({"XIAOYU_BEDROCK_REGION": "ap-northeast-1"}):
+            registry = providers.build(config(base_url=""))
+        made: list[dict] = []
+
+        class FakeBedrock:
+            def __init__(self, **kw) -> None:
+                made.append(kw)
+
+        import anthropic
+
+        with mock.patch.object(anthropic, "AnthropicBedrock", FakeBedrock):
+            with mock.patch("importlib.util.find_spec", return_value=object()):
+                client = registry.resolve(self.MODEL).client.anthropic_client()
+        self.assertIsInstance(client, FakeBedrock)
+        self.assertEqual(made[0]["aws_region"], "ap-northeast-1")
+        self.assertEqual(made[0]["max_retries"], 0)
+        self.assertIsNone(made[0]["api_key"], "凭据走 AWS 链，绝不把占位 key 交给 SDK")
+
+    def test_api_key_alone_activates_with_default_region(self) -> None:
+        """有 Bedrock API key 就注册（同其它直连：key 即开关），区域缺省 us-east-1；
+        只认 AWS 官方名 AWS_BEARER_TOKEN_BEDROCK；有 key 时不要求 botocore。"""
+        #  留一个网关，Registry 才建得起来；断言的是 bedrock 这一家不在
+        with isolated_env({"BEDROCK_MANTLE_API_KEY": "ABSK-test", "XIAOYU_API_KEY": "k"}):
+            self.assertIsNone(providers.build(config()).get("bedrock"), "非官方旧名不认")
+        for env_name in ("AWS_BEARER_TOKEN_BEDROCK",):
+            with isolated_env({env_name: "ABSK-test"}):
+                registry = providers.build(config(base_url=""))
+            bedrock = registry.get("bedrock")
+            assert bedrock is not None, env_name
+            self.assertEqual(bedrock.aws_region, "us-east-1")
+            self.assertIn("API key", bedrock.display)
+            made: list[dict] = []
+
+            class FakeBedrock:
+                def __init__(self, **kw) -> None:
+                    made.append(kw)
+
+            import anthropic
+
+            with mock.patch.object(anthropic, "AnthropicBedrock", FakeBedrock):
+                with mock.patch("importlib.util.find_spec", return_value=None):
+                    registry.resolve(self.MODEL).client.anthropic_client()
+            self.assertEqual(made[0]["api_key"], "ABSK-test")
+            self.assertEqual(made[0]["aws_region"], "us-east-1")
+
+    def test_region_ignores_aws_cli_and_legacy_variables(self) -> None:
+        """区域只认 XIAOYU_BEDROCK_REGION：AWS_REGION 是 aws cli 的（几乎每台 AWS
+        机器都有，读了等于自动激活），BEDROCK_MANTLE_REGION 是非官方旧名。"""
+        with isolated_env(
+            {
+                "AWS_REGION": "us-west-2",
+                "AWS_DEFAULT_REGION": "us-west-2",
+                "BEDROCK_MANTLE_REGION": "us-west-2",
+                "XIAOYU_API_KEY": "k",
+            }
+        ):
+            self.assertEqual(providers.bedrock_region(), "")
+            registry = providers.build(config())
+            self.assertIsNone(registry.get("bedrock"))
+        with isolated_env({"AWS_REGION": "us-west-2", "AWS_BEARER_TOKEN_BEDROCK": "ABSK-test"}):
+            self.assertEqual(providers.build(config(base_url="")).get("bedrock").aws_region, "us-east-1")
+
+    def test_missing_botocore_is_a_readable_error(self) -> None:
+        from xiaoyu import messages
+
+        with mock.patch("importlib.util.find_spec", return_value=None):
+            with self.assertRaises(MissingConfig) as caught:
+                messages.bedrock_client("us-east-1", 30.0)
+        self.assertIn("xiaoyu-agent[bedrock]", str(caught.exception))
+
+    def test_effort_is_clamped_to_measured_levels(self) -> None:
+        order = ("none", "minimal", "low", "medium", "high", "xhigh", "max")
+        self.assertEqual(providers.effort_for("bedrock", self.MODEL, "none", order), "low")
+        self.assertEqual(providers.effort_for("bedrock", self.MODEL, "max", order), "max")
+
+    def test_context_window_sees_through_bedrock_prefixes(self) -> None:
+        from xiaoyu.config import FALLBACK_CONTEXT_LIMIT, context_window
+
+        for name in (
+            self.MODEL,
+            "us.anthropic.claude-opus-5-5",
+            "anthropic.claude-sonnet-5-5",
+            "bedrock/global.anthropic.claude-fable-5-1",
+            "arn:aws:bedrock:us-east-1:1:inference-profile/global.anthropic.claude-opus-5-5",
+        ):
+            self.assertEqual(context_window(name), 1_000_000, name)
+        self.assertEqual(context_window("global.anthropic.claude-haiku-4-5-20251001-v1:0"), 200_000)
+        #  别家在 Bedrock 上的 id 不受影响（表里本就没有它们，仍是兜底）；带 anthropic
+        #  字样的非 Bedrock 名字也不误剥
+        self.assertEqual(context_window("deepseek.v3.2"), FALLBACK_CONTEXT_LIMIT)
+        self.assertEqual(context_window("my.custom.anthropic.thing"), FALLBACK_CONTEXT_LIMIT)
+
+    def test_aws_credentials_are_not_stripped_from_subprocess_env(self) -> None:
+        """AWS 凭证与区域变量不进子进程密钥剥除名单：容器里 agent 跑 aws CLI
+        就靠这些变量；只剥 Bedrock API key。"""
+        from xiaoyu.tools import non_inheritable_env_names
+
+        names = non_inheritable_env_names()
+        for name in ("AWS_PROFILE", "AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "XIAOYU_BEDROCK_REGION"):
+            self.assertNotIn(name, names)
+        #  Bedrock API key 是小羽自己的密钥，照常剥
+        self.assertIn("AWS_BEARER_TOKEN_BEDROCK", names)
+
+
+class TestEffortPerModel(ProviderTestCase):
+    """档位跟着会话走，但各型号认的档位不一样。"""
+
+    ORDER = ("none", "minimal", "low", "medium", "high", "xhigh", "max")
+
+    def test_known_model_gets_the_nearest_level_it_accepts(self) -> None:
+        pick = lambda wanted: providers.effort_for("zhipu", "glm-5.3", wanted, self.ORDER)  # noqa: E731
+        self.assertEqual(pick("low"), "low")
+        self.assertEqual(pick("high"), "high")
+        self.assertEqual(pick("medium"), "high")  # 一样近时取高的
+        self.assertEqual(pick("xhigh"), "max")  # high 与 max 一样近，取高的
+        self.assertEqual(pick("minimal"), "low")
+        self.assertEqual(pick("none"), "low")
+        self.assertEqual(pick(""), "")
+
+    def test_gpt_6_line_drops_minimal_and_astra_drops_none(self) -> None:
+        """实测：三兄弟都不认 minimal，astra 还不认 none——都就近落到 low。"""
+        pick = lambda model, wanted: providers.effort_for("openai", model, wanted, self.ORDER)  # noqa: E731
+        for model in ("gpt-6-astra", "gpt-6.1-sol", "gpt-6-luna"):
+            self.assertEqual(pick(model, "minimal"), "low")
+            self.assertEqual(pick(model, "max"), "max")
+        self.assertEqual(pick("gpt-6-astra", "none"), "low")
+        self.assertEqual(pick("gpt-6.1-sol", "none"), "none")
+
+    def test_unmeasured_routes_are_left_alone(self) -> None:
+        for provider, model in (("zhipu", "glm-9"), ("deepseek", "deepseek-flash"),
+                                (GATEWAY, "glm-5.3"), ("nobody", "x")):
+            self.assertEqual(providers.effort_for(provider, model, "medium", self.ORDER), "medium")
+
+    def agent(self, direct_script: list, backup_script: list, **cfg_extra):
+        direct, backup = FakeClient(direct_script), FakeClient(backup_script)
+        registry = Registry(
+            [
+                Provider("deepseek", "u", "k", DS_MODELS, "直连 deepseek"),
+                Provider("zhipu", "u", "k", ("glm-5.3",), "直连 zhipu"),
+            ],
+            clients={"deepseek": direct, "zhipu": backup},
+        )
+        cfg = config(auto_approve=True, enable_skills=False, enable_plugins=False,
+                     effort="medium", **cfg_extra)
+        return Agent(cfg, registry=registry, usage=Usage()), direct, backup
+
+    def run_once(self, agent: Agent) -> str:
+        buffer = io.StringIO()
+        with mock.patch("xiaoyu.agent.Agent._sleep"), contextlib.redirect_stdout(buffer):
+            agent.send("hi")
+        return buffer.getvalue()
+
+    def test_fallback_route_gets_a_level_it_accepts(self) -> None:
+        """主模型宕机、最需要降级的时候，不该因为备用模型不认这一档而 400。"""
+        failure = openai.InternalServerError("炸了", response=_response(500), body=None)
+        agent, direct, backup = self.agent(
+            [failure, failure, failure], [[chunk(content="备用顶上"), usage_chunk(10, 2)]],
+            fallback_models=["glm-5.3"],
+        )
+        agent.config.model = DS_MODELS[0]
+        shown = self.run_once(agent)
+        self.assertEqual({c["reasoning_effort"] for c in direct.completions.calls}, {"medium"})
+        (sent,) = backup.completions.calls
+        self.assertEqual(sent["reasoning_effort"], "high")
+        self.assertIn("不认推理深度 medium", shown)
+
+    def test_the_users_own_pick_is_sent_as_is(self) -> None:
+        """用户给自己点名的模型配的档位原样发：不认就让上游报错，不静默改。"""
+        agent, direct, backup = self.agent([], [[chunk(content="好"), usage_chunk(10, 2)]])
+        agent.config.model = "glm-5.3"
+        shown = self.run_once(agent)
+        (sent,) = backup.completions.calls
+        self.assertEqual(sent["reasoning_effort"], "medium")
+        self.assertNotIn("不认推理深度", shown)
+
+    def test_inherited_effort_is_adjusted_for_a_sub_agent(self) -> None:
+        agent, direct, backup = self.agent(
+            [], [[chunk(content="好"), usage_chunk(10, 2)]], subagent_depth=1
+        )
+        agent.config.model = "glm-5.3"
+        self.run_once(agent)
+        (sent,) = backup.completions.calls
+        self.assertEqual(sent["reasoning_effort"], "high")
+
+
+class TestRetryBudgetAndPreferredProbe(TestCrossProviderFallback):
+    """重试不随路由条数成倍放大；粘性降级冷却到期后回探首选模型。"""
+
+    def limited(self) -> openai.RateLimitError:
+        return openai.RateLimitError("429", response=_response(429), body=None)
+
+    def test_retry_budget_is_shared_across_chain(self) -> None:
+        direct, gateway = FakeClient([self.limited()] * 20), FakeClient([self.limited()] * 20)
+        registry = Registry(
+            [
+                Provider("deepseek", "u", "k", DS_MODELS, "直连 deepseek"),
+                Provider(GATEWAY, "u", "k", (), "网关"),
+            ],
+            clients={"deepseek": direct, GATEWAY: gateway},
+        )
+        cfg = config(auto_approve=True, fallback_models=["other-model"])
+        agent = Agent(cfg, registry=registry, usage=Usage())
+        chain = agent.model_chain()
+        self.assertGreaterEqual(len(chain), 3)
+        with self.assertRaises(openai.RateLimitError):
+            self._run(agent)
+        total = len(direct.completions.calls) + len(gateway.completions.calls)
+        #  每条路由至少一次 + 全链共享的重试预算；旧行为是 3 × 路由数
+        self.assertEqual(total, len(chain) + agent._RECOVERY_BUDGET)
+
+    def downgraded(self, direct_after: list) -> tuple[Agent, FakeClient, FakeClient]:
+        direct = FakeClient([self.limited()] * 3 + direct_after)
+        gateway = FakeClient([[chunk(content="网关顶上")], [chunk(content="网关再顶")]])
+        registry = Registry(
+            [
+                Provider("deepseek", "u", "k", DS_MODELS, "直连 deepseek"),
+                Provider(GATEWAY, "u", "k", (), "网关"),
+            ],
+            clients={"deepseek": direct, GATEWAY: gateway},
+        )
+        agent = Agent(config(auto_approve=True), registry=registry, usage=Usage())
+        self._run(agent)
+        self.assertEqual(agent.config.model, f"{GATEWAY}/deepseek-flash")
+        self.assertEqual(agent._preferred_model, "deepseek-flash")
+        return agent, direct, gateway
+
+    def test_no_probe_before_cooldown(self) -> None:
+        agent, direct, gateway = self.downgraded([])
+        self._run(agent)
+        self.assertEqual(len(direct.completions.calls), 3, "冷却内不该碰首选模型")
+        self.assertEqual(agent.last_assistant_text(), "网关再顶")
+
+    def test_probe_after_cooldown_switches_back(self) -> None:
+        agent, direct, gateway = self.downgraded([[chunk(content="直连恢复")]])
+        agent._preferred_retry_at = 0.0
+        self._run(agent)
+        self.assertEqual(agent.last_assistant_text(), "直连恢复")
+        self.assertEqual(agent.config.model, "deepseek-flash")
+        self.assertIsNone(agent._preferred_model)
+        self.assertEqual(len(gateway.completions.calls), 1, "回探成功这一步不该再打网关")
+
+    def test_failed_probe_backs_off_without_retrying(self) -> None:
+        agent, direct, gateway = self.downgraded([self.limited()])
+        agent._preferred_retry_at = 0.0
+        before = agent._preferred_backoff
+        self._run(agent)
+        self.assertEqual(len(direct.completions.calls), 4, "回探只单发一次，不走重试")
+        self.assertEqual(agent.last_assistant_text(), "网关再顶")
+        self.assertEqual(agent.config.model, f"{GATEWAY}/deepseek-flash")
+        self.assertEqual(agent._preferred_backoff, before * 2)
+
+    def test_explicit_switch_cancels_probe(self) -> None:
+        agent, _, _ = self.downgraded([])
+        agent.switch_model("other-model")
+        self.assertIsNone(agent._preferred_model)
+
+
+class TestCustomHeaders(ProviderTestCase):
+    """XIAOYU_PROVIDER_<NAME>_HEADERS：中转站要求的额外头（鉴权形态、站点标识）。
+    以前只能改代码；三条协议的 client 都要带上，展示面只露名字。"""
+
+    def test_parse_keeps_order_allows_equals_in_value_and_skips_bad_segments(self) -> None:
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            got = providers.parse_provider_headers(
+                " X-Title = xiaoyu ; Authorization=Bearer a=b=c;;no-equals; =novalue ", "T"
+            )
+        self.assertEqual(got, (("X-Title", "xiaoyu"), ("Authorization", "Bearer a=b=c")))
+        self.assertIn("no-equals", err.getvalue())
+        self.assertEqual(providers.parse_provider_headers("", "T"), ())
+
+    def test_env_reference_is_expanded_and_unresolved_header_is_dropped_loudly(self) -> None:
+        err = io.StringIO()
+        with isolated_env({"RELAY_TOKEN": "tok-" + "123"}), contextlib.redirect_stderr(err):
+            got = providers.parse_provider_headers(
+                "Authorization=Bearer ${env:RELAY_TOKEN};X-Missing=${env:NOT_SET_ANYWHERE};X-Plain=${RELAY_TOKEN}",
+                "T",
+            )
+        self.assertEqual(got, (("Authorization", "Bearer tok-123"), ("X-Plain", "tok-123")))
+        self.assertIn("X-Missing", err.getvalue(), "引用没兑现要出声，不能把 ${...} 字面量发上游")
+        self.assertNotIn("tok-123", err.getvalue())
+
+    def _registry(self, **extra: str) -> Registry:
+        env = {
+            "XIAOYU_PROVIDER_RELAY_BASE_URL": "https://relay.example/v1",
+            "XIAOYU_PROVIDER_RELAY_API_KEY": "k",
+            "XIAOYU_PROVIDER_RELAY_MODELS": "m",
+            "XIAOYU_PROVIDER_RELAY_HEADERS": "Authorization=Bearer ${env:RELAY_TOKEN};X-Title=xiaoyu",
+            "RELAY_TOKEN": "secret-" + "token",
+            **extra,
+        }
+        with isolated_env(env):
+            return providers.build(config(base_url=""))
+
+    def test_generic_provider_records_headers_and_exposes_only_names(self) -> None:
+        provider = self._registry().get("relay")
+        assert provider is not None
+        self.assertEqual(dict(provider.headers), {"Authorization": "Bearer secret-token", "X-Title": "xiaoyu"})
+        self.assertEqual(provider.header_names, ("Authorization", "X-Title"))
+        self.assertNotIn("secret-token", repr(provider.header_names))
+
+    def test_chat_and_responses_clients_get_default_headers(self) -> None:
+        for protocol in ("", "responses"):
+            with self.subTest(protocol or "chat"):
+                registry = self._registry(XIAOYU_PROVIDER_RELAY_PROTOCOL=protocol)
+                with mock.patch("xiaoyu.providers.OpenAI") as fake:
+                    fake.side_effect = lambda **kw: object()
+                    client = registry.client("relay")
+                self.assertEqual(
+                    fake.call_args.kwargs["default_headers"],
+                    {"Authorization": "Bearer secret-token", "X-Title": "xiaoyu"},
+                )
+                self.assertEqual(client.protocol_for("m"), protocol or "chat")
+
+    def test_anthropic_client_gets_default_headers(self) -> None:
+        registry = self._registry(XIAOYU_PROVIDER_RELAY_PROTOCOL="anthropic")
+        with mock.patch("xiaoyu.providers.OpenAI", side_effect=lambda **kw: object()), mock.patch(
+            "anthropic.Anthropic", side_effect=lambda **kw: object()
+        ) as fake:
+            registry.client("relay").anthropic_client()
+        self.assertEqual(
+            fake.call_args.kwargs["default_headers"],
+            {"Authorization": "Bearer secret-token", "X-Title": "xiaoyu"},
+        )
+
+    def test_no_headers_means_argument_is_not_passed(self) -> None:
+        """没声明就不传：构造参数与从前一个字节不差（显式 None 也是一种改变）。"""
+        with isolated_env({"DEEPSEEK_API_KEY": "ds"}):
+            registry = providers.build(config(base_url=""))
+        with mock.patch("xiaoyu.providers.OpenAI") as fake:
+            fake.side_effect = lambda **kw: object()
+            registry.client("deepseek")
+        self.assertNotIn("default_headers", fake.call_args.kwargs)
+
+    def test_provider_protocol_for_matches_transport(self) -> None:
+        chat = Provider("a", "https://u", "k", ("m",))
+        self.assertEqual(chat.protocol_for("m"), "chat")
+        self.assertEqual(
+            Provider("a", "https://u", "k", ("m",), responses_models=("*",)).protocol_for("m"), "responses"
+        )
+        self.assertEqual(
+            Provider("a", "https://u", "k", ("m",), responses_models=("*",), anthropic_models=("m",)).protocol_for("m"),
+            "anthropic",
+        )
+
+
+class TestRouteAndClients(ProviderTestCase):
+    ENV = {"XIAOYU_API_KEY": "gw", "DEEPSEEK_API_KEY": "ds"}
+
+    def test_route_equality_ignores_client(self) -> None:
+        """去重按 (provider, model)：client 参与比较的话去重就失效了。"""
+        self.assertEqual(Route("a", "m", object()), Route("a", "m", object()))
+
+    def test_client_is_cached_per_provider(self) -> None:
+        registry = providers.build(config())
+        with mock.patch("xiaoyu.providers.OpenAI") as fake:
+            fake.side_effect = lambda **kw: object()
+            first = registry.client("deepseek")
+            second = registry.client("deepseek")
+        self.assertIs(first, second, "同一家只开一条连接池")
+        self.assertEqual(fake.call_count, 1)
+
+    def test_api_key_not_in_repr(self) -> None:
+        """异常回溯会带出 repr，key 绝不能出现在里面。"""
+        provider = Provider("x", "https://u", "super-secret", (), "x")
+        self.assertNotIn("super-secret", repr(provider))
+
+
+class TestTimeouts(ProviderTestCase):
+    """建连超时必须和 request_timeout 分开：把单个秒数交给 SDK，httpx2 会把
+    connect 也设成它——端点写错/网关挂了要干等十分钟才报错，用户只看到假死。"""
+
+    ENV = {"XIAOYU_API_KEY": "gw", "DEEPSEEK_API_KEY": "ds"}
+
+    def test_connect_is_short_while_read_stays_long(self) -> None:
+        timeout = providers.request_timeout(600.0)
+        self.assertEqual(timeout.connect, providers._CONNECT_TIMEOUT)
+        self.assertEqual(timeout.read, 600.0)
+        self.assertEqual(timeout.write, 600.0)
+
+    def test_short_request_timeout_is_not_lengthened(self) -> None:
+        """eval 横扫时会把 request_timeout 调小，建连不能反倒比它还长。"""
+        timeout = providers.request_timeout(3.0)
+        self.assertEqual(timeout.connect, 3.0)
+        self.assertEqual(timeout.read, 3.0)
+
+    def test_client_gets_the_split_timeout(self) -> None:
+        registry = providers.build(config())
+        with mock.patch("xiaoyu.providers.OpenAI") as fake:
+            fake.side_effect = lambda **kw: object()
+            registry.client("deepseek")
+        passed = fake.call_args.kwargs["timeout"]
+        self.assertIsInstance(passed, httpx2.Timeout)
+        self.assertEqual(passed.connect, providers._CONNECT_TIMEOUT)
+
+
+if __name__ == "__main__":
+    unittest.main()
+
+
+class TestAutoDiscovery(ProviderTestCase):
+    """XIAOYU_PROVIDER_<NAME>_MODELS=auto：本机端点启动时探 /v1/models 自动注册。
+    探测失败/空、或远端端点都不注册（绝不退化成通配劫持网关）。"""
+
+    LOCAL = "http://localhost:8000/v1"
+
+    def _env(self, **extra) -> dict[str, str]:
+        env = {
+            "XIAOYU_PROVIDER_LOCAL_BASE_URL": self.LOCAL,
+            "XIAOYU_PROVIDER_LOCAL_MODELS": "auto",
+        }
+        env.update(extra)
+        return env
+
+    def test_local_auto_registers_discovered_models(self) -> None:
+        with isolated_env(self._env(XIAOYU_PROVIDER_LOCAL_TOOLS="text", XIAOYU_PROVIDER_LOCAL_VISION="*")):
+            with mock.patch.object(providers, "_discover_models", return_value=("m-new-27b",)) as probe:
+                registry = providers.build(config(base_url=""))
+        probe.assert_called_once()
+        local = registry.get("local")
+        self.assertIsNotNone(local)
+        self.assertEqual(local.models, ("m-new-27b",))
+        self.assertFalse(local.wildcard)  # 具名而非通配：不会吃掉别家模型名
+        self.assertEqual(registry.resolve("m-new-27b").provider, "local")
+        #  换 model 后新 id 出现在清单里，用户 config --show / /model 补全都看得到
+        self.assertIn("m-new-27b", [e.model for e in registry.listing()])
+        #  _TOOLS=text / _VISION=* 仍作用于探测出来的名字
+        transport = registry.client("local")
+        self.assertTrue(local.sees_images("m-new-27b"))
+
+    def test_probe_failure_skips_not_wildcard(self) -> None:
+        #  端点没起来（探测返回空）：跳过注册，绝不变成通配去劫持网关
+        import contextlib, io
+        with isolated_env(self._env(XIAOYU_API_KEY="gw")), contextlib.redirect_stderr(io.StringIO()):
+            with mock.patch.object(providers, "_discover_models", return_value=()):
+                registry = providers.build(config(base_url=GW))
+        self.assertIsNone(registry.get("local"))
+        self.assertEqual([p.name for p in registry.providers], [GATEWAY])
+        #  网关模型仍走网关，没被通配的 local 劫持
+        self.assertEqual(registry.resolve("deepseek-flash").provider, GATEWAY)
+
+    def test_remote_auto_is_refused(self) -> None:
+        import contextlib, io
+        env = {
+            "XIAOYU_PROVIDER_REMOTE_BASE_URL": "https://vllm.example.com/v1",
+            "XIAOYU_PROVIDER_REMOTE_API_KEY": "k",
+            "XIAOYU_PROVIDER_REMOTE_MODELS": "auto",
+            "XIAOYU_API_KEY": "gw",
+        }
+        with isolated_env(env), contextlib.redirect_stderr(io.StringIO()) as err:
+            with mock.patch.object(providers, "_discover_models") as probe:
+                registry = providers.build(config(base_url=GW))
+        probe.assert_not_called()  # 远端根本不探测
+        self.assertIsNone(registry.get("remote"))
+        self.assertIn("只对本机 localhost", err.getvalue())
+
+    def test_discover_models_parses_openai_list_shape(self) -> None:
+        #  探测函数本身：/v1/models 的 {data:[{id}]} → 排序去重的 id 元组
+        import types
+        page = [types.SimpleNamespace(id="b"), types.SimpleNamespace(id="a"), types.SimpleNamespace(id="a")]
+        fake = mock.MagicMock()
+        fake.with_options.return_value.models.list.return_value = page
+        with mock.patch.object(providers, "OpenAI", return_value=fake):
+            got = providers._discover_models(self.LOCAL, "local", "XIAOYU_PROVIDER_LOCAL")
+        self.assertEqual(got, ("a", "b"))
+        #  探一次就用完的 client：当场关掉，不把连接留给垃圾回收
+        fake.close.assert_called_once()
+
+    def test_discover_models_closes_client_on_failure_too(self) -> None:
+        import contextlib, io
+        fake = mock.MagicMock()
+        fake.with_options.return_value.models.list.side_effect = RuntimeError("connection refused")
+        #  关连接本身出错不能盖掉探测的结论
+        fake.close.side_effect = OSError("already closed")
+        with mock.patch.object(providers, "OpenAI", return_value=fake), \
+             contextlib.redirect_stderr(io.StringIO()) as err:
+            got = providers._discover_models(self.LOCAL, "local", "XIAOYU_PROVIDER_LOCAL")
+        self.assertEqual(got, ())
+        self.assertIn("connection refused", err.getvalue())
+        fake.close.assert_called_once()
+
+    def test_discover_models_failure_returns_empty(self) -> None:
+        import contextlib, io
+        fake = mock.MagicMock()
+        fake.with_options.return_value.models.list.side_effect = RuntimeError("connection refused")
+        with mock.patch.object(providers, "OpenAI", return_value=fake), \
+             contextlib.redirect_stderr(io.StringIO()) as err:
+            got = providers._discover_models(self.LOCAL, "local", "XIAOYU_PROVIDER_LOCAL")
+        self.assertEqual(got, ())
+        self.assertIn("探测失败", err.getvalue())
+
+    def test_discover_models_empty_error_keeps_startup_alive(self) -> None:
+        for message in ("", "\n", "   "):
+            with self.subTest(message=message):
+                fake = mock.MagicMock()
+                fake.with_options.return_value.models.list.side_effect = AssertionError(message)
+                with mock.patch.object(providers, "OpenAI", return_value=fake), \
+                     contextlib.redirect_stderr(io.StringIO()) as err:
+                    got = providers._discover_models(self.LOCAL, "local", "T")
+                self.assertEqual(got, ())
+                self.assertIn("AssertionError", err.getvalue())
+                fake.close.assert_called_once()

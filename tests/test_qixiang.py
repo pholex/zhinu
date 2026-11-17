@@ -1,0 +1,586 @@
+"""七襄（批量并行委托）的测试。不打网络。
+
+校验层（spec/items/模板/去重/上限）、扇出与按序聚合、失败隔离与续跑提示、
+min-summary 追问闸、批量 resume、非只读默认 worktree 隔离，各卡一处。
+并发路径用"全同响应"脚本（FakeClient 的脚本消费顺序在多线程下不定，
+需要区分各项答案的用例一律并发=1 串行跑）。
+"""
+
+from __future__ import annotations
+
+import contextlib
+import io
+import json
+import re
+import shutil
+import subprocess
+import threading
+import unittest
+from unittest import mock
+
+from xiaoyu import qixiang as qixiang_mod
+from xiaoyu.agent import Usage
+from xiaoyu.agents import AgentSpec, RunStore
+from xiaoyu.providers import Registry, UnknownModel
+from xiaoyu.qixiang import _ItemState, _status_of, make_qixiang_tool
+from xiaoyu.render import PlainSink
+
+from .test_agent_paths import AgentTestCase, FakeClient, call_fragment, chunk
+
+HAS_GIT = shutil.which("git") is not None
+
+READER = AgentSpec(
+    name="reader", description="d", system_prompt="工作区 {workspace}",
+    tools=("read_file", "grep", "list_files"),
+)
+WRITER = AgentSpec(
+    name="writer", description="d", system_prompt="工作区 {workspace}",
+    tools=("read_file", "write_file"),
+)
+
+#  ≥200 字符的长结论：不触发 min-summary 追问
+LONG = "结论：" + "详" * 210
+
+
+def text_turn(text: str) -> list:
+    return [chunk(content=text)]
+
+
+def tool_turn(call_id: str, name: str, args: dict) -> list:
+    return [chunk(tool_calls=[call_fragment(0, call_id, name, json.dumps(args))])]
+
+
+class QixiangTestCase(AgentTestCase):
+    def make_tool(self, specs, script, runs=None):
+        self.sub_client = FakeClient(script)
+        self.runs = runs if runs is not None else RunStore()
+        return make_qixiang_tool(
+            list(specs),
+            self.config,
+            Registry.for_client(self.sub_client),
+            Usage(),
+            PlainSink(indent="", verbose=False),
+            lambda name, args: True,
+            None,
+            self.runs,
+        )
+
+    def call(self, tool, **kwargs) -> str:
+        with contextlib.redirect_stdout(io.StringIO()):
+            return tool.handler(**kwargs)
+
+
+class ValidationTest(QixiangTestCase):
+    def test_unknown_spec(self):
+        tool = self.make_tool([READER], [])
+        result = self.call(tool, spec="nobody", prompt_template="{{item}}", items=["a", "b"])
+        self.assertTrue(result.startswith("ERROR"))
+        self.assertIn("reader", result)
+
+    def test_single_item_rejected(self):
+        tool = self.make_tool([READER], [])
+        result = self.call(tool, spec="reader", prompt_template="{{item}}", items=["a"])
+        self.assertTrue(result.startswith("ERROR"))
+        self.assertIn("至少 2 项", result)
+
+    def test_template_placeholder_required(self):
+        tool = self.make_tool([READER], [])
+        result = self.call(tool, spec="reader", prompt_template="没有占位符", items=["a", "b"])
+        self.assertTrue(result.startswith("ERROR"))
+        self.assertIn("{{item}}", result)
+
+    def test_duplicate_expansion_rejected(self):
+        tool = self.make_tool([READER], [])
+        result = self.call(tool, spec="reader", prompt_template="查 {{item}}", items=["x", "x"])
+        self.assertTrue(result.startswith("ERROR"))
+        self.assertIn("完全相同", result)
+
+    def test_over_limit_rejected(self):
+        tool = self.make_tool([READER], [])
+        with mock.patch.object(qixiang_mod, "MAX_ITEMS", 3):
+            result = self.call(
+                tool, spec="reader", prompt_template="{{item}}",
+                items=["a", "b", "c", "d"],
+            )
+        self.assertTrue(result.startswith("ERROR"))
+        self.assertIn("最多 3 项", result)
+
+    def test_bad_resume_shape(self):
+        tool = self.make_tool([READER], [])
+        result = self.call(tool, spec="reader", resume=["not-a-dict"])
+        self.assertTrue(result.startswith("ERROR"))
+        self.assertIn("resume", result)
+
+    def test_nothing_to_do(self):
+        tool = self.make_tool([READER], [])
+        result = self.call(tool, spec="reader")
+        self.assertTrue(result.startswith("ERROR"))
+
+
+class FanOutTest(QixiangTestCase):
+    def setUp(self):
+        super().setUp()
+        self.config.qixiang_concurrency = 1  # 串行：脚本消费顺序 = 输入顺序
+
+    def test_ordered_report_with_resume_handles(self):
+        script = [text_turn("甲的结论 " + LONG), text_turn("乙的结论 " + LONG)]
+        tool = self.make_tool([READER], script)
+        result = self.call(
+            tool, spec="reader", prompt_template="查 {{item}}", items=["甲", "乙"]
+        )
+        self.assertIn("完成 2 / 未做完 0 / 失败 0", result)
+        #  输入顺序聚合
+        self.assertLess(result.index("甲的结论"), result.index("乙的结论"))
+        self.assertEqual(len(re.findall(r"resume_from: [0-9a-f]{8}", result)), 2)
+        self.assertEqual(len(self.runs), 2)
+
+    def test_capped_item_is_counted_as_unfinished_and_offered_for_resume(self):
+        capped = AgentSpec(
+            name="reader", description="d", system_prompt="工作区 {workspace}",
+            tools=("read_file", "grep", "list_files"), max_iterations=1,
+        )
+        self.config.turn_extension = 0
+        script = [
+            tool_turn("r1", "read_file", {"path": "calc.py"}),
+            text_turn("甲只查到一半 " + LONG),
+            text_turn("乙的结论 " + LONG),
+        ]
+        tool = self.make_tool([capped], script)
+        result = self.call(
+            tool, spec="reader", prompt_template="查 {{item}}", items=["甲", "乙"]
+        )
+        self.assertIn("完成 1 / 未做完 1 / 失败 0", result)
+        self.assertIn("1/2 未做完", result)
+        self.assertIn("撞了轮数上限", result)
+        self.assertIn("甲只查到一半", result)
+        self.assertIn("批量续跑", result)
+
+    def test_failure_isolated_with_retry_hint(self):
+        script = [RuntimeError("模型炸了"), text_turn("乙的结论 " + LONG)]
+        tool = self.make_tool([READER], script)
+        with mock.patch.object(qixiang_mod, "MIN_ANSWER_CHARS", 0):
+            result = self.call(
+                tool, spec="reader", prompt_template="查 {{item}}", items=["甲", "乙"]
+            )
+        self.assertIn("完成 1 / 未做完 0 / 失败 1", result)
+        self.assertIn("子 agent 失败", result)
+        self.assertIn("批量续跑", result)
+        #  失败的也有 resume 句柄（从 failed 恢复继续修是正当用法）
+        self.assertEqual(len(re.findall(r"resume_from: [0-9a-f]{8}", result)), 2)
+
+    def test_short_answer_gets_continuation(self):
+        script = [
+            text_turn("太短"),                      # 第 1 项首轮：触发追问
+            text_turn("补全后的完整交接 " + LONG),   # 追问轮（resume 通道）
+            text_turn("乙的结论 " + LONG),           # 第 2 项
+        ]
+        tool = self.make_tool([READER], script)
+        result = self.call(
+            tool, spec="reader", prompt_template="查 {{item}}", items=["甲", "乙"]
+        )
+        self.assertIn("补全后的完整交接", result)
+        self.assertNotIn("--- 1/2 完成 · 甲\n太短", result)
+
+    def test_continuation_keeps_capability_mode(self):
+        """追问轮不许丢档位收紧：read-only 批里被追问的子 agent 试图 write_file
+        必须仍然写不进（评审抓出的越权回归）。"""
+        script = [
+            text_turn("太短"),  # 触发追问
+            #  追问轮里模型试图写文件——档位若继承，write_file 不在工具箱里
+            tool_turn("w1", "write_file", {"path": "sneak.txt", "content": "x"}),
+            text_turn("写不了，补交接 " + LONG),
+            text_turn("乙 " + LONG),
+        ]
+        tool = self.make_tool([WRITER], script)
+        result = self.call(
+            tool, spec="writer", prompt_template="改 {{item}}", items=["甲", "乙"],
+            capability_mode="read-only", isolation="none",
+        )
+        self.assertIn("完成 2", result)
+        self.assertFalse((self.root / "sneak.txt").exists(), "追问轮拿回了写权限")
+
+    def test_store_capacity_scales_with_batch(self):
+        """批内的 resume 句柄不许被滚动淘汰成死链。"""
+        script = [text_turn(f"第{n}项 " + LONG) for n in range(3)]
+        tool = self.make_tool([READER], script)
+        with mock.patch("xiaoyu.agents.MAX_RUNS", 2):
+            result = self.call(
+                tool, spec="reader", prompt_template="查 {{item}}",
+                items=["a", "b", "c"],
+            )
+        ids = re.findall(r"resume_from: ([0-9a-f]{8})", result)
+        self.assertEqual(len(ids), 3)
+        for rid in ids:
+            self.assertIn(rid, self.runs, "报告里的句柄已被淘汰成死链")
+
+    def test_batch_resume_inherits_transcript(self):
+        first = self.make_tool([READER], [text_turn("首轮 " + LONG), text_turn("次轮 " + LONG)])
+        report = self.call(
+            first, spec="reader", prompt_template="任务 {{item}}", items=["A", "B"]
+        )
+        rid = re.search(r"resume_from: ([0-9a-f]{8})", report).group(1)
+        second = self.make_tool([READER], [text_turn("续上了 " + LONG)], runs=self.runs)
+        result = self.call(second, spec="reader", resume={rid: "接着干"})
+        self.assertIn("续上了", result)
+        new_id = re.search(r"resume_from: ([0-9a-f]{8})", result).group(1)
+        dump = json.dumps(self.runs[new_id].messages, ensure_ascii=False)
+        self.assertIn("任务 A", dump)
+        self.assertIn("接着干", dump)
+
+    def test_unknown_resume_id_fails_item_not_batch(self):
+        script = [text_turn("乙 " + LONG)]
+        tool = self.make_tool([READER], script)
+        result = self.call(tool, spec="reader", resume={"deadbeef": "继续"})
+        self.assertIn("未执行 1", result)
+        self.assertIn("resume_from='deadbeef'", result)
+
+
+class BreakerTest(QixiangTestCase):
+    """鉴权不过、额度用尽：换一项重试也不会好，别把余下的每一项都跑一遍再失败。"""
+
+    def auth_error(self):
+        import httpx2
+        import openai
+
+        response = httpx2.Response(401, request=httpx2.Request("POST", "http://unused"))
+        return openai.AuthenticationError("bad key", response=response, body=None)
+
+    def test_stops_starting_items_after_three_hopeless_failures(self):
+        self.config.qixiang_concurrency = 1
+        tool = self.make_tool([READER], [self.auth_error() for _ in range(6)])
+        result = self.call(
+            tool, spec="reader", prompt_template="查 {{item}}",
+            items=[f"i{n}" for n in range(6)],
+        )
+        self.assertEqual(len(self.sub_client.completions.calls), 3)
+        self.assertIn("连续 3 项都因鉴权失败", result)
+        self.assertIn("失败 3", result)
+        self.assertIn("中止 3", result)
+
+    def test_ordinary_failures_do_not_trip_it(self):
+        self.config.qixiang_concurrency = 1
+        script = [RuntimeError("这一项自己的问题") for _ in range(4)]
+        tool = self.make_tool([READER], script)
+        result = self.call(
+            tool, spec="reader", prompt_template="查 {{item}}",
+            items=[f"i{n}" for n in range(4)],
+        )
+        self.assertEqual(len(self.sub_client.completions.calls), 4)
+        self.assertNotIn("不再起步", result)
+
+    def test_a_success_in_between_resets_the_streak(self):
+        self.config.qixiang_concurrency = 1
+        script = [self.auth_error(), self.auth_error(), text_turn("好了 " + LONG),
+                  self.auth_error(), self.auth_error()]
+        tool = self.make_tool([READER], script)
+        result = self.call(
+            tool, spec="reader", prompt_template="查 {{item}}",
+            items=[f"i{n}" for n in range(5)],
+        )
+        self.assertEqual(len(self.sub_client.completions.calls), 5)
+        self.assertNotIn("不再起步", result)
+
+
+class ObservingSinkTest(unittest.TestCase):
+    """批量运行时子 agent 的告警不能一句都出不来：卡在限流退避上和正在干活，
+    从外面看要分得清。"""
+
+    def test_keeps_warnings_and_last_action_drops_the_chatter(self):
+        from xiaoyu.events import Notice, ObservingSink, TextDelta, ToolRunning
+
+        observer = ObservingSink("甲")
+        self.assertEqual(observer.activity(), "")
+        observer.emit(TextDelta("一大段正文"))
+        observer.emit(ToolRunning("bash", {"command": "ls"}))
+        observer.emit(Notice("[压缩完成]", "info"))
+        observer.emit(Notice("[限流，30.0s 后重试（1/2）]", "warn"))
+        self.assertEqual(observer.drain(), ["[限流，30.0s 后重试（1/2）]"])
+        self.assertEqual(observer.drain(), [])
+        activity = observer.activity()
+        self.assertIn("最近调用 bash", activity)
+        self.assertIn("限流", activity)
+
+    def test_the_same_warning_is_not_repeated_within_the_window(self):
+        from xiaoyu.events import Notice, ObservingSink
+
+        observer = ObservingSink()
+        for _ in range(5):
+            observer.emit(Notice("[同一句告警]", "warn"))
+        observer.emit(Notice("[另一句]", "error"))
+        self.assertEqual(observer.drain(), ["[同一句告警]", "[另一句]"])
+
+    def test_reporter_relays_warnings_with_the_item_label(self):
+        from xiaoyu.events import Notice, ObservingSink
+
+        shown: list = []
+
+        class Sink:
+            def emit(self, event):
+                shown.append(event)
+
+        first, second = ObservingSink("甲"), ObservingSink("乙")
+        report = qixiang_mod.make_progress_reporter(
+            [("甲", first, lambda: True), ("乙", second, lambda: True)], Sink(), "🕸 七襄"
+        )
+        report()
+        self.assertEqual(shown, [])
+        second.emit(Notice("[限流，5.0s 后重试（1/2）]", "warn"))
+        report()
+        (event,) = shown
+        self.assertEqual(event.level, "warn")
+        self.assertIn("[乙]", event.text)
+        self.assertIn("限流", event.text)
+
+    def test_heartbeat_after_a_long_quiet_spell(self):
+        from xiaoyu.events import ObservingSink, ToolRunning
+
+        shown: list = []
+
+        class Sink:
+            def emit(self, event):
+                shown.append(event)
+
+        running, done = ObservingSink("甲"), ObservingSink("乙")
+        running.emit(ToolRunning("bash", {}))
+        done.emit(ToolRunning("grep", {}))
+        clock = {"now": 1000.0}
+        with mock.patch.object(qixiang_mod.time, "monotonic", lambda: clock["now"]):
+            report = qixiang_mod.make_progress_reporter(
+                [("甲", running, lambda: True), ("乙", done, lambda: False)], Sink(), "🕸 七襄"
+            )
+            clock["now"] += 10
+            report()
+            self.assertEqual(shown, [])
+            clock["now"] += 25
+            report()
+        (event,) = shown
+        self.assertIn("[甲] 仍在跑", event.text)
+        self.assertIn("bash", event.text)
+
+    def test_retry_notice_of_a_batch_item_reaches_the_user(self):
+        from .test_errors import rate_limit_error
+
+        class Case(QixiangTestCase):
+            def runTest(self):  # pragma: no cover - 只借 setUp
+                pass
+
+        case = Case()
+        case.setUp()
+        self.addCleanup(case.doCleanups)
+        case.config.qixiang_concurrency = 1
+        tool = case.make_tool(
+            [READER],
+            [rate_limit_error(), text_turn("甲的结论 " + LONG), text_turn("乙的结论 " + LONG)],
+        )
+        buffer = io.StringIO()
+        with mock.patch("xiaoyu.agent.Agent._sleep"), contextlib.redirect_stdout(buffer):
+            result = tool.handler(
+                spec="reader", prompt_template="查 {{item}}", items=["甲", "乙"]
+            )
+        self.assertIn("完成 2", result)
+        self.assertIn("限流", buffer.getvalue())
+        self.assertIn("[甲]", buffer.getvalue())
+
+
+class InterruptedTest(QixiangTestCase):
+    """打断照样往上抛，但已收束各项的结论与 resume 句柄要跟着出来——否则
+    存档还在，句柄却没人知道，花掉的那几项等于白跑。"""
+
+    def run_interrupted(self, total: int, after: int):
+        from xiaoyu.errors import PARTIAL_OUTPUT, Interrupted
+
+        self.config.qixiang_concurrency = 1
+        runs = RunStore()
+        stop_seen = threading.Event()
+        execute = qixiang_mod.execute_delegation
+
+        def execute_until_stopped(*args, **kwargs):
+            # 假响应可能在调度线程巡检前全部跑完。让下一项等到巡检确认中止，
+            # 才能稳定构造“已有结果、仍有任务未完成”的打断现场。
+            if len(runs) >= after:
+                if not stop_seen.wait(5):
+                    raise AssertionError("调度线程未检查中止请求")
+                raise Interrupted("测试任务等待期间被打断")
+            return execute(*args, **kwargs)
+
+        def stop_requested():
+            if len(runs) < after:
+                return False
+            stop_seen.set()
+            return True
+
+        self.sub_client = FakeClient([text_turn(f"第{n}项 " + LONG) for n in range(total)])
+        tool = make_qixiang_tool(
+            [READER], self.config, Registry.for_client(self.sub_client), Usage(),
+            PlainSink(indent="", verbose=False), lambda name, args: True, None, runs,
+            stop_requested=stop_requested,
+        )
+        with (
+            mock.patch.object(qixiang_mod, "execute_delegation", execute_until_stopped),
+            contextlib.redirect_stdout(io.StringIO()),
+            self.assertRaises(Interrupted) as caught,
+        ):
+            tool.handler(
+                spec="reader", prompt_template="查 {{item}}",
+                items=[f"i{n}" for n in range(total)],
+            )
+        return getattr(caught.exception, PARTIAL_OUTPUT, None), runs
+
+    def test_finished_items_travel_with_the_interrupt(self):
+        report, runs = self.run_interrupted(total=6, after=2)
+        self.assertIsInstance(report, str)
+        self.assertIn("被打断", report)
+        handles = re.findall(r"resume_from: ([0-9a-f]{8})", report)
+        self.assertGreaterEqual(len(handles), 2)
+        self.assertTrue(set(handles) <= set(runs))
+        self.assertIn("第0项", report)
+        #  没跑到的项如实列为中止，不冒充完成
+        self.assertRegex(report, r"中止 [1-9]")
+        self.assertNotIn("完成 6", report)
+
+    def test_status_counts_running_items_as_aborted_when_cancelled(self):
+        state = _ItemState(index=0, label="x", task="t", started_at=1.0)
+        self.assertEqual(_status_of(state, cancelled=True), "aborted")
+
+
+class ConcurrentTest(QixiangTestCase):
+    def test_parallel_batch_completes(self):
+        self.config.qixiang_concurrency = 4
+        script = [text_turn(LONG) for _ in range(6)]
+        tool = self.make_tool([READER], script)
+        result = self.call(
+            tool, spec="reader", prompt_template="查 {{item}}",
+            items=[f"i{n}" for n in range(6)],
+        )
+        self.assertIn("完成 6 / 未做完 0 / 失败 0", result)
+        #  块按输入顺序（与完成先后无关）
+        positions = [result.index(f"· i{n}") for n in range(6)]
+        self.assertEqual(positions, sorted(positions))
+
+
+@unittest.skipUnless(HAS_GIT, "机器上没有 git")
+class IsolationDefaultTest(QixiangTestCase):
+    def setUp(self):
+        super().setUp()
+        self.config.qixiang_concurrency = 1
+        subprocess.run(["git", "init", "-q"], cwd=self.root, check=True)
+        subprocess.run(["git", "add", "-A"], cwd=self.root, check=True)
+        subprocess.run(
+            ["git", "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "init"],
+            cwd=self.root, check=True,
+        )
+
+    def _write_script(self, filename: str) -> list:
+        return [
+            tool_turn("w1", "write_file", {"path": filename, "content": "x"}),
+            text_turn(f"写完 {filename} " + LONG),
+        ]
+
+    def test_nonreadonly_defaults_to_worktree(self):
+        from xiaoyu import worktree as worktree_mod
+
+        script = self._write_script("a.txt") + self._write_script("b.txt")
+        tool = self.make_tool([WRITER], script)
+        real_create = worktree_mod.create
+        with mock.patch.object(
+            worktree_mod, "user_config_dir", lambda: self.root / "cfg"
+        ), mock.patch.object(
+            worktree_mod, "create", side_effect=real_create
+        ) as created:
+            result = self.call(
+                tool, spec="writer", prompt_template="写 {{item}}",
+                items=["a.txt", "b.txt"],
+            )
+        self.assertIn("完成 2", result)
+        self.assertEqual(created.call_count, 2)
+        #  改动没落主工作区
+        self.assertFalse((self.root / "a.txt").exists())
+        self.assertIn("worktree:", result)
+
+    def test_isolation_none_opts_out(self):
+        script = self._write_script("c.txt") + self._write_script("d.txt")
+        tool = self.make_tool([WRITER], script)
+        result = self.call(
+            tool, spec="writer", prompt_template="写 {{item}}",
+            items=["c.txt", "d.txt"], isolation="none",
+        )
+        self.assertIn("完成 2", result)
+        self.assertTrue((self.root / "c.txt").exists())
+        self.assertNotIn("worktree:", result)
+
+
+class StatusClassifyTest(unittest.TestCase):
+    def test_timed_out_is_aborted(self):
+        state = _ItemState(index=0, label="x", task="t")
+        state.timed_out = True
+        self.assertEqual(_status_of(state, cancelled=False), "aborted")
+
+    def test_never_started_is_aborted(self):
+        state = _ItemState(index=0, label="x", task="t")
+        state.never_started = True
+        self.assertEqual(_status_of(state, cancelled=True), "aborted")
+
+    def test_crash_is_failed(self):
+        state = _ItemState(index=0, label="x", task="t")
+        state.crash = "boom"
+        self.assertEqual(_status_of(state, cancelled=False), "failed")
+
+
+if __name__ == "__main__":
+    unittest.main()
+
+
+class ModelEffortTest(QixiangTestCase):
+    """整批统一的 model / effort：开工前校验、逐项生效、报告头可见。"""
+
+    def test_unknown_model_rejected_upfront(self):
+        tool = self.make_tool([READER], [])
+        with mock.patch.object(Registry, "resolve", side_effect=UnknownModel("没人认领")):
+            result = self.call(
+                tool, spec="reader", prompt_template="{{item}}", items=["a", "b"],
+                model="ghost-1",
+            )
+        self.assertTrue(result.startswith("ERROR"), result)
+        self.assertIn("ghost-1", result)
+        self.assertEqual(self.sub_client.completions.calls, [], "校验失败不该起任何子 agent")
+
+    def test_bad_effort_rejected_upfront(self):
+        tool = self.make_tool([READER], [])
+        result = self.call(
+            tool, spec="reader", prompt_template="{{item}}", items=["a", "b"],
+            effort="ultra",
+        )
+        self.assertTrue(result.startswith("ERROR"), result)
+        self.assertIn("ultra", result)
+        self.assertEqual(self.sub_client.completions.calls, [])
+
+    def test_model_and_effort_apply_to_every_item(self):
+        tool = self.make_tool([READER], [text_turn(LONG), text_turn(LONG)])
+        result = self.call(
+            tool, spec="reader", prompt_template="{{item}}", items=["a", "b"],
+            model="cheap-x", effort="LOW",
+        )
+        self.assertIn("model=cheap-x", result)
+        self.assertIn("effort=low", result)
+        self.assertEqual({run.model for run in self.runs.values()}, {"cheap-x"})
+        calls = self.sub_client.completions.calls
+        self.assertEqual(len(calls), 2)
+        self.assertEqual({call["model"] for call in calls}, {"cheap-x"})
+        self.assertEqual({call.get("reasoning_effort") for call in calls}, {"low"})
+
+    def test_resume_item_keeps_archived_model(self):
+        """resume 项的模型钉在存档上：整批传了别的 model 也只对新开项生效。"""
+        tool = self.make_tool([READER], [text_turn(LONG), text_turn(LONG)])
+        self.config.qixiang_concurrency = 1
+        first = self.call(
+            tool, spec="reader", prompt_template="{{item}}", items=["a", "b"],
+            model="model-one",
+        )
+        rid = re.search(r"resume_from: (\w+)", first).group(1)
+        tool = self.make_tool([READER], [text_turn(LONG), text_turn(LONG)], runs=self.runs)
+        self.call(
+            tool, spec="reader", prompt_template="{{item}}", items=["c"],
+            resume={rid: "接着"}, model="model-two",
+        )
+        used = [call["model"] for call in self.sub_client.completions.calls]
+        self.assertEqual(sorted(used), ["model-one", "model-two"])

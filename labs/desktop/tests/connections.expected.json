@@ -1,0 +1,33 @@
+{
+  "config": {
+    "revision": 1,
+    "connections": [
+      {
+        "id": "research",
+        "revision": 1,
+        "definition": {
+          "name": "资料连接",
+          "transport": "http",
+          "timeout": 30,
+          "url": "https://mcp.example.invalid/tools"
+        }
+      }
+    ]
+  },
+  "session": {
+    "connections": [
+      {
+        "id": "research",
+        "configuration_revision": 1,
+        "mounted": false,
+        "state": "unmounted",
+        "tools": [],
+        "declaration_fingerprint": "",
+        "oauth_status": "not_configured",
+        "declaration_warning": ""
+      }
+    ],
+    "can_manage": true,
+    "reason": ""
+  }
+}

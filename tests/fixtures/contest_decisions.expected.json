@@ -1,0 +1,79 @@
+{
+  "contest_id": "contest-one",
+  "spec": "reader",
+  "task": "比较两个方案",
+  "task_truncated": false,
+  "criteria": "正确性优先",
+  "criteria_truncated": false,
+  "revision": 3,
+  "phase": "settled",
+  "final": true,
+  "cancelled": false,
+  "candidates": [
+    {
+      "id": "contest-one:1",
+      "index": 1,
+      "status": "completed",
+      "model": "model-1",
+      "run_id": "child-1",
+      "workspace": "",
+      "worktree": null,
+      "answer": "方案1",
+      "answer_truncated": false,
+      "error": "",
+      "started": true,
+      "artifacts": []
+    },
+    {
+      "id": "contest-one:2",
+      "index": 2,
+      "status": "completed",
+      "model": "model-2",
+      "run_id": "child-2",
+      "workspace": "",
+      "worktree": null,
+      "answer": "方案2",
+      "answer_truncated": false,
+      "error": "",
+      "started": true,
+      "artifacts": []
+    }
+  ],
+  "judge": {
+    "status": "completed",
+    "model": "judge-model",
+    "run_id": "judge-run",
+    "answer": "胜者：#2",
+    "answer_truncated": false,
+    "reason": "",
+    "recommendation_id": "contest-one:2"
+  },
+  "run_id": "",
+  "selection": {
+    "id": "<SELECTION:2>",
+    "candidate_id": "contest-one:2",
+    "reason": "补充验收后改选第二席",
+    "source": "user",
+    "created_at": "<TIME>",
+    "sequence": 2
+  },
+  "selections": [
+    {
+      "id": "<SELECTION:1>",
+      "candidate_id": "contest-one:1",
+      "reason": "独立核对后采用第一席",
+      "source": "user",
+      "created_at": "<TIME>",
+      "sequence": 1
+    },
+    {
+      "id": "<SELECTION:2>",
+      "candidate_id": "contest-one:2",
+      "reason": "补充验收后改选第二席",
+      "source": "user",
+      "created_at": "<TIME>",
+      "sequence": 2
+    }
+  ],
+  "selection_revision": 2
+}

@@ -1,0 +1,71 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>羽案 · 工作台</title>
+  <link rel="stylesheet" href="./style.css">
+  <link rel="stylesheet" href="./settings.css">
+  <link rel="stylesheet" href="./panes.css">
+  <script type="module" src="./app.mjs"></script>
+</head>
+<body>
+  <a class="skip" href="#workspace">跳到工作区</a>
+  <div class="shell">
+    <nav id="app-rail" class="app-rail" aria-label="全局导航">
+      <button id="home" class="rail-brand" type="button" aria-label="首页" data-tooltip="首页 · 返回对话"><span data-icon="home"></span></button>
+      <div class="global-nav">
+<button id="library" class="nav-item" data-tooltip="作品 · 查看交付成果" aria-label="作品" data-route="library" type="button"><span data-icon="library"></span><span>作品</span></button><button id="capabilities" class="nav-item" data-tooltip="插件 · 管理技能与连接器" aria-label="插件" data-route="capabilities" type="button"><span data-icon="capabilities"></span><span>插件</span></button><button id="spaces" class="nav-item" data-tooltip="空间 · 整理资料与成果" aria-label="空间" data-route="spaces" type="button"><span data-icon="space"></span><span>空间</span></button><button id="automations" class="nav-item" data-tooltip="定时任务 · 安排重复工作" aria-label="定时任务" type="button" aria-pressed="false" hidden><span data-icon="clock"></span><span>定时任务</span></button></div>
+      <div class="rail-bottom"><details id="sidebar-more" class="sidebar-more">
+          <summary title="更多功能" aria-label="更多功能"><span data-icon="more"></span><span id="more-label" class="sr-only">更多</span></summary>
+          <nav class="utility-nav" aria-label="更多功能">
+            <button id="cli-sessions" class="nav-item" type="button" aria-pressed="false"><span data-icon="terminal"></span><span>Xiaoyu CLI 会话</span></button>
+            <button id="archive-sessions" class="nav-item" type="button" data-route="archived" aria-pressed="false" hidden><span data-icon="archive"></span><span>已归档</span></button>
+          </nav>
+        </details><button id="settings" class="nav-item" title="设置（⌘,）" aria-label="设置" type="button"><span data-icon="settings"></span><span>设置</span><kbd>⌘,</kbd></button></div>
+    </nav>
+    <aside id="sidebar" class="sidebar" aria-label="项目与会话">
+      <div class="brand"><strong>羽案</strong><details id="sidebar-activity" class="sidebar-activity"><summary class="quiet icon-button" title="会话动态与筛选" aria-label="会话动态与筛选"><span data-icon="bell"></span><span id="activity-dot" hidden></span></summary>      <nav id="filters" class="session-filters menu-items" aria-label="会话状态筛选">
+        <button type="button" data-filter="all" aria-pressed="true"><span data-icon="message"></span>全部</button>
+        <button type="button" data-filter="attention" aria-pressed="false"><span data-icon="bell"></span>待处理 <span id="n-attention" class="nav-count">0</span></button>
+        <button type="button" data-filter="running" aria-pressed="false"><span data-icon="play"></span>执行中 <span id="n-running" class="nav-count">0</span></button>
+      </nav></details><button id="search-toggle" class="quiet icon-button" title="搜索（⌘K）" aria-label="搜索" type="button" aria-expanded="false" aria-controls="sidebar-search"><span data-icon="search"></span></button><button id="collapse-sidebar" class="quiet icon-button" type="button" aria-label="收起侧栏" title="收起侧栏（⌘B）"><span data-icon="sidebar"></span></button></div>
+      <nav class="primary-nav" aria-label="任务导航">
+        <button id="new-session" class="nav-item" type="button" disabled><span data-icon="edit"></span><span>新对话</span><kbd>⌘N</kbd></button>
+        <button id="projects" class="nav-item" type="button" aria-pressed="false" hidden><span data-icon="folder"></span><span>项目</span></button>
+      </nav>
+      <label id="sidebar-search" class="search" hidden><span class="sr-only">搜索会话、路径或模型</span><input id="search" type="search" placeholder="搜索会话、项目…" autocomplete="off" aria-keyshortcuts="Meta+K Control+K"></label>
+
+      <nav id="sessions" aria-label="项目与最近会话"></nav>
+      <div class="sidebar-bottom"><span id="connection-state" role="status">尚未连接</span><button id="disconnect" class="quiet" type="button" hidden>断开</button></div>
+    </aside>
+    <div class="work-area">
+    <main id="workspace" tabindex="-1">
+      <header class="topbar"><button id="expand-sidebar" class="quiet icon-button" type="button" aria-label="展开侧栏" aria-controls="sidebar" aria-expanded="true" title="展开侧栏（⌘B）" hidden><span data-icon="sidebar"></span></button><div class="heading"><h1 id="title">新任务</h1><p id="subtitle">想法、项目与成果，在这里连接。</p></div><div class="header-actions"><span id="session-state"></span><button id="return-chat" class="quiet" type="button" hidden><span data-icon="arrowLeft"></span>返回对话</button><details id="session-menu" class="session-menu"><summary aria-label="会话操作" title="会话操作"><span data-icon="more"></span></summary><div id="session-menu-items" class="menu-items"></div></details><button id="toggle-panes" class="quiet icon-button" type="button" aria-label="显示／隐藏右侧栏" title="显示／隐藏右侧栏"><span data-icon="sidebarRight"></span></button><details id="collaboration-menu" class="toolbar-menu" hidden><summary title="协作任务"><span data-icon="capabilities"></span><span>协作</span><span data-icon="chevron"></span></summary><div class="menu-items"><button id="new-contest" class="quiet" type="button" hidden><span data-icon="compare"></span>方案比选</button><button id="new-weave" class="quiet" type="button" hidden><span data-icon="capabilities"></span>批量执行</button><button id="new-fleet" type="button" data-fc-action="open" hidden><span data-icon="group"></span>统筹协作</button></div></details><button id="refresh" class="quiet icon-button" type="button" title="刷新" aria-label="刷新" disabled><span data-icon="refresh"></span></button></div></header>
+      <div id="banner" class="banner" role="alert" hidden></div>
+      <div id="state-conflicts"></div>
+      <section id="connection-panel" hidden class="panel" aria-labelledby="connect-title">
+        <div class="panel-heading"><h2 id="connect-title">连接本机小羽</h2><button id="close-settings" class="quiet" type="button">收起</button></div><p id="connection-description">连接服务后，可创建任务、处理审批和查看成果。</p><div id="connection-summary" class="facts" hidden></div>
+        <form id="connect-form"><label>服务地址<input id="endpoint" type="url" value="http://127.0.0.1:8420" required autocomplete="off"></label><label>访问令牌<input id="token" type="password" autocomplete="off" placeholder="仅保留在页面内存"></label><button class="primary" type="submit">连接服务</button></form>
+        <details><summary>如何启动服务</summary><pre id="setup-command"></pre></details>
+      </section>
+      <section id="create-panel" class="panel" hidden aria-labelledby="create-title">
+        <h2 id="create-title">新建任务</h2><p id="workspace-hint">工作目录必须在服务允许的范围内。</p>
+        <div id="composer-project-choices" class="composer-project-choices"></div><details><summary>使用其他工作目录</summary><form id="create-form"><label>工作目录<input id="workspace-path" required autocomplete="off" placeholder="项目目录的绝对路径"></label><div class="actions"><button class="primary" id="create" type="submit">使用此目录</button><button id="cancel-create" type="button">取消</button></div></form></details>
+      </section>
+      <div id="outbox" class="outbox" aria-live="polite"></div>
+      <div id="notice" class="notice" role="status"></div>
+      <div id="thread-scroll" class="thread-scroll"><article id="thread" class="thread" aria-label="会话内容"><div class="empty"><img class="empty-mark" src="./logo.png" width="64" height="64" alt=""><h2>从一件具体的事开始。</h2><p>新建任务，或在左侧接着上次的工作继续。</p></div></article></div>
+      <section id="takeover-bar" class="takeover-bar" aria-label="终端会话的接续状态" aria-live="polite" hidden></section>
+      <section id="composer-area" class="composer-area" aria-label="任务输入">
+        <div class="composer-context"><button id="composer-project" class="quiet" type="button"><span data-icon="folder"></span><span id="composer-project-label">选择项目</span></button><details id="execution-menu" class="toolbar-menu execution-host"><summary aria-label="工作位置：本地" title="工作位置"><span data-icon="monitor"></span><span id="execution-location">本地</span></summary><div class="menu-items"><p class="menu-label">工作位置</p><button id="execution-local" type="button" aria-current="true"><span data-icon="monitor"></span><span>本地</span><span class="menu-trailing" data-icon="check"></span></button><button type="button" disabled data-planned title="云端执行环境尚未接入"><span data-icon="cloud"></span><span>云端</span><small class="menu-trailing">即将支持</small></button><button type="button" disabled data-planned title="远程执行环境尚未接入"><span data-icon="globe"></span><span>远程</span><small class="menu-trailing">即将支持</small></button></div></details><div class="composer-choice workflow-choice" title="直接描述你要完成的事；需要批量执行、方案比选或统筹协作时，再选择对应工作方式。"><span data-icon="capabilities"></span><select id="work-mode" aria-label="工作方式"><option value="auto">对话</option><option value="weave">批量执行</option><option value="contest">方案比选</option><option value="fleet">统筹协作</option></select><div id="workflow-picker"></div></div></div>
+        <form id="composer"><label class="sr-only" for="message">任务或插话</label><textarea id="message" rows="2" placeholder="描述你想完成的事…" disabled></textarea><div class="composer-bottom"><div class="composer-options"><details id="starter-menu" class="toolbar-menu"><summary title="添加材料" aria-label="添加材料"><span data-icon="plus"></span></summary><div class="menu-items"></div></details><div class="composer-choice permission-choice"><span data-icon="shield"></span><select id="composer-mode" aria-label="新会话执行模式"><option value="">跟随服务权限</option></select><div id="permission-picker"></div></div></div><div class="composer-model-actions"><div class="composer-choice model-choice"><span class="model-fallback-icon" data-icon="cpu"></span><select id="composer-model" aria-label="新会话模型"><option value="">跟随服务模型</option></select><div id="model-picker"></div></div><div class="actions"><button id="stop" type="button" hidden><span data-icon="stop"></span><span class="sr-only">停止本轮</span></button><button id="send" class="primary" type="submit" disabled aria-label="发送" title="发送"><svg class="ui-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 19V5m-6 6 6-6 6 6"/></svg><span class="sr-only">发送</span></button></div></div></div></form><p id="composer-hint" class="composer-hint" role="status" hidden></p>
+      </section>
+    </main>
+    <aside id="workspace-panes" aria-label="工具与内容工作区" hidden></aside>
+    </div>
+  </div>
+<dialog id="archive-delete-dialog" class="archive-delete-dialog" aria-labelledby="archive-delete-title"><form method="dialog"><h2 id="archive-delete-title">删除对话？</h2><p id="archive-delete-description"></p><p class="note">会话记录将永久删除，无法恢复。项目文件会保留。</p><div class="actions"><button value="cancel" autofocus>取消</button><button value="delete" class="danger">删除</button></div></form></dialog>
+<dialog id="execution-dialog" class="execution-dialog" aria-labelledby="execution-detail-title"><header><h2 id="execution-detail-title">运行详情</h2><button id="close-execution-details" type="button" class="quiet" aria-label="关闭运行详情">关闭</button></header><div id="execution-detail-body"></div></dialog>
+</body>
+</html>

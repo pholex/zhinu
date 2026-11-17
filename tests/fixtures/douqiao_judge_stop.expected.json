@@ -1,0 +1,58 @@
+{
+  "final": {
+    "cancelled": true,
+    "candidates": [
+      {
+        "answer": "方案：详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详",
+        "answer_truncated": false,
+        "artifact_previews": [],
+        "artifacts": [],
+        "error": "",
+        "id": "CONTEST:1",
+        "index": 1,
+        "model": "main-model",
+        "run_id": "CANDIDATE_RUN_1",
+        "started": true,
+        "status": "completed",
+        "workspace": "WORKSPACE",
+        "worktree": null
+      },
+      {
+        "answer": "方案：详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详",
+        "answer_truncated": false,
+        "artifact_previews": [],
+        "artifacts": [],
+        "error": "",
+        "id": "CONTEST:2",
+        "index": 2,
+        "model": "main-model",
+        "run_id": "CANDIDATE_RUN_2",
+        "started": true,
+        "status": "completed",
+        "workspace": "WORKSPACE",
+        "worktree": null
+      }
+    ],
+    "contest_id": "CONTEST",
+    "criteria": "",
+    "criteria_truncated": false,
+    "final": true,
+    "judge": {
+      "answer": "",
+      "answer_truncated": false,
+      "model": "main-model",
+      "reason": "比赛已中止，未产生有效推荐",
+      "recommendation_id": "",
+      "run_id": "JUDGE_RUN",
+      "status": "aborted"
+    },
+    "kind": "douqiao.updated",
+    "phase": "settled",
+    "revision": "REVISION",
+    "spec": "thinker",
+    "task": "核查交付",
+    "task_truncated": false
+  },
+  "model_requests": 3,
+  "report": "[斗巧 report · 被打断，评审中止，以下是打断时的进度] spec=thinker · 2 席完赛\n\n比赛被打断，判官评审已中止，未产生有效裁决——已交卷席位的成果与各席存档如下，可用各自的 resume_from 续跑。\n\n--- #1 完赛 · model=main-model\n\nresume_from: CANDIDATE_RUN_1\n\n方案：详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详\n\n--- #2 完赛 · model=main-model\n\nresume_from: CANDIDATE_RUN_2\n\n方案：详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详详"
+}

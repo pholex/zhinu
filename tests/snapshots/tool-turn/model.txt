@@ -1,0 +1,8 @@
+# 工具一轮：参数分片流式下发（锁拼接），随后收尾正文
+tool_call_part: {"index": 0, "id": "c1", "name": "bash"}
+tool_call_part: {"index": 0, "arguments": "{\"command\": \"ec"}
+tool_call_part: {"index": 0, "arguments": "ho snapshot-ok\"}"}
+usage: {"prompt_tokens": 150, "completion_tokens": 20}
+---
+text: "命令输出 snapshot-ok，完成。"
+usage: {"prompt_tokens": 190, "completion_tokens": 12}

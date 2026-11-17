@@ -1,0 +1,4065 @@
+"""小羽的工具集：read_file / write_file / bash。
+
+设计要点：
+- 工具是纯函数式的"执行 + 返回文本"，成功失败都返回字符串交给模型判断，
+  只有真正的内部异常才向上抛。
+- 路径一律相对 workspace 解析；逃出 workspace 的路径强制需要人工确认。
+- 所有输出统一截断，避免一次 grep 把上下文打爆。
+"""
+
+from __future__ import annotations
+
+import atexit
+import collections
+import contextlib
+import fnmatch
+import codecs
+import functools
+import hashlib
+import json
+import locale
+import math
+import os
+import re
+import signal
+import unicodedata
+import urllib.parse
+import urllib.request
+import subprocess
+import sys
+import threading
+import time
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, Callable, Collection
+
+from . import askpass, browser, command_check, fsguard, mcp, media, patches, sandbox, tempdirs
+from .background import (
+    MONITOR_DEFAULT_TIMEOUT,
+    OUTPUT_READ_BYTES,
+    TERM_GRACE_SECONDS as _TERM_GRACE_SECONDS,
+    TaskManager,
+    kill_tree as _kill_tree,
+    mark_group_leader as _mark_group_leader,
+)
+from .config import Config
+from .errors import Interrupted, attach_partial
+from .invisible import strip_invisible
+from .rewind import RewindStore
+from .artifacts import ArtifactCollector
+
+
+#  硬性拦截：不可撤销的系统级破坏，
+#  连 --yolo / auto_approve 都不放行——审批是"用户想不想"，这里是"绝不"。
+#  只收录误伤概率极低的模式；宁可漏（还有人工审批兜底），不可错杀日常命令。
+#
+#  两种规则，都保证对命令长度线性：
+#  - 整条命令上的单个正则（_HARDLINE_WHOLE）：模式里没有跨词的通配，随便扫。
+#  - 段内链（_HARDLINE_CHAINS）："先有 rm、后面有 -r、段尾是根目录"这类带
+#    "中间随便隔什么"的规则。写成一个正则就得用两三个 [^;|&]* 通配，每个起点
+#    都扫到段尾，几 KB 的重复词就能跑上秒级（持 GIL、Ctrl-C 打不断，serve 下
+#    拖住所有会话）。这里拆成逐步向后找：每一步取第一处命中、下一步从它后面
+#    接着找——"存在一组先后出现的位置"与"每步取最早的那个"等价，每步只扫一遍。
+_HARDLINE_WHOLE: tuple[tuple[re.Pattern[str], str], ...] = tuple(
+    (re.compile(pattern), reason)
+    for pattern, reason in [
+        (r":\(\)\s*\{\s*:\s*\|\s*:\s*&\s*\}\s*;\s*:", "fork bomb"),
+        (r"\bmkfs(\.\w+)?\b", "格式化文件系统（mkfs）"),
+        (r">\s*/dev/(sd[a-z]|disk\d|nvme\d)", "重定向覆写块设备"),
+        (r"\bdiskutil\s+(erase|zero)", "diskutil 抹盘"),
+        (r"(?i)\bformat\s+[a-z]:", "Windows format 格式化分区"),
+    ]
+)
+
+_HARDLINE_CHAINS: tuple[tuple[tuple[re.Pattern[str], ...], str], ...] = tuple(
+    (tuple(re.compile(step) for step in steps), reason)
+    for steps, reason in [
+        #  rm 递归删根/家目录（目标必须是裸 / ~ $HOME /*，/tmp/foo 这类不命中）
+        (
+            (
+                r"\brm(?=\s)",
+                r"\s-\w*r",
+                r"\s(?:/|/\*|~|~/|\$HOME/?|\"\$HOME\"/?)\s*\Z",
+            ),
+            "rm 递归删除根目录或家目录",
+        ),
+        ((r"\bdd\b", r"\bof=/dev/"), "dd 直写块设备"),
+        (
+            (r"(?i)\b(?:rd|rmdir)\s+/s\b", r"(?i)\s[a-z]:\\?\s*\Z"),
+            "Windows 递归删除盘根",
+        ),
+        (
+            (r"(?i)Remove-Item\b", r"(?i)-Recurse", r"(?i)\s[a-z]:\\\s*\Z"),
+            "PowerShell 递归删除盘根",
+        ),
+    ]
+)
+
+#  段的边界：命令分隔符与换行（多行脚本的每一行各是一条命令）
+_HARDLINE_SEGMENT_SPLIT = re.compile(r"[;|&\n]")
+
+
+UNTRUSTED_TAG = "untrusted_content"
+#  在 NFKC 折叠 + 小写之后匹配：全角 ＜ｕｎｔｒｕｓｔｅｄ… 这类形近字符伪造的
+#  开闭标记同样认得出来
+_UNTRUSTED_MARKER = re.compile(rf"<\s*/?\s*{UNTRUSTED_TAG}")
+SANITIZED_MARKER = "[[标记已消毒]]"
+
+
+def neutralize_untrusted_markers(text: str) -> str:
+    """把外部内容里伪造的 <untrusted_content> 开闭标记替换掉。
+
+    不处理的话，网页/MCP 结果里写一行 </untrusted_content> 就能"提前闭合"包裹，
+    让后面的文字看起来像包裹之外的可信内容。逐字符折叠并记下原位置，命中后
+    在原文上替换——折叠会改变长度，不能直接在折叠串上切。
+    """
+    folded: list[str] = []
+    origin: list[int] = []
+    for index, char in enumerate(text):
+        piece = unicodedata.normalize("NFKC", char).lower()
+        folded.append(piece)
+        origin.extend([index] * len(piece))
+    flat = "".join(folded)
+    spans = [
+        (origin[match.start()], origin[match.end() - 1] + 1)
+        for match in _UNTRUSTED_MARKER.finditer(flat)
+    ]
+    if not spans:
+        return text
+    parts: list[str] = []
+    cursor = 0
+    for start, end in spans:
+        if start < cursor:
+            continue
+        parts.append(text[cursor:start])
+        parts.append(SANITIZED_MARKER)
+        cursor = end
+    parts.append(text[cursor:])
+    return "".join(parts)
+
+
+def wrap_untrusted(source: str, text: str) -> str:
+    """外部来源的工具结果 → 带来源的不可信包裹（系统提示里约定了它的含义）。"""
+    label = re.sub(r"[^\w.:/@-]", "_", source)[:120] or "external"
+    return (
+        f'<{UNTRUSTED_TAG} source="{label}">\n'
+        f"{neutralize_untrusted_markers(text)}\n"
+        f"</{UNTRUSTED_TAG}>"
+    )
+
+
+#  模型写工具名时常见的"命名空间"前缀：有的模型把工具当成 functions 命名空间
+#  下的成员来调（训练语料里的 schema 形态），有的照 tools 数组的键名写
+_TOOL_NAME_PREFIXES = ("functions.", "functions:", "tools.", "tools:")
+#  MCP 全限定名的三种畸变写法里 server 与 tool 之间的分隔
+_MCP_NAME_SEPARATORS = ("__", ".", ":")
+
+
+def canonical_tool_name(name: str, known: Collection[str]) -> str | None:
+    """把模型写歪的工具名归一到实际广告的名字；归不回去返回 None。
+
+    只做**精确**归一，不做模糊匹配（编辑距离那种"猜你想调 bash"会把 deny 规则
+    点名的工具猜成没点名的）。认两类畸变：
+    - 命名空间前缀：`functions.bash` / `tools.read_file` → 去掉前缀后在广告名单里；
+    - MCP 名字拼法：`server.tool` / `server__tool` / `server:tool`（含带 `mcp__`
+      前缀的）→ 按确定性命名算出 `mcp__<server>__<tool>`，恰好在名单里才算。
+      server 名自己可以含分隔符，每个切分位置都试；多个切法都命中（不同的
+      真实工具）就是歧义，不猜。
+    """
+    name = name.strip()
+    if not name:
+        return None
+    if name in known:
+        return name
+    bare = name
+    for prefix in _TOOL_NAME_PREFIXES:
+        if bare.startswith(prefix) and len(bare) > len(prefix):
+            bare = bare[len(prefix):]
+            break
+    if bare in known:
+        return bare
+    body = bare[len("mcp__"):] if bare.startswith("mcp__") else bare
+    matches: set[str] = set()
+    for separator in _MCP_NAME_SEPARATORS:
+        start = 0
+        while (at := body.find(separator, start)) > 0:
+            server, tool = body[:at], body[at + len(separator):]
+            start = at + 1
+            if not tool:
+                continue
+            candidate = mcp.public_tool_name(server, tool)
+            if candidate in known:
+                matches.add(candidate)
+    return matches.pop() if len(matches) == 1 else None
+
+
+def hardline_violation(command: str) -> str | None:
+    """命中硬性拦截规则时返回原因，否则 None。"""
+    for pattern, reason in _HARDLINE_WHOLE:
+        if pattern.search(command):
+            return reason
+    #  两种读法都查：原样按行切；续行（反斜杠 + 换行）接回一行再切。只查后一种
+    #  会把 PowerShell 里行尾的 `C:\` 当成续行吃掉——那里反斜杠不是续行符
+    views = [command]
+    if "\\\n" in command:
+        views.append(command.replace("\\\n", " "))
+    for view in views:
+        for segment in _HARDLINE_SEGMENT_SPLIT.split(view):
+            for steps, reason in _HARDLINE_CHAINS:
+                position = 0
+                for step in steps:
+                    match = step.search(segment, position)
+                    if match is None:
+                        break
+                    position = match.end()
+                else:
+                    return reason
+    return None
+
+
+def _decode_output(data: bytes | str | None) -> str:
+    """子进程输出解码：UTF-8 优先，失败按本地代码页（GBK 等）兜底。
+
+    中文 Windows 的 PowerShell 5.1 / 老 native 程序会按 OEM 代码页输出——
+    硬解 UTF-8 会把「无法将 xx 识别为 cmdlet」这类关键报错变成一串 �，
+    模型只能盲猜（真实会话里因此多绕了十几轮）。
+    """
+    if data is None:
+        return ""
+    if isinstance(data, str):
+        return data
+    try:
+        return data.decode("utf-8")
+    except UnicodeDecodeError:
+        pass
+    preferred = locale.getpreferredencoding(False) or ""
+    for encoding in (preferred, "gbk"):
+        if not encoding or encoding.replace("-", "").lower() == "utf8":
+            continue
+        try:
+            return data.decode(encoding)
+        except (UnicodeDecodeError, LookupError):
+            continue
+    return data.decode("utf-8", errors="replace")
+
+
+#  bash 输出在内存里的上限（stdout / stderr 各自）：开头、结尾各留一半，中间丢弃
+#  并计数。远大于 max_tool_output——超出那部分还要落 spill 供 recall 取回；这里只
+#  防几 GB 的输出（cat 大日志、失控的循环打印）把进程内存吃爆。留结尾是因为测试
+#  失败汇总、构建报错都在最后（与 _truncate 同理）。
+_PIPE_KEEP_BYTES = 8 * 1024 * 1024
+_PIPE_READ_CHUNK = 64 * 1024
+
+
+class _BoundedPipe:
+    """后台线程读一路管道，内存里只留头尾（替代 communicate 的无界读取）。"""
+
+    def __init__(self, stream: Any, keep: int | None = None) -> None:
+        #  调用时再读模块常量（默认参数在定义时就绑死，改常量不生效）
+        self._half = max(1, (_PIPE_KEEP_BYTES if keep is None else keep) // 2)
+        self._head = bytearray()
+        self._tail: collections.deque[bytes] = collections.deque()
+        self._tail_size = 0
+        self.dropped = 0
+        self.thread = threading.Thread(target=self._pump, args=(stream,), daemon=True)
+        self.thread.start()
+
+    def _pump(self, stream: Any) -> None:
+        read = getattr(stream, "read1", None) or stream.read
+        try:
+            while chunk := read(_PIPE_READ_CHUNK):
+                room = self._half - len(self._head)
+                if room > 0:
+                    self._head += chunk[:room]
+                    chunk = chunk[room:]
+                if not chunk:
+                    continue
+                self._tail.append(chunk)
+                self._tail_size += len(chunk)
+                #  整块淘汰最旧的尾部，直到再丢一块就不足一半为止
+                while self._tail and self._tail_size - len(self._tail[0]) >= self._half:
+                    old = self._tail.popleft()
+                    self._tail_size -= len(old)
+                    self.dropped += len(old)
+        except (OSError, ValueError):
+            pass  # 进程树被杀、管道被关：已读到的照常交付
+        finally:
+            with contextlib.suppress(OSError, ValueError):
+                stream.close()
+
+    def value(self) -> bytes:
+        tail = b"".join(self._tail)
+        if not self.dropped:
+            return bytes(self._head) + tail
+        head = _trim_partial_utf8(bytes(self._head))
+        #  尾部开头可能落在多字节字符中间：跳过至多 3 个续字节
+        skip = 0
+        while skip < min(3, len(tail)) and tail[skip] & 0xC0 == 0x80:
+            skip += 1
+        marker = f"\n…[输出过大：中间 {self.dropped} 字节未保留（内存上限），以下为结尾]…\n"
+        return head + marker.encode("utf-8") + tail[skip:]
+
+
+def _trim_partial_utf8(data: bytes) -> bytes:
+    """去掉结尾被截断的半个 UTF-8 字符（否则整段严格解码失败、退到 GBK 解成乱码）。"""
+    for back in range(1, min(4, len(data)) + 1):
+        byte = data[-back]
+        if byte & 0xC0 == 0x80:
+            continue
+        if byte >= 0xC0:
+            need = 2 if byte < 0xE0 else 3 if byte < 0xF0 else 4
+            return data[:-back] if back < need else data
+        return data
+    return data
+
+
+#  等前台命令时多久看一次"有没有人叫停"
+_STOP_POLL_SECONDS = 0.2
+
+
+#  杀掉之后等它退出的上限（秒）。kill_tree 返回时整组已收到 SIGKILL（或已自行
+#  退干净），进程是毫秒级退出的，这个数只防意外：等不到就放手，打断不能因此卡住
+_REAP_SECONDS = 2.0
+#  前台 bash 的 timeout 参数上限（秒）。模型会自己把 timeout 往上调去 sleep 等
+#  后台事件（实测逐级调到 330s，整轮卡死）；更久的活用 run_in_background /
+#  monitor，等事件靠通知。用户配置的 bash_timeout 比它还大时以配置为准。
+BASH_TIMEOUT_CAP = 600
+
+
+def _reap(proc: subprocess.Popen, timeout: float = _REAP_SECONDS) -> None:
+    """把刚杀掉的进程收掉（有界）。
+
+    杀只是发信号；不 wait，它就以僵尸的形态挂着、占着进程表的一格，直到本进程
+    退出——常驻进程（serve、嵌入宿主）里每打断一次就攒一个。Popen 对象被回收时
+    也会因此报"subprocess still running"。
+    """
+    with contextlib.suppress(Exception):
+        proc.wait(timeout=timeout)
+
+
+def _wait_bounded(
+    proc: subprocess.Popen,
+    pipes: list[_BoundedPipe],
+    deadline: float,
+    stop_requested: Callable[[], bool] | None = None,
+    service: Callable[[], float] | None = None,
+) -> bool:
+    """等进程退出、两路管道读完，不超过 deadline；超时返回 False。
+
+    先等进程再等管道：进程退出了而孙进程还握着管道（`sleep 30 &`）时，管道的
+    EOF 迟迟不来——这同样算超时，交给调用方整树杀掉，与 communicate(timeout)
+    的语义一致。
+
+    给了 stop_requested 就切成小片等，每片问一次；有人叫停就抛 Interrupted
+    （调用方的收尾分支负责整树杀）。宿主的 interrupt() 不是信号，不会自己
+    打断一个阻塞着的 wait——不问的话，一条跑半小时的命令要跑完才停得下来。
+
+    给了 service 也切片：每片调一次，让等待期间要本进程出面的事（sudo 的
+    askpass helper 连上来要密码）有机会被处理。它返回花掉的秒数，原样加回
+    deadline——那段时间是人在敲密码，不该算进命令的超时。
+    """
+
+    def step(wait_once: Callable[[float], bool]) -> bool:
+        """反复等到成功或超时。wait_once(秒) 返回"等到了吗"。"""
+        nonlocal deadline
+        while True:
+            remaining = deadline - time.monotonic()
+            if stop_requested is None and service is None:
+                return wait_once(max(0.0, remaining))
+            if wait_once(max(0.0, min(_STOP_POLL_SECONDS, remaining))):
+                return True
+            if stop_requested is not None and stop_requested():
+                raise Interrupted("宿主请求打断")
+            if service is not None and (spent := service()) > 0:
+                deadline += spent
+                continue
+            if remaining <= 0:
+                return False
+
+    def process_exited(seconds: float) -> bool:
+        try:
+            proc.wait(timeout=seconds)
+        except subprocess.TimeoutExpired:
+            return False
+        return True
+
+    if not step(process_exited):
+        return False
+    for pipe in pipes:
+
+        def pipe_drained(seconds: float, pipe: _BoundedPipe = pipe) -> bool:
+            pipe.thread.join(seconds)
+            return not pipe.thread.is_alive()
+
+        if not step(pipe_drained):
+            return False
+    return True
+
+
+#  在跑的前台 bash 进程（任意线程）。_bash 进出登记，atexit 兜底整树收割：
+#  子 agent 线程里正跑着命令、主线程收到 SIGTERM 退出时，那条命令的等待不在
+#  主线程栈上，_bash 自己的 except 管不到它。正常完成路径只多一次加锁的集合增删。
+_FOREGROUND_PROCS: set[subprocess.Popen] = set()
+_FOREGROUND_LOCK = threading.Lock()
+
+
+def _register_foreground(proc: subprocess.Popen) -> None:
+    with _FOREGROUND_LOCK:
+        _FOREGROUND_PROCS.add(proc)
+
+
+def _unregister_foreground(proc: subprocess.Popen) -> None:
+    with _FOREGROUND_LOCK:
+        _FOREGROUND_PROCS.discard(proc)
+
+
+def _reap_foreground() -> None:
+    """进程退出兜底：收割所有仍在登记的前台命令树（kill_tree 对已退出进程无害）。"""
+    with _FOREGROUND_LOCK:
+        procs = list(_FOREGROUND_PROCS)
+    for proc in procs:
+        with contextlib.suppress(Exception):
+            _kill_tree(proc)
+
+
+#  导入时注册：排在 tempdirs 的目录清理之前执行（atexit 后注册先跑）
+atexit.register(_reap_foreground)
+
+
+def _partial_chunks(stdout: bytes | str | None, stderr: bytes | str | None) -> str:
+    """把 stdout/stderr 拼成给模型看的分段文本，空段不占行。"""
+    chunks = []
+    if out := _decode_output(stdout).strip():
+        chunks.append(f"stdout:\n{out}")
+    if err := _decode_output(stderr).strip():
+        chunks.append(f"stderr:\n{err}")
+    return "\n".join(chunks)
+
+
+class _Undecodable(Exception):
+    """文件在全部候选编码下都解不出无损文本。"""
+
+
+def _edit_encodings() -> list[str]:
+    """编辑链路解码原文的候选编码：UTF-8 优先，其次本地代码页与 GBK。
+
+    GBK 单列一项：中文 Windows 的存量源码/配置就是这个形态，而开发机的本地
+    代码页多半是 UTF-8，只靠 locale 覆盖不到。去重按 codecs 规范名（cp936 即 gbk）。
+    """
+    names: list[str] = []
+    for candidate in ("utf-8", locale.getpreferredencoding(False) or "", "gbk"):
+        try:
+            canonical = codecs.lookup(candidate).name
+        except LookupError:
+            continue
+        if canonical not in names:
+            names.append(canonical)
+    return names
+
+
+#  read_file / str_replace 整读文件的大小上限。两者都是整份读进内存再解码、
+#  分段读（offset/limit）也不例外——几百 MB 的日志能把进程吃爆，内容也塞不进上下文。
+_READ_MAX_BYTES = 50 * 1024 * 1024
+
+
+def _unreadable_file_error(target: Path, shown: str, size_cap: bool = True) -> str | None:
+    """整读前的闸：非普通文件、或超过大小上限，返回拒绝说明；可读返回 None。
+
+    类型判定在 fsguard（rewind 快照、贴图入口共用同一个闸）：读 FIFO 会永久
+    阻塞、读设备读不到头，stat 跟随符号链接，链接指向 FIFO 同样拦下。
+    size_cap=False 只查类型（覆盖写不整读原文）。
+    """
+    def refuse(kind: str) -> str:
+        return (
+            f"ERROR: {shown} 是{kind}，不是普通文件，已拒绝读取——读它可能永久阻塞"
+            "等待数据，或读出没有尽头的内容。确需查看请用 bash 并加超时与字节上限"
+            f"（如 timeout 5 head -c 4096 {shown}）。"
+        )
+
+    #  Windows 的设备藏在名字里（NUL.txt、CON），stat 报的是普通文件：先按名字判
+    if kind := fsguard.reserved_device_kind(target):
+        return refuse(kind)
+    try:
+        info = os.stat(target)
+    except OSError as exc:
+        return f"ERROR: 读取失败 {shown}: {exc}"
+    if kind := fsguard.non_regular_kind(info.st_mode):
+        return refuse(kind)
+    if size_cap and info.st_size > _READ_MAX_BYTES:
+        return (
+            f"ERROR: {shown} 有 {info.st_size / 1048576:.1f} MiB，超过整读上限 "
+            f"{_READ_MAX_BYTES / 1048576:.0f} MiB，已拒绝读取。请先用 grep 定位关键内容，"
+            "再用 bash 的 head / tail / sed -n '起,止p' 取需要的片段。"
+        )
+    return None
+
+
+_SNIFF_BYTES = 8192
+
+#  read_file 单行显示上限（字符）。总量由 _bound_output 管，但 minified JS、单行
+#  JSON、一行几万字符的日志能一行就吃掉整段预算：截断显示、说明还剩多少，要看
+#  整行就单读那一行（limit=1 不截，整行再超长由 _bound_output 落盘可召回）。
+_READ_LINE_CAP = 2000
+
+
+def _clip_long_lines(
+    lines: list[str], first_number: int, cap: int = _READ_LINE_CAP
+) -> tuple[list[str], list[int]]:
+    """把超过 cap 的行截成前 cap 字符 + 说明；返回 (新行, 被截行的行号)。"""
+    clipped: list[int] = []
+    shown: list[str] = []
+    for index, line in enumerate(lines):
+        if len(line) > cap:
+            number = first_number + index
+            clipped.append(number)
+            line = line[:cap] + (
+                f"…（本行还有 {len(line) - cap} 字符未显示；"
+                f"要看整行用 offset={number} limit=1）"
+            )
+        shown.append(line)
+    return shown, clipped
+
+
+def _ranges_without(start: int, end: int, holes: list[int]) -> tuple[tuple[int, int], ...]:
+    """[start, end] 去掉 holes 里的行号后剩下的闭区间：截断显示的行不算读过。"""
+    ranges: list[tuple[int, int]] = []
+    cursor = start
+    for hole in holes:
+        if hole > cursor:
+            ranges.append((cursor, hole - 1))
+        cursor = hole + 1
+    if cursor <= end:
+        ranges.append((cursor, end))
+    return tuple(ranges)
+
+
+def _binary_file_error(target: Path, shown: str) -> str | None:
+    """文本工具读到二进制文件：拒读并指路；是文本返回 None。
+
+    判据是开头一段里有没有 NUL 字节——文本文件里不会有，二进制几乎必有。有损解码
+    硬读的话，回给模型的是几万字符的乱码（还夹着控制字符），占掉上下文却什么
+    信息都没有。
+    """
+    try:
+        with open(target, "rb") as handle:
+            head = handle.read(_SNIFF_BYTES)
+        size = target.stat().st_size
+    except OSError:
+        return None
+    if head.startswith((b"\xff\xfe", b"\xfe\xff")):
+        return (
+            f"ERROR: {shown} 是 UTF-16 编码的文本，read_file 读不了。先用 bash 转成 UTF-8 再读："
+            f"iconv -f UTF-16 -t UTF-8 {shown}"
+        )
+    if b"\0" not in head:
+        return None
+    return (
+        f"ERROR: {shown} 是二进制文件（{size} 字节），read_file 只读文本。"
+        f"想知道它是什么：bash 跑 file {shown}；要看字节：xxd {shown} | head；"
+        "PDF/DOCX 用 read_document，XLSX 用 read_spreadsheet；压缩包用 unzip -l 或 tar -tf，数据库用对应的命令行客户端。"
+    )
+
+
+def _read_for_edit(target: Path) -> tuple[str, str, bytes]:
+    """严格解码读文件，返回 (文本, 编码, 原始字节)；解不开抛 _Undecodable。
+
+    有损解码（errors="replace"）后再写回，会把无法识别的字节永久替换成 U+FFFD
+    ——GBK 文件改一处就整篇中文变成 �，而且 /rewind 快照里存的也是坏文本，
+    救不回来。所以编辑链路只接受能无损解码的文件，并按原编码写回。
+    换行按 read_text 的通用换行规则归一（\\r\\n、\\r → \\n），与原先的读法一致，
+    old_str 的匹配语义不变。原始字节留给 /rewind 做逐字节恢复。
+    """
+    raw = target.read_bytes()
+    for encoding in _edit_encodings():
+        try:
+            decoded = raw.decode(encoding)
+        except UnicodeDecodeError:
+            continue
+        #  文件开头的 BOM 不是正文：留在文本里的话，模型照抄首行做多行替换时，
+        #  匹配落在第 1 个字符之后，会被"old_str 从行中间开始"的护栏误拒
+        decoded = decoded.removeprefix("\ufeff")
+        return decoded.replace("\r\n", "\n").replace("\r", "\n"), encoding, raw
+    raise _Undecodable(str(target))
+
+
+def _encoding_of(raw: bytes) -> str:
+    """这段字节能无损解码的第一种候选编码；都解不开返回空串。"""
+    for encoding in _edit_encodings():
+        try:
+            raw.decode(encoding)
+        except UnicodeDecodeError:
+            continue
+        return encoding
+    return ""
+
+
+def _newline_of(raw: bytes) -> str:
+    """文件用的是哪种换行：按出现次数取多数，没有换行或数不出多数按 LF。"""
+    crlf = raw.count(b"\r\n")
+    lf = raw.count(b"\n") - crlf
+    cr = raw.count(b"\r") - crlf
+    if crlf > lf and crlf >= cr:
+        return "\r\n"
+    if cr > lf and cr > crlf:
+        return "\r"
+    return "\n"
+
+
+def _write_like_original(target: Path, text: str, encoding: str, raw: bytes | None) -> bytes:
+    """按原文件的样子写回：同样的编码、同样的换行、原来带 BOM 的还带。
+
+    读的时候换行统一成了 LF（匹配要用），写回时不还原的话，改一处就等于把整份
+    文件的换行全换掉——版本控制里显示成整篇都改了，团队里别人的编辑器和换行
+    检查跟着报。按字节写，不经文本模式的平台换行转换。
+    """
+    original = raw or b""
+    newline = _newline_of(original)
+    body = text.replace("\r\n", "\n").replace("\r", "\n")
+    if newline != "\n":
+        body = body.replace("\n", newline)
+    data = body.encode(encoding)
+    if original.startswith(codecs.BOM_UTF8) and codecs.lookup(encoding).name == "utf-8":
+        data = codecs.BOM_UTF8 + data
+    fsguard.write_atomic(target, data, check_writable=True)
+    return data
+
+
+def _mixed_newlines(raw: bytes) -> bool:
+    """文件里是不是不止一种换行（\\r\\n、单独的 \\n、单独的 \\r 三种里出现了两种以上）。"""
+    crlf = raw.count(b"\r\n")
+    kinds = (crlf, raw.count(b"\n") - crlf, raw.count(b"\r") - crlf)
+    return sum(1 for count in kinds if count) > 1
+
+
+def _write_edit(target: Path, before: str, updated: str, encoding: str, raw: bytes | None) -> bytes:
+    """局部替换的写回：换行不纯的文件只动被替换的那一段，其余字节原样留着。
+
+    匹配是在换行归一成 LF 的文本上做的，写回时整体换成"多数派"换行——对换行
+    单一的文件这是还原，对换行不纯的文件却是改写：少数派的行被统一掉，LF 文件
+    里孤立的 \\r（CSV 字段内、测试夹具）变成 \\n，那是内容变化，而模型根本没碰
+    那几行。所以不纯时把改动定位回原文：两头没变的部分按原字节保留，只有中间
+    新写的那段用多数派换行。
+    """
+    if raw is None or not _mixed_newlines(raw):
+        return _write_like_original(target, updated, encoding, raw)
+    try:
+        decoded = raw.decode(encoding).removeprefix("\ufeff")
+    except UnicodeDecodeError:
+        return _write_like_original(target, updated, encoding, raw)
+    #  归一后第 i 个字符在原文里从哪儿开始（\\r\\n 占两个字符）
+    starts: list[int] = []
+    index = 0
+    while index < len(decoded):
+        starts.append(index)
+        index += 2 if decoded.startswith("\r\n", index) else 1
+    starts.append(len(decoded))
+    if len(starts) - 1 != len(before):
+        #  对不上说明手里的 before 不是这份字节归一出来的：不猜，走整体写回
+        return _write_like_original(target, updated, encoding, raw)
+    limit = min(len(before), len(updated))
+    head = 0
+    while head < limit and before[head] == updated[head]:
+        head += 1
+    tail = 0
+    while tail < limit - head and before[-1 - tail] == updated[-1 - tail]:
+        tail += 1
+    middle = updated[head : len(updated) - tail]
+    newline = _newline_of(raw)
+    if newline != "\n":
+        middle = middle.replace("\n", newline)
+    data = (decoded[: starts[head]] + middle + decoded[starts[len(before) - tail] :]).encode(encoding)
+    if raw.startswith(codecs.BOM_UTF8) and codecs.lookup(encoding).name == "utf-8":
+        data = codecs.BOM_UTF8 + data
+    fsguard.write_atomic(target, data, check_writable=True)
+    return data
+
+
+def _undecodable_error(path: str) -> str:
+    return (
+        f"ERROR: {path} 按 UTF-8、GBK 都无法无损解码（可能是二进制或其它编码），"
+        "已拒绝编辑——有损解码后写回会把无法识别的字节永久替换成 �。"
+        "如确需修改，请先向用户确认文件编码，再用 bash 按正确编码处理。"
+    )
+
+
+def _unencodable_error(path: str, text: str, encoding: str) -> str | None:
+    """新内容能否用原文件的编码表示；不能则返回拒绝写入的说明。"""
+    try:
+        text.encode(encoding)
+    except UnicodeEncodeError as exc:
+        return (
+            f"ERROR: {path} 是 {encoding} 编码的文件，新内容里的 "
+            f"{exc.object[exc.start:exc.end]!r} 无法用该编码表示，已拒绝写入"
+            "（强行转码会改变整个文件的编码）。换成该编码能表示的写法再试，"
+            "或先征得用户同意再转换文件编码。"
+        )
+    return None
+
+
+@functools.lru_cache(maxsize=1)
+def _pwsh_path() -> str | None:
+    """PowerShell 7 (pwsh) 的路径，没装返回 None。
+
+    pwsh 相对预装的 5.1：默认 UTF-8 输出、支持 && / ||、native 命令的 stderr
+    原样透传而不是包装成红色 ErrorRecord（5.1 的包装会把 CLI 输出的 JSON 拆碎）。
+    有则优先。
+    """
+    return sandbox.host_which("pwsh")
+
+
+#  PS 5.1 对重定向的管道按系统 OEM 代码页（中文机是 GBK）编码输出，
+#  先把两个输出编码都拨到 UTF-8，Python 侧才能稳定解码中文。
+_PS51_UTF8_PREFIX = "$OutputEncoding=[Console]::OutputEncoding=[System.Text.Encoding]::UTF8; "
+
+
+def _shell_argv(command: str) -> list[str]:
+    """按平台选 shell。Windows 没有 /bin/bash，硬编码会让所有命令 WinError 2。"""
+    if os.name == "nt":
+        if pwsh := _pwsh_path():
+            return [pwsh, "-NoProfile", "-Command", command]
+        #  PowerShell 5.1 随 Windows 预装，语义比 cmd 稳定；-NoProfile 避免用户配置拖慢/干扰
+        return ["powershell", "-NoProfile", "-Command", _PS51_UTF8_PREFIX + command]
+    return ["/bin/bash", "-lc", command]
+
+
+#  整树终止挪到了 background.py（后台任务的 watcher 也要用；安全函数只此一份），
+#  本模块经顶部 import 以 _kill_tree 旧名继续使用。
+
+
+_URL_PATTERN = re.compile(r"https?://\S+")
+#  工具输出里点到召回 id 的几种写法（见 _bound_output / _recall 的文案）
+_RECALL_ID_MENTION = re.compile(r"召回 id[:：]?\s*(\d+)")
+_AUTH_KEYWORDS = (
+    "浏览器",
+    "扫码",
+    "二维码",
+    "browser",
+    "authoriz",
+    "authenticat",
+    "device",
+    "oauth",
+    "verify",
+    "login",
+    "扫描",
+    "授权",
+)
+
+
+def _interactive_auth_hint(output: str) -> str:
+    """超时输出里带浏览器授权链接时的附加提示。
+
+    OAuth device flow / 登录扫码类命令会阻塞到用户完成授权——套在 timeout 里
+    跑必然超时（真实会话里模型对同一条 auth login 连撞三次超时才换姿势）。
+    检测到这种形态就把正确姿势直接告诉模型。
+    """
+    if not _URL_PATTERN.search(output):
+        return ""
+    low = output.lower()
+    if not any(keyword in low for keyword in _AUTH_KEYWORDS):
+        return ""
+    return (
+        "\n[提示] 输出中有需要用户在浏览器完成的授权链接。这类交互式认证命令"
+        "阻塞等待只会超时：把链接原样展示给用户、请其完成授权，等用户答复后"
+        "再用查询状态类命令确认，不要重复干等或反复重跑。"
+    )
+
+
+#  信号终止的释义，按信号**名**索引：编号随平台不同（SIGBUS 在 Linux 是 7、
+#  macOS 是 10），运行时经 signal.Signals 换算。只收常见的几种——128+N 形态
+#  程序自己也能 exit 出来，表外的编号宁可不释义也不乱贴标签。
+#  SIGINT 不在表里：那是用户中断，另有处理。
+_SIGNAL_EXIT_NOTES = {
+    "SIGKILL": "常见原因：内存不足被系统杀掉，或超时被强杀",
+    "SIGTERM": "收到终止请求（kill、外部超时或关停）",
+    "SIGSEGV": "段错误，程序崩溃",
+    "SIGABRT": "程序主动中止（断言失败或致命运行时错误）",
+    "SIGBUS": "总线错误（非法内存访问，如映射的文件被截断）",
+    "SIGPIPE": "向已关闭的管道写入（如下游 head 已提前退出）",
+    "SIGHUP": "所在终端或会话断开",
+    "SIGFPE": "算术错误（如整数除零）",
+    "SIGILL": "非法指令（二进制损坏或 CPU 架构不符）",
+    "SIGQUIT": "收到退出信号",
+    "SIGXCPU": "超出 CPU 时间限制",
+    "SIGXFSZ": "超出文件大小限制",
+}
+
+
+def _signal_exit_hint(returncode: int) -> str:
+    """信号类退出码的一行释义；不是信号终止返回空串。
+
+    模型只看到 `exit_status: 137` 或 `-9` 时容易当成命令自身报错去改代码，
+    其实多半是被 OOM 杀了。负数是 Popen 确知"被信号 N 杀"，措辞确定；
+    128+N 是 shell 转述子进程的死因，程序也可能自己 exit 这个值，措辞留余地。
+    Windows 退出码没有这层约定，不释义。
+    """
+    if os.name == "nt":
+        return ""
+    if returncode < 0:
+        signum, definite = -returncode, True
+    elif returncode > 128:
+        signum, definite = returncode - 128, False
+    else:
+        return ""
+    try:
+        name = signal.Signals(signum).name
+    except ValueError:
+        return ""
+    if name == "SIGINT":
+        return ""
+    note = _SIGNAL_EXIT_NOTES.get(name)
+    if definite:
+        detail = f"——{note}" if note else ""
+        return f"\n[提示] 进程被 {name}({signum}) 终止{detail}。"
+    if note is None:
+        return ""
+    return f"\n[提示] 退出码 {returncode} 通常表示进程被 {name}({signum}) 终止——{note}。"
+
+
+@functools.lru_cache(maxsize=1)
+def non_inheritable_env_names() -> frozenset[str]:
+    """模型跑的子进程**永远**拿不到的环境变量名（统一大写比较）。
+
+    集合 = 小羽自己的密钥：网关 key、每个直连 provider 的 key（含别名）、
+    serve 令牌。这些是"小羽调模型用的"，模型跑的命令没有任何正当理由需要
+    它们——而 `env | grep KEY` 是最省事的外泄方式。
+    名单从 providers.PRESETS 推导而不是手抄：新增 provider 自动纳入。
+    例外同样从 PRESETS 推导：声明为 shared_key_envs 的多产品通用名
+    （如 GOOGLE_API_KEY）"没有任何正当理由"不成立——gcloud 一类无关命令
+    正当地需要它，剥了是误伤，故不进名单。
+    """
+    from .config import GATEWAY_KEY_ENVS
+    from .providers import PRESETS
+
+    names = set(GATEWAY_KEY_ENVS) | {"XIAOYU_SERVE_TOKEN"}
+    shared: set[str] = set()
+    for preset in PRESETS.values():
+        names.update(preset.key_envs)
+        shared.update(preset.shared_key_envs)
+    return frozenset(name.upper() for name in names) - {name.upper() for name in shared}
+
+
+def _hardened_env(extra: dict[str, str] | None = None) -> dict[str, str]:
+    """子进程环境：剔除 LD_* / DYLD_*（进程加固）与小羽自己的密钥。
+
+    LD_PRELOAD / DYLD_INSERT_LIBRARIES 能往任何被执行的程序里注入代码——
+    模型跑的命令不该继承这类注入通道。
+
+    密钥剔除在 `extra` 合并**之后**做，且不区分大小写：否则 extra 里一个
+    `deepseek_api_key` 就把刚剔掉的又塞回去。extra 里其它变量（宿主有意
+    递给工具的 GITHUB_TOKEN 之类）是操作者的明确决定，照传。
+    """
+    env = {
+        key: value
+        for key, value in os.environ.items()
+        if not key.startswith(("LD_", "DYLD_"))
+    }
+    if extra:
+        env.update(extra)
+    #  Python 子进程的输出流钉成 UTF-8：管道另一头的 stdout 在 Windows 上默认走
+    #  本地代码页，模型写的脚本一打印 ✓ 或 emoji 就直接 UnicodeEncodeError 崩掉——
+    #  我们这头能解 GBK 输出，却救不了那头自己崩。setdefault：用户环境里点了名的
+    #  照他的；只动流编码，不开 PYTHONUTF8（那个连带改文件与 locale 的默认编码）
+    env.setdefault("PYTHONIOENCODING", "utf-8")
+    secrets = non_inheritable_env_names()
+    return {key: value for key, value in env.items() if key.upper() not in secrets}
+
+
+#  进程级 core dump 关闭只做一次（rlimit 跨 fork/exec 继承，见 _harden_core_limit）。
+_core_limit_hardened = False
+
+
+def _harden_core_limit() -> None:
+    """在**父进程**里把 RLIMIT_CORE 压到 (0, 0)：命令崩溃时不把内存（可能含
+    密钥）dump 到磁盘；本进程（内存里有 provider 密钥）崩溃时同样不落 core。
+
+    绝不能退回 preexec_fn 方案（历史写法）：preexec_fn 强迫 CPython 放弃
+    posix_spawn 改走 fork()，并在 fork 与 exec 之间的子进程里跑 Python 字节码
+    （旧实现里还有一次 import）。xiaoyu 有常驻工作线程（browser 专用线程、
+    七襄/斗巧线程池），fork 瞬间其他线程持有的锁（import 锁、分配器锁）在
+    子进程里永远无人释放——子进程可能在 exec 前死锁，并带着继承的每个 fd
+    一起挂住。tests/test_subprocess_hardening.py 的 AST 哨兵挡回归。
+
+    rlimit 跨 fork/exec 继承，父进程设一次即可覆盖所有后代——包括 playwright
+    自己拉起的浏览器进程，覆盖面比逐 spawn 设置更广。硬上限一并压到 0，
+    后代无法自行抬回。
+    """
+    global _core_limit_hardened
+    if _core_limit_hardened or os.name == "nt":
+        return
+    _core_limit_hardened = True
+    import resource
+
+    with contextlib.suppress(Exception):
+        resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
+
+
+def _subprocess_hardening() -> dict[str, Any]:
+    """POSIX 子进程加固参数：独立会话（core dump 由 _harden_core_limit 进程级处理）。
+
+    - start_new_session：新进程组/会话，防 TIOCSTI 类终端注入，也让超时杀得干净。
+      不带 preexec_fn 时 CPython 可走 posix_spawn（POSIX_SPAWN_SETSID），
+      比 fork 快且无 fork-with-threads 风险。
+    Windows 没有这些语义，返回空。
+    stdin 归属各调用点自定（MCP server 要 PIPE、工具命令要 DEVNULL），不在此统一。
+    """
+    if os.name == "nt":
+        return {}
+    _harden_core_limit()
+    return {"start_new_session": True}
+
+
+def _platform_shell_note() -> str:
+    """拼进 bash 工具描述的平台提示：模型得知道自己在对谁说话。"""
+    if os.name == "nt":
+        if _pwsh_path():
+            return (
+                "本机是 Windows：命令由 PowerShell 7 (pwsh) 执行，"
+                "用 PowerShell 写法（Get-ChildItem、Select-String、Get-Date…），"
+                "不要用 bash/Unix 语法。"
+            )
+        return (
+            "本机是 Windows：命令由 Windows PowerShell 5.1 执行，"
+            "用 PowerShell 写法（Get-ChildItem、Select-String、Get-Date…），"
+            "不要用 bash/Unix 语法。5.1 的已知坑："
+            "不支持 && 和 ||，用 ; 分隔或分成多次调用；"
+            "运行 .ps1 脚本可能被执行策略拦截，改用 powershell -ExecutionPolicy Bypass -File；"
+            "native 程序写 stderr 会被包装成红色错误记录，是否真失败以 exit_status 为准。"
+        )
+    if sys.platform == "darwin":
+        return "注意本机是 macOS：BSD sed/grep 不支持 GNU 语法，替换文本请用 perl。"
+    return "本机是 Linux。"
+
+
+#  需确认的工具在 schema 里注入的"目的"参数名：模型顺手写一句为何调用，
+#  确认框里展示给用户——审批时"这条命令要干嘛"不用人肉猜。
+#  执行前由 agent 剥离，不进 handler。
+PURPOSE_PARAM = "__tool_use_purpose"
+
+
+def _escape_drift_hint(text: str, old_str: str) -> str:
+    """只诊断能用原文佐证的多余转义；不猜 new_str 的意图、不改写审批参数。"""
+    candidates = []
+    if "\\\"" in old_str or "\\'" in old_str:
+        candidates.append(old_str.replace("\\\"", '"').replace("\\'", "'"))
+    runs = re.findall(r"\\+", old_str)
+    if runs and all(len(run) % 2 == 0 for run in runs):
+        candidates.append(re.sub(r"\\+", lambda match: "\\" * (len(match[0]) // 2), old_str))
+    if any(candidate != old_str and candidate in text for candidate in candidates):
+        return (
+            "\n[转义诊断] old_str 疑似多转义了一层：移除多余转义后能在文件中找到。"
+            "请重新 read_file，对照原文重发 old_str/new_str；new_str 的反斜杠可能是"
+            "有意保留的，工具不会自动反转义。"
+        )
+    return ""
+
+
+_INTEGER_TEXT = re.compile(r"[+-]?\d+$")
+_NUMBER_TEXT = re.compile(r"[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?$")
+_BOOLEAN_TEXT = {"true": True, "false": False, "1": True, "0": False}
+_TYPE_NAMES = {"integer": "整数", "number": "数字", "boolean": "布尔值（true / false）"}
+_MAX_COERCE_DEPTH = 8
+
+
+def _coercion_kind(schema: dict[str, Any]) -> Any:
+    kind = schema.get("type")
+    if isinstance(kind, list) and len(kind) == 2 and kind.count("null") == 1:
+        # 可选空值不增加转换歧义；多个非空类型仍不猜。
+        return next(item for item in kind if item != "null")
+    return kind
+
+
+def coerce_to_schema(value: Any, schema: Any, depth: int = 0) -> Any:
+    """按 schema 声明的类型，把模型写成字符串的数字 / 布尔 / 数组 / 对象还原成真类型。
+
+    模型经常把 `300` 写成 `"300"`、把 `false` 写成 `"false"`、把数组整个序列化成
+    一个 JSON 字符串。不还原的后果各不相同：`"false"` 是非空字符串，直接拿去判真假
+    恰好是反的；`"5"` 进了算术才炸，那时进程可能已经起来了。
+
+    只按声明转、只转认得出的：单类型可带 null，多种非空类型不猜，转不动原样留着。
+    """
+    if not isinstance(schema, dict) or depth > _MAX_COERCE_DEPTH:
+        return value
+    kind = _coercion_kind(schema)
+    if not isinstance(kind, str):
+        return value
+    if isinstance(value, str):
+        text = value.strip()
+        if kind == "integer" and _INTEGER_TEXT.match(text):
+            return int(text)
+        if kind == "number" and _NUMBER_TEXT.match(text):
+            return int(text) if _INTEGER_TEXT.match(text) else float(text)
+        if kind == "boolean" and text.lower() in _BOOLEAN_TEXT:
+            return _BOOLEAN_TEXT[text.lower()]
+        if kind in ("array", "object") and text[:1] in ("[", "{"):
+            try:
+                decoded = json.loads(text)
+            except ValueError:
+                return value
+            if not isinstance(decoded, list if kind == "array" else dict):
+                return value
+            value = decoded
+    if kind == "integer" and isinstance(value, float) and value.is_integer():
+        return int(value)
+    if kind == "object" and isinstance(value, dict):
+        properties = schema.get("properties")
+        if isinstance(properties, dict):
+            return {
+                key: coerce_to_schema(item, properties[key], depth + 1)
+                if key in properties else item
+                for key, item in value.items()
+            }
+    if kind == "array" and isinstance(value, list) and isinstance(schema.get("items"), dict):
+        return [coerce_to_schema(item, schema["items"], depth + 1) for item in value]
+    return value
+
+
+def _mistyped_argument(args: dict[str, Any], schema: Any) -> str:
+    """还原之后仍然是字符串的数字 / 布尔参数：点名字段。交给 handler 的话，报出来的
+    是一句 Python 的类型错误，模型看不出是哪个参数、该改成什么。"""
+    properties = schema.get("properties") if isinstance(schema, dict) else None
+    for key, declared in (properties or {}).items():
+        kind = _coercion_kind(declared) if isinstance(declared, dict) else None
+        if isinstance(kind, str) and kind in _TYPE_NAMES and isinstance(args.get(key), str):
+            return f"{key} 应为{_TYPE_NAMES[kind]}，收到的是字符串 {args[key]!r}"
+    return ""
+
+
+def _json_equal(left: Any, right: Any) -> bool:
+    """JSON 的布尔值不是数字；Python 的 True == 1 不能用于 enum。"""
+    if isinstance(left, bool) or isinstance(right, bool):
+        return type(left) is type(right) and left == right
+    if isinstance(left, dict) and isinstance(right, dict):
+        return left.keys() == right.keys() and all(_json_equal(left[k], right[k]) for k in left)
+    if isinstance(left, list) and isinstance(right, list):
+        return len(left) == len(right) and all(_json_equal(a, b) for a, b in zip(left, right))
+    return left == right
+
+
+def _argument_problem(value: Any, schema: Any, path: str = "$") -> str:
+    """基础参数契约：类型、枚举、必填、对象成员与数组元素，返回首个问题。
+
+    不冒充完整 JSON Schema：引用、组合分支、pattern 等复杂约束仍由远端或
+    工具自己的 validator 负责。patternProperties 存在时不猜哪些键是额外字段。
+    SDK 的严格工具自行校验，不经过这里，也不做类型转换。
+    """
+    if schema is False:
+        return f"{path} 不允许这个值"
+    if not isinstance(schema, dict) or "$ref" in schema:
+        return ""
+    numeric = isinstance(value, (int, float)) and not isinstance(value, bool)
+    finite = numeric and (not isinstance(value, float) or math.isfinite(value))
+    matches = {
+        "object": isinstance(value, dict), "array": isinstance(value, list),
+        "string": isinstance(value, str), "boolean": isinstance(value, bool),
+        "null": value is None, "number": finite,
+        "integer": finite and (isinstance(value, int) or value.is_integer()),
+    }
+    kind = schema.get("type")
+    kinds = [kind] if isinstance(kind, str) else kind
+    if isinstance(kinds, list) and kinds and all(isinstance(k, str) and k in matches for k in kinds):
+        if not any(matches[k] for k in kinds):
+            labels = {**_TYPE_NAMES, "object": "JSON 对象", "array": "数组", "string": "字符串", "null": "null"}
+            return f"{path} 类型应为 {' / '.join(labels.get(k, k) for k in kinds)}"
+    if isinstance(schema.get("enum"), list) and not any(_json_equal(value, choice) for choice in schema["enum"]):
+        return f"{path} 不在允许的 enum 内"
+    if "const" in schema and not _json_equal(value, schema["const"]):
+        return f"{path} 不符合 const"
+    if isinstance(value, dict):
+        required = schema.get("required", [])
+        if isinstance(required, list):
+            for key in required:
+                if isinstance(key, str) and key not in value:
+                    return f"{path} 缺少必填字段 {key}"
+        properties = schema.get("properties", {})
+        properties = properties if isinstance(properties, dict) else {}
+        for key, item in value.items():
+            if key in properties:
+                child = properties[key]
+            elif "patternProperties" in schema:
+                continue
+            else:
+                child = schema.get("additionalProperties", True)
+            if problem := _argument_problem(item, child, f"{path}.{key}"):
+                return problem
+    if isinstance(value, list) and isinstance(schema.get("items"), (dict, bool)):
+        # prefixItems 的前缀有独立 schema，不能拿尾部 items 误验前缀。
+        start = len(schema["prefixItems"]) if isinstance(schema.get("prefixItems"), list) else 0
+        for index in range(start, len(value)):
+            if problem := _argument_problem(value[index], schema["items"], f"{path}[{index}]"):
+                return problem
+    return ""
+
+
+def _prepare_arguments(args: Any, schema: dict[str, Any]) -> tuple[dict[str, Any], str]:
+    """本地与 MCP 共用的执行前收口；不改写调用方持有的参数。"""
+    if not isinstance(args, dict):
+        return {}, "参数必须是 JSON 对象"
+    try:
+        args = coerce_to_schema(args, {**schema, "type": "object"})
+        return args, _mistyped_argument(args, schema) or _argument_problem(args, schema)
+    except (RecursionError, ValueError, OverflowError):
+        return {}, "参数嵌套过深或数值无法表示"
+
+
+@dataclass(frozen=True)
+class _ReadMark:
+    """一个文件"读过"到什么程度，以及读的时候它是哪个版本。"""
+
+    mtime: float
+    size: int  # -1 = 当时取不到
+    whole: bool  # 模型手上有全文
+    digest: bytes | None  # 实际展示或写出的原始字节的 SHA-256；None = 无法确认版本
+    seen: tuple[tuple[int, int], ...] = ()  # 分段读过的行范围（1 起、闭区间、已合并）
+    total: int = 0  # 分段读时文件的总行数
+
+
+def _merge_ranges(ranges: list[tuple[int, int]]) -> tuple[tuple[int, int], ...]:
+    merged: list[tuple[int, int]] = []
+    for start, end in sorted(ranges):
+        if merged and start <= merged[-1][1] + 1:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], end))
+        else:
+            merged.append((start, end))
+    return tuple(merged)
+
+
+@dataclass
+class Tool:
+    name: str
+    description: str
+    parameters: dict[str, Any]
+    handler: Callable[..., str]
+    #  fail-closed 的默认值方向：没声明的能力按最危险假设。
+    #  第三方/插件工具忘了声明时，宁可多问一次，不能静默放行。
+    #  真正只读的工具需要显式写 requires_approval=False。
+    requires_approval: bool = True
+    #  可用性探测：返回 False 时不进 schemas、拒绝执行。
+    #  每次组装 schemas 都会调用，必须是廉价检查（which / 路径存在 / 列表非空）。
+    check_fn: Callable[[], bool] | None = None
+    #  结果来自外部（MCP server、网页、联网搜索）：回灌模型前由 agent 包进
+    #  <untrusted_content>，其中的指令只当数据（见 wrap_untrusted）
+    untrusted: bool = False
+    #  这个工具的输出留在上下文里的字符上限；None = 用全局的 max_tool_output。
+    #  超出的部分不丢：完整内容落盘，内联留头尾预览和召回 id（见 _bound_output）。
+    #  给"结论类"工具用——子 agent、检索、联网搜索存在的理由就是省上下文，
+    #  但把结论的后半截直接切掉，等于白跑了那一半
+    output_limit: int | None = None
+    # Strict SDK tools validate their original JSON arguments themselves.
+    coerce_arguments: bool = True
+
+    def available(self) -> bool:
+        if self.check_fn is None:
+            return True
+        try:
+            return bool(self.check_fn())
+        except Exception:  # noqa: BLE001 - 探测出错按不可用处理，不炸主流程
+            return False
+
+    def schema(self) -> dict[str, Any]:
+        """转成 OpenAI 兼容的 function-calling schema。"""
+        parameters = self.parameters
+        #  只给需确认的工具注入目的参数：免确认的工具没人看这句话，纯浪费 token。
+        #  浅拷贝后加键，不改动原 parameters（它可能被复用/被测试断言）。
+        if self.requires_approval:
+            parameters = {
+                **parameters,
+                "properties": {
+                    PURPOSE_PARAM: {
+                        "type": "string",
+                        "description": "先生成此字段，用一句话说明调用目的；再生成路径、命令或正文。会展示给用户。",
+                    },
+                    **parameters.get("properties", {}),
+                },
+            }
+        return {
+            "type": "function",
+            "function": {
+                "name": self.name,
+                "description": self.description,
+                "parameters": parameters,
+            },
+        }
+
+
+#  第三方工具插件的 entry point 组名。
+#  这是"接内部工具"的代码层通道：内部工具包只要在自己的 pyproject.toml 里声明
+#      [project.entry-points."xiaoyu.tools"]
+#      my_tool = "my_pkg.xiaoyu_plugin:make_tools"
+#  被 pip install 后即被发现。入口是可调用：接收 Config，返回 Tool 或 Tool 列表。
+PLUGIN_GROUP = "xiaoyu.tools"
+
+
+def load_plugin_tools(config: Config, *, selected: tuple[tuple[str, str], ...] | None = None) -> list[Tool]:
+    """加载 entry_points 插件工具。单个插件坏了只警告，不拦启动。
+
+    fail-closed：插件没显式声明 requires_approval 的，按 Tool 的默认值需要确认。
+    """
+    try:
+        from importlib.metadata import entry_points
+
+        candidates = entry_points(group=PLUGIN_GROUP)
+    except Exception:  # noqa: BLE001 - 插件发现失败不能影响内置工具
+        if selected is not None:
+            raise
+        return []
+
+    if selected is not None:
+        def normalized(name: str) -> str:
+            return re.sub(r"[-_.]+", "-", name).lower()
+
+        chosen = []
+        for distribution, name in selected:
+            matches = [entry for entry in candidates if entry.name == name and
+                       normalized(getattr(getattr(entry, "dist", None), "name", "")) == normalized(distribution)]
+            if len(matches) != 1:
+                raise ValueError(f"Plugin must resolve to one entry point: {distribution}/{name}")
+            chosen.append(matches[0])
+        candidates = chosen
+
+    tools: list[Tool] = []
+    for entry in candidates:
+        try:
+            made = entry.load()(config)
+        except Exception as exc:  # noqa: BLE001 - 坏插件只警告
+            if selected is not None:
+                raise RuntimeError(f"Selected plugin failed: {entry.name}") from exc
+            print(f"[插件 {entry.name} 加载失败：{type(exc).__name__}: {exc}]", file=sys.stderr)
+            continue
+        for tool in made if isinstance(made, list) else [made]:
+            if isinstance(tool, Tool):
+                tools.append(tool)
+            else:
+                if selected is not None:
+                    raise TypeError(f"Selected plugin returned an invalid tool: {entry.name}")
+                print(f"[插件 {entry.name} 返回了非 Tool 对象，已忽略]", file=sys.stderr)
+    return tools
+
+
+#  Unicode 标点归一表（容错匹配的最后一级）：
+#  模型从 IDE/网页复制代码时最常混进来的"看着一样字节不同"的字符。
+_UNICODE_PUNCT_TRANS = str.maketrans(
+    {
+        **{ord(ch): "-" for ch in "‐‑‒–—―−"},
+        **{ord(ch): "'" for ch in "‘’‚‛"},
+        **{ord(ch): '"' for ch in "“”„‟"},
+        #  不换行空格、各宽度排版空格、全角空格 → 普通空格
+        **{
+            code: " "
+            for code in (
+                0x00A0, 0x2000, 0x2001, 0x2002, 0x2003, 0x2004, 0x2005,
+                0x2006, 0x2007, 0x2008, 0x2009, 0x200A, 0x202F, 0x3000,
+            )
+        },
+    }
+)
+
+#  逐级放宽的行归一化：任何一级出现「唯一命中」即采用（唯一性护栏不放松）。
+#  精确匹配是第 0 级（在 _str_replace 主流程里），这里是 1-3 级。
+_FUZZY_LEVELS: tuple[tuple[str, Callable[[str], str]], ...] = (
+    ("忽略行尾空白", lambda line: line.rstrip()),
+    ("忽略首尾空白", lambda line: line.strip()),
+    ("Unicode 标点归一", lambda line: line.translate(_UNICODE_PUNCT_TRANS).strip()),
+)
+
+
+@dataclass
+class FuzzyMatch:
+    line_index: int  # 命中起始行（0-based）
+    line_count: int  # 匹配的行数
+    level: str  # 用了哪一级归一化
+
+
+def fuzzy_find_lines(text: str, old_str: str) -> FuzzyMatch | list[int] | None:
+    """按行做逐级放宽的匹配。
+
+    返回：唯一命中 → FuzzyMatch；某级多处命中 → 行号列表（1-based，报歧义用）；
+    全部落空 → None。多行 old_str 末尾的空串是"结尾换行"的哨兵，参与匹配前
+    先剥掉再重试。
+    """
+    text_lines = text.split("\n")
+    pattern = old_str.split("\n")
+    if len(pattern) > 1 and pattern[-1] == "":
+        pattern = pattern[:-1]
+    if not pattern:
+        return None
+    for level, norm in _FUZZY_LEVELS:
+        normalized_text = [norm(line) for line in text_lines]
+        normalized_pattern = [norm(line) for line in pattern]
+        hits = [
+            index
+            for index in range(len(normalized_text) - len(normalized_pattern) + 1)
+            if normalized_text[index : index + len(normalized_pattern)] == normalized_pattern
+        ]
+        if len(hits) == 1:
+            return FuzzyMatch(hits[0], len(pattern), level)
+        if len(hits) > 1:
+            return [index + 1 for index in hits]
+    return None
+
+
+#  搜索/列目录时跳过的目录，避免噪声和把上下文撑爆
+_SKIP_DIRS = {
+    ".git",
+    ".venv",
+    "venv",
+    "node_modules",
+    "__pycache__",
+    ".mypy_cache",
+    ".pytest_cache",
+    "dist",
+    "build",
+    ".idea",
+}
+
+#  搜索类工具（grep / list_files）不碰的敏感文件：它们免确认、只读，正是沙箱明确
+#  不挡的那条凭据外泄路（docs/security.md「沙箱不解决凭据外泄」）——模型一条
+#  grep "KEY" 就能把 .env、私钥读进上下文，用户连确认框都见不到。read_file 不在
+#  此列：它走审批，用户看得见。目录按路径里任一级匹配、文件按名字匹配（fnmatch）。
+#  开关 XIAOYU_SEARCH_SENSITIVE=0（guardrails.py 表里的一层，--unguarded 预设跟随）。
+_SENSITIVE_DIRS = frozenset({".ssh", ".gnupg", ".git"})
+_SENSITIVE_NAMES: tuple[str, ...] = (
+    ".env",
+    ".env.*",
+    "*.pem",
+    "*.key",
+    "*.p12",
+    "*.pfx",
+    "id_rsa*",
+    "id_dsa*",
+    "id_ecdsa*",
+    "id_ed25519*",
+    ".netrc",
+    ".pgpass",
+)
+#  (父目录名, 文件名)：名字本身不特殊、放在特定目录下才是凭据
+_SENSITIVE_PAIRS = frozenset({(".aws", "credentials"), (".docker", "config.json")})
+
+
+def sensitive_reason(path: Path) -> str | None:
+    """路径是不是搜索类工具该跳过的敏感文件；是则返回给人看的理由，否则 None。
+
+    只看名字与路径成分，不读内容、不 stat：几万条 grep 结果逐条过一遍也得是
+    零开销的。".env.example" 这类模板会被 ".env.*" 一起挡下——宁可多跳一个
+    示例文件（read_file 照样读得到），不可漏一个 ".env.production"。
+    """
+    parts = path.parts
+    for part in parts:
+        if part in _SENSITIVE_DIRS:
+            return f"位于 {part}/ 之下"
+    name = path.name
+    if any(fnmatch.fnmatchcase(name, pattern) for pattern in _SENSITIVE_NAMES):
+        return "凭据 / 密钥类文件名"
+    if len(parts) >= 2 and (parts[-2], name) in _SENSITIVE_PAIRS:
+        return f"{parts[-2]}/{name} 是凭据文件"
+    return None
+
+
+#  grep 后端输出的 "路径:行号:内容"：取路径用。懒匹配到第一个 ":数字:"，Windows
+#  盘符 "C:\\x\\y.py:12:" 里的 "C:" 后面不是数字，不会被截在那
+_GREP_LINE_PATH = re.compile(r"^(.+?):\d+:")
+
+
+def _sensitive_skip_note(files: int) -> str:
+    """结果末尾那行说明：跳过了多少个敏感文件、想看怎么办。"""
+    if not files:
+        return ""
+    return (
+        f"\n[已跳过 {files} 个敏感文件（.env / 私钥 / .ssh 等不进搜索结果）；"
+        "确需查看请用 read_file 逐个读取（会经确认）]"
+    )
+
+
+def _locate_grep() -> str | None:
+    """找一个能用的 grep：先看 PATH，Windows 上再探一次 Git for Windows 自带的。
+
+    装了 Git 就有一个货真价实的 GNU grep 躺在 `Git\\usr\\bin\\grep.exe`，但只有
+    `Git\\cmd` 会进 PATH，`usr\\bin` 不进——所以从 cmd/PowerShell 起的小羽里
+    `which("grep")` 必然落空（Git Bash 里反而找得到，同一台机器两种结果）。
+    捡起它比退到纯 Python 兜底快一个数量级，而装 Git 的概率几乎是 100%。
+
+    不缓存结果：一次 which 的开销远小于一次搜索，换来的是用户中途装完
+    ripgrep/Git 不必重启会话。
+
+    路径拼接走 os.path 而非 Path：Path() 按调用时的 os.name 分派，测试里伪造
+    Windows 只能 patch os.name，那会连带把 Path 变成 WindowsPath（在 POSIX 上
+    一构造就抛 UnsupportedOperation）。同 cli.py 的 _running_launcher。
+    """
+    if found := sandbox.host_which("grep"):
+        return found
+    if os.name != "nt":
+        return None
+
+    candidates: list[str] = []
+    if git := sandbox.host_which("git"):
+        #  ...\Git\cmd\git.exe 或 ...\Git\bin\git.exe → ...\Git\usr\bin\grep.exe
+        git_root = os.path.dirname(os.path.dirname(git))
+        candidates.append(os.path.join(git_root, "usr", "bin", "grep.exe"))
+    roots = [
+        os.environ.get("ProgramFiles"),
+        os.environ.get("ProgramW6432"),
+        os.environ.get("ProgramFiles(x86)"),
+    ]
+    candidates += [
+        os.path.join(root, "Git", "usr", "bin", "grep.exe") for root in roots if root
+    ]
+    #  用户级安装（不需要管理员那种）落在 %LOCALAPPDATA%\Programs\Git
+    if local := os.environ.get("LOCALAPPDATA"):
+        candidates.append(os.path.join(local, "Programs", "Git", "usr", "bin", "grep.exe"))
+
+    for candidate in candidates:
+        with contextlib.suppress(OSError):
+            if os.path.isfile(candidate):
+                return candidate
+    return None
+
+
+#  grep 后端的三道界：单文件体积（rg --max-filesize；纯 Python 兜底同值；GNU grep
+#  没有等价选项，接受——它本来就是没装 rg 时的次选）、stdout 总量、总时长。
+#  原先 capture_output 把结果整份读进内存、只有 60s 一道界：一个宽泛 pattern 打在
+#  大仓库上能吐几百 MB，进程还没超时内存先爆。
+_GREP_MAX_FILESIZE = 1024 * 1024
+_GREP_STDOUT_CAP = 8 * 1024 * 1024
+_GREP_STDERR_CAP = 64 * 1024
+_GREP_TIMEOUT = 60.0
+
+
+@dataclass
+class _BoundedRun:
+    """有界运行的结果：stdout 最多 cap 字节；overflow / timed_out 说明为何提前收场。"""
+
+    stdout: bytes
+    stderr: bytes
+    returncode: int | None
+    overflow: bool = False
+    timed_out: bool = False
+
+
+def _drain(stream: Any, cap: int, keep_draining: bool) -> tuple[bytes, bool]:
+    """从管道读到 EOF 或超过 cap：keep_draining=True 时超过上限后继续读但不再保留
+    （stderr：让子进程写得出去），False 时直接停（stdout：调用方随后杀进程）。"""
+    chunks: list[bytes] = []
+    total = 0
+    overflow = False
+    while True:
+        data = stream.read(65536)
+        if not data:
+            break
+        if overflow:
+            continue
+        if total + len(data) > cap:
+            chunks.append(data[: cap - total])
+            overflow = True
+            if not keep_draining:
+                break
+            continue
+        chunks.append(data)
+        total += len(data)
+    return b"".join(chunks), overflow
+
+
+def _run_bounded(
+    command: list[str],
+    *,
+    cwd: str,
+    env: dict[str, str],
+    cap: int | None = None,
+    timeout: float | None = None,
+) -> _BoundedRun:
+    """起子进程、stdout 只保留前 cap 字节、到时限就整树杀掉。
+
+    读管道的线程只做搬运；超过上限或超时都由这边杀进程（先 SIGTERM 给一点宽限
+    再 SIGKILL，与后台任务同一把 kill_tree），管道随即 EOF、读线程自然收工。
+    OSError（找不到可执行文件等）原样抛给调用方决定兜底。
+    """
+    #  上限在调用时取模块量（不写成默认参数）：测试要能把它们调小
+    cap = _GREP_STDOUT_CAP if cap is None else cap
+    timeout = _GREP_TIMEOUT if timeout is None else timeout
+    proc = subprocess.Popen(
+        command,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        cwd=cwd,
+        env=env,
+        **_subprocess_hardening(),
+    )
+    _mark_group_leader(proc)
+    out: dict[str, Any] = {}
+
+    def read_stdout() -> None:
+        out["stdout"] = _drain(proc.stdout, cap, keep_draining=False)
+
+    def read_stderr() -> None:
+        out["stderr"] = _drain(proc.stderr, _GREP_STDERR_CAP, keep_draining=True)
+
+    threads = [
+        threading.Thread(target=read_stdout, name="grep-stdout", daemon=True),
+        threading.Thread(target=read_stderr, name="grep-stderr", daemon=True),
+    ]
+    for thread in threads:
+        thread.start()
+    threads[0].join(timeout)
+    timed_out = threads[0].is_alive()
+    overflow = bool(out.get("stdout", (b"", False))[1])
+    if timed_out or overflow or proc.poll() is None:
+        if timed_out or overflow:
+            _kill_tree(proc, grace=_TERM_GRACE_SECONDS)
+        with contextlib.suppress(Exception):
+            proc.wait(timeout=_TERM_GRACE_SECONDS + 5)
+    for thread in threads:
+        thread.join(timeout=5)
+    for stream in (proc.stdout, proc.stderr):
+        with contextlib.suppress(OSError):
+            stream.close()
+    stdout, _ = out.get("stdout", (b"", False))
+    stderr, _ = out.get("stderr", (b"", False))
+    return _BoundedRun(stdout, stderr, proc.returncode, overflow=overflow, timed_out=timed_out)
+
+
+def _glob_matches(item: Path, root: Path, glob: str) -> bool:
+    """纯 Python 搜索里的 glob 过滤，语义对齐 rg --glob：不含 / 的模式匹配文件名
+    （任意层级都算），含 / 的模式匹配相对搜索起点的路径。"""
+    if "/" not in glob:
+        return fnmatch.fnmatch(item.name, glob)
+    try:
+        relative = item.relative_to(root).as_posix()
+    except ValueError:
+        relative = item.as_posix()
+    return fnmatch.fnmatch(relative, glob.lstrip("/"))
+
+
+#  "属性不存在"的哨兵（attach_mcp_log 用：None 是"没接线"，缺属性是"不是 manager"）
+_UNSET = object()
+
+
+class Toolbox:
+    """持有 config 的工具集合。
+
+    only 参数用来构造受限子集 —— explore 子 agent 拿到的就是 READONLY 那几个。
+    **不能给子 agent bash**：bash 能写文件、能 pip install，"只读"就成了空话。
+    """
+
+    #  真正只读的工具集：不可能修改任何文件
+    READONLY = ["read_file", "grep", "list_files"]
+
+    def __init__(
+        self,
+        config: Config,
+        only: list[str] | None = None,
+        mcp_view: "mcp.McpView | None" = None,
+    ) -> None:
+        self.config = config
+        #  宿主侧找 rg / git 时，这个工作区下面的 PATH 目录不算数（见 sandbox.host_which）
+        sandbox.note_workspace(config.workspace)
+        for folder in config.additional_workspaces:
+            sandbox.note_workspace(folder)
+        #  "有没有人叫停"：Agent 接线时注入（interrupt_requested）。没有 Agent 的
+        #  用法（测试、直接拿 Toolbox 跑工具）保持 None，等待照旧一口气等到底
+        self.stop_requested: Callable[[], bool] | None = None
+        #  sudo 要密码时向用户要（见 askpass.py）：交互前端接线时注入；无人值守、
+        #  子 agent、直接拿 Toolbox 跑工具的用法保持 None = 不装通道，sudo 照旧
+        #  因为没有终端而失败
+        self.secret_prompt: askpass.SecretPrompt | None = None
+        self._askpass_bridge: askpass.AskpassBridge | None = None
+        # Host text processing runs before recall persistence and output clipping.
+        self.result_transform: Callable[[str, dict[str, Any], str], str] | None = None
+        self._tools: dict[str, Tool] = {}
+        # 插件依赖的短暂抖动不应反复增删请求前缀；执行时仍实时检查。
+        self._plugin_probes: dict[str, tuple[Tool, float, bool]] = {}
+        self._plugin_advertised: set[str] = set()
+        #  后台任务表（bash run_in_background / monitor）。通知回调由 Agent
+        #  注入（agent.__init__ 里 tasks.notify = self.notify）；受限子集
+        #  （explore 的 READONLY）没有 bash，这张表闲置无害。
+        self.tasks = TaskManager()
+        #  task_output 上一次对各任务的查询形态 (偏移, 状态, next_offset)：再查一遍
+        #  完全一样时提醒模型别原地轮询
+        self._task_output_seen: dict[str, tuple[int | None, str, int]] = {}
+        #  文件快照（/rewind）：write_file / str_replace 改前把原内容记进当前轮
+        #  的快照点；轮次边界由 Agent.send 划（begin/finish）。
+        self.rewind = RewindStore(config.workspace)
+        self.artifacts = ArtifactCollector(config.workspace)
+        #  已用 read_file 读过的文件 → 当时的 mtime。
+        #  用来强制"先读再改"，并检测读完之后文件被外部改动。
+        self._reads: dict[Path, _ReadMark] = {}
+        self._batch_reads: dict[Path, _ReadMark] | None = None
+        #  超长工具输出的落盘目录（spill）：
+        #  懒创建，进程级临时目录，进程退出时连内容一起删（tempdirs）——召回靠
+        #  内存里的 _spills 表，resume 后的新进程本来就取不回。
+        #  落盘失败退回纯截断，绝不影响工具本身。
+        self._spill_dir: Path | None = None
+        self._spill_seq = 0
+        #  spill 召回表：短 id（序号字符串）→ 元信息。inline 预览只留头尾 + 一个
+        #  短 id，中段随时用 recall(id, ...) 按需取回——id 只有一两个字符，压缩
+        #  丢了 60 字符的临时路径也不影响召回（addressable recall）
+        self._spills: dict[str, dict[str, Any]] = {}
+        #  接进来的历史（resume / fork / 精简副本）里提到过的最大召回 id：那些 id
+        #  是别的进程或别的工具箱落的盘，这里取不回。本工具箱的新 id 从它之后
+        #  起编，≤ 它又不在 _spills 里的一律明说取不回（见 adopt_history）
+        self._foreign_recall_ids = 0
+        #  连续 read_file 次数，用于引导改用 explore
+        self._read_streak = 0
+        #  非 MCP 工具产出的图片（浏览器桥的截图等）：与 MCP 那份一起由 take_media 取走
+        self._media: list[dict[str, Any]] = []
+        self._media_lock = threading.Lock()
+        self._register_builtins()
+        #  插件工具排在所有内置工具之后（注册顺序 = 请求里的工具顺序 = prompt cache
+        #  的前缀资产，内置/扩展分区拼接——插件变动不影响内置前缀）。
+        #  only 子集（explore 用）不加载插件：受限集合里本来就没有它们。
+        if only is None and config.enable_plugins:
+            for tool in load_plugin_tools(config):
+                #  不许覆盖内置工具：同名插件直接忽略（fail-closed）
+                if tool.name not in self._tools:
+                    self.register(tool)
+                    self._plugin_probes[tool.name] = (tool, 0.0, False)
+        #  MCP server 工具：后台懒加载（不阻塞启动）。默认走**检索模式**：
+        #  工具不进 schema，由 search_tool 按需
+        #  检索、use_tool 调用——工具集会话内稳定，prompt cache 不再被中途连上
+        #  的 server 作废。XIAOYU_MCP_TOOL_SEARCH=0 回到旧的全量注册
+        #  （就绪后经 _absorb_mcp 追加在最尾部，append-only）。
+        #  显式传入的 mcp_view 一律优先于配置发现（替代而非合并）：
+        #  - 子 agent 继承父级 manager 的筛选视图（spec 的 mcp 字段，见
+        #    agents.py）——绝不按子 workspace（可能是 worktree）再拉一批进程；
+        #  - 嵌入宿主自建 manager（按宿主声明的 server 清单构造 ServerSpec +
+        #    McpManager）后经此接线——server 生命周期归调用方，admission /
+        #    OSV 闸在 server 启动层照常执行，不因注入而绕过。
+        #  enable_mcp 只 gate 配置发现分支：显式注入=宿主明确要，开关不拦
+        #  （宿主要关就别传 view，两个旋钮不叠加）。
+        #  受限子集（only）没有 view 时也不 launch。
+        self._mcp: Any
+        if mcp_view is not None:
+            self._mcp = mcp_view
+        elif only is None:
+            self._mcp = mcp.launch(config) if config.enable_mcp else None
+        else:
+            self._mcp = None
+        self._mcp_search = self._mcp is not None and config.mcp_tool_search
+        #  MCP server 上线公告的投递通道（Agent 注入 notify；None = 不公告，
+        #  等注入后第一次组装 schemas 时补发）。已公告：server → 工具集指纹。
+        self.notify_hook: Callable[[str, str], None] | None = None
+        self._announced: dict[str, str] = {}
+        #  MCP 工具运行期间的进度（server 的 notifications/progress）→ 前端。
+        #  mcp_progress_hook(工具名, {"progress","total","message"})，由 Agent 注入；
+        #  在 server 的读线程上被调用，实现方只许发事件不许阻塞
+        self.mcp_progress_hook: Callable[[str, dict[str, Any]], None] | None = None
+        if self._mcp_search:
+            self._register_mcp_search()
+        if only is not None:
+            unknown = [name for name in only if name not in self._tools]
+            if unknown:
+                raise ValueError(f"未知工具：{unknown}")
+            #  检索模式的两个元工具跟着视图走：不在 only 白名单语义里，
+            #  它们是 MCP 继承的载体（use_tool 照常 requires_approval）
+            keep = list(only) + (
+                [name for name in ("search_tool", "use_tool") if name in self._tools]
+                if self._mcp_search
+                else []
+            )
+            self._tools = {name: self._tools[name] for name in keep}
+
+    # ---------- 注册 / 查询 ----------
+
+    def register(self, tool: Tool) -> None:
+        self._tools[tool.name] = tool
+
+    def unregister(self, name: str) -> None:
+        self._tools.pop(name, None)
+
+    def _register_mcp_search(self) -> None:
+        """检索模式的两个元工具。它们自身常驻 schema（稳定），MCP 工具藏在后面。"""
+        self.register(
+            Tool(
+                name="search_tool",
+                description=(
+                    "按关键词检索可用的 MCP 集成工具，返回匹配工具的确切参数 schema。"
+                    "关键词带上 server 名和动作效果最好（如 \"linear create issue\"）；"
+                    "直接给全限定工具名则精确返回那一个。调用 MCP 工具前必须先用它"
+                    "拿到 schema——绝不要凭猜写参数名。status 为 partial 表示"
+                    "还有 server 在连接中，结果可能不全。"
+                ),
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "query": {
+                            "type": "string",
+                            "description": "检索关键词（server 名 / 动作 / 工具名）",
+                        },
+                        "limit": {
+                            "type": ["integer", "null"],
+                            "description": "最多返回几个结果，默认 5",
+                        },
+                    },
+                    "required": ["query"],
+                },
+                handler=self._search_mcp_tools,
+                requires_approval=False,
+                check_fn=lambda: self._mcp is not None,
+            )
+        )
+        self.register(
+            Tool(
+                name="use_tool",
+                description=(
+                    "调用一个 MCP 集成工具。tool_name 是 search_tool 返回的全限定名"
+                    "（形如 mcp__server__tool），tool_input 必须严格符合 search_tool "
+                    "返回的参数 schema。"
+                ),
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "tool_name": {
+                            "type": "string",
+                            "description": "全限定工具名（search_tool 的结果里抄）",
+                        },
+                        "tool_input": {
+                            "type": ["object", "null"],
+                            "description": "传给该工具的参数对象（按其 schema 构造）",
+                        },
+                    },
+                    "required": ["tool_name"],
+                },
+                handler=self._use_tool,
+                requires_approval=True,
+                check_fn=lambda: self._mcp is not None,
+            )
+        )
+
+    def _ready_mcp_entries(self) -> list["mcp.RemoteTool"]:
+        if self._mcp is None:
+            return []
+        return [remote for remote in self._mcp.ready_tools() if remote.check_fn()]
+
+    def _search_mcp_tools(self, query: str, limit: int | None = None) -> str:
+        from . import mcp_search
+
+        available = self._ready_mcp_entries()
+        entries = [
+            mcp_search.Entry(
+                name=remote.name,
+                server=remote.server or "unknown",
+                description=remote.description,
+                parameters=remote.parameters,
+            )
+            for remote in available
+        ]
+        status = "partial" if self._mcp is not None and self._mcp.loading() else "ready"
+        ranked = mcp_search.search(entries, str(query or ""), int(limit or 5))
+        payload: dict[str, Any] = {
+            "results": [
+                {
+                    "tool_name": entry.name,
+                    "server": entry.server,
+                    "score": round(score, 2),
+                    "description": entry.description,
+                    "input_schema": entry.parameters,
+                }
+                for entry, score in ranked
+            ],
+            "total_hidden_tools": len(entries),
+            "status": status,
+        }
+        if not entries:
+            payload["note"] = (
+                "当前没有任何已就绪的 MCP 工具。"
+                + ("还有 server 在连接中，稍后再试。" if status == "partial" else "")
+            )
+        elif not ranked:
+            payload["note"] = "没有匹配的工具，换更贴近 server 名/动作的关键词再试。"
+        return json.dumps(payload, ensure_ascii=False, indent=1)
+
+    def _use_tool(self, tool_name: str, tool_input: Any = None) -> str:
+        name = str(tool_name or "").strip()
+        if tool_input is None:
+            tool_input = {}
+        elif isinstance(tool_input, str):
+            #  宽进：模型偶尔把参数对象整个序列化成字符串
+            try:
+                tool_input = json.loads(tool_input)
+            except json.JSONDecodeError:
+                return "ERROR: tool_input 必须是 JSON 对象（按 search_tool 返回的 schema 构造）。"
+        if not isinstance(tool_input, dict):
+            return "ERROR: tool_input 必须是 JSON 对象。"
+        if name in self._tools:
+            #  原生工具纠偏：别绕 use_tool
+            return (
+                f"ERROR: {name} 是内置工具，不是 MCP 集成工具。"
+                f"直接以 {name} 为名发起工具调用，不要经过 use_tool。"
+            )
+        if "__" not in name:
+            return (
+                f"ERROR: {name!r} 不是合法的 MCP 工具名。工具名是 search_tool 返回的"
+                "全限定名（形如 mcp__server__tool），先用 search_tool 检索。"
+            )
+        remote = next(
+            (item for item in (self._mcp.ready_tools() if self._mcp else []) if item.name == name),
+            None,
+        )
+        if remote is None:
+            return (
+                f"ERROR: 没有名为 {name!r} 的 MCP 工具。用 search_tool 检索当前可用的工具。"
+            )
+        if not remote.check_fn():
+            return f"ERROR: MCP 工具 {name} 当前不可用（server 未就绪或已退出）。"
+        #  目的参数是给审批框看的，别漏进远端参数
+        tool_input = {key: value for key, value in tool_input.items() if key != PURPOSE_PARAM}
+        tool_input, problem = _prepare_arguments(tool_input, remote.parameters)
+        if problem:
+            return f"ERROR: 调用 {name} 的参数不对：{problem}"
+        return self._interruptible(remote.handler, name)(**tool_input)
+
+    def _interruptible(self, handler: Callable[..., str], name: str = "") -> Callable[..., str]:
+        """给 MCP 工具的 handler 包一层：调用期间把本工具箱的"有没有人叫停"挂到
+        当前线程上（mcp.stop_scope），在飞的远端调用据此停得下来。
+
+        handler 是 manager 级的闭包，父子 agent 的工具箱共用同一个；stop_requested
+        却是每个 Agent 各自注入的，而且注入晚于工具箱构造——所以在调用的那一刻
+        现取。原 handler 记在 remote 属性上，_absorb_mcp 靠它认"还是不是同一代"。
+        进度回调同一时刻现取：有人接（mcp_progress_hook）才让远端发进度。
+        """
+
+        def call(**kwargs: Any) -> str:
+            hook = self.mcp_progress_hook
+            progress = (lambda info: hook(name, info)) if hook is not None else None
+            with mcp.stop_scope(self.stop_requested, media_owner=self, progress=progress):
+                return handler(**kwargs)
+
+        call.remote = handler  # type: ignore[attr-defined]
+        return call
+
+    def attach_mcp_log(self, hook: Callable[[str, str, str], None]) -> None:
+        """把 MCP server 的日志通知（warning 及以上）接到前端。只有持有 manager
+        的顶层工具箱接线：子 agent 拿的是父级的筛选视图，再接一次就是同一条
+        告警打两遍。已有人接线的不覆盖（嵌入宿主自建的 manager 可能先接了）。"""
+        #  鸭子类型而不是 isinstance：嵌入 / SDK 场景里 manager 可能是打桩或包装对象。
+        #  视图（McpView）没有 on_log 这个属性，自然落空
+        manager = self._mcp
+        if manager is not None and getattr(manager, "on_log", _UNSET) is None:
+            manager.on_log = hook
+
+    def mcp_content_trusted(self, tool_name: str) -> bool:
+        """use_tool 触达的 MCP 工具，其 server 是否声明了 trustContent（结果不套
+        不可信标记）。默认 False：查不到就按外部来源处理。"""
+        if self._mcp is None:
+            return False
+        return any(
+            item.name == tool_name and getattr(item, "trust_content", False)
+            for item in self._mcp.ready_tools()
+        )
+
+    def _announce_mcp(self) -> None:
+        """检索模式的上线公告：server 就绪/工具集变化时经通知轨道告诉模型。
+
+        不公告模型就不知道自己有哪些集成——工具已经不在 schema 里了。
+        指纹 = 工具名集合的哈希，同 server 变更会以新 key 再公告一次。
+        """
+        if self.notify_hook is None:
+            return
+        groups: dict[str, list[str]] = {}
+        for remote in self._ready_mcp_entries():
+            #  指纹并入公告 key：代际 swap 只换 schema 不换名字时也要再公告一次
+            groups.setdefault(remote.server or "unknown", []).append(
+                f"{remote.name}:{remote.fingerprint}"
+            )
+        for server, names in sorted(groups.items()):
+            digest = hashlib.sha256("\0".join(sorted(names)).encode("utf-8")).hexdigest()[:8]
+            if self._announced.get(server) == digest:
+                continue
+            changed = server in self._announced
+            self._announced[server] = digest
+            verb = "工具集已更新" if changed else "已连接"
+            self.notify_hook(
+                f"MCP server「{server}」{verb}（{len(names)} 个工具）。"
+                "要用 MCP 工具：先 search_tool 检索拿到确切参数 schema，"
+                "再 use_tool 调用；绝不要凭猜写参数名。",
+                f"mcp-online-{server}-{digest}",
+            )
+
+    def _absorb_mcp(self) -> None:
+        """把已就绪的 MCP 工具追加注册进来（幂等：按名字去重）。
+
+        MCP server 在后台线程里握手，就绪时机不定——每次查询工具集前同步一次。
+        ready_tools 是 append-only 列表，注册顺序因此稳定，prompt cache 只在
+        新工具首次出现时作废尾部。fail-closed：一律 requires_approval=True，
+        server 自报的 readOnlyHint 不作为放行依据。
+
+        检索模式（默认）不注册，只做上线公告——工具经 search_tool/use_tool 触达。
+        """
+        if self._mcp is None:
+            return
+        if self._mcp_search:
+            self._announce_mcp()
+            return
+        for remote in self._mcp.ready_tools():
+            existing = self._tools.get(remote.name)
+            #  handler 同一 = 还是同一代的同一个声明；不同 = 代际 swap 换过
+            #  （/mcp approve 后的新 schema）→ 原位覆盖（dict 赋值保序，
+            #  schemas 顺序与 prompt cache 前缀不动）
+            if existing is not None and getattr(existing.handler, "remote", None) is remote.handler:
+                continue
+            self.register(
+                Tool(
+                    name=remote.name,
+                    description=remote.description,
+                    parameters=remote.parameters,
+                    handler=self._interruptible(remote.handler, remote.name),
+                    requires_approval=True,
+                    #  server 进程退出后工具自动从 schemas 消失、拒绝执行
+                    check_fn=remote.check_fn,
+                    #  声明里 trustContent: true 的 server，结果不套不可信标记
+                    untrusted=not getattr(remote, "trust_content", False),
+                )
+            )
+
+    def get(self, name: str) -> Tool | None:
+        self._absorb_mcp()
+        return self._tools.get(name)
+
+    def schemas(self) -> list[dict[str, Any]]:
+        #  顺序 = 注册顺序（dict 保序），会话内必须稳定：工具列表是每轮请求的
+        #  前缀之一，顺序一变 prompt cache 全部作废。不要 sort、不要中途重排。
+        self._absorb_mcp()
+        return [tool.schema() for tool in self._tools.values() if self._advertised(tool)]
+
+    def _advertised(self, tool: Tool) -> bool:
+        probe = self._plugin_probes.get(tool.name)
+        if probe is None or probe[0] is not tool:
+            return tool.available()
+        if tool.name in self._plugin_advertised:
+            return True
+        _, until, available = probe
+        if time.monotonic() >= until:
+            available = tool.available()
+            self._plugin_probes[tool.name] = (tool, time.monotonic() + 5.0, available)
+        if available:
+            self._plugin_advertised.add(tool.name)
+        return available
+
+    def names(self) -> list[str]:
+        self._absorb_mcp()
+        return list(self._tools)
+
+    def outside_workspace(self, args: dict[str, Any]) -> bool:
+        """这次调用的路径参数是否逃出工作区。没有 path 参数按"没越界"算。
+
+        公开出来是给 auto 档的放行判定用（modes.auto_approves）——
+        "改的是不是工作区内的文件"这个判断只应该有一处实现。
+        """
+        if "changes" in args and "path" not in args:
+            return any(self.outside_workspace(item) for item in patches.changes_of(args))
+        path = args.get("path")
+        if not isinstance(path, str) or not path:
+            return False
+        try:
+            resolved, outside = self._resolve(path)
+        except (OSError, RuntimeError):
+            #  路径解析不了（符号链接成环等）：按越界算，退回人工确认
+            return True
+        #  spill 落盘文件按"工作区内"对待：是我们自己写下的工具输出，
+        #  取回它不该再弹一次确认——否则 spill 的取回指引形同虚设
+        if outside and self._is_spill_path(resolved):
+            return False
+        return outside
+
+    def resolved_target(self, args: dict[str, Any]) -> Path | tuple | None:
+        """这次调用的路径参数此刻落在哪（resolve 过）。没有路径参数、解析不了返回 None。"""
+        if "changes" in args and "path" not in args:
+            return tuple(self.resolved_target(item) for item in patches.changes_of(args))
+        path = args.get("path")
+        if not isinstance(path, str) or not path:
+            return None
+        try:
+            return self._resolve(path)[0]
+        except (OSError, RuntimeError):
+            return None
+
+    def target_moved(self, args: dict[str, Any], reviewed: Path | tuple | None) -> str | None:
+        """过审时路径落在 reviewed，现在要执行了——还落在同一处吗？不是就返回拒因。
+
+        "在不在工作区内""是不是可执行配置""命不命中 deny 规则"都是对着过审那一刻
+        的落点判的；从那时到真正执行之间隔着确认框（人要读、要想）和 hook。这段
+        时间里路径上的某一级被换成指向别处的符号链接——后台任务、别的进程都
+        做得到——放行的就不再是实际写下去的那个文件。这里把窗口从"人按键的
+        几秒到几分钟"收到"两次系统调用之间"；彻底关上要靠按 fd 钉住每一级目录，
+        那是另一件事。
+        """
+        if reviewed is None:
+            return None
+        now = self.resolved_target(args)
+        if now == reviewed:
+            return None
+        return (
+            f"ERROR: {args.get('path') or '补丁目标'} 在确认之后指向了别处"
+            f"（过审时是 {reviewed}，现在是 {now or '无法解析'}）——路径上有符号链接被改动。"
+            "这次调用没有执行；确认路径无误后重新发起。"
+        )
+
+    def guarded_config(self, name: str, args: dict[str, Any]) -> str | None:
+        """这次调用是不是在写可执行配置（.mcp.json / .env / .xiaoyu/ / .git/）。
+
+        是就返回说明。只看会写文件的工具；判定用 resolve 过的路径，与
+        outside_workspace 同一个解析口。解析不了的路径不在这里拦——它会按
+        越界走确认。
+        """
+        if name == "apply_patch" and "changes" in args:
+            return next((reason for item in patches.changes_of(args)
+                         if (reason := self.guarded_config(name, item))), None)
+        tool = self.get(name)
+        if tool is None or not tool.requires_approval or name == "bash":
+            return None
+        path = args.get("path")
+        if not isinstance(path, str) or not path:
+            return None
+        try:
+            resolved, _ = self._resolve(path)
+        except (OSError, RuntimeError):
+            return None
+        from . import folder_trust
+
+        return folder_trust.guarded_write_reason(resolved)
+
+    def _is_spill_path(self, resolved: Path) -> bool:
+        """resolve 过的路径是否落在 spill 目录下（自家落盘的工具输出）。"""
+        return self._spill_dir is not None and resolved.is_relative_to(self._spill_dir)
+
+    def needs_approval(self, name: str, args: dict[str, Any]) -> bool:
+        tool = self.get(name)
+        if tool is None:
+            return False
+        if tool.requires_approval:
+            return True
+        #  读操作本身安全，但读到 workspace 外面去了仍然要问。
+        return self.outside_workspace(args)
+
+    def run(self, name: str, args: dict[str, Any]) -> str:
+        """执行工具。参数错误/文件不存在等都作为文本结果返回给模型。"""
+        tool = self.get(name)
+        if tool is None:
+            #  直接调用方（测试、嵌入）也享受名字归一；主循环在权限判定之前已经
+            #  归一过一次，到这里的名字多半已是真名
+            if (canonical := canonical_tool_name(name, self.names())) is not None:
+                name, tool = canonical, self.get(canonical)
+        if tool is None:
+            return f"ERROR: 未知工具 {name!r}。可用工具：{', '.join(self.names())}"
+        if not tool.available():
+            return f"ERROR: 工具 {name} 当前不可用（环境探测未通过），换其它办法。"
+
+        #  连续读文件计数：用任何其它工具即重置
+        if name == "read_file":
+            self._read_streak += 1
+        else:
+            self._read_streak = 0
+
+        blocked = self._streak_block_message(name)
+        if blocked:
+            return blocked
+
+        if tool.coerce_arguments:
+            args, problem = _prepare_arguments(args, tool.parameters)
+            if problem:
+                return f"ERROR: 调用 {name} 的参数不对：{problem}"
+
+        try:
+            produced = tool.handler(**args)
+        except Interrupted as exc:
+            if self.result_transform is not None:
+                attach_partial(exc, lambda: "[工具执行中断；未经结果变换的输出已扣留，请核实状态后再决定是否重试。]")
+            raise
+        except TypeError as exc:
+            produced = f"ERROR: 调用 {name} 的参数不对：{exc}"
+            if self.result_transform is None:
+                return produced
+        except Exception as exc:  # noqa: BLE001
+            produced = f"ERROR: {type(exc).__name__}: {exc}"
+            if self.result_transform is None:
+                return produced
+        except BaseException as exc:
+            if self.result_transform is not None:
+                attach_partial(exc, lambda: "[工具执行异常；未经结果变换的输出已扣留，请核实状态后再决定是否重试。]")
+            raise
+
+        if self.result_transform is not None:
+            try:
+                produced = self.result_transform(name, args, produced)
+            except BaseException as exc:
+                # The action already happened. Never expose its unprocessed text,
+                # or let history repair describe the action as never executed.
+                with contextlib.suppress(Exception):
+                    self.take_media()
+                attach_partial(exc, lambda: (
+                    "[工具已执行，但结果变换未完成；原始结果已扣留。"
+                    "请先核实状态，不要直接重试工具。]"
+                ))
+                raise
+
+        try:
+            if isinstance(produced, str):
+                #  工具结果汇入上下文的唯一收口：读到的文件、网页、MCP 结果里的
+                #  隐形字符都在这里剥（见 invisible.py）。放在落盘之前——spill
+                #  文件和内联预览看到的是同一份
+                produced = strip_invisible(produced, f"工具 {name} 的结果")
+            output = self._bound_output(name, produced, tool.output_limit)
+        except Interrupted:
+            #  打断不是工具的错误：不能折成 ERROR 文本回给模型然后接着跑
+            raise
+        except TypeError as exc:
+            return f"ERROR: 调用 {name} 的参数不对：{exc}"
+        except Exception as exc:  # noqa: BLE001 - 工具错误要回给模型自愈
+            return f"ERROR: {type(exc).__name__}: {exc}"
+
+        note = self._streak_warn_note(name)
+        return f"{output}\n\n{note}" if note else output
+
+    def report_artifact(self, path: str | Path) -> None:
+        """进程内业务工具显式交付工作区文件，交给本轮结果与事件消费者。"""
+        self.artifacts.report(path)
+
+    def take_media(self) -> list[dict[str, Any]]:
+        """本批工具调用产出的图片部件（取完即清）。来源：MCP 工具，以及经 push_media 交图的进程内工具（浏览器桥截图）。
+
+        走 Toolbox 中转而不是让 agent 直接问 mcp：子 agent / 受限工具集
+        （only=READONLY）根本没有 _mcp，调用方不该为此写分支。
+        """
+        with self._media_lock:
+            own, self._media = self._media, []
+        with mcp.media_scope(self):
+            remote = self._mcp.take_media() if self._mcp is not None else []
+        return own + remote
+
+    def push_media(self, part: dict[str, Any]) -> None:
+        """进程内工具交一张图（`media.image_part(ref)`），下一次 take_media 一并取走。"""
+        with self._media_lock:
+            self._media.append(part)
+
+    def runtime_inventory(self) -> dict[str, Any]:
+        """注册元数据快照；刻意不吸收 MCP 更新或运行工具的 check_fn。"""
+        mcp = self._mcp.runtime_inventory() if self._mcp is not None else {"servers": [], "tools": []}
+        tools = {name: {"name": name, "registered_in_toolbox": True,
+                        "requires_approval": tool.requires_approval}
+                 for name, tool in self._tools.items()}
+        for remote in mcp["tools"]:
+            name = remote["name"]
+            tools[name] = {"registered_in_toolbox": name in tools,
+                           "requires_approval": True, **tools.get(name, {}), **remote}
+        return {"servers": mcp["servers"], "tools": [tools[n] for n in sorted(tools)],
+                "exposure": "mcp_search" if self._mcp_search else "direct"}
+
+    @property
+    def mcp_manager(self) -> Any:
+        """本工具箱挂着的 MCP manager（或视图，或 None）。
+
+        公开出来给声明式 subagent 做继承（agents.py 构造 McpView 用），
+        不然它得伸手摸私有字段。"""
+        return self._mcp
+
+    # ---------- 连续读文件的引导与拦截 ----------
+
+    def _explore_available(self) -> bool:
+        return self.get("explore") is not None
+
+    def _streak_block_message(self, name: str) -> str | None:
+        if name != "read_file" or not self._explore_available():
+            return None
+        if self._read_streak < self.config.read_streak_block:
+            return None
+        return (
+            f"ERROR: 你已连续 {self._read_streak - 1} 次 read_file，这是「逐个翻文件」的模式，"
+            "会把这些内容永久堆在上下文里（实测比委托检索多花一倍 token）。\n"
+            "改用 explore：把你想查清的问题描述给它，它用便宜模型只读检索并返回"
+            "带 路径:行号 + 原文行 的结论。\n"
+            "如果你确实是在读「马上要动手改」的那几个文件，先调用一次别的工具"
+            "（如 grep 定位、或直接开始 str_replace），计数会重置。"
+        )
+
+    def _streak_warn_note(self, name: str) -> str | None:
+        if name != "read_file" or not self._explore_available():
+            return None
+        if not (self.config.read_streak_warn <= self._read_streak < self.config.read_streak_block):
+            return None
+        remaining = self.config.read_streak_block - self._read_streak
+        return (
+            f"[提示] 你已连续读了 {self._read_streak} 个文件。"
+            f"如果是在摸清代码而不是准备修改，请改用 explore（便宜模型只读检索，不占你的上下文）。"
+            f"再连续读 {remaining} 次会被拦截。"
+        )
+
+    # ---------- 内部工具 ----------
+
+    def _register_builtins(self) -> None:
+        self.register(Tool(
+            name="apply_patch",
+            description=("一次提交多个文件的精确补丁。changes 每项含 path、operation(create/update/delete)。"
+                         "update 推荐传 edits（old_str/new_str 数组）：每项唯一匹配同一份原文，范围不可重叠；也可传 diff，二者互斥。"
+                         "diff 是不带文件头的 unified diff，使用 @@ -旧行,数量 +新行,数量 @@ 和空格/+/- 行；"
+                         "create 使用 @@ -0,0 +1,N @@；delete 不带 diff。已有文件必须先 read_file，"
+                         "删除须完整读过。先校验全部文件再执行；写盘失败可能部分完成，按返回清单核实，勿整批盲重试。"),
+            parameters={"type": "object", "properties": {"changes": {
+                "type": "array", "minItems": 1, "maxItems": 50,
+                "items": {"type": "object", "properties": {
+                    "path": {"type": "string"},
+                    "operation": {"type": "string", "enum": ["create", "update", "delete"]},
+                    "diff": {"type": "string"},
+                    "edits": {"type": "array", "minItems": 1, "maxItems": 100,
+                              "items": {"type": "object", "properties": {
+                                  "old_str": {"type": "string"}, "new_str": {"type": "string"}},
+                                  "required": ["old_str", "new_str"], "additionalProperties": False}}},
+                    "required": ["path", "operation"],
+                    "additionalProperties": False}}}, "required": ["changes"]},
+            # 路径必须以原始对象参与审批，不在审批后才把字符串还原成目标列表。
+            handler=self._apply_patch, requires_approval=True, coerce_arguments=False,
+        ))
+        self.register(Tool(
+            name="view_image",
+            description=("查看本地 PNG/JPEG/GIF/WEBP 图片，返回图像给模型。"
+                         "crop=[左,上,右,下] 为原图像素坐标，max_size 为缩放后最长边（1–4096），"
+                         "两者均可省略；变换只影响返回图，不改原文件。裁剪缩放需 xiaoyu-agent[image]。"),
+            parameters={"type": "object", "properties": {
+                "path": {"type": "string"},
+                "crop": {"type": ["array", "null"], "items": {"type": "integer"}},
+                "max_size": {"type": ["integer", "null"]}}, "required": ["path"]},
+            handler=self._view_image, requires_approval=False, untrusted=True,
+        ))
+        self.register(Tool(
+            name="read_document",
+            description=("读取本地 PDF/DOCX。PDF 的 pages 为从 1 起的页码范围，如 1-3,5；默认第 1 页。"
+                         "mode=text 提取带页码正文（最多 20 页），mode=image 返回页面图片（最多 4 页）。"
+                         "长文档先用 mode=info 查看页数和目录，mode=search 配 query 找页（默认前 100 页，可用 pages 续查）。"
+                         "图表、双栏、扫描页和关键数值须用 image 核对；不自动 OCR。"
+                         "image 可传 crop（左上原点、0–1 的 [左,上,右,下]）和 dpi（36–600），直接渲染局部高清图。需安装 xiaoyu-agent[pdf]。"
+                         "DOCX 支持 text/info/search：按正文块号读取段落、表格，offset 从 1 起，limit 默认 50、最多 100；"
+                         "info 列标题，search 配 query 搜当前块范围；不提供页码或图片，不读取批注、修订正文等附加内容。需 xiaoyu-agent[docx]。"),
+            parameters={"type": "object", "properties": {
+                "path": {"type": "string"}, "pages": {"type": ["string", "null"]},
+                "mode": {"type": "string", "enum": ["text", "image", "info", "search"]},
+                "query": {"type": ["string", "null"], "description": "search 的字面关键词，区分大小写，最多 200 字符"},
+                "crop": {"type": ["array", "null"], "items": {"type": "number"}, "minItems": 4, "maxItems": 4},
+                "dpi": {"type": ["integer", "null"], "minimum": 36, "maximum": 600},
+                "offset": {"type": ["integer", "null"], "minimum": 1, "description": "仅 DOCX：起始正文块号"},
+                "limit": {"type": ["integer", "null"], "minimum": 1, "maximum": 100, "description": "仅 DOCX：本次读取/搜索的块数"}}, "required": ["path"]},
+            handler=self._read_document, requires_approval=False, untrusted=True,
+        ))
+        self.register(Tool(
+            name="read_spreadsheet",
+            description=("只读本地 XLSX。省略 sheet 列出工作表；只传 sheet 查看声明范围、合并格和隐藏行列；"
+                         "传 sheet + cell_range（如 A1:F50，最多 2000 格）读取带坐标、类型和数字格式的单元格。"
+                         "公式原文与文件缓存结果分别返回，缓存可能缺失或过期；不重算、不更新外部链接、不执行宏。"
+                         "不读取图表、图片、批注内容；CSV/TSV 用 read_file。需 xiaoyu-agent[spreadsheet]。"),
+            parameters={"type": "object", "properties": {
+                "path": {"type": "string"},
+                "sheet": {"type": ["string", "null"]},
+                "cell_range": {"type": ["string", "null"]}}, "required": ["path"]},
+            handler=self._read_spreadsheet, requires_approval=False, untrusted=True,
+        ))
+        self.register(Tool(
+            name="task_input",
+            description=("向 bash(interactive=true) 启动的任务发送原样文本，不自动补换行。"
+                         "输入回车用 text 中的换行；eof=true 发送 EOF；POSIX 单独发送 U+0003 可中断任务。输入可能执行代码，需逐次确认；"
+                         "不用于密码或密钥。输出用 task_output，终止用 kill_task。"),
+            parameters={"type": "object", "properties": {
+                "task_id": {"type": "string"}, "text": {"type": "string"},
+                "eof": {"type": "boolean"}}, "required": ["task_id"]},
+            handler=self._task_input, requires_approval=True,
+            check_fn=lambda: any(task.interactive and not task.done.is_set() for task in self.tasks.all()),
+        ))
+        self.register(
+            Tool(
+                name="read_file",
+                description=(
+                    "读取文本文件内容。路径相对当前工作区解析。"
+                    "图片（png / jpg / gif / webp）也用它：图会直接交给你看。"
+                    "大文件可以用 offset（起始行号，从 1 开始）和 limit（最多读多少行）只读一段。"
+                    "修改任何文件之前必须先读过它：局部修改（str_replace）读过要改的那一段即可，"
+                    "整体覆盖（write_file）要把全部内容都读到（分段读完也算）。"
+                ),
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "path": {"type": "string", "description": "文件路径"},
+                        "offset": {
+                            "type": ["integer", "null"],
+                            "description": "起始行号，从 1 开始；省略表示从头读",
+                        },
+                        "limit": {
+                            "type": ["integer", "null"],
+                            "description": "最多读多少行；省略表示读到结尾",
+                        },
+                    },
+                    "required": ["path"],
+                },
+                handler=self._read_file,
+                requires_approval=False,
+            )
+        )
+        self.register(
+            Tool(
+                name="write_file",
+                description=(
+                    "把完整内容写入文件（整文件覆盖，不是补丁）。"
+                    "只在新建文件或需要全量重写时用；改动已有文件的局部请用 str_replace。"
+                    "覆盖已有文件前必须先用 read_file 把它完整读过（只读过一部分的不能覆盖）。"
+                    "父目录不存在会自动创建。"
+                    "先生成 path，再生成 content，便于用户提前看到写入位置。"
+                ),
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "path": {"type": "string", "description": "文件路径"},
+                        "content": {
+                            "type": "string",
+                            "description": "文件的完整新内容",
+                        },
+                    },
+                    "required": ["path", "content"],
+                },
+                handler=self._write_file,
+                requires_approval=True,
+            )
+        )
+        self.register(
+            Tool(
+                name="str_replace",
+                description=(
+                    "把文件里的一段文本精确替换成另一段——修改已有文件的首选工具。"
+                    "调用前必须先用 read_file 读过该文件。"
+                    "old_str 必须与文件内容逐字符完全一致（含缩进和空行），"
+                    "并且在整个文件里只能出现一次；"
+                    "如果不唯一，就把上下文往外扩几行直到唯一。"
+                    "删除代码就把 new_str 设为空字符串。"
+                    "先生成 path，再生成 old_str 和 new_str。"
+                ),
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "path": {"type": "string", "description": "文件路径"},
+                        "old_str": {
+                            "type": "string",
+                            "description": "要被替换掉的原文，必须逐字符精确且在文件中唯一",
+                        },
+                        "new_str": {
+                            "type": "string",
+                            "description": "替换成的新文本，留空表示删除",
+                        },
+                    },
+                    "required": ["path", "old_str", "new_str"],
+                },
+                handler=self._str_replace,
+                requires_approval=True,
+            )
+        )
+        self.register(
+            Tool(
+                name="grep",
+                description=(
+                    "在工作区里按正则搜索文本，返回 路径:行号: 内容。"
+                    "找符号定义、找调用点、找配置项都用它。"
+                    "可用 glob 限定文件类型（如 *.py）。这是只读操作；"
+                    ".env、私钥、.ssh 这类敏感文件不进结果，要看用 read_file。"
+                ),
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "pattern": {"type": "string", "description": "正则表达式"},
+                        "path": {
+                            "type": "string",
+                            "description": "搜索起点，默认工作区根目录",
+                        },
+                        "glob": {
+                            "type": ["string", "null"],
+                            "description": "文件名 glob 过滤，如 *.py；省略表示不过滤",
+                        },
+                        "max_matches": {
+                            "type": "integer",
+                            "description": "最多返回多少条，默认 200；结果被截断时会提示总数",
+                        },
+                    },
+                    "required": ["pattern"],
+                },
+                handler=self._grep,
+                requires_approval=False,
+            )
+        )
+        self.register(
+            Tool(
+                name="recall",
+                description=(
+                    "召回之前因超长而只留了头尾预览的工具输出。预览里给了「召回 id」，"
+                    "用它取回被省略的中段，不必重跑原命令。"
+                    "不给 id：列出本会话所有可召回的输出（id / 来源 / 规模 / 首行）。"
+                    "给 id + pattern：在该输出里按正则找匹配行（带行号）。"
+                    "给 id + offset/limit：取该输出的某一段行。这是只读操作。"
+                ),
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "id": {"type": ["string", "null"], "description": "召回 id（预览里给的）；省略则列出全部"},
+                        "pattern": {"type": ["string", "null"], "description": "正则：在该输出里找匹配行"},
+                        "offset": {"type": ["integer", "null"], "description": "起始行号（从 1）；与 limit 配合取一段"},
+                        "limit": {"type": ["integer", "null"], "description": "最多取多少行"},
+                    },
+                    "required": [],
+                },
+                handler=self._recall,
+                requires_approval=False,
+                #  接回的历史里点过名的 id 也要有个去处：工具不在表里的话，模型
+                #  照着旧预览调 recall 只会得到一句"没有这个工具"
+                check_fn=lambda: bool(self._spills) or self._foreign_recall_ids > 0,
+            )
+        )
+        self.register(
+            Tool(
+                name="list_files",
+                description=(
+                    "列出工作区里的文件（可用 glob 过滤，如 **/*.py）。"
+                    "摸清项目结构时用它，比 bash ls 更干净：自动跳过 .git、"
+                    "node_modules、__pycache__ 等噪声目录，也不列 .env、私钥等敏感文件。"
+                    "这是只读操作。"
+                ),
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "pattern": {
+                            "type": "string",
+                            "description": "glob 模式，默认 **/*",
+                        },
+                        "path": {"type": "string", "description": "起点，默认工作区根目录"},
+                        "limit": {"type": "integer", "description": "最多列多少个，默认 300"},
+                    },
+                    "required": [],
+                },
+                handler=self._list_files,
+                requires_approval=False,
+            )
+        )
+        self.register(
+            Tool(
+                name="bash",
+                description=(
+                    "在工作区目录下执行 shell 命令，返回合并后的 stdout/stderr 和退出码。"
+                    "命令已经在工作区根目录下执行，不需要自己 cd 过去。"
+                    "用它来查找文件、跑测试、跑构建、查 git 状态。"
+                    "需要用户在浏览器完成的交互式认证命令（OAuth device flow、登录扫码）"
+                    "不要阻塞干等：先用能立即返回的方式发起并拿到授权链接，"
+                    "把链接展示给用户，等用户确认完成后再查状态。"
+                    "长时间运行的命令（dev server、长构建、部署后的收敛等待）用 "
+                    "run_in_background=true：立即返回 task id，完成时会在后续工具结果里"
+                    "收到通知——不要轮询、不要 sleep 干等，也不要在命令末尾自己加 &。"
+                    "需要 root 的命令直接写 sudo：有人值守时密码由用户在界面里输入，"
+                    "你看不到也不需要知道；绝不要向用户索要密码、把密码写进命令或用 "
+                    "-S / echo 管道喂给 sudo。"
+                    + _platform_shell_note()
+                    + self._sandbox_note()
+                ),
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "command": {"type": "string", "description": "要执行的命令"},
+                        "timeout": {
+                            "type": ["integer", "null"],
+                            "description": (
+                                f"超时秒数，默认 {self.config.bash_timeout}，上限 {BASH_TIMEOUT_CAP}。"
+                                "超时的命令会被终止，已产生的输出仍会返回给你；"
+                                "预计耗时长的命令（完整测试、构建）请显式调大，"
+                                "更久的用 run_in_background。不要用 sleep 等后台事件：完成时会自动通知你。"
+                                "后台任务默认不受超时约束，显式给了才生效"
+                            ),
+                        },
+                        "interactive": {
+                            "type": "boolean",
+                            "description": "保留标准输入并在后台运行，用 task_input 继续输入；不会继承用户终端。",
+                        },
+                        "tty": {
+                            "type": "boolean",
+                            "description": "分配独立伪终端（仅 POSIX，需 interactive=true），适合 REPL / 调试器。",
+                        },
+                        "run_in_background": {
+                            "type": "boolean",
+                            "description": (
+                                "true = 后台运行：立即返回 task id，命令继续跑，"
+                                "完成时自动通知你。用 task_output 查看输出、kill_task 终止"
+                            ),
+                        },
+                        #  升权协议：只有沙箱真的生效时这两个
+                        #  参数才出现在 schema 里——没有沙箱就没有权限可升
+                        **(
+                            {
+                                "sandbox_permissions": {
+                                    "type": ["string", "null"],
+                                    "enum": self._escalation_modes() + [None],
+                                    "description": (
+                                        "为**这一次**调用申请更高的沙箱权限（需用户批准，"
+                                        "仅本次生效）。只在命令确实被沙箱拦截时使用，"
+                                        "选最窄的足够档位，必须与 justification 成对出现。"
+                                    ),
+                                },
+                                "justification": {
+                                    "type": ["string", "null"],
+                                    "description": (
+                                        "一句给用户看的解释：为什么这条命令需要升权。"
+                                        "必须与 sandbox_permissions 成对出现。"
+                                    ),
+                                },
+                            }
+                            if self._escalation_modes()
+                            else {}
+                        ),
+                    },
+                    "required": ["command"],
+                },
+                handler=self._bash,
+                requires_approval=True,
+            )
+        )
+        self.register(
+            Tool(
+                name="task_output",
+                description=(
+                    "查看后台任务（run_in_background 的命令 / monitor）的输出与状态。"
+                    "默认立即返回快照；要等任务结束就给 timeout（秒），到点仍在跑也会"
+                    "返回现状。不要反复轮询——任务完成时你会自动收到通知；"
+                    "需要等待就用一次带 timeout 的调用等到位。"
+                    "日志很长时默认只给头尾；要看中段或接着上次往下读，给 offset"
+                    "（字节，取上次返回的 next_offset）与 limit（字节）分段读。"
+                ),
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "task_ids": {
+                            "type": ["array", "string"],
+                            "items": {"type": "string"},
+                            "description": "要查看的任务 id 列表；单个任务也可传 id 字符串",
+                        },
+                        "timeout": {
+                            "type": ["integer", "null"],
+                            "description": "最多等多少秒（上限 600）；省略或 0 = 立即返回快照",
+                        },
+                        "offset": {
+                            "type": ["integer", "null"],
+                            "description": (
+                                "从日志的第几个字节起读（0 = 开头）；接着上次读就填"
+                                "上次返回的 next_offset。省略 = 头尾快照"
+                            ),
+                        },
+                        "limit": {
+                            "type": ["integer", "null"],
+                            "description": (
+                                f"这一段最多读多少字节，默认 {OUTPUT_READ_BYTES}"
+                            ),
+                        },
+                    },
+                    "required": ["task_ids"],
+                },
+                handler=self._task_output,
+                requires_approval=False,
+                check_fn=lambda: bool(self.tasks.known_ids()),
+            )
+        )
+        self.register(
+            Tool(
+                name="kill_task",
+                description="终止一个后台任务或 monitor（整棵进程树）。已结束的任务返回其退出码。",
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "task_id": {"type": "string", "description": "要终止的任务 id"}
+                    },
+                    "required": ["task_id"],
+                },
+                handler=self._kill_task,
+                requires_approval=False,
+                check_fn=lambda: bool(self.tasks.known_ids()),
+            )
+        )
+        self.register(
+            Tool(
+                name="monitor",
+                description=(
+                    "启动一个后台观察进程：命令的 stdout 每输出一行就是一个事件，"
+                    "会自动送达给你，进程退出即结束观察。适用：盯 CI 状态、tail 日志、"
+                    "轮询外部条件。**输出量纪律**：每一行都会打进你的上下文，"
+                    "脚本只应输出关键事件（如 DONE / FAILED），管道过滤用 "
+                    "grep --line-buffered（裸 grep 会整块缓冲，事件迟到几分钟）。"
+                    "输出太快会被限流，持续刷屏会被自动终止。"
+                ),
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "command": {
+                            "type": "string",
+                            "description": "观察脚本/命令。每行 stdout 是一个事件，退出即结束",
+                        },
+                        "description": {
+                            "type": "string",
+                            "description": "在观察什么（每条事件通知都会带上这句话）",
+                        },
+                        "timeout": {
+                            "type": ["integer", "null"],
+                            "description": f"最长观察秒数，默认 {MONITOR_DEFAULT_TIMEOUT}（10 小时）",
+                        },
+                    },
+                    "required": ["command", "description"],
+                },
+                handler=self._monitor,
+                requires_approval=True,
+            )
+        )
+        self.register(
+            Tool(
+                name="browser",
+                description=(
+                    "操作浏览器（Playwright）。action 取值："
+                    "open=打开 url 并返回页面快照；"
+                    "snapshot=当前页面快照（YAML，交互元素带 [ref=eN]）；"
+                    "click=点击、fill=填输入框（配 text），selector 用快照里的 ref"
+                    "（写作 aria-ref=e5）或 Playwright 选择器（text=、css）；"
+                    "press=按键（key 如 Enter）；read=页面正文纯文本；"
+                    "screenshot=截图存到 path（给用户看的，不会回传给你）；"
+                    "close=关闭浏览器。"
+                    "点击打开了新标签页时会自动切过去。页面弹出确认框时默认取消并告诉你，"
+                    "确实要确认就带 dialog=accept 重做那一步。"
+                    "默认无头启动独立 Chromium（无登录态）。要操作需要登录态的页面，"
+                    "请用户以 --remote-debugging-port=9222 启动本机 Chrome 并设"
+                    " XIAOYU_BROWSER_CDP=http://127.0.0.1:9222，即可接管已登录会话。"
+                ),
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "action": {"type": "string", "enum": list(browser.ACTIONS)},
+                        "url": {"type": ["string", "null"], "description": "open 用"},
+                        "selector": {"type": ["string", "null"], "description": "click/fill 用"},
+                        "text": {"type": ["string", "null"], "description": "fill 用"},
+                        "key": {"type": ["string", "null"], "description": "press 用"},
+                        "path": {"type": ["string", "null"], "description": "screenshot 用"},
+                        "dialog": {
+                            "type": ["string", "null"],
+                            "enum": list(browser.DIALOG_CHOICES) + [None],
+                            "description": (
+                                "这一步里页面弹出确认框时怎么答：dismiss=取消（默认），"
+                                "accept=确认"
+                            ),
+                        },
+                    },
+                    "required": ["action"],
+                },
+                handler=self._browser,
+                untrusted=True,
+                requires_approval=True,
+                #  lambda 晚绑定而非直接引用：测试/运行期 monkeypatch
+                #  browser.available 时门控要跟着变。enable_browser 也进门控：
+                #  可用性绑在宿主装没装 playwright 上，不给开关就没法把工具表
+                #  钉死（e2e golden 曾因 CI runner 镜像预装 playwright 而漂移）
+                check_fn=lambda: self.config.enable_browser and browser.available(),
+            )
+        )
+
+    def _browser(
+        self,
+        action: str,
+        url: str | None = None,
+        selector: str | None = None,
+        text: str | None = None,
+        key: str | None = None,
+        path: str | None = None,
+        dialog: str | None = None,
+    ) -> str:
+        if action == "open" and url and url.strip().lower().startswith("file:"):
+            #  file:// 加 read 能把任何本机文件读出来，绕过文件工具的全部护栏
+            #  （工作区边界、特殊文件、体积上限）。只许工作区内的
+            #  url2pathname 而不是自己取 path 段：Windows 上 file:///C:/x 的 path 段是
+            #  "/C:/x"，当路径用会多出开头那个斜杠，工作区里的文件也被判成在外面
+            local = Path(urllib.request.url2pathname(urllib.parse.urlsplit(url).path))
+            _, outside = self._resolve(str(local))
+            if outside:
+                return (
+                    f"ERROR: 浏览器只能打开工作区内的本地文件（{local} 在工作区之外）。"
+                    "要读那个文件请用 read_file。"
+                )
+        if action == "screenshot" and path:
+            #  相对路径按工作区解析，和别的文件工具一致（此前按进程的当前目录）
+            path = str(self._resolve(path)[0])
+        return browser.session().run(
+            action, url=url, selector=selector, text=text, key=key, path=path, dialog=dialog
+        )
+
+    def _sandbox_note(self) -> str:
+        """拼进 bash 描述的沙箱边界说明：模型得先知道墙在哪，才不会撞了才学。"""
+        if not sandbox.enabled(self.config.sandbox):
+            return ""
+        note = (
+            "命令在沙箱里执行：**只能写工作区、临时目录和构建缓存**，"
+            "写其它路径会返回 Operation not permitted / Read-only file system"
+            "（这是策略拦截，不是命令写错）。全盘可读。"
+        )
+        note += "" if self.config.sandbox_network else "网络已禁用，联网命令会失败。"
+        return note + (
+            "确需更高权限时用最窄档位的 sandbox_permissions + justification "
+            "原样重试那一条命令（需用户批准，仅该次调用生效）。"
+        )
+
+    def _askpass_bridge_for(self, command: str) -> askpass.AskpassBridge | None:
+        """这条前台命令要不要装 sudo 的密码通道；要就返回（惰性建一次、全程复用）。
+
+        三个条件缺一不可：有前端能问人（secret_prompt）、开关没关、命令里认得出
+        提权入口。识别用的是与审批同一个 `privileged_command`——它认不出的写法
+        本来也进不了免确认通道，这里漏装只是 sudo 照旧失败，不是安全问题。
+        """
+        if self.secret_prompt is None or not self.config.enable_askpass:
+            return None
+        if not command_check.privileged_command(command):
+            return None
+        if self._askpass_bridge is None:
+            self._askpass_bridge = askpass.AskpassBridge.create()
+        return self._askpass_bridge
+
+    def _escalation_modes(self) -> list[str]:
+        """当前沙箱配置下可申请的升权档位（从窄到宽；未套沙箱时为空）。
+
+        升权词汇**只能向上**——档位表按当前配置生成，
+        已经放行的能力不会出现在表里（网络已放行就没有 allow-network 档），
+        所以"非扩大的请求"在 schema 层面就不成立，撞进来的按参数错误拒绝。
+        """
+        if not sandbox.enabled(self.config.sandbox):
+            return []
+        modes_list: list[str] = []
+        if not self.config.sandbox_network:
+            modes_list.append("allow-network")
+        modes_list.append("danger-full-access")
+        return modes_list
+
+    def _read_file(self, path: str, offset: int | None = None, limit: int | None = None) -> str:
+        target, outside = self._resolve(path)
+        #  spill 文件不打"工作区之外"标注：那是我们自己落盘的工具输出
+        if outside and self._is_spill_path(target):
+            outside = False
+        if not target.exists():
+            return f"ERROR: 文件不存在：{path}"
+        if target.is_dir():
+            return f"ERROR: {path} 是目录，不是文件。用 list_files 看目录。"
+        if error := _unreadable_file_error(target, path):
+            return error
+        if target.suffix.lower() in media.IMAGE_SUFFIXES:
+            #  图片交给模型自己看：解码成文本只会得到乱码
+            ref, problem = media.accept_file(target)
+            if not ref:
+                return f"ERROR: {path} 是图片，但没能读进来：{problem}"
+            self.push_media(media.image_part(ref))
+            where = "（工作区之外）" if outside else ""
+            return f"[{path}{where} 是图片（{media.label(ref)}），见下一条消息里的图片]"
+        if error := _binary_file_error(target, path):
+            return error
+        try:
+            text, encoding, raw = _read_for_edit(target)
+        except _Undecodable:
+            #  只读展示仍给有损文本（总比什么都不给强），但明说有损、编辑会被拒
+            try:
+                raw = target.read_bytes()
+                text = raw.decode("utf-8", errors="replace").replace("\r\n", "\n").replace("\r", "\n")
+                encoding = ""
+            except OSError as exc:
+                return f"ERROR: 读取失败 {path}: {exc}"
+        except OSError as exc:
+            return f"ERROR: 读取失败 {path}: {exc}"
+
+        prefix = "(注意：该路径在工作区之外)\n" if outside else ""
+        if not encoding:
+            prefix += (
+                "(注意：该文件含 UTF-8、GBK 都解不开的字节，以下为有损显示，"
+                "� 处是无法识别的字节；str_replace 会拒绝编辑它)\n"
+            )
+        elif encoding != "utf-8":
+            prefix += f"(注意：该文件按 {encoding} 解码显示，str_replace 会按原编码写回)\n"
+        if not text:
+            self._mark_read(target, from_read=True, raw=raw)
+            return f"{prefix}(文件为空：{path})"
+
+        limit_chars = self.config.max_tool_output
+        if offset is None and limit is None:
+            lines = text.splitlines()
+            clipped_lines, clipped = _clip_long_lines(lines, 1)
+            if clipped:
+                #  截断显示的行模型没看全：按"读过其余各行"记，整体覆盖要先把这
+                #  几行单独读到（limit=1 不截）
+                shown = (
+                    f"{prefix}[{path} 有 {len(clipped)} 行超过 {_READ_LINE_CAP} 字符，"
+                    "已截断显示（行末有说明）；整体覆盖（write_file）前要把这些行"
+                    "用 offset=行号 limit=1 读全]\n" + "\n".join(clipped_lines)
+                )
+                fits = len(shown) <= limit_chars
+                self._mark_read(
+                    target,
+                    from_read=True,
+                    raw=raw,
+                    seen=_ranges_without(1, len(lines), clipped) if fits else (),
+                    total=len(lines),
+                )
+                if fits:
+                    return shown
+                return shown + (
+                    f"\n[{path} 太长，上面只显示了头尾；没显示的部分用 offset/limit 分段读。"
+                    "整体覆盖（write_file）要把各段都读到，局部修改（str_replace）现在就可以]"
+                )
+            shown = f"{prefix}{text}"
+            if len(shown) <= limit_chars:
+                self._mark_read(target, from_read=True, raw=raw)
+                return shown
+            #  整读但装不下：回给模型的只有头尾预览，中段它没看见。记成"读过一部分"——
+            #  够做局部替换（old_str 得逐字对上），不够整体覆盖
+            self._mark_read(target, from_read=True, seen=(), raw=raw)
+            return shown + (
+                f"\n[{path} 太长，上面只显示了头尾；没显示的部分用 offset/limit 分段读。"
+                "整体覆盖（write_file）要把各段都读到，局部修改（str_replace）现在就可以]"
+            )
+
+        lines = text.splitlines()
+        start = max(1, offset or 1)
+        if start > len(lines):
+            return f"ERROR: {path} 只有 {len(lines)} 行，offset={start} 超出范围"
+        end = len(lines) if limit is None else min(len(lines), start + max(1, limit) - 1)
+        segment = lines[start - 1 : end]
+        clipped: list[int] = []
+        if end > start:
+            #  单读一行（limit=1）是模型专门来看这一行的，不截；多行才截超长行
+            segment, clipped = _clip_long_lines(segment, start)
+        chunk = "\n".join(segment)
+        note = (
+            f"{prefix}[{path} 第 {start}-{end} 行，共 {len(lines)} 行；"
+            "这是部分内容：局部修改（str_replace）可以直接做，"
+            "整体覆盖（write_file）要把全部行都读到]\n"
+        )
+        if clipped:
+            note += (
+                f"[其中 {len(clipped)} 行超过 {_READ_LINE_CAP} 字符已截断显示，"
+                "要看整行用 offset=行号 limit=1]\n"
+            )
+        #  这一段自己也装不下的话，模型同样只看见头尾——不计入已读范围
+        fits = len(note) + len(chunk) <= limit_chars
+        seen = _ranges_without(start, end, clipped) if fits else ()
+        self._mark_read(target, from_read=True, seen=seen, total=len(lines), raw=raw)
+        return note + chunk
+
+    def _write_file(self, path: str, content: str) -> str:
+        target, outside = self._resolve(path)
+        existed = target.exists()
+        if existed:
+            guard = self._guard_known(target, path, whole=True)
+            if guard:
+                return guard
+            #  快照要 read_bytes 原文、写入要 open 它：FIFO 两步都会阻塞死
+            if error := _unreadable_file_error(target, path, size_cap=False):
+                return error
+        #  /rewind 快照：改前内容（新建文件记 None——回滚即删除）
+        previous: bytes | None = None
+        if existed:
+            try:
+                previous = target.read_bytes()
+            except OSError:
+                pass
+            else:
+                self.rewind.record(target, previous)
+        else:
+            self.rewind.record(target, None)
+        converted = ""
+        try:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            encoding = _encoding_of(previous) if previous else ""
+            if encoding:
+                #  覆盖已有文件：沿用它的编码与换行，和局部替换的承诺一致
+                try:
+                    content.encode(encoding)
+                except UnicodeEncodeError:
+                    converted = (
+                        f"；原文件是 {encoding} 编码，新内容里有它表示不了的字符，已改用 UTF-8"
+                    )
+                    encoding = "utf-8"
+                written = _write_like_original(target, content, encoding, previous)
+            else:
+                written = content.encode("utf-8")
+                fsguard.write_atomic(target, written, check_writable=True)
+        except OSError as exc:
+            return f"ERROR: 写入失败 {path}: {exc}"
+        self._mark_read(target, raw=written)
+        self.artifacts.written(target, previous, written)
+        self.rewind.written(target, written)
+        action = "已覆盖" if existed else "已创建"
+        note = ("（工作区之外）" if outside else "") + converted
+        lines = content.count("\n") + (1 if content and not content.endswith("\n") else 0)
+        return f"{action}{note} {path}：{len(content)} 字符 / {lines} 行"
+
+    def _view_image(self, path: str, crop: list[int] | None = None,
+                    max_size: int | None = None) -> str:
+        from .images import load_image
+
+        target, _ = self._resolve(path)
+        ref, problem = load_image(target, crop, max_size)
+        if problem:
+            return f"ERROR: {problem}"
+        self.push_media(media.image_part(ref))
+        return f"已读取图片 {path}（{media.label(ref)}）"
+
+    def _read_document(self, path: str, pages: str | None = None, mode: str = "text",
+                       query: str | None = None, crop: list[float] | None = None,
+                       dpi: int | None = None, offset: int | None = None,
+                       limit: int | None = None) -> str:
+        from .documents import read_pdf
+
+        target, _ = self._resolve(path)
+        if target.suffix.lower() == ".docx":
+            from .word_documents import read_docx
+
+            if pages is not None or crop is not None or dpi is not None:
+                return "ERROR: DOCX 用 offset/limit 按块读取，不支持 pages/crop/dpi；页面图请先转换为 PDF。"
+            return read_docx(target, mode, offset=offset if offset is not None else 1,
+                             limit=limit if limit is not None else 50, query=query)
+        if target.suffix.lower() == ".doc":
+            return "ERROR: 旧版 .doc 请先另存为 .docx 后读取。"
+        if offset is not None or limit is not None:
+            return "ERROR: PDF 用 pages 按页读取；offset/limit 仅用于 DOCX。"
+        text, images = read_pdf(target, pages, mode, query=query, crop=crop, dpi=dpi)
+        for data in images:
+            ref = media.store(data, "image/png")
+            if not ref:
+                return "ERROR: 页面已渲染，但图片缓存写入失败，请检查临时目录空间与权限。"
+            self.push_media(media.image_part(ref))
+        return text
+
+    def _read_spreadsheet(self, path: str, sheet: str | None = None,
+                          cell_range: str | None = None) -> str:
+        from .spreadsheets import read_xlsx
+
+        target, _ = self._resolve(path)
+        return read_xlsx(target, sheet, cell_range)
+
+    def _task_input(self, task_id: str, text: str = "", eof: bool = False) -> str:
+        if self.config.hardline and (reason := hardline_violation(text)):
+            return f"ERROR: 输入被硬性拦截（{reason}）"
+        return self.tasks.send_input(task_id, text, eof=eof)
+
+    def _apply_patch(self, changes: list[dict]) -> str:
+        patches.validate(changes)
+        prepared = []
+        targets: set[Path] = set()
+        for item in changes:
+            path, operation = item["path"], item["operation"]
+            if operation in {"create", "delete"} and self._path_entry(path).is_symlink():
+                return f"ERROR: {path} 是符号链接；create/delete 不跟随或替换链接，请显式操作链接本身。未修改文件。"
+            target, _ = self._resolve(path)
+            if target in targets:
+                return f"ERROR: 重复目标 {path}；每个文件只能出现一次。未修改文件。"
+            targets.add(target)
+            if any(target in other.parents or other in target.parents for other in targets - {target}):
+                return "ERROR: 补丁目标之间存在父子路径冲突。未修改文件。"
+            raw, text, encoding = None, "", "utf-8"
+            if operation == "create":
+                if target.exists():
+                    return f"ERROR: {path} 已存在，create 不覆盖文件。未修改文件。"
+            else:
+                if error := _unreadable_file_error(target, path):
+                    return error + "；未修改文件。"
+                if error := self._guard_known(target, path, whole=operation == "delete"):
+                    return error + "；未修改文件。"
+                text, encoding, raw = _read_for_edit(target)
+            updated = None if operation == "delete" else patches.apply_change(text, item)
+            if updated is not None and (error := _unencodable_error(path, updated, encoding)):
+                return error + "；未修改文件。"
+            prepared.append((item, target, raw, text, encoding, updated))
+        completed = []
+        for index, (item, target, raw, text, encoding, updated) in enumerate(prepared):
+            try:
+                if item["operation"] in {"create", "delete"} and self._path_entry(item["path"]).is_symlink():
+                    raise OSError("目标目录项在校验后被替换为符号链接")
+                if self._resolve(item["path"])[0] != target:
+                    raise OSError("目标路径在校验后被替换")
+                if raw is None:
+                    if target.exists():
+                        raise OSError("新文件目标在校验后已存在")
+                else:
+                    fsguard.require_regular(target)
+                    if target.read_bytes() != raw:
+                        raise OSError("文件在校验后被外部修改")
+                self.rewind.record(target, raw)
+                if updated is None:
+                    target.unlink()
+                    self._reads.pop(target, None)
+                    self.artifacts.removed(target)
+                    self.rewind.written(target, None)
+                else:
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    written = _write_edit(target, text, updated, encoding, raw) if raw is not None else updated.encode("utf-8")
+                    if raw is None:
+                        fsguard.write_atomic(target, written, check_writable=True)
+                    self._mark_read(target, keep_level=raw is not None, raw=written)
+                    self.artifacts.written(target, raw, written)
+                    self.rewind.written(target, written)
+                completed.append(f'{item["operation"]} {item["path"]}')
+            except OSError as exc:
+                pending = ", ".join(entry[0]["path"] for entry in prepared[index + 1:]) or "无"
+                return (f"ERROR: {item['path']} 操作失败：{exc}。请核实该文件状态。\n"
+                        f"已完成：{'; '.join(completed) or '无'}\n未执行：{pending}")
+        return "补丁已应用：\n" + "\n".join(completed)
+
+    def _str_replace(self, path: str, old_str: str, new_str: str) -> str:
+        target, outside = self._resolve(path)
+        if not target.exists():
+            return f"ERROR: 文件不存在：{path}。新建文件请用 write_file。"
+        if target.is_dir():
+            return f"ERROR: {path} 是目录，不是文件。"
+        if not old_str:
+            return "ERROR: old_str 不能为空。要新建或整体重写文件请用 write_file。"
+        if old_str == new_str:
+            return "ERROR: old_str 和 new_str 完全相同，这次替换没有意义。"
+
+        guard = self._guard_known(target, path)
+        if guard:
+            return guard
+        #  读过之后路径可能被换成了 FIFO/设备：闸门之后的整读同样要拦
+        if error := _unreadable_file_error(target, path):
+            return error
+
+        try:
+            text, encoding, raw = _read_for_edit(target)
+        except _Undecodable:
+            return _undecodable_error(path)
+        except OSError as exc:
+            return f"ERROR: 读取失败 {path}: {exc}"
+
+        count = text.count(old_str)
+        if count == 0:
+            #  精确匹配落空 → 逐级放宽的容错匹配。
+            #  行尾空格 / tab-space 混用 / IDE 弯引号是三类最高频的"看着一样字节不同"，
+            #  只要放宽后唯一命中就接受；多处命中仍打回——唯一性护栏不放松。
+            return self._fuzzy_replace(
+                target, path, text, old_str, new_str, outside, encoding, raw
+            )
+        if count > 1:
+            return (
+                f"ERROR: old_str 在 {path} 中出现了 {count} 次，无法确定改哪一处。"
+                f"请把上下文往外扩几行让它唯一。出现位置在第 "
+                f"{', '.join(str(n) for n in self._match_lines(text, old_str))} 行附近。"
+            )
+
+        offset = text.index(old_str)
+        #  多行替换时如果 old_str 不是从行首开始，new_str 的后续行会丢掉原有缩进。
+        if "\n" in new_str and offset > 0 and text[offset - 1] not in "\n":
+            return (
+                f"ERROR: old_str 从行中间开始（第 {text.count(chr(10), 0, offset) + 1} 行），"
+                "而 new_str 是多行的——这样替换会让新增的行丢掉缩进。"
+                "请把 old_str 扩展到从行首开始（含该行的缩进）再试。"
+            )
+        line_no = text.count("\n", 0, offset) + 1
+        updated = text.replace(old_str, new_str, 1)
+        if error := _unencodable_error(path, updated, encoding):
+            return error
+        self.rewind.record(target, raw)
+        try:
+            written = _write_edit(target, text, updated, encoding, raw)
+        except OSError as exc:
+            return f"ERROR: 写入失败 {path}: {exc}"
+        self._mark_read(target, keep_level=True, raw=written)
+        self.artifacts.written(target, raw, written)
+        self.rewind.written(target, written)
+
+        note = "（工作区之外）" if outside else ""
+        delta = updated.count("\n") - text.count("\n")
+        action = "删除" if not new_str else "替换"
+        return (
+            f"已{action}{note} {path} 第 {line_no} 行处的内容，行数变化 {delta:+d}。\n"
+            f"改动后该处上下文：\n{self._context_around(updated, offset)}"
+        )
+
+    def _fuzzy_replace(
+        self,
+        target: Path,
+        path: str,
+        text: str,
+        old_str: str,
+        new_str: str,
+        outside: bool,
+        encoding: str = "utf-8",
+        raw: bytes | None = None,
+    ) -> str:
+        """old_str 精确匹配落空后的容错路径。找不到时回显 old_str 帮模型自查。"""
+        found = fuzzy_find_lines(text, old_str)
+        if isinstance(found, list):
+            return (
+                f"ERROR: old_str 精确匹配失败；放宽空白/标点后在 {path} 的第 "
+                f"{', '.join(str(n) for n in found[:8])} 行有多处近似命中，无法确定改哪一处。"
+                "请把上下文往外扩几行让它唯一。"
+            )
+        if found is None:
+            echo = old_str if len(old_str) <= 800 else old_str[:800] + "\n…（过长截断）"
+            return (
+                f"ERROR: 在 {path} 中找不到 old_str（连放宽空白/标点也没匹配上）。"
+                "它必须照抄原文，常见原因是凭记忆写而非照抄、或文件内容与你的预期不同。"
+                f"{self._near_miss_hint(text, old_str)}\n"
+                f"{_escape_drift_hint(text, old_str)}\n"
+                f"你提供的 old_str 原文如下，请对照 read_file 的结果找差异：\n{echo}"
+            )
+
+        text_lines = text.split("\n")
+        if new_str:
+            new_lines = new_str.split("\n")
+            #  old_str 的结尾换行哨兵在匹配前被剥掉了，new_str 的也要对称剥掉，
+            #  否则会凭空多出一个空行
+            if len(new_lines) > 1 and new_lines[-1] == "" and old_str.endswith("\n"):
+                new_lines = new_lines[:-1]
+            #  缩进修正：strip 级容错意味着 old_str 的缩进和原文对不上（tab-space
+            #  混用、层级抄错），new_str 的缩进多半跟着错。用首行的缩进差把
+            #  new_str 整体映射回原文的缩进，别把错的缩进写进文件。
+            pattern = old_str.split("\n")
+            if len(pattern) > 1 and pattern[-1] == "":
+                pattern = pattern[:-1]
+            original_first = text_lines[found.line_index]
+            original_indent = original_first[: len(original_first) - len(original_first.lstrip())]
+            pattern_indent = pattern[0][: len(pattern[0]) - len(pattern[0].lstrip())]
+            if original_indent != pattern_indent:
+                new_lines = [
+                    original_indent + line[len(pattern_indent):]
+                    if line.strip() and line.startswith(pattern_indent)
+                    else line
+                    for line in new_lines
+                ]
+        else:
+            new_lines = []
+        updated_lines = (
+            text_lines[: found.line_index]
+            + new_lines
+            + text_lines[found.line_index + found.line_count :]
+        )
+        updated = "\n".join(updated_lines)
+        if error := _unencodable_error(path, updated, encoding):
+            return error
+        self.rewind.record(target, raw if raw is not None else text.encode(encoding))
+        try:
+            written = _write_edit(target, text, updated, encoding, raw)
+        except OSError as exc:
+            return f"ERROR: 写入失败 {path}: {exc}"
+        self._mark_read(target, keep_level=True, raw=written)
+        self.artifacts.written(target, raw if raw is not None else text.encode(encoding), written)
+        self.rewind.written(target, written)
+
+        offset = sum(len(line) + 1 for line in updated_lines[: found.line_index])
+        note = "（工作区之外）" if outside else ""
+        delta = updated.count("\n") - text.count("\n")
+        action = "删除" if not new_str else "替换"
+        return (
+            f"已{action}{note} {path} 第 {found.line_index + 1} 行处的内容，"
+            f"行数变化 {delta:+d}。\n"
+            f"[注意] old_str 与原文不完全一致，已按「{found.level}」容错匹配。"
+            "请核对下方上下文确认改动落点正确：\n"
+            f"{self._context_around(updated, min(offset, len(updated)))}"
+        )
+
+    def _grep(
+        self,
+        pattern: str,
+        path: str = ".",
+        glob: str | None = None,
+        max_matches: int = 200,
+    ) -> str:
+        """只读搜索。优先 rg，其次 grep -rnE（macOS 的 BSD grep 没有 -P，
+        所以用 -E 不用 -P），两个都没有就走纯 Python 兜底。
+
+        兜底不是可选项：Windows 上默认既没有 ripgrep 也没有 grep.exe，直接
+        subprocess 会抛 [WinError 2]，模型每次搜索都白烧一轮、只能退化成一个个
+        read_file 硬啃——explore 子 agent 的 12 轮上限就是这么被烧光的。
+        """
+        target, _ = self._resolve(path)
+        if not target.exists():
+            return f"ERROR: 路径不存在：{path}"
+        if refused := self._sensitive_root_error(target, path):
+            return refused
+
+        #  绝对路径起：rg 不经沙箱、不经确认，不能让 PATH 上工作区里的同名程序顶替
+        #  三个后端搜的范围要一样，否则同一个问题在不同机器上答案不同：
+        #  --hidden：rg 默认跳过点开头的目录，.github/ 里的引用搜不到，模型会据此
+        #    断定"没有任何地方引用"（另两个后端搜得到）；.git 等由下面的排除表挡
+        #  --no-config：不读用户的 ripgrep 配置，它能改掉输出形态
+        #  模式一律走 -e、路径前加 --：模式以 - 开头时不被当成选项
+        if rg := sandbox.host_which("rg"):
+            command = [
+                rg, "--line-number", "--no-heading", "--color", "never",
+                "--hidden", "--no-config", "--max-filesize", str(_GREP_MAX_FILESIZE),
+                "-e", pattern,
+            ]
+            for skip in sorted(_SKIP_DIRS):
+                command += ["--glob", f"!{skip}/**"]
+            if glob:
+                command += ["--glob", glob]
+            command += ["--", str(target)]
+        elif grep := _locate_grep():
+            command = [grep, "-rnE", "-e", pattern]
+            for skip in sorted(_SKIP_DIRS):
+                command.append(f"--exclude-dir={skip}")
+            if glob:
+                command.append(f"--include={glob}")
+            command += ["--", str(target)]
+        else:
+            return self._grep_python(pattern, target, glob, max_matches)
+
+        try:
+            result = _run_bounded(command, cwd=str(self.config.workspace), env=_hardened_env())
+        except OSError:
+            #  which 说有、真跑起来却没有（PATH 里挂着失效的 shim 等），照样兜底，
+            #  别把一个可恢复的环境问题变成模型眼里的死路
+            return self._grep_python(pattern, target, glob, max_matches)
+        if result.timed_out:
+            return f"ERROR: 搜索超时（{_GREP_TIMEOUT:.0f}s）：{pattern}，请缩小 path 或 glob 范围"
+
+        #  Windows 默认 locale 编码（GBK/cp1252）解不了 UTF-8 输出，必须显式按 UTF-8 解
+        stdout = result.stdout.decode("utf-8", errors="replace")
+        #  grep/rg 没匹配到时退出码是 1，这不是错误；被我们杀掉的（溢出）另说
+        if not result.overflow and result.returncode not in (0, 1):
+            stderr = result.stderr.decode("utf-8", errors="replace")
+            return f"ERROR: 搜索失败（exit {result.returncode}）：{stderr.strip()[:200]}"
+
+        lines = [line for line in stdout.splitlines() if line.strip()]
+        if result.overflow:
+            #  最后一行多半被截在半截，丢掉；总数不可知，提示收窄而不是报个假数
+            lines = lines[:-1]
+            return self._grep_output(lines, pattern, max_matches) + (
+                f"\n[结果过多：输出超过 {_GREP_STDOUT_CAP // 1048576} MiB 已中止搜索，"
+                "以上只是开头一部分、总数不可知；请收窄 pattern 或 path / glob]"
+            )
+        return self._grep_output(lines, pattern, max_matches)
+
+    def _grep_python(
+        self,
+        pattern: str,
+        target: Path,
+        glob: str | None,
+        max_matches: int,
+    ) -> str:
+        """没有 rg / grep 时的纯 Python 搜索，输出格式与它们保持一致。
+
+        只求"能用"不求快：跳过 _SKIP_DIRS、二进制和超大文件（与 rg 的
+        --max-filesize 同一上限），并留一个整体时间预算，免得在大仓库上把一轮
+        工具调用耗死。
+        """
+        try:
+            regex = re.compile(pattern)
+        except re.error as exc:
+            return f"ERROR: 正则不合法：{exc}"
+
+        candidates = [target] if target.is_file() else sorted(target.rglob("*"))
+        deadline = time.monotonic() + 60
+        lines: list[str] = []
+        timed_out = False
+        for item in candidates:
+            if time.monotonic() > deadline:
+                timed_out = True
+                break
+            if not item.is_file() or _SKIP_DIRS & set(item.parts):
+                continue
+            if glob and not _glob_matches(item, target, glob):
+                continue
+            try:
+                if item.stat().st_size > _GREP_MAX_FILESIZE:
+                    continue
+                with item.open("rb") as raw:
+                    if b"\0" in raw.read(4096):
+                        continue
+                with item.open("r", encoding="utf-8", errors="replace") as handle:
+                    for number, line in enumerate(handle, 1):
+                        if regex.search(line):
+                            lines.append(f"{item}:{number}:{line.rstrip()}")
+            except OSError:
+                continue
+
+        hint = (
+            "\n[提示] 本机没有 ripgrep/grep，已用内置搜索兜底"
+            "（装 ripgrep 会快很多：winget install BurntSushi.ripgrep.MSVC）"
+        )
+        if timed_out:
+            hint += "\n[提示] 已达 60 秒搜索预算，结果可能不完整，请缩小 path 或 glob 范围"
+        return self._grep_output(lines, pattern, max_matches) + hint
+
+    def _grep_output(self, lines: list[str], pattern: str, max_matches: int) -> str:
+        """把 路径:行号:内容 的原始行整理成给模型看的结果：路径转成工作区相对、
+        分隔符统一正斜杠（Windows 的反斜杠会让模型在后续工具调用里混用两种）。"""
+        root = str(self.config.workspace)
+        kept: list[str] = []
+        skipped_files: set[str] = set()
+        for line in lines:
+            for prefix in (root + os.sep, root + "/"):
+                if line.startswith(prefix):
+                    line = line[len(prefix):]
+                    break
+            #  敏感文件的匹配行整条剔除：留着哪怕一行，.env 里那个值就进上下文了。
+            #  只认 "路径:行号:" 形态；搜单个文件时后端不打路径，那种情况起点
+            #  本身已在 _sensitive_root_error 里判过
+            if self.config.search_sensitive and (found := _GREP_LINE_PATH.match(line)):
+                if sensitive_reason(Path(found.group(1))):
+                    skipped_files.add(found.group(1))
+                    continue
+            kept.append(line)
+        skip_note = _sensitive_skip_note(len(skipped_files))
+        if not kept:
+            return f"没有匹配：{pattern}" + skip_note
+
+        shown = []
+        for line in kept[:max_matches]:
+            head, sep, rest = line.partition(":")
+            if sep:
+                line = head.replace("\\", "/") + sep + rest
+            shown.append(line[:300])
+        note = (
+            f"\n... 还有 {len(kept) - max_matches} 条未显示，请缩小范围"
+            if len(kept) > max_matches
+            else ""
+        )
+        return f"{len(kept)} 条匹配：\n" + "\n".join(shown) + note + skip_note
+
+    def _list_files(self, pattern: str = "**/*", path: str = ".", limit: int = 300) -> str:
+        target, _ = self._resolve(path)
+        if not target.is_dir():
+            return f"ERROR: 不是目录：{path}"
+        if refused := self._sensitive_root_error(target, path):
+            return refused
+
+        found: list[str] = []
+        skipped = 0
+        for item in sorted(target.glob(pattern)):
+            if not item.is_file():
+                continue
+            if _SKIP_DIRS & set(item.parts):
+                continue
+            if self.config.search_sensitive and sensitive_reason(item):
+                skipped += 1
+                continue
+            try:
+                #  统一正斜杠：输出给模型的路径不随平台漂移（Windows 反斜杠会让
+                #  模型在后续 str_replace/read_file 里混用两种分隔符）
+                found.append(item.relative_to(self.config.workspace).as_posix())
+            except ValueError:
+                found.append(str(item))
+
+        skip_note = _sensitive_skip_note(skipped)
+        if not found:
+            return f"没有匹配 {pattern} 的文件" + skip_note
+        note = f"\n... 共 {len(found)} 个，只列出前 {limit} 个" if len(found) > limit else ""
+        return f"{len(found)} 个文件：\n" + "\n".join(found[:limit]) + note + skip_note
+
+    def _sensitive_root_error(self, target: Path, shown: str) -> str | None:
+        """搜索起点本身就是敏感路径（path=~/.ssh、path=.env）时拒绝整个请求。
+
+        结果里逐条剔除挡的是"顺带搜到"，起点直指敏感目录是"专门去搜"——同样
+        不该免确认放行。"""
+        if not self.config.search_sensitive:
+            return None
+        reason = sensitive_reason(target)
+        if reason is None:
+            return None
+        return (
+            f"ERROR: {shown} 是敏感路径（{reason}），grep / list_files 不进去搜。"
+            "确需查看请用 read_file 读具体文件（会经确认）。"
+        )
+
+    def _command_argv(self, command: str, escalation: str | None = None) -> list[str]:
+        """命令 → 实际执行的 argv（平台 shell + 需要时套沙箱）。
+
+        前台 bash、后台任务、monitor 三条路必须同一份拼装——沙箱是否套上
+        不能因执行形态而异。escalation 是**本次调用**获批的升权档位：
+        allow-network = 仍套沙箱但放行网络；danger-full-access = 本次不套沙箱。
+        """
+        argv = _shell_argv(command)
+        if escalation == "danger-full-access":
+            return argv
+        if sandbox.enabled(self.config.sandbox):
+            #  只读宿主查询按完整参数校验，直接 exec 系统程序，不把 shell 带出沙箱。
+            if query := sandbox.host_query_argv(command):
+                return query
+            allow_network = self.config.sandbox_network or escalation == "allow-network"
+            scope = {"additional_workspaces": self.config.additional_workspaces} if self.config.additional_workspaces else {}
+            argv = sandbox.wrap(argv, self.config.workspace, allow_network, **scope)
+        return argv
+
+    def _spawn_background(
+        self,
+        command: str,
+        *,
+        kind: str,
+        description: str,
+        timeout: float | None,
+        escalation: str | None = None,
+        interactive: bool = False,
+        tty: bool = False,
+    ) -> str:
+        """后台进程的统一入口：进程策略在这里拼好，生命周期交给 TaskManager。"""
+        if self.config.hardline and (reason := hardline_violation(command)):
+            return (
+                f"ERROR: 命令被硬性拦截（{reason}）。"
+                "这类不可撤销的破坏性操作在任何模式下都不执行，包括 --yolo。"
+            )
+        started = self.tasks.start(
+            self._command_argv(command, escalation),
+            command=command,
+            kind=kind,
+            description=description,
+            cwd=str(self.config.workspace),
+            env=_hardened_env(self.config.extra_env),
+            timeout=timeout,
+            popen_extra=_subprocess_hardening(),
+            interactive=interactive, tty=tty,
+        )
+        if isinstance(started, str):
+            return started
+        if kind == "monitor":
+            return (
+                f"monitor 已启动（{started.task_id}，最长观察 {timeout:.0f}s）。\n"
+                "每个事件都会自动送达，继续干别的活——不要轮询、不要 sleep 等待。\n"
+                "事件可能在你等用户答复时到达——事件不是用户的回复。"
+            )
+        note = "" if timeout is None else f"，{timeout:.0f}s 后仍未结束会被终止"
+        warn = ""
+        others = [task for task in self.tasks.running() if task.task_id != started.task_id]
+        if others:
+            listed = "；".join(f'"{task.task_id}"（{task.description}）' for task in others[:5])
+            warn = (
+                f"\n注意：还有 {len(others)} 个后台任务在跑：{listed}。"
+                "重复的任务请先 kill_task 再起新的。"
+            )
+        return (
+            f"后台任务已启动：{started.task_id}{note}\n"
+            f"日志：{started.log_path}\n"
+            f"完成时会自动通知你；中途要看输出用 task_output(task_ids=[\"{started.task_id}\"])。"
+            f"不要轮询等待，先继续别的工作。{warn}"
+        )
+
+    def _check_escalation(
+        self, sandbox_permissions: str | None, justification: str | None
+    ) -> str | None:
+        """升权参数校验：非法/非扩大的请求直接失败，不打扰任何人。
+
+        返回错误文本；None = 合法（含"没申请升权"）。成对约束：两个参数
+        必须同现——没有理由的升权用户没法裁决，没有升权的理由是废话。
+        """
+        if sandbox_permissions is None and not (justification or "").strip():
+            return None
+        modes_list = self._escalation_modes()
+        if not modes_list:
+            return (
+                "ERROR: 当前没有沙箱在生效，不存在可申请的升权档位。"
+                "去掉 sandbox_permissions/justification 直接执行即可。"
+            )
+        if sandbox_permissions is None:
+            return "ERROR: justification 必须与 sandbox_permissions 成对出现。"
+        if not (justification or "").strip():
+            return (
+                "ERROR: sandbox_permissions 必须与 justification 成对出现——"
+                "给用户一句解释：为什么这条命令需要升权。"
+            )
+        if sandbox_permissions not in modes_list:
+            return (
+                f"ERROR: 未知的升权档位 {sandbox_permissions!r}。"
+                f"当前可申请：{', '.join(modes_list)}（只能申请尚未放行的能力）。"
+            )
+        return None
+
+    def _bash(
+        self,
+        command: str,
+        timeout: int | None = None,
+        run_in_background: bool = False,
+        interactive: bool = False,
+        tty: bool = False,
+        sandbox_permissions: str | None = None,
+        justification: str | None = None,
+    ) -> str:
+        if error := self._check_escalation(sandbox_permissions, justification):
+            return error
+        escalation = sandbox_permissions
+        if tty and not interactive:
+            return "ERROR: tty=true 必须与 interactive=true 一起使用。"
+        if run_in_background or interactive:
+            command = command.rstrip()
+            if command.endswith("&"):
+                return (
+                    "ERROR: run_in_background=true 时不要在命令末尾写 &——"
+                    "去掉它重试，后台化由我负责。"
+                )
+            #  后台任务默认不受超时约束：显式给了 timeout 才生效
+            return self._spawn_background(
+                command, kind="command", description=command,
+                timeout=float(timeout) if timeout else None,
+                escalation=escalation, interactive=interactive, tty=tty,
+            )
+        #  硬红线查表（Config.hardline）：XIAOYU_HARDLINE=0 / --unguarded 关掉它——
+        #  内部运维（镜像烧录、格式化）在隔离环境里确有 dd of=/dev/… 的真实需求
+        if self.config.hardline and (reason := hardline_violation(command)):
+            return (
+                f"ERROR: 命令被硬性拦截（{reason}）。"
+                "这类不可撤销的破坏性操作在任何模式下都不执行，包括 --yolo。"
+                "如果确有需要，请用户自己在终端里手动执行。"
+            )
+        limit = min(timeout or self.config.bash_timeout, max(BASH_TIMEOUT_CAP, self.config.bash_timeout))
+        #  macOS 上套 Seatbelt 沙箱：写权限收到工作区+临时目录+构建缓存，
+        #  其余路径只读。系统只读查询有精确执行例外，其余子孙进程继承策略。
+        #  升权本次生效：danger-full-access 不套沙箱；allow-network 套但放网。
+        sandboxed = sandbox.enabled(self.config.sandbox) and escalation != "danger-full-access"
+        argv = self._command_argv(command, escalation)
+        sandboxed = sandboxed and argv[0] != "/usr/bin/top"
+        #  自建 Popen 而不用 subprocess.run：run 超时后只杀直接子进程，然后无限期
+        #  等管道关闭——孙进程握着管道时"超时"根本不生效。这里超时整树杀。
+        #  字节模式读管道，解码带 GBK 兜底（见 _decode_output）。
+        started = time.monotonic()
+        hardening = _subprocess_hardening()
+        env = _hardened_env(self.config.extra_env)
+        #  命令里有提权入口且有人值守：装上 sudo 的密码通道（见 askpass.py）。
+        #  只在这种调用上装——DISPLAY 这个副作用不该落到每条普通命令上
+        bridge = self._askpass_bridge_for(command)
+        service: Callable[[], float] | None = None
+        if bridge is not None:
+            env = bridge.env(env)
+            prompt_fn = self.secret_prompt
+
+            def service(prompt_fn=prompt_fn, command=command) -> float:
+                return bridge.service(lambda text: prompt_fn(text, command))
+
+        try:
+            proc = subprocess.Popen(
+                argv,
+                #  掐断 stdin：ssh 等命令默认读取并转发 stdin，继承 tty 会偷键入
+                #  ——和输入 prompt、插话线程抢字节；被中断后残留的子进程更会
+                #  让"提示符在、打字没反应"（iTerm2 实测形态）。
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                cwd=str(self.config.workspace),
+                env=env,
+                **hardening,
+            )
+        except OSError as exc:
+            return f"ERROR: 无法执行命令：{exc}"
+        #  趁组长还活着登记进程组：shell 先退、孙进程握着管道时超时才杀得到
+        if hardening.get("start_new_session"):
+            _mark_group_leader(proc)
+        #  不用 communicate：它把整份输出读进内存，几 GB 的输出能把进程吃爆
+        pipes = [_BoundedPipe(proc.stdout), _BoundedPipe(proc.stderr)]
+        _register_foreground(proc)
+        try:
+            #  没装密码通道就保持原来的调用形状：等待循环的替身（测试）只认四个参数
+            extra = {"service": service} if service is not None else {}
+            if not _wait_bounded(proc, pipes, started + limit, self.stop_requested, **extra):
+                raise subprocess.TimeoutExpired(argv, limit)
+            stdout_raw, stderr_raw = pipes[0].value(), pipes[1].value()
+        except KeyboardInterrupt:
+            #  Ctrl-C 的 SIGINT 只到前台进程组（我们自己）；子进程在独立会话里
+            #  收不到，不杀就成遗孤继续跑、还握着管道。中断语义必须是
+            #  "真的停掉这条命令"，杀完再上抛给前端打中断提示。
+            #  先 SIGTERM 给命令一个清理的机会；宽限期内再按一次 Ctrl-C 即刻强杀
+            _kill_tree(proc, grace=_TERM_GRACE_SECONDS)
+            _reap(proc)
+            raise
+        except subprocess.TimeoutExpired:
+            #  宽限期内宿主叫停就不再等：直接强杀
+            _kill_tree(proc, grace=_TERM_GRACE_SECONDS, stop_requested=self.stop_requested)
+            #  整树已杀、管道随之关闭，这里只回收已缓冲的输出；再收不到就放弃，
+            #  绝不能为了一点残余输出重新陷入无限期等待。
+            _wait_bounded(proc, pipes, time.monotonic() + 10)
+            stdout_raw, stderr_raw = pipes[0].value(), pipes[1].value()
+            elapsed = time.monotonic() - started
+            #  超时不是 error：超时前的输出往往已经包含答案（比如测试
+            #  跑完了只是进程没退出）。提示前置 + 部分输出照样给模型，exit 124 是
+            #  timeout 命令的约定退出码。
+            partial = _partial_chunks(stdout_raw, stderr_raw)
+            capped = ""
+            if timeout and timeout > limit:
+                capped = (
+                    f"你给的 timeout={timeout}s 超过上限 {limit}s。更久的命令请用 run_in_background；"
+                    "等后台事件靠通知送达，不要 sleep。"
+                )
+            output = (
+                f"命令超时（{limit}s），已终止整个进程树（含后台子进程，"
+                f"实际等待 {elapsed:.0f}s）。{capped}以下是超时前已产生的输出：\n"
+                f"exit_status: 124 (timeout)\n{partial or '(无输出)'}"
+            )
+            return output + _interactive_auth_hint(partial)
+        except Interrupted:
+            #  宿主的 interrupt()：与 Ctrl-C 同一个待遇。打断标志此刻已经立着，
+            #  再催一次也看不出区别，所以这条路的宽限不可再打断——有界一秒
+            _kill_tree(proc, grace=_TERM_GRACE_SECONDS)
+            _reap(proc)
+            raise
+        except BaseException:
+            #  其余一切非正常退出：SIGTERM 被 session_log 转成的 SystemExit、
+            #  等待期间的任何异常。命令在独立会话里收不到我们的信号，不收割就
+            #  整树成孤儿一直活着——与 Ctrl-C 同理，杀完照常上抛。
+            #  不给宽限：本进程自己正在被要求退出
+            _kill_tree(proc)
+            _reap(proc)
+            raise
+        finally:
+            _unregister_foreground(proc)
+
+        chunks = [f"exit_status: {proc.returncode}"]
+        if stdout_text := _decode_output(stdout_raw).rstrip():
+            chunks.append(f"stdout:\n{stdout_text}")
+        if stderr_text := _decode_output(stderr_raw).rstrip():
+            chunks.append(f"stderr:\n{stderr_text}")
+        if len(chunks) == 1:
+            chunks.append("(无输出)")
+        #  超时杀掉的已在上面带着 exit 124 提前返回，这里的信号只可能来自外部
+        output = "\n".join(chunks) + _signal_exit_hint(proc.returncode)
+        if escalation:
+            #  升权执行的结果打标：用户和模型都要看得出"这次是升权跑的"
+            output = f"[沙箱：本次调用已按 {escalation} 升权执行，仅本次生效]\n" + output
+        if sandboxed and proc.returncode != 0:
+            #  两类正交分开报：runner 自身失败 = 命令根本没跑，
+            #  是沙箱问题；疑似拒绝 = 命令跑了被策略挡。混为一谈会把模型
+            #  引向错误的下一步（对沙箱故障升权、或对策略拦截重试原命令）。
+            if failure_line := sandbox.runner_failure(output):
+                output += (
+                    "\n[沙箱提示] 沙箱运行器自身失败（{line}）——**命令没有执行**。"
+                    "这是沙箱环境的问题，不是命令的问题：重试原命令或升权都没有意义，"
+                    "请向用户说明沙箱异常（可用 XIAOYU_SANDBOX=0 暂时关闭后重试）。"
+                ).format(line=failure_line)
+            elif sandbox.looks_denied(
+                output, network_disabled=not self.config.sandbox_network
+            ):
+                #  内核只回 EPERM，模型看不出"是我越界了"还是"命令本身坏了"，
+                #  不提示它就会原地重试到撞上循环护栏。
+                output += "\n" + sandbox.denial_hint(
+                    self.config.workspace,
+                    self.config.sandbox_network,
+                    escalation=bool(self._escalation_modes()),
+                )
+        return output
+
+    def _wait_task(self, task: Any, deadline: float) -> None:
+        """等一个后台任务结束，不超过 deadline；宿主叫停就抛 Interrupted。
+
+        宿主的 interrupt() 只是置个标志，打不断一个阻塞着的 Event.wait——不切片
+        问的话，serve 的 abort、ACP 的 cancel 都要等这里最长十分钟的等待自己到点。
+        任务本身不动：等的人走了，它照常在后台跑、完成时照常通知。
+        """
+        while not task.done.is_set():
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return
+            if self.stop_requested is None:
+                task.done.wait(remaining)
+                return
+            if task.done.wait(min(_STOP_POLL_SECONDS, remaining)):
+                return
+            if self.stop_requested():
+                raise Interrupted("宿主请求打断")
+
+    def _task_output(
+        self,
+        task_ids: Any,
+        timeout: int | None = None,
+        offset: int | None = None,
+        limit: int | None = None,
+    ) -> str:
+        """后台任务快照 / 有界等待 / 按字节分段续读。宽进：单个 id 裸字符串也收。
+
+        不给 offset / limit 是原来的头尾快照；给了任一个就按字节切片，并回
+        next_offset 供下一段接着读。同一任务、同一偏移、状态与 next_offset 都
+        和上次一样时提醒一句——那是在原地重查，看多少遍都是同一份内容。
+        """
+        if isinstance(task_ids, str):
+            # 保留单 id 与 JSON 编码数组两种已有输入形式。
+            task_ids = coerce_to_schema(task_ids, {"type": "array", "items": {"type": "string"}})
+            if isinstance(task_ids, str):
+                task_ids = [task_ids]
+        if not isinstance(task_ids, list) or not task_ids:
+            return "ERROR: task_ids 必须是非空数组（单个任务写成一元数组）。"
+        ids: list[str] = []
+        for item in task_ids:
+            text = str(item).strip()
+            if text and text not in ids:
+                ids.append(text)
+        wait = min(max(int(timeout or 0), 0), 600)
+        sliced = offset is not None or limit is not None
+        start = max(int(offset or 0), 0)
+        span = max(int(limit or OUTPUT_READ_BYTES), 1)
+        deadline = time.monotonic() + wait
+        sections: list[str] = []
+        for task_id in ids:
+            task = self.tasks.get(task_id)
+            if task is None:
+                known = ", ".join(self.tasks.known_ids()) or "（无）"
+                sections.append(f"{task_id}：not_found。已知任务：{known}")
+                continue
+            if wait:
+                self._wait_task(task, deadline)
+            status = task.status
+            head = f"{task_id}：{status}"
+            if task.done.is_set():
+                head += f"（exit {task.exit_code}，用时 {task.elapsed():.1f}s）"
+            else:
+                head += f"（已运行 {task.elapsed():.0f}s）"
+                if wait:
+                    head += "——等待已到上限，不必再调；任务完成时会自动通知你"
+            if sliced:
+                body, next_offset, size = self.tasks.output_slice(task, start, span)
+                tail = f"[字节 {start}-{next_offset}，日志共 {size} 字节；next_offset={next_offset}"
+                tail += "，已到末尾]" if next_offset >= size else "，接着读就填这个 offset]"
+                body = body if body.strip() else "（这一段没有内容）"
+            else:
+                body = self.tasks.output_of(task)
+                try:
+                    next_offset = task.log_path.stat().st_size
+                except OSError:
+                    next_offset = -1
+                tail = ""
+            #  原地重查：同一任务、同一偏移、状态没变、日志也没长
+            seen = (start if sliced else None, status, next_offset)
+            if self._task_output_seen.get(task_id) == seen:
+                tail += (
+                    "\n[内容与上次查询相同，别立刻重查：任务完成会自动通知你；"
+                    "要等就用一次带 timeout 的 task_output，长期盯着用 monitor]"
+                )
+            self._task_output_seen[task_id] = seen
+            sections.append(f"{head}\n输出：\n{body}{tail}")
+        return "\n\n".join(sections)
+
+    def _kill_task(self, task_id: str) -> str:
+        return self.tasks.kill(str(task_id).strip())
+
+    def _monitor(
+        self, command: str, description: str, timeout: int | None = None
+    ) -> str:
+        limit = float(timeout or MONITOR_DEFAULT_TIMEOUT)
+        return self._spawn_background(
+            command, kind="monitor", description=description.strip() or command,
+            timeout=limit,
+        )
+
+    # ---------- 辅助 ----------
+
+    @contextlib.contextmanager
+    def tool_batch(self):
+        """本批读取结果尚未交给模型，不能为本批写入提供新的已读凭据。"""
+        previous = self._batch_reads
+        self._batch_reads = dict(self._reads) if self.config.batch_read_guard else None
+        try:
+            yield
+        finally:
+            self._batch_reads = previous
+
+    def _set_read_mark(self, target: Path, mark: _ReadMark, from_read: bool) -> None:
+        self._reads[target] = mark
+        # 写出的内容来自模型自己的参数，后续同批编辑可以沿用它。
+        if not from_read and self._batch_reads is not None:
+            self._batch_reads[target] = mark
+
+    def _mark_read(
+        self,
+        target: Path,
+        seen: tuple[tuple[int, int], ...] | None = None,
+        total: int = 0,
+        keep_level: bool = False,
+        *,
+        raw: bytes | None = None,
+        from_read: bool = False,
+    ) -> None:
+        """记下这个文件"已被读过"、读到了哪个程度，以及元数据和内容指纹。
+
+        seen=None 是模型手上有全文（完整读过，或刚由它整个写出来）；给了 seen
+        就是只看过这些行范围（1 起、闭区间），同一版本文件的多次分段读累加，
+        凑齐全部行即等同全文。keep_level 给局部替换后用：文件版本换了、行号也
+        可能错位，全文的仍算全文，只读过一部分的清空已读范围但保留"读过"。
+        raw 必须来自实际展示或写出的字节，不能在登记时重读并认证另一份内容。
+        """
+        try:
+            stat_result = target.stat()
+            mtime, size = stat_result.st_mtime, stat_result.st_size
+        except OSError:
+            mtime, size = 0.0, -1
+        digest = hashlib.sha256(raw).digest() if raw is not None else None
+        marks = self._batch_reads if not from_read and self._batch_reads is not None else self._reads
+        previous = marks.get(target)
+        if keep_level and previous is not None:
+            self._set_read_mark(target, _ReadMark(mtime, size, previous.whole, digest, (), 0), from_read)
+            return
+        if seen is None:
+            self._set_read_mark(target, _ReadMark(mtime, size, True, digest, (), 0), from_read)
+            return
+        ranges = list(seen)
+        whole = False
+        if digest is not None and previous is not None and (
+            previous.mtime, previous.size, previous.digest
+        ) == (mtime, size, digest):
+            #  同一版本上的又一次读：已读范围累加；之前就有全文的不降级
+            whole = previous.whole
+            ranges += previous.seen
+        merged = _merge_ranges(ranges)
+        if total and merged == ((1, total),):
+            whole = True
+        self._set_read_mark(target, _ReadMark(mtime, size, whole, digest, merged, total), from_read)
+
+    def _guard_known(self, target: Path, shown: str, whole: bool = False) -> str | None:
+        """改动已有文件前的两道闸：必须读过，且读过之后没被别人改。
+
+        whole=True 是整体覆盖：要求手上有全文。局部替换只要求读过——old_str 得
+        逐字对上、且在全文里唯一，这本身就证明模型知道它要改的那一段长什么样。
+        """
+        marks = self._batch_reads if self._batch_reads is not None else self._reads
+        mark = marks.get(target)
+        if mark is None and self._batch_reads is not None and target in self._reads:
+            return (f"ERROR: {shown} 在本批调用中才读取，模型尚未看到读取结果。"
+                    "请在下一次模型响应中再提交修改。")
+        if mark is None:
+            return (
+                f"ERROR: 还没读过 {shown}，不能直接改。"
+                "请先用 read_file 读一遍（用 bash cat 看过不算，我要确保你手上是完整现状）。"
+            )
+        try:
+            current = target.stat()
+        except OSError as exc:
+            return f"ERROR: 无法确认 {shown} 的当前内容：{exc}。请重新 read_file 后再改。"
+        if error := _unreadable_file_error(target, shown, size_cap=False):
+            return error
+        #  mtime 比"不等"而不是"更新"、再加上大小：换回一份更旧的文件（git checkout、
+        #  从备份恢复）mtime 是往回走的，只比"更新"会漏掉
+        changed = current.st_mtime != mark.mtime or (mark.size >= 0 and current.st_size != mark.size)
+        if not changed:
+            try:
+                # 时间与大小相同也可能是另一份内容；分块散列避免额外整读占用内存。
+                digest = hashlib.sha256()
+                with target.open("rb") as handle:
+                    while chunk := handle.read(1024 * 1024):
+                        digest.update(chunk)
+                changed = mark.digest is None or digest.digest() != mark.digest
+            except OSError as exc:
+                return f"ERROR: 无法确认 {shown} 的当前内容：{exc}。请重新 read_file 后再改。"
+        if changed:
+            return (
+                f"ERROR: {shown} 在你上次 read_file 之后被改动过"
+                "（可能是你自己用 bash 改的，或外部编辑器改的）。"
+                "请重新 read_file 拿到最新内容再改，否则会覆盖掉别人的改动。"
+            )
+        if whole and not mark.whole:
+            return (
+                f"ERROR: {shown} 你只读过一部分，不能整体覆盖——没读到的内容会被直接丢掉。"
+                "局部修改请用 str_replace；确实要整体重写，先用 read_file 的 offset/limit "
+                "把没读到的行分段读完。"
+            )
+        return None
+
+    @staticmethod
+    def _match_lines(text: str, needle: str) -> list[int]:
+        """needle 每次出现所在的行号。"""
+        lines: list[int] = []
+        start = 0
+        while (index := text.find(needle, start)) != -1:
+            lines.append(text.count("\n", 0, index) + 1)
+            start = index + 1
+        return lines
+
+    @staticmethod
+    def _near_miss_hint(text: str, old_str: str) -> str:
+        """old_str 没匹配上时，猜一下它大概想指哪几行，帮模型自愈。"""
+        probe = next((line.strip() for line in old_str.splitlines() if line.strip()), "")
+        if not probe:
+            return ""
+        hits = [
+            number
+            for number, line in enumerate(text.splitlines(), start=1)
+            if line.strip() == probe
+        ]
+        if not hits:
+            return ""
+        preview_line = probe if len(probe) <= 60 else probe[:60] + "…"
+        return (
+            f"\n提示：第 {', '.join(str(n) for n in hits[:5])} 行有内容去掉首尾空白后"
+            f"与你 old_str 的首行一致（{preview_line!r}），"
+            "很可能是缩进或行尾空白不一致。请重新 read_file 照抄原文。"
+        )
+
+    @staticmethod
+    def _context_around(text: str, offset: int, radius: int = 3) -> str:
+        """给出改动位置附近的带行号上下文，方便模型确认改对了。"""
+        lines = text.splitlines()
+        center = text.count("\n", 0, min(offset, len(text)))
+        start = max(0, center - radius)
+        end = min(len(lines), center + radius + 1)
+        width = len(str(end))
+        return "\n".join(
+            f"{number:>{width}} | {lines[number - 1]}" for number in range(start + 1, end + 1)
+        )
+
+    def _path_entry(self, path: str) -> Path:
+        candidate = Path(path).expanduser()
+        if not candidate.is_absolute():
+            candidate = self.config.workspace / candidate
+        return candidate.parent.resolve() / candidate.name
+
+    def _resolve(self, path: str) -> tuple[Path, bool]:
+        """相对工作区解析路径，并标记是否逃出工作区。"""
+        candidate = Path(path).expanduser()
+        if not candidate.is_absolute():
+            candidate = self.config.workspace / candidate
+        resolved = candidate.resolve()
+        outside = not any(resolved.is_relative_to(root) for root in
+                          (self.config.workspace, *self.config.additional_workspaces))
+        return resolved, outside
+
+    def _spill(self, name: str, text: str) -> tuple[Path, str] | None:
+        """把完整输出落盘并登记进召回表，返回 (文件路径, 短 id)；
+        写失败返回 None（退回纯截断）。"""
+        try:
+            if self._spill_dir is None:
+                #  resolve 后再存：outside_workspace 的豁免判断用的是 resolve 过的
+                #  路径，macOS 的 /var → /private/var 符号链接会让未解析形态对不上
+                self._spill_dir = tempdirs.make_dir("xiaoyu-spill-").resolve()
+            self._spill_seq += 1
+            spill_id = str(self._spill_seq)
+            safe_name = "".join(ch if ch.isalnum() else "-" for ch in name)[:40] or "tool"
+            path = self._spill_dir / f"{self._spill_seq:03d}-{safe_name}.txt"
+            path.write_text(text, encoding="utf-8")
+            first_line = next((ln.strip() for ln in text.splitlines() if ln.strip()), "")
+            self._spills[spill_id] = {
+                "path": path,
+                "name": name,
+                "chars": len(text),
+                "lines": text.count("\n") + 1,
+                "summary": first_line[:120],
+            }
+            return path, spill_id
+        except OSError:
+            return None
+
+    def adopt_history(self, messages: list[dict[str, Any]]) -> None:
+        """历史是接进来的（resume / fork / 精简副本）时调用：把里面的召回 id 作废。
+
+        召回 id 是每个工具箱从 1 起编的序号，落盘内容随进程清理。接回的历史里
+        那句"召回 id: 1"指的是上一个进程的文件——不处理的话，这边新落一次盘
+        又编出个 1，模型照旧预览去召回，拿到的是另一条命令的输出，而且没有
+        任何迹象。所以：已有的登记清掉（它们属于被换掉的那段对话），新 id 从
+        历史里出现过的最大号之后起编。
+        """
+        highest = 0
+        for message in messages:
+            if message.get("role") != "tool":
+                continue
+            for found in _RECALL_ID_MENTION.finditer(media.text_of(message.get("content"))):
+                highest = max(highest, int(found.group(1)))
+        self._spills.clear()
+        self._spill_seq = max(self._spill_seq, highest)
+        self._foreign_recall_ids = self._spill_seq
+
+    def _bound_output(self, name: str, text: str, limit: int | None = None) -> str:
+        """超长输出：完整落盘 + 内联留头尾预览和取回定位符（spill）。
+
+        纯截断会把中段永久丢掉——测试输出的中部失败、长日志的关键一段，
+        模型想再看只能重跑命令。落盘后中段随时可用 read_file/grep 按需取回，
+        重跑（可能有副作用、可能很慢）不再是唯一出路。落盘失败退回纯截断。
+        """
+        #  工具自己声明的上限只能比全局的更紧
+        limit = min(limit or self.config.max_tool_output, self.config.max_tool_output)
+        if len(text) <= limit:
+            return text
+        result = self._spill(name, text)
+        if result is None:
+            return self._truncate(text)
+        spilled, spill_id = result
+        omitted = len(text) - limit
+        head = limit // 2
+        tail = limit - head
+        marker = f"\n\n… [中间省略 {omitted} 字符，完整内容见召回 id {spill_id}] …\n\n"
+        total_lines = text.count("\n") + 1
+        return (
+            f"[输出超长：原始 {len(text)} 字符 / 约 {total_lines} 行，"
+            f"完整内容已存，召回 id: {spill_id}。"
+            f"需要中段时用 recall(id=\"{spill_id}\", pattern=…) 按正则找，或 "
+            f"recall(id=\"{spill_id}\", offset=行号, limit=行数) 取一段——不要为此重跑原命令。"
+            "以下保留开头和结尾]\n"
+            f"{text[:head]}{marker}{text[-tail:]}"
+        )
+
+    def _recall(
+        self,
+        id: str | None = None,
+        pattern: str | None = None,
+        offset: int | None = None,
+        limit: int | None = None,
+    ) -> str:
+        """按 id 召回超长输出的片段（addressable recall）。
+
+        无 id = 列表；id+pattern = 该输出内正则找行；id+offset/limit = 取行段；
+        id 单独 = 取一段中部（比 inline 预览多、又不至于再次撑爆）。
+        """
+        if not id:
+            if not self._spills:
+                return "没有可召回的输出（还没有工具输出超长落盘）。"
+            rows = [
+                f"  id {sid}: {meta['name']}（{meta['chars']} 字符 / {meta['lines']} 行）"
+                + (f" — {meta['summary']}" if meta["summary"] else "")
+                for sid, meta in self._spills.items()
+            ]
+            return "可召回的输出：\n" + "\n".join(rows)
+        meta = self._spills.get(str(id).strip())
+        if meta is None:
+            avail = "、".join(self._spills) or "（无）"
+            wanted = str(id).strip()
+            if wanted.isdigit() and 0 < int(wanted) <= self._foreign_recall_ids:
+                return (
+                    f"ERROR: 召回 id {id} 是带进来的历史里留下的，它的内容落盘在"
+                    "别的进程或别的会话里，这里取不回。还需要这份输出的话只能重跑"
+                    f"原命令。当前可用 id：{avail}"
+                )
+            return f"ERROR: 没有召回 id {id}。可用 id：{avail}"
+        try:
+            text = Path(meta["path"]).read_text(encoding="utf-8", errors="replace")
+        except OSError as exc:
+            return f"ERROR: 召回 id {id} 的文件已不可读（{exc}）——可能会话临时目录已被清理，只能重跑原命令。"
+        lines = text.splitlines()
+        total = len(lines)
+        #  recall 的结果也会经 run() 外层的 _bound_output——若超长会再次落盘、
+        #  生成新 id 又把中段丢掉。所以这里主动把结果压到预算内（从开头留，尾部
+        #  截并注明），召回自己绝不触发二次 spill
+        budget = max(200, self.config.max_tool_output - 200)
+
+        def fit(header: str, body: str, tail_hint: str) -> str:
+            if len(body) <= budget:
+                return f"{header}\n{body}"
+            return f"{header}（内容过长，只显示前 {budget} 字符，{tail_hint}）\n{body[:budget]}"
+
+        if pattern:
+            try:
+                rx = re.compile(pattern)
+            except re.error as exc:
+                return f"ERROR: 正则有误：{exc}"
+            hits = [f"{n}: {ln}" for n, ln in enumerate(lines, 1) if rx.search(ln)]
+            if not hits:
+                return f"召回 id {id}（{total} 行）里没有匹配 {pattern!r} 的行。"
+            return fit(
+                f"召回 id {id} 匹配 {pattern!r}（{len(hits)} 处）：",
+                "\n".join(hits),
+                "缩小范围或用 offset/limit 取具体段",
+            )
+        if offset is not None or limit is not None:
+            start = max(1, offset or 1)
+            if start > total:
+                return f"ERROR: 召回 id {id} 只有 {total} 行，offset={start} 超出范围"
+            end = total if limit is None else min(total, start + max(1, limit) - 1)
+            chunk = "\n".join(lines[start - 1 : end])
+            return fit(f"[召回 id {id} 第 {start}-{end} 行，共 {total} 行]", chunk, "减小 limit")
+        #  只给 id：取中部一段（inline 预览已给头尾，中部最可能是被丢掉的）
+        if len(text) <= budget:
+            return f"[召回 id {id} 完整内容，{total} 行]\n{text}"
+        mid = len(text) // 2
+        half = budget // 2
+        lo, hi = max(0, mid - half), mid + half
+        return (
+            f"[召回 id {id} 中段（约第 {lo}–{hi} 字符，共 {meta['chars']}）；"
+            f"要头尾看原预览，要定位段用 pattern= 或 offset=]\n{text[lo:hi]}"
+        )
+
+    def _truncate(self, text: str) -> str:
+        """超长输出保头保尾、砍中段。
+
+        只留开头会把最关键的部分砍掉——测试输出的失败汇总、构建的最终错误
+        都在结尾。顶部先声明原始规模，模型才能决定要不要换姿势重取。
+        """
+        limit = self.config.max_tool_output
+        if len(text) <= limit:
+            return text
+        omitted = len(text) - limit
+        head = limit // 2
+        tail = limit - head
+        marker = f"\n\n… [中间已截断 {omitted} 字符] …\n\n"
+        return (
+            f"[警告：输出超长已截断——原始 {len(text)} 字符 / "
+            f"约 {text.count(chr(10)) + 1} 行，以下保留开头和结尾]\n"
+            f"{text[:head]}{marker}{text[-tail:]}"
+        )

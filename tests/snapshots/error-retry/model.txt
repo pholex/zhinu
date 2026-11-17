@@ -1,0 +1,5 @@
+# 限流一次后恢复（纯手写：真 API 录不出确定的 429 时序）
+error: rate limit 429
+---
+text: "恢复了。"
+usage: {"prompt_tokens": 120, "completion_tokens": 5}

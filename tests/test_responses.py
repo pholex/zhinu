@@ -1,0 +1,1011 @@
+"""Responses 协议翻译层：请求形态、事件流、鸭子型 client。不打网络。
+
+断言的对象是"两种 wire format 之间的翻译"，所以每条用例都拿真实观测到的形状
+写死——事件名、字段名（output_index / call_id / input_tokens）一旦变，这里先红。
+"""
+
+from __future__ import annotations
+
+import unittest
+from types import SimpleNamespace
+from typing import Any
+
+from xiaoyu import responses
+from xiaoyu.errors import StreamFailed, classify
+from xiaoyu.responses import (
+    REASONING_KEY,
+    Transport,
+    to_completion,
+    to_input,
+    to_request,
+    to_tools,
+)
+
+
+def event(kind: str, **fields: Any) -> SimpleNamespace:
+    return SimpleNamespace(type=kind, **fields)
+
+
+def text_delta(text: str, index: int = 0) -> SimpleNamespace:
+    return event("response.output_text.delta", delta=text, output_index=index)
+
+
+def call_added(index: int, call_id: str, name: str) -> SimpleNamespace:
+    return event(
+        "response.output_item.added",
+        output_index=index,
+        item=SimpleNamespace(type="function_call", call_id=call_id, name=name),
+    )
+
+
+def args_delta(index: int, text: str) -> SimpleNamespace:
+    return event(
+        "response.function_call_arguments.delta", output_index=index, delta=text
+    )
+
+
+def completed(input_tokens: int = 0, output_tokens: int = 0) -> SimpleNamespace:
+    return event(
+        "response.completed",
+        response=SimpleNamespace(
+            usage=SimpleNamespace(input_tokens=input_tokens, output_tokens=output_tokens)
+        ),
+    )
+
+
+TOOL = {
+    "type": "function",
+    "function": {
+        "name": "read_file",
+        "description": "读文件",
+        "parameters": {"type": "object", "properties": {"path": {"type": "string"}}},
+    },
+}
+
+
+class FakeResponses:
+    """录下 responses.create 收到的参数，回放预设的事件流/响应。"""
+
+    def __init__(self, events: list[Any] | None = None, result: Any = None) -> None:
+        self._events = events or []
+        self._result = result
+        self.calls: list[dict[str, Any]] = []
+
+    def create(self, **kwargs: Any) -> Any:
+        self.calls.append(kwargs)
+        return iter(self._events) if kwargs.get("stream") else self._result
+
+
+class FakeChatCompletions:
+    def __init__(self) -> None:
+        self.calls: list[dict[str, Any]] = []
+
+    def create(self, **kwargs: Any) -> str:
+        self.calls.append(kwargs)
+        return "chat-result"
+
+
+class FakeClient:
+    def __init__(self, responses_api: FakeResponses) -> None:
+        self.responses = responses_api
+        self.chat = SimpleNamespace(completions=FakeChatCompletions())
+        self.marker = "inner"
+
+    def with_options(self, **kwargs: Any) -> "FakeClient":
+        clone = FakeClient(self.responses)
+        clone.marker = f"inner+{kwargs}"
+        return clone
+
+
+def responses_transport(api: FakeResponses) -> Transport:
+    return Transport(FakeClient(api), (responses.WILDCARD,))
+
+
+class TestRequestTranslation(unittest.TestCase):
+    def test_tool_calls_become_flat_items_paired_by_call_id(self) -> None:
+        """assistant.tool_calls / role:tool 都要拍平成平级 item，靠 call_id 配对。"""
+        messages = [
+            {"role": "system", "content": "你是小羽"},
+            {"role": "user", "content": "读文件"},
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [
+                    {
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {"name": "read_file", "arguments": '{"path":"a"}'},
+                    }
+                ],
+            },
+            {"role": "tool", "tool_call_id": "call_1", "content": "文件内容"},
+        ]
+        self.assertEqual(
+            to_input(messages),
+            [
+                {"role": "system", "content": "你是小羽"},
+                {"role": "user", "content": "读文件"},
+                {
+                    "type": "function_call",
+                    "call_id": "call_1",
+                    "name": "read_file",
+                    "arguments": '{"path":"a"}',
+                },
+                {"type": "function_call_output", "call_id": "call_1", "output": "文件内容"},
+            ],
+        )
+
+    def test_assistant_with_text_and_tool_calls_emits_both(self) -> None:
+        """边说话边调工具：消息 item 在前，function_call 在后，顺序不能颠倒。"""
+        items = to_input(
+            [
+                {
+                    "role": "assistant",
+                    "content": "我看一下",
+                    "tool_calls": [
+                        {"id": "c1", "function": {"name": "ls", "arguments": "{}"}}
+                    ],
+                }
+            ]
+        )
+        self.assertEqual([item.get("role") or item["type"] for item in items],
+                         ["assistant", "function_call"])
+
+    def test_empty_content_assistant_emits_no_message_item(self) -> None:
+        """只带 tool_calls 的 assistant 不发空消息——Responses 拒收空 content。"""
+        items = to_input(
+            [{"role": "assistant", "content": None,
+              "tool_calls": [{"id": "c1", "function": {"name": "ls", "arguments": "{}"}}]}]
+        )
+        self.assertEqual([item["type"] for item in items], ["function_call"])
+
+    def test_missing_arguments_defaults_to_empty_object(self) -> None:
+        """arguments 为空串时补 "{}"：Responses 要求它是合法 JSON 串。"""
+        items = to_input(
+            [{"role": "assistant", "tool_calls": [{"id": "c1", "function": {"name": "ls"}}]}]
+        )
+        self.assertEqual(items[0]["arguments"], "{}")
+
+    def test_tools_are_flattened_with_strict_off(self) -> None:
+        """schema 拍平 + strict 显式关掉（Responses 侧默认 True，会整批拒收）。"""
+        self.assertEqual(
+            to_tools([TOOL]),
+            [
+                {
+                    "type": "function",
+                    "name": "read_file",
+                    "description": "读文件",
+                    "parameters": TOOL["function"]["parameters"],
+                    "strict": False,
+                }
+            ],
+        )
+
+    def test_native_tools_pass_through(self) -> None:
+        """已经是 Responses 形态的（web_search 等内置工具）原样透传。"""
+        native = {"type": "web_search"}
+        self.assertEqual(to_tools([native]), [native])
+
+    def test_request_disables_store_and_renames_token_cap(self) -> None:
+        """store=False 与 chat 行为对齐；max_tokens 系改名，其余参数原样透传。"""
+        request = to_request(
+            "gpt-5.6-sol",
+            [{"role": "user", "content": "hi"}],
+            [TOOL],
+            {"max_completion_tokens": 16, "temperature": 0.2},
+        )
+        self.assertIs(request["store"], False)
+        self.assertEqual(request["max_output_tokens"], 16)
+        self.assertEqual(request["temperature"], 0.2)
+        self.assertNotIn("max_completion_tokens", request)
+
+    def test_no_tools_key_when_tools_absent(self) -> None:
+        """收尾总结那类"不许干活"的调用不能带 tools 键。"""
+        self.assertNotIn(
+            "tools", to_request("m", [{"role": "user", "content": "hi"}], None, {})
+        )
+
+
+class TestStreamTranslation(unittest.TestCase):
+    def collect(self, events: list[Any]) -> tuple[str, dict[int, dict[str, Any]], Any]:
+        """按 agent._consume_stream 的原样攒法消费，保证断言的是内核真实读法。"""
+        text: list[str] = []
+        pending: dict[int, dict[str, Any]] = {}
+        seen_usage = None
+        for chunk in responses.stream_chunks(iter(events)):
+            if chunk.usage:
+                seen_usage = chunk.usage
+            if not chunk.choices:
+                continue
+            delta = chunk.choices[0].delta
+            if delta.content:
+                text.append(delta.content)
+            for fragment in delta.tool_calls or []:
+                slot = pending.setdefault(
+                    fragment.index,
+                    {"id": "", "type": "function", "function": {"name": "", "arguments": ""}},
+                )
+                if fragment.id:
+                    slot["id"] = fragment.id
+                if fragment.function is None:
+                    continue
+                if fragment.function.name and not slot["function"]["name"]:
+                    slot["function"]["name"] = fragment.function.name
+                if fragment.function.arguments:
+                    slot["function"]["arguments"] += fragment.function.arguments
+        return "".join(text), pending, seen_usage
+
+    def test_text_deltas_concatenate(self) -> None:
+        text, pending, _ = self.collect([text_delta("你"), text_delta("好"), completed()])
+        self.assertEqual((text, pending), ("你好", {}))
+
+    def test_function_call_assembles_from_fragments(self) -> None:
+        """name 随 item 一次给全、arguments 分片累加——攒出来必须是完整 tool_call。"""
+        _, pending, _ = self.collect(
+            [
+                call_added(0, "call_x", "read_file"),
+                args_delta(0, '{"pa'),
+                args_delta(0, 'th":"a"}'),
+                completed(),
+            ]
+        )
+        self.assertEqual(
+            pending,
+            {
+                0: {
+                    "id": "call_x",
+                    "type": "function",
+                    "function": {"name": "read_file", "arguments": '{"path":"a"}'},
+                }
+            },
+        )
+
+    def test_parallel_calls_keep_output_index_as_slot(self) -> None:
+        """output_index 直接当 tool_calls[].index：并行调用不能串槽。"""
+        _, pending, _ = self.collect(
+            [
+                call_added(0, "c0", "a"),
+                call_added(1, "c1", "b"),
+                args_delta(1, "{}"),
+                args_delta(0, "{}"),
+                completed(),
+            ]
+        )
+        self.assertEqual([pending[i]["id"] for i in sorted(pending)], ["c0", "c1"])
+
+    def test_usage_field_names_are_translated(self) -> None:
+        """input/output_tokens → prompt/completion_tokens：记账靠这一步。"""
+        _, _, usage = self.collect([text_delta("x"), completed(11, 22)])
+        self.assertEqual((usage.prompt_tokens, usage.completion_tokens), (11, 22))
+
+    def test_completed_without_usage_still_signals_finish(self) -> None:
+        """不回 usage 的兼容端点：收尾事件补一个 stop，内核才不会把它当断流重发。"""
+        chunks = list(
+            responses.stream_chunks(iter([event("response.completed", response=SimpleNamespace(usage=None))]))
+        )
+        self.assertEqual([c.choices[0].finish_reason for c in chunks if c.choices], ["stop"])
+        #  有 usage 时形状不变：不多发 stop
+        with_usage = list(responses.stream_chunks(iter([completed(1, 2)])))
+        self.assertEqual([c for c in with_usage if c.choices], [])
+
+    def test_usage_chunk_carries_no_choices(self) -> None:
+        """收尾 usage chunk 的 choices 必须为空——内核靠它跳过，形状同 chat 流末尾。"""
+        chunks = list(responses.stream_chunks(iter([completed(1, 2)])))
+        self.assertEqual([chunk.choices for chunk in chunks], [[]])
+
+    def test_reasoning_and_unknown_events_are_ignored(self) -> None:
+        """推理摘要等事件没有展示位，必须彻底忽略而不是混进正文。"""
+        text, pending, _ = self.collect(
+            [
+                event("response.created"),
+                event("response.reasoning_summary_text.delta", delta="想一想"),
+                event("response.output_item.added",
+                      output_index=0, item=SimpleNamespace(type="reasoning")),
+                text_delta("答案"),
+                event("response.output_item.done"),
+                completed(),
+            ]
+        )
+        self.assertEqual((text, pending), ("答案", {}))
+
+    def test_failed_and_error_events_raise(self) -> None:
+        """上游失败必须抛出去，交给 agent 那层的分类，不能静默收流。
+
+        类型必须是 StreamFailed 而不是裸 RuntimeError：这条路径上没有 HTTP 状态码，
+        裸异常会被 classify 兜底成 fatal——一次容量抖动就不退避不换路由地打死整轮。
+        """
+        with self.assertRaises(StreamFailed) as failed:
+            list(responses.stream_chunks(iter([
+                event("response.failed",
+                      response=SimpleNamespace(error=SimpleNamespace(message="内部错误"))),
+            ])))
+        self.assertIn("内部错误", str(failed.exception))
+        self.assertEqual(classify(failed.exception).kind, "transient")
+        with self.assertRaises(StreamFailed) as errored:
+            list(responses.stream_chunks(iter([event("error", message="连接断了")])))
+        self.assertIn("连接断了", str(errored.exception))
+        self.assertTrue(classify(errored.exception).retryable)
+
+    def test_failure_carries_the_error_code_for_classification(self) -> None:
+        """超限的文案不含任何可认的词，码才是稳定的判据：码丢了就会被兜底成
+        transient，同一个超大请求原样重发到预算烧光。"""
+        with self.assertRaises(StreamFailed) as failed:
+            list(responses.stream_chunks(iter([
+                event("response.failed", response=SimpleNamespace(error=SimpleNamespace(
+                    message="请求未能完成", code="context_length_exceeded"))),
+            ])))
+        self.assertIn("context_length_exceeded", str(failed.exception))
+        self.assertEqual(classify(failed.exception).kind, "context_overflow")
+        with self.assertRaises(StreamFailed) as errored:
+            list(responses.stream_chunks(iter([
+                event("error", message="余额不足", code="insufficient_quota")
+            ])))
+        self.assertEqual(classify(errored.exception).kind, "quota")
+
+    def test_incomplete_keeps_partial_text_instead_of_raising(self) -> None:
+        """截断/内容过滤不抛：chat 侧 finish_reason=length 也是照常返回半截正文。"""
+        text, _, usage = self.collect([
+            text_delta("半截"),
+            event("response.incomplete",
+                  response=SimpleNamespace(
+                      usage=SimpleNamespace(input_tokens=3, output_tokens=4),
+                      incomplete_details=SimpleNamespace(reason="max_output_tokens"))),
+        ])
+        self.assertEqual(text, "半截")
+        self.assertEqual((usage.prompt_tokens, usage.completion_tokens), (3, 4))
+
+    def test_max_output_tokens_surfaces_as_length(self) -> None:
+        chunks = list(responses.stream_chunks(iter([
+            event("response.incomplete",
+                  response=SimpleNamespace(
+                      usage=SimpleNamespace(input_tokens=3, output_tokens=4),
+                      incomplete_details=SimpleNamespace(reason="max_output_tokens"))),
+        ])))
+        self.assertEqual([c.choices[0].finish_reason for c in chunks if c.choices], ["length"])
+
+    def test_content_filter_surfaces_as_finish_reason(self) -> None:
+        """内容过滤要透传成 finish_reason，否则内核只看到空补全、当断流重发。"""
+        chunks = list(responses.stream_chunks(iter([
+            event("response.incomplete",
+                  response=SimpleNamespace(
+                      usage=SimpleNamespace(input_tokens=3, output_tokens=0),
+                      incomplete_details=SimpleNamespace(reason="content_filter"))),
+        ])))
+        reasons = [c.choices[0].finish_reason for c in chunks if c.choices]
+        self.assertEqual(reasons, ["content_filter"])
+
+
+class TestDuckClient(unittest.TestCase):
+    def test_stream_call_translates_request_and_response(self) -> None:
+        api = FakeResponses(events=[text_delta("好"), completed(5, 6)])
+        client = responses_transport(api)
+        chunks = list(
+            client.chat.completions.create(
+                model="gpt-5.6-sol",
+                messages=[{"role": "user", "content": "hi"}],
+                stream=True,
+                stream_options={"include_usage": True},
+                tools=[TOOL],
+            )
+        )
+        sent = api.calls[0]
+        self.assertEqual(sent["model"], "gpt-5.6-sol")
+        self.assertEqual(sent["input"], [{"role": "user", "content": "hi"}])
+        self.assertIs(sent["store"], False)
+        self.assertIs(sent["stream"], True)
+        self.assertEqual(sent["tools"][0]["name"], "read_file")
+        #  stream_options 是 chat 独有的，不许漏进 Responses 请求
+        self.assertNotIn("stream_options", sent)
+        self.assertEqual(chunks[0].choices[0].delta.content, "好")
+
+    def test_non_stream_call_looks_like_a_completion(self) -> None:
+        """摘要路径读的是 choices[0].message.content 与 usage。"""
+        api = FakeResponses(
+            result=SimpleNamespace(
+                output_text="摘要正文",
+                usage=SimpleNamespace(input_tokens=7, output_tokens=8),
+            )
+        )
+        client = responses_transport(api)
+        result = client.chat.completions.create(
+            model="m", messages=[{"role": "user", "content": "hi"}]
+        )
+        self.assertEqual(result.choices[0].message.content, "摘要正文")
+        self.assertEqual(result.usage.prompt_tokens, 7)
+        self.assertNotIn("stream", api.calls[0])
+
+    def test_other_attributes_delegate_to_inner_client(self) -> None:
+        """web_search 直接用 client.responses.create，这层不能挡住。"""
+        api = FakeResponses()
+        client = responses_transport(api)
+        self.assertIs(client.responses, api)
+        self.assertEqual(client.marker, "inner")
+
+    def test_with_options_keeps_protocol(self) -> None:
+        """带超时的副本仍须是包过的、且协议不变，否则会悄悄退回裸 client。"""
+        client = responses_transport(FakeResponses()).with_options(timeout=1.0)
+        self.assertIsInstance(client, Transport)
+        self.assertEqual(client.protocol_for("any"), "responses")
+        self.assertEqual(client.marker, "inner+{'timeout': 1.0}")
+
+    def test_protocol_is_decided_per_model(self) -> None:
+        """协议按型号定：同一家常常只有部分型号开了 Responses（上一代 deepseek 就是
+        flash 通、pro 不通，而 pro 当时是默认主模型——按家切会当场切死）。"""
+        inner = FakeClient(FakeResponses())
+        partial = responses.wrap(inner, ("deepseek-flash",))
+        self.assertEqual(partial.protocol_for("deepseek-flash"), "responses")
+        self.assertEqual(partial.protocol_for("chat-only-model"), "chat")
+        whole = responses.wrap(inner, (responses.WILDCARD,))
+        self.assertEqual(whole.protocol_for("随便什么名字"), "responses")
+        #  没声明 = 整家走 chat（净化仍然照做，见 TestChatPassthrough）
+        self.assertEqual(responses.wrap(inner, ()).protocol_for("m"), "chat")
+
+    def test_partial_provider_routes_each_model_to_its_own_protocol(self) -> None:
+        """同一个 client 上两个型号各走各的路，不能串。"""
+        inner = FakeClient(FakeResponses(events=[completed()]))
+        client = responses.wrap(inner, ("deepseek-flash",))
+        list(client.chat.completions.create(
+            model="deepseek-flash", messages=[{"role": "user", "content": "hi"}], stream=True))
+        client.chat.completions.create(
+            model="chat-only-model", messages=[{"role": "user", "content": "hi"}])
+        self.assertEqual([c["model"] for c in inner.responses.calls], ["deepseek-flash"])
+        self.assertEqual(
+            [c["model"] for c in inner.chat.completions.calls], ["chat-only-model"]
+        )
+
+
+class TestChatPassthrough(unittest.TestCase):
+    """chat 协议也过 Transport：唯一的活儿是摘私有键，其余必须原样直发。"""
+
+    def send(self, **kwargs: Any) -> dict[str, Any]:
+        inner = FakeClient(FakeResponses())
+        client = Transport(inner, responses.CHAT)
+        client.chat.completions.create(**kwargs)
+        return inner.chat.completions.calls[0]
+
+    def test_request_is_forwarded_verbatim(self) -> None:
+        sent = self.send(
+            model="chat-only-model",
+            messages=[{"role": "user", "content": "hi"}],
+            stream=True,
+            stream_options={"include_usage": True},
+            tools=[TOOL],
+        )
+        self.assertEqual(
+            sent,
+            {
+                "model": "chat-only-model",
+                "messages": [{"role": "user", "content": "hi"}],
+                "stream": True,
+                "stream_options": {"include_usage": True},
+                "tools": [TOOL],
+            },
+        )
+
+    def test_absent_options_are_omitted_not_none(self) -> None:
+        """显式 None 会被 SDK 当成"发个 null 上去"，有的端点因此 400。"""
+        sent = self.send(model="m", messages=[{"role": "user", "content": "hi"}])
+        self.assertEqual(sorted(sent), ["messages", "model"])
+
+    def test_private_keys_never_reach_the_chat_endpoint(self) -> None:
+        """`_reasoning` 是内核私有的。漏出去不报错——只是每轮白付一千字符的
+        input token，所以这条断言是唯一能发现它的地方。"""
+        history = [
+            {"role": "user", "content": "hi"},
+            {"role": "assistant", "content": "ok", REASONING_KEY: {"model": "m", "items": [{}]}},
+        ]
+        sent = self.send(model="chat-only-model", messages=history)
+        self.assertEqual(
+            sent["messages"],
+            [{"role": "user", "content": "hi"}, {"role": "assistant", "content": "ok"}],
+        )
+        #  原始历史不许被就地改写：内核还要拿它继续对话
+        self.assertIn(REASONING_KEY, history[1])
+
+    def test_cache_key_is_dropped_on_chat(self) -> None:
+        sent = self.send(model="m", messages=[{"role": "user", "content": "hi"}],
+                         **{responses.CACHE_KEY: "k"})
+        self.assertEqual(sorted(sent), ["messages", "model"])
+
+
+class TestMaxOutputTokens(unittest.TestCase):
+    """XIAOYU_MAX_OUTPUT_TOKENS：本地小模型/中转站限输出上限，超了 400。
+    内核统一用 chat 的 max_tokens 出，三路在出网口各自翻译。"""
+
+    MESSAGES = [{"role": "user", "content": "hi"}]
+
+    def test_chat_gets_max_tokens_stream_full_and_sync_capped(self) -> None:
+        inner = FakeClient(FakeResponses())
+        client = Transport(inner, (), max_output_tokens=20_000)
+        client.chat.completions.create(model="m", messages=self.MESSAGES, stream=True)
+        client.chat.completions.create(model="m", messages=self.MESSAGES)
+        stream_call, sync_call = inner.chat.completions.calls
+        self.assertEqual(stream_call["max_tokens"], 20_000)
+        self.assertEqual(sync_call["max_tokens"], responses.SYNC_MAX_TOKENS, "同步请求取 min(设值, 常量)")
+        self.assertNotIn("max_completion_tokens", stream_call)
+
+    def test_small_cap_applies_to_sync_too(self) -> None:
+        inner = FakeClient(FakeResponses())
+        Transport(inner, (), max_output_tokens=512).chat.completions.create(model="m", messages=self.MESSAGES)
+        self.assertEqual(inner.chat.completions.calls[0]["max_tokens"], 512)
+
+    def test_responses_protocol_translates_to_max_output_tokens(self) -> None:
+        api = FakeResponses(result=SimpleNamespace(id="r", output=[], usage=None, status="completed", incomplete_details=None))
+        client = Transport(FakeClient(api), (responses.WILDCARD,), max_output_tokens=4096)
+        client.chat.completions.create(model="m", messages=self.MESSAGES)
+        sent = api.calls[0]
+        self.assertEqual(sent["max_output_tokens"], 4096)
+        self.assertNotIn("max_tokens", sent)
+
+    def test_unset_means_nothing_is_added(self) -> None:
+        inner = FakeClient(FakeResponses())
+        Transport(inner, ()).chat.completions.create(model="m", messages=self.MESSAGES, stream=True)
+        self.assertNotIn("max_tokens", inner.chat.completions.calls[0])
+
+    def test_explicit_caller_value_wins(self) -> None:
+        inner = FakeClient(FakeResponses())
+        client = Transport(inner, (), max_output_tokens=20_000)
+        client.chat.completions.create(model="m", messages=self.MESSAGES, max_tokens=300)
+        client.chat.completions.create(model="m", messages=self.MESSAGES, max_completion_tokens=301)
+        first, second = inner.chat.completions.calls
+        self.assertEqual(first["max_tokens"], 300)
+        self.assertEqual(second["max_completion_tokens"], 301)
+        self.assertNotIn("max_tokens", second)
+
+    def test_with_options_keeps_the_cap(self) -> None:
+        client = Transport(FakeClient(FakeResponses()), (), max_output_tokens=99)
+        self.assertEqual(client.with_options(timeout=1).max_output_tokens, 99)
+
+
+class TestChatCacheControl(unittest.TestCase):
+    """网关下 Claude 后端的 chat 载荷缓存断点：没有断点上游一个 token 都不缓存
+    （2026-10-02 对自建 LiteLLM 网关实测）。断点只落在发送副本上。"""
+
+    def send(self, provider: str, model: str, messages: list, tools: list | None = None) -> dict:
+        inner = FakeClient(FakeResponses())
+        client = Transport(inner, responses.CHAT, provider=provider)
+        kwargs: dict[str, Any] = {"model": model, "messages": messages}
+        if tools is not None:
+            kwargs["tools"] = tools
+        client.chat.completions.create(**kwargs)
+        return inner.chat.completions.calls[0]
+
+    @staticmethod
+    def marked(messages: list) -> list[int]:
+        return [
+            index for index, message in enumerate(messages)
+            if "cache_control" in message
+            or (isinstance(message.get("content"), list)
+                and any("cache_control" in block for block in message["content"]))
+        ]
+
+    def test_provider_name_matches_registry(self) -> None:
+        from xiaoyu.providers import GATEWAY
+
+        self.assertEqual(responses.GATEWAY_PROVIDER, GATEWAY)
+
+    def test_system_tools_and_tail_get_breakpoints(self) -> None:
+        history = [
+            {"role": "system", "content": "你是小羽"},
+            {"role": "user", "content": "hi"},
+        ]
+        sent = self.send("gateway", "claude-sonnet-5.5", history, [TOOL])
+        self.assertEqual(
+            sent["messages"][0]["content"],
+            [{"type": "text", "text": "你是小羽", "cache_control": {"type": "ephemeral"}}],
+        )
+        self.assertEqual(
+            sent["messages"][1]["content"],
+            [{"type": "text", "text": "hi", "cache_control": {"type": "ephemeral"}}],
+        )
+        self.assertEqual(sent["tools"][-1]["cache_control"], {"type": "ephemeral"})
+        #  原始历史与工具表一个字不动：内核还要拿它们继续对话
+        self.assertEqual(history[0]["content"], "你是小羽")
+        self.assertEqual(history[1]["content"], "hi")
+        self.assertNotIn("cache_control", TOOL)
+
+    def test_tool_tail_uses_message_level_field_and_secondary_anchor(self) -> None:
+        """尾部是 tool 结果：消息级字段；再往前 ≥20 条处的最近一条 user/tool 作次锚点。"""
+        history: list[dict[str, Any]] = [{"role": "system", "content": "s"}, {"role": "user", "content": "开始"}]
+        for n in range(15):
+            history.append({"role": "assistant", "content": None,
+                            "tool_calls": [{"id": f"c{n}", "type": "function",
+                                            "function": {"name": "read_file", "arguments": "{}"}}]})
+            history.append({"role": "tool", "tool_call_id": f"c{n}", "content": f"r{n}"})
+        sent = self.send("gateway", "anthropic.claude-opus-5", history)
+        tail = len(history) - 1
+        self.assertEqual(sent["messages"][tail]["cache_control"], {"type": "ephemeral"})
+        self.assertEqual(sent["messages"][tail]["content"], "r14")
+        #  次锚点：下标 ≤ tail-20 的最近一条 user/tool
+        anchor = max(i for i in range(1, tail - 20 + 1) if history[i]["role"] in ("user", "tool"))
+        self.assertEqual(self.marked(sent["messages"]), [0, anchor, tail])
+        #  断点总数不超过 Anthropic 的上限 4（这里没有 tools）
+        self.assertLessEqual(len(self.marked(sent["messages"])), 4)
+        self.assertNotIn("cache_control", history[tail])
+
+    def test_short_history_has_no_secondary_anchor(self) -> None:
+        history = [{"role": "system", "content": "s"}, {"role": "user", "content": "a"},
+                   {"role": "assistant", "content": "b"}, {"role": "user", "content": "c"}]
+        sent = self.send("gateway", "claude-sonnet-5.5", history)
+        self.assertEqual(self.marked(sent["messages"]), [0, 3])
+
+    def test_image_only_tail_is_left_alone(self) -> None:
+        history = [{"role": "system", "content": "s"},
+                   {"role": "user", "content": [{"type": "image_url", "image_url": {"url": "data:x"}}]}]
+        sent = self.send("gateway", "claude-sonnet-5.5", history)
+        self.assertEqual(self.marked(sent["messages"]), [0])
+
+    def test_other_models_and_providers_untouched(self) -> None:
+        history = [{"role": "system", "content": "s"}, {"role": "user", "content": "hi"}]
+        for provider, model in (("gateway", "deepseek-flash"), ("deepseek", "claude-ish"), ("", "claude-sonnet-5.5")):
+            sent = self.send(provider, model, history, [TOOL])
+            self.assertEqual(sent["messages"], history, (provider, model))
+            self.assertEqual(sent["tools"], [TOOL], (provider, model))
+
+    def test_env_switch_turns_it_off(self) -> None:
+        import os
+        from unittest import mock
+
+        history = [{"role": "system", "content": "s"}, {"role": "user", "content": "hi"}]
+        with mock.patch.dict(os.environ, {responses.CHAT_CACHE_ENV: "0"}):
+            sent = self.send("gateway", "claude-sonnet-5.5", history)
+        self.assertEqual(sent["messages"], history)
+
+
+class TestPromptCacheKey(unittest.TestCase):
+    """缓存路由键：xai 2026-09-29 实测不带时 6k 前缀只命中 ~19%，带上后 ~99%。"""
+
+    def test_responses_request_carries_prompt_cache_key(self) -> None:
+        api = FakeResponses(events=[text_delta("好"), completed(5, 6)])
+        list(responses_transport(api).chat.completions.create(
+            model="grok-4.7", messages=[{"role": "user", "content": "hi"}], stream=True,
+            **{responses.CACHE_KEY: "abc"},
+        ))
+        self.assertEqual(api.calls[0]["prompt_cache_key"], "abc")
+        self.assertNotIn(responses.CACHE_KEY, api.calls[0])
+
+    def test_key_follows_the_session_file_and_hides_its_name(self) -> None:
+        from pathlib import Path
+
+        from xiaoyu.agent import Agent
+
+        def key(log: Any) -> str:
+            return Agent._prompt_cache_key(  # 只读两个属性，免建整个 Agent
+                SimpleNamespace(session_log=log, _cache_key_fallback="fallback")
+            )
+
+        first = key(SimpleNamespace(path=Path("/s/2026-09-29-abc.jsonl")))
+        #  resume 同一个会话文件 = 同一把键；文件名本身不外发
+        self.assertEqual(first, key(SimpleNamespace(path=Path("/other/2026-09-29-abc.jsonl"))))
+        self.assertNotIn("abc", first)
+        self.assertNotEqual(first, key(SimpleNamespace(path=Path("/s/2026-09-29-xyz.jsonl"))))
+        self.assertEqual(key(None), "fallback")
+
+
+def broken_arguments_history() -> list[dict[str, Any]]:
+    """模型曾吐过坏参数的历史：每路调用都已回了结果（坏的那几路是 ERROR）。"""
+    calls = [
+        ("bad", "{不是合法 JSON"),
+        #  字符串里夹裸换行：严格 json.loads 拒收，strict=False 能读
+        ("ctrl", '{"content": "a\nb"}'),
+        ("ok", '{"path": "calc.py"}'),
+        ("empty", ""),
+        ("array", "[1, 2]"),
+    ]
+    return [
+        {"role": "user", "content": "改文件"},
+        {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [
+                {"id": call_id, "type": "function", "function": {"name": "write_file", "arguments": raw}}
+                for call_id, raw in calls
+            ],
+        },
+        *[
+            {"role": "tool", "tool_call_id": call_id, "content": "ERROR: 参数不是合法 JSON"}
+            for call_id, _ in calls
+        ],
+        {"role": "user", "content": "再试一次"},
+    ]
+
+
+EXPECTED_ARGUMENTS = ["{}", '{"content": "a\\nb"}', '{"path": "calc.py"}', "{}", "{}"]
+
+
+class TestBrokenToolArguments(unittest.TestCase):
+    """历史里的坏工具参数：出网副本修成合法 JSON 对象串，历史本身不动。"""
+
+    def test_chat_path_sends_repaired_arguments(self) -> None:
+        history = broken_arguments_history()
+        inner = FakeClient(FakeResponses())
+        Transport(inner, responses.CHAT).chat.completions.create(
+            model="chat-only-model", messages=history
+        )
+        sent = inner.chat.completions.calls[0]["messages"]
+        self.assertEqual(
+            [call["function"]["arguments"] for call in sent[1]["tool_calls"]], EXPECTED_ARGUMENTS
+        )
+        #  tool 结果里的 ERROR 保留：模型仍知道那次调用失败了
+        self.assertTrue(all("ERROR" in m["content"] for m in sent if m["role"] == "tool"))
+        #  历史不许被就地改写（会话日志要留模型原话）
+        self.assertEqual(history, broken_arguments_history())
+
+    def test_responses_path_sends_repaired_arguments(self) -> None:
+        history = broken_arguments_history()
+        api = FakeResponses(events=[completed()])
+        responses_transport(api).chat.completions.create(
+            model="responses-model", messages=history, stream=True
+        )
+        items = [item for item in api.calls[0]["input"] if item.get("type") == "function_call"]
+        self.assertEqual([item["arguments"] for item in items], EXPECTED_ARGUMENTS)
+        self.assertEqual(history, broken_arguments_history())
+
+    def test_nameless_call_gets_a_placeholder_on_the_way_out(self) -> None:
+        """没写工具名的调用已经回过「未知工具」，但空名字留在历史里，校验函数名的
+        端点每次回放都拒。"""
+        def history():
+            return [
+                {"role": "user", "content": "hi"},
+                {"role": "assistant", "content": None, "tool_calls": [
+                    {"id": "a", "type": "function", "function": {"name": "", "arguments": "{}"}},
+                    {"id": "b", "type": "function", "function": {"arguments": '{"x": 1}'}},
+                    {"id": "c", "type": "function", "function": {"name": "f", "arguments": "{}"}},
+                ]},
+                {"role": "tool", "tool_call_id": "a", "content": "ERROR: 未知工具 ''"},
+                {"role": "tool", "tool_call_id": "b", "content": "ERROR: 未知工具 ''"},
+                {"role": "tool", "tool_call_id": "c", "content": "ok"},
+            ]
+
+        original = history()
+        repaired = responses.repair_tool_arguments(original)
+        names = [call["function"]["name"] for call in repaired[1]["tool_calls"]]
+        self.assertEqual(names, [responses.NAMELESS_TOOL, responses.NAMELESS_TOOL, "f"])
+        self.assertEqual(repaired[1]["tool_calls"][1]["function"]["arguments"], '{"x": 1}')
+        self.assertEqual(original, history())
+
+        inner = FakeClient(FakeResponses())
+        Transport(inner, responses.CHAT).chat.completions.create(
+            model="chat-only-model", messages=original
+        )
+        sent = inner.chat.completions.calls[0]["messages"]
+        self.assertTrue(all(call["function"]["name"] for call in sent[1]["tool_calls"]))
+
+    def test_clean_history_is_reused_without_copies(self) -> None:
+        history = [
+            {"role": "user", "content": "hi"},
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [{"id": "a", "function": {"name": "f", "arguments": '{"x": 1}'}}],
+            },
+        ]
+        repaired = responses.repair_tool_arguments(history)
+        self.assertIs(repaired[1], history[1])
+
+
+class TestToolSignatures(unittest.TestCase):
+    """Gemini thought_signature 的出网还原（restore_tool_extras）。
+
+    纪律同 _reasoning：产出路由（provider+model 都对上）才还原；签名型号收到
+    别家产的 tool_calls 历史时补占位签名（上游对当前轮缺签名的 function call
+    直接 400）；并行调用只有第一路有签名，原样还原不多补。
+    """
+
+    SIG = {"google": {"thought_signature": "SIG"}}
+
+    def history(self) -> list[dict[str, Any]]:
+        return [
+            {"role": "user", "content": "hi"},
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [
+                    {"id": "a", "type": "function", "function": {"name": "f", "arguments": "{}"}},
+                    {"id": "b", "type": "function", "function": {"name": "f", "arguments": "{}"}},
+                ],
+                responses.TOOL_EXTRAS_KEY: {
+                    "model": "gemini-3.7-flash",
+                    "provider": "gemini",
+                    "extras": {"a": self.SIG},
+                },
+            },
+            {"role": "tool", "tool_call_id": "a", "content": "ok"},
+            {"role": "tool", "tool_call_id": "b", "content": "ok"},
+        ]
+
+    def send(self, model: str, provider: str, history: list[dict[str, Any]]) -> dict[str, Any]:
+        inner = FakeClient(FakeResponses())
+        client = Transport(inner, (), provider=provider, signature_models=("*",))
+        client.chat.completions.create(model=model, messages=history)
+        return inner.chat.completions.calls[0]
+
+    def test_matching_route_restores_signature_verbatim(self) -> None:
+        history = self.history()
+        sent = self.send("gemini-3.7-flash", "gemini", history)
+        calls = sent["messages"][1]["tool_calls"]
+        self.assertEqual(calls[0]["extra_content"], self.SIG)
+        #  并行调用只有第一路带签名（上游原样给的）：第二路不许补占位——
+        #  多补反而偏离模型的原始输出
+        self.assertNotIn("extra_content", calls[1])
+        #  私有键在净化点被摘掉；原始历史不许被就地改写
+        self.assertNotIn(responses.TOOL_EXTRAS_KEY, sent["messages"][1])
+        self.assertIn(responses.TOOL_EXTRAS_KEY, history[1])
+        self.assertNotIn("extra_content", history[1]["tool_calls"][0])
+
+    def test_foreign_history_gets_placeholder_signatures(self) -> None:
+        """会话中途切到签名型号：历史是别家模型产的，没有签名会被 400 拒收。"""
+        history = self.history()
+        history[1][responses.TOOL_EXTRAS_KEY] = {
+            "model": "chat-only-model",
+            "provider": "deepseek",
+            "extras": {"a": self.SIG},
+        }
+        sent = self.send("gemini-3.7-flash", "gemini", history)
+        for call in sent["messages"][1]["tool_calls"]:
+            self.assertEqual(
+                call["extra_content"],
+                {"google": {"thought_signature": responses.DUMMY_SIGNATURE}},
+            )
+
+    def test_non_signature_model_leaves_foreign_calls_untouched(self) -> None:
+        """非签名型号不补占位；不匹配的签名也不许跨路由塞回去。"""
+        inner = FakeClient(FakeResponses())
+        client = Transport(inner, (), provider="deepseek")
+        client.chat.completions.create(model="chat-only-model", messages=self.history())
+        sent = inner.chat.completions.calls[0]
+        for call in sent["messages"][1]["tool_calls"]:
+            self.assertNotIn("extra_content", call)
+        self.assertNotIn(responses.TOOL_EXTRAS_KEY, sent["messages"][1])
+
+    def test_stale_extras_that_match_no_call_get_placeholder(self) -> None:
+        """extras 非空但一个 call id 都盖不到（id 漂移/捕获缺口）＝没有签名：
+        必须照走占位分支——否则当前轮整条无签名出网，正是占位分支要防的 400。"""
+        history = self.history()
+        history[1][responses.TOOL_EXTRAS_KEY]["extras"] = {"drifted": self.SIG}
+        sent = self.send("gemini-3.7-flash", "gemini", history)
+        for call in sent["messages"][1]["tool_calls"]:
+            self.assertEqual(
+                call["extra_content"],
+                {"google": {"thought_signature": responses.DUMMY_SIGNATURE}},
+            )
+
+    def test_with_options_copy_keeps_provider_for_restore(self) -> None:
+        """with_options 副本必须原样带走 provider：丢了则副本上路由比对永远不中，
+        签名型号自己产的真签名会被占位签名整段盖掉——比不还原更糟。"""
+        inner = FakeClient(FakeResponses())
+        copy = Transport(
+            inner, (), provider="gemini", signature_models=("*",)
+        ).with_options(timeout=1)
+        copy.chat.completions.create(model="gemini-3.7-flash", messages=self.history())
+        sent = copy._inner.chat.completions.calls[0]
+        calls = sent["messages"][1]["tool_calls"]
+        self.assertEqual(calls[0]["extra_content"], self.SIG)
+        self.assertNotIn("extra_content", calls[1])
+
+
+class TestReasoningPassthrough(unittest.TestCase):
+    ITEM = {"type": "reasoning", "id": "rs_1", "encrypted_content": "ENC"}
+
+    def test_reasoning_item_is_collected_at_done_not_added(self) -> None:
+        """added 时 encrypted_content 还是半截的（实测 932 → 1124 字符）。"""
+        chunks = list(responses.stream_chunks(iter([
+            event("response.output_item.added", output_index=0,
+                  item=SimpleNamespace(type="reasoning",
+                                       model_dump=lambda **_: {"half": True})),
+            event("response.output_item.done", output_index=0,
+                  item=SimpleNamespace(type="reasoning",
+                                       model_dump=lambda **_: self.ITEM)),
+            completed(),
+        ])))
+        self.assertEqual([c.reasoning for c in chunks if c.reasoning], [[self.ITEM]])
+
+    def test_plaintext_reasoning_is_not_kept(self) -> None:
+        """deepseek 给明文 content、qwen 给明文 summary，都没有可回放的加密串。
+        回传实测不被服务端消费（input_tokens 97→101），存下来只是让日志变大、
+        让原始思维链落盘——一律不留。"""
+        chunks = list(responses.stream_chunks(iter([
+            event("response.output_item.done", output_index=0,
+                  item=SimpleNamespace(type="reasoning", model_dump=lambda **_: {
+                      "type": "reasoning", "content": [{"text": "我先算 27*43…"}]})),
+            event("response.output_item.done", output_index=1,
+                  item=SimpleNamespace(type="reasoning", model_dump=lambda **_: {
+                      "type": "reasoning", "summary": [{"text": "思路摘要"}]})),
+            completed(),
+        ])))
+        self.assertEqual([c.reasoning for c in chunks if c.reasoning], [])
+
+    def test_reasoning_replays_before_the_items_it_produced(self) -> None:
+        """服务端要求 reasoning item 排在它引出的 message / function_call 之前。"""
+        items = to_input(
+            [
+                {
+                    "role": "assistant",
+                    "content": "算好了",
+                    "tool_calls": [{"id": "c1", "function": {"name": "calc", "arguments": "{}"}}],
+                    REASONING_KEY: {"model": "gpt-5.6-sol", "items": [self.ITEM]},
+                }
+            ],
+            "gpt-5.6-sol",
+        )
+        self.assertEqual(
+            [item.get("type") or item["role"] for item in items],
+            ["reasoning", "assistant", "function_call"],
+        )
+
+    def test_reasoning_is_dropped_when_the_model_changed(self) -> None:
+        """加密串是模型侧私有状态：/model 切走之后不能再塞回去。"""
+        message = {
+            "role": "assistant",
+            "content": "算好了",
+            REASONING_KEY: {"model": "gpt-5.6-sol", "items": [self.ITEM]},
+        }
+        self.assertEqual(
+            to_input([message], "gpt-5.6-terra"),
+            [{"role": "assistant", "content": "算好了"}],
+        )
+
+    def test_reasoning_is_dropped_when_the_provider_changed(self) -> None:
+        """降级链让同名模型跑在两家上（直连 vs 网关）：signature 是服务侧
+        私有状态，跨家回放属于喂错东西。provider 对不上整段跳过；
+        旧会话存量（无 provider 标签）在真实路由上同样按不匹配处理。"""
+        tagged = {
+            "role": "assistant",
+            "content": "算好了",
+            REASONING_KEY: {"model": "gpt-5.6-sol", "provider": "openai", "items": [self.ITEM]},
+        }
+        #  同家回放、跨家丢弃
+        self.assertEqual(
+            to_input([dict(tagged)], "gpt-5.6-sol", "openai")[0].get("type"), "reasoning"
+        )
+        self.assertEqual(
+            to_input([dict(tagged)], "gpt-5.6-sol", "gateway"),
+            [{"role": "assistant", "content": "算好了"}],
+        )
+        #  存量无标签 + 真实路由 → 丢
+        legacy = {
+            "role": "assistant",
+            "content": "算好了",
+            REASONING_KEY: {"model": "gpt-5.6-sol", "items": [self.ITEM]},
+        }
+        self.assertEqual(
+            to_input([legacy], "gpt-5.6-sol", "openai"),
+            [{"role": "assistant", "content": "算好了"}],
+        )
+
+    def test_reasoning_survives_the_transport_not_just_to_input(self) -> None:
+        """回归：净化若跑在翻译之前，`_reasoning` 会被当私有键摘掉——回传当场失效，
+        且不报任何错，只是悄悄变慢变贵。这条断言走完整条 create 路径。"""
+        api = FakeResponses(events=[completed()])
+        client = responses_transport(api)
+        list(client.chat.completions.create(
+            model="gpt-5.6-sol",
+            messages=[{"role": "assistant", "content": "算好了",
+                       REASONING_KEY: {"model": "gpt-5.6-sol", "items": [self.ITEM]}}],
+            stream=True,
+        ))
+        self.assertEqual(api.calls[0]["input"][0], self.ITEM)
+
+    def test_request_asks_for_encrypted_reasoning(self) -> None:
+        """store=False 下不带这个 include 就拿不回推理状态，回传也就无从谈起。"""
+        request = to_request("m", [{"role": "user", "content": "hi"}], None, {})
+        self.assertEqual(request["include"], ["reasoning.encrypted_content"])
+
+
+class TestCompletionShape(unittest.TestCase):
+    def test_missing_usage_is_none(self) -> None:
+        """拿不到 usage 时给 None：内核据此退化为本地估算（见 tokens.py）。"""
+        result = to_completion(SimpleNamespace(output_text="x", usage=None))
+        self.assertIsNone(result.usage)
+
+    def test_incomplete_max_output_tokens_maps_to_length(self) -> None:
+        """非流式的 incomplete 截断同样翻成 finish_reason=length（摘要截断判定靠它）。"""
+        details = SimpleNamespace(reason="max_output_tokens")
+        cut = to_completion(SimpleNamespace(output_text="半截", usage=None, incomplete_details=details))
+        self.assertEqual(cut.choices[0].finish_reason, "length")
+        done = to_completion(SimpleNamespace(output_text="完整", usage=None, incomplete_details=None))
+        self.assertIsNone(done.choices[0].finish_reason)
+
+
+if __name__ == "__main__":  # pragma: no cover
+    unittest.main()

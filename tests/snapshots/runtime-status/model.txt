@@ -1,0 +1,5 @@
+tool_call: {"name":"get_runtime_status","arguments":{"section":"mcp"}}
+usage: {"prompt_tokens":150,"completion_tokens":20}
+---
+text: 当前会话没有已加载的 MCP 服务。
+usage: {"prompt_tokens":190,"completion_tokens":12}

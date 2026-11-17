@@ -1,0 +1,1477 @@
+"""命令风险分析：参数注入识别 + 危险命令识别。
+
+两个函数、两个方向（核心设计观念——方向相反的两套判定不能共用一个解析器）：
+
+- ``injection_risk``：回答"这条命令能不能被 allow 规则**免确认放行**"。
+  前缀规则只看命令开头，而很多常见命令有"参数级逃逸口"——任何能指定
+  「外部程序」或「输出文件」的 flag 都能把 `git *` 这类 allow 变成任意代码执行
+  （`git -c core.pager='!sh …' log`）。识别到就不吃 allow 规则，退回人工确认。
+  **保守方向**：拿不准就报风险（多问一次的代价可接受）。
+
+- ``dangerous_command``：回答"这条命令是不是破坏性操作"（强制 rm 等）。
+  攻击面在包装层：`sudo -u root rm -rf`、`env -S 'rm -rf …'`、`bash -c 'rm -rf …'`、
+  `echo "$(rm -rf …)"` 都包着同一个 rm。识别时要**宽松解析、递归剥 wrapper**，
+  尽量从复杂写法里挖出字面量命令。识别不出来不要紧——识别不出的命令本来
+  就进不了 allow 通道（injection_risk / 前缀不匹配兜底），最终仍会走人工确认。
+
+- ``privileged_command``：回答"这条命令要不要提权"（sudo/doas/su/pkexec）。
+  与 ``dangerous_command`` 同方向（宽松解析、剥同一批 wrapper），只是命中的
+  是另一类东西，所以扫描骨架抽成了共用的 ``_scan_script`` / ``_scan_segment``。
+  给 auto 档用：沙箱能拦住越权写盘，但提权是唯一可能捅穿它的动作，得有人看着。
+
+- ``remote_command``：回答"这条命令的效果是不是落在另一台主机上"（ssh/scp/sftp/
+  rsync 的远端形态）。同样给 auto 档用：沙箱管的是本机文件系统，ssh 对端的 shell
+  不在它的管辖内——对端就是本机（`ssh localhost …`）时等于绕出沙箱。ssh 带的远端
+  命令同时当作一段脚本下钻，`ssh host 'sudo rm -rf …'` 里的 rm 和 sudo 照样挖得到。
+
+剥 wrapper 的关键是**认得每个 wrapper 的选项语法**：`sudo -u root rm` 里的 root
+是选项值不是命令名，`timeout 5 rm` 的 5 是 DURATION。只跳过 `-` 开头的 token 会把
+选项值当成命令，里面真正的 rm 就漏了。选项表见 ``_WRAPPERS``；表外的选项按
+fail-safe 处理（带值 / 不带值两种解释都扫），扫不完（嵌套过深、分叉过多）按有风险报。
+同一套剥法也覆盖"把后续参数交给 shell"的工具（watch 拼接参数、script -c、sg），
+find 的 -exec/-execdir/-ok/-okdir 命令段单独切出来递归扫。
+"""
+
+from __future__ import annotations
+
+import os
+import re
+import shlex
+from dataclasses import dataclass, field
+
+#  递归剥 wrapper 的深度上限：
+#  防止构造出的嵌套命令把解析拖死
+_MAX_WRAPPER_DEPTH = 8
+#  嵌套层里被扫描的节点总数上限：表外选项会分叉出两种解释，层层嵌套时分叉相乘，
+#  靠它兜底。只数嵌套层——几百行的扁平脚本（heredoc 写文件）不该因为长而被判风险
+_MAX_SCAN_NODES = 512
+_TOO_COMPLEX = "命令嵌套过深或写法分叉过多，无法完整分析（按有风险处理）"
+
+
+_ANSI_C_ESCAPES = {
+    "a": "\a", "b": "\b", "e": "\x1b", "E": "\x1b", "f": "\f", "n": "\n",
+    "r": "\r", "t": "\t", "v": "\v", "\\": "\\", "'": "'", '"': '"', "?": "?",
+}
+_HEX = "0123456789abcdefABCDEF"
+
+
+def _decode_ansi_c(body: str) -> str:
+    """`$'…'` 引号体里的转义 → 字面字符（bash 手册 ANSI-C Quoting 一节的那张表）。"""
+    out: list[str] = []
+    i, n = 0, len(body)
+    while i < n:
+        ch = body[i]
+        if ch != "\\" or i + 1 >= n:
+            out.append(ch)
+            i += 1
+            continue
+        nxt = body[i + 1]
+        if nxt in _ANSI_C_ESCAPES:
+            out.append(_ANSI_C_ESCAPES[nxt])
+            i += 2
+        elif nxt in "xuU":
+            width = {"x": 2, "u": 4, "U": 8}[nxt]
+            j = i + 2
+            while j < n and j - (i + 2) < width and body[j] in _HEX:
+                j += 1
+            digits = body[i + 2 : j]
+            try:
+                out.append(chr(int(digits, 16)) if digits else "\\" + nxt)
+            except (ValueError, OverflowError):
+                out.append("?")
+            i = j
+        elif nxt in "01234567":
+            j = i + 1
+            while j < n and j - (i + 1) < 3 and body[j] in "01234567":
+                j += 1
+            out.append(chr(int(body[i + 1 : j], 8) & 0xFF))
+            i = j
+        elif nxt == "c" and i + 2 < n:
+            out.append(chr(ord(body[i + 2]) & 0x1F))
+            i += 3
+        else:
+            out.append("\\" + nxt)
+            i += 2
+    return "".join(out)
+
+
+def _plain_quoting(segment: str) -> str:
+    """把 shlex 不认的两种 shell 写法改写成它认的等价形式。
+
+    - `$'-rf'`（ANSI-C 引号）→ 普通单引号串。不改的话 shlex 把它读成 `$-rf`，
+      `rm $'-rf' x` 里的 force 就看不见了；
+    - 反斜杠 + 换行（续行）→ 删掉。shell 在分词之前就把它拿走，`r` + 续行 + `m` 是 rm。
+    认引号状态：单引号里这两样都是字面量，双引号里 `$'` 是字面量。
+    """
+    if "$'" not in segment and "\\\n" not in segment:
+        return segment
+    out: list[str] = []
+    quote = ""
+    i, n = 0, len(segment)
+    while i < n:
+        ch = segment[i]
+        if quote == "'":
+            out.append(ch)
+            if ch == "'":
+                quote = ""
+            i += 1
+            continue
+        if ch == "\\" and i + 1 < n:
+            if segment[i + 1] == "\n":
+                i += 2
+                continue
+            out.append(segment[i : i + 2])
+            i += 2
+            continue
+        if quote == '"':
+            out.append(ch)
+            if ch == '"':
+                quote = ""
+            i += 1
+            continue
+        if ch == "$" and segment.startswith("$'", i):
+            j = i + 2
+            while j < n and segment[j] != "'":
+                j += 2 if segment[j] == "\\" and j + 1 < n else 1
+            if j < n:
+                out.append(shlex.quote(_decode_ansi_c(segment[i + 2 : j])))
+                i = j + 1
+                continue
+        if ch in "'\"":
+            quote = ch
+        out.append(ch)
+        i += 1
+    return "".join(out)
+
+
+def _split(segment: str) -> list[str]:
+    """shlex 分词；解析不了（引号不闭合等）返回空列表，由调用方决定方向。"""
+    try:
+        return shlex.split(_plain_quoting(segment), posix=True)
+    except ValueError:
+        return []
+
+
+def _base_name(token: str) -> str:
+    """argv[0] 归一：取 basename、去 Windows 后缀、小写。
+
+    没有这一步，`/usr/bin/git` / `git.exe` 就绕过了所有按名字写的检查。
+    """
+    name = token.replace("\\", "/").rsplit("/", 1)[-1].lower()
+    for suffix in (".exe", ".cmd", ".bat", ".com"):
+        if name.endswith(suffix):
+            return name[: -len(suffix)]
+    return name
+
+
+# ---------- 注入风险（allow 规则的防绕过） ----------
+
+#  git 的全局选项黑名单：这些出现在 subcommand 之前就能注入任意执行/改仓库位置。
+#  -c core.pager=… / -p 走 pager 执行、--exec-path 劫持子命令二进制目录。
+#  三种书写形态都要覆盖：独立值（-c foo=x）、粘连值（-cfoo=x）、等号（--git-dir=x）。
+_GIT_UNSAFE_GLOBAL_EXACT = {"-c", "-C", "-p", "--paginate", "--config-env",
+                            "--exec-path", "--git-dir", "--namespace",
+                            "--super-prefix", "--work-tree"}
+_GIT_UNSAFE_GLOBAL_PREFIX = ("--config-env=", "--exec-path=", "--git-dir=",
+                             "--namespace=", "--super-prefix=", "--work-tree=")
+_GIT_UNSAFE_GLOBAL_INLINE = ("-c", "-C")  # -cfoo.bar=x / -C/path 粘连形态
+#  子命令级：能写任意文件或执行外部程序的选项
+_GIT_UNSAFE_SUB_EXACT = {"--output", "--ext-diff", "--textconv", "--exec", "--upload-pack",
+                         "--open-files-in-pager", "-O"}
+#  -O<pager> 是 git grep 的粘连写法（别的子命令的 -O<orderfile> 多问一次无妨）
+_GIT_UNSAFE_SUB_PREFIX = ("--output=", "--exec=", "--upload-pack=",
+                          "--open-files-in-pager=", "-O")
+
+_SORT_NAMES = {"sort", "gsort"}
+_PAGER_NAMES = {"man", "less", "more", "most"}
+#  go 的"拿这个程序来跑 / 来编译"类选项（test/run 的 -exec，build 家族的 -toolexec，vet 的 -vettool）
+_GO_EXEC_OPTIONS = {"exec", "toolexec", "vettool"}
+
+#  find：执行/删除/写文件类动作
+_FIND_UNSAFE = {"-exec", "-execdir", "-ok", "-okdir", "-delete",
+                "-fls", "-fprint", "-fprint0", "-fprintf"}
+
+#  rg：--pre 对每个文件执行任意命令，-z/--search-zip 调外部解压器
+_RG_UNSAFE_EXACT = {"--pre", "--hostname-bin", "-z", "--search-zip"}
+_RG_UNSAFE_PREFIX = ("--pre=", "--hostname-bin=")
+
+#  tar / rsync / ssh 系：能指定外部程序的选项
+_TAR_UNSAFE_PREFIX = ("--to-command", "--use-compress-program", "--rmt-command", "--rsh-command")
+
+#  sed 家族：脚本里的 e 标志/命令会执行 shell（GNU 扩展）
+_SED_NAMES = {"sed", "gsed", "ssed"}
+#  vim/ex 家族：-c/--cmd/+cmd 跑 ex 命令，可 :!shell 逃逸；-S 直接 source 脚本
+_VIM_NAMES = {"vim", "vi", "view", "nvim", "ex", "rvim", "gvim", "vimdiff", "evim"}
+_VIM_EXEC_EXACT = {"-c", "--cmd", "-S", "--source"}
+_VIM_EXEC_PREFIX = ("-c", "--cmd=", "-S", "--source=", "+")
+
+
+def _sed_script_executes(script: str) -> bool:
+    """sed 脚本里有没有会执行 shell 的构造：`s///e` 标志 或 独立 `e` 命令。
+
+    关键是把 `s/a/b/e`（e 是**替换后的标志**=执行）和 `s/e/x/`（e 只是被替换的
+    字面量）分开——前者危险、后者无害。做法：定位每个 s 命令，越过它的三个
+    定界符（转义的 `\\<定界符>` 不算），只在**定界符之后的标志段**里找 e。
+    """
+    n = len(script)
+    i = 0
+    while i < n:
+        if script[i] == "s" and i + 1 < n:
+            delim = script[i + 1]
+            #  定界符是紧跟 s 的那个字符，通常 / 也可以是别的；字母数字/空白/
+            #  反斜杠不能当定界符（那是普通命令/转义，不是 s 命令）
+            if not delim.isalnum() and delim not in (" ", "\\", "\n"):
+                #  开定界符是 script[i+1]，完整 s 命令后面还有 2 个（中、闭）
+                j, seen = i + 2, 0
+                while j < n and seen < 2:
+                    if script[j] == "\\" and j + 1 < n:
+                        j += 2  # 转义序列整体跳过，`\<定界符>` 不计入定界符
+                        continue
+                    if script[j] == delim:
+                        seen += 1
+                    j += 1
+                if seen == 2:
+                    #  闭定界符之后是标志段（字母数字连续串），含 e 即执行
+                    flags = ""
+                    while j < n and script[j].isalnum():
+                        flags += script[j]
+                        j += 1
+                    if "e" in flags:
+                        return True
+                    i = j
+                    continue
+        i += 1
+    #  独立 e 命令（GNU：`e` 或 `e 命令`）——出现在命令位（脚本开头或 ; / 换行后）。
+    #  带地址的花式形态（`/re/e cmd`）不强求覆盖：over-flag 只是多问一次人，
+    #  漏掉的少数形态由前缀不匹配/人工确认兜底。
+    if re.search(r"(?:^|[;\n])\s*e(?:\s|$)", script):
+        return True
+    return False
+
+
+def injection_risk(segment: str) -> str | None:
+    """单段命令（不含 && ; | 等连接符）里发现参数级逃逸口时返回原因，否则 None。
+
+    只用于收窄 allow 规则的放行范围——返回原因意味着"这条命令不吃 allow 规则、
+    退回人工确认"，不是拒绝执行。
+    """
+    argv = _split(segment)
+    if not argv:
+        #  解析不了的命令看不清楚，保守方向：按有风险处理（allow 不放行）
+        return "命令无法安全解析（引号不闭合等）" if segment.strip() else None
+    return injection_risk_argv(argv)
+
+
+def injection_risk_argv(argv: list[str]) -> str | None:
+    """injection_risk 的 argv 版：调用方已有可靠分词（bash_ast）时直接用，
+    不再经 shlex 二次解析（二次解析会把引号里的内容又拆开）。"""
+    try:
+        return _injection_risk_argv(argv, 0)
+    except _TooComplex:
+        return _TOO_COMPLEX
+
+
+def _injection_risk_argv(argv: list[str], depth: int) -> str | None:
+    if not argv:
+        return None
+    name = _base_name(argv[0])
+
+    if name == "git":
+        return _git_risk(argv[1:])
+    if name == "find":
+        for arg in argv[1:]:
+            if arg in _FIND_UNSAFE:
+                return f"find {arg} 可执行命令/删除/写文件"
+        return None
+    if name == "rg":
+        for arg in argv[1:]:
+            if arg in _RG_UNSAFE_EXACT or arg.startswith(_RG_UNSAFE_PREFIX):
+                return f"rg {arg} 可调用外部程序"
+        return None
+    if name == "tar":
+        for arg in argv[1:]:
+            if arg.startswith(_TAR_UNSAFE_PREFIX):
+                return f"tar {arg} 可执行外部程序"
+        return None
+    if name in ("ssh", "scp", "sftp"):
+        for index, arg in enumerate(argv[1:], start=1):
+            lowered = arg.lower()
+            if "proxycommand" in lowered or "localcommand" in lowered:
+                return f"{name} 的 ProxyCommand/LocalCommand 可执行任意命令"
+            if arg == "-o" and index + 1 < len(argv):
+                follow = argv[index + 1].lower()
+                if "proxycommand" in follow or "localcommand" in follow:
+                    return f"{name} -o {argv[index + 1].split('=')[0]} 可执行任意命令"
+        return None
+    if name in ("awk", "gawk", "mawk", "nawk"):
+        if any("system(" in arg for arg in argv[1:]):
+            return "awk system() 可执行任意命令"
+        return None
+    if name in _SED_NAMES:
+        #  脚本可能是位置参数，也可能跟在 -e/--expression 后；-f 是脚本文件不检查
+        #  （文件内容用户自控，属意图）。逐 token 扫（文件名不会误命中 s///e 结构）。
+        for arg in argv[1:]:
+            if _sed_script_executes(arg):
+                return "sed 的 e 标志/命令会执行 shell"
+        return None
+    if name in _VIM_NAMES:
+        for arg in argv[1:]:
+            if arg in _VIM_EXEC_EXACT or arg.startswith(_VIM_EXEC_PREFIX):
+                return f"{name} {arg.split('=')[0]} 可执行 ex 命令（:!shell 逃逸）"
+        return None
+    if name in _SORT_NAMES:
+        for arg in argv[1:]:
+            if arg.startswith("--compress-program"):
+                return "sort --compress-program 可执行外部程序"
+            if arg == "--output" or arg.startswith("--output=") or (
+                arg.startswith("-") and not arg.startswith("--") and "o" in arg[1:]
+            ):
+                return "sort -o 可写任意文件"
+        return None
+    if name in _PAGER_NAMES:
+        #  翻页器是交互程序：`!cmd` 随时能起 shell，`+` 开头的参数是启动即执行的命令
+        for arg in argv[1:]:
+            if arg.startswith("+") or arg in ("-P", "--pager", "-H") or arg.startswith(
+                ("-P", "--pager=", "--html=", "-H")
+            ):
+                return f"{name} {arg[:12]} 可执行外部程序"
+        if name != "man":
+            return f"{name} 是交互式翻页器，里面能起 shell"
+        return None
+    if name == "go":
+        for arg in argv[1:]:
+            option = arg.lstrip("-").split("=", 1)[0]
+            if arg.startswith("-") and option in _GO_EXEC_OPTIONS:
+                return f"go -{option} 可执行外部程序"
+        return None
+    if name == "xargs":
+        return "xargs 会执行任意后续命令"
+    #  wrapper 不能替里面的命令洗白：`timeout 60 git -c core.pager=sh log` 被
+    #  `timeout 60 git*` 放行的话，git 的注入口就绕过去了。剥开逐个候选再查
+    if (peeled := _peel_wrapper(name, argv)) is not None:
+        commands, scripts = peeled
+        if scripts:
+            return f"{name} 会把一段源码交给 shell 执行，前缀规则看不见里面跑什么"
+        for inner in commands:
+            if depth + 1 > _MAX_WRAPPER_DEPTH:
+                raise _TooComplex
+            if reason := _injection_risk_argv(_strip_shell_prefix(inner), depth + 1):
+                return reason
+    #  透传运行器同理：`uv run git -c core.pager=sh log` 不能靠 `uv run git *` 放行
+    elif (inners := _peel_runner(name, argv)) is not None:
+        for inner in inners:
+            if depth + 1 > _MAX_WRAPPER_DEPTH:
+                raise _TooComplex
+            if reason := _injection_risk_argv(_strip_shell_prefix(inner), depth + 1):
+                return reason
+    return None
+
+
+def _git_risk(args: list[str]) -> str | None:
+    """先定位 subcommand（跳过全局选项），路上撞到注入口就报。
+
+    「第一个非选项 token 就是 subcommand」——不这样定位的话，
+    `git checkout status` 会被误判成安全的 status（经典反例）。
+    """
+    skip_next = False
+    for arg in args:
+        if skip_next:
+            skip_next = False
+            continue
+        if arg in _GIT_UNSAFE_GLOBAL_EXACT or arg.startswith(_GIT_UNSAFE_GLOBAL_PREFIX):
+            return f"git 全局选项 {arg.split('=')[0]} 可注入任意命令（如 -c core.pager）"
+        #  粘连形态：-cfoo.bar=x / -C/path
+        if any(arg.startswith(opt) and len(arg) > len(opt) for opt in _GIT_UNSAFE_GLOBAL_INLINE):
+            return f"git 全局选项 {arg[:2]} 可注入任意命令（如 -c core.pager）"
+        #  带独立值的无害全局选项：跳过它的值
+        if arg in ("--git-dir", "--work-tree", "--namespace"):  # 已在黑名单，防御性保留
+            skip_next = True
+            continue
+        if arg == "--" or arg.startswith("-"):
+            continue
+        #  到达 subcommand：往后只查子命令级黑名单
+        break
+    for arg in args:
+        if arg in _GIT_UNSAFE_SUB_EXACT or arg.startswith(_GIT_UNSAFE_SUB_PREFIX):
+            return f"git {arg.split('=')[0]} 可执行外部程序或写任意文件"
+    return None
+
+
+# ---------- wrapper 选项表 ----------
+
+#  选项的五种语法（剥法各不相同）：
+#  - value：必带值，`-u root` / `-uroot` / `--user root` / `--user=root`，值不是命令；
+#  - optional：值可选，只认粘连（`-m/proc/1/ns/mnt`、`--mount=…`），不吃下一个 token；
+#  - flag：不带值；
+#  - script：值是一段 shell 源码（`su -c '…'`），要重新当脚本扫；
+#  - split：值按空白拆成参数、插回原位继续当本 wrapper 的参数（`env -S '…'`）；
+#  - exec：不带值的开关，打开后命令直接 exec、不再拼成 shell 源码（`watch -x`）。
+#  可选值（optional）只认粘连：`--mount=file` / `-mfile`，`--mount file` 里的 file 是下一个参数。
+#  **拿不准的选项宁可不写进表**：表外选项两种解释都扫，最多多报；把带值选项
+#  错写成 flag 则会把选项值当命令、真命令漏掉——这正是本表要修的那类洞。
+
+
+@dataclass(frozen=True)
+class _WrapperSpec:
+    """一个 wrapper 的命令行语法。options：选项名 → 语法；单字母是短选项，多字母是长选项（不写 --）。"""
+
+    options: dict[str, str] = field(default_factory=dict)
+    positionals: int = 0  # 命令之前的位置参数个数：timeout 的 DURATION、chroot 的 NEWROOT、flock 的锁文件
+    assignments: bool = False  # env / sudo：命令之前可以有 NAME=VALUE
+    numeric: bool = False  # nice 的老写法 `nice -10 cmd`
+    post_script: bool = False  # flock：锁文件之后可以是 `-c '脚本'`
+    shell_tail: bool = False  # su：选项可以出现在用户名之后（GNU 重排），用户名之后的参数整体交给 shell
+    permute: bool = False  # util-linux script：非选项参数只是日志文件名，选项可以跟在它后面，命令只从 -c 来
+    joined_script: bool = False  # watch：命令参数用空格拼成一段交给 sh -c（打开 exec 开关才直接 exec）
+    command_is_script: bool = False  # sg：命令位上的参数是交给 sh -c 的源码，不是 argv
+    single_dash_long: bool = False  # macOS arch：多字母选项只写一个横线（`-arch arm64`、`-x86_64`）
+
+
+def _spec(*, value: str = "", optional: str = "", flag: str = "", script: str = "",
+          split: str = "", exec_flag: str = "", **extra) -> _WrapperSpec:
+    """用空格分隔的选项串建表，免得每个选项写一遍语法名。"""
+    options: dict[str, str] = {}
+    for kind, names in (("value", value), ("optional", optional), ("flag", flag),
+                        ("script", script), ("split", split), ("exec", exec_flag)):
+        for option in names.split():
+            options[option] = kind
+    return _WrapperSpec(options, **extra)
+
+
+_SU_OPTIONS = dict(
+    value="G g s w group shell supp-group whitelist-environment",
+    flag="P T V f h l m p fast login no-pty preserve-environment pty help version",
+    script="c command session-command",
+)
+
+#  chrt 的优先级只在是纯数字时才吃（新版允许 SCHED_OTHER/BATCH/IDLE 省略），吃与不吃两种形态都扫
+_CHRT_OPTIONS = dict(
+    value="D P T U X clamp-max clamp-min sched-deadline sched-period sched-runtime",
+    flag="G O R V a b d e f h i m o p r v all-tasks batch deadline deadline-overrun ext fifo "
+         "idle max other pid reclaim-grub reset-on-fork rr verbose help version",
+)
+
+#  wrapper → 语法（元组：一个命令有两种调用形态时两种都扫，如 runuser）。
+#  逐项对照手册与上游 getopt 源码复核（util-linux / coreutils / sudo / systemd / procps /
+#  shadow / polkit / OpenBSD doas；FreeBSD 与 macOS 的变体取并集）。
+_WRAPPERS: dict[str, tuple[_WrapperSpec, ...]] = {
+    #  故意不写：-h 在 getopt 里是可选值（-hhost），但后面跟非选项参数时 sudo 也会把它吃成
+    #  主机名，两种都可能；-c 新版是 login class（带值），各实现未必一致。表外按两种解释都扫
+    "sudo": (_spec(
+        value="C D R T U a g p r t u auth-type chdir chroot close-from command-timeout group "
+              "host login-class other-user prompt role type user",
+        optional="preserve-env",
+        flag="A B E H K N P S V b e i k l n s v askpass background bell edit help list login "
+             "no-update non-interactive preserve-groups remove-timestamp reset-timestamp "
+             "set-home shell stdin validate version",
+        assignments=True,  # sudo [VAR=value] command
+    ),),
+    #  -C config 只校验不执行，照样按带值剥、扫后面的命令（多扫无害）
+    "doas": (_spec(value="C a u", flag="L n s"),),
+    "run0": (_spec(
+        value="D g u area background chdir description group lightweight machine nice property "
+              "setenv shell-prompt-prefix slice unit user",
+        flag="K V h i k n v empower login no-ask-password no-pager non-interactive pipe pty "
+             "pty-late remove-timestamp reset-timestamp same-root-dir slice-inherit validate "
+             "via-shell help version",
+    ),),
+    #  pkexec 不走 getopt：只认独立的 `--user X` / `-u X`，遇到别的参数就当 PROGRAM。
+    #  按 getopt 剥（多认了粘连/等号/-- 写法）只会多扫
+    "pkexec": (_spec(value="u user", flag="disable-internal-agent keep-cwd help version"),),
+    #  GNU env 与 BSD env 取并集：-P altpath / -L|-U user 是 BSD 的带值选项
+    "env": (_spec(
+        value="C L P U a u argv0 chdir env0-from unset",
+        optional="block-signal default-signal ignore-signal",
+        flag="0 i v debug ignore-environment list-signal-handling null help version",
+        split="S split-string",
+        assignments=True,
+    ),),
+    "nice": (_spec(value="n adjustment", flag="help version", numeric=True),),
+    "ionice": (_spec(value="P c n p u class classdata pgid pid uid",
+                     flag="V h t ignore help version"),),
+    "nohup": (_spec(flag="help version"),),
+    "timeout": (_spec(value="k s kill-after signal",
+                      flag="f h p v foreground preserve-status verbose help version",
+                      positionals=1),),
+    "stdbuf": (_spec(value="e i o error input output", flag="help version"),),
+    "command": (_spec(flag="p v V"),),
+    #  `builtin eval '…'` / `builtin command …`：只是点名走内建版本，后面照常执行
+    "builtin": (_spec(),),
+    "exec": (_spec(value="a", flag="c l"),),
+    #  GNU time 与 BSD time 取并集（bash 关键字 time 只认 -p）
+    "time": (_spec(value="f o format output",
+                   flag="a h l p q v V append portability quiet verbose help version"),),
+    "setsid": (_spec(flag="V c f h w ctty fork wait help version"),),
+    #  GNU chroot 只有长选项，-G/-g/-u/-n 是 BSD/macOS 的
+    "chroot": (_spec(value="G g u groups userspec", flag="n skip-chdir help version",
+                     positionals=1),),
+    "flock": (_spec(
+        value="E w conflict-exit-code fd length start timeout wait",
+        flag="F V e h n o s u x close exclusive fcntl nb no-fork nonblocking shared unlock "
+             "verbose help version",
+        script="c command",
+        positionals=1, post_script=True,
+    ),),
+    "su": (_spec(**_SU_OPTIONS, shell_tail=True),),
+    #  runuser 两种形态：`runuser -u user -- cmd …`（argv 形态）与 su 兼容形态
+    "runuser": (
+        _spec(value="u user " + _SU_OPTIONS["value"], flag=_SU_OPTIONS["flag"],
+              script=_SU_OPTIONS["script"]),
+        _spec(value="u user " + _SU_OPTIONS["value"], flag=_SU_OPTIONS["flag"],
+              script=_SU_OPTIONS["script"], shell_tail=True),
+    ),
+    #  故意不写 -W/--wdns：上游现为可选值（只认 -Wdir / --wdns=dir），引入时是否如此拿不准
+    "nsenter": (_spec(
+        value="G N S t net-socket setgid setuid target",
+        optional="C T U i m n p r u w cgroup ipc mount net pid root time user uts wd",
+        flag="F V Z a c e h all env follow-context join-cgroup keep-caps no-fork "
+             "preserve-credentials user-parent help version",
+    ),),
+    #  短选项 -m/-u/-i/-n/-p/-C/-T/-U 不带值，只有对应的长选项有可选值（--mount=file）
+    "unshare": (_spec(
+        value="G R S l w boottime load-interp map-group map-groups map-user map-users monotonic "
+              "owner propagation root setgid setgroups setuid wd whitelist-env",
+        optional="cgroup ipc kill-child mount mount-binfmt mount-proc net pid time user uts",
+        flag="C T U V c f h i m n p r u clear-env forward-signals fork keep-caps map-auto "
+             "map-current-user map-root-user map-subids help version",
+    ),),
+    "setpriv": (_spec(
+        value="ambient-caps apparmor-profile bounding-set egid euid groups inh-caps "
+              "landlock-access landlock-rule list-landlock-rights pdeathsig ptracer regid reuid "
+              "rgid ruid securebits seccomp-filter selinux-label",
+        flag="V d h clear-groups dump init-groups keep-groups landlock-support list-caps "
+             "list-landlock-access nnp no-new-privs reset-env help version",
+    ),),
+    "systemd-run": (_spec(
+        value="C E H M p u background capsule description expand-environment gid host job-mode "
+              "json machine nice on-active on-boot on-calendar on-startup on-unit-active "
+              "on-unit-inactive output path-property property root-directory service-type "
+              "setenv slice socket-property timer-property uid unit working-directory",
+        flag="G P R S T d h q r t v collect ignore-failure no-ask-password no-block no-pager "
+             "on-clock-change on-timezone-change pipe pty pty-late quiet remain-after-exit "
+             "same-dir same-root-dir scope send-sighup shell slice-inherit system tty user "
+             "verbose wait help version",
+    ),),
+    #  GNU xargs 与 BSD xargs 取并集（-J/-R/-S 是 BSD 的带值选项）
+    "xargs": (_spec(
+        value="E I J L P R S a d n s arg-file delimiter max-args max-chars max-procs "
+              "process-slot-var",
+        optional="e i l eof max-lines replace",
+        flag="0 o p r t x exit interactive no-run-if-empty null open-tty show-limits verbose "
+             "help version",
+    ),),
+    "strace": (_spec(value="E I O P S U X a b e o p s u output",
+                     flag="A C D F N T V Y Z c d f h i k n q r t v w x y z"),),
+    "ltrace": (_spec(
+        value="A D F a d e l n o p s u w x align config debug indent library max-depth output "
+              "where",
+        flag="C L S T V b c f h i r t demangle help no-signals version",
+    ),),
+    "chrt": (_spec(**_CHRT_OPTIONS, positionals=1), _spec(**_CHRT_OPTIONS)),
+    "taskset": (_spec(flag="V a c h p all-tasks cpu-list pid help version", positionals=1),),
+    #  procps watch：命令参数用空格拼成一段交给 `sh -c`，-x/--exec 才直接 exec
+    "watch": (_spec(
+        value="n q s equexit interval shotsdir",
+        optional="d differences",
+        flag="C b c e f g h p r t v w beep chgexit color errexit follow help no-color "
+             "no-rerun no-title no-wrap precise version",
+        exec_flag="x exec",
+        joined_script=True,
+    ),),
+    #  script 两种形态都扫：util-linux `script [选项] [file]`（命令只从 -c 来）；
+    #  BSD/macOS `script [-adeFfkpqrw] [-t time] [file [command ...]]`
+    "script": (
+        _spec(value="B E I O T m o echo log-in log-io log-out log-timing logging-format "
+                    "output-limit",
+              optional="t timing",
+              flag="V a e f h q append flush force help quiet return version",
+              script="c command", permute=True),
+        _spec(value="T t", flag="F a d e f k p q r w", positionals=1),
+    ),
+    #  shadow 的 sg：`sg [-|-l] group [[-c] command]`，command 交给 /bin/sh -c
+    "sg": (_spec(flag="l", script="c", positionals=1, command_is_script=True),),
+    #  macOS：`caffeinate [-dimsu] [-t timeout] [-w pid] [utility arguments...]`
+    "caffeinate": (_spec(value="t w", flag="d i m s u"),),
+    #  macOS：`arch [-32] [-64] [[-arch_name | -arch arch_name]...] [-c] [-d env]... [-e env=value]... prog`
+    "arch": (_spec(value="arch d e", flag="32 64 arm64 arm64e c h i386 x86_64 x86_64h",
+                   single_dash_long=True),),
+}
+
+#  所有 wrapper 名：permissions 的会话授权与 allow 探针都从这里取，加一个 wrapper 三处同时受益
+WRAPPER_NAMES = frozenset(_WRAPPERS)
+
+#  透传运行器：后面跟的是另一条命令（`uv run rm -rf x` 跑的就是 rm）。与 wrapper 的
+#  区别是选项不查表——各家选项多且常变，按表外选项的办法处理：选项后面那个词按
+#  「是它的值」「就是命令」两种解释都扫。permissions 的授权范围与 allow 规则判定同用这两张表
+RUNNER_SUBCOMMANDS = frozenset({
+    ("uv", "run"), ("poetry", "run"), ("conda", "run"),
+    ("npm", "exec"), ("pnpm", "exec"), ("pnpm", "dlx"), ("yarn", "exec"), ("yarn", "dlx"),
+})
+RUNNER_HEADS = frozenset({"npx", "bunx", "uvx"})
+
+
+def command_starts(argv: list[str], start: int) -> list[int]:
+    """从 start 起跳过不查表的选项，给出下一个非选项词可能落在的每个下标。
+
+    选项后面那个词既可能是它的值、也可能就是要找的词，两种都给；`--` 之后
+    紧跟的那个词一定是。`uv run --with x rm` 给出 x 与 rm 两个位置。
+    """
+    found: list[int] = []
+    index = start
+    while index < len(argv):
+        token = argv[index]
+        if token == "--":
+            if index + 1 < len(argv):
+                found.append(index + 1)
+            break
+        if not token.startswith("-"):
+            found.append(index)
+            if index == start or not argv[index - 1].startswith("-"):
+                break
+        index += 1
+    return found
+
+
+def _peel_runner(name: str, argv: list[str]) -> list[list[str]] | None:
+    """透传运行器剥掉外层，返回里面可能被执行的命令 argv 候选；不是运行器形态返回 None。"""
+    if name in RUNNER_HEADS:
+        starts = [1]
+    else:
+        subs = {sub for runner, sub in RUNNER_SUBCOMMANDS if runner == name}
+        if not subs:
+            return None
+        starts = [index + 1 for index in command_starts(argv, 1) if argv[index] in subs]
+        if not starts:
+            return None
+    return [argv[index:] for start in starts for index in command_starts(argv, start)]
+
+_NICE_NUMERIC = re.compile(r"-[+-]?\d+")
+
+
+class _TooComplex(ValueError):
+    """扫描超出深度 / 工作量上限：调用方按"有风险"处理，绝不当作安全。"""
+
+
+def unwrap_argv(argv: list[str]) -> list[list[str]] | None:
+    """剥一层 wrapper，返回里面可能被执行的命令 argv（选项里带的脚本包成 `sh -c 脚本`）。
+
+    不是 wrapper 返回 None；表外选项分叉过多时抛 ValueError（调用方按有风险处理）。
+    给 permissions 判 allow 规则模式用——它要看 `nice -n 5 *` 剥开以后放行的是什么。
+    """
+    if not argv:
+        return None
+    peeled = _peel_wrapper(_base_name(argv[0]), argv)
+    if peeled is None:
+        return None
+    commands, scripts = peeled
+    return commands + [["sh", "-c", script] for script in scripts]
+
+
+def _long_kind(spec: _WrapperSpec, name: str) -> str | None:
+    """长选项的语法。GNU getopt 接受无歧义缩写（`su --comm '…'`），按前缀匹配；
+    缩写能对上脚本类选项就当脚本（宁可多扫），其余有歧义的返回 None（表外）。
+    单字母名同时是短选项键（`su --c` 的 c）也照样按前缀找长选项：短选项表里有它
+    不代表 `--c` 就是那个短选项，它在 getopt 眼里是 `--command` 的缩写。"""
+    kind = spec.options.get(name)
+    if kind and len(name) > 1:
+        return kind
+    if not name:
+        return None
+    kinds = {kind for option, kind in spec.options.items()
+             if len(option) > 1 and option.startswith(name)}
+    for preferred in ("script", "split"):
+        if preferred in kinds:
+            return preferred
+    return kinds.pop() if len(kinds) == 1 else None
+
+
+def _option_steps(argv: list[str], index: int,
+                  spec: _WrapperSpec) -> list[tuple[int, list[str], list[str]]]:
+    """解析 argv[index] 这个选项，返回每种可能解释的 (下一个 token 下标, 脚本值, 拆分值)。
+
+    表内选项只有一种解释；表外选项两种都给（带值吃掉下一个 token / 不带值）。
+    """
+    token = argv[index]
+    following = argv[index + 1] if index + 1 < len(argv) else None
+    after_value = index + 2 if following is not None else index + 1
+
+    def carried(kind: str, value: str | None, step: int) -> tuple[int, list[str], list[str]]:
+        found = [] if value is None else [value]
+        return (step, found if kind == "script" else [], found if kind == "split" else [])
+
+    if spec.single_dash_long and not token.startswith("--"):
+        #  arch 的 `-arch arm64` / `-x86_64`：整串对上多字母选项才按长选项剥，否则退回短选项聚合
+        name, equals, _ = token[1:].partition("=")
+        kind = spec.options.get(name) if len(name) > 1 else None
+        if kind == "value" and not equals:
+            return [(after_value, [], [])]
+        if kind is not None:
+            return [(index + 1, [], [])]
+
+    if token.startswith("--"):
+        name, equals, attached = token[2:].partition("=")
+        kind = _long_kind(spec, name)
+        if kind in ("script", "split"):
+            return [carried(kind, attached if equals else following,
+                            index + 1 if equals else after_value)]
+        if kind == "value":
+            return [(index + 1 if equals else after_value, [], [])]
+        if kind in ("flag", "optional", "exec") or equals:
+            return [(index + 1, [], [])]
+        #  表外长选项：带值、不带值两种解释都走
+        return [(index + 1, [], []), (after_value, [], [])]
+
+    steps: list[tuple[int, list[str], list[str]]] = []
+    #  短选项聚合（-Eu root）：逐字母走，遇到带值字母为止；它的值是本 token 剩余部分或下一个 token
+    for offset in range(1, len(token)):
+        letter, rest = token[offset], token[offset + 1:]
+        kind = spec.options.get(letter)
+        if kind in ("flag", "exec"):
+            continue
+        if kind == "optional":
+            steps.append((index + 1, [], []))
+            return steps
+        if kind in ("value", "script", "split"):
+            steps.append(carried(kind, rest or following, index + 1 if rest else after_value))
+            return steps
+        #  表外字母：先记"它带值"这种解释，再当不带值继续往后走
+        steps.append((index + 1 if rest else after_value, [], []))
+    steps.append((index + 1, [], []))
+    return steps
+
+
+#  env -S 里的控制字符转义与 ${VARNAME}
+_ENV_SPLIT_CONTROLS = {"f": "\f", "n": "\n", "r": "\r", "t": "\t", "v": "\v"}
+_ENV_SPLIT_VARIABLE = re.compile(r"\$\{[A-Za-z_][A-Za-z0-9_]*\}")
+
+
+def _split_env_payload(payload: str) -> list[str]:
+    """`env -S` 的值拆成参数，规则照 GNU env 手册（coreutils 的实现同此）。
+
+    GNU env 对不合法的串（引号不闭合、非法转义、双引号里的 `\\c`）直接报错退出、
+    什么都不执行；这里退回按空白粗切——只会多扫，不会漏。BSD/macOS env 的 -S
+    规则大同小异（多认 `\\<空白>`），差异处同样落到宽松方向。
+    """
+    args = _parse_env_split(payload)
+    return args if args is not None else payload.split()
+
+
+def _parse_env_split(payload: str) -> list[str] | None:
+    """GNU env -S 分词；不合法返回 None。
+
+    - 引号外空白分词；单引号内只有 `\\\\`、`\\'` 是转义，双引号内照常转义；
+    - `\\_` 引号外是分词、双引号内是空格；`\\c` 截断其后；`\\f \\n \\r \\t \\v` 是控制字符；
+      `\\" \\# \\$ \\' \\\\` 是字面量，其余转义不合法；
+    - 参数开头的 `#` 注释掉其后；
+    - 单引号外的 `${VAR}` 会展开——值要到运行时才知道，原样保留字面量（与脚本里的 $VAR 同口径）。
+    """
+    args: list[str] = []
+    single = double = False
+    separated = True  # 上一个字符是分隔符：下一个字符开始新参数
+    i, n = 0, len(payload)
+
+    def put(text: str) -> None:
+        nonlocal separated
+        if separated:
+            args.append("")
+            separated = False
+        args[-1] += text
+
+    while i < n:
+        ch = payload[i]
+        if ch == "'" and not double:
+            single = not single
+            put("")  # 空引号 '' 也是一个参数
+            i += 1
+        elif ch == '"' and not single:
+            double = not double
+            put("")
+            i += 1
+        elif ch in " \t\n\v\f\r" and not (single or double):
+            separated = True
+            i += 1
+        elif ch == "#" and separated:
+            break
+        elif ch == "\\":
+            following = payload[i + 1] if i + 1 < n else ""
+            if single and following not in ("\\", "'"):
+                put("\\")
+                i += 1
+                continue
+            if following in ('"', "#", "$", "'", "\\"):
+                put(following)
+            elif following == "_":
+                if double:
+                    put(" ")
+                else:
+                    separated = True
+            elif following == "c":
+                if double:
+                    return None
+                break
+            elif following in _ENV_SPLIT_CONTROLS:
+                put(_ENV_SPLIT_CONTROLS[following])
+            else:
+                return None
+            i += 2
+        elif ch == "$" and not single:
+            match = _ENV_SPLIT_VARIABLE.match(payload, i)
+            if match is None:
+                return None  # GNU 只认 ${VARNAME}
+            put(match.group(0))
+            i = match.end()
+        else:
+            put(ch)
+            i += 1
+    else:
+        if single or double:
+            return None
+    return args
+
+
+def _exec_switch(token: str, spec: _WrapperSpec) -> bool | None:
+    """这个选项 token 会不会打开 exec 开关（watch -x）。
+
+    表外字母可能带值、把后面的 x 吞成它的值，有歧义的长选项缩写也说不准：两可时返回 None。
+    """
+    if token.startswith("--"):
+        name = token[2:].partition("=")[0]
+        kind = _long_kind(spec, name)
+        if kind is None and name:
+            ambiguous = any(len(option) > 1 and option.startswith(name) and option_kind == "exec"
+                            for option, option_kind in spec.options.items())
+            return None if ambiguous else False
+        return kind == "exec"
+    uncertain = False
+    for letter in token[1:]:
+        kind = spec.options.get(letter)
+        if kind == "exec":
+            return None if uncertain else True
+        if kind is None:
+            uncertain = True
+        elif kind != "flag":
+            break  # 带值字母之后是它的值，不再是开关
+    return False
+
+
+def _merge_exec(current: bool | None, switch: bool | None) -> bool | None:
+    """exec 开关的三态合并：任一处确定打开就是打开，有两可就两可。"""
+    if current is True or switch is True:
+        return True
+    if current is None or switch is None:
+        return None
+    return False
+
+
+def _peel_wrapper(name: str, argv: list[str]) -> tuple[list[list[str]], list[str]] | None:
+    """wrapper 剥掉外层，返回 (里面可能被执行的命令 argv 列表, 选项里携带的脚本列表)。
+
+    不是 wrapper 则返回 None（注意与"是 wrapper 但里面是空"的 `([], [])` 区分）。
+    剥法只写这一处：危险命令、提权、注入三套判定共用，加一个 wrapper 三边同时受益。
+
+    做法是在 (下标, 还差几个位置参数, 是否已过 --, 已收集的位置参数) 状态上走一遍：
+    表外选项分叉成两条路，每条路走到命令位就记一个候选——宁可多扫几个候选，不漏真命令。
+    """
+    specs = _WRAPPERS.get(name)
+    if specs is None:
+        return None
+    commands: list[list[str]] = []
+    scripts: list[str] = []
+    for spec in specs:
+        #  状态：(下标, 还差几个位置参数, 是否已过 --, su 形态收集的尾巴, exec 开关三态)
+        seen: set[tuple[int, int, bool, tuple[str, ...], bool | None]] = set()
+        pending: list[tuple[int, int, bool, tuple[str, ...], bool | None]] = [
+            (1, spec.positionals, False, (), False)]
+        while pending:
+            state = pending.pop()
+            if state in seen:
+                continue
+            seen.add(state)
+            if len(seen) > _MAX_SCAN_NODES:
+                raise _TooComplex
+            index, need, ended, tail, exec_mode = state
+            if index >= len(argv):
+                #  su 形态：第一个位置参数是用户名，其后的参数原样交给 shell（`su root -- -c '…'`）
+                if spec.shell_tail and len(tail) > 1:
+                    commands.append(["sh", *tail[1:]])
+                continue
+            token = argv[index]
+            if not ended and token == "--":
+                pending.append((index + 1, need, True, tail, exec_mode))
+            elif not ended and token == "-":
+                #  env 的 `-` 等于 -i，su 的 `-` 等于 -l，sg 的 `-` 是登录环境：都是开关
+                pending.append((index + 1, need, ended, tail, exec_mode))
+            elif not ended and token.startswith("-"):
+                if spec.numeric and _NICE_NUMERIC.fullmatch(token):
+                    pending.append((index + 1, need, ended, tail, exec_mode))
+                    continue
+                if spec.joined_script:
+                    exec_mode = _merge_exec(exec_mode, _exec_switch(token, spec))
+                for step, found_scripts, found_splits in _option_steps(argv, index, spec):
+                    scripts.extend(found_scripts)
+                    for payload in found_splits:
+                        #  拆出来的参数插回原位，连同其后的参数重新当 env 的参数剥一遍
+                        commands.append([argv[0], *_split_env_payload(payload), *argv[step:]])
+                    pending.append((step, need, ended, tail, exec_mode))
+            elif spec.assignments and "=" in token.lstrip("="):
+                pending.append((index + 1, need, ended, tail, exec_mode))
+            elif spec.shell_tail:
+                pending.append((index + 1, need, ended, (*tail, token), exec_mode))
+            elif spec.permute:
+                #  util-linux script：非选项参数是日志文件名，后面还可以跟选项
+                pending.append((index + 1, need, ended, tail, exec_mode))
+            elif need > 0:
+                pending.append((index + 1, need - 1, ended, tail, exec_mode))
+            elif spec.post_script and token in ("-c", "--command"):
+                if index + 1 < len(argv):
+                    scripts.append(argv[index + 1])
+            elif spec.command_is_script:
+                #  sg 只把紧跟的那一个参数交给 sh -c、其后的忽略；整段拼起来扫是宽松方向
+                scripts.append(" ".join(argv[index:]))
+            else:
+                rest = argv[index:]
+                #  watch：没开 exec 就是 `sh -c "参数用空格拼起来"`；开没开说不准时两种都扫
+                if spec.joined_script and exec_mode is not True:
+                    scripts.append(" ".join(rest))
+                if not spec.joined_script or exec_mode is not False:
+                    commands.append(rest)
+    return commands, scripts
+
+
+# ---------- 危险命令 / 提权（递归剥 wrapper） ----------
+
+#  会把一段 shell 源码当参数的 shell：-c / -lc 后面那坨要重新按脚本解析
+_SHELLS = {"bash", "sh", "zsh", "dash", "ksh", "fish"}
+#  提权入口。sudo/doas/run0 同时也在 _WRAPPERS 里——两张表各答各的问题：
+#  查危险命令时要剥开 sudo 看里面包着什么，查提权时看见 sudo 本身就已经命中。
+_PRIVILEGE_ESCALATORS = {"sudo", "doas", "su", "pkexec", "runas", "run0"}
+
+#  脚本再切分用的连接符（与 permissions._SEGMENT_SPLIT 同源，避免循环引用手动内联）。
+#  单个 & 是后台符，同样隔开两条命令；但 2>&1、&> 里的 & 属于重定向，不切
+_CONNECTORS = ("&&", "||", ";", "|", "&", "\n")
+
+#  命令名之前的 shell 语法外壳：子 shell/分组、流程关键字、变量赋值、前置重定向
+_SHELL_KEYWORDS = frozenset({"!", "{", "if", "then", "else", "elif", "do", "while", "until"})
+_ASSIGNMENT = re.compile(r"[A-Za-z_][A-Za-z0-9_]*\+?=")
+_REDIRECTION = re.compile(r"\d*(?:&>>?|>>?|>&|>\||<<<|<<-?|<>|<&|<)")
+
+
+def command_risk(command: str) -> str | None:
+    """给确认框用的汇总判定：危险操作优先，其次参数注入口，再次远端执行。
+
+    返回原因或 None。远端执行排最后：它解释的是"auto 档为什么停下来问"，
+    前两类说的是命令本身有问题，更该先让人看见。
+    """
+    if reason := dangerous_command(command):
+        return reason
+    for segment in _split_script(command):
+        if reason := injection_risk(segment):
+            return reason
+    return remote_command(command)
+
+
+def dangerous_command(command: str) -> str | None:
+    """从命令里挖出破坏性操作（当前主要是强制 rm）。返回原因或 None。
+
+    宽松方向：尽量识别，识别不出不代表安全（安全判定另有 allow/确认兜底）。
+    扫不完（嵌套过深、分叉过多）返回原因——宁可多问一次，不能当安全放行。
+    """
+    return _scan_command(command, _dangerous_hit)
+
+
+def privileged_command(command: str) -> str | None:
+    """命令里出现提权入口（sudo/doas/su/pkexec）时返回原因，否则 None。
+
+    与 `dangerous_command` 同样是宽松方向：`bash -c 'sudo …'`、`env -S 'sudo …'`、
+    `echo "$(sudo …)"` 这类包起来的写法也要挖出来。识别不出不代表安全——
+    沙箱与逐次确认仍在。
+    """
+    return _scan_command(command, _privileged_hit)
+
+
+def remote_command(command: str) -> str | None:
+    """命令会在另一台主机上执行或落盘（ssh / scp / sftp / rsync 远端形态）时返回原因。
+
+    判的是**动词与形态**，不判对端是谁：要分清"本机"得枚举回环写法、主机名、
+    网卡地址、ssh_config 别名，枚举不全就是漏洞；而对端是不是本机，结论都一样——
+    那边的 shell 不受这边沙箱约束。`rsync -a src/ dst/` 这类纯本地形态不算。
+    """
+    return _scan_command(command, _remote_hit)
+
+
+def any_layer(command: str, predicate) -> bool:
+    """命令的任意一层是否满足 `predicate(name, argv)`。
+
+    "层"与危险命令扫描是同一套：剥掉语法外壳（`(…)`、`FOO=1 …`）、wrapper
+    （`env …`、`sudo -u x …`）、shell 源码（`bash -c '…'`、`$(…)`）之后露出来的
+    每一条命令都问一次；name 是归一过的命令名（`/usr/bin/curl` → `curl`）。
+    给 deny 规则用：规则写的是 `curl *`，换个写法包一层不该就躲过去。
+    扫不完（嵌套过深）返回 False——这类命令本来就进不了任何免确认通道。
+    """
+    def hit(name: str, argv: list[str]) -> str | None:
+        return "hit" if predicate(name, argv) else None
+
+    try:
+        return _scan_script(command, 0, hit, _Budget()) is not None
+    except _TooComplex:
+        return False
+
+
+def _privileged_hit(name: str, argv: list[str]) -> str | None:
+    if name in _PRIVILEGE_ESCALATORS:
+        return f"提权命令（{name}）"
+    return None
+
+
+#  登录到对端 / 在对端执行：出现即算
+_REMOTE_SHELLS = {"ssh", "slogin", "mosh", "sftp", "ssh-copy-id"}
+#  拷贝类：本地到本地是日常（构建脚本里的 rsync），只认带远端参数的形态
+_REMOTE_COPIERS = {"scp", "rsync"}
+_REMOTE_URLS = ("ssh://", "scp://", "sftp://", "rsync://")
+#  host:path / user@host:path / host::module——冒号出现在第一个 / 之前（scp 自己的判法）
+_REMOTE_SPEC = re.compile(r"[^/:\s]+:")
+#  C:\\x、C:/x 在 Windows 上是盘符路径；别的平台上单字母也是合法主机名（h:/tmp）
+_DRIVE_LETTER = re.compile(r"[A-Za-z]:[\\/]")
+#  ssh 带值的短选项（其余短选项都是开关）；用来找出主机名之后的远端命令
+_SSH_VALUE_OPTIONS = frozenset("BbcDEeFIiJLlmOoPpQRSWw")
+
+
+def _remote_hit(name: str, argv: list[str]) -> str | None:
+    if name in _REMOTE_SHELLS:
+        return f"在远程主机上执行（{name}），不受本机沙箱约束"
+    if name in _REMOTE_COPIERS:
+        for arg in argv[1:]:
+            if arg.startswith("-"):
+                continue
+            if arg.startswith(_REMOTE_URLS) or (
+                _REMOTE_SPEC.match(arg)
+                and not (os.name == "nt" and _DRIVE_LETTER.match(arg))
+            ):
+                return f"向远程主机传输文件（{name}），不受本机沙箱约束"
+    return None
+
+
+def _ssh_remote_script(argv: list[str]) -> str:
+    """`ssh [选项] 主机 命令…` 里交给对端 shell 的那段源码；没带命令返回空串。
+
+    ssh 把主机名之后的参数用空格拼成一行交给对端 shell 解析，所以拼回去再扫。
+    """
+    index = 1
+    while index < len(argv):
+        token = argv[index]
+        if token == "--":
+            index += 1
+            break
+        if not token.startswith("-") or token == "-":
+            break
+        #  短选项可聚合（-tt、-vp2222）：带值选项之后的余下字符就是它的值，
+        #  后面没字符了才吃下一个 token
+        letters = token[1:]
+        for position, letter in enumerate(letters):
+            if letter in _SSH_VALUE_OPTIONS:
+                if position == len(letters) - 1:
+                    index += 1
+                break
+        index += 1
+    return " ".join(argv[index + 1:])
+
+
+def _split_script(script: str) -> list[str]:
+    """按连接符把脚本粗切成段——**认引号**：单/双引号内的 && || ; | 属于参数，
+    不当连接符切。裸切（旧实现）会把 `grep 'a|b|c'`、`echo "x && y"` 里引号中的
+    连接符也切开，段内引号被劈成两半 → 下游 shlex 判成"引号不闭合"而误报风险。
+
+    引号规则贴 bash：单引号内无转义、只认闭合的 `'`；双引号内 `\\` 转义下一字符
+    （`\\"` 不算闭合）；引号外 `\\` 也转义下一字符（`\\|` 是字面量不是连接符）。
+    真正不闭合的引号会一直吃到末尾成一段，下游 shlex 仍会如实报"无法解析"——
+    该报的没漏。方向仍宽松：认引号只是别切错，不追求完整 shell 语法。"""
+    segments: list[str] = []
+    buf: list[str] = []
+    quote = ""  # "'" 或 '"'；空 = 不在引号内
+    i, n = 0, len(script)
+    while i < n:
+        ch = script[i]
+        if quote == "'":
+            buf.append(ch)
+            if ch == "'":
+                quote = ""
+            i += 1
+        elif quote == '"':
+            if ch == "\\" and i + 1 < n:
+                buf.append(ch)
+                buf.append(script[i + 1])
+                i += 2
+                continue
+            buf.append(ch)
+            if ch == '"':
+                quote = ""
+            i += 1
+        elif ch == "\\" and i + 1 < n:
+            buf.append(ch)
+            buf.append(script[i + 1])
+            i += 2
+        elif ch in ("'", '"'):
+            quote = ch
+            buf.append(ch)
+            i += 1
+        elif (connector := next((c for c in _CONNECTORS if script.startswith(c, i)), None)) and not (
+            connector == "&" and ((i > 0 and script[i - 1] in "<>") or script.startswith("&>", i))
+        ):
+            segments.append("".join(buf))
+            buf = []
+            i += len(connector)
+        else:
+            buf.append(ch)
+            i += 1
+    segments.append("".join(buf))
+    return [segment.strip() for segment in segments if segment.strip()]
+
+
+def _closing_paren(script: str, start: int) -> int:
+    """从 start（`$(` 之后）找配对的 `)`，找不到返回 len(script)（取到末尾，宽松方向）。
+
+    用显式栈而不是递归：病态的深层嵌套不能把 Python 调用栈打爆。
+    双引号内的括号是字面量，但双引号里的 `$(` 照样开新一层。"""
+    stack = ["("]
+    i, n = start, len(script)
+    while i < n:
+        ch, top = script[i], stack[-1]
+        if top == "'":
+            if ch == "'":
+                stack.pop()
+        elif ch == "\\":
+            i += 1
+        elif top == '"':
+            if ch == '"':
+                stack.pop()
+            elif script.startswith("$(", i):
+                stack.append("(")
+                i += 1
+        elif ch in ("'", '"'):
+            stack.append(ch)
+        elif ch == "(":
+            stack.append("(")
+        elif ch == ")":
+            stack.pop()
+            if not stack:
+                return i
+        i += 1
+    return n
+
+
+def _substitutions(script: str) -> list[str]:
+    """脚本里会被执行的命令替换体：`$(…)`、反引号、进程替换 `<(…)` / `>(…)`。
+
+    单引号内不展开（`echo '$(rm -rf /)'` 只是字面量），双引号内照样展开，
+    `\\$(` 是转义的字面量。只取最外层——里面再嵌套的由递归扫描接着挖。
+    """
+    bodies: list[str] = []
+    quote = ""
+    i, n = 0, len(script)
+    while i < n:
+        ch = script[i]
+        if quote == "'":
+            if ch == "'":
+                quote = ""
+            i += 1
+        elif ch == "\\":
+            i += 2
+        elif ch == "`":
+            end = i + 1
+            while end < n and script[end] != "`":
+                end += 2 if script[end] == "\\" else 1
+            bodies.append(script[i + 1:end])
+            i = end + 1
+        elif script.startswith("$(", i) or (not quote and ch in "<>" and script.startswith("(", i + 1)):
+            end = _closing_paren(script, i + 2)
+            bodies.append(script[i + 2:end])
+            i = end + 1
+        else:
+            if ch == '"':
+                quote = "" if quote else '"'
+            elif ch == "'" and not quote:
+                quote = "'"
+            i += 1
+    return bodies
+
+
+def _strip_shell_prefix(argv: list[str]) -> list[str]:
+    """剥掉命令名之前的 shell 语法外壳：`(rm …)`、`then rm …`、`FOO=1 rm …`、`2>/dev/null rm …`。
+
+    不剥的话 argv[0] 是 `(rm` / `then` / `FOO=1`，按名字写的检查全部落空。
+    """
+    while argv:
+        head = argv[0]
+        if head.startswith("("):
+            head = head.lstrip("(")
+            argv = [head, *argv[1:]] if head else argv[1:]
+        elif head in _SHELL_KEYWORDS or _ASSIGNMENT.match(head):
+            argv = argv[1:]
+        elif match := _REDIRECTION.match(head):
+            #  `>/dev/null` 目标粘在一起只占一个 token；`> /dev/null` 要连目标一起跳
+            argv = argv[1:] if match.end() < len(head) else argv[2:]
+        else:
+            break
+    return argv
+
+
+#  sh 家族（-c 是开关）里带独立值的短选项：`-o 选项名` 各家都认，`-O shopt 名` 是 bash 的。
+#  "未必带值"的字母两种读法都走：-O 在别的 shell 未必认，ksh93 的 -R 文件、mksh 的 -T 终端同理
+_SHELL_VALUE_LETTERS = {"bash": "oO"}
+_SHELL_MAYBE_VALUE_LETTERS = {"bash": "", "ksh": "ORT"}
+_SHELL_VALUE_LONG = frozenset({"--rcfile", "--init-file"})  # bash 的长选项不认 = 写法
+#  fish：-c/--command 与 -C/--init-command 的值就是脚本（可以给多个）；其余带值选项的值跳过
+_FISH_SCRIPT_OPTIONS = {"c": "command", "C": "init-command"}
+_FISH_VALUE_OPTIONS = {"d": "debug", "f": "features", "o": "debug-output", "p": "profile"}
+_FISH_VALUE_LONG = ("profile-startup",)
+
+
+def _posix_shell_scripts(name: str, argv: list[str]) -> list[str]:
+    """`sh [选项] -c 脚本 [$0 [$1 …]]`：只有 -c 之后第一个非选项参数是脚本。
+
+    手册语义：选项在第一个非选项参数处结束。有 -c 时它是脚本、其后是 $0 $1…；
+    没有 -c 时它是脚本文件（`bash script.sh`，文件内容不扫），`-s` 从 stdin 读同理。
+    带值短选项（-o pipefail）的值不算非选项参数；拿不准带不带值的字母两种读法都扫。
+    """
+    value_letters = _SHELL_VALUE_LETTERS.get(name, "o")
+    maybe_letters = _SHELL_MAYBE_VALUE_LETTERS.get(name, "O")
+    scripts: list[str] = []
+    seen: set[tuple[int, bool]] = set()
+    pending = [(1, False)]
+    while pending:
+        state = pending.pop()
+        if state in seen:
+            continue
+        seen.add(state)
+        if len(seen) > _MAX_SCAN_NODES:
+            raise _TooComplex
+        index, has_c = state
+        if index >= len(argv):
+            continue
+        token = argv[index]
+        if token in ("--", "-"):
+            #  选项结束（bash 里单个 - 等于 --）：下一个参数是脚本或脚本文件
+            if has_c and index + 1 < len(argv):
+                scripts.append(argv[index + 1])
+        elif token.startswith("--"):
+            pending.append((index + (2 if token in _SHELL_VALUE_LONG else 1), has_c))
+        elif len(token) > 1 and token[0] in "-+":
+            #  聚合短选项：-c 置位；每个带值字母按顺序各吃掉后面一个参数（-eo pipefail）
+            consumed = {0}
+            for letter in token[1:]:
+                if letter in value_letters:
+                    consumed = {count + 1 for count in consumed}
+                elif letter in maybe_letters:
+                    consumed |= {count + 1 for count in consumed}
+            sets_c = token[0] == "-" and "c" in token[1:]
+            for count in consumed:
+                pending.append((index + 1 + count, has_c or sets_c))
+        elif has_c:
+            scripts.append(token)
+    return list(dict.fromkeys(scripts))
+
+
+def _fish_scripts(argv: list[str]) -> list[str]:
+    """fish 的 -c/-C 值是脚本，其后的位置参数是 $argv。
+
+    不在第一个位置参数处停：`fish file -c …` 里 -c 算不算选项取决于实现，照样扫（宽松方向）。
+    """
+    script_long = tuple(_FISH_SCRIPT_OPTIONS.values())
+    value_long = (*_FISH_VALUE_OPTIONS.values(), *_FISH_VALUE_LONG)
+    scripts: list[str] = []
+    index = 1
+    while index < len(argv):
+        token = argv[index]
+        following = argv[index + 1] if index + 1 < len(argv) else None
+        if token == "--":
+            break
+        if token.startswith("--"):
+            name, equals, attached = token[2:].partition("=")
+            is_script = bool(name) and any(option.startswith(name) for option in script_long)
+            takes_value = is_script or (bool(name) and any(option.startswith(name)
+                                                           for option in value_long))
+            value = attached if equals else (following if takes_value else None)
+            if is_script and value is not None:
+                scripts.append(value)
+            index += 2 if takes_value and not equals else 1
+            continue
+        if token.startswith("-") and len(token) > 1:
+            step = 1
+            for offset in range(1, len(token)):
+                letter, rest = token[offset], token[offset + 1:]
+                if letter in _FISH_SCRIPT_OPTIONS or letter in _FISH_VALUE_OPTIONS:
+                    value = rest or following
+                    if letter in _FISH_SCRIPT_OPTIONS and value is not None:
+                        scripts.append(value)
+                    step = 1 if rest else 2
+                    break
+            index += step
+            continue
+        index += 1
+    return scripts
+
+
+#  find 的执行类动作：其后到 `;`（或紧跟在 `{}` 后的 `+`）为止是一条命令
+_FIND_EXEC_ACTIONS = frozenset({"-exec", "-execdir", "-ok", "-okdir"})
+
+
+def _find_exec_commands(argv: list[str]) -> list[list[str]]:
+    """find 表达式里 -exec/-execdir/-ok/-okdir 带的命令段。
+
+    `{}` 当普通参数；`+` 只有紧跟 `{}` 时才是结束符（`-exec chmod + x {} +` 里第一个 + 是参数）；
+    找不到结束符就取到末尾（宽松方向）。`-delete` 不在这里：它与不带 -f 的 rm 同口径，
+    不算强制删除，靠 injection_risk 挡住免确认。
+    """
+    commands: list[list[str]] = []
+    index = 1
+    while index < len(argv):
+        if argv[index] not in _FIND_EXEC_ACTIONS:
+            index += 1
+            continue
+        start = index = index + 1
+        while index < len(argv) and not (
+            argv[index] == ";" or (argv[index] == "+" and index > start and argv[index - 1] == "{}")
+        ):
+            index += 1
+        if index > start:
+            commands.append(argv[start:index])
+        index += 1
+    return commands
+
+
+def _inner_scripts(name: str, argv: list[str]) -> list[str]:
+    """参数里被当作 shell 源码的那部分：`bash -c '…'`、`trap '…' EXIT`、`eval '…'`。
+
+    返回的每一项都要重新当脚本扫一遍。
+    """
+    if name in _SHELLS:
+        return _fish_scripts(argv) if name == "fish" else _posix_shell_scripts(name, argv)
+    if name == "trap" and len(argv) >= 2:
+        #  trap 'action' SIGNAL：action 是一段 shell 源码
+        return [argv[1]]
+    if name == "eval" and len(argv) >= 2:
+        #  eval 把全部参数拼成一段源码执行
+        return [" ".join(argv[1:])]
+    if name in ("ssh", "slogin") and (script := _ssh_remote_script(argv)):
+        return [script]
+    return []
+
+
+class _Budget:
+    """一次判定的扫描工作量：每下钻一层记一个节点，超深度或超总量抛 _TooComplex。"""
+
+    def __init__(self) -> None:
+        self.nodes = 0
+
+    def descend(self, depth: int) -> int:
+        self.nodes += 1
+        if depth + 1 > _MAX_WRAPPER_DEPTH or self.nodes > _MAX_SCAN_NODES:
+            raise _TooComplex
+        return depth + 1
+
+
+def _scan_command(command: str, hit) -> str | None:
+    """危险命令与提权的共用入口；扫不完按有风险返回（fail-safe）。"""
+    try:
+        return _scan_script(command, 0, hit, _Budget())
+    except _TooComplex:
+        return _TOO_COMPLEX
+
+
+def _scan_script(script: str, depth: int, hit, budget: _Budget) -> str | None:
+    """扫一段 shell 源码：先挖命令替换体（递归当脚本扫），再逐段扫。"""
+    for body in _substitutions(script):
+        if reason := _scan_script(body, budget.descend(depth), hit, budget):
+            return reason
+    previous: list[str] = []
+    for segment in _split_script(script):
+        argv = _split(segment)
+        if reason := _scan_segment(argv, depth, hit, budget):
+            return reason
+        for fed in _stdin_scripts(argv, previous):
+            if reason := _scan_script(fed, budget.descend(depth), hit, budget):
+                return reason
+        previous = argv
+    return None
+
+
+_ECHO_NAMES = {"echo", "printf"}
+
+
+def _stdin_scripts(argv: list[str], previous: list[str]) -> list[str]:
+    """从 stdin 喂给 shell 的源码里，写在同一条命令里看得见的那部分。
+
+    - here-string：`bash <<< 'rm -rf x'`；
+    - 前一段是 echo / printf：`echo 'rm -rf x' | sh`。
+    `cat x.sh | sh`、`curl … | sh` 这种内容不在命令里的不归这里（那和 `sh x.sh`
+    一样看不见，靠确认与沙箱）。连接符是不是管道不细究：多扫一段只会多问一次。
+    """
+    argv = _strip_shell_prefix(list(argv))
+    if not argv or _base_name(argv[0]) not in _SHELLS:
+        return []
+    found: list[str] = []
+    for index, token in enumerate(argv):
+        if token == "<<<" and index + 1 < len(argv):
+            found.append(argv[index + 1])
+        elif token.startswith("<<<") and len(token) > 3:
+            found.append(token[3:])
+    previous = _strip_shell_prefix(list(previous))
+    if previous and _base_name(previous[0]) in _ECHO_NAMES and len(previous) > 1:
+        #  printf 的 \n 是换行：每行各是一条命令
+        found.append(" ".join(previous[1:]).replace("\\n", "\n"))
+    return found
+
+
+def _scan_segment(argv: list[str], depth: int, hit, budget: _Budget) -> str | None:
+    """通用的段扫描：剥语法外壳、剥 wrapper、下钻 shell 源码，每层拿 `hit` 问一次。
+
+    `hit(name, argv) -> str | None` 是两套判定唯一不同的地方。
+    """
+    argv = _strip_shell_prefix(argv)
+    if not argv:
+        return None
+    name = _base_name(argv[0])
+    if reason := hit(name, argv):
+        return reason
+    if (peeled := _peel_wrapper(name, argv)) is not None:
+        commands, scripts = peeled
+        for inner in commands:
+            if reason := _scan_segment(inner, budget.descend(depth), hit, budget):
+                return reason
+        for script in scripts:
+            if reason := _scan_script(script, budget.descend(depth), hit, budget):
+                return reason
+        return None
+    if (inners := _peel_runner(name, argv)) is not None:
+        for inner in inners:
+            if reason := _scan_segment(inner, budget.descend(depth), hit, budget):
+                return reason
+        return None
+    if name == "find":
+        for inner in _find_exec_commands(argv):
+            if reason := _scan_segment(inner, budget.descend(depth), hit, budget):
+                return reason
+        return None
+    for script in _inner_scripts(name, argv):
+        if reason := _scan_script(script, budget.descend(depth), hit, budget):
+            return reason
+    return None
+
+
+def _dangerous_hit(name: str, argv: list[str]) -> str | None:
+    if name == "rm" and _rm_has_force(argv[1:]):
+        return "强制删除（rm -f/-rf）"
+    return None
+
+
+def _rm_has_force(args: list[str]) -> bool:
+    """rm 是否带 force。`--` 之后是文件名（`rm -- -f` 是删一个叫 -f 的文件）。"""
+    for arg in args:
+        if arg == "--":
+            return False
+        if arg == "--force":
+            return True
+        #  短选项聚合：-rf / -fr / -f；排除长选项（--foo 里的 f 不算）
+        if arg.startswith("-") and not arg.startswith("--") and "f" in arg[1:]:
+            return True
+    return False

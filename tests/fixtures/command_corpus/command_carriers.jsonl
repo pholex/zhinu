@@ -1,0 +1,60 @@
+{"cmd": "watch 'rm -rf ~'", "guard": "dangerous", "expect": "block", "note": "watch 把命令交给 sh -c"}
+{"cmd": "watch -n 1 rm -rf ~", "guard": "dangerous", "expect": "block", "note": "watch -n 带值，参数拼接后交给 shell"}
+{"cmd": "watch -n1 -d rm -rf ~", "guard": "dangerous", "expect": "block", "note": "watch 粘连值 + -d 可选值"}
+{"cmd": "watch --interval=2 --differences=permanent 'rm -rf ~'", "guard": "dangerous", "expect": "block", "note": "watch 长选项"}
+{"cmd": "watch echo 'a; rm -rf ~'", "guard": "dangerous", "expect": "block", "note": "watch 拼接参数后 ; 在 shell 里生效"}
+{"cmd": "watch -x sh -c 'rm -rf ~'", "guard": "dangerous", "expect": "block", "note": "watch -x 直接 exec argv"}
+{"cmd": "watch -x echo 'a; rm -rf ~'", "guard": "dangerous", "expect": "allow", "note": "watch -x 不经 shell，; 只是 echo 的参数"}
+{"cmd": "watch -n 5 git status", "guard": "dangerous", "expect": "allow", "note": "watch 包无害命令"}
+{"cmd": "watch -n 1 sudo id", "guard": "privileged", "expect": "block", "note": "watch 包 sudo"}
+{"cmd": "script -c 'rm -rf ~' /dev/null", "guard": "dangerous", "expect": "block", "note": "util-linux script -c 脚本"}
+{"cmd": "script -qc 'rm -rf ~' out.log", "guard": "dangerous", "expect": "block", "note": "script 短选项聚合末位 -c"}
+{"cmd": "script --command='rm -rf ~'", "guard": "dangerous", "expect": "block", "note": "script --command="}
+{"cmd": "script out.log -c 'rm -rf ~'", "guard": "dangerous", "expect": "block", "note": "util-linux script 选项可在文件名之后"}
+{"cmd": "script -q /dev/null rm -rf ~", "guard": "dangerous", "expect": "block", "note": "BSD/macOS script [file [command ...]]"}
+{"cmd": "script -t 0 out.log rm -rf ~", "guard": "dangerous", "expect": "block", "note": "BSD script -t 带值"}
+{"cmd": "script -q /dev/null make test", "guard": "dangerous", "expect": "allow", "note": "script 包无害命令"}
+{"cmd": "script -c 'make test' build.log", "guard": "dangerous", "expect": "allow", "note": "script -c 无害脚本"}
+{"cmd": "script -q -c 'sudo id' /dev/null", "guard": "privileged", "expect": "block", "note": "script -c 藏 sudo"}
+{"cmd": "sg docker -c 'rm -rf ~'", "guard": "dangerous", "expect": "block", "note": "sg group -c 脚本"}
+{"cmd": "sg docker 'rm -rf ~'", "guard": "dangerous", "expect": "block", "note": "sg 省略 -c 同样交给 sh -c"}
+{"cmd": "sg - docker -c 'rm -rf ~'", "guard": "dangerous", "expect": "block", "note": "sg - 登录环境"}
+{"cmd": "sg docker -c 'docker ps'", "guard": "dangerous", "expect": "allow", "note": "sg 无害脚本"}
+{"cmd": "sg wheel -c 'sudo id'", "guard": "privileged", "expect": "block", "note": "sg 藏 sudo"}
+{"cmd": "caffeinate -i rm -rf ~", "guard": "dangerous", "expect": "block", "note": "macOS caffeinate 包命令"}
+{"cmd": "caffeinate -t 3600 rm -rf ~", "guard": "dangerous", "expect": "block", "note": "caffeinate -t 带值"}
+{"cmd": "caffeinate -i make", "guard": "dangerous", "expect": "allow", "note": "caffeinate 包无害命令"}
+{"cmd": "arch -x86_64 rm -rf ~", "guard": "dangerous", "expect": "block", "note": "macOS arch -<架构名>"}
+{"cmd": "arch -arch arm64 rm -rf ~", "guard": "dangerous", "expect": "block", "note": "arch 单横线长选项 -arch 带值"}
+{"cmd": "arch -e FOO=1 -d BAR rm -rf ~", "guard": "dangerous", "expect": "block", "note": "arch -e/-d 带值"}
+{"cmd": "arch -arm64 make", "guard": "dangerous", "expect": "allow", "note": "arch 包无害命令"}
+{"cmd": "arch -x86_64 sudo id", "guard": "privileged", "expect": "block", "note": "arch 包 sudo"}
+{"cmd": "find . -name '*.tmp' -exec rm -rf {} \\;", "guard": "dangerous", "expect": "block", "note": "find -exec rm -rf"}
+{"cmd": "find . -type d -execdir rm -rf {} +", "guard": "dangerous", "expect": "block", "note": "find -execdir … {} +"}
+{"cmd": "find /tmp -ok rm -f {} ';'", "guard": "dangerous", "expect": "block", "note": "find -ok"}
+{"cmd": "find . -exec echo {} \\; -okdir rm -rf {} \\;", "guard": "dangerous", "expect": "block", "note": "第二个动作里的 rm"}
+{"cmd": "find . -exec sh -c 'rm -rf \"$1\"' sh {} \\;", "guard": "dangerous", "expect": "block", "note": "find -exec sh -c"}
+{"cmd": "find . -exec grep -l rm {} \\;", "guard": "dangerous", "expect": "allow", "note": "find -exec 无害命令"}
+{"cmd": "find . -exec echo rm -rf {} \\;", "guard": "dangerous", "expect": "allow", "note": "rm 只是 echo 的参数"}
+{"cmd": "find . -name '*.pyc' -delete", "guard": "dangerous", "expect": "allow", "note": "-delete 与不带 -f 的 rm 同口径，不算强制删除（仍是注入风险）"}
+{"cmd": "find . -exec sudo chown root {} +", "guard": "privileged", "expect": "block", "note": "find -exec sudo"}
+{"cmd": "bash -c 'rm -rf ~' arg0", "guard": "dangerous", "expect": "block", "note": "-c 之后第一个参数才是脚本"}
+{"cmd": "bash -o pipefail -c 'rm -rf ~'", "guard": "dangerous", "expect": "block", "note": "-o 带值在 -c 之前"}
+{"cmd": "bash -co pipefail 'rm -rf ~'", "guard": "dangerous", "expect": "block", "note": "-c 与 -o 聚合，-o 的值在脚本之前"}
+{"cmd": "bash -c -- 'rm -rf ~'", "guard": "dangerous", "expect": "block", "note": "-- 之后是脚本"}
+{"cmd": "bash -Tc 'rm -rf ~'", "guard": "dangerous", "expect": "block", "note": "bash -T 是 flag"}
+{"cmd": "ksh -R /tmp/x -c 'rm -rf ~'", "guard": "dangerous", "expect": "block", "note": "ksh -R 各实现不一：两种解释都扫"}
+{"cmd": "fish -C 'rm -rf ~' -c 'echo hi'", "guard": "dangerous", "expect": "block", "note": "fish -C 初始化命令也是脚本"}
+{"cmd": "fish -c 'echo hi' -c 'rm -rf ~'", "guard": "dangerous", "expect": "block", "note": "fish 可以给多个 -c"}
+{"cmd": "fish --command='rm -rf ~'", "guard": "dangerous", "expect": "block", "note": "fish --command="}
+{"cmd": "bash -c 'echo \"$0\"' 'rm -rf ~'", "guard": "dangerous", "expect": "allow", "note": "$0 位置的参数不是脚本"}
+{"cmd": "sh -c 'printf %s \"$1\"' sh 'rm -rf ~'", "guard": "dangerous", "expect": "allow", "note": "$1 位置的参数不是脚本"}
+{"cmd": "fish -c 'echo $argv' 'rm -rf ~'", "guard": "dangerous", "expect": "allow", "note": "fish -c 之后的参数是 $argv"}
+{"cmd": "bash script.sh -c 'rm -rf ~'", "guard": "dangerous", "expect": "allow", "note": "第一个非选项参数之后都交给 script.sh"}
+{"cmd": "bash -c 'echo ok' sudo", "guard": "privileged", "expect": "allow", "note": "$0 位置写 sudo 不是提权"}
+{"cmd": "env -S \"sh -c 'printf \\\\c; rm -rf ~'\"", "guard": "dangerous", "expect": "block", "note": "env -S 单引号内 \\c 是字面量（旧近似在此截断而漏检）"}
+{"cmd": "env -S 'rm -rf ~ \\c ignored'", "guard": "dangerous", "expect": "block", "note": "env -S 的 \\c 截断其后"}
+{"cmd": "env -S 'echo hi \\c rm -rf ~'", "guard": "dangerous", "expect": "allow", "note": "\\c 之后的内容不执行"}
+{"cmd": "env -S 'rm -r\\f /tmp/x'", "guard": "dangerous", "expect": "allow", "note": "\\f 是换页符不是字母 f"}
+{"cmd": "env -S 'rm -rf #~ comment'", "guard": "dangerous", "expect": "block", "note": "参数开头的 # 注释掉其后，rm -rf 仍在"}
+{"cmd": "env -S 'echo #; rm -rf ~'", "guard": "dangerous", "expect": "allow", "note": "# 之后全是注释"}

@@ -1,0 +1,29 @@
+usage: xiaoyu connect [-h] [--workspace WORKSPACE] [--session SESSION]
+                      [--instance INSTANCE] [--history | --status | --watch |
+                      --prompt PROMPT | --steer STEER | --abort |
+                      --approve REQUEST_ID | --answer QUESTION_ID]
+                      [--turn TURN] [--decision {allow,deny}]
+                      [--reason REASON] [--answers-json ANSWERS_JSON]
+                      [--idempotency-key IDEMPOTENCY_KEY]
+
+连接已运行的羽案会话；不会新建 agent 或接管日志。
+
+options:
+  -h, --help            show this help message and exit
+  --workspace WORKSPACE
+  --session SESSION
+  --instance INSTANCE   仅允许此前观察到的服务实例
+  --history
+  --status
+  --watch
+  --prompt PROMPT
+  --steer STEER
+  --abort
+  --approve REQUEST_ID
+  --answer QUESTION_ID
+  --turn TURN
+  --decision {allow,deny}
+  --reason REASON
+  --answers-json ANSWERS_JSON
+                        明确的 answers 数组；- 表示从标准输入读取
+  --idempotency-key IDEMPOTENCY_KEY

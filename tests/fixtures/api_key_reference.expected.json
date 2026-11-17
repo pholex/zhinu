@@ -1,0 +1,8 @@
+{
+  "exit_code": 1,
+  "stdout": {
+    "error": "XIAOYU_API_KEY 引用的 SNAPSHOT_MISSING_TOKEN 未设置：环境变量与同名 Keychain 均无有效值。",
+    "user_env_path": "<USER_ENV_PATH>"
+  },
+  "stderr": ""
+}

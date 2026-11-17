@@ -1,0 +1,32 @@
+# 供应链：每周一次自动开升级 PR。
+#  - github-actions：workflow 里全部 action 钉 commit SHA（见 ci.yml），dependabot 会
+#    连同 SHA 一起升、注释里的 vX.Y.Z 同步改——手动追 SHA 太容易漏；
+#  - pip：pyproject 的依赖是精确锁版本（范围声明会让投毒的新版本自动进用户机器），
+#    升级 = 有意改那一行并重跑测试。dependabot 开的 PR 正是那个"有意"的入口，
+#    CI 全矩阵跑过才合。小版本（minor + patch）分组进一个 PR，减少噪音；
+#    大版本单独开，必须逐个看变更说明。
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      actions-minor:
+        update-types: [minor, patch]
+
+  - package-ecosystem: pip
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      pip-minor:
+        update-types: [minor, patch]
+
+  - package-ecosystem: pip
+    directory: /packages/xiaoyu-agent-sdk
+    schedule:
+      interval: weekly
+    groups:
+      sdk-pip-minor:
+        update-types: [minor, patch]

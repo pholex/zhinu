@@ -1,0 +1,35 @@
+{
+  "controls": [
+    {
+      "board_id": "BOARD",
+      "created_at": "TIME",
+      "kind": "message",
+      "member_name": "reader",
+      "member_run_id": "RUN",
+      "operation_id": "op-1",
+      "reason": "成员已结束，消息未进入本轮上下文",
+      "status": "not_consumed",
+      "text": "补充核对。",
+      "updated_at": "TIME"
+    },
+    {
+      "board_id": "BOARD",
+      "created_at": "TIME",
+      "kind": "stop",
+      "member_name": "reader",
+      "member_run_id": "RUN",
+      "operation_id": "stop-1",
+      "reason": "成员执行已结束；工作区和存档保留",
+      "status": "settled",
+      "text": "",
+      "updated_at": "TIME"
+    }
+  ],
+  "member": {
+    "execution_outcome": "partial",
+    "execution_state": "settled",
+    "status": "done",
+    "stop_reason": "interrupted",
+    "stop_requested": true
+  }
+}
