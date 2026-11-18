@@ -138,10 +138,23 @@ class YuAdapterTest(Base):
             "tool_steps": 3, "bad_steps": 2, "user_inputs": 1,
             "seconds": 46,  # 到最后一句正文为止，不含退出前停在提示符上的四分钟
             "requests": 3, "context_median": 2000, "context_max": 3000, "context_total": 6000,
-            "output_total": 60, "tool_seconds": 42,  # 同批并行的两步只算一段
+            "output_total": 60,
+            "delegated_requests": 0, "delegated_context_total": 0, "delegated_output_total": 0,
+            "tool_seconds": 42,  # 同批并行的两步只算一段
              "wait_asked": 40, "wait_seconds": 40,
             "said_requests": 2, "ends_with_text": True,
         })
+
+    def test_sub_agent_requests_are_counted_apart_from_the_main_chain(self) -> None:
+        sub = [{"ts": "2026-01-01T10:00:02", "event": "explore_request", "run": "r", "step": n,
+                "prompt_tokens": 700, "completion_tokens": 5} for n in (1, 2)]
+        timeline = compare.load_yu(write_jsonl(self.dir / "sub.jsonl", YU + sub))
+        summary = compare.summarize(timeline)
+        self.assertEqual((summary["delegated_requests"], summary["delegated_context_total"],
+                          summary["delegated_output_total"]), (2, 1400, 10))
+        self.assertEqual((summary["requests"], summary["context_total"]), (3, 6000))
+        self.assertIn("| 子 agent 请求数 / 输入 token（不含在上面各项里） | 2 / 1,400 |",
+                      compare.render_summary([timeline]))
 
     def test_interrupted_call_is_marked_and_ends_without_text(self) -> None:
         records = YU[:8] + [{"ts": "2026-01-01T10:00:20", "role": "tool", "tool_call_id": "c2",

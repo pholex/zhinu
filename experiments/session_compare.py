@@ -18,6 +18,9 @@ tool_result 块、usage 字段），路径由参数给；也可以给 id 加 `--
   是下限），每步再封顶到该步实际耗时——被拦下、被打断的 sleep 不会虚增。
 - 每请求上下文：小羽取 request 记录的 prompt_tokens；小雪取 usage 里三项输入之和
   （新输入 + 读缓存 + 写缓存）。都是"这次请求模型看到多少"。
+- 请求数与 token 各项只算主链。小羽的检索子 agent 另发的请求单列一行，不并进去：
+  它可能跑在另一个模型上，混在一起两边就没法比；但漏掉它，"小羽更省"会是假象
+  （实测一场会话主链 12 万、子 agent 68 万）。小雪的侧链目前不计。
 """
 
 from __future__ import annotations
@@ -75,6 +78,7 @@ class Timeline:
     model: str = ""
     steps: list[Step] = field(default_factory=list)
     requests: list[Request] = field(default_factory=list)
+    delegated: list[Request] = field(default_factory=list)   # 检索子 agent 发的请求，不进主链各项
     warnings: list[str] = field(default_factory=list)
 
 
@@ -151,6 +155,9 @@ def load_yu(path: Path) -> Timeline:
             out.requests.append(request)
             if data.get("model"):
                 out.model = str(data["model"])
+        elif kind == "explore_request":
+            out.delegated.append(Request(len(out.delegated) + 1, data.get("prompt_tokens"),
+                                         data.get("completion_tokens"), failed=bool(row.get("error"))))
         elif kind == "message.assistant":
             out.steps.append(Step(clock.at(stamp), "say", row["request"], detail=row["summary"]))
             if row["request"] in by_request:
@@ -270,6 +277,9 @@ def summarize(timeline: Timeline) -> dict[str, Any]:
         "context_max": max(contexts, default=None),
         "context_total": sum(contexts) if contexts else None,
         "output_total": sum(r.output or 0 for r in timeline.requests) if timeline.requests else None,
+        "delegated_requests": len(timeline.delegated),
+        "delegated_context_total": sum(r.context or 0 for r in timeline.delegated),
+        "delegated_output_total": sum(r.output or 0 for r in timeline.delegated),
         "tool_seconds": round(_covered([(s.at, s.at + s.took) for s in tools if s.took is not None])),
         "wait_asked": round(sum(s.asked_wait for s in tools)),
         "wait_seconds": round(sum(min(s.asked_wait, s.took) for s in tools if s.took is not None)),
@@ -317,6 +327,8 @@ SUMMARY_ROWS = (
     ("每请求上下文（中位 / 最大）", lambda s: f"{_num(s['context_median'])} / {_num(s['context_max'])}"),
     ("输入 token 合计", lambda s: _num(s["context_total"])),
     ("输出 token 合计", lambda s: _num(s["output_total"])),
+    ("子 agent 请求数 / 输入 token（不含在上面各项里）",
+     lambda s: f"{_num(s['delegated_requests'])} / {_num(s['delegated_context_total'])}"),
     ("工具执行秒数", lambda s: _num(s["tool_seconds"])),
     ("前台等待秒数（计入 / 申请）", lambda s: f"{_num(s['wait_seconds'])} / {_num(s['wait_asked'])}"),
     ("带正文的请求", lambda s: f"{s['said_requests']}/{s['requests']}"),

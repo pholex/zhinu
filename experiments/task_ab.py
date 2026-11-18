@@ -224,6 +224,8 @@ ROWS = (
     ("每请求上下文（中位）", lambda runs: _median(runs, "context_median")),
     ("输入 token 合计", lambda runs: _median(runs, "context_total")),
     ("输出 token 合计", lambda runs: _median(runs, "output_total")),
+    ("子 agent 请求数（不含在上面各项里）", lambda runs: _median(runs, "delegated_requests")),
+    ("子 agent 输入 token 合计", lambda runs: _median(runs, "delegated_context_total")),
     ("前台等待秒数", lambda runs: _median(runs, "wait_seconds")),
     ("带正文的请求占比（中位）", _said),
     ("以正文收尾", lambda runs: _count(runs, "ends_with_text")),
