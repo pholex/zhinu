@@ -14,9 +14,15 @@
 
 from __future__ import annotations
 
+import json
+import time
+import uuid
+from typing import Any, Callable
+
 from . import ui
 from .config import Config
-from .events import Notice, UISink
+from .errors import Interrupted
+from .events import Notice, RequestEnded, ToolCompleted, ToolDenied, ToolPending, UIEvent, UISink
 from .providers import Registry, UnknownModel
 from .render import PlainSink
 from .tools import Tool, Toolbox
@@ -50,6 +56,98 @@ EXPLORE_PROMPT = """你是代码检索助手，只负责查清事实，不做修
 #  子 agent 的回答如果太长就失去意义了（省上下文是它存在的理由）
 MAX_ANSWER_CHARS = 4000
 
+#  旁录进父会话日志的参数值上限：留得下路径与正则，留不下整段正文
+TRACE_ARG_CHARS = 200
+TRACE_QUESTION_CHARS = 300
+
+
+def _clip_args(args: Any) -> dict[str, Any]:
+    """工具参数的日志形态：标量原样，长字符串与嵌套结构截到 TRACE_ARG_CHARS。"""
+    if not isinstance(args, dict):
+        return {}
+    clipped: dict[str, Any] = {}
+    for key, value in args.items():
+        if isinstance(value, (bool, int, float)) or value is None:
+            clipped[str(key)] = value
+            continue
+        text = value if isinstance(value, str) else json.dumps(value, ensure_ascii=False, default=str)
+        clipped[str(key)] = text if len(text) <= TRACE_ARG_CHARS else text[:TRACE_ARG_CHARS] + "…"
+    return clipped
+
+
+class TraceSink:
+    """把检索子 agent 每一步的事实旁录进父会话日志，事件原样转给真正的 sink。
+
+    子 agent 自己不落盘（它的历史用完即弃），父会话里就只剩"问了什么、答了什么"：
+    一次检索为什么花了二十轮、哪几步在空转、token 花在哪，事后无从回答。
+    这里只记事实——工具名、截短的参数、成败、耗时、输出字数、每次请求的用量——
+    不记工具输出正文（那正是不想留在主会话里的东西）。
+
+    记在 sink 这一层而不是给子 agent 挂 session_log：后者会把子 agent 的消息
+    当成父会话的对话写进去，resume 时读回来就乱了。留痕出错不连累检索。
+    """
+
+    def __init__(self, inner: UISink, log: Any, run: str) -> None:
+        self.inner = inner
+        self.log = log
+        self.run = run
+        self.requests = 0
+        self.tools = 0
+        self.failed_tools = 0
+        self.prompt_tokens = 0
+        self.completion_tokens = 0
+        self._args: dict[str, dict[str, Any]] = {}
+
+    def __getattr__(self, name: str) -> Any:
+        #  表现层的其余能力（quiet_child / interrupt …）都是 duck-typed 取用的
+        return getattr(self.inner, name)
+
+    def emit(self, event: UIEvent) -> None:
+        try:
+            self._note(event)
+        except Exception:  # noqa: BLE001 - 留痕失败不该打断检索
+            pass
+        self.inner.emit(event)
+
+    def record(self, kind: str, **fields: Any) -> None:
+        try:
+            self.log.event(kind, run=self.run, **fields)
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _note(self, event: UIEvent) -> None:
+        if isinstance(event, RequestEnded):
+            self.requests += 1
+            usage = event.usage or {}
+            fields: dict[str, Any] = {"step": self.requests, "ms": event.duration_ms}
+            if event.ttft_ms is not None:
+                fields["first_chunk_ms"] = event.ttft_ms
+            for key in ("prompt_tokens", "completion_tokens", "cached_tokens"):
+                if isinstance(usage.get(key), int):
+                    fields[key] = usage[key]
+            self.prompt_tokens += int(fields.get("prompt_tokens", 0))
+            self.completion_tokens += int(fields.get("completion_tokens", 0))
+            if event.error:
+                fields["error"] = event.error
+            self.record("explore_request", **fields)
+        elif isinstance(event, ToolPending):
+            self._args[event.tool_call_id] = _clip_args(event.args)
+        elif isinstance(event, ToolCompleted):
+            self.tools += 1
+            self.failed_tools += 0 if event.ok else 1
+            self.record(
+                "explore_tool", step=self.requests, tool=event.name,
+                args=self._args.pop(event.tool_call_id, {}), ok=event.ok,
+                ms=round(event.seconds * 1000), output_chars=len(event.output or ""),
+            )
+        elif isinstance(event, ToolDenied):
+            self.tools += 1
+            self.failed_tools += 1
+            self.record(
+                "explore_tool", step=self.requests, tool=event.name,
+                args=self._args.pop(event.tool_call_id, {}), ok=False, denied=event.by,
+            )
+
 
 def make_explore_tool(
     config: Config,
@@ -60,9 +158,13 @@ def make_explore_tool(
     approver=None,
     permissions=None,
     toolbox: Toolbox | None = None,
+    journal: Callable[[], Any] | None = None,
 ) -> Tool:
     """造一个 explore 工具挂到主 agent 上。usage 与 registry 都传父级的：
     成本记同一本账，client 也按 provider 复用（explore_model 可能落在另一家）。
+
+    journal 取父会话当前的日志（现取：/clear、resume 会换掉它）；有日志时
+    每次检索的逐步事实旁录进去（见 TraceSink），没有就不记。
 
     sink 是父 agent 的表现层出口：explore 的进度提示随父级的界面走。
     approver / permissions 也是父级的：只读工具免确认，但用户写的 deny / ask
@@ -153,6 +255,20 @@ def make_explore_tool(
         #  自己上方；裸 print（PlainSink 默认路径）会把活区搅花。
         #  父 sink 不支持派生（PlainSink/NullSink）就传 None，走原有默认。
         child_maker = getattr(sink, "quiet_child", None)
+        child_sink = child_maker() if callable(child_maker) else None
+        log = journal() if journal is not None else None
+        trace: TraceSink | None = None
+        if log is not None:
+            #  没有可派生的父 sink 时补上 Agent 自己会造的那个静默明文 sink
+            trace = TraceSink(
+                child_sink or PlainSink(indent="    ", verbose=False), log, uuid.uuid4().hex[:8]
+            )
+            child_sink = trace
+            trace.record(
+                "explore_start", model=model, budget=config.explore_iterations,
+                question=question if len(question) <= TRACE_QUESTION_CHARS
+                else question[:TRACE_QUESTION_CHARS] + "…",
+            )
         sub_agent = Agent(
             sub_config,
             Toolbox(sub_config, only=Toolbox.READONLY, mcp_view=view),
@@ -162,7 +278,7 @@ def make_explore_tool(
             allow_explore=False,
             approver=approver,
             permissions=permissions,
-            sink=child_maker() if callable(child_maker) else None,
+            sink=child_sink,
         )
         sub_agent.agent_name = "explore"
         sub_agent.system_prompt_override = EXPLORE_PROMPT.format(workspace=config.workspace)
@@ -178,13 +294,27 @@ def make_explore_tool(
             )
         sub_agent.messages[0]["content"] = sub_agent.system_prompt_override
 
+        started = time.monotonic()
+        #  收尾事件在 finally 里记：用户中断（KeyboardInterrupt 一路抛给父级）
+        #  正是最需要回看"它停在第几步"的时候
+        outcome = "interrupted"
         try:
             sub_agent.send(question)
+            outcome = "done" if sub_agent.last_assistant_text() else "no_answer"
         except Exception as exc:  # noqa: BLE001 - 检索失败不该打断主流程
+            outcome = "interrupted" if isinstance(exc, Interrupted) else "error"
             return (
                 f"ERROR: 检索子 agent 失败（{type(exc).__name__}: {exc}）。"
                 "可以自己用 grep / read_file 继续查。"
             )
+        finally:
+            if trace is not None:
+                trace.record(
+                    "explore_end", outcome=outcome, stop=getattr(sub_agent, "last_stop", ""),
+                    requests=trace.requests, tools=trace.tools, failed_tools=trace.failed_tools,
+                    prompt_tokens=trace.prompt_tokens, completion_tokens=trace.completion_tokens,
+                    seconds=round(time.monotonic() - started, 1),
+                )
 
         answer = sub_agent.last_assistant_text()
         tools_used = len(sub_agent.trace)

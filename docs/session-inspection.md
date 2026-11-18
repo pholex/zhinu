@@ -46,6 +46,21 @@ xiaoyu sessions inspect 1 --kind compact --kind approval --limit 50
 （使用这份转写）与 `prefix`（主模型成功使用历史前缀，转写覆盖率不适用于实际输入），
 `summary_route` 标出该次摘要路由。以上字段可用 `--raw` 或 `--json` 查看。
 
+`explore` 检索子 agent 的历史用完即弃，父会话里只有问题与结论。它每一步的事实
+另外旁录成四种事件，`--kind explore` 一次筛出，同一次检索共用一个 `run`：
+
+- `explore_start`：模型、轮数上限 `budget`、问题（截到 300 字符）；
+- `explore_request`：第几次请求 `step`、耗时 `ms`、首字延迟、`prompt_tokens` /
+  `completion_tokens` / `cached_tokens`，出错时带 `error` 分类；
+- `explore_tool`：所属 `step`、工具名、参数（每个值截到 200 字符）、`ok`、耗时 `ms`、
+  输出字数 `output_chars`；被拦下的调用带 `denied`；
+- `explore_end`：`outcome`（`done` / `no_answer` / `interrupted` / `error`）、请求数、
+  工具调用数与失败数、token 合计、总秒数。用户中断时同样写入。
+
+工具输出正文不记，只留字数。这些请求不计入 `R` 请求序号。`--errors` 会筛出失败的
+工具调用、出错的请求和没有正常收尾的检索。声明式委托的子 agent 有自己的运行记录，
+不走这组事件。
+
 默认摘要至多 240 字符；`--raw` 添加完整记录字段，仍做凭据脱敏与终端控制字符
 清理。它会包含记录中的对话、参数与工具正文，不等于仅含运行指标的报告。
 `--json` 输出相同结构，适合宿主进一步处理。读取使用固定文件大小边界，检查正在
