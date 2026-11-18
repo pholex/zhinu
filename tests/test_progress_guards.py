@@ -96,6 +96,22 @@ class WaitStallTest(StallDetectionTest):
         self.assertIn("如实告诉用户", outputs[4])
         self.assertIn("二选一", outputs[5])
 
+    def test_trailing_exit_echo_and_loops_do_not_hide_the_unchanged_result(self) -> None:
+        """替身环境实测到的两种写法：命令尾巴接 `echo "exit=$?"`，以及把几次
+        重试写进一条 for 循环——字面末行都不是那句结论。"""
+        closed = "Connection closed by 203.0.113.7 port 22"
+        once = f"exit_status: 0\nstdout:\n{closed}\nssh_exit=255"
+        looped = "exit_status: 0\nstdout:\n" + "".join(
+            f"--- attempt {i} ---\n{closed}\nexit=255\n" for i in (1, 2, 3))
+        agent = self.build_with_fake_bash([once, once, looped])
+        outputs = [
+            self._run(agent, "bash", {"command": 'ssh h uptime; echo "ssh_exit=$?"'}),
+            self._run(agent, "bash", {"command": 'sleep 20; ssh h uptime; echo "ssh_exit=$?"'}),
+            self._run(agent, "bash", {"command": 'for i in 1 2 3; do sleep 25; ssh h uptime; echo "exit=$?"; done'}),
+        ]
+        self.assertNotIn("[提示]", outputs[1])
+        self.assertIn("2 次先 sleep 再查", outputs[2])
+
     def test_waiting_that_changes_the_result_is_silent(self) -> None:
         pending = "exit_status: 0\nstdout:\ndeployment is still rolling out"
         agent = self.build_with_fake_bash([pending, "exit_status: 0\nstdout:\ndeployment finished ok"])
@@ -116,7 +132,8 @@ class WaitStallTest(StallDetectionTest):
         second = 'exit_status: 0\nstdout:\n[\n  {"State": "running"}\n]'
         agent = self.build_with_fake_bash([first, second, second])
         outputs = [self._run(agent, "bash", {"command": f"sleep 30; status #{i}"}) for i in range(3)]
-        self.assertEqual(agent._wait_unchanged, 1)  # 只有第三次：整段和第二次一样
+        #  第二次：整段不同，最后一行有实质内容的行（State）也不同；第三次才算没变
+        self.assertEqual(agent._wait_unchanged, 1)
         self.assertTrue(all("[提示]" not in text for text in outputs), outputs)
 
     def test_counters_reset_each_turn(self) -> None:

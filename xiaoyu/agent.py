@@ -5728,7 +5728,8 @@ class Agent:
     #  "等完结果没变"达到这个次数提示 / 要求收敛
     _WAIT_NOTE = 2
     _WAIT_CONVERGE = 3
-    #  末行指纹至少要有这么多非空白字符：`]`、`}`、`ok` 这类收尾行谁都长一个样
+    #  算"有实质内容"的行至少要有这么多非空白字符：`]`、`}`、`exit=255` 这类
+    #  收尾行谁都长一个样
     _WAIT_TAIL_MIN = 12
     _SLEEP = re.compile(r"(?:^|[;&|\n(]|\bdo\b|\bthen\b)\s*sleep\s+(\d+(?:\.\d+)?)([smh]?)(?![\w.])")
     _LEADING_SLEEP = re.compile(r"^\s*(?:sleep\s+\d+(?:\.\d+)?[smh]?\s*(?:;|&&)\s*)+")
@@ -5747,8 +5748,10 @@ class Agent:
         打转检测认参数相同，无进展检测认非零退出码；而"重启后连不上就加长
         sleep 再连"两头都不沾——每次 sleep 的秒数不同，命令接了管道（`| tail`）
         退出码又是 0。实测一轮里这样等了三分多钟，结果从第一次起就没变过。
-        判据是结果而不是命令：等完拿到的输出（整段，或有实质内容的末行）
+        判据是结果而不是命令：等完拿到的输出（整段，或最后一行有实质内容的行）
         在本轮更早的 bash 输出里已经出现过，说明等待没有改变任何东西。
+        取"最后一行有实质内容的"而不是字面的末行：模型常在命令尾巴上接
+        `echo "exit=$?"`，字面末行就成了谁都长一个样的 `exit=255`。
         只提示、不拦截：真在推进的轮询（末行带进度数字）会被数字抹平误伤，
         由模型自己判断；要等外部事件本来就该用 run_in_background。
         """
@@ -5762,9 +5765,11 @@ class Agent:
         if body:
             #  整段只留摘要：一轮里的 bash 输出加起来可以很大
             prints.add(hashlib.sha1(self._VOLATILE.sub("#", body).encode("utf-8", "replace")).hexdigest())
-            tail = self._VOLATILE.sub("#", body.splitlines()[-1].strip())
-            if len(re.sub(r"\s", "", tail)) >= self._WAIT_TAIL_MIN:
-                prints.add(tail)
+            for line in reversed(body.splitlines()):
+                tail = self._VOLATILE.sub("#", line.strip())
+                if len(re.sub(r"\s", "", tail)) >= self._WAIT_TAIL_MIN:
+                    prints.add(tail)
+                    break
         slept = 0.0 if args.get("run_in_background") else self._slept_seconds(str(args.get("command") or ""))
         unchanged = slept >= self._WAIT_MIN_SECONDS and bool(prints & self._wait_seen)
         self._wait_seen |= prints
