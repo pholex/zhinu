@@ -281,6 +281,7 @@ def make_explore_tool(
             sink=child_sink,
         )
         sub_agent.agent_name = "explore"
+        sub_agent.reports_only = True
         sub_agent.system_prompt_override = EXPLORE_PROMPT.format(workspace=config.workspace)
         if view is not None:
             sub_agent.system_prompt_override = sub_agent.system_prompt_override.replace(

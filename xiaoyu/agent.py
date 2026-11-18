@@ -1137,6 +1137,10 @@ class Agent:
         #  quiet 用于子 agent：不刷正文，只用缩进显示它调了什么工具。
         #  所有面向用户的输出走 sink（第 0 步重构）：不传就按 quiet 构造明文渲染。
         self.quiet = quiet
+        #  只读子 agent（检索）由创建方置 True：它的收尾正文是给主模型的报告，
+        #  不是对用户的交付，产物对账护栏不适用。不从工具箱推断——内核会往任何
+        #  工具箱里补登记自己的工具，名单说明不了"能不能改动现场"
+        self.reports_only = False
         self.sink: UISink = sink or PlainSink(indent="    " if quiet else "", verbose=not quiet)
         #  每次工具调用的记录，供 eval 与排障使用。
         self.trace: list[dict[str, Any]] = []
@@ -3636,7 +3640,10 @@ class Agent:
                     #  成功的改动类工具——改动不存在（真实会话里模型空口宣布
                     #  "已生成文件"，用户去找时什么都没有）。排在 Stop hook 之前：
                     #  hook 该看到的是澄清/补做之后的收尾
-                    if not nudged_phantom and self._turn_mutations == 0:
+                    #  只读子 agent（检索）不问：它没有任何能改动现场的工具，报告里
+                    #  "更新额度时调 /user/info"这类话是在转述读到的代码，不是宣称。
+                    #  问了白费一次请求，提示还会冒到主会话里，看着像主回答出了错
+                    if not nudged_phantom and self._turn_mutations == 0 and not self.reports_only:
                         claims = phantom_claims(media.text_of(message.get("content")))
                         if claims:
                             nudged_phantom = True
