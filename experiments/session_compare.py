@@ -42,7 +42,8 @@ from xiaoyu.session_inspect import inspect_session  # noqa: E402
 
 INTERRUPTED = "用户按 Ctrl-C 中断了本轮"
 #  小雪日志里由客户端代写、不是用户敲的 user 文本
-_XUE_NOT_TYPED = ("<local-command", "<command-", "<system-reminder>", "[Request interrupted")
+_XUE_NOT_TYPED = ("<local-command", "<command-", "<system-reminder>", "<task-notification>",
+                  "<bash-input>", "<bash-stdout>", "<bash-stderr>", "[Request interrupted")
 STATUS_MARK = {"ok": "✓", "fail": "✗", "denied": "拒", "interrupted": "断", "pending": "…"}
 
 
@@ -176,6 +177,12 @@ def load_yu(path: Path) -> Timeline:
     return out
 
 
+def _xue_client_written(record: dict[str, Any]) -> bool:
+    """客户端代写的 user 记录：注入的说明、压缩摘要、后台任务的完成通知。"""
+    return bool(record.get("isMeta") or record.get("isCompactSummary")
+                or record.get("promptSource") == "system")
+
+
 def load_xue(path: Path) -> Timeline:
     """小雪会话 jsonl → 时间线。只看主链；一次请求的多个内容块按 message.id 归并。"""
     out = Timeline(label="小雪", name=path.name)
@@ -204,7 +211,7 @@ def load_xue(path: Path) -> Timeline:
                         step = open_calls.pop(str(block.get("tool_use_id") or ""), None)
                         if step is not None:
                             _close(step, clock.at(stamp), "fail" if block.get("is_error") else "ok")
-                    elif block.get("type") == "text" and not record.get("isMeta"):
+                    elif block.get("type") == "text" and not _xue_client_written(record):
                         text = str(block.get("text") or "").strip()
                         if text and not text.startswith(_XUE_NOT_TYPED):
                             clock.start(stamp)

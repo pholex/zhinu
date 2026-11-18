@@ -85,6 +85,9 @@ XUE = [
     {**xue_assistant("18", "m9", {"type": "tool_use", "id": "t9", "name": "Bash",
                                   "input": {"command": "ls"}}, 99), "isSidechain": True},
     xue_assistant("20", "m3", {"type": "text", "text": "已重启。"}, 6000),
+    xue_line("user", "30", "客户端写的压缩摘要", isCompactSummary=True),
+    xue_line("user", "31", "客户端转来的后台任务通知", promptSource="system"),
+    xue_line("user", "32", "<bash-input>ls</bash-input>"),
     "这一行不是 JSON",
 ]
 
@@ -176,10 +179,11 @@ class XueAdapterTest(Base):
     def test_client_written_text_and_side_chain_are_skipped(self) -> None:
         details = " ".join(s.detail for s in self.timeline.steps)
         self.assertNotIn("客户端", details)
+        self.assertNotIn("bash-input", details)
         self.assertNotIn("ls", [s.detail for s in self.timeline.steps])
 
     def test_corrupt_line_is_a_warning_not_a_crash(self) -> None:
-        self.assertEqual(self.timeline.warnings, ["L13: 损坏的日志记录"])
+        self.assertEqual(self.timeline.warnings, ["L16: 损坏的日志记录"])
 
     def test_blocked_sleep_does_not_count_as_waiting(self) -> None:
         summary = compare.summarize(self.timeline)
