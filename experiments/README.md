@@ -41,12 +41,20 @@ nohup bash -c "trap '' HUP; exec ./experiments/compaction_e2e.sh" >/tmp/run.log 
 | `fixtures/versioned_modules.py` | 5 个大模块，各带一个 VERSION 常量 |
 | `standin_ab.py --arm 名字=引用 … --scenario …` | 替身运维环境里的版本对比：重启后停不停、连不上追不追、说不说话 |
 | `fixtures/standin_ops.py` | 替身环境：假机群 CLI、连上即断的假 ssh、立即返回的假 sleep |
+| `task_ab.py --arm 名字=侧:模型 … --task …` | 同题对照跑批：同一道题两边各做几遍，判据是测试与事实，汇总并排（题目见 `fixtures/ab_tasks.py`） |
 | `session_compare.py --yu <id> --xue <文件>` | 同题对照：小羽与小雪（对照侧）各一场会话归一成同一张时间线表，只读不调模型 |
 
 `session_compare.py` 不受上面的前提约束（不执行任何工具）。小雪一侧给会话 jsonl 的路径，
 或给 id 加 `--xue-root <目录>`；只给一侧也行，用来单看一场会话的步数与等待。
 `--json` 出结构化数据，`--out` 写文件。汇总表的口径（时间起点、等待秒数怎么封顶、
 每请求上下文各取哪个字段）写在脚本开头。输出里有会话原文摘要，只留在本机，不入库。
+
+`task_ab.py` 真实调模型并放开审批，适用上面的前提。两边都按本机真实配置跑；
+每次运行的起点是本仓某个提交导出的**无历史**副本（答案就在后续提交里，留着历史等于
+把答案放在手边），跑完即删。小雪的可执行文件与会话目录用 `--xue-bin` / `--xue-root`
+或环境变量 `XIAOXUE_BIN` / `XIAOXUE_ROOT` 给。先 `--dry-run` 看题面与起点；
+中断后同一个 `--out` 重跑会接着没跑完的继续。涉及本机其他目录的私有题目放
+`--tasks-file`，不入库。
 
 ## 已记录的结果
 
