@@ -118,7 +118,8 @@ def judge(task: ab_tasks.Task, ready: dict[str, Any], final_text: str, root: Pat
             facts["tests_pass"], output = run_tests(workspace, task.tests, python)
             (root / "check.txt").write_text(output, encoding="utf-8")
     if task.expect:
-        missing = [p for p in task.expect if not re.search(p, final_text)]
+        plain = re.sub(r"[*`]", "", final_text)  # 「第 **2** 次」这类强调写法不该让事实对不上
+        missing = [p for p in task.expect if not re.search(p, plain)]
         facts["answer_hits"] = f"{len(task.expect) - len(missing)}/{len(task.expect)}"
         facts["answer_ok"] = not missing
     facts["done"] = all(v for k, v in facts.items() if isinstance(v, bool))

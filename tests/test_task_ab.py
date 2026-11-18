@@ -84,6 +84,8 @@ class WorkspaceTest(unittest.TestCase):
                           expect=[r"10\s*秒", r"第\s*3\s*次"])
         facts = runner.judge(task, self.ready, "至少 10 秒，第 2 次提示", self.root, sys.executable)
         self.assertEqual((facts["answer_hits"], facts["answer_ok"], facts["done"]), ("1/2", False, False))
+        facts = runner.judge(task, self.ready, "至少 **10 秒**，第 **3** 次要求收敛", self.root, sys.executable)
+        self.assertEqual((facts["answer_hits"], facts["answer_ok"]), ("2/2", True))
 
 
 class RenderTest(unittest.TestCase):
