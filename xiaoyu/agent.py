@@ -3885,7 +3885,10 @@ class Agent:
         note = "[余量] " + " ".join(lines) + " 请据此安排节奏。"
         self._record_operator(note)
         self.compactor.synthetic_user_texts |= {note}
-        self.emit(Notice("[余量] " + " ".join(lines), "warn"))
+        #  子 agent（quiet）的余量是它自己的内部节奏：模型要知情，用户不必看——
+        #  上屏会被读成主会话快到头了（explore 每次检索都要跨两条线）
+        if not self.quiet:
+            self.emit(Notice("[余量] " + " ".join(lines), "warn"))
         if self.session_log:
             self.session_log.event("headroom_notice", lines=lines)
 

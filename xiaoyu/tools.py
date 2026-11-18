@@ -3158,7 +3158,7 @@ class Toolbox:
 
         兜底不是可选项：Windows 上默认既没有 ripgrep 也没有 grep.exe，直接
         subprocess 会抛 [WinError 2]，模型每次搜索都白烧一轮、只能退化成一个个
-        read_file 硬啃——explore 子 agent 的 12 轮上限就是这么被烧光的。
+        read_file 硬啃——explore 子 agent 的轮数上限就是这么被烧光的。
         """
         target, _ = self._resolve(path)
         if not target.exists():

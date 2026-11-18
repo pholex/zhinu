@@ -116,7 +116,7 @@ XIAOYU_API_KEY=<key>
 | `XIAOYU_STREAM_MAX_LIFETIME` | `0` | 单次流式响应总时限（秒），`0` 关闭。请求发出后按单调时钟计时，原始事件（包括 ping）和模型 chunk 边界均检查；达到时停止本轮、不自动重试，保留已输出正文、丢弃未执行的工具调用。同步读取不会被计时器强行打断：无事件时仍等既有读超时，因此实际退出可能晚于设值一个读取等待周期 |
 | `XIAOYU_FIRST_CHUNK_TIMEOUT` | `300` | 首 chunk 看门狗（秒）：请求发出后等第一个流事件超过它就中止本次尝试、按瞬时错误走既有重试/降级链，报错点名"首 chunk 等待超过 300s（XIAOYU_FIRST_CHUNK_TIMEOUT）"；`0` = 关。实现是收紧这次请求的读超时（等首 token 时进程阻塞在一次 socket 读上，不起线程就只有它能打断），所以看门狗生效时流内两个 chunk 之间的等待上限也是这个数；比单次请求超时（600s）长时不生效 |
 | `XIAOYU_MAX_IMAGES_PER_REQUEST` | `20` | 每次请求最多发出去几张图（`0` = 不限）：只投影发出去的副本——更早的图换成一行"[图片已省略：第 N 张…]"占位，历史与会话文件照旧带图，`/compact` 或用户重贴随时能回来。内置厂商若声明了更小的张数上限，按较小的算。用户贴的图刻意不老化，没有这一层，贴图多的长会话会撞端点的张数上限（400 且每次重发同样 400） |
-| `XIAOYU_EXPLORE_ITERATIONS` | `12` | `explore` 子 agent 单次检索的工具调用轮数上限（1–100；主 agent 的 50 轮不受影响） |
+| `XIAOYU_EXPLORE_ITERATIONS` | `24` | `explore` 子 agent 单次检索的工具调用轮数上限（1–100；主 agent 的 50 轮不受影响） |
 | `XIAOYU_QIXIANG_CONCURRENCY` | `4` | 七襄批量委托的并发上限（1–16） |
 | `XIAOYU_QIXIANG_TIMEOUT` | `0` | 七襄单项任务墙钟超时（秒，从实际启动起算；`0` = 不限时） |
 | `XIAOYU_CHENSHU_MAX_WORKERS` | `4` | 宸枢同时在跑的成员上限（worker + reviewer，1–16） |
