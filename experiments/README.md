@@ -41,6 +41,12 @@ nohup bash -c "trap '' HUP; exec ./experiments/compaction_e2e.sh" >/tmp/run.log 
 | `fixtures/versioned_modules.py` | 5 个大模块，各带一个 VERSION 常量 |
 | `standin_ab.py --arm 名字=引用 … --scenario …` | 替身运维环境里的版本对比：重启后停不停、连不上追不追、说不说话 |
 | `fixtures/standin_ops.py` | 替身环境：假机群 CLI、连上即断的假 ssh、立即返回的假 sleep |
+| `session_compare.py --yu <id> --xue <文件>` | 同题对照：小羽与小雪（对照侧）各一场会话归一成同一张时间线表，只读不调模型 |
+
+`session_compare.py` 不受上面的前提约束（不执行任何工具）。小雪一侧给会话 jsonl 的路径，
+或给 id 加 `--xue-root <目录>`；只给一侧也行，用来单看一场会话的步数与等待。
+`--json` 出结构化数据，`--out` 写文件。汇总表的口径（时间起点、等待秒数怎么封顶、
+每请求上下文各取哪个字段）写在脚本开头。输出里有会话原文摘要，只留在本机，不入库。
 
 ## 已记录的结果
 
