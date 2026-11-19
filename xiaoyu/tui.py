@@ -1297,6 +1297,9 @@ class RichSink:
         #  当前正文块是否已打开 OSC 133 锚点（TextEnd 负责收束配对），
         #  语义与 PlainSink 对齐，见 render.OSC133_TEXT_START 的注释
         self._osc133_open = False
+        #  当前是否有一段正文块还没收尾（不论是否真终端）：工具参数开始流式生成时
+        #  要先把它收掉再起 spinner，见 _close_text
+        self._text_open = False
         #  流式正文的行级轻渲染器：只在真终端上起用（管道 / 测试的 StringIO
         #  仍是逐字节直出），TextEnd 与中断路径负责把它手里的半行冲出去
         self._styler: _StreamStyler | None = None
@@ -1413,6 +1416,11 @@ class RichSink:
             return
         if self._running_line is None or self._preparing_index != event.index:
             self._stop_status()
+            #  同一次请求里模型常常先说一句再调工具，TextEnd 却要等整条流结束才到。
+            #  spinner（rich Live）会接管 stdout、重绘当前行：正文块不先收尾，半行
+            #  正文会被 Live 擦掉，收尾的 OSC 133 序列也会被它的 stdout 代理解码成
+            #  字面量「133;B133;C」打在屏幕上
+            self._close_text()
             self._preparing_index = event.index
             self._running_line = _RunningLine(event.name, verb="生成参数中")
             self._status = self.console.status(self._running_line, spinner="dots")
@@ -1427,6 +1435,7 @@ class RichSink:
         self._flush_ro_group()
         if not self.verbose:
             return
+        self._text_open = True
         if not self._osc133_open and self.console.is_terminal:
             #  正文块起点的零宽锚点：终端把每段回复当可导航的"提示块"
             print(end=render.OSC133_TEXT_START)
@@ -1443,12 +1452,19 @@ class RichSink:
 
     def _text_end(self, event: TextEnd) -> None:
         self._flush_ro_group()
-        if self.verbose:
-            self._flush_text()
-            if self._osc133_open:
-                print(end=render.OSC133_TEXT_END)
-                self._osc133_open = False
-            print()
+        self._close_text()
+
+    def _close_text(self) -> None:
+        """收尾当前正文块：冲出半行、闭合 OSC 133 锚点、换行。幂等——工具参数
+        生成前提前收过的，流末的 TextEnd 到了不再多打一个空行。"""
+        if not self._text_open:
+            return
+        self._text_open = False
+        self._flush_text()
+        if self._osc133_open:
+            print(end=render.OSC133_TEXT_END)
+            self._osc133_open = False
+        print()
 
     def _tool_pending(self, event: ToolPending) -> None:
         #  模型决定调工具了，"思考中"到此为止（接下来是工具自己的 spinner）
