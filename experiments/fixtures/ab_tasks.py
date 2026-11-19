@@ -5,6 +5,7 @@
 
 - 定位问答（locate）：只读。判据是收尾正文里有没有那几个事实，外加工作区没被动过。
 - 单文件修改（edit）：给一句话需求。判据是跑完后拷进去的验收用例（题目里不出现）。
+- 多文件功能（feature）：题面是一份小规格，改动跨几个文件。判据同上，是题面里不出现的验收用例。
 - 照失败输出排障（debug）：把一次真实修复的源码改动退回去、测试留着，题面就是
   失败输出本身。判据是那组测试通过，且测试文件没被改。
 
@@ -23,7 +24,7 @@ TEST = "PYTHONPATH=$PWD {python} -P -m unittest"
 @dataclass
 class Task:
     name: str
-    category: str                      # locate / edit / debug
+    category: str                      # locate / edit / debug / feature
     prompt: str
     ref: str = ""                      # 导出本仓的哪个提交作起点
     cwd: str = ""                      # 或：直接在这个真实目录里跑（只给只读题用）
@@ -72,5 +73,42 @@ TASKS = [
         prompt="跑 `" + TEST + " tests.test_budget_pacing tests.test_user_config` 挂了，输出如下。"
                "测试是对的，请修代码。\n\n{failure}",
         tests=["tests.test_budget_pacing", "tests.test_user_config"], frozen=["tests"],
+    ),
+    Task(
+        name="feature-explore-trace", category="feature", ref="f4f4474^",
+        prompt="检索子 agent（explore）不落盘，父会话日志里只剩问题与结论，事后看不出一次检索每一步"
+               "做了什么。请把它的逐步事实记进**父会话**的日志（`session_log.event(种类, **字段)`）：\n"
+               "- 开始记一条 `explore_start`（字段 question）。\n"
+               "- 子 agent 每次模型请求记一条 `explore_request`：step（从 1 起）、prompt_tokens、"
+               "completion_tokens。\n"
+               "- 每次工具调用记一条 `explore_tool`：step（所属请求的序号）、tool（工具名）、ok（成败）。"
+               "工具输出的正文不许进日志。\n"
+               "- 收尾记一条 `explore_end`：outcome（done / interrupted / error）、requests、tools、"
+               "failed_tools。用户中断（KeyboardInterrupt 照常往上抛）和子 agent 出错时也要写。\n"
+               "- 同一次检索的所有记录带同一个 run 字段。\n"
+               "- 会话日志可能在 agent 建好之后才挂上或被换掉，用检索当时的那个；没有日志时照常检索；"
+               "写日志出错不能连累检索。\n"
+               "- `sessions inspect`：`kinds=(\"explore\",)` 能筛出这一整组；`errors_only` 要包含失败的"
+               "工具调用、带 error 字段的请求、outcome 不是 done 的收尾；这些请求不计入父会话的请求数。\n"
+               "补上用例，并在 docs/session-inspection.md 里写一段说明。\n"
+               "跑测试：" + TEST + " tests.test_session_inspect tests.test_subagent_knobs",
+        tests=["tests.test_session_inspect", "tests.test_subagent_knobs", "tests.test_ab_explore_trace"],
+        hidden=["test_ab_explore_trace.py"],
+    ),
+    Task(
+        name="feature-delegated-rows", category="feature", ref="81c0939",
+        prompt="experiments/session_compare.py 的汇总只算了主链的请求。小羽会话日志里检索子 agent 另发的"
+               "请求是 `explore_request` 事件（带 prompt_tokens / completion_tokens），现在被漏掉了。"
+               "请把它们单列出来，不要并进主链各项：\n"
+               "- `summarize()` 多三个键：delegated_requests、delegated_context_total、"
+               "delegated_output_total（没有子 agent 时都是 0）。\n"
+               "- 单场会话的汇总表加一行，标题里带「子 agent」，值写成 `请求数 / 输入 token`"
+               "（数字带千分位）。\n"
+               "- experiments/task_ab.py 的跑批汇总表也加上子 agent 的请求数与输入 token 合计"
+               "（标题里带「子 agent」，取各次运行的中位）。\n"
+               "两个脚本的测试都补上用例，脚本开头的口径说明也补一句。\n"
+               "跑测试：" + TEST + " tests.test_session_compare tests.test_task_ab",
+        tests=["tests.test_session_compare", "tests.test_task_ab", "tests.test_ab_delegated_rows"],
+        hidden=["test_ab_delegated_rows.py"],
     ),
 ]

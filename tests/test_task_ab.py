@@ -33,7 +33,7 @@ class TaskTableTest(unittest.TestCase):
         self.assertEqual(len(names), len(set(names)))
         for task in tasks.TASKS:
             with self.subTest(task.name):
-                self.assertIn(task.category, ("locate", "edit", "debug"))
+                self.assertIn(task.category, ("locate", "edit", "debug", "feature"))
                 self.assertTrue(bool(task.ref) != bool(task.cwd), "起点二选一：导出提交，或真实目录")
                 self.assertTrue(task.tests or task.expect, "每题至少一条判据")
                 for name in task.hidden:
