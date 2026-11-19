@@ -67,6 +67,9 @@ def build_workspace(task: ab_tasks.Task, workspace: Path) -> str:
         blob = subprocess.run(["git", "-C", str(REPO), "show", f"{commit}:{path}"],
                               check=True, capture_output=True)
         (workspace / path).write_bytes(blob.stdout)
+    for name, path in task.seed:
+        (workspace / path).parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy(ab_tasks.SEEDS / name, workspace / path)
     sh(["git", "init", "-q"], workspace)
     sh(["git", "add", "-A"], workspace)
     sh(["git", *GIT_ID, "commit", "-q", "-m", "任务起点"], workspace)
@@ -112,6 +115,14 @@ def judge(task: ab_tasks.Task, ready: dict[str, Any], final_text: str, root: Pat
         if task.frozen:
             facts["frozen_kept"] = sh(["git", "diff", "--quiet", start, "--", *task.frozen],
                                       workspace, check=False).returncode == 0
+        if task.scope:
+            changed = sh(["git", "diff", "--name-only", start], workspace, check=False).stdout.split("\n")
+            facts["in_scope"] = all(any(path == s or path.startswith(s.rstrip("/") + "/") for s in task.scope)
+                                    for path in changed if path)
+        if task.artifact:
+            produced = workspace / task.artifact
+            facts["artifact_exists"] = produced.is_file()
+            final_text = produced.read_text(encoding="utf-8", errors="replace") if produced.is_file() else ""
         if task.tests:
             for name in task.hidden:
                 shutil.copy(ab_tasks.CHECKS / name, workspace / "tests" / name)
@@ -216,6 +227,8 @@ ROWS = (
     ("没改测试", lambda runs: _count(runs, "frozen_kept")),
     ("答案里的事实齐全", lambda runs: _count(runs, "answer_ok")),
     ("没动工作区（只读题）", lambda runs: _count(runs, "untouched")),
+    ("交出了文件", lambda runs: _count(runs, "artifact_exists")),
+    ("没动范围之外的文件", lambda runs: _count(runs, "in_scope")),
     ("超时", lambda runs: _count(runs, "timed_out")),
     ("工具步数 中位（最小–最大）", lambda runs: _median(runs, "tool_steps")),
     ("失败 / 被拒的步数", lambda runs: _median(runs, "bad_steps")),

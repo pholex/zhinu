@@ -33,7 +33,7 @@ class TaskTableTest(unittest.TestCase):
         self.assertEqual(len(names), len(set(names)))
         for task in tasks.TASKS:
             with self.subTest(task.name):
-                self.assertIn(task.category, ("locate", "edit", "debug", "feature"))
+                self.assertIn(task.category, ("locate", "edit", "debug", "feature", "doc"))
                 self.assertTrue(bool(task.ref) != bool(task.cwd), "起点二选一：导出提交，或真实目录")
                 self.assertTrue(task.tests or task.expect, "每题至少一条判据")
                 for name in task.hidden:
@@ -41,6 +41,10 @@ class TaskTableTest(unittest.TestCase):
                     self.assertIn("tests." + name.removesuffix(".py"), task.tests)
                 if "{failure}" in task.prompt:
                     self.assertTrue(task.restore and task.tests and task.frozen)
+                for name, _ in task.seed:
+                    self.assertTrue((tasks.SEEDS / name).is_file(), name)
+                if task.category == "doc":
+                    self.assertTrue(task.artifact and task.scope and task.expect)
                 if task.category == "locate":
                     self.assertTrue(task.readonly or task.cwd)
 
@@ -86,6 +90,28 @@ class WorkspaceTest(unittest.TestCase):
         self.assertEqual((facts["answer_hits"], facts["answer_ok"], facts["done"]), ("1/2", False, False))
         facts = runner.judge(task, self.ready, "至少 **10 秒**，第 **3** 次要求收敛", self.root, sys.executable)
         self.assertEqual((facts["answer_hits"], facts["answer_ok"]), ("2/2", True))
+
+
+    def test_artifact_is_judged_by_its_content_and_scope(self) -> None:
+        task = tasks.Task(name="d", category="doc", prompt="p", ref=self.task.ref,
+                          seed=[("results.json", "data/results.json")],
+                          artifact="report.md", scope=["report.md"], expect=[r"\b47\b"])
+        root = self.root / "doc"
+        root.mkdir()
+        ready = runner.prepare(task, root, sys.executable)
+        workspace = ready["workspace"]
+        self.assertTrue((workspace / "data" / "results.json").is_file())
+        self.assertEqual(git("status", "--porcelain", cwd=workspace), "")  # 种子文件算起点的一部分
+        #  收尾正文里说了数字不算，文件没交就是没办成
+        facts = runner.judge(task, ready, "中位数是 47", root, sys.executable)
+        self.assertEqual((facts["artifact_exists"], facts["answer_ok"], facts["done"]), (False, False, False))
+        (workspace / "report.md").write_text("耗时中位 47 秒\n", encoding="utf-8")
+        facts = runner.judge(task, ready, "", root, sys.executable)
+        self.assertEqual((facts["artifact_exists"], facts["answer_ok"], facts["in_scope"], facts["done"]),
+                         (True, True, True, True))
+        (workspace / "AGENTS.md").write_text("顺手改了别的\n", encoding="utf-8")
+        facts = runner.judge(task, ready, "", root, sys.executable)
+        self.assertEqual((facts["in_scope"], facts["done"]), (False, False))
 
 
 class RenderTest(unittest.TestCase):

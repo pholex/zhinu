@@ -1,0 +1,235 @@
+{
+ "arms": {
+  "north": "yu:model-a",
+  "south": "yu:model-b",
+  "delta": "xue:model-a"
+ },
+ "runs": {
+  "parse-config": {
+   "north": [
+    {
+     "done": true,
+     "timed_out": false,
+     "seconds": 31,
+     "tool_steps": 6,
+     "requests": 5
+    },
+    {
+     "done": true,
+     "timed_out": false,
+     "seconds": 47,
+     "tool_steps": 8,
+     "requests": 6
+    },
+    {
+     "done": true,
+     "timed_out": false,
+     "seconds": 52,
+     "tool_steps": 6,
+     "requests": 6
+    },
+    {
+     "done": true,
+     "timed_out": false,
+     "seconds": 40,
+     "tool_steps": 8,
+     "requests": 4
+    },
+    {
+     "done": true,
+     "timed_out": false,
+     "seconds": 66,
+     "tool_steps": 6,
+     "requests": 5
+    }
+   ],
+   "south": [
+    {
+     "done": true,
+     "timed_out": false,
+     "seconds": 58,
+     "tool_steps": 5,
+     "requests": 7
+    },
+    {
+     "done": true,
+     "timed_out": false,
+     "seconds": 63,
+     "tool_steps": 3,
+     "requests": 7
+    },
+    {
+     "done": false,
+     "timed_out": false,
+     "seconds": 90,
+     "tool_steps": 9,
+     "requests": 4
+    },
+    {
+     "done": true,
+     "timed_out": false,
+     "seconds": 61,
+     "tool_steps": 8,
+     "requests": 5
+    },
+    {
+     "done": true,
+     "timed_out": false,
+     "seconds": 77,
+     "tool_steps": 3,
+     "requests": 6
+    }
+   ],
+   "delta": [
+    {
+     "done": true,
+     "timed_out": false,
+     "seconds": 118,
+     "tool_steps": 9,
+     "requests": 7
+    },
+    {
+     "done": false,
+     "timed_out": true,
+     "seconds": 600,
+     "tool_steps": 8,
+     "requests": 4
+    },
+    {
+     "done": true,
+     "timed_out": false,
+     "seconds": 97,
+     "tool_steps": 9,
+     "requests": 6
+    },
+    {
+     "done": false,
+     "timed_out": true,
+     "seconds": 600,
+     "tool_steps": 8,
+     "requests": 4
+    },
+    {
+     "done": true,
+     "timed_out": false,
+     "seconds": 131,
+     "tool_steps": 8,
+     "requests": 5
+    }
+   ]
+  },
+  "fix-retry": {
+   "north": [
+    {
+     "done": true,
+     "timed_out": false,
+     "seconds": 29,
+     "tool_steps": 4,
+     "requests": 8
+    },
+    {
+     "done": true,
+     "timed_out": false,
+     "seconds": 25,
+     "tool_steps": 7,
+     "requests": 4
+    },
+    {
+     "done": true,
+     "timed_out": false,
+     "seconds": 33,
+     "tool_steps": 8,
+     "requests": 7
+    },
+    {
+     "done": true,
+     "timed_out": false,
+     "seconds": 28,
+     "tool_steps": 3,
+     "requests": 7
+    },
+    {
+     "done": true,
+     "timed_out": false,
+     "seconds": 41,
+     "tool_steps": 9,
+     "requests": 5
+    }
+   ],
+   "south": [
+    {
+     "done": true,
+     "timed_out": false,
+     "seconds": 211,
+     "tool_steps": 4,
+     "requests": 5
+    },
+    {
+     "done": true,
+     "timed_out": false,
+     "seconds": 180,
+     "tool_steps": 8,
+     "requests": 4
+    },
+    {
+     "done": true,
+     "timed_out": false,
+     "seconds": 243,
+     "tool_steps": 8,
+     "requests": 7
+    },
+    {
+     "done": false,
+     "timed_out": false,
+     "seconds": 205,
+     "tool_steps": 5,
+     "requests": 4
+    },
+    {
+     "done": false,
+     "timed_out": true,
+     "seconds": 600,
+     "tool_steps": 8,
+     "requests": 4
+    }
+   ],
+   "delta": [
+    {
+     "done": true,
+     "timed_out": false,
+     "seconds": 386,
+     "tool_steps": 4,
+     "requests": 5
+    },
+    {
+     "done": false,
+     "timed_out": true,
+     "seconds": 600,
+     "tool_steps": 8,
+     "requests": 4
+    },
+    {
+     "done": true,
+     "timed_out": false,
+     "seconds": 352,
+     "tool_steps": 5,
+     "requests": 6
+    },
+    {
+     "done": true,
+     "timed_out": false,
+     "seconds": 401,
+     "tool_steps": 5,
+     "requests": 5
+    },
+    {
+     "done": false,
+     "timed_out": false,
+     "seconds": 395,
+     "tool_steps": 6,
+     "requests": 4
+    }
+   ]
+  }
+ }
+}

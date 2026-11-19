@@ -6,6 +6,8 @@
 - 定位问答（locate）：只读。判据是收尾正文里有没有那几个事实，外加工作区没被动过。
 - 单文件修改（edit）：给一句话需求。判据是跑完后拷进去的验收用例（题目里不出现）。
 - 多文件功能（feature）：题面是一份小规格，改动跨几个文件。判据同上，是题面里不出现的验收用例。
+- 写文档 / 报告（doc）：交一个文件。判据是文件在、里面有那几个事实（要读代码或算数才写得出），
+  且没有动范围之外的东西。事实对了不等于文档写得好，文字质量另看产物。
 - 照失败输出排障（debug）：把一次真实修复的源码改动退回去、测试留着，题面就是
   失败输出本身。判据是那组测试通过，且测试文件没被改。
 
@@ -18,13 +20,14 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 CHECKS = Path(__file__).resolve().parent / "ab_checks"
+SEEDS = Path(__file__).resolve().parent / "ab_seed"
 TEST = "PYTHONPATH=$PWD {python} -P -m unittest"
 
 
 @dataclass
 class Task:
     name: str
-    category: str                      # locate / edit / debug / feature
+    category: str                      # locate / edit / debug / feature / doc
     prompt: str
     ref: str = ""                      # 导出本仓的哪个提交作起点
     cwd: str = ""                      # 或：直接在这个真实目录里跑（只给只读题用）
@@ -34,6 +37,9 @@ class Task:
     frozen: list[str] = field(default_factory=list)                # 不许动的路径（相对起点提交）
     expect: list[str] = field(default_factory=list)                # 收尾正文里每条正则都要命中
     readonly: bool = False             # 工作区不该有任何改动
+    seed: list[tuple[str, str]] = field(default_factory=list)      # (ab_seed/ 下的文件, 工作区里的路径)：起点前拷进去
+    artifact: str = ""                 # 要交出的文件；给了它，expect 就对着这个文件判，不对着收尾正文
+    scope: list[str] = field(default_factory=list)                 # 只许动这些路径（前缀）
 
 
 TASKS = [
@@ -110,5 +116,25 @@ TASKS = [
                "跑测试：" + TEST + " tests.test_session_compare tests.test_task_ab",
         tests=["tests.test_session_compare", "tests.test_task_ab", "tests.test_ab_delegated_rows"],
         hidden=["test_ab_delegated_rows.py"],
+    ),
+    Task(
+        name="doc-wait-stall", category="doc", ref="30fe7b4",
+        prompt="给用户写一篇说明文档 docs/wait-stall.md，讲这个项目的「空等检测」：它在防什么、"
+               "什么样的命令算一次等待、怎么判断「结果没变」、第几次提示、第几次要求收敛、"
+               "提示出现后用户会看到什么。数字以代码为准，不要凭印象写。只新建这一个文件，不改代码。",
+        artifact="docs/wait-stall.md", scope=["docs/wait-stall.md"],
+        expect=[r"10\s*秒|10s|>=\s*10|≥\s*10", r"第?\s*[2二两]\s*次", r"第?\s*[3三]\s*次", r"12",
+                r"最后一行|末尾.{0,6}行|末行"],
+    ),
+    Task(
+        name="doc-batch-report", category="doc", ref="81c0939",
+        seed=[("results.json", "data/results.json")],
+        prompt="data/results.json 是一批对照运行的原始结果（两道题、三列、每格 5 次）。请写一份报告 "
+               "report.md 给没看过数据的人：一张表列出每题每列的办成次数和耗时中位数（秒），"
+               "再用几句话说清哪一列超时最多、一共超时几次、全批办成了多少次。数字要算出来，不要估。"
+               "只新建 report.md，不改别的文件。",
+        artifact="report.md", scope=["report.md"],
+        expect=[r"\b47\b", r"\b63\b", r"\b131\b", r"\b29\b", r"\b211\b", r"\b395\b",
+                r"delta", r"23\s*/\s*30|23\s*次", r"\b3\s*次|共\s*3\b|3\s*runs"],
     ),
 ]
