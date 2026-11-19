@@ -139,6 +139,7 @@ class YuAdapterTest(Base):
             "seconds": 46,  # 到最后一句正文为止，不含退出前停在提示符上的四分钟
             "requests": 3, "context_median": 2000, "context_max": 3000, "context_total": 6000,
             "output_total": 60,
+            "compactions": 0,
             "delegated_requests": 0, "delegated_context_total": 0, "delegated_output_total": 0,
             "tool_seconds": 42,  # 同批并行的两步只算一段
              "wait_asked": 40, "wait_seconds": 40,

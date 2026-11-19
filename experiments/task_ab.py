@@ -63,7 +63,8 @@ def run_tests(workspace: Path, modules: list[str], python: str) -> tuple[bool, s
 
 def build_workspace(task: ab_tasks.Task, workspace: Path, skill_dirs: tuple[str, ...] = ()) -> str:
     """导出起点、退回指定文件、另起一个只有一次提交的仓。返回起点提交。"""
-    workspace.mkdir(parents=True)
+    if not task.generate:  # 生成器自己建目录
+        workspace.mkdir(parents=True)
     if task.ref:
         archive = subprocess.run(["git", "-C", str(REPO), "archive", task.ref], check=True, capture_output=True)
         subprocess.run(["tar", "-x", "-C", str(workspace)], input=archive.stdout, check=True)
@@ -71,6 +72,9 @@ def build_workspace(task: ab_tasks.Task, workspace: Path, skill_dirs: tuple[str,
         blob = subprocess.run(["git", "-C", str(REPO), "show", f"{commit}:{path}"],
                               check=True, capture_output=True)
         (workspace / path).write_bytes(blob.stdout)
+    if task.generate:
+        __import__(task.generate).build(workspace)
+        shutil.rmtree(workspace / "__pycache__", ignore_errors=True)
     junk = shutil.ignore_patterns("__pycache__", ".DS_Store")
     for name, path in task.seed:
         source = ab_tasks.SEEDS / name
@@ -210,12 +214,15 @@ def narrated_before_reboot(timeline: session_compare.Timeline) -> bool | None:
 
 
 def command_for(side: str, model: str, prompt: str, workspace: Path, session: str, args: argparse.Namespace,
-                bin_dir: Path | None = None, mcp_config: Path | None = None) -> tuple[list[str], dict[str, str]]:
+                bin_dir: Path | None = None, mcp_config: Path | None = None,
+                window: int = 0) -> tuple[list[str], dict[str, str]]:
     env = dict(os.environ)
     if bin_dir:
         env["PATH"] = f"{bin_dir}{os.pathsep}{env.get('PATH', '')}"
     if side == "yu":
         env["PYTHONPATH"] = str(REPO)
+        if window:
+            env["XIAOYU_CONTEXT_LIMIT"] = str(window)
         return [args.python, "-P", "-m", "xiaoyu", "--yolo", "--trust", "--workspace", str(workspace),
                 "--model", model, "--session-id", session, "-p", prompt], env
     #  从小雪的会话里发起时，子进程不该以为自己是嵌套的那一个
@@ -226,6 +233,8 @@ def command_for(side: str, model: str, prompt: str, workspace: Path, session: st
                "--dangerously-skip-permissions", "--output-format", "json"]
     if bin_dir:  # 运维题不带本机配置的外部工具服务：它们接着真实云账号
         command.append("--strict-mcp-config")
+    if window:
+        command += ["--settings", json.dumps({"autoCompactWindow": window})]
     if mcp_config:  # 工具题只接题目给的那一个服务，免得活被别的工具干了
         command += ["--mcp-config", str(mcp_config), "--strict-mcp-config"]
     return command, env
@@ -257,7 +266,8 @@ def run_once(task: ab_tasks.Task, side: str, model: str, root: Path, args: argpa
     standin = ready.get("standin")
     command, env = command_for(side, model, ready["prompt"], ready["workspace"], session, args,
                                standin["bin"] if standin else None,
-                               ready["workspace"] / ".mcp.json" if task.mcp else None)
+                               ready["workspace"] / ".mcp.json" if task.mcp else None,
+                               task.windows.get(side, 0))
     started = time.monotonic()
     timed_out = False
     with (root / "stdout.txt").open("w", encoding="utf-8") as sink, \
@@ -289,6 +299,8 @@ def run_once(task: ab_tasks.Task, side: str, model: str, root: Path, args: argpa
     timeline = load_timeline(side, session, args)
     if timeline is not None:
         facts.update(session_compare.summarize(timeline), model=timeline.model)
+        if task.windows:
+            facts["compacted"] = timeline.compactions > 0
         if standin:
             facts["ops_narrated"] = narrated_before_reboot(timeline)
         (root / "timeline.md").write_text(session_compare.render([timeline]), encoding="utf-8")
@@ -330,6 +342,7 @@ ROWS = (
     ("重启前有一句说明", lambda runs: _count(runs, "ops_narrated")),
     ("收尾如实写了登录不上", lambda runs: _count(runs, "ops_reports_ssh_failure")),
     ("登录尝试次数", lambda runs: _median(runs, "ops_ssh_attempts")),
+    ("压缩过上下文（没压到的不能说明压缩的事）", lambda runs: _count(runs, "compacted")),
     ("超时", lambda runs: _count(runs, "timed_out")),
     ("被服务端拒绝（该次不作数）", lambda runs: _count(runs, "refused")),
     ("工具步数 中位（最小–最大）", lambda runs: _median(runs, "tool_steps")),

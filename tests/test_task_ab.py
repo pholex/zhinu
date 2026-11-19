@@ -1,4 +1,5 @@
 """同题对照跑批的离线自证：题目清单自洽、起点不带历史、判据按事实给。不调模型。"""
+import argparse
 import importlib.util
 import json
 import subprocess
@@ -34,13 +35,14 @@ class TaskTableTest(unittest.TestCase):
         self.assertEqual(len(names), len(set(names)))
         for task in tasks.TASKS:
             with self.subTest(task.name):
-                self.assertIn(task.category, ("locate", "edit", "debug", "feature", "doc", "ops", "skill", "mcp"))
+                self.assertIn(task.category, ("locate", "edit", "debug", "feature", "doc", "ops", "skill", "mcp", "long"))
                 if task.standin:  # 运维题：起点与判据都由替身场景给
                     self.assertIn(task.standin, runner.standin_ops.SCENARIOS)
                     self.assertFalse(task.ref or task.cwd or task.tests or task.expect)
                     continue
-                self.assertTrue(sum(map(bool, (task.ref, task.cwd, task.seed and not task.ref))) == 1,
-                                "起点三选一：导出提交、真实目录、只用种子")
+                self.assertTrue(sum(map(bool, (task.ref, task.cwd, task.generate,
+                                               task.seed and not task.ref))) == 1,
+                                "起点四选一：导出提交、真实目录、生成器、只用种子")
                 self.assertTrue(task.tests or task.expect or task.checker, "每题至少一条判据")
                 for name in task.skills:
                     self.assertTrue((tasks.SKILLS / name / "SKILL.md").is_file(), name)
@@ -167,6 +169,42 @@ class SkillTaskTest(unittest.TestCase):
         git(*runner.GIT_ID, "commit", "-q", "-m", "fix(cart): 小计等于门槛时也用券", cwd=workspace)
         facts = self.facts()
         self.assertEqual((facts["rules_kept"], facts["rules_hits"]), (True, "11/11"), (self.root / "check.txt").read_text())
+
+
+class LongTaskTest(unittest.TestCase):
+    def test_start_has_one_bug_per_module_and_the_checker_tells_progress(self) -> None:
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        root = Path(temp.name).resolve()
+        task = next(t for t in tasks.TASKS if t.name == "long-sweep")
+        ready = runner.prepare(task, root, sys.executable)
+        workspace = ready["workspace"]
+        sweep = sys.modules["long_sweep"]
+        self.assertEqual(git("status", "--porcelain", cwd=workspace), "")
+        facts = runner.judge(task, ready, "", root, sys.executable)
+        self.assertEqual((facts["rules_kept"], facts["answer_ok"]), (False, False))
+        self.assertIn("模块全部修好（0/48）", (root / "check.txt").read_text(encoding="utf-8"))
+        #  把每个模块写错的那个函数换回正确的函数体，照规矩记进度、删交接文件
+        for index in range(sweep.MODULES):
+            path = workspace / "mods" / f"{sweep.module_name(index)}.py"
+            _, _, right, buggy, _ = sweep.FUNCTIONS[(index * 5 + 3) % len(sweep.FUNCTIONS)]
+            source = path.read_text(encoding="utf-8")
+            self.assertEqual(source.count(buggy), 1)
+            path.write_text(source.replace(buggy, right), encoding="utf-8")
+            with (workspace / "PROGRESS.md").open("a", encoding="utf-8") as handle:
+                handle.write(f"{sweep.module_name(index)} ok {sweep.broken_function(index)}\n")
+        (workspace / "HANDOFF.md").unlink()
+        facts = runner.judge(task, ready, "修了 48 个，口令 kestrel-4471-amber", root, sys.executable)
+        self.assertEqual((facts["rules_kept"], facts["rules_hits"], facts["answer_ok"], facts["done"]),
+                         (True, "8/8", True, True), (root / "check.txt").read_text(encoding="utf-8"))
+
+    def test_each_side_gets_its_own_window_setting(self) -> None:
+        args = argparse.Namespace(python="py", xue_bin="/opt/x/xue")
+        _, env = runner.command_for("yu", "m", "p", Path("/w"), "s", args, window=100_000)
+        self.assertEqual(env["XIAOYU_CONTEXT_LIMIT"], "100000")
+        command, _ = runner.command_for("xue", "m", "p", Path("/w"), "s", args, window=100_000)
+        self.assertEqual(json.loads(command[command.index("--settings") + 1]), {"autoCompactWindow": 100000})
+        self.assertNotIn("--settings", runner.command_for("xue", "m", "p", Path("/w"), "s", args)[0])
 
 
 class McpTaskTest(unittest.TestCase):

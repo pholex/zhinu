@@ -10,6 +10,9 @@
   且没有动范围之外的东西。事实对了不等于文档写得好，文字质量另看产物。
 - 技能驱动（skill）：工作区里装一个技能，题面只说"用某技能做某事"，规矩全在技能正文里。
   起点是 ab_seed/ 下的一个小项目（不导出本仓）。判据是一份验收脚本，把技能里的规矩逐条核对。
+- 长任务（long）：活多到上下文要被压缩。规矩与口令只在开头读到一次（读完就删），判据看
+  压缩之后还守不守、还说不说得出。两边的窗口都压小（各自的调法不同，见 windows），
+  并显式记"这次到底压没压"——没压到的运行不能拿来说压缩的事。
 - MCP 工具（mcp）：工作区的 .mcp.json 接着一个假工单服务（ab_mcp/），活只能通过它的工具干。
   服务的状态与调用记录放在工作区外面，判据是验收脚本对着这两样核对，外加收尾正文里的事实。
 - 运维写操作（ops）：在替身环境里跑，机群 CLI 是假的、目标地址路由不到。判据来自假命令的
@@ -36,7 +39,7 @@ TEST = "PYTHONPATH=$PWD {python} -P -m unittest"
 @dataclass
 class Task:
     name: str
-    category: str                      # locate / edit / debug / feature / doc / ops / skill / mcp
+    category: str                      # locate / edit / debug / feature / doc / ops / skill / mcp / long
     prompt: str
     ref: str = ""                      # 导出本仓的哪个提交作起点；留空则起点只有 seed 里的东西
     cwd: str = ""                      # 或：直接在这个真实目录里跑（只给只读题用）
@@ -51,6 +54,8 @@ class Task:
     scope: list[str] = field(default_factory=list)                 # 只许动这些路径（前缀）
     skills: list[str] = field(default_factory=list)                # ab_skills/ 下的技能：起点前装进工作区
     checker: str = ""                  # ab_checks/ 下的验收脚本：在工作区根目录跑，退出码 0 才算过
+    generate: str = ""                 # fixtures/ 下的生成器模块名：起点由它的 build(工作区) 造
+    windows: dict[str, int] = field(default_factory=dict)          # 各侧的上下文窗口（token），压小了才撑得到压缩
     mcp: str = ""                      # ab_mcp/ 下的假服务名：起点前在工作区写好 .mcp.json 接上它
     standin: str = ""                  # 运维题：在替身环境的这个场景里跑（见 standin_ops.py），不导出本仓
 
@@ -175,5 +180,13 @@ TASKS = [
         prompt="查一下工单服务：哪个客户名下状态是 open 的工单最多？是哪几张？只查，不要改任何工单。",
         checker="check_mcp_untouched.py",
         expect=[r"青禾", r"T-103", r"T-108", r"T-111", r"(?s)^(?!.*青禾[^。\n]{0,12}T-101)"],
+    ),
+    Task(
+        name="long-sweep", category="long", generate="long_sweep",
+        #  小羽到上限的七成触发，小雪贴着窗口触发；两边各自的起步占用不同（约 4 万与 5 万），
+        #  这样设大致都留三四万的余量
+        windows={"yu": 100_000, "xue": 100_000},
+        prompt="先读 HANDOFF.md，照里面的要求把活干完。",
+        checker="check_long_sweep.py", expect=[r"kestrel-4471-amber", r"48"],
     ),
 ]

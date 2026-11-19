@@ -79,6 +79,7 @@ class Timeline:
     steps: list[Step] = field(default_factory=list)
     requests: list[Request] = field(default_factory=list)
     delegated: list[Request] = field(default_factory=list)   # 检索子 agent 发的请求，不进主链各项
+    compactions: int = 0         # 上下文被压缩了几次（本地摘要与服务端压缩都算）
     warnings: list[str] = field(default_factory=list)
 
 
@@ -155,6 +156,8 @@ def load_yu(path: Path) -> Timeline:
             out.requests.append(request)
             if data.get("model"):
                 out.model = str(data["model"])
+        elif kind in ("compact", "server_compaction"):
+            out.compactions += 1
         elif kind == "explore_request":
             out.delegated.append(Request(len(out.delegated) + 1, data.get("prompt_tokens"),
                                          data.get("completion_tokens"), failed=bool(row.get("error"))))
@@ -205,6 +208,8 @@ def load_xue(path: Path) -> Timeline:
                 continue
             if not isinstance(record, dict) or record.get("isSidechain"):
                 continue
+            if record.get("isCompactSummary"):
+                out.compactions += 1
             message = record.get("message")
             if record.get("type") not in ("user", "assistant") or not isinstance(message, dict):
                 continue
@@ -277,6 +282,7 @@ def summarize(timeline: Timeline) -> dict[str, Any]:
         "context_max": max(contexts, default=None),
         "context_total": sum(contexts) if contexts else None,
         "output_total": sum(r.output or 0 for r in timeline.requests) if timeline.requests else None,
+        "compactions": timeline.compactions,
         "delegated_requests": len(timeline.delegated),
         "delegated_context_total": sum(r.context or 0 for r in timeline.delegated),
         "delegated_output_total": sum(r.output or 0 for r in timeline.delegated),
@@ -329,6 +335,7 @@ SUMMARY_ROWS = (
     ("输出 token 合计", lambda s: _num(s["output_total"])),
     ("子 agent 请求数 / 输入 token（不含在上面各项里）",
      lambda s: f"{_num(s['delegated_requests'])} / {_num(s['delegated_context_total'])}"),
+    ("上下文压缩次数", lambda s: _num(s["compactions"])),
     ("工具执行秒数", lambda s: _num(s["tool_seconds"])),
     ("前台等待秒数（计入 / 申请）", lambda s: f"{_num(s['wait_seconds'])} / {_num(s['wait_asked'])}"),
     ("带正文的请求", lambda s: f"{s['said_requests']}/{s['requests']}"),
