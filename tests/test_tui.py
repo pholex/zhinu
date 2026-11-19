@@ -1748,6 +1748,31 @@ class TestStreamStyler(unittest.TestCase):
         "结尾没有换行"
     )
 
+    def test_text_block_closes_before_argument_spinner(self) -> None:
+        """同一次请求里先说一句、再流式生成工具参数：参数 spinner 起来前正文块要
+        先收尾。否则 Live 接管 stdout 后，收尾的 OSC 133 序列被它的代理解码成
+        字面量「133;B133;C」，半行正文也被重绘擦掉。"""
+        from xiaoyu import render
+        from xiaoyu.events import (
+            RequestEnded, RequestStarted, TextDelta, TextEnd, ToolPending, ToolPreparing,
+        )
+
+        sink, buffer = self.build()
+        raw = io.StringIO()
+        with contextlib.redirect_stdout(raw):
+            sink.emit(RequestStarted("m"))
+            sink.emit(TextDelta("现在执行："))
+            sink.emit(ToolPreparing("bash", 0, 10))
+            sink.emit(TextEnd())
+            sink.emit(ToolPending("bash", {"command": "ops reboot x"}))
+            sink.emit(RequestEnded())
+        shown = buffer.getvalue() + raw.getvalue()
+        self.assertNotIn("133;B133;C", shown.replace(render.OSC133_TEXT_END, ""))
+        self.assertEqual(raw.getvalue().count(render.OSC133_TEXT_END), 1)
+        self.assertIn("现在执行：", self._ANSI.sub("", shown))
+        #  提前收过尾，流末的 TextEnd 不再多打空行
+        self.assertEqual(raw.getvalue().count("\n"), 1)
+
     def test_plain_text_survives_any_chunking(self) -> None:
         """分片边界落在哪都不该改变打出去的字符：标记符保留、不丢不重。"""
         for chunk in (1, 2, 3, 7, 1000):
