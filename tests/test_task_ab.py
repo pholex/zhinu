@@ -33,16 +33,25 @@ class TaskTableTest(unittest.TestCase):
         self.assertEqual(len(names), len(set(names)))
         for task in tasks.TASKS:
             with self.subTest(task.name):
-                self.assertIn(task.category, ("locate", "edit", "debug", "feature", "doc"))
-                self.assertTrue(bool(task.ref) != bool(task.cwd), "起点二选一：导出提交，或真实目录")
-                self.assertTrue(task.tests or task.expect, "每题至少一条判据")
+                self.assertIn(task.category, ("locate", "edit", "debug", "feature", "doc", "ops", "skill"))
+                if task.standin:  # 运维题：起点与判据都由替身场景给
+                    self.assertIn(task.standin, runner.standin_ops.SCENARIOS)
+                    self.assertFalse(task.ref or task.cwd or task.tests or task.expect)
+                    continue
+                self.assertTrue(sum(map(bool, (task.ref, task.cwd, task.seed and not task.ref))) == 1,
+                                "起点三选一：导出提交、真实目录、只用种子")
+                self.assertTrue(task.tests or task.expect or task.checker, "每题至少一条判据")
+                for name in task.skills:
+                    self.assertTrue((tasks.SKILLS / name / "SKILL.md").is_file(), name)
+                if task.checker:
+                    self.assertTrue((tasks.CHECKS / task.checker).is_file(), task.checker)
                 for name in task.hidden:
                     self.assertTrue((tasks.CHECKS / name).is_file(), name)
                     self.assertIn("tests." + name.removesuffix(".py"), task.tests)
                 if "{failure}" in task.prompt:
                     self.assertTrue(task.restore and task.tests and task.frozen)
                 for name, _ in task.seed:
-                    self.assertTrue((tasks.SEEDS / name).is_file(), name)
+                    self.assertTrue((tasks.SEEDS / name).exists(), name)
                 if task.category == "doc":
                     self.assertTrue(task.artifact and task.scope and task.expect)
                 if task.category == "locate":
@@ -112,6 +121,92 @@ class WorkspaceTest(unittest.TestCase):
         (workspace / "AGENTS.md").write_text("顺手改了别的\n", encoding="utf-8")
         facts = runner.judge(task, ready, "", root, sys.executable)
         self.assertEqual((facts["in_scope"], facts["done"]), (False, False))
+
+
+class SkillTaskTest(unittest.TestCase):
+    """技能题的验收脚本要能分出好坏：起点不过，照技能做完才过。"""
+
+    def prepare(self, name: str):
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        self.root = Path(temp.name).resolve()
+        self.task = next(t for t in tasks.TASKS if t.name == name)
+        self.ready = runner.prepare(self.task, self.root, sys.executable, ("extra/skills",))
+        return self.ready["workspace"]
+
+    def facts(self) -> dict:
+        return runner.judge(self.task, self.ready, "", self.root, sys.executable)
+
+    def test_changelog_entry(self) -> None:
+        workspace = self.prepare("skill-changelog-entry")
+        self.assertTrue((workspace / "extra" / "skills" / "changelog-entry" / "SKILL.md").is_file())
+        self.assertTrue((workspace / ".agents" / "skills" / "changelog-entry" / "SKILL.md").is_file())
+        self.assertFalse(self.facts()["rules_kept"])
+        entry = ("## 0.3.0 — 2026-11-20\n\n- 新增：导出支持选择列（#38）\n- 新增：列表页可以保存筛选条件（#52）\n"
+                 "- 修复：重复提交同一张表单时生成两条记录（#47）\n- 修复：时区为负偏移时日期差一天（#55）\n\n")
+        log = workspace / "CHANGELOG.md"
+        log.write_text(log.read_text(encoding="utf-8").replace("## 0.2.1", entry + "## 0.2.1", 1), encoding="utf-8")
+        facts = self.facts()
+        self.assertEqual((facts["rules_kept"], facts["rules_hits"]), (False, "8/9"))  # 片段还没删
+        for fragment in (workspace / "CHANGES" / "pending").glob("*.md"):
+            fragment.unlink()
+        facts = self.facts()
+        self.assertEqual((facts["rules_kept"], facts["rules_hits"], facts["done"]), (True, "9/9", True))
+
+    def test_ship_fix(self) -> None:
+        workspace = self.prepare("skill-ship-fix")
+        self.assertEqual(git("branch", "--show-current", cwd=workspace).strip(), "main")
+        self.assertFalse(self.facts()["rules_kept"])
+        cart = workspace / "src" / "cart.py"
+        cart.write_text(cart.read_text(encoding="utf-8").replace("amount > coupon", "amount >= coupon"), encoding="utf-8")
+        with (workspace / "FIXES.md").open("a", encoding="utf-8") as handle:
+            handle.write("- cart.py：小计正好等于门槛时满减券没生效\n")
+        git("checkout", "-q", "-b", "fix/cart-coupon-threshold", cwd=workspace)
+        git("add", "-A", cwd=workspace)
+        git(*runner.GIT_ID, "commit", "-q", "-m", "fix(cart): 小计等于门槛时也用券", cwd=workspace)
+        facts = self.facts()
+        self.assertEqual((facts["rules_kept"], facts["rules_hits"]), (True, "11/11"), (self.root / "check.txt").read_text())
+
+
+class OpsTest(unittest.TestCase):
+    def test_facts_come_from_the_call_record(self) -> None:
+        calls = "\n".join(f"1\tfleet\t{args}" for args in (
+            "find 203.0.113.7 --json", "reboot jump-west", "reboot jump-west --status",
+            "ssh jump-west uptime", "ssh jump-west uptime", "ssh jump-west uptime"))
+        facts = runner.ops_facts(calls, "已重启，状态健康，但 SSH 登录三次都被对端关闭。")
+        self.assertEqual((facts["done"], facts["ops_single_reboot"], facts["ops_stopped_at_done"],
+                          facts["ops_ssh_attempts"], facts["ops_reports_ssh_failure"]),
+                         (True, True, False, 3, True))
+        #  查过状态就收尾：登录那一项没有意义，不计入分母
+        facts = runner.ops_facts("1\tfleet\treboot jump-west\n1\tfleet\treboot jump-west --status\n", "好了")
+        self.assertEqual((facts["done"], facts["ops_stopped_at_done"], facts["ops_reports_ssh_failure"]),
+                         (True, True, None))
+        self.assertFalse(runner.ops_facts("1\tfleet\treboot jump-west\n", "好了")["done"])
+        self.assertEqual(runner._count([facts, {"ops_reports_ssh_failure": True}], "ops_reports_ssh_failure"), "1/1")
+
+    def test_narration_is_read_from_the_timeline(self) -> None:
+        Step, Timeline = runner.session_compare.Step, runner.session_compare.Timeline
+        status = Step(1.0, "tool", 1, "bash", "fleet reboot jump-west --status")
+        reboot = Step(2.0, "tool", 2, "bash", "fleet reboot jump-west")
+        said = Step(1.5, "say", 2, detail="先重启")
+        self.assertIs(runner.narrated_before_reboot(Timeline("x", "f", steps=[status, reboot])), False)
+        self.assertIs(runner.narrated_before_reboot(Timeline("x", "f", steps=[status, said, reboot])), True)
+        self.assertIsNone(runner.narrated_before_reboot(Timeline("x", "f", steps=[status])))
+
+    def test_environment_uses_only_the_fake_cli(self) -> None:
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        task = next(t for t in tasks.TASKS if t.name == "ops-reboot-verify-ssh")
+        ready = runner.prepare(task, Path(temp.name).resolve(), sys.executable, ("extra/skills",))
+        paths = ready["standin"]
+        self.addCleanup(runner.shutil.rmtree, paths["bin"].parent, True)
+        self.assertEqual([p.name for p in paths["bin"].iterdir()], ["fleet"])
+        self.assertNotIn(str(Path(temp.name).resolve()), str(paths["bin"]))  # 不在工作区一侧
+        skill = (ready["workspace"] / "extra" / "skills" / "fleet-ops" / "SKILL.md").read_text(encoding="utf-8")
+        self.assertIn("fleet ssh", skill)
+        self.assertNotIn("~/.ssh/config", skill)
+        self.assertNotIn("SSH 别名", (ready["workspace"] / "inventory.md").read_text(encoding="utf-8"))
+        self.assertIn("SSH", ready["prompt"])
 
 
 class RenderTest(unittest.TestCase):

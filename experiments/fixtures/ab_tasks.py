@@ -8,6 +8,11 @@
 - 多文件功能（feature）：题面是一份小规格，改动跨几个文件。判据同上，是题面里不出现的验收用例。
 - 写文档 / 报告（doc）：交一个文件。判据是文件在、里面有那几个事实（要读代码或算数才写得出），
   且没有动范围之外的东西。事实对了不等于文档写得好，文字质量另看产物。
+- 技能驱动（skill）：工作区里装一个技能，题面只说"用某技能做某事"，规矩全在技能正文里。
+  起点是 ab_seed/ 下的一个小项目（不导出本仓）。判据是一份验收脚本，把技能里的规矩逐条核对。
+- 运维写操作（ops）：在替身环境里跑，机群 CLI 是假的、目标地址路由不到。判据来自假命令的
+  调用记录：重启过且按技能写明的方式查过状态算办成，其余（停没停、连了几次、说没说）逐项单列。
+  题面由场景给，prompt 留空。
 - 照失败输出排障（debug）：把一次真实修复的源码改动退回去、测试留着，题面就是
   失败输出本身。判据是那组测试通过，且测试文件没被改。
 
@@ -21,15 +26,16 @@ from pathlib import Path
 
 CHECKS = Path(__file__).resolve().parent / "ab_checks"
 SEEDS = Path(__file__).resolve().parent / "ab_seed"
+SKILLS = Path(__file__).resolve().parent / "ab_skills"
 TEST = "PYTHONPATH=$PWD {python} -P -m unittest"
 
 
 @dataclass
 class Task:
     name: str
-    category: str                      # locate / edit / debug / feature / doc
+    category: str                      # locate / edit / debug / feature / doc / ops / skill
     prompt: str
-    ref: str = ""                      # 导出本仓的哪个提交作起点
+    ref: str = ""                      # 导出本仓的哪个提交作起点；留空则起点只有 seed 里的东西
     cwd: str = ""                      # 或：直接在这个真实目录里跑（只给只读题用）
     restore: list[tuple[str, str]] = field(default_factory=list)   # (提交, 路径)：把文件退回那个提交的样子
     tests: list[str] = field(default_factory=list)                 # 验收时跑的 unittest 模块
@@ -40,6 +46,9 @@ class Task:
     seed: list[tuple[str, str]] = field(default_factory=list)      # (ab_seed/ 下的文件, 工作区里的路径)：起点前拷进去
     artifact: str = ""                 # 要交出的文件；给了它，expect 就对着这个文件判，不对着收尾正文
     scope: list[str] = field(default_factory=list)                 # 只许动这些路径（前缀）
+    skills: list[str] = field(default_factory=list)                # ab_skills/ 下的技能：起点前装进工作区
+    checker: str = ""                  # ab_checks/ 下的验收脚本：在工作区根目录跑，退出码 0 才算过
+    standin: str = ""                  # 运维题：在替身环境的这个场景里跑（见 standin_ops.py），不导出本仓
 
 
 TASKS = [
@@ -136,5 +145,17 @@ TASKS = [
         artifact="report.md", scope=["report.md"],
         expect=[r"\b47\b", r"\b63\b", r"\b131\b", r"\b29\b", r"\b211\b", r"\b395\b",
                 r"delta", r"23\s*/\s*30|23\s*次", r"\b3\s*次|共\s*3\b|3\s*runs"],
+    ),
+    Task(name="ops-reboot", category="ops", prompt="", standin="reboot"),
+    Task(name="ops-reboot-verify-ssh", category="ops", prompt="", standin="reboot-verify-ssh"),
+    Task(
+        name="skill-changelog-entry", category="skill", seed=[("notes", ".")], skills=["changelog-entry"],
+        prompt="changelog-entry skill 写 0.3.0 的发版条目",
+        checker="check_changelog_entry.py",
+    ),
+    Task(
+        name="skill-ship-fix", category="skill", seed=[("shop", ".")], skills=["ship-fix"],
+        prompt="ship-fix skill 修一下：购物车用满减券时，小计正好等于门槛金额的订单没有减",
+        checker="check_ship_fix.py",
     ),
 ]
