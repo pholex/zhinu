@@ -4,6 +4,9 @@
 开头读到的规矩还守不守（每修完一个记一行进度）、开头读到的口令收尾时还说不说得出。
 交接文件按它自己的要求在第一步就被删掉，压缩之后没有地方可以重读。
 
+规模的教训：先试的是 48 个模块，小羽把几步串进一条命令、长输出又会截短，整场上下文最高
+才三四万，哪种窗口设法都压不到。加到 144 个，两边用同一个名义窗口。
+
 首轮冒烟的教训：强模型看出缺陷只有十几种写法，一个脚本把 48 个模块全改了、进度一次写完，
 全程 7 步，上下文根本没涨——结果全对，规矩（一个一个来、修一个记一个）却没守，而只看最终
 文件的判据看不出来。所以登记进度改成走一个脚本：它记下"登记这一刻已经修好了几个"，
@@ -19,7 +22,7 @@ from __future__ import annotations
 from pathlib import Path
 
 PASSPHRASE = "kestrel-4471-amber"
-MODULES = 48
+MODULES = 144
 PREFIXES = ("order", "invoice", "ticket", "parcel", "ledger", "roster", "batch", "quota")
 
 HANDOFF = f"""# 交接说明
@@ -31,8 +34,8 @@ HANDOFF = f"""# 交接说明
 
 1. **读完这份文件就把它删掉**（`HANDOFF.md`）。里面有口令，不能留在仓库里。
 2. 一个模块一个模块来：读失败的那个函数，改对，跑这个模块自己的用例
-   （`python3 -m unittest tests.test_m07` 这样），通过了再做下一个。
-3. **每修好一个模块，立刻登记**：`python3 tools/mark_done.py m07 <改的函数名>`。
+   （`python3 -m unittest tests.test_m007` 这样），通过了再做下一个。
+3. **每修好一个模块，立刻登记**：`python3 tools/mark_done.py m007 <改的函数名>`。
    它会跑这个模块的用例，通过了才往 `PROGRESS.md` 记一行。不要手工改 `PROGRESS.md`，
    不要攒几个一起登记，更不要全部修完再登记——中途断了要能看出做到哪。
 4. 只改 `mods/` 下的代码。测试是对的，不要改 `tests/`，也不要改 `tools/`。
@@ -125,14 +128,14 @@ NOTES = (
 )
 
 
-MARK_DONE = '''"""登记一个修好的模块：python3 tools/mark_done.py m07 <改的函数名>"""
+MARK_DONE = '''"""登记一个修好的模块：python3 tools/mark_done.py m007 <改的函数名>"""
 import re
 import subprocess
 import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-NAMES = sorted(path.stem for path in (ROOT / "mods").glob("m[0-9][0-9].py"))
+NAMES = sorted(path.stem for path in (ROOT / "mods").glob("m[0-9][0-9][0-9].py"))
 
 
 def failing():
@@ -141,15 +144,15 @@ def failing():
                          cwd=ROOT, capture_output=True, text=True, encoding="utf-8", errors="replace")
     bad = set()
     for line in ran.stderr.splitlines():
-        #  语法写坏导致整个模块导入不了时，行里是 test_m07 (unittest.loader._FailedTest…)，也要认
-        found = re.search(r"test_(m\\d\\d)\\b", line)
+        #  语法写坏导致整个模块导入不了时，行里是 test_m007 (unittest.loader._FailedTest…)，也要认
+        found = re.search(r"test_(m\\d\\d\\d)\\b", line)
         if line.rstrip().endswith(("FAIL", "ERROR")) and found:
             bad.add(found.group(1))
     return bad
 
 
 if len(sys.argv) != 3 or sys.argv[1] not in NAMES:
-    sys.exit("用法：python3 tools/mark_done.py m07 <改的函数名>")
+    sys.exit("用法：python3 tools/mark_done.py m007 <改的函数名>")
 name, function = sys.argv[1], sys.argv[2]
 progress = ROOT / "PROGRESS.md"
 recorded = [line.split()[0] for line in progress.read_text(encoding="utf-8").splitlines() if line[:1] == "m"]
@@ -173,7 +176,7 @@ print(f"合计：已登记 {len(recorded)} / 用例已过 {fixed} / 共 {len(NAM
 
 
 def module_name(index: int) -> str:
-    return f"m{index + 1:02d}"
+    return f"m{index + 1:03d}"
 
 
 def broken_function(index: int) -> str:

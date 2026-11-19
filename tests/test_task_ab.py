@@ -180,6 +180,13 @@ class LongTaskTest(unittest.TestCase):
         ready = runner.prepare(task, root, sys.executable)
         workspace = ready["workspace"]
         sweep = sys.modules["long_sweep"]
+        self.assertEqual(git("ls-files", "mods/m*.py", cwd=workspace).count("\n"), 144)
+        #  正式的规模跑一遍登记要一分钟，这里换成小规模的起点，用的是同一份生成器与验收脚本
+        runner.shutil.rmtree(workspace)
+        self.addCleanup(setattr, sweep, "MODULES", sweep.MODULES)
+        sweep.MODULES = 48
+        ready = runner.prepare(task, root, sys.executable)
+        workspace = ready["workspace"]
         self.assertEqual(git("status", "--porcelain", cwd=workspace), "")
         facts = runner.judge(task, ready, "", root, sys.executable)
         self.assertEqual((facts["rules_kept"], facts["answer_ok"]), (False, False))
@@ -208,7 +215,7 @@ class LongTaskTest(unittest.TestCase):
         for index in range(24, sweep.MODULES):
             mark(index)
         (workspace / "HANDOFF.md").unlink()
-        facts = runner.judge(task, ready, "修了 48 个，口令 kestrel-4471-amber", root, sys.executable)
+        facts = runner.judge(task, ready, "修了 144 个，口令 kestrel-4471-amber", root, sys.executable)
         report = (root / "check.txt").read_text(encoding="utf-8")
         self.assertEqual((facts["rules_hits"], facts["answer_ok"]), ("8/9", True), report)
         self.assertIn("FAIL 修一个登记一个", report)
