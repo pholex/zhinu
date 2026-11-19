@@ -347,18 +347,18 @@ class DeferredQuestionTests(unittest.TestCase):
                 original = session._save_usage
                 def wait():
                     entered.set()
-                    if not release.wait(3):
+                    if not release.wait(WAIT):
                         raise AssertionError("reset was not released")
                     original()
                 with patch.object(session, "_save_usage", side_effect=wait):
                     with ThreadPoolExecutor(max_workers=1) as pool:
                         active = pool.submit(session.reset)
                         try:
-                            self.assertTrue(entered.wait(3))
+                            self.assertTrue(entered.wait(WAIT))
                             self.assertEqual(next(watch).kind, "question.cancelled")
                         finally:
                             release.set()
-                        active.result(timeout=3)
+                        active.result(timeout=WAIT)
 
     def test_watch_close_unblocks_empty_session_and_after_close_ends(self):
         session = Session(self.config([]))
