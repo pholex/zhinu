@@ -1,0 +1,126 @@
+[
+ {
+  "id": "T-101",
+  "customer": "青禾",
+  "status": "closed",
+  "updated": "2026-09-30",
+  "title": "导出的报表缺最后一行",
+  "comments": [
+   "客户来信：导出的报表缺最后一行",
+   "已处理并回复客户"
+  ],
+  "resolution": "done"
+ },
+ {
+  "id": "T-102",
+  "customer": "远山",
+  "status": "open",
+  "updated": "2026-10-20",
+  "title": "登录后偶尔跳回首页",
+  "comments": [
+   "客户来信：登录后偶尔跳回首页"
+  ]
+ },
+ {
+  "id": "T-103",
+  "customer": "青禾",
+  "status": "open",
+  "updated": "2026-11-15",
+  "title": "批量导入卡在 90%",
+  "comments": [
+   "客户来信：批量导入卡在 90%"
+  ]
+ },
+ {
+  "id": "T-104",
+  "customer": "白鹭",
+  "status": "pending",
+  "updated": "2026-10-01",
+  "title": "发票抬头改不了",
+  "comments": [
+   "客户来信：发票抬头改不了"
+  ]
+ },
+ {
+  "id": "T-105",
+  "customer": "远山",
+  "status": "open",
+  "updated": "2026-11-06",
+  "title": "通知邮件进垃圾箱",
+  "comments": [
+   "客户来信：通知邮件进垃圾箱"
+  ]
+ },
+ {
+  "id": "T-106",
+  "customer": "白鹭",
+  "status": "open",
+  "updated": "2026-10-28",
+  "title": "子账号看不到共享文件夹",
+  "comments": [
+   "客户来信：子账号看不到共享文件夹"
+  ]
+ },
+ {
+  "id": "T-107",
+  "customer": "松间",
+  "status": "open",
+  "updated": "2026-11-18",
+  "title": "接口偶发 502",
+  "comments": [
+   "客户来信：接口偶发 502"
+  ]
+ },
+ {
+  "id": "T-108",
+  "customer": "青禾",
+  "status": "open",
+  "updated": "2026-11-05",
+  "title": "搜索结果排序不稳定",
+  "comments": [
+   "客户来信：搜索结果排序不稳定"
+  ]
+ },
+ {
+  "id": "T-109",
+  "customer": "松间",
+  "status": "closed",
+  "updated": "2026-10-10",
+  "title": "重置密码链接失效",
+  "comments": [
+   "客户来信：重置密码链接失效",
+   "已处理并回复客户"
+  ],
+  "resolution": "done"
+ },
+ {
+  "id": "T-110",
+  "customer": "远山",
+  "status": "pending",
+  "updated": "2026-11-12",
+  "title": "账单金额对不上",
+  "comments": [
+   "客户来信：账单金额对不上"
+  ]
+ },
+ {
+  "id": "T-111",
+  "customer": "青禾",
+  "status": "open",
+  "updated": "2026-11-19",
+  "title": "移动端图表显示不全",
+  "comments": [
+   "客户来信：移动端图表显示不全"
+  ]
+ },
+ {
+  "id": "T-112",
+  "customer": "白鹭",
+  "status": "open",
+  "updated": "2026-09-12",
+  "title": "旧版客户端无法同步",
+  "comments": [
+   "客户来信：旧版客户端无法同步"
+  ]
+ }
+]

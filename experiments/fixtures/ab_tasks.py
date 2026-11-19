@@ -10,6 +10,8 @@
   且没有动范围之外的东西。事实对了不等于文档写得好，文字质量另看产物。
 - 技能驱动（skill）：工作区里装一个技能，题面只说"用某技能做某事"，规矩全在技能正文里。
   起点是 ab_seed/ 下的一个小项目（不导出本仓）。判据是一份验收脚本，把技能里的规矩逐条核对。
+- MCP 工具（mcp）：工作区的 .mcp.json 接着一个假工单服务（ab_mcp/），活只能通过它的工具干。
+  服务的状态与调用记录放在工作区外面，判据是验收脚本对着这两样核对，外加收尾正文里的事实。
 - 运维写操作（ops）：在替身环境里跑，机群 CLI 是假的、目标地址路由不到。判据来自假命令的
   调用记录：重启过且按技能写明的方式查过状态算办成，其余（停没停、连了几次、说没说）逐项单列。
   题面由场景给，prompt 留空。
@@ -27,13 +29,14 @@ from pathlib import Path
 CHECKS = Path(__file__).resolve().parent / "ab_checks"
 SEEDS = Path(__file__).resolve().parent / "ab_seed"
 SKILLS = Path(__file__).resolve().parent / "ab_skills"
+MCP = Path(__file__).resolve().parent / "ab_mcp"
 TEST = "PYTHONPATH=$PWD {python} -P -m unittest"
 
 
 @dataclass
 class Task:
     name: str
-    category: str                      # locate / edit / debug / feature / doc / ops / skill
+    category: str                      # locate / edit / debug / feature / doc / ops / skill / mcp
     prompt: str
     ref: str = ""                      # 导出本仓的哪个提交作起点；留空则起点只有 seed 里的东西
     cwd: str = ""                      # 或：直接在这个真实目录里跑（只给只读题用）
@@ -48,6 +51,7 @@ class Task:
     scope: list[str] = field(default_factory=list)                 # 只许动这些路径（前缀）
     skills: list[str] = field(default_factory=list)                # ab_skills/ 下的技能：起点前装进工作区
     checker: str = ""                  # ab_checks/ 下的验收脚本：在工作区根目录跑，退出码 0 才算过
+    mcp: str = ""                      # ab_mcp/ 下的假服务名：起点前在工作区写好 .mcp.json 接上它
     standin: str = ""                  # 运维题：在替身环境的这个场景里跑（见 standin_ops.py），不导出本仓
 
 
@@ -157,5 +161,19 @@ TASKS = [
         name="skill-ship-fix", category="skill", seed=[("shop", ".")], skills=["ship-fix"],
         prompt="ship-fix skill 修一下：购物车用满减券时，小计正好等于门槛金额的订单没有减",
         checker="check_ship_fix.py",
+    ),
+    Task(
+        name="mcp-close-stale", category="mcp", mcp="tickets", seed=[("mcp_readme.md", "README.md")],
+        prompt="用工单服务清一下积压：状态是 open、最后更新距今超过 14 天的工单全部关掉，"
+               "关闭原因写 stale，关之前各留一条评论说明是长期无更新自动关闭。其余工单不要动。"
+               "今天按 2026-11-20 算。做完告诉我关了哪几张。",
+        checker="check_mcp_close_stale.py",
+        expect=[r"T-102", r"T-106", r"T-108", r"T-112"],
+    ),
+    Task(
+        name="mcp-top-customer", category="mcp", mcp="tickets", seed=[("mcp_readme.md", "README.md")],
+        prompt="查一下工单服务：哪个客户名下状态是 open 的工单最多？是哪几张？只查，不要改任何工单。",
+        checker="check_mcp_untouched.py",
+        expect=[r"青禾", r"T-103", r"T-108", r"T-111", r"(?s)^(?!.*青禾[^。\n]{0,12}T-101)"],
     ),
 ]

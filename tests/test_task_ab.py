@@ -1,5 +1,6 @@
 """同题对照跑批的离线自证：题目清单自洽、起点不带历史、判据按事实给。不调模型。"""
 import importlib.util
+import json
 import subprocess
 import sys
 import tempfile
@@ -33,7 +34,7 @@ class TaskTableTest(unittest.TestCase):
         self.assertEqual(len(names), len(set(names)))
         for task in tasks.TASKS:
             with self.subTest(task.name):
-                self.assertIn(task.category, ("locate", "edit", "debug", "feature", "doc", "ops", "skill"))
+                self.assertIn(task.category, ("locate", "edit", "debug", "feature", "doc", "ops", "skill", "mcp"))
                 if task.standin:  # 运维题：起点与判据都由替身场景给
                     self.assertIn(task.standin, runner.standin_ops.SCENARIOS)
                     self.assertFalse(task.ref or task.cwd or task.tests or task.expect)
@@ -166,6 +167,64 @@ class SkillTaskTest(unittest.TestCase):
         git(*runner.GIT_ID, "commit", "-q", "-m", "fix(cart): 小计等于门槛时也用券", cwd=workspace)
         facts = self.facts()
         self.assertEqual((facts["rules_kept"], facts["rules_hits"]), (True, "11/11"), (self.root / "check.txt").read_text())
+
+
+class McpTaskTest(unittest.TestCase):
+    """工具题：假服务能按协议应答，状态在工作区外面，验收脚本分得出做对与做错。"""
+
+    def setUp(self) -> None:
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        self.root = Path(temp.name).resolve()
+
+    def prepare(self, name: str) -> dict:
+        self.task = next(t for t in tasks.TASKS if t.name == name)
+        ready = runner.prepare(self.task, self.root, sys.executable)
+        self.addCleanup(runner.shutil.rmtree, ready["state"], True)
+        return ready
+
+    def talk(self, ready: dict, *calls: tuple[str, dict]) -> list[dict]:
+        spec = json.loads((ready["workspace"] / ".mcp.json").read_text(encoding="utf-8"))["mcpServers"]["tickets"]
+        lines = [{"jsonrpc": "2.0", "id": 0, "method": "initialize", "params": {"protocolVersion": "2025-06-18"}},
+                 {"jsonrpc": "2.0", "id": 1, "method": "tools/list"}]
+        lines += [{"jsonrpc": "2.0", "id": n + 2, "method": "tools/call", "params": {"name": name, "arguments": args}}
+                  for n, (name, args) in enumerate(calls)]
+        ran = subprocess.run([spec["command"], *spec["args"]], text=True, capture_output=True, check=True,
+                             input="".join(json.dumps(line) + "\n" for line in lines), encoding="utf-8")
+        return [json.loads(line) for line in ran.stdout.splitlines()]
+
+    def test_listing_is_paged_and_state_lives_outside_the_workspace(self) -> None:
+        ready = self.prepare("mcp-top-customer")
+        self.assertNotIn(str(self.root), str(ready["state"]))
+        self.assertEqual(git("status", "--porcelain", cwd=ready["workspace"]), "")  # .mcp.json 不算改动
+        replies = self.talk(ready, ("list_tickets", {"status": "open"}),
+                            ("list_tickets", {"status": "open", "cursor": "5"}))
+        self.assertEqual([t["name"] for t in replies[1]["result"]["tools"]],
+                         ["list_tickets", "get_ticket", "add_comment", "close_ticket"])
+        first, second = (json.loads(r["result"]["content"][0]["text"]) for r in replies[2:])
+        self.assertEqual((len(first["tickets"]), first["next_cursor"], first["total"]), (5, "5", 8))
+        self.assertNotIn("next_cursor", second)
+        answer = "open 最多的是青禾：T-103、T-108、T-111"
+        facts = runner.judge(self.task, ready, answer, self.root, sys.executable)
+        self.assertEqual((facts["rules_kept"], facts["answer_ok"], facts["done"]), (True, True, True))
+        #  把已关闭的那张也算进去：答案不对
+        self.assertFalse(runner.judge(self.task, ready, "青禾：T-101、T-103、T-108、T-111", self.root,
+                                      sys.executable)["answer_ok"])
+
+    def test_closing_the_right_tickets_passes_and_one_extra_fails(self) -> None:
+        ready = self.prepare("mcp-close-stale")
+        self.assertFalse(runner.judge(self.task, ready, "", self.root, sys.executable)["rules_kept"])
+        steps = [("list_tickets", {"status": "open"}), ("list_tickets", {"status": "open", "cursor": "5"})]
+        for ticket in ("T-102", "T-106", "T-108", "T-112"):
+            steps += [("add_comment", {"id": ticket, "text": "长期无更新，自动关闭"}),
+                      ("close_ticket", {"id": ticket, "resolution": "stale"})]
+        self.talk(ready, *steps)
+        facts = runner.judge(self.task, ready, "关了 T-102、T-106、T-108、T-112", self.root, sys.executable)
+        self.assertEqual((facts["rules_kept"], facts["rules_hits"], facts["done"]), (True, "6/6", True),
+                         (self.root / "check.txt").read_text(encoding="utf-8"))
+        self.talk(ready, ("add_comment", {"id": "T-105", "text": "长期无更新，自动关闭"}),
+                  ("close_ticket", {"id": "T-105", "resolution": "stale"}))  # 正好 14 天的那张
+        self.assertEqual(runner.judge(self.task, ready, "", self.root, sys.executable)["rules_hits"], "5/6")
 
 
 class OpsTest(unittest.TestCase):

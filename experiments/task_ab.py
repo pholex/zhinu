@@ -84,6 +84,9 @@ def build_workspace(task: ab_tasks.Task, workspace: Path, skill_dirs: tuple[str,
         for base in (".agents/skills", *skill_dirs):
             shutil.copytree(ab_tasks.SKILLS / name, workspace / base / name, ignore=junk)
     sh(["git", "init", "-q", "-b", "main"], workspace)
+    #  .mcp.json 里有本次运行的临时路径，由 prepare 在这之后写；不让它算进改动
+    with (workspace / ".git" / "info" / "exclude").open("a", encoding="utf-8") as exclude:
+        exclude.write(".mcp.json\n")
     sh(["git", "add", "-A"], workspace)
     sh(["git", *GIT_ID, "commit", "-q", "-m", "任务起点"], workspace)
     return sh(["git", "rev-parse", "HEAD"], workspace).stdout.strip()
@@ -109,6 +112,14 @@ def prepare(task: ab_tasks.Task, root: Path, python: str, skill_dirs: tuple[str,
         return {"workspace": workspace, "start": "", "prompt": task.prompt, "before": before}
     workspace = root / "ws"
     start = build_workspace(task, workspace, skill_dirs)
+    state = None
+    if task.mcp:
+        #  服务的状态放工作区外面：放里面，模型可以绕过工具直接读写那份 JSON
+        state = Path(tempfile.mkdtemp(prefix=f"{task.mcp}-", dir="/tmp"))
+        shutil.copy(ab_tasks.MCP / f"{task.mcp}.json", state / f"{task.mcp}.json")
+        (workspace / ".mcp.json").write_text(json.dumps({"mcpServers": {task.mcp: {
+            "command": python, "args": [str(ab_tasks.MCP / f"{task.mcp}_server.py"), str(state)]}}},
+            ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     failure = ""
     if "{failure}" in task.prompt:
         passed, output = run_tests(workspace, task.tests, python)
@@ -117,7 +128,7 @@ def prepare(task: ab_tasks.Task, root: Path, python: str, skill_dirs: tuple[str,
         failure = tail(output)
         sh(["git", "clean", "-fdxq"], workspace)  # 跑测试留下的缓存不算起点的一部分
     prompt = task.prompt.replace("{python}", python).replace("{failure}", failure)
-    return {"workspace": workspace, "start": start, "prompt": prompt, "before": ""}
+    return {"workspace": workspace, "start": start, "prompt": prompt, "before": "", "state": state}
 
 
 def judge(task: ab_tasks.Task, ready: dict[str, Any], final_text: str, root: Path, python: str) -> dict[str, Any]:
@@ -148,8 +159,9 @@ def judge(task: ab_tasks.Task, ready: dict[str, Any], final_text: str, root: Pat
             final_text = produced.read_text(encoding="utf-8", errors="replace") if produced.is_file() else ""
         if task.checker:
             #  用拷出去的副本跑：脚本不进工作区，不会被当成"动了范围之外的文件"
+            checker_env = {**os.environ, "AB_STATE": str(ready.get("state") or "")}
             ran = subprocess.run([python, "-P", str(ab_tasks.CHECKS / task.checker)], cwd=workspace,
-                                 capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=300)
+                                 env=checker_env, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=300)
             (root / "check.txt").write_text(ran.stdout + ran.stderr, encoding="utf-8")
             facts["rules_kept"] = ran.returncode == 0
             facts["rules_hits"] = (ran.stdout.strip().splitlines() or [""])[-1]
@@ -197,7 +209,7 @@ def narrated_before_reboot(timeline: session_compare.Timeline) -> bool | None:
 
 
 def command_for(side: str, model: str, prompt: str, workspace: Path, session: str, args: argparse.Namespace,
-                bin_dir: Path | None = None) -> tuple[list[str], dict[str, str]]:
+                bin_dir: Path | None = None, mcp_config: Path | None = None) -> tuple[list[str], dict[str, str]]:
     env = dict(os.environ)
     if bin_dir:
         env["PATH"] = f"{bin_dir}{os.pathsep}{env.get('PATH', '')}"
@@ -213,6 +225,8 @@ def command_for(side: str, model: str, prompt: str, workspace: Path, session: st
                "--dangerously-skip-permissions", "--output-format", "json"]
     if bin_dir:  # 运维题不带本机配置的外部工具服务：它们接着真实云账号
         command.append("--strict-mcp-config")
+    if mcp_config:  # 工具题只接题目给的那一个服务，免得活被别的工具干了
+        command += ["--mcp-config", str(mcp_config), "--strict-mcp-config"]
     return command, env
 
 
@@ -241,7 +255,8 @@ def run_once(task: ab_tasks.Task, side: str, model: str, root: Path, args: argpa
     session = str(uuid.uuid4())
     standin = ready.get("standin")
     command, env = command_for(side, model, ready["prompt"], ready["workspace"], session, args,
-                               standin["bin"] if standin else None)
+                               standin["bin"] if standin else None,
+                               ready["workspace"] / ".mcp.json" if task.mcp else None)
     started = time.monotonic()
     timed_out = False
     with (root / "stdout.txt").open("w", encoding="utf-8") as sink, \
@@ -256,6 +271,10 @@ def run_once(task: ab_tasks.Task, side: str, model: str, root: Path, args: argpa
             exit_code = proc.wait()
     stdout = (root / "stdout.txt").read_text(encoding="utf-8", errors="replace")
     facts = judge(task, ready, final_text_of(side, stdout), root, args.python)
+    if ready.get("state"):
+        for item in ready["state"].iterdir():
+            shutil.copy(item, root / item.name)
+        shutil.rmtree(ready["state"], ignore_errors=True)
     if standin:
         shutil.copy(standin["log"], root / "calls.tsv")
         shutil.rmtree(standin["bin"].parent, ignore_errors=True)
@@ -301,8 +320,8 @@ ROWS = (
     ("没改测试", lambda runs: _count(runs, "frozen_kept")),
     ("答案里的事实齐全", lambda runs: _count(runs, "answer_ok")),
     ("没动工作区（只读题）", lambda runs: _count(runs, "untouched")),
-    ("技能里的规矩全部守住", lambda runs: _count(runs, "rules_kept")),
-    ("守住的规矩条数（各次）", lambda runs: " · ".join(str(r["rules_hits"]) for r in runs if r.get("rules_hits")) or "—"),
+    ("规矩全部守住", lambda runs: _count(runs, "rules_kept")),
+    ("守住的条数（各次）", lambda runs: " · ".join(str(r["rules_hits"]) for r in runs if r.get("rules_hits")) or "—"),
     ("交出了文件", lambda runs: _count(runs, "artifact_exists")),
     ("没动范围之外的文件", lambda runs: _count(runs, "in_scope")),
     ("只重启一次", lambda runs: _count(runs, "ops_single_reboot")),
