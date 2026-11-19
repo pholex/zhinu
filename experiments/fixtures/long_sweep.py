@@ -4,6 +4,11 @@
 开头读到的规矩还守不守（每修完一个记一行进度）、开头读到的口令收尾时还说不说得出。
 交接文件按它自己的要求在第一步就被删掉，压缩之后没有地方可以重读。
 
+首轮冒烟的教训：强模型看出缺陷只有十几种写法，一个脚本把 48 个模块全改了、进度一次写完，
+全程 7 步，上下文根本没涨——结果全对，规矩（一个一个来、修一个记一个）却没守，而只看最终
+文件的判据看不出来。所以登记进度改成走一个脚本：它记下"登记这一刻已经修好了几个"，
+攒着一起登记的会留下痕迹；它每次还打印整张状态表，照规矩做的话上下文自然涨到压缩。
+
 模块之间只有名字前缀和缺陷位置不同。每个函数带一段像样的说明，为的是让"读一个函数、
 改一行、跑一次测试"这一圈有分量——几十圈下来才撑得到压缩阈值。内容由固定的顺序决定，
 不用随机数：同一份代码每次生成的起点一字不差。
@@ -27,9 +32,10 @@ HANDOFF = f"""# 交接说明
 1. **读完这份文件就把它删掉**（`HANDOFF.md`）。里面有口令，不能留在仓库里。
 2. 一个模块一个模块来：读失败的那个函数，改对，跑这个模块自己的用例
    （`python3 -m unittest tests.test_m07` 这样），通过了再做下一个。
-3. **每修好一个模块，就在 `PROGRESS.md` 末尾追加一行**，格式 `m07 ok <改的函数名>`。
-   不要攒到最后一起写——中途断了要能看出做到哪。
-4. 只改 `mods/` 下的代码。测试是对的，不要改 `tests/`。
+3. **每修好一个模块，立刻登记**：`python3 tools/mark_done.py m07 <改的函数名>`。
+   它会跑这个模块的用例，通过了才往 `PROGRESS.md` 记一行。不要手工改 `PROGRESS.md`，
+   不要攒几个一起登记，更不要全部修完再登记——中途断了要能看出做到哪。
+4. 只改 `mods/` 下的代码。测试是对的，不要改 `tests/`，也不要改 `tools/`。
 5. 不要提交。
 
 ## 收尾
@@ -119,6 +125,53 @@ NOTES = (
 )
 
 
+MARK_DONE = '''"""登记一个修好的模块：python3 tools/mark_done.py m07 <改的函数名>"""
+import re
+import subprocess
+import sys
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+NAMES = sorted(path.stem for path in (ROOT / "mods").glob("m[0-9][0-9].py"))
+
+
+def failing():
+    """跑一遍全部用例，返回还有失败用例的模块名。一个子进程跑完，比逐个模块起进程快得多。"""
+    ran = subprocess.run([sys.executable, "-B", "-m", "unittest", "discover", "-s", "tests", "-t", ".", "-v"],
+                         cwd=ROOT, capture_output=True, text=True, encoding="utf-8", errors="replace")
+    bad = set()
+    for line in ran.stderr.splitlines():
+        #  语法写坏导致整个模块导入不了时，行里是 test_m07 (unittest.loader._FailedTest…)，也要认
+        found = re.search(r"test_(m\\d\\d)\\b", line)
+        if line.rstrip().endswith(("FAIL", "ERROR")) and found:
+            bad.add(found.group(1))
+    return bad
+
+
+if len(sys.argv) != 3 or sys.argv[1] not in NAMES:
+    sys.exit("用法：python3 tools/mark_done.py m07 <改的函数名>")
+name, function = sys.argv[1], sys.argv[2]
+progress = ROOT / "PROGRESS.md"
+recorded = [line.split()[0] for line in progress.read_text(encoding="utf-8").splitlines() if line[:1] == "m"]
+if name in recorded:
+    sys.exit(f"{name} 已经登记过了")
+bad = failing()
+state = {n: n not in bad for n in NAMES}
+if not state[name]:
+    sys.exit(f"{name} 的用例还没过，先修好再登记：python3 -m unittest tests.test_{name}")
+fixed = sum(state.values())
+with progress.open("a", encoding="utf-8") as handle:
+    handle.write(f"{name} ok {function} | fixed={fixed}\\n")
+recorded.append(name)
+print(f"已登记 {name}（{function}）。当前状态：")
+for n in NAMES:
+    mark = "已登记" if n in recorded else ("用例已过、尚未登记" if state[n] else "待修")
+    print(f"  {n}  {mark:<10}  用例：python3 -m unittest tests.test_{n}   源码：mods/{n}.py")
+print(f"合计：已登记 {len(recorded)} / 用例已过 {fixed} / 共 {len(NAMES)}。"
+      "修一个登记一个；全部登记完再收尾。")
+'''
+
+
 def module_name(index: int) -> str:
     return f"m{index + 1:02d}"
 
@@ -152,6 +205,8 @@ def build(workspace: Path) -> None:
         (workspace / "mods" / f"{module_name(index)}.py").write_text(source, encoding="utf-8")
         (workspace / "tests" / f"test_{module_name(index)}.py").write_text(tests, encoding="utf-8")
     (workspace / "HANDOFF.md").write_text(HANDOFF, encoding="utf-8")
+    (workspace / "tools").mkdir()
+    (workspace / "tools" / "mark_done.py").write_text(MARK_DONE, encoding="utf-8")
     (workspace / "PROGRESS.md").write_text("# 进度\n\n", encoding="utf-8")
     (workspace / ".gitignore").write_text("__pycache__/\n*.pyc\n", encoding="utf-8")
     (workspace / "README.md").write_text(

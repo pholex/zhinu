@@ -184,19 +184,35 @@ class LongTaskTest(unittest.TestCase):
         facts = runner.judge(task, ready, "", root, sys.executable)
         self.assertEqual((facts["rules_kept"], facts["answer_ok"]), (False, False))
         self.assertIn("模块全部修好（0/48）", (root / "check.txt").read_text(encoding="utf-8"))
-        #  把每个模块写错的那个函数换回正确的函数体，照规矩记进度、删交接文件
-        for index in range(sweep.MODULES):
+        def fix(index: int) -> None:
             path = workspace / "mods" / f"{sweep.module_name(index)}.py"
             _, _, right, buggy, _ = sweep.FUNCTIONS[(index * 5 + 3) % len(sweep.FUNCTIONS)]
             source = path.read_text(encoding="utf-8")
             self.assertEqual(source.count(buggy), 1)
             path.write_text(source.replace(buggy, right), encoding="utf-8")
-            with (workspace / "PROGRESS.md").open("a", encoding="utf-8") as handle:
-                handle.write(f"{sweep.module_name(index)} ok {sweep.broken_function(index)}\n")
+
+        def mark(index: int) -> subprocess.CompletedProcess:
+            return subprocess.run([sys.executable, "tools/mark_done.py", sweep.module_name(index),
+                                   sweep.broken_function(index)], cwd=workspace, capture_output=True, text=True)
+
+        self.assertNotEqual(mark(0).returncode, 0)  # 没修好不给登记
+        #  前一半修一个登记一个；后一半全修完再一口气登记——验收要看得出来
+        for index in range(24):
+            fix(index)
+            done = mark(index)
+            self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertIn("待修", done.stdout)
+        self.assertGreater(len(done.stdout), 3000)  # 状态表有分量，照规矩做上下文才涨得起来
+        for index in range(24, sweep.MODULES):
+            fix(index)
+        for index in range(24, sweep.MODULES):
+            mark(index)
         (workspace / "HANDOFF.md").unlink()
         facts = runner.judge(task, ready, "修了 48 个，口令 kestrel-4471-amber", root, sys.executable)
-        self.assertEqual((facts["rules_kept"], facts["rules_hits"], facts["answer_ok"], facts["done"]),
-                         (True, "8/8", True, True), (root / "check.txt").read_text(encoding="utf-8"))
+        report = (root / "check.txt").read_text(encoding="utf-8")
+        self.assertEqual((facts["rules_hits"], facts["answer_ok"]), ("8/9", True), report)
+        self.assertIn("FAIL 修一个登记一个", report)
+        self.assertIn("ok   模块全部修好（48/48）", report)
 
     def test_each_side_gets_its_own_window_setting(self) -> None:
         args = argparse.Namespace(python="py", xue_bin="/opt/x/xue")
