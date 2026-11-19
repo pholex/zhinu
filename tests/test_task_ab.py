@@ -251,6 +251,8 @@ class OpsTest(unittest.TestCase):
         self.assertIs(runner.narrated_before_reboot(Timeline("x", "f", steps=[status, reboot])), False)
         self.assertIs(runner.narrated_before_reboot(Timeline("x", "f", steps=[status, said, reboot])), True)
         self.assertIsNone(runner.narrated_before_reboot(Timeline("x", "f", steps=[status])))
+        chained = Step(2.0, "tool", 2, "Bash", "fleet reboot jump-west; sleep 40; fleet reboot jump-west --status")
+        self.assertIs(runner.narrated_before_reboot(Timeline("x", "f", steps=[said, chained])), True)
 
     def test_environment_uses_only_the_fake_cli(self) -> None:
         temp = tempfile.TemporaryDirectory()
