@@ -168,7 +168,7 @@ class SkillTaskTest(unittest.TestCase):
         git("add", "-A", cwd=workspace)
         git(*runner.GIT_ID, "commit", "-q", "-m", "fix(cart): 小计等于门槛时也用券", cwd=workspace)
         facts = self.facts()
-        self.assertEqual((facts["rules_kept"], facts["rules_hits"]), (True, "11/11"), (self.root / "check.txt").read_text())
+        self.assertEqual((facts["rules_kept"], facts["rules_hits"]), (True, "11/11"), (self.root / "check.txt").read_text(encoding="utf-8"))
 
 
 class LongTaskTest(unittest.TestCase):
@@ -182,7 +182,9 @@ class LongTaskTest(unittest.TestCase):
         sweep = sys.modules["long_sweep"]
         self.assertEqual(git("ls-files", "mods/m*.py", cwd=workspace).count("\n"), 144)
         #  正式的规模跑一遍登记要一分钟，这里换成小规模的起点，用的是同一份生成器与验收脚本
-        runner.shutil.rmtree(workspace)
+        #  另起一个目录，不去删刚才那份：Windows 上 .git 里的对象文件是只读的，删不掉
+        root = root / "small"
+        root.mkdir()
         self.addCleanup(setattr, sweep, "MODULES", sweep.MODULES)
         sweep.MODULES = 48
         ready = runner.prepare(task, root, sys.executable)

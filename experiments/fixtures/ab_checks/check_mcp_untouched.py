@@ -14,6 +14,8 @@ if (STATE / "calls.tsv").is_file():
         if len(parts) == 3:
             names.append(parts[1])
             cursors.append(json.loads(parts[2]).get("cursor"))
+for _stream in (sys.stdout, sys.stderr):  # 输出里有中文：Windows 默认的控制台编码写不出来
+    _stream.reconfigure(encoding="utf-8", errors="replace")
 checks = [
     ("工单一张没动", same),
     ("没调过写工具", not any(name in ("add_comment", "close_ticket") for name in names)),

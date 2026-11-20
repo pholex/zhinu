@@ -8,6 +8,8 @@ import sys
 import time
 from pathlib import Path
 
+for _stream in (sys.stdin, sys.stdout):  # 协议走 UTF-8，不跟着系统的控制台编码走
+    _stream.reconfigure(encoding="utf-8", errors="replace")
 STATE = Path(sys.argv[1]) / "tickets.json"
 CALLS = Path(sys.argv[1]) / "calls.tsv"
 PAGE = 5

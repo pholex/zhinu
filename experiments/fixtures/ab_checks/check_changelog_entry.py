@@ -16,6 +16,8 @@ outside = [row for row in changed
            if not (row[3:].startswith("CHANGES/pending") or row[3:] == "CHANGELOG.md")]
 commits = subprocess.run(["git", "rev-list", "--count", "HEAD"], capture_output=True, text=True).stdout.strip()
 
+for _stream in (sys.stdout, sys.stderr):  # 输出里有中文：Windows 默认的控制台编码写不出来
+    _stream.reconfigure(encoding="utf-8", errors="replace")
 checks = [
     ("标题用给定的版本号与 RELEASE_DATE 里的日期", start is not None and lines[start] == "## 0.3.0 — 2026-11-20"),
     ("插在标题行之后、上一个版本之前", start is not None and "## 0.2.1" in "\n".join(lines[end:end + 1])

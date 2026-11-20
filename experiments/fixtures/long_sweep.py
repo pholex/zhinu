@@ -134,6 +134,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+for _stream in (sys.stdout, sys.stderr):
+    _stream.reconfigure(encoding="utf-8", errors="replace")
 ROOT = Path(__file__).resolve().parents[1]
 NAMES = sorted(path.stem for path in (ROOT / "mods").glob("m[0-9][0-9][0-9].py"))
 
