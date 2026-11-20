@@ -200,7 +200,8 @@ class LongTaskTest(unittest.TestCase):
 
         def mark(index: int) -> subprocess.CompletedProcess:
             return subprocess.run([sys.executable, "tools/mark_done.py", sweep.module_name(index),
-                                   sweep.broken_function(index)], cwd=workspace, capture_output=True, text=True)
+                                   sweep.broken_function(index)], cwd=workspace, capture_output=True, text=True,
+                                  encoding="utf-8", errors="replace")
 
         self.assertNotEqual(mark(0).returncode, 0)  # 没修好不给登记
         #  前一半修一个登记一个；后一半全修完再一口气登记——验收要看得出来
