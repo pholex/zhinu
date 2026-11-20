@@ -263,11 +263,14 @@ def normalize_questions(questions: Any) -> list[dict[str, Any]] | str:
 SYSTEM_IDENTITY = """你是小羽（Xiaoyu），一个在终端里干活的编码 agent。"""
 
 SYSTEM_HARNESS_RULES = """工作方式：
-- **跨文件探查一律先用 explore**。凡是"这个符号定义在哪""谁调用了它""这条链路怎么走"
-  "这个功能涉及哪些文件"这类需要翻 2 个以上文件才能回答的问题，交给 explore
+- **找东西先自己定位**：用 grep / list_files 一两步找到相关的文件或目录。
+  再读一两处就能回答的，自己读完直接答 —— 委托一次要等几十秒，不值。
+- **顺着多个文件追一条链路才交给 explore**。"谁调用了它""这条链路怎么走"
+  "这个功能涉及哪些文件"这类要翻好几个文件才能回答的问题，交给 explore
   （便宜模型的只读子 agent），它会返回带 路径:行号 的结论。
   不要自己连续 read_file 去翻 —— 那些中间内容会永久占住你的上下文，实测会多花一倍。
-- 目标明确的单点查找（找一个已知字符串、列某类文件）直接用 grep / list_files，不必绕 explore。
+- 委托时把你已经定位到的路径写进问题里。不要把"不知道在哪"的宽问题直接丢过去：
+  它会在错的地方耗尽轮次，带回一份看着完整、其实没找对地方的结论。
 - **explore 给的证据（路径:行号 + 原文行）可以直接采信**，不要为了核对再把那些文件读一遍
   —— 重读一遍等于白花了委托的钱。
 - 只有你**马上要动手改**的那个文件，才必须先自己完整 read_file 一遍。
@@ -1137,6 +1140,10 @@ class Agent:
         #  quiet 用于子 agent：不刷正文，只用缩进显示它调了什么工具。
         #  所有面向用户的输出走 sink（第 0 步重构）：不传就按 quiet 构造明文渲染。
         self.quiet = quiet
+        #  只读子 agent（检索）由创建方置 True：它的收尾正文是给主模型的报告，
+        #  不是对用户的交付，产物对账护栏不适用。不从工具箱推断——内核会往任何
+        #  工具箱里补登记自己的工具，名单说明不了"能不能改动现场"
+        self.reports_only = False
         self.sink: UISink = sink or PlainSink(indent="    " if quiet else "", verbose=not quiet)
         #  每次工具调用的记录，供 eval 与排障使用。
         self.trace: list[dict[str, Any]] = []
@@ -3636,7 +3643,10 @@ class Agent:
                     #  成功的改动类工具——改动不存在（真实会话里模型空口宣布
                     #  "已生成文件"，用户去找时什么都没有）。排在 Stop hook 之前：
                     #  hook 该看到的是澄清/补做之后的收尾
-                    if not nudged_phantom and self._turn_mutations == 0:
+                    #  只读子 agent（检索）不问：它没有任何能改动现场的工具，报告里
+                    #  "更新额度时调 /user/info"这类话是在转述读到的代码，不是宣称。
+                    #  问了白费一次请求，提示还会冒到主会话里，看着像主回答出了错
+                    if not nudged_phantom and self._turn_mutations == 0 and not self.reports_only:
                         claims = phantom_claims(media.text_of(message.get("content")))
                         if claims:
                             nudged_phantom = True

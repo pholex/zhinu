@@ -231,6 +231,14 @@ def run_once(source: Path, root: Path, *, python: str, model: str | None,
                 continue
             if isinstance(record, dict):
                 records.append(record)
+    #  调用记录写不进去（比如输出目录在沙箱不让写的地方）时，各项计数会全是 0，
+    #  看着像"什么都没做"。宁可中止，也不出一张假表。
+    logged = paths["log"].is_file() and paths["log"].read_text(encoding="utf-8", errors="replace").strip()
+    asked = any(word in json.dumps(r.get("tool_calls") or "", ensure_ascii=False)
+                for r in records for word in ("fleet ", "ssh "))
+    if asked and not logged:
+        raise RuntimeError(f"假命令的调用记录是空的：{paths['log']}。多半是沙箱不让往输出目录写，"
+                           "把 --out 换到临时目录下再跑")
     facts = score(paths["log"].read_text(encoding="utf-8", errors="replace"), records)
     meta = next((r for r in records if r.get("event") == "meta"), {})
     facts.update(seconds=round(time.monotonic() - started), exit_code=exit_code,

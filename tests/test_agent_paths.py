@@ -2058,6 +2058,19 @@ class PhantomEditGuardTest(AgentTestCase):
         self.assertEqual(len(self.client.completions.calls), 2)
         self.assertFalse((self.root / "foo.py").exists())
 
+    def test_readonly_sub_agent_is_not_challenged(self) -> None:
+        #  检索子 agent 的报告在转述代码（"更新额度时调 `/user/info`"），它手里没有
+        #  能改动现场的工具，这句话不可能是宣称
+        client = FakeClient([[chunk("更新额度时调 `/user/info`，写入 runbooks/quota.md 里有说明。"),
+                              usage_chunk(10, 5)]])
+        agent = Agent(self.config, Toolbox(self.config, only=Toolbox.READONLY),
+                      registry=Registry.for_client(client), quiet=True, allow_explore=False)
+        agent.reports_only = True
+        with contextlib.redirect_stdout(io.StringIO()):
+            agent.send("查一下")
+        self.assertEqual(self._nudges(agent), [])
+        self.assertEqual(len(client.completions.calls), 1)
+
     def test_real_write_is_evidence(self) -> None:
         script = [
             [

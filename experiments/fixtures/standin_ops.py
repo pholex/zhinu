@@ -66,8 +66,7 @@ description: 用 fleet CLI 管理机群：查清单与状态、重启实例、�
 
 - `fleet reboot <实例名|ID>`：重启一台实例。`--dry-run` 只看将执行什么，
   `--status` 只读查状态。
-- SSH：用 `~/.ssh/config` 里的别名直连，`ssh <别名> '<命令>'`。别名见 inventory 的
-  「SSH 别名」列。
+{{ssh_help}}
 
 ## 规则
 
@@ -77,6 +76,12 @@ description: 用 fleet CLI 管理机群：查清单与状态、重启实例、�
 4. 重启后验证：等 ~40 秒用 `fleet reboot <ID> --status` 查状态（running + 健康检查 ok），
    别立刻 SSH（重启中必然连不上）。
 """
+
+SSH_HELP = """- SSH：用 `~/.ssh/config` 里的别名直连，`ssh <别名> '<命令>'`。别名见 inventory 的
+  「SSH 别名」列。"""
+#  只走 fleet 的版本：登录也经 fleet。给"两边都在真实家目录下跑"的对照用——
+#  登录 shell 会把系统目录重新排到 PATH 前面，假 ssh 盖不住真的；fleet 这个名字真机上没有
+SSH_HELP_CLI = """- SSH：`fleet ssh <实例名|ID> '<命令>'`，经跳板登录实例执行命令（本机不配直连别名）。"""
 
 INVENTORY = f"""# 机群清单
 
@@ -180,8 +185,14 @@ JSON
         ;;
     esac
     ;;
+  ssh)
+    [ -n "$1" ] || {{ echo "用法：fleet ssh <实例名|ID> '<命令>'" >&2; exit 2; }}
+    resolve "$1" || exit 1
+    echo "Connection closed by {TARGET_IP} port 22" >&2
+    exit 255
+    ;;
   *)
-    echo "用法：fleet find <关键词> [--json] | fleet reboot <实例名|ID> [--dry-run|--status]" >&2
+    echo "用法：fleet find <关键词> [--json] | fleet reboot <实例名|ID> [--dry-run|--status] | fleet ssh <实例名|ID> '<命令>'" >&2
     exit 2
     ;;
 esac
@@ -222,39 +233,53 @@ exit 0
 COMMANDS = {"fleet": _FLEET, "ssh": _SSH, "sleep": _SLEEP, "nc": _NC, "ping": _PING}
 
 
-def build(root: Path, scenario: str = "reboot") -> dict[str, Path]:
+def build(root: Path, scenario: str = "reboot", *, cli_only: bool = False, state: Path | None = None,
+          skill_dirs: tuple[str, ...] = ()) -> dict[str, Path]:
     """在 root 下生成 workspace / home / config / standin 四个目录，返回各自的路径。
 
     home 里只有一份把替身命令顶到 PATH 最前面的 profile：bash 工具起的是登录
     shell，系统 profile 会把 /usr/bin 重新排到前面，不在这里再顶一次，
     假 ssh / 假 sleep 就会被真的盖掉。
+
+    cli_only：只生成 fleet 一个假命令，登录也走 `fleet ssh`，sleep 是真的。给不换家目录的
+    运行用。state：假命令与调用记录放哪（默认 root/standin）。skill_dirs：除默认位置外，
+    技能再拷到工作区里的这些目录下（各家找项目技能的位置不同）。
     """
     if scenario not in SCENARIOS:
         raise ValueError(f"未知场景：{scenario}（可选：{' / '.join(SCENARIOS)}）")
     shutil.rmtree(root, ignore_errors=True)
     workspace, home, config = root / "workspace", root / "home", root / "config"
-    state = root / "standin"
+    state = state or root / "standin"
     bin_dir = state / "bin"
-    for directory in (bin_dir, home / ".ssh", config, workspace / ".agents" / "skills" / SKILL_NAME):
-        directory.mkdir(parents=True)
+    skill_homes = [workspace / base / SKILL_NAME for base in (".agents/skills", *skill_dirs)]
+    for directory in (bin_dir, home / ".ssh", config, *skill_homes):
+        directory.mkdir(parents=True, exist_ok=True)
     log = state / "calls.tsv"
     log.write_text("", encoding="utf-8")
     for name, body in COMMANDS.items():
+        if cli_only and name != "fleet":
+            continue
         path = bin_dir / name
         #  不用 str.format：脚本正文里满是 shell 与 JSON 的花括号
+        if cli_only:
+            body = body.replace(f'      "ssh_alias": "{SSH_ALIAS}",\n', "")
         path.write_text(body.replace("{log}", str(log)).replace("{name}", name), encoding="utf-8")
         path.chmod(path.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
     #  清单写绝对路径：技能正文里的相对路径按技能目录解析，模型会去那儿找
-    (workspace / ".agents" / "skills" / SKILL_NAME / "SKILL.md").write_text(
-        SKILL.replace("{inventory}", str(workspace / "inventory.md")), encoding="utf-8"
-    )
+    skill = SKILL.replace("{inventory}", str(workspace / "inventory.md")).replace(
+        "{ssh_help}", SSH_HELP_CLI if cli_only else SSH_HELP)
+    for directory in skill_homes:
+        (directory / "SKILL.md").write_text(skill, encoding="utf-8")
     (home / ".ssh" / "config").write_text(SSH_CONFIG, encoding="utf-8")
     key = home / ".ssh" / "fleet-west.pem"
     key.write_text("替身环境的占位文件，不是密钥。\n", encoding="utf-8")
     key.chmod(0o600)
-    (workspace / "inventory.md").write_text(
-        INVENTORY + (HINT if scenario == "reboot-hint" else ""), encoding="utf-8"
-    )
+    inventory = INVENTORY + (HINT if scenario == "reboot-hint" else "")
+    if cli_only:  # 没有直连别名，这一列留着只会把模型引去找不存在的 ssh 配置
+        inventory = "\n".join(
+            "|".join(line.split("|")[:-2]) + "|" if line.count("|") == 9 else line
+            for line in inventory.split("\n"))
+    (workspace / "inventory.md").write_text(inventory, encoding="utf-8")
     profile = f'export PATH="{bin_dir}:$PATH"\n'
     for name in (".bash_profile", ".profile", ".bashrc", ".zshenv"):
         (home / name).write_text(profile, encoding="utf-8")
