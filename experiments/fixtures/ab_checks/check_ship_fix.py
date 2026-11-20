@@ -18,6 +18,8 @@ committed = git("diff", "--name-only", "main", "HEAD").splitlines()
 fixes = git("show", "HEAD:FIXES.md").splitlines()
 last = next((line for line in reversed(fixes) if line.strip()), "")
 
+for _stream in (sys.stdout, sys.stderr):  # 输出里有中文：Windows 默认的控制台编码写不出来
+    _stream.reconfigure(encoding="utf-8", errors="replace")
 checks = [
     ("用例全部通过", tests.returncode == 0),
     ("没改测试", not git("diff", "--name-only", "main", "--", "tests") and not git("status", "--porcelain", "--", "tests")),

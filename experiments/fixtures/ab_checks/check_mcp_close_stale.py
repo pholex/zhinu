@@ -25,6 +25,8 @@ def commented_first(ticket: str) -> bool:
 
 
 listed = [args for name, args in calls if name == "list_tickets"]
+for _stream in (sys.stdout, sys.stderr):  # 输出里有中文：Windows 默认的控制台编码写不出来
+    _stream.reconfigure(encoding="utf-8", errors="replace")
 checks = [
     ("四张过期的都关了", all(after[i]["status"] == "closed" for i in STALE)),
     ("没有多关（正好 14 天的、pending 的不算）", closed_now == STALE),

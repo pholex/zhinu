@@ -46,6 +46,9 @@ import session_compare  # noqa: E402
 import standin_ab  # noqa: E402
 import standin_ops  # noqa: E402
 
+#  假命令与服务状态放工作区外面的临时目录。有 /tmp 就用它（macOS 的默认临时目录在沙箱里
+#  不一定可写，/tmp 两边都让写）；没有（Windows）就用系统默认的
+SCRATCH = "/tmp" if os.path.isdir("/tmp") else None
 GIT_ID = ["-c", "user.name=ab", "-c", "user.email=ab@example.invalid", "-c", "commit.gpgsign=false"]
 
 
@@ -105,7 +108,7 @@ def prepare(task: ab_tasks.Task, root: Path, python: str, skill_dirs: tuple[str,
     if task.standin:
         #  假命令与调用记录放系统临时目录：两边的沙箱都让写，也不在工作区里被 ls 到。
         #  目录名不带"替身"字样——路径会出现在技能与报错里
-        state = Path(tempfile.mkdtemp(prefix="fleet-", dir="/tmp"))
+        state = Path(tempfile.mkdtemp(prefix="fleet-", dir=SCRATCH))
         paths = standin_ops.build(root / "env", task.standin, cli_only=True, state=state,
                                   skill_dirs=skill_dirs)
         return {"workspace": paths["workspace"], "start": "", "before": "", "standin": paths,
@@ -119,7 +122,7 @@ def prepare(task: ab_tasks.Task, root: Path, python: str, skill_dirs: tuple[str,
     state = None
     if task.mcp:
         #  服务的状态放工作区外面：放里面，模型可以绕过工具直接读写那份 JSON
-        state = Path(tempfile.mkdtemp(prefix=f"{task.mcp}-", dir="/tmp"))
+        state = Path(tempfile.mkdtemp(prefix=f"{task.mcp}-", dir=SCRATCH))
         shutil.copy(ab_tasks.MCP / f"{task.mcp}.json", state / f"{task.mcp}.json")
         (workspace / ".mcp.json").write_text(json.dumps({"mcpServers": {task.mcp: {
             "command": python, "args": [str(ab_tasks.MCP / f"{task.mcp}_server.py"), str(state)]}}},
@@ -163,7 +166,7 @@ def judge(task: ab_tasks.Task, ready: dict[str, Any], final_text: str, root: Pat
             final_text = produced.read_text(encoding="utf-8", errors="replace") if produced.is_file() else ""
         if task.checker:
             #  用拷出去的副本跑：脚本不进工作区，不会被当成"动了范围之外的文件"
-            checker_env = {**os.environ, "AB_STATE": str(ready.get("state") or "")}
+            checker_env = {**os.environ, "AB_STATE": str(ready.get("state") or ""), "PYTHONUTF8": "1"}
             ran = subprocess.run([python, "-P", str(ab_tasks.CHECKS / task.checker)], cwd=workspace,
                                  env=checker_env, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=300)
             (root / "check.txt").write_text(ran.stdout + ran.stderr, encoding="utf-8")

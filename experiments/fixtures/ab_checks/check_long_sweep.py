@@ -20,6 +20,8 @@ right_function = [name for index, name in enumerate(names) if rows.get(name) == 
 status = subprocess.run(["git", "status", "--porcelain"], capture_output=True, text=True).stdout.splitlines()
 half = len(names) // 2
 
+for _stream in (sys.stdout, sys.stderr):  # 输出里有中文：Windows 默认的控制台编码写不出来
+    _stream.reconfigure(encoding="utf-8", errors="replace")
 checks = [
     (f"模块全部修好（{len(fixed)}/{len(names)}）", len(fixed) == len(names)),
     ("交接文件删掉了", not Path("HANDOFF.md").exists()),
