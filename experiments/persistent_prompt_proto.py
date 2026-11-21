@@ -204,45 +204,56 @@ def split_rows(text: str, cols: int) -> tuple[list[str], str]:
     return rows, text[start:]
 
 
-def commit(app, data: str, *, sync: bool, extra_up: int = 0, cont: int = 0) -> None:
-    """擦掉输入区 → 写正文 → 重画输入区，攒成一次写出。
+def erase_live(app, *, cont: int = 0, up: int | None = None) -> None:
+    """把光标挪到输入区首行并擦掉整个输入区，渲染器归零。只写缓冲、不冲刷。
 
-    不用库自带的「挂起应用再打印」：那条路擦除、正文、重画是三次写出，
-    中间态肉眼可见；而且它的擦除是「回到输入区首行再清到屏末」，输入区
-    恰好从屏幕第一行开始时，有的终端复用器会把整屏当作「清屏」推进历史，
-    留下一帧输入区的残影。这里首行单独清行，其余行再清到屏末，绕开它。
+    擦除不用库自带的「回到首行清到屏末」：输入区恰好从屏幕第一行开始时，
+    有的终端复用器会把整屏当作「清屏」推进历史，留下一帧输入区的残影。
+    这里首行单独清行，其余行再清到屏末，绕开它。
 
-    cont 非零表示输入区首行是上一行软折下来的续行，行首那个字符（宽 cont 格）
-    已经落在终端里：这时不能从行首清——那会抹掉上一行的折行标记、把一个逻辑行
-    拆成两行——只从它后面清到屏末。
+    cont 非零表示首行是上一行软折下来的续行，行首那个字符（宽 cont 格）已经
+    落在终端里：这时不能从行首清——那会抹掉上一行的折行标记、把一个逻辑行
+    拆成两行——只从它后面清到屏末。up 给出时按它回退（缩放后行数变了）。
+    """
+    out, renderer = app.output, app.renderer
+    out.write_raw("\r")
+    out.cursor_up(renderer._cursor_pos.y if up is None else up)
+    if cont:
+        out.write_raw(f"\x1b[{cont}C\x1b[J\r")
+    else:
+        out.write_raw("\x1b[2K\x1b[1B\x1b[J\x1b[1A")
+    out.reset_attributes()
+    out.enable_autowrap()
+    renderer.reset()
+    app._request_absolute_cursor_position()
 
+
+def redraw_fresh(app, render=None) -> None:
+    """擦过之后的第一帧。库在这一帧前会再从行首清一次屏，那一下同样会抹掉
+    续行的折行标记；我们已经清过，所以这期间让它空转。"""
+    out = app.output
+    erase_down, out.erase_down = out.erase_down, lambda: None
+    try:
+        (render or app._redraw)()
+    finally:
+        out.erase_down = erase_down
+
+
+def commit(app, data: str, *, sync: bool, cont: int = 0) -> None:
+    """整块重画式的补打：擦掉输入区 → 写正文 → 重画输入区，攒成一次写出。
+
+    会闪，只在活区变矮、需要把高度归位时用；平时走 commit_in_place。
     用到渲染器的私有成员（光标位置、上一帧、强制重画），正式实现时要么
     收进一个渲染器子类，要么接受随库版本核对。
     """
-    out, renderer = app.output, app.renderer
+    out = app.output
     flush, out.flush = out.flush, lambda: None      # 攒到最后一次写出
     try:
         if sync:
             out.write_raw("\x1b[?2026h")
-        pos = renderer._cursor_pos
-        out.write_raw("\r")
-        out.cursor_up(pos.y + extra_up)
-        if cont:
-            out.write_raw(f"\x1b[{cont}C\x1b[J\r")
-        else:
-            out.write_raw("\x1b[2K\x1b[1B\x1b[J\x1b[1A")
-        out.reset_attributes()
-        out.enable_autowrap()
+        erase_live(app, cont=cont)
         out.write_raw(data)
-        renderer.reset()
-        app._request_absolute_cursor_position()
-        #  库在重画第一帧前会再从行首清一次屏；上面已经清过，而且那一下同样会
-        #  抹掉续行的折行标记，所以重画期间让它空转。
-        erase_down, out.erase_down = out.erase_down, lambda: None
-        try:
-            app._redraw()
-        finally:
-            out.erase_down = erase_down
+        redraw_fresh(app)
         if sync:
             out.write_raw("\x1b[?2026l")
     finally:
@@ -291,19 +302,17 @@ def commit_in_place(app, data: str, rows: int, *, sync: bool, cont: int) -> None
         out.flush()
 
 
-def reflow_extra(app) -> int:
-    """窗口变窄后，输入区在光标之上多出了几行（终端把宽行重排成多行）。"""
-    renderer = app.renderer
-    screen, pos = renderer._last_screen, renderer._cursor_pos
-    if screen is None:
-        return 0
-    cols = max(1, app.output.get_size().columns)
-    extra = 0
-    for y in range(pos.y):
-        row = screen.data_buffer.get(y) or {}
-        width = max((x + c.width for x, c in row.items() if c.char.strip()), default=0)
-        extra += max(0, -(-width // cols) - 1)
-    return extra + pos.x // cols
+def row_text(screen, y: int) -> str:
+    """上一帧第 y 行实际画到终端上的文字（去掉行尾空白）。"""
+    row = screen.data_buffer.get(y) or {}
+    return "".join(row[x].char for x in sorted(row) if row[x].width).rstrip()
+
+
+def rows_after_reflow(screen, y: int, cols: int) -> int:
+    """上一帧第 y 行在新宽度下占几行：终端会把比窗口宽的行重排成多行。"""
+    row = screen.data_buffer.get(y) or {}
+    width = max((x + c.width for x, c in row.items() if c.char.strip()), default=0)
+    return max(1, -(-width // cols))
 
 
 def run_ui(args: argparse.Namespace) -> int:
@@ -324,8 +333,12 @@ def run_ui(args: argparse.Namespace) -> int:
         ).stdout.decode("utf-8", errors="replace").strip() or "main"
     except (OSError, subprocess.SubprocessError):
         branch = "main"
-    #  tail=活区里的尾巴；open=当前逻辑行已软折落下的前半；cont=续行行首字符的宽度
-    view = {"tail": "", "open": "", "cont": 0, "rows": 0}
+    #  tail  活区首行里还没落下的尾巴
+    #  open  当前逻辑行已经落进终端的部分
+    #  carry open 的末尾里、和尾巴同在一个物理行上的那一截：它已经落下，但每帧
+    #        随首行一起重画（只有缩放把行重排之后才会非空）
+    #  cont  首行是续行时，行首字符的宽度（见 commit）
+    view = {"tail": "", "open": "", "carry": "", "cont": 0, "rows": 0, "size": None}
     session: PromptSession[str] = PromptSession(
         erase_when_done=True, reserve_space_for_menu=0, style=Style.from_dict(STYLE))
 
@@ -359,35 +372,84 @@ def run_ui(args: argparse.Namespace) -> int:
         只在界面线程调。每个物理行写完都清到行末，因为它是盖在旧内容上的。
         """
         cols = columns()
+        carry = view["carry"]
         with shared.lock:
             lines, shared.pending = shared.pending, []
-            rows, rest = split_rows(shared.tail, cols)
+            rows, rest = split_rows(carry + shared.tail, cols) if not lines else ([], "")
             if rows:
                 shared.tail = rest
             view["tail"] = shared.tail
 
-        def full(row: str) -> str:      # 铺满的行：差一格没满（宽字符挪走了）才需要清
-            return row if sum(get_cwidth(c) for c in row) >= cols else row + "\x1b[K"
+        def laid(text: str) -> tuple[str, int]:
+            """一个逻辑行从行首写起的字节与占用行数；铺满的行靠终端自己折。"""
+            wrapped, last = split_rows(text, cols)
+            body = "".join(
+                r if sum(get_cwidth(c) for c in r) >= cols else r + "\x1b[K" for r in wrapped)
+            return body + last, len(wrapped)
 
         data, used = "", 0
         for line in lines:
             transcript.append(view["open"] + line)
-            view["open"], view["cont"] = "", 0
-            wrapped, last = split_rows(line, cols)
-            data += "".join(full(r) for r in wrapped) + last + "\x1b[K\r\n"
-            used += len(wrapped) + 1
+            body, n = laid(carry + line)        # carry 已在屏上，原样重写一遍不碍事
+            data += body + "\x1b[K\r\n"
+            used += n + 1
+            carry = view["open"] = view["carry"] = ""
+            view["cont"] = 0
         if rows:                        # 铺满的行 + 下一个字符触发折行，再回到行首
-            view["open"] += "".join(rows)
+            body, n = laid("".join(rows) + rest[0])
+            data += body + "\r"
+            used += n
+            view["open"] += "".join(rows)[len(carry):]
+            view["carry"] = ""
             view["cont"] = get_cwidth(rest[0])
-            data += "".join(full(r) for r in rows) + rest[0] + "\r"
-            used += len(rows)
         return data, used
 
-    def on_resize() -> None:
-        commit(session.app, "", sync=args.sync, cont=view["cont"],
-               extra_up=reflow_extra(session.app))
+    def resync() -> None:
+        """窗口大小变了：按终端重排后的样子找到输入区的新起点，擦掉重画。
 
-    session.app._on_resize = on_resize  # 接管缩放（见模块说明第 4 条）
+        终端会把每个逻辑行按新宽度重新折行。输入区里的行各自是一个逻辑行，
+        比新窗口宽的会变成多行；首行若是续行，则连同上面已落下的部分一起
+        重排——尾巴可能被并到上一行行尾，也可能被挤到下面几行。这里用同一套
+        折行规则重算一遍：重排后落在「最后一个物理行」之前的字符都算已落下，
+        最后一行那一截（carry + 尾巴）留给首行继续画。
+        """
+        app = session.app
+        size = view["size"] = app.output.get_size()
+        cols = max(8, size.columns)
+        screen, pos = app.renderer._last_screen, app.renderer._cursor_pos
+        if screen is None:
+            return
+        drawn = row_text(screen, 0)
+        with shared.lock:
+            shown = drawn[len(view["carry"]):] if drawn.startswith(view["carry"]) else ""
+            while shown and not shared.tail.startswith(shown):
+                shown = shown[:-1]
+            text = view["open"] + shown
+            rows, last = split_rows(text, cols)
+            above = sum(len(r) for r in rows)           # 重排后落在最后一行之前的字符数
+            moved = max(0, above - len(view["open"]))   # 其中原本还在尾巴里的
+            view["open"] += shared.tail[:moved]
+            shared.tail = shared.tail[moved:]
+            view["carry"] = view["open"][above:]
+            view["tail"] = shared.tail
+            view["cont"] = get_cwidth(last[0]) if above and last else 0
+        up = 1 + sum(rows_after_reflow(screen, y, cols) for y in range(1, pos.y))
+        erase_live(app, cont=view["cont"], up=up + pos.x // cols)
+
+    #  缩放的处理卡在渲染入口：终端一缩放就已经把屏上的内容重排了，在我们
+    #  按新布局对齐之前，库哪怕只按旧位置画一帧，后面的推算就全错位。所以
+    #  每次重画前先看窗口大小变没变，变了就先对齐、再画这一帧。
+    plain_render = session.app.renderer.render
+
+    def render(app, layout, is_done: bool = False) -> None:
+        if is_done or view["size"] is None or app.output.get_size() == view["size"]:
+            plain_render(app, layout, is_done)
+            return
+        resync()
+        redraw_fresh(app, lambda: plain_render(app, layout, is_done))
+
+    session.app.renderer.render = render
+    session.app._on_resize = session.app._redraw
 
     def start_turn(text: str) -> None:
         shared.cancel.clear()
@@ -459,7 +521,7 @@ def run_ui(args: argparse.Namespace) -> int:
         cols = columns()
         frame = SPINNER[int(time.monotonic() * 10) % len(SPINNER)]
         out: list[tuple[str, str]] = []
-        out.append(("", tail + "\n"))  # 尾巴这一行常在（空着也占位），行数才稳定
+        out.append(("", view["carry"] + tail + "\n"))   # 这一行常在（空着也占位）
         if ask or running or steers:
             out.append(("", "\n"))
         if ask:
@@ -547,6 +609,8 @@ def run_ui(args: argparse.Namespace) -> int:
             stats["max_lag_ms"] = max(stats["max_lag_ms"], (now - prev - interval) * 1e3)
             prev = now
             running = shared.running
+            if app.output.get_size() != view["size"]:
+                app._redraw()           # 信号可能还在路上：落笔前先对齐窗口大小
             cont = view["cont"]         # 落笔前的状态：此刻首行是不是续行
             data, used = take()
             if data:
@@ -572,6 +636,7 @@ def run_ui(args: argparse.Namespace) -> int:
 
         def pre_run() -> None:
             nonlocal task
+            view["size"] = session.app.output.get_size()
             task = session.app.create_background_task(pump())
             if args.auto:
                 asyncio.get_running_loop().call_later(0.3, start_turn, args.auto)
@@ -633,6 +698,7 @@ def selfcheck(args: argparse.Namespace) -> int:
         "--chars", str(args.chars), "--cps", str(args.cps), "--hz", str(args.hz),
         "--transcript-out", str(want), "--stats-out", str(stat),
         *([] if args.sync else ["--no-sync"]),
+        *(["--erase"] if args.erase else []),
     ])
     tmux("kill-server")
     tmux("new-session", "-d", "-s", name, "-x", "100", "-y", "30", cmd)
