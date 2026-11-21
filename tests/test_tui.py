@@ -1244,6 +1244,28 @@ class TestRunningLine(unittest.TestCase):
         #  确实在轮换，不是卡在同一条
         self.assertGreater(len(seen), 1)
 
+    def test_tip_key_is_accented_and_the_rest_stays_dim(self) -> None:
+        """按键 / 前缀单独提亮：整行弱化色时找不到"到底按什么"。"""
+        import time
+
+        from xiaoyu import keys
+        from xiaoyu.tui import _RunningLine
+
+        labels = {label for label, _ in keys.tip_parts()}
+        accented: set[str] = set()
+        for _ in range(len(labels) + 1):
+            line = _RunningLine("bash")
+            line.started = time.monotonic() - 5.0
+            text = line.__rich__()
+            #  弱化色不能当整行底色：dim 会把强调色一并压暗
+            self.assertEqual(text.style, "")
+            for span in text.spans:
+                if span.style == "text.accent":
+                    accented.add(text.plain[span.start : span.end])
+                else:
+                    self.assertEqual(span.style, "text.secondary")
+        self.assertEqual(accented, labels)
+
     def test_rotation_reaches_every_tip_across_runs(self) -> None:
         """起点逐实例推进：单次窗口只够三四条，跨运行必须把整张表轮完
         ——否则表尾的提示（XIAOYU_MODE 一类）永远见不了天日。"""

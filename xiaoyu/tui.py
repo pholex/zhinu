@@ -350,10 +350,14 @@ class _RunningLine:
 
     def __rich__(self) -> Text:
         elapsed = time.monotonic() - self.started
-        suffix = self.progress or self._suffix(elapsed)
-        head = Text(
-            f"{self.name} {self.verb} · {elapsed:.0f}s · {suffix}",
-            style="text.secondary",
+        label, suffix = ("", self.progress) if self.progress else self._suffix(elapsed)
+        #  轮播提示里的按键 / 前缀单独提亮：整行都是弱化色时，眼睛找不到
+        #  "到底按什么"；说明文字仍弱化，不和正文抢注意力。弱化色按段上而不是
+        #  当整行底色——暗色主题的弱化是 dim，当底色会把强调色也一并压暗
+        head = Text.assemble(
+            (f"{self.name} {self.verb} · {elapsed:.0f}s · ", "text.secondary"),
+            (label, "text.accent"),
+            (f" {suffix}" if label else suffix, "text.secondary"),
         )
         if self.footer is None:
             return head
@@ -363,15 +367,16 @@ class _RunningLine:
             extra = []
         return Text("\n").join([head, *extra]) if extra else head
 
-    def _suffix(self, elapsed: float) -> str:
+    def _suffix(self, elapsed: float) -> tuple[str, str]:
+        """(要提亮的按键, 其余文字)；没有按键可提亮时前一项为空。"""
         if elapsed >= self._LONG:
             budget = f"上限 {self.timeout}s · " if self.timeout else ""
-            return f"{budget}Ctrl-C 中断"
+            return "", f"{budget}Ctrl-C 中断"
         if elapsed < self._QUIET:
-            return "Ctrl-C 中断"
-        rotation = [*keys.tips(), *_EXTRA_TIPS]
+            return "", "Ctrl-C 中断"
+        rotation = [*keys.tip_parts(), *(("", tip) for tip in _EXTRA_TIPS)]
         if not rotation:
-            return "Ctrl-C 中断"
+            return "", "Ctrl-C 中断"
         index = (self._tip_start + int((elapsed - self._QUIET) // self._CYCLE)) % len(rotation)
         return rotation[index]
 
