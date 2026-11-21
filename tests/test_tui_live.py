@@ -120,6 +120,16 @@ class LiveWriterTest(unittest.TestCase):
         self.assertEqual(real.getvalue(), "一\n二\n")
         self.assertEqual((writer.pending, writer.tail), ([], ""))
 
+    def test_tracks_whether_output_ends_with_a_blank_line(self) -> None:
+        writer, _ = self.make()
+        self.assertTrue(writer.ends_blank)
+        writer.write("正文\n")
+        self.assertFalse(writer.ends_blank)
+        writer.write("\n")
+        self.assertTrue(writer.ends_blank)
+        writer.write("半行")
+        self.assertFalse(writer.ends_blank)
+
     def test_looks_like_a_terminal_to_its_users(self) -> None:
         writer, _ = self.make()
         self.assertTrue(writer.isatty())

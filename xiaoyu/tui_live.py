@@ -181,6 +181,8 @@ class LiveWriter:
         self.tail = ""
         self.passthrough = True
         self._tail_owner: int | None = None
+        #  最近落下的一整行是不是空行（要不要再空一行由调用方据此决定）
+        self.ends_blank = True
 
     def write(self, text: str) -> int:
         if not text:
@@ -195,6 +197,8 @@ class LiveWriter:
                 return len(text)
             *lines, self.tail = (self.tail + text).split("\n")
             self.pending.extend(lines)
+            if lines or self.tail:
+                self.ends_blank = not self.tail and not visible_width(lines[-1])
             self._tail_owner = me if self.tail else None
         return len(text)
 
@@ -610,6 +614,7 @@ class LiveTui(Tui):
         )
         real = sys.stdout
         writer = self._writer = LiveWriter(real)
+        writer.ends_blank = False  # 开场提示刚打过，第一句话上方也要空一行
         screen = self._screen = LiveScreen(app, writer)
         screen.animate = lambda: self._busy is not None
         self._worker = threading.Thread(target=self._work, name="live-worker", daemon=True)
@@ -821,9 +826,25 @@ class LiveTui(Tui):
             else:
                 agent.steer(text)
             return
-        #  输入行不留在原地了，把这一行补打到上方，scrollback 里才有「我说了什么」
-        self.console.print(Text.assemble(("› ", "prompt"), (text, "")))
+        self._echo(text, literal)
         self._jobs.put((text, literal))
+
+    def _echo(self, text: str, literal: bool) -> None:
+        """输入行不留在原地了，把这一行补打到上方，scrollback 里才有「我说了什么」。
+
+        回头翻记录时最先要找的就是「我在哪儿问的」：上方空一行把它和前面的输出
+        隔开；对模型说的话整行加粗、提示符用强调色，命令（/、!、#）是对程序
+        说的，保持原样不抢眼。续行缩进对齐到提示符之后。
+        """
+        writer = self._writer
+        if writer is not None and not writer.ends_blank:
+            print()
+        said = keys.classify_input(text, literal=literal).kind == "send"
+        body = text.replace("\n", "\n  ")
+        if said:
+            self.console.print(Text.assemble(("› ", "text.accent bold"), (body, "bold")))
+        else:
+            self.console.print(Text.assemble(("› ", "prompt"), (body, "")))
 
     def _above(self, action: Callable[[], None]) -> None:
         action()
