@@ -168,8 +168,8 @@ BY_COMMAND: dict[str, Binding] = {item.command: item for item in BINDINGS}
 #  上表 PREFIX 分类的可执行形态（与绑定表同一模块，不另立文件）：
 #  文档表加了前缀、这里没跟上（或反之），tests/test_input_router.py 的防漂移
 #  断言会红。`@`（prefix.file）是补全层前缀，行提交时早已展开成路径，不进
-#  本路由；模型作答期间的整行输入也不经过这里——那是 steer，斜杠不特判是
-#  SteerPoller 的文档化决策。
+#  本路由；模型作答期间的整行输入只借本路由认一件事——是不是斜杠命令
+#  （是就不当插话交给模型，见 SteerPoller），`!` 与 `#` 前缀在运行中仍是插话。
 
 
 @dataclass(frozen=True)

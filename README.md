@@ -102,6 +102,10 @@ xiaoyu term install                     # 把终端集成与 Tab 补全写进 ~/
 
 REPL 里：`/help` `/tools` `/skills` `/model` `/search` `/effort` `/mode` `/usage` `/context` `/compact` `/copy` `/export` `/clear` `/exit` `/tasks` `/plan` `/goal` `/perm` `/allow` `/deny` `/resume` `/rewind` `/mcp` `/quit`
 
+模型作答期间敲的整行是插话，在下一个步骤边界送给模型；斜杠命令不送给模型：
+`/help` `/keys` `/tools` `/tasks` `/usage` `/context` `/perm` 这几条只读的在下一个输出间隙（工具跑完、一段正文收尾）执行，
+其余留到本轮结束、预填回输入行等你确认（TUI，macOS / Linux）。
+
 提问面板中选「取消提问，返回对话」或按 `Esc` / `Ctrl-C`，会停止本轮并保留已答内容，
 可直接输入新消息；明文问答中输入 `0`、直接回车或按 `Ctrl-C` 同效。
 

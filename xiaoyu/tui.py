@@ -69,8 +69,10 @@ kitty 键盘协议也不开：prompt_toolkit 3.0.53 的 vt100 解析器不认 CS
 
 from __future__ import annotations
 
+import collections
 import contextlib
 import difflib
+import io
 import itertools
 import os
 import re
@@ -1324,12 +1326,17 @@ class RichSink:
         #  轮末「接着问」的接手方（Tui 接线）：它知道提示符挂没挂着、怎么喂输入行的
         #  幽灵建议。没人接手就只打一行
         self.on_suggestions: Callable[[list[str]], None] | None = None
+        #  安全点回调（Tui 接线）：每个事件处理完、且没有半截正文悬在行上时调一次，
+        #  运行中的本地命令借它把输出插进事件之间。子 agent 的静默 sink 不接
+        self.on_safe_point: Callable[[], None] | None = None
 
     def emit(self, event: UIEvent) -> None:
         handler = self._handlers.get(type(event))
         if handler is not None:
             #  终端注入面：模型正文与工具输出可能夹带转义序列（见 ui.strip_controls）
             handler(render.sanitize_event(event))
+        if self.on_safe_point is not None and not self._text_open:
+            self.on_safe_point()
 
     def _artifacts(self, event: ArtifactsReady) -> None:
         if self.verbose:
@@ -1812,8 +1819,10 @@ class SteerPoller:
     - 线程自己不打印任何东西（rich Live 归主线程独占）：确认反馈由
       steer.accepted 事件在消费点（agent 线程=主线程）打出，敲字时的即时
       回显本来就有 tty echo；
-    - 斜杠命令不特判：运行中敲 `/...` 也会作为插话交给模型（提示语义上
-      它就是"对模型说的话"；命令请等本轮结束）；
+    - 斜杠命令不交给模型：`/usage` 是对程序说的话，送进历史只会让模型去猜
+      用户想干什么。命令形状的单行（判定走 keys.classify_input，与输入行同一张
+      表）改进 `commands` 队列，由主线程在安全点取走（Tui._run_midturn_commands）；
+      线程自己照旧不执行、不打印；
     - 多行粘贴合并成一条：规范模式逐行交付，窗口内连着到达的行并成整段；
     - Windows 没有 select-on-stdin：整个 poller 禁用，保留旧的"收尾预填"路径。
     """
@@ -1824,6 +1833,8 @@ class SteerPoller:
 
     def __init__(self, agent: Agent) -> None:
         self.agent = agent
+        #  运行中敲的斜杠命令：本线程只入队，主线程取走（deque 的两端操作原子）
+        self.commands: collections.deque[str] = collections.deque()
         self._stop = threading.Event()
         self._paused = threading.Event()
         self._thread: threading.Thread | None = None
@@ -1912,8 +1923,14 @@ class SteerPoller:
             lines.pop(0)
         while lines and not lines[-1].strip():
             lines.pop()
-        if lines:
-            self.agent.steer("\n".join(lines))
+        if not lines:
+            return
+        text = "\n".join(lines)
+        #  只认单行：多行粘贴即使以 / 开头也是给模型看的正文
+        if len(lines) == 1 and keys.classify_input(text).kind == "slash":
+            self.commands.append(text.strip())
+            return
+        self.agent.steer(text)
 
 
 class Tui:
@@ -1958,6 +1975,9 @@ class Tui:
         self._image_id = 0
         #  运行期插话线程（run() 里按轮起停）；confirm() 靠它 pause/resume
         self._poller: SteerPoller | None = None
+        #  运行中敲下、要等本轮结束才能跑的斜杠命令：轮末预填回输入行
+        self._held_commands: list[str] = []
+        self.sink.on_safe_point = self._run_midturn_commands
         #  "切进 auto 但沙箱不可用"只提醒一次，别每次按键都刷一行
         self._warned_no_sandbox = False
         #  轮末「接着问」（见 suggest.py）：本轮的几条建议 + 正挂着的 prompt app
@@ -2387,6 +2407,42 @@ class Tui:
             fragments.append((theme.ptk(mode.style), f"{mode.marker} {mode.label} "))
         fragments.append((theme.ptk("prompt"), "› "))
         return fragments
+
+    def _run_midturn_commands(self) -> None:
+        """取走运行期输入通道接住的斜杠命令：能当场跑的跑掉，其余记下留到轮末。
+
+        由 sink 在事件之间的安全点调用，轮末收尾时再补调一次（一直没等到安全点的
+        命令不丢）。只在主线程动手：并行委托的工作线程也会经 sink 发事件，
+        那里既不该读会话状态，也不该和主线程抢着打印。
+        """
+        poller = self._poller
+        if poller is None or not poller.commands:
+            return
+        if threading.current_thread() is not threading.main_thread():
+            return
+        from .cli import MIDTURN_COMMANDS, handle_slash
+
+        #  只处理进来时已有的那几条：处理期间新到的留给下一个安全点，循环有界
+        for _ in range(len(poller.commands)):
+            try:
+                line = poller.commands.popleft()
+            except IndexError:  # 读线程刚把它撤回了（Esc）
+                break
+            self.sink._flush_ro_group()  # noqa: SLF001 - 同模块前端搭档
+            if line.split()[0] not in MIDTURN_COMMANDS:
+                self._held_commands.append(line)
+                self.console.print(
+                    Text(f"  ↳ {line} 要等本轮结束，已留到输入行", style="text.secondary")
+                )
+                continue
+            #  命令实现用 print 直出；活区在转时裸写 stdout 会和它抢光标，
+            #  所以先收进缓冲，再整段经 console 打到活区上方
+            buffer = io.StringIO()
+            with contextlib.redirect_stdout(buffer):
+                handle_slash(poller.agent, line)
+            self.console.print(Text(f"  ↳ {line}", style="text.secondary"))
+            if output := buffer.getvalue().rstrip("\n"):
+                self.console.print(Text.from_ansi(output))
 
     def _drain_typeahead(self) -> str:
         """取走用户在模型作答期间敲进终端缓冲的整行输入。
@@ -3051,6 +3107,8 @@ class Tui:
                 )
             finally:
                 self._poller.stop()
+                #  一直没等到安全点的命令（比如整轮只有一段长正文）在这里补跑
+                self._run_midturn_commands()
                 self._poller = None
             #  still-running 状态行：inline 架构没有常驻状态栏，
             #  轮次结束打一行即走，与明文 REPL 同一份文案（cli.background_status）
@@ -3069,7 +3127,8 @@ class Tui:
             #  都转成下一轮输入行的预填——用户的话绝不凭空消失，也绝不自动提交
             leftover = agent.drain_steers()
             typed = self._drain_typeahead()
-            queued = "\n".join(part for part in [*leftover, typed] if part).strip()
+            held, self._held_commands = self._held_commands, []
+            queued = "\n".join(part for part in [*leftover, *held, typed] if part).strip()
             if queued:
                 self.console.print(
                     Text("  （已接住你刚才输入的内容，确认后回车发送）", style="text.secondary")

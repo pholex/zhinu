@@ -317,6 +317,108 @@ class PollerTest(unittest.TestCase):
         with mock.patch.object(tui.sys, "stdin", mock.Mock(isatty=lambda: False)):
             self.assertFalse(tui.SteerPoller.supported())
 
+    def test_slash_command_is_queued_not_steered(self):
+        """运行中敲的斜杠命令是对程序说的，不进模型的历史。"""
+        from xiaoyu import tui
+
+        with mock.patch.object(tui.SteerPoller, "_PASTE_WINDOW", 0.05):
+            target, write_fd = self._start_on_pipe()
+            os.write(write_fd, "/usage\n".encode())
+            time.sleep(0.3)
+            #  紧跟一条普通插话当哨兵：它到了，说明前一行已经处理完
+            os.write(write_fd, "接着干\n".encode())
+            self._wait_lines(target, 1)
+            self.assertEqual(target.lines, ["接着干"])
+
+
+class DeliverRoutingTest(unittest.TestCase):
+    """_deliver 的分流：只有命令形状的单行进命令队列。"""
+
+    def _deliver(self, data: str):
+        from xiaoyu import tui
+
+        target = _FakeSteerTarget()
+        poller = tui.SteerPoller(target)  # type: ignore[arg-type]
+        poller._deliver(data.encode())
+        return target.lines, list(poller.commands)
+
+    def test_command_with_arguments(self):
+        self.assertEqual(self._deliver("  /model foo \n"), ([], ["/model foo"]))
+
+    def test_path_like_text_goes_to_the_model(self):
+        lines, commands = self._deliver("/etc/hosts 也看一下\n")
+        self.assertEqual((lines, commands), (["/etc/hosts 也看一下"], []))
+
+    def test_multiline_paste_goes_to_the_model(self):
+        lines, commands = self._deliver("/usage\n第二行\n")
+        self.assertEqual((lines, commands), (["/usage\n第二行"], []))
+
+
+class MidturnCommandTest(unittest.TestCase):
+    """主线程在安全点取走命令：只读的当场跑，其余留到轮末预填。"""
+
+    def setUp(self) -> None:
+        import collections
+        import io
+        import tempfile
+        from pathlib import Path
+        from types import SimpleNamespace
+
+        from rich.console import Console
+
+        from xiaoyu.permissions import Permissions
+        from xiaoyu.tui import Tui
+
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.output = io.StringIO()
+        self.tui = Tui(Permissions(Path(tmp.name)), console=Console(file=self.output, width=120))
+        self.commands: collections.deque[str] = collections.deque()
+        #  /usage 只读 agent.usage；别的属性一碰就 AttributeError，正好当"没被执行"的哨兵
+        agent = SimpleNamespace(usage="用量哨兵 42 tok")
+        self.tui._poller = SimpleNamespace(commands=self.commands, agent=agent)
+
+    def test_read_only_command_runs_in_place(self):
+        self.commands.append("/usage")
+        self.tui._run_midturn_commands()
+        shown = self.output.getvalue()
+        self.assertIn("↳ /usage", shown)
+        self.assertIn("用量哨兵 42 tok", shown)
+        self.assertEqual(self.tui._held_commands, [])
+        self.assertFalse(self.commands)
+
+    def test_other_command_is_held_for_the_input_line(self):
+        self.commands.append("/clear")
+        self.tui._run_midturn_commands()
+        self.assertEqual(self.tui._held_commands, ["/clear"])
+        self.assertIn("/clear 要等本轮结束", self.output.getvalue())
+
+    def test_waits_while_a_text_block_is_open(self):
+        from xiaoyu.events import Notice
+
+        self.commands.append("/usage")
+        self.tui.sink._text_open = True
+        self.tui.sink.emit(Notice("正文还没收尾", "info"))
+        self.assertEqual(list(self.commands), ["/usage"], "半截正文悬着时不该插进输出")
+        self.tui.sink._text_open = False
+        self.tui.sink.emit(Notice("收尾了", "info"))
+        self.assertFalse(self.commands)
+        self.assertIn("用量哨兵 42 tok", self.output.getvalue())
+
+    def test_worker_thread_never_runs_commands(self):
+        import threading
+
+        self.commands.append("/usage")
+        worker = threading.Thread(target=self.tui._run_midturn_commands)
+        worker.start()
+        worker.join()
+        self.assertEqual(list(self.commands), ["/usage"])
+
+    def test_every_midturn_command_is_a_registered_command(self):
+        from xiaoyu.cli import MIDTURN_COMMANDS, SLASH_COMMANDS
+
+        self.assertLessEqual(MIDTURN_COMMANDS, set(SLASH_COMMANDS))
+
 
 if __name__ == "__main__":
     unittest.main()
