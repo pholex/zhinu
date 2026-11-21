@@ -237,5 +237,118 @@ class SwitchTest(unittest.TestCase):
         self.assertIsNone(front.sink.live_footer)
 
 
+@unittest.skipUnless(HAVE_TUI, "没装 TUI 可选依赖")
+class PanelTest(unittest.TestCase):
+    """确认菜单、提问面板、单行追问嵌进输入区：只验状态怎么流转，画面靠 tmux 验收。"""
+
+    def front(self):
+        from pathlib import Path
+
+        from prompt_toolkit import PromptSession
+        from prompt_toolkit.input import create_pipe_input
+        from prompt_toolkit.output import DummyOutput
+        from rich.console import Console
+
+        from xiaoyu.permissions import Permissions
+        from xiaoyu.tui_live import LiveTui
+
+        folder = tempfile.TemporaryDirectory()
+        self.addCleanup(folder.cleanup)
+        pipe = create_pipe_input()
+        self.addCleanup(pipe.__exit__, None, None, None)
+        front = LiveTui(Permissions(Path(folder.name)), console=Console(file=io.StringIO()))
+        front._session = PromptSession(
+            input=pipe.__enter__(), output=DummyOutput(), completer=object(), multiline=True
+        )
+        return front
+
+    def test_menu_runs_in_the_host_it_is_given(self) -> None:
+        #  tui.py 的接缝：菜单把按键与画面交给宿主，结果经宿主的 finish 交回
+        from xiaoyu.tui import inline_select
+
+        seen: dict = {}
+
+        class Host:
+            def run(self, bindings, fragments, height):
+                seen.update(bindings=bindings, fragments=fragments, height=height)
+                digit = next(b for b in bindings.bindings if b.keys == ("2",))
+                digit.handler(None)
+                return seen["result"]
+
+            def finish(self, result):
+                seen["result"] = result
+
+            def above(self, action):
+                action()
+
+        options = [("once", "允许一次", "y"), ("deny", "拒绝", "n")]
+        self.assertEqual(inline_select("要执行吗？", options, host=Host()), "deny")
+        self.assertEqual(seen["height"], 4)
+        self.assertIn("允许一次", "".join(text for _style, text in seen["fragments"]()))
+
+    def test_without_an_input_area_asking_counts_as_cancelled(self) -> None:
+        front = self.front()
+        self.assertIsNone(front._menu_host().run(None, list, 1))
+        with self.assertRaises(EOFError):
+            front._confirm_prompt([("", "  规则：")], default="allow bash(ls *)")
+
+    def test_line_question_borrows_the_input_line_and_gives_it_back(self) -> None:
+        from prompt_toolkit.document import Document
+
+        from xiaoyu.tui_live import _Panel
+
+        front = self.front()
+        session = front._session
+        buffer = session.default_buffer
+        completer = session.completer
+        buffer.reset(Document("半截草稿"))
+        panel = _Panel("text")
+        panel.label, panel.default, panel.password = [("", "  密码：")], "", True
+        front._open(panel)
+        self.assertEqual(buffer.text, "")
+        self.assertTrue(session.is_password)
+        self.assertIsNone(session.completer)
+        self.assertEqual(front._live_message()[-1], ("", "  密码："))
+        buffer.reset(Document("hunter2"))
+        front._hand_off(buffer)
+        self.assertTrue(panel.done.is_set())
+        self.assertEqual(panel.result, "hunter2")
+        self.assertEqual(buffer.text, "半截草稿")
+        self.assertFalse(session.is_password)
+        self.assertIs(session.completer, completer)
+        self.assertIsNone(front._panel)
+
+    def test_empty_answer_to_a_line_question_is_an_answer(self) -> None:
+        from xiaoyu.tui_live import _CANCELLED, _Panel
+
+        front = self.front()
+        panel = _Panel("text")
+        panel.result = _CANCELLED
+        front._open(panel)
+        front._hand_off(front._session.default_buffer)
+        self.assertEqual(panel.result, "")
+
+    def test_menu_is_drawn_above_the_input_line_and_keeps_the_draft(self) -> None:
+        from prompt_toolkit.document import Document
+
+        from xiaoyu.tui_live import _Panel
+
+        front = self.front()
+        buffer = front._session.default_buffer
+        buffer.reset(Document("半截草稿"))
+        panel = _Panel("menu")
+        panel.fragments = lambda: [("class:menu-title", "  要执行这条命令吗？")]
+        front._open(panel)
+        drawn = "".join(text for _style, text in front._live_message())
+        self.assertIn("要执行这条命令吗？", drawn)
+        self.assertTrue(drawn.endswith("› "))
+        front._hand_off(buffer)  # 回车归菜单管，漏到这里也不能把草稿当消息发出去
+        self.assertEqual(buffer.text, "半截草稿")
+        self.assertTrue(front._jobs.empty())
+        front._menu_host().finish("once")
+        self.assertEqual(panel.result, "once")
+        self.assertIsNone(front._panel)
+
+
 if __name__ == "__main__":
     unittest.main()

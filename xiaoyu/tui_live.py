@@ -10,8 +10,11 @@
 - **仍然不进 alt-screen**。所有输出先进 `LiveWriter`，由主线程按节拍补打到输入区
   上方、落进终端原生 scrollback，每个字符只落一次。没成行但已铺满一屏宽的部分按
   软折行落（写满一行后多写一个字符让终端自己折），复制出去仍是一整行。
-- **要独占终端的事先让位**：确认菜单、提问面板、斜杠命令、`!` 命令执行期间输入区
-  整个收起（`LiveScreen.suspended`），做完再画回来——这些交互沿用旧实现，一行不改。
+- **等人拿主意的事嵌在输入区里**：确认菜单、提问面板画在输入行上方，按键与画面
+  还是 `tui.py` 那一份（`MenuHost` 接缝），只是换了住处；规则编辑、附言、拒绝理由、
+  自由回答、密码这些单行追问直接借用输入行，半截草稿先收起、问完放回。
+- **要独占终端的事先让位**：斜杠命令、`!` 命令执行期间输入区整个收起
+  （`LiveScreen.suspended`），做完再画回来。
 
 终端细节上踩实的几条（改动前先读）：
 
@@ -44,8 +47,16 @@ import threading
 import time
 from typing import Any, Callable, Iterator
 
+from prompt_toolkit.document import Document
+from prompt_toolkit.filters import Condition
 from prompt_toolkit.formatted_text import ANSI, to_formatted_text
-from prompt_toolkit.key_binding import KeyBindings, merge_key_bindings
+from prompt_toolkit.key_binding import (
+    ConditionalKeyBindings,
+    DynamicKeyBindings,
+    KeyBindings,
+    merge_key_bindings,
+)
+from prompt_toolkit.keys import Keys
 from prompt_toolkit.styles import Style
 from prompt_toolkit.utils import get_cwidth
 from rich.text import Text
@@ -566,6 +577,45 @@ class LiveScreen:
 # ---------------------------------------------------------------------------
 
 
+class _Panel:
+    """嵌在输入区里、等人拿主意的一件事。工作线程开、等；主线程画、收。
+
+    `menu`：按键与画面由菜单自己给，画在输入行上方，输入行只读。
+    `text`：借用输入行问一行字，`label` 顶替提示符；`stash` 是被收起的草稿。
+    """
+
+    def __init__(self, kind: str) -> None:
+        self.kind = kind
+        self.done = threading.Event()
+        self.result: Any = None
+        self.bindings: Any = None
+        self.fragments: Callable[[], Any] = list
+        self.label: list[tuple[str, str]] = []
+        self.default = ""
+        self.password = False
+        self.stash: Any = None
+        self.saved: dict[str, Any] = {}
+
+
+class _PanelHost:
+    """菜单宿主（`tui.MenuHost` 的三个口子）：菜单画进输入区，不另起应用。"""
+
+    def __init__(self, front: "LiveTui") -> None:
+        self.front = front
+
+    def run(self, bindings: Any, fragments: Callable[[], Any], height: int) -> Any:
+        panel = _Panel("menu")
+        panel.bindings, panel.fragments = bindings, fragments
+        result = self.front._show(panel)  # noqa: SLF001 - 同模块搭档
+        return None if result is _CANCELLED else result
+
+    def finish(self, result: Any) -> None:
+        self.front._resolve(result)  # noqa: SLF001
+
+    def above(self, action: Callable[[], None]) -> None:
+        action()  # 打印本来就落在输入区上方
+
+
 class LiveTui(Tui):
     """常驻输入区的交互前端。渲染层、按键、确认与提问都继承自 `Tui`。"""
 
@@ -585,6 +635,8 @@ class LiveTui(Tui):
         self._exit_code = 0
         #  底部那一行右侧的事实：分支与改动量、上下文用量。工作线程在回合之间刷新
         self._facts = {"git": "", "context": ""}
+        self._panel: _Panel | None = None  # 正画在输入区里的
+        self._asking: _Panel | None = None  # 工作线程正在等的（退出时要放它走）
         self.sink.activity = self._set_activity
         #  运行期的输入行就是输入区本身，不再往 spinner 下面画草稿
         self.sink.live_footer = None
@@ -608,7 +660,17 @@ class LiveTui(Tui):
         session.reserve_space_for_menu = 0
         app = session.app
         app.erase_when_done = True
-        bindings = merge_key_bindings([session.key_bindings, self._live_bindings()])
+        menu_open = Condition(lambda: self._panel is not None and self._panel.kind == "menu")
+        #  菜单挂着时输入行的键全部停用，只剩菜单自己的；排在后面的优先
+        bindings = merge_key_bindings(
+            [
+                ConditionalKeyBindings(
+                    merge_key_bindings([session.key_bindings, self._live_bindings()]), ~menu_open
+                ),
+                self._panel_bindings(menu_open),
+                DynamicKeyBindings(lambda: self._panel.bindings if menu_open() else None),
+            ]
+        )
         style = Style.from_dict(
             {**theme.ptk_style(), "bottom-toolbar": "noreverse", "bottom-toolbar.text": "noreverse"}
         )
@@ -624,6 +686,9 @@ class LiveTui(Tui):
             screen.install()
             writer.passthrough = False
             self._prime_prompt()
+            #  菜单挂着时草稿留在原处但改不动，光标收起
+            session.default_buffer.read_only = menu_open
+            app.layout.current_window.always_hide_cursor = menu_open
             session.default_buffer.on_completions_changed += self._on_completions
             self._worker.start()
 
@@ -643,6 +708,8 @@ class LiveTui(Tui):
             asyncio.run(main())
         finally:
             screen.stop()
+            if (asking := self._asking) is not None:
+                asking.done.set()  # 还在等人拿主意就退出了：按取消放行
             writer.passthrough = True
             sys.stdout = real
             if self._busy == "turn":
@@ -811,6 +878,12 @@ class LiveTui(Tui):
     # ---- 主线程：输入 ----
 
     def _hand_off(self, buffer: Any) -> None:
+        panel = self._panel
+        if panel is not None:
+            self._literal_submit = False
+            if panel.kind == "text":
+                self._resolve(buffer.text)  # 追问的回答原样交回，空的也算
+            return
         text = buffer.text.strip()
         literal, self._literal_submit = self._literal_submit, False
         if not text:
@@ -885,6 +958,9 @@ class LiveTui(Tui):
 
         def interrupt(event: Any) -> None:
             agent = self.agent
+            if self._panel is not None:
+                self._resolve(_CANCELLED)
+                return
             if self._busy == "turn" and agent is not None:
                 agent.interrupt()
                 return
@@ -929,23 +1005,113 @@ class LiveTui(Tui):
                 Text(f"  ⟲ {lines[0]}（发下一条消息时送达模型）", style="text.secondary")
             )
 
-    # ---- 要独占终端的交互：先让位，再走旧实现 ----
+    # ---- 等人拿主意的交互：嵌在输入区里 ----
+    #
+    #  确认、提问、密码的流程仍是 `Tui` 的（工作线程里同步地问、等、接着走），
+    #  这里只顶替它们落到终端的那两个口子：菜单宿主与单行追问。
 
-    def confirm(self, name: str, args: dict[str, Any]) -> Any:
-        with self._yield_terminal():
-            return super().confirm(name, args)
+    def _menu_host(self) -> Any:
+        return _PanelHost(self)
 
-    def ask(self, questions: list[dict[str, Any]]) -> dict[str, str]:
-        with self._yield_terminal():
-            return super().ask(questions)
+    def _free_text(self) -> Callable[[str], str | None]:
+        return lambda draft: self._ask_line(
+            [(theme.ptk("menu.title"), "  自由回答：")], default=draft
+        )
 
-    def secret_prompt(self, prompt: str, command: str) -> str | None:
-        with self._yield_terminal():
-            return super().secret_prompt(prompt, command)
+    def _confirm_prompt(self, message: Any, **kwargs: Any) -> str:
+        answer = self._ask_line(
+            list(message),
+            default=str(kwargs.get("default") or ""),
+            password=bool(kwargs.get("is_password")),
+        )
+        if answer is None:
+            raise EOFError
+        return answer
 
-    def _yield_terminal(self) -> "contextlib.AbstractContextManager[None]":
+    def _prompt_abandoned(self) -> None:
+        """追问借用的是输入行，放弃后它原地变回输入行，没有要收尾的半行。"""
+
+    def _ask_line(
+        self, label: list[tuple[str, str]], default: str = "", password: bool = False
+    ) -> str | None:
+        """借输入行问一行字；放弃（Esc / Ctrl-C / 输入区已不在）返回 None。"""
+        panel = _Panel("text")
+        panel.label, panel.default, panel.password = label, default, password
+        result = self._show(panel)
+        return None if result is _CANCELLED else result
+
+    def _show(self, panel: _Panel) -> Any:
+        """工作线程：把面板交给主线程画出来，等到有结果。"""
         screen = self._screen
-        return screen.suspended() if screen is not None else contextlib.nullcontext()
+        loop = screen._loop if screen is not None else None  # noqa: SLF001
+        if screen is None or loop is None or not screen.active:
+            return _CANCELLED
+        panel.result = _CANCELLED
+        self._asking = panel
+        try:
+            loop.call_soon_threadsafe(self._open, panel)
+            if not screen.active:  # 排上队之前输入区刚好收了
+                return _CANCELLED
+            panel.done.wait()
+        except RuntimeError:  # 事件循环已经关了（正在退出）
+            return _CANCELLED
+        finally:
+            self._asking = None
+        return panel.result
+
+    def _open(self, panel: _Panel) -> None:
+        session = self._session
+        if session is None or panel.done.is_set():
+            return
+        self._panel = panel
+        if panel.kind == "text":
+            buffer = session.default_buffer
+            panel.stash = buffer.document
+            #  追问的是规则、理由、密码：不要斜杠补全、幽灵建议与行首着色
+            for name in ("completer", "auto_suggest", "lexer"):
+                panel.saved[name] = getattr(session, name)
+                setattr(session, name, None)
+            session.is_password = panel.password
+            buffer.reset(Document(panel.default, len(panel.default)))
+        session.app.invalidate()
+
+    def _resolve(self, result: Any) -> None:
+        """主线程：面板有了结果，收起来，放工作线程走。"""
+        panel, session = self._panel, self._session
+        if panel is None:
+            return
+        self._panel = None
+        if panel.kind == "text" and session is not None:
+            for name, value in panel.saved.items():
+                setattr(session, name, value)
+            session.is_password = False
+            #  reset 连撤销栈一起清：密码不留在输入行的任何角落
+            session.default_buffer.reset(panel.stash or Document())
+        panel.result = result
+        panel.done.set()
+        if session is not None:
+            session.app.invalidate()
+
+    def _panel_bindings(self, menu_open: Any) -> KeyBindings:
+        """面板挂着时才生效的键。菜单：没被菜单认领的键一律吃掉（否则落进输入
+        行）；单行追问：Esc / 空行上的 Ctrl-D 放弃。"""
+        bindings = KeyBindings()
+        text_open = Condition(lambda: self._panel is not None and self._panel.kind == "text")
+        empty = Condition(lambda: self._session is None or not self._session.default_buffer.text)
+
+        def swallow(event: Any) -> None:
+            return None
+
+        def cancel(event: Any) -> None:
+            self._resolve(_CANCELLED)
+
+        for key in (Keys.Any, Keys.BracketedPaste, "c-d"):
+            bindings.add(key, filter=menu_open)(swallow)
+        bindings.add("<sigint>", filter=menu_open)(cancel)
+        #  Esc 立刻生效：不等「是不是某个组合键的开头」那一秒多
+        bindings.add("escape", filter=menu_open | text_open, eager=True)(cancel)
+        bindings.add("c-d", filter=text_open & empty)(cancel)
+        return bindings
 
     # ---- 主线程：画输入区 ----
 
@@ -972,7 +1138,12 @@ class LiveTui(Tui):
         rows: list[list[tuple[str, str]]] = []
         frame = _SPINNER[int(time.monotonic() * 10) % len(_SPINNER)]
         activity = self._activity
-        if activity is not None:
+        panel = self._panel
+        if panel is not None:
+            #  等人拿主意：不转圈；菜单就画在这儿，单行追问在下面顶替提示符
+            if panel.kind == "menu":
+                rows.append([*to_formatted_text(panel.fragments())])
+        elif activity is not None:
             with contextlib.suppress(Exception):
                 line = self._ansi(activity.__rich__()).split("\n")[0]
                 rows.append([(accent, f"{frame} "), *to_formatted_text(ANSI(line))])
@@ -991,13 +1162,21 @@ class LiveTui(Tui):
             for row in rows:
                 out.extend(row)
                 out.append(("", "\n"))
-            out.append(("", "\n"))
+            if panel is None:
+                out.append(("", "\n"))
         out.append((dim, "─" * cols + "\n"))
-        out.append((theme.ptk("prompt"), "› "))
+        if panel is not None and panel.kind == "text":
+            out.extend(panel.label)
+        else:
+            out.append((theme.ptk("prompt"), "› "))
         return out
 
     def _live_placeholder(self) -> list[tuple[str, str]]:
-        hint = "继续输入可以插话" if self._busy == "turn" else "输入消息，回车发送"
+        panel = self._panel
+        if panel is not None:
+            hint = "先在上面选一项" if panel.kind == "menu" else ""
+        else:
+            hint = "继续输入可以插话" if self._busy == "turn" else "输入消息，回车发送"
         return [(theme.ptk("text.secondary"), hint)]
 
     def _live_toolbar(self) -> list[tuple[str, str]]:
@@ -1013,11 +1192,16 @@ class LiveTui(Tui):
         agent = self.agent
         mode = modes.get(agent.mode if agent is not None else modes.DEFAULT)
         label = f"{mode.marker} {mode.label}".strip()
-        hints = " (shift+tab 切换)" + (
-            " · ctrl-c 打断 · enter 插话"
-            if self._busy == "turn"
-            else " · enter 发送 · ctrl-c ×2 退出"
-        )
+        panel = self._panel
+        if panel is not None:
+            #  菜单自带一行按键说明；单行追问只有这两个键
+            hints = "" if panel.kind == "menu" else " · enter 确认 · esc 取消"
+        else:
+            hints = " (shift+tab 切换)" + (
+                " · ctrl-c 打断 · enter 插话"
+                if self._busy == "turn"
+                else " · enter 发送 · ctrl-c ×2 退出"
+            )
         model = str(agent.config.model) if agent is not None else ""
         git, context = self._facts["git"], self._facts["context"]
         branch = git.split(" ")[0] if git else ""
@@ -1041,6 +1225,9 @@ class LiveTui(Tui):
             (theme.ptk(mode.style), label),
             (dim, f"{keys_shown}{' ' * max(1, gap)}{right} "),
         ]
+
+
+_CANCELLED: Any = object()  # 面板被放弃（与「回答了空串」「选了 None 值」区分开）
 
 
 def _elapsed(seconds: int) -> str:

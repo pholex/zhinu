@@ -849,11 +849,47 @@ def apply_theme(console: Console) -> None:
     setattr(console, _THEMED, True)
 
 
+class MenuHost:
+    """行内菜单住在哪儿、怎么收场。
+
+    菜单自己只管三样：按键、画什么、占几行；交给宿主去显示、等结果。默认宿主
+    为每个菜单起一个一次性的小应用，退出即擦除。常驻输入区前端换成自己的宿主，
+    把同一份按键与画面嵌进输入区里（`tui_live.LiveTui`）。
+    """
+
+    _application: Application | None = None
+
+    def run(self, bindings: KeyBindings, fragments: Callable[[], Any], height: int) -> Any:
+        window = Window(
+            FormattedTextControl(fragments, focusable=True, show_cursor=False),
+            height=height,
+            always_hide_cursor=True,
+        )
+        self._application = Application(
+            layout=Layout(window),
+            key_bindings=bindings,
+            full_screen=False,
+            erase_when_done=True,
+            style=Style.from_dict(theme.ptk_style()),
+        )
+        return self._application.run(handle_sigint=_owns_signals())
+
+    def finish(self, result: Any) -> None:
+        """菜单有了结果（None = 取消）。"""
+        assert self._application is not None
+        self._application.exit(result=result)
+
+    def above(self, action: Callable[[], None]) -> None:
+        """菜单挂着时往它上方打字（补打全文）。"""
+        run_in_terminal(action)
+
+
 def inline_select(
     title: str,
     options: list[tuple[Any, str, str]],
     amend: bool = True,
     expand: Callable[[], None] | None = None,
+    host: MenuHost | None = None,
 ) -> Any:
     """不进 alt-screen 的行内单选菜单（确认框与会话选择共用的通用件）。
 
@@ -869,6 +905,7 @@ def inline_select(
     取消返回 None。菜单退出即擦除（erase_when_done），决定由调用方回显
     一行定格进 scrollback。
     """
+    host = host or MenuHost()
     selected = 0
     expanded = False
 
@@ -881,16 +918,16 @@ def inline_select(
         selected = (selected + 1) % len(options)
 
     def _accept(event: Any) -> None:
-        event.app.exit(result=options[selected][0])
+        host.finish(options[selected][0])
 
     def _amend(event: Any) -> None:
         if amend:
-            event.app.exit(result=("amend", options[selected][0]))
+            host.finish(("amend", options[selected][0]))
         else:
-            event.app.exit(result=options[selected][0])
+            host.finish(options[selected][0])
 
     def _cancel(event: Any) -> None:
-        event.app.exit(result=None)
+        host.finish(None)
 
     def _expand(event: Any) -> None:
         #  一次性：全文已定格进 scrollback，再按只会重复倾倒同一坨
@@ -898,7 +935,7 @@ def inline_select(
         if expand is None or expanded:
             return
         expanded = True
-        run_in_terminal(expand)
+        host.above(expand)
 
     bindings = _register(
         {
@@ -917,7 +954,7 @@ def inline_select(
 
     def bind_choice(value: Any):
         def handler(event: Any) -> None:
-            event.app.exit(result=value)
+            host.finish(value)
 
         return handler
 
@@ -949,19 +986,7 @@ def inline_select(
         rows.append(("class:menu-hint", f"    {hint}"))
         return rows
 
-    window = Window(
-        FormattedTextControl(fragments, focusable=True, show_cursor=False),
-        height=len(options) + 2,
-        always_hide_cursor=True,
-    )
-    application: Application = Application(
-        layout=Layout(window),
-        key_bindings=bindings,
-        full_screen=False,
-        erase_when_done=True,
-        style=Style.from_dict(theme.ptk_style()),
-    )
-    return application.run(handle_sigint=_owns_signals())
+    return host.run(bindings, fragments, len(options) + 2)
 
 
 def search_select(
@@ -1084,6 +1109,7 @@ def question_select(
     checked: set[int] | None = None,
     selected: int = 0,
     cancel_index: int | None = None,
+    host: MenuHost | None = None,
 ) -> int | list[int] | None:
     """ask_user 的行内选择面板（inline 形态）。
 
@@ -1094,6 +1120,7 @@ def question_select(
     cancel_index 指向取消操作行，单选与多选下都立即取消，不作为答案提交。
     面板退出即擦除，答案由调用方回显一行定格进 scrollback（与确认框同一纪律）。
     """
+    host = host or MenuHost()
     marked: set[int] = set(checked or ())
     cursor = min(max(selected, 0), len(options) - 1)
 
@@ -1107,20 +1134,20 @@ def question_select(
 
     def _accept(event: Any) -> None:
         if cursor == cancel_index:
-            event.app.exit(result=None)
+            host.finish(None)
         elif multi:
-            event.app.exit(result=sorted(marked))
+            host.finish(sorted(marked))
         else:
-            event.app.exit(result=cursor)
+            host.finish(cursor)
 
     def _toggle(event: Any) -> None:
         if cursor == cancel_index:
-            event.app.exit(result=None)
+            host.finish(None)
         elif multi:
             marked.symmetric_difference_update({cursor})
 
     def _cancel(event: Any) -> None:
-        event.app.exit(result=None)
+        host.finish(None)
 
     bindings = _register(
         {
@@ -1142,11 +1169,11 @@ def question_select(
             nonlocal cursor
             cursor = index
             if index == cancel_index:
-                event.app.exit(result=None)
+                host.finish(None)
             elif multi:
                 marked.symmetric_difference_update({index})
             else:
-                event.app.exit(result=index)
+                host.finish(index)
 
         return handler
 
@@ -1175,22 +1202,15 @@ def question_select(
         return rows
 
     height = 2 + len(options) + sum(1 for _label, description in options if description)
-    window = Window(
-        FormattedTextControl(fragments, focusable=True, show_cursor=False),
-        height=height,
-        always_hide_cursor=True,
-    )
-    application: Application = Application(
-        layout=Layout(window),
-        key_bindings=bindings,
-        full_screen=False,
-        erase_when_done=True,
-        style=Style.from_dict(theme.ptk_style()),
-    )
-    return application.run(handle_sigint=_owns_signals())
+    return host.run(bindings, fragments, height)
 
 
-def ask_questions(questions: list[dict[str, Any]], console: Console) -> dict[str, str]:
+def ask_questions(
+    questions: list[dict[str, Any]],
+    console: Console,
+    host: MenuHost | None = None,
+    free_text: Callable[[str], str | None] | None = None,
+) -> dict[str, str]:
     """ask_user 工具的 TUI 侧交互：顺序逐题问，返回 {问题: 答案}。
 
     多题刻意**不做 Tab 分页**：行内面板 erase_when_done、一次一屏，
@@ -1201,6 +1221,9 @@ def ask_questions(questions: list[dict[str, Any]], console: Console) -> dict[str
     面板，已敲的草稿保留、下次进入预填。
     多选题勾了「其他」时，提交前先问自由输入，与勾选项合并成一个答案。
     面板上 Esc / Ctrl-C / 取消项 = 结束本轮并返回对话，已答部分交给工具层保留。
+
+    host / free_text 是前端的接缝：面板住在哪儿、自由输入那一行由谁来问
+    （草稿 → 文本，放弃返回 None）。不给就各起各的一次性输入。
     """
     answers: dict[str, str] = {}
     total = len(questions)
@@ -1209,6 +1232,9 @@ def ask_questions(questions: list[dict[str, Any]], console: Console) -> dict[str
     def prompt_other(draft: str) -> str | None:
         """自由输入一行；Esc/Ctrl-C/EOF → None（退回面板，草稿由调用方保留）。"""
         nonlocal session
+        if free_text is not None:
+            text = free_text(draft)
+            return None if text is None else text.strip()
         if session is None:
             session = PromptSession()
         try:
@@ -1243,7 +1269,7 @@ def ask_questions(questions: list[dict[str, Any]], console: Console) -> dict[str
             try:
                 result = question_select(
                     title, rows, multi=multi, checked=checked, selected=cursor,
-                    cancel_index=cancel_index,
+                    cancel_index=cancel_index, host=host,
                 )
             except Exception:  # noqa: BLE001 - 非常规终端起不了面板：退回文本问答，提问永远可用
                 from .cli import ask_one_text
@@ -2763,7 +2789,9 @@ class Tui:
         self.sink._stop_status()  # noqa: SLF001 - 同模块前端搭档
         attention.waiting(attention.WAITING_INPUT)
         try:
-            return ask_questions(questions, self.console)
+            return ask_questions(
+                questions, self.console, host=self._menu_host(), free_text=self._free_text()
+            )
         finally:
             attention.running()
             if self._poller is not None:
@@ -2787,14 +2815,12 @@ class Tui:
                     style="text.secondary",
                 )
             )
-            if self._confirm_session is None:
-                self._confirm_session = PromptSession()
             try:
                 return self._confirm_prompt(
                     [(theme.ptk("menu.title"), "  密码：")], is_password=True
                 )
             except (EOFError, KeyboardInterrupt):
-                print()
+                self._prompt_abandoned()
                 return None
         finally:
             attention.running()
@@ -2954,27 +2980,23 @@ class Tui:
     def _ask_rule(self, rule: str, empty_means: str = "仅本次允许") -> str | None:
         """「总是允许」/「以后都拒绝」的规则写入前可编辑（选项预填推导出的规则）。
         回车接受原文；置空 = 不写规则、只按本次的判定走；Esc/Ctrl-C = 取消。"""
-        if self._confirm_session is None:
-            self._confirm_session = PromptSession()
         try:
             return self._confirm_prompt(
                 [(theme.ptk("menu.title"), f"  规则（可编辑，置空 = {empty_means}）：")], default=rule
             )
         except (EOFError, KeyboardInterrupt):
-            print()
+            self._prompt_abandoned()
             return None
 
     def _ask_note(self) -> str:
         """Tab 附言：批准的同时给模型一句
         指示，随这次 tool result 回灌。空输入 = 不附言。"""
-        if self._confirm_session is None:
-            self._confirm_session = PromptSession()
         try:
             return self._confirm_prompt(
                 [(theme.ptk("menu.title"), "  附加指示（回车跳过）：")]
             ).strip()
         except (EOFError, KeyboardInterrupt):
-            print()
+            self._prompt_abandoned()
             return ""
 
     def _inline_select(
@@ -2984,18 +3006,28 @@ class Tui:
         expand: Callable[[], None] | None = None,
     ) -> Any:
         """确认框的行内单选：通用件 inline_select 的带附言（Tab）形态。"""
-        return inline_select(title, options, amend=True, expand=expand)
+        return inline_select(title, options, amend=True, expand=expand, host=self._menu_host())
+
+    def _menu_host(self) -> MenuHost | None:
+        """确认菜单与提问面板的宿主；None = 各起一个一次性的小应用。"""
+        return None
+
+    def _free_text(self) -> Callable[[str], str | None] | None:
+        """提问面板「其他」项的自由输入由谁来问；None = 面板自己起一行输入。"""
+        return None
+
+    def _prompt_abandoned(self) -> None:
+        """追问输入行被 Esc / Ctrl-C 放弃：光标还停在那一行上，换到下一行。"""
+        print()
 
     def _ask_reason(self) -> str:
         """拒绝之后追问一句"下一步怎么做"：拒绝即改指令，不让模型干猜。"""
-        if self._confirm_session is None:
-            self._confirm_session = PromptSession()
         try:
             return self._confirm_prompt(
                 [(theme.ptk("menu.title"), "  下一步该怎么做？（回车 = 仅拒绝）")]
             ).strip()
         except (EOFError, KeyboardInterrupt):
-            print()
+            self._prompt_abandoned()
             return ""
 
     def _echo_verdict(self, text: str) -> None:
@@ -3005,8 +3037,6 @@ class Tui:
         """菜单起不来时的回退：与 cli.make_confirm 相同的文本问答语义。"""
         from .cli import GRANT_SESSION, interpret_confirm_answer
 
-        if self._confirm_session is None:
-            self._confirm_session = PromptSession()
         escalation = bool(ui.escalation_notice(args)) if name == "bash" else False
         verb = "升权执行" if escalation else "执行"
         session_option = (
@@ -3023,7 +3053,7 @@ class Tui:
                 ]
             )
         except (EOFError, KeyboardInterrupt):
-            print()
+            self._prompt_abandoned()
             return False
 
         verdict = interpret_confirm_answer(answer)
