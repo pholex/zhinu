@@ -101,7 +101,7 @@ from rich.syntax import Syntax
 from rich.text import Text
 from rich.theme import Theme as RichTheme
 
-from . import attention, command_check, keys, media, modes, suggest, theme, ui
+from . import attention, command_check, keys, media, midturn, modes, suggest, theme, ui
 from .agent import Agent, _CancelledAnswers
 from .config import user_config_dir
 from .events import (
@@ -279,11 +279,33 @@ _IMAGE_REF_TAIL = re.compile(r"\[图片 #\d+[^\]]*\]$")
 #  但主题不是键位、进不了按键绑定表，在这里独立维护。保持短句。
 _EXTRA_TIPS = (
     "常用 auto 档？xiaoyu config --set XIAOYU_MODE=auto 设为个人默认",
+    "不用等它跑完：直接打字，Enter 送出插话，Esc 撤回",
 )
 
 #  轮播起点逐实例推进：单次运行的展示窗口（_QUIET→_LONG）只够放三四条，
 #  恒从表头开始的话表尾的提示永远轮不到——12+ 条里只有前 4 条见过天日
 _TIP_START = itertools.count()
+
+
+#  bracketed paste 开关：逐键模式下让终端把整段粘贴包起来交付
+_PASTE_ON = "\x1b[?2004h"
+_PASTE_OFF = "\x1b[?2004l"
+
+
+def _tail_fit(text: str, cells: int) -> str:
+    """只留末尾 cells 个显示宽度（草稿要看的是刚敲的那一截），截过就以 … 开头。"""
+    from rich.cells import cell_len
+
+    if cell_len(text) <= cells:
+        return text
+    kept: list[str] = []
+    used = 1  # … 占一格
+    for ch in reversed(text):
+        used += cell_len(ch)
+        if used > cells:
+            break
+        kept.append(ch)
+    return "…" + "".join(reversed(kept))
 
 
 class _RunningLine:
@@ -307,10 +329,18 @@ class _RunningLine:
     _CYCLE = 8.0  # 每条提示停留多久
     _LONG = 30.0  # 这之后换成耗时/上限
 
-    def __init__(self, name: str, timeout: int | None = None, verb: str = "运行中") -> None:
+    def __init__(
+        self,
+        name: str,
+        timeout: int | None = None,
+        verb: str = "运行中",
+        footer: Callable[[], list[Text]] | None = None,
+    ) -> None:
         self.name = name
         self.timeout = timeout
         self.verb = verb
+        #  活区页脚（运行期输入行：草稿与待送达的插话），每帧现取
+        self.footer = footer
         #  见 _TIP_START：跨运行把整张提示表轮完，而不是每次都从头四条开始
         self._tip_start = next(_TIP_START)
         self.started = time.monotonic()
@@ -321,10 +351,17 @@ class _RunningLine:
     def __rich__(self) -> Text:
         elapsed = time.monotonic() - self.started
         suffix = self.progress or self._suffix(elapsed)
-        return Text(
+        head = Text(
             f"{self.name} {self.verb} · {elapsed:.0f}s · {suffix}",
             style="text.secondary",
         )
+        if self.footer is None:
+            return head
+        try:
+            extra = self.footer()
+        except Exception:  # noqa: BLE001 - 刷新线程里抛出去，整个活区就不再刷新了
+            extra = []
+        return Text("\n").join([head, *extra]) if extra else head
 
     def _suffix(self, elapsed: float) -> str:
         if elapsed >= self._LONG:
@@ -1329,6 +1366,8 @@ class RichSink:
         #  安全点回调（Tui 接线）：每个事件处理完、且没有半截正文悬在行上时调一次，
         #  运行中的本地命令借它把输出插进事件之间。子 agent 的静默 sink 不接
         self.on_safe_point: Callable[[], None] | None = None
+        #  活区页脚来源（Tui 接线）：运行期输入行画在 spinner 下面
+        self.live_footer: Callable[[], list[Text]] | None = None
 
     def emit(self, event: UIEvent) -> None:
         handler = self._handlers.get(type(event))
@@ -1406,7 +1445,8 @@ class RichSink:
             return
         self._stop_status()
         self._status = self.console.status(
-            _RunningLine(event.model, self.request_timeout, verb="思考中"), spinner="dots"
+            _RunningLine(event.model, self.request_timeout, verb="思考中", footer=self.live_footer),
+            spinner="dots",
         )
         with contextlib.suppress(Exception):
             self._status.start()
@@ -1429,7 +1469,7 @@ class RichSink:
             #  字面量「133;B133;C」打在屏幕上
             self._close_text()
             self._preparing_index = event.index
-            self._running_line = _RunningLine(event.name, verb="生成参数中")
+            self._running_line = _RunningLine(event.name, verb="生成参数中", footer=self.live_footer)
             self._status = self.console.status(self._running_line, spinner="dots")
             with contextlib.suppress(Exception):
                 self._status.start()
@@ -1529,7 +1569,7 @@ class RichSink:
         if not self.verbose or not self.console.is_terminal:
             return
         self._stop_status()
-        line = _RunningLine(event.name, self._timeout_for(event))
+        line = _RunningLine(event.name, self._timeout_for(event), footer=self.live_footer)
         self._running_line = line
         self._status = self.console.status(line, spinner="dots")
         with contextlib.suppress(Exception):
@@ -1807,34 +1847,49 @@ class SlashCompleter(Completer):
 
 
 class SteerPoller:
-    """模型作答期间的后台 stdin 行读取：整行（按过回车）→ `agent.steer()`。
+    """模型作答期间的后台输入读取：一行草稿，回车 → `agent.steer()`。
 
     小羽全同步，`agent.send()` 期间主线程被占住，没有任何输入循环在跑——
     这个小线程补上"运行中还能说话"的通道（配 pause/resume 纪律）。要点：
 
-    - 终端处于规范模式：select 只在**整行完成**（用户按了回车）时可读，
-      半截输入留在内核行缓冲，既不会被这里偷走，也照常出现在下一轮 prompt；
+    - **逐键模式**（`raw=True`，真终端上用）：终端切到 cbreak、关掉回显，按键
+      逐个到达，交给 `midturn.Draft` 维护一行草稿；草稿不由终端回显，而是画在
+      活区里（Tui._live_footer）——回显落在哪由程序定，不再和正文、spinner 抢
+      同一处。Ctrl-C 仍是信号（cbreak 保留 ISIG），中断路径不变；
+    - **整行模式**（`raw=False`）：终端留在规范模式，整行（按过回车）才可读，
+      回显归终端。输出不是终端时没有活区可画草稿，退回这条老路；解析走同一个
+      `Draft`，两种模式只差"字节怎么到达"；
     - **审批确认框期间必须 pause()**——确认菜单是 prompt_toolkit Application
-      在主线程接管终端，这里不停手就会吃掉用户的选择按键；
-    - 线程自己不打印任何东西（rich Live 归主线程独占）：确认反馈由
-      steer.accepted 事件在消费点（agent 线程=主线程）打出，敲字时的即时
-      回显本来就有 tty echo；
+      在主线程接管终端，这里不停手就会吃掉用户的选择按键。pause 同时把终端
+      模式还回去（确认框、密码输入各有各的模式要求），resume 再切回来；
+    - 线程自己不打印任何东西（rich Live 归主线程独占）：草稿与待送达的插话由
+      活区的刷新线程每帧读走，接纳确认由 steer.accepted 事件在消费点打出；
     - 斜杠命令不交给模型：`/usage` 是对程序说的话，送进历史只会让模型去猜
       用户想干什么。命令形状的单行（判定走 keys.classify_input，与输入行同一张
       表）改进 `commands` 队列，由主线程在安全点取走（Tui._run_midturn_commands）；
       线程自己照旧不执行、不打印；
-    - 多行粘贴合并成一条：规范模式逐行交付，窗口内连着到达的行并成整段；
+    - 多行粘贴是一条：bracketed paste 整段进草稿；终端没透传时，连着到达的
+      多行靠"回车后面紧跟数据就是换行"并成一段（见 midturn 模块注释）；
+    - Esc：有草稿就清空，没有就撤回最后一条还没被接纳的插话、放回草稿；
     - Windows 没有 select-on-stdin：整个 poller 禁用，保留旧的"收尾预填"路径。
     """
 
     _POLL = 0.1
-    #  粘贴合并窗口：读到一行后这么久内还有数据，就并进同一条插话
+    #  歧义判定窗口：回车 / ESC 之后这么久内还有数据，就不是提交 / Esc 键
     _PASTE_WINDOW = 0.05
+    #  逐键模式下收到这些信号要先把终端模式还回去：进程死在 cbreak 里，
+    #  用户拿回的是一个不回显的 shell
+    _FATAL_SIGNALS = ("SIGTERM", "SIGHUP")
 
-    def __init__(self, agent: Agent) -> None:
+    def __init__(self, agent: Agent, raw: bool = False) -> None:
         self.agent = agent
         #  运行中敲的斜杠命令：本线程只入队，主线程取走（deque 的两端操作原子）
         self.commands: collections.deque[str] = collections.deque()
+        self.draft = midturn.Draft()
+        self.raw = raw and self.supported()
+        #  进逐键模式前的终端属性；None = 当前不在逐键模式
+        self._saved_mode: list[Any] | None = None
+        self._saved_handlers: dict[int, Any] = {}
         self._stop = threading.Event()
         self._paused = threading.Event()
         self._thread: threading.Thread | None = None
@@ -1853,6 +1908,8 @@ class SteerPoller:
     def start(self) -> None:
         if not self.supported() or self._thread is not None:
             return
+        self._enter_raw()
+        self._install_signal_handlers()
         self._thread = threading.Thread(target=self._loop, daemon=True, name="steer-poller")
         self._thread.start()
 
@@ -1862,12 +1919,96 @@ class SteerPoller:
         self._stop.set()
         self._thread.join(timeout=1.0)
         self._thread = None
+        self._restore_signal_handlers()
+        self._leave_raw()
+        #  线程停在歧义窗口里（刚按下回车）：按"后面没有东西"收尾，那句话照常
+        #  入队，由轮末的回收路径预填回输入行
+        self._apply(self.draft.settle())
 
     def pause(self) -> None:
         self._paused.set()
+        self._leave_raw()
 
     def resume(self) -> None:
+        self._enter_raw()
         self._paused.clear()
+
+    #  ---------- 终端模式（只在主线程调用） ----------
+
+    def _enter_raw(self) -> None:
+        if not self.raw or self._saved_mode is not None:
+            return
+        try:
+            import termios
+            import tty
+
+            fd = sys.stdin.fileno()
+            saved = termios.tcgetattr(fd)
+            #  TCSANOW：默认的 TCSAFLUSH 会丢掉切换前已经敲进缓冲的按键
+            tty.setcbreak(fd, termios.TCSANOW)
+        except Exception:  # noqa: BLE001 - 切不过去就退回整行模式，绝不能拦住这一轮
+            self.raw = False
+            return
+        self._saved_mode = saved
+        self._terminal_write(_PASTE_ON)
+
+    def _leave_raw(self) -> None:
+        saved, self._saved_mode = self._saved_mode, None
+        if saved is None:
+            return
+        self._terminal_write(_PASTE_OFF)
+        with contextlib.suppress(Exception):
+            import termios
+
+            termios.tcsetattr(sys.stdin.fileno(), termios.TCSANOW, saved)
+
+    @staticmethod
+    def _terminal_write(sequence: str) -> None:
+        """模式开关直写终端 fd：活区在转时 sys.stdout 是 rich 的代理，会把转义
+        序列当正文处理。"""
+        with contextlib.suppress(Exception):
+            os.write(sys.__stdout__.fileno(), sequence.encode())
+
+    def _install_signal_handlers(self) -> None:
+        if not self.raw or threading.current_thread() is not threading.main_thread():
+            return
+        import signal
+
+        def fatal(signum: int, _frame: Any) -> None:
+            self._leave_raw()
+            signal.signal(signum, self._saved_handlers.get(signum, signal.SIG_DFL))
+            os.kill(os.getpid(), signum)
+
+        def resumed(_signum: int, _frame: Any) -> None:
+            #  Ctrl-Z 再 fg：shell 接手期间把终端模式改回了它自己的，回来得重新切
+            #  （还回去的目标仍是最初存下的那份，不是 shell 留下的）
+            if self._saved_mode is None:
+                return
+            with contextlib.suppress(Exception):
+                import termios
+                import tty
+
+                tty.setcbreak(sys.stdin.fileno(), termios.TCSANOW)
+            self._terminal_write(_PASTE_ON)
+
+        handlers = {name: fatal for name in self._FATAL_SIGNALS}
+        handlers["SIGCONT"] = resumed
+        for name, handler in handlers.items():
+            signum = getattr(signal, name, None)
+            if signum is None:
+                continue
+            with contextlib.suppress(Exception):
+                self._saved_handlers[signum] = signal.signal(signum, handler)
+
+    def _restore_signal_handlers(self) -> None:
+        import signal
+
+        while self._saved_handlers:
+            signum, previous = self._saved_handlers.popitem()
+            with contextlib.suppress(Exception):
+                signal.signal(signum, previous)
+
+    #  ---------- 读线程 ----------
 
     def _loop(self) -> None:
         import select
@@ -1877,60 +2018,51 @@ class SteerPoller:
             if self._paused.is_set():
                 time.sleep(self._POLL)
                 continue
+            timeout = self._PASTE_WINDOW if self.draft.unsettled else self._POLL
             try:
-                readable, _, _ = select.select([fd], [], [], self._POLL)
-                if not readable or self._paused.is_set() or self._stop.is_set():
+                readable, _, _ = select.select([fd], [], [], timeout)
+                if self._paused.is_set() or self._stop.is_set():
                     #  select 返回后再查一次 pause/stop：确认框刚接管终端时
-                    #  宁可把这行留给它，也不能抢读
+                    #  宁可把按键留给它，也不能抢读
+                    continue
+                if not readable:
+                    #  静下来了：行尾的回车算提交，单独的 ESC 算 Esc 键
+                    self._apply(self.draft.settle())
                     continue
                 data = os.read(fd, 4096)
             except Exception:  # noqa: BLE001 - 读不动就收工，绝不能拖垮主循环
                 return
             if not data:
+                self._apply(self.draft.settle())
                 return
-            data, eof = self._gather_burst(fd, data)
-            self._deliver(data)
-            if eof:
-                return
+            self._apply(self.draft.feed(data))
 
-    def _gather_burst(self, fd: int, data: bytes) -> tuple[bytes, bool]:
-        """读到一行后，窗口内还有数据就接着读，返回 (合并后的字节, 是否已 EOF)。
+    def _apply(self, actions: list[midturn.Action]) -> None:
+        for kind, text in actions:
+            if kind == "submit":
+                self._submit(text)
+            elif kind == "retract":
+                self._retract()
 
-        规范模式下每次 read 最多交出一行：粘贴 N 行会连着到达，逐次 steer 就成了
-        N 条插话。人手敲完一行再敲下一行远慢于窗口，正常交互只多等这一个窗口。
-        窗口期间被 pause/stop 就停手，已读到的照常交付。
-        """
-        import select
-
-        while not self._paused.is_set() and not self._stop.is_set():
-            try:
-                readable, _, _ = select.select([fd], [], [], self._PASTE_WINDOW)
-                if not readable:
-                    return data, False
-                more = os.read(fd, 4096)
-            except Exception:  # noqa: BLE001 - 读不动就交付已有的并收工
-                return data, True
-            if not more:
-                return data, True
-            data += more
-        return data, False
-
-    def _deliver(self, data: bytes) -> None:
-        """整段作为**一条**插话：保留内部换行（含空行），只去首尾空行。"""
-        text = data.decode("utf-8", errors="replace")
-        lines = text.replace("\r\n", "\n").replace("\r", "\n").split("\n")
-        while lines and not lines[0].strip():
-            lines.pop(0)
-        while lines and not lines[-1].strip():
-            lines.pop()
-        if not lines:
-            return
-        text = "\n".join(lines)
+    def _submit(self, text: str) -> None:
         #  只认单行：多行粘贴即使以 / 开头也是给模型看的正文
-        if len(lines) == 1 and keys.classify_input(text).kind == "slash":
+        if "\n" not in text and keys.classify_input(text).kind == "slash":
             self.commands.append(text.strip())
             return
         self.agent.steer(text)
+
+    def _retract(self) -> None:
+        """撤回最后一条还没生效的输入，放回草稿接着改。已被接纳的撤不回。"""
+        if self.commands:
+            with contextlib.suppress(IndexError):
+                self.draft.text = self.commands.pop()
+            return
+        pending = self.agent.pending_steers()
+        if not pending:
+            return
+        text = self.agent.retract_steer(pending[-1][0])
+        if text:
+            self.draft.text = text
 
 
 class Tui:
@@ -1978,6 +2110,7 @@ class Tui:
         #  运行中敲下、要等本轮结束才能跑的斜杠命令：轮末预填回输入行
         self._held_commands: list[str] = []
         self.sink.on_safe_point = self._run_midturn_commands
+        self.sink.live_footer = self._live_footer
         #  "切进 auto 但沙箱不可用"只提醒一次，别每次按键都刷一行
         self._warned_no_sandbox = False
         #  轮末「接着问」（见 suggest.py）：本轮的几条建议 + 正挂着的 prompt app
@@ -2407,6 +2540,36 @@ class Tui:
             fragments.append((theme.ptk(mode.style), f"{mode.marker} {mode.label} "))
         fragments.append((theme.ptk("prompt"), "› "))
         return fragments
+
+    def _live_footer(self) -> list[Text]:
+        """活区页脚：待执行的命令、待送达的插话、正在敲的草稿。
+
+        由 rich 的刷新线程每帧调用——只读，不改任何状态。每项压成一行：
+        活区越高，重绘时闪动越明显。
+        """
+        poller = self._poller
+        if poller is None:
+            return []
+        width = max(20, self.console.width - 6)
+        waiting = [f"待执行：{line}" for line in list(poller.commands)]
+        waiting += [f"待送达：{text}" for _, text in poller.agent.pending_steers()]
+        lines: list[Text] = []
+        if len(waiting) > 2:
+            lines.append(Text(f"↳ 还有 {len(waiting) - 2} 条在前面排着", style="text.secondary"))
+        for item in waiting[-2:]:
+            shown = ui.preview(item.replace("\n", " ⏎ "), width)
+            lines.append(Text(f"↳ {shown}", style="text.secondary"))
+        if not poller.raw:
+            return lines
+        if draft := poller.draft.text:
+            hint = "  Enter 送出 · Esc 清空"
+            shown = _tail_fit(draft.replace("\n", " ⏎ "), max(8, width - len(hint) * 2))
+            lines.append(
+                Text.assemble(("› ", "text.accent"), (shown, ""), ("▏", ""), (hint, "text.secondary"))
+            )
+        elif waiting:
+            lines.append(Text("  Esc 撤回最后一条", style="text.secondary"))
+        return lines
 
     def _run_midturn_commands(self) -> None:
         """取走运行期输入通道接住的斜杠命令：能当场跑的跑掉，其余记下留到轮末。
@@ -3087,7 +3250,9 @@ class Tui:
             attention.running()
             #  运行期插话（steer）：整行回车即在 step 边界进入本轮。
             #  poller 起不来（Windows/非 tty）时自动退回旧的"收尾预填"体验
-            self._poller = SteerPoller(agent)
+            #  真终端上逐键读、草稿画进活区；输出不是终端就没有活区，留在整行模式
+            self._poller = SteerPoller(agent, raw=self.console.is_terminal)
+            unsent = ""
             try:
                 with NoticeCapture(self.sink):
                     self._poller.start()
@@ -3109,6 +3274,8 @@ class Tui:
                 self._poller.stop()
                 #  一直没等到安全点的命令（比如整轮只有一段长正文）在这里补跑
                 self._run_midturn_commands()
+                #  敲了一半没按回车的草稿：和没赶上的插话一起预填回输入行
+                unsent = self._poller.draft.take()
                 self._poller = None
             #  still-running 状态行：inline 架构没有常驻状态栏，
             #  轮次结束打一行即走，与明文 REPL 同一份文案（cli.background_status）
@@ -3128,7 +3295,7 @@ class Tui:
             leftover = agent.drain_steers()
             typed = self._drain_typeahead()
             held, self._held_commands = self._held_commands, []
-            queued = "\n".join(part for part in [*leftover, *held, typed] if part).strip()
+            queued = "\n".join(part for part in [*leftover, *held, unsent, typed] if part).strip()
             if queued:
                 self.console.print(
                     Text("  （已接住你刚才输入的内容，确认后回车发送）", style="text.secondary")

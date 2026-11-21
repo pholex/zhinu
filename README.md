@@ -102,7 +102,9 @@ xiaoyu term install                     # 把终端集成与 Tab 补全写进 ~/
 
 REPL 里：`/help` `/tools` `/skills` `/model` `/search` `/effort` `/mode` `/usage` `/context` `/compact` `/copy` `/export` `/clear` `/exit` `/tasks` `/plan` `/goal` `/perm` `/allow` `/deny` `/resume` `/rewind` `/mcp` `/quit`
 
-模型作答期间敲的整行是插话，在下一个步骤边界送给模型；斜杠命令不送给模型：
+模型作答期间可以直接打字：草稿显示在转圈那一行下面，`Enter` 送出插话（在下一个步骤边界
+送给模型），`Esc` 清空草稿、草稿为空时撤回最后一条还没送达的；没按回车的草稿在本轮结束后
+预填回输入行。正文流式输出的那几秒没有地方画草稿，按键照收、稍后显示。斜杠命令不送给模型：
 `/help` `/keys` `/tools` `/tasks` `/usage` `/context` `/perm` 这几条只读的在下一个输出间隙（工具跑完、一段正文收尾）执行，
 其余留到本轮结束、预填回输入行等你确认（TUI，macOS / Linux）。
 

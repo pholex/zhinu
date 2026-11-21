@@ -332,14 +332,15 @@ class PollerTest(unittest.TestCase):
 
 
 class DeliverRoutingTest(unittest.TestCase):
-    """_deliver 的分流：只有命令形状的单行进命令队列。"""
+    """提交后的分流：只有命令形状的单行进命令队列。"""
 
     def _deliver(self, data: str):
         from xiaoyu import tui
 
         target = _FakeSteerTarget()
         poller = tui.SteerPoller(target)  # type: ignore[arg-type]
-        poller._deliver(data.encode())
+        poller._apply(poller.draft.feed(data.encode()))
+        poller._apply(poller.draft.settle())
         return target.lines, list(poller.commands)
 
     def test_command_with_arguments(self):
@@ -352,6 +353,147 @@ class DeliverRoutingTest(unittest.TestCase):
     def test_multiline_paste_goes_to_the_model(self):
         lines, commands = self._deliver("/usage\n第二行\n")
         self.assertEqual((lines, commands), (["/usage\n第二行"], []))
+
+
+class _QueueTarget:
+    """带待送达队列的插话收集器：撤回要用到 pending_steers / retract_steer。"""
+
+    def __init__(self) -> None:
+        self.queue: list[tuple[str, str]] = []
+
+    def steer(self, text: str) -> None:
+        self.queue.append((f"id{len(self.queue)}", text))
+
+    def pending_steers(self) -> tuple[tuple[str, str], ...]:
+        return tuple(self.queue)
+
+    def retract_steer(self, ident: str) -> str | None:
+        for index, (key, text) in enumerate(self.queue):
+            if key == ident:
+                del self.queue[index]
+                return text
+        return None
+
+
+class RetractTest(unittest.TestCase):
+    """Esc：有草稿清草稿，没草稿就撤回最后一条还没生效的输入。"""
+
+    def setUp(self) -> None:
+        from xiaoyu import tui
+
+        self.target = _QueueTarget()
+        self.poller = tui.SteerPoller(self.target)  # type: ignore[arg-type]
+
+    def _type(self, data: str) -> None:
+        self.poller._apply(self.poller.draft.feed(data.encode()))
+        self.poller._apply(self.poller.draft.settle())
+
+    def test_escape_pulls_the_last_pending_steer_back_into_the_draft(self):
+        self._type("第一条\r")
+        self._type("第二条\r")
+        self._type("\x1b")
+        self.assertEqual(self.poller.draft.text, "第二条")
+        self.assertEqual([text for _, text in self.target.queue], ["第一条"])
+
+    def test_escape_with_a_draft_only_clears_it(self):
+        self._type("已送出\r")
+        self._type("写了一半\x1b")
+        self.assertEqual(self.poller.draft.text, "")
+        self.assertEqual(len(self.target.queue), 1, "有草稿时 Esc 不该动已送出的")
+
+    def test_escape_pulls_back_a_queued_command_first(self):
+        self._type("补充一句\r")
+        self._type("/clear\r")
+        self._type("\x1b")
+        self.assertEqual(self.poller.draft.text, "/clear")
+        self.assertFalse(self.poller.commands)
+        self.assertEqual(len(self.target.queue), 1)
+
+    def test_escape_with_nothing_pending_is_a_no_op(self):
+        self._type("\x1b")
+        self.assertEqual(self.poller.draft.text, "")
+
+
+@unittest.skipUnless(os.name == "posix", "逐键模式仅 posix（termios）")
+class RawModeTest(unittest.TestCase):
+    """pty 实测：逐键模式关回显、逐键可读，pause / stop 把终端模式还回去。"""
+
+    def setUp(self) -> None:
+        import pty
+        import termios
+
+        from xiaoyu import tui
+
+        self.termios = termios
+        self.master, self.slave = pty.openpty()
+        fake_stdin = os.fdopen(self.slave, "rb", buffering=0, closefd=False)
+        patcher = mock.patch.object(tui.sys, "stdin", fake_stdin)
+        patcher.start()
+        #  模式开关序列写的是真终端 fd：测试里拦下来，别往跑测试的终端上写
+        self.written: list[str] = []
+        writer = mock.patch.object(
+            tui.SteerPoller, "_terminal_write", staticmethod(self.written.append)
+        )
+        writer.start()
+        self.target = _QueueTarget()
+        self.poller = tui.SteerPoller(self.target, raw=True)  # type: ignore[arg-type]
+
+        def cleanup() -> None:
+            self.poller.stop()
+            writer.stop()
+            patcher.stop()
+            fake_stdin.close()
+            os.close(self.slave)
+            os.close(self.master)
+
+        self.addCleanup(cleanup)
+
+    def _lflag(self) -> int:
+        #  只比我们动过的三位：内核自己会在 lflag 里置状态位（macOS 切回规范模式时
+        #  的 PENDIN），整字相等会把那个也算成"没还原"
+        mask = self.termios.ICANON | self.termios.ECHO | self.termios.ISIG
+        return self.termios.tcgetattr(self.slave)[3] & mask
+
+    def _wait(self, condition, timeout: float = 5.0) -> None:
+        deadline = time.monotonic() + timeout
+        while not condition() and time.monotonic() < deadline:
+            time.sleep(0.01)
+
+    def test_keys_arrive_without_enter_and_mode_is_restored(self):
+        from xiaoyu import tui
+
+        before = self._lflag()
+        self.assertTrue(before & self.termios.ICANON, "前提：pty 起始在规范模式")
+        self.poller.start()
+        self.assertTrue(self.poller.raw)
+        self.assertFalse(self._lflag() & (self.termios.ICANON | self.termios.ECHO))
+        self.assertTrue(self._lflag() & self.termios.ISIG, "Ctrl-C 必须仍是信号")
+        self.assertEqual(self.written, [tui._PASTE_ON])
+
+        os.write(self.master, "半句".encode())
+        self._wait(lambda: self.poller.draft.text == "半句")
+        self.assertEqual(self.poller.draft.text, "半句", "没按回车的按键也该进草稿")
+        self.assertEqual(self.target.queue, [])
+
+        os.write(self.master, b"\r")
+        self._wait(lambda: self.target.queue)
+        self.assertEqual([text for _, text in self.target.queue], ["半句"])
+
+        self.poller.pause()
+        self.assertEqual(self._lflag(), before, "确认框接管前要把终端模式还回去")
+        self.poller.resume()
+        self.assertFalse(self._lflag() & self.termios.ICANON)
+        self.poller.stop()
+        self.assertEqual(self._lflag(), before)
+        self.assertEqual(self.written[-1], tui._PASTE_OFF)
+
+    def test_stop_keeps_the_unsent_draft_for_the_input_line(self):
+        self.poller.start()
+        os.write(self.master, "没发完".encode())
+        self._wait(lambda: self.poller.draft.text == "没发完")
+        self.poller.stop()
+        self.assertEqual(self.poller.draft.take(), "没发完")
+        self.assertEqual(self.target.queue, [])
 
 
 class MidturnCommandTest(unittest.TestCase):
@@ -413,6 +555,47 @@ class MidturnCommandTest(unittest.TestCase):
         worker.start()
         worker.join()
         self.assertEqual(list(self.commands), ["/usage"])
+
+    def test_footer_shows_waiting_items_and_the_draft(self):
+        from types import SimpleNamespace
+
+        from xiaoyu import midturn
+
+        draft = midturn.Draft()
+        agent = SimpleNamespace(pending_steers=lambda: (("id0", "先跑测试\n再提交"),))
+        self.tui._poller = SimpleNamespace(
+            commands=self.commands, agent=agent, draft=draft, raw=True
+        )
+        self.commands.append("/usage")
+        lines = [line.plain for line in self.tui._live_footer()]
+        self.assertEqual(lines[0], "↳ 待执行：/usage")
+        self.assertEqual(lines[1], "↳ 待送达：先跑测试 ⏎ 再提交")
+        self.assertIn("Esc 撤回", lines[2])
+
+        draft.text = "正在敲"
+        lines = [line.plain for line in self.tui._live_footer()]
+        self.assertTrue(lines[-1].startswith("› 正在敲▏"), lines[-1])
+
+        #  整行模式：回显归终端，页脚不再画一遍草稿
+        self.tui._poller.raw = False
+        self.assertEqual(len(self.tui._live_footer()), 2)
+
+    def test_footer_keeps_the_tail_of_a_long_draft_on_one_line(self):
+        from types import SimpleNamespace
+
+        from rich.cells import cell_len
+
+        from xiaoyu import midturn
+
+        draft = midturn.Draft()
+        draft.text = "很长的一句话" * 60 + "结尾"
+        self.tui._poller = SimpleNamespace(
+            commands=self.commands, agent=SimpleNamespace(pending_steers=tuple), draft=draft, raw=True
+        )
+        (line,) = self.tui._live_footer()
+        self.assertLessEqual(cell_len(line.plain), self.tui.console.width - 2)
+        self.assertIn("…", line.plain)
+        self.assertIn("结尾▏", line.plain)
 
     def test_every_midturn_command_is_a_registered_command(self):
         from xiaoyu.cli import MIDTURN_COMMANDS, SLASH_COMMANDS
