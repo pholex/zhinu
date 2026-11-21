@@ -833,17 +833,20 @@ class LiveTui(Tui):
         """输入行不留在原地了，把这一行补打到上方，scrollback 里才有「我说了什么」。
 
         回头翻记录时最先要找的就是「我在哪儿问的」：上方空一行把它和前面的输出
-        隔开；对模型说的话整行加粗、提示符用强调色，命令（/、!、#）是对程序
-        说的，保持原样不抢眼。续行缩进对齐到提示符之后。
+        隔开；对模型说的话行首立一条强调色竖线、正文加粗（多行就每行一条，连成
+        一道边），命令（/、!、#）是对程序说的，保持原样不抢眼。
         """
         writer = self._writer
         if writer is not None and not writer.ends_blank:
             print()
         said = keys.classify_input(text, literal=literal).kind == "send"
-        body = text.replace("\n", "\n  ")
         if said:
-            self.console.print(Text.assemble(("› ", "text.accent bold"), (body, "bold")))
+            rows = [
+                Text.assemble(("▌ ", "text.accent"), (row, "bold")) for row in text.split("\n")
+            ]
+            self.console.print(Text("\n").join(rows))
         else:
+            body = text.replace("\n", "\n  ")
             self.console.print(Text.assemble(("› ", "prompt"), (body, "")))
 
     def _above(self, action: Callable[[], None]) -> None:
