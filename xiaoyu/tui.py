@@ -765,6 +765,15 @@ class DedupedHistory(FileHistory):
         super().append_string(string)
 
 
+def _owns_signals() -> bool:
+    """当前线程能不能装信号处理器（只有主线程能）。
+
+    常驻输入区前端（tui_live）把主线程留给输入区，确认菜单与追问输入行改在
+    工作线程里跑；那里让 prompt_toolkit 接管 SIGINT 会直接抛错。
+    """
+    return threading.current_thread() is threading.main_thread()
+
+
 def _register(handlers: dict[str, Any], *categories: str) -> KeyBindings:
     """按绑定表注册一组按键。
 
@@ -952,7 +961,7 @@ def inline_select(
         erase_when_done=True,
         style=Style.from_dict(theme.ptk_style()),
     )
-    return application.run()
+    return application.run(handle_sigint=_owns_signals())
 
 
 def search_select(
@@ -1059,7 +1068,7 @@ def search_select(
         erase_when_done=True,
         style=Style.from_dict(theme.ptk_style()),
     )
-    return application.run()
+    return application.run(handle_sigint=_owns_signals())
 
 
 #  提问面板自动附加的自由输入项（模型不许自己造「其他」，
@@ -1178,7 +1187,7 @@ def question_select(
         erase_when_done=True,
         style=Style.from_dict(theme.ptk_style()),
     )
-    return application.run()
+    return application.run(handle_sigint=_owns_signals())
 
 
 def ask_questions(questions: list[dict[str, Any]], console: Console) -> dict[str, str]:
@@ -1204,7 +1213,9 @@ def ask_questions(questions: list[dict[str, Any]], console: Console) -> dict[str
             session = PromptSession()
         try:
             return session.prompt(
-                [(theme.ptk("menu.title"), "  自由回答：")], default=draft
+                [(theme.ptk("menu.title"), "  自由回答：")],
+                default=draft,
+                handle_sigint=_owns_signals(),
             ).strip()
         except (EOFError, KeyboardInterrupt):
             print()
@@ -1373,6 +1384,9 @@ class RichSink:
         self.on_safe_point: Callable[[], None] | None = None
         #  活区页脚来源（Tui 接线）：运行期输入行画在 spinner 下面
         self.live_footer: Callable[[], list[Text]] | None = None
+        #  活区指示的接手方（常驻输入区前端接线）：给了就不再起 rich 的 spinner，
+        #  而是把「正在画的那一行」交过去，由它画进自己的输入区；None = 收掉
+        self.activity: Callable[[Any | None], None] | None = None
 
     def emit(self, event: UIEvent) -> None:
         handler = self._handlers.get(type(event))
@@ -1418,7 +1432,17 @@ class RichSink:
         管道/测试里也有确定值），不去问 shutil。"""
         return ui.budget(len(self.indent) + reserve, self.console.width)
 
+    def _start_status(self, line: Any) -> None:
+        if self.activity is not None:
+            self.activity(line)
+            return
+        self._status = self.console.status(line, spinner="dots")
+        with contextlib.suppress(Exception):
+            self._status.start()
+
     def _stop_status(self) -> None:
+        if self.activity is not None:
+            self.activity(None)
         if self._status is not None:
             with contextlib.suppress(Exception):
                 self._status.stop()
@@ -1449,12 +1473,9 @@ class RichSink:
         if not self.verbose or not self.console.is_terminal:
             return
         self._stop_status()
-        self._status = self.console.status(
-            _RunningLine(event.model, self.request_timeout, verb="思考中", footer=self.live_footer),
-            spinner="dots",
+        self._start_status(
+            _RunningLine(event.model, self.request_timeout, verb="思考中", footer=self.live_footer)
         )
-        with contextlib.suppress(Exception):
-            self._status.start()
 
     def _request_ended(self, event: RequestEnded) -> None:
         #  兜底：正常路径上活区早在首个正文/工具行时就收掉了，这里管的是
@@ -1475,9 +1496,7 @@ class RichSink:
             self._close_text()
             self._preparing_index = event.index
             self._running_line = _RunningLine(event.name, verb="生成参数中", footer=self.live_footer)
-            self._status = self.console.status(self._running_line, spinner="dots")
-            with contextlib.suppress(Exception):
-                self._status.start()
+            self._start_status(self._running_line)
         self._running_line.progress = ui.fit(render.preparation_text(event), width=self.console.width)
 
     def _text_delta(self, event: TextDelta) -> None:
@@ -1576,9 +1595,7 @@ class RichSink:
         self._stop_status()
         line = _RunningLine(event.name, self._timeout_for(event), footer=self.live_footer)
         self._running_line = line
-        self._status = self.console.status(line, spinner="dots")
-        with contextlib.suppress(Exception):
-            self._status.start()
+        self._start_status(line)
 
     def _tool_progress(self, event: ToolProgress) -> None:
         """工具自报的进度写进活区那一行（没有活区就丢：进度是可覆盖的状态，
@@ -2265,7 +2282,7 @@ class Tui:
         if get_app_or_none() is None:
             _print()
         else:
-            run_in_terminal(_print)
+            self._above(_print)
 
     def _take_image(self, data: bytes, source: str = "") -> str | None:
         """字节 → chip 文本；不合格时打一行原因并返回 None。
@@ -2360,6 +2377,16 @@ class Tui:
         else:
             buffer.complete_next()
 
+    def _hand_off(self, buffer: Any) -> None:
+        """回车落定之后把这一行交出去。默认是结束这次 prompt、由主循环接住；
+        常驻输入区前端改成「取走文本、输入行留在原地」。"""
+        buffer.validate_and_handle()
+
+    def _above(self, action: Callable[[], None]) -> None:
+        """输入行挂着时往它上方打字。默认借 prompt_toolkit 把输入行让开再打；
+        常驻输入区前端的打印本来就落在输入区上方，直接打即可。"""
+        run_in_terminal(action)
+
     def _input_session(self) -> PromptSession:
         if self._session is None:
             history_dir = user_config_dir()
@@ -2421,7 +2448,7 @@ class Tui:
             if expanded != buffer.text:
                 buffer.text = expanded
                 buffer.cursor_position = len(expanded)
-            buffer.validate_and_handle()
+            self._hand_off(buffer)
 
         def _tab(event: Any) -> None:
             self._tab_complete(event.current_buffer)
@@ -2489,7 +2516,7 @@ class Tui:
                         )
                     )
 
-            run_in_terminal(_report)
+            self._above(_report)
 
         def _recall(event: Any) -> None:
             if self._last_input:
@@ -2512,7 +2539,7 @@ class Tui:
             ):
                 self._warned_no_sandbox = True
                 text = modes.describe(modes.AUTO, sandbox_ready=False)
-                run_in_terminal(
+                self._above(
                     lambda: self.console.print(Text(f"  {text}", style="status.warning"))
                 )
 
@@ -2763,7 +2790,7 @@ class Tui:
             if self._confirm_session is None:
                 self._confirm_session = PromptSession()
             try:
-                return self._confirm_session.prompt(
+                return self._confirm_prompt(
                     [(theme.ptk("menu.title"), "  密码：")], is_password=True
                 )
             except (EOFError, KeyboardInterrupt):
@@ -2918,13 +2945,19 @@ class Tui:
             return f"要{verb} {base} 吗？"
         return f"允许执行 {name} 吗？"
 
+    def _confirm_prompt(self, message: Any, **kwargs: Any) -> str:
+        """确认流程里的单行追问（规则编辑、附言、拒绝理由、密码）共用的输入行。"""
+        if self._confirm_session is None:
+            self._confirm_session = PromptSession()
+        return self._confirm_session.prompt(message, handle_sigint=_owns_signals(), **kwargs)
+
     def _ask_rule(self, rule: str, empty_means: str = "仅本次允许") -> str | None:
         """「总是允许」/「以后都拒绝」的规则写入前可编辑（选项预填推导出的规则）。
         回车接受原文；置空 = 不写规则、只按本次的判定走；Esc/Ctrl-C = 取消。"""
         if self._confirm_session is None:
             self._confirm_session = PromptSession()
         try:
-            return self._confirm_session.prompt(
+            return self._confirm_prompt(
                 [(theme.ptk("menu.title"), f"  规则（可编辑，置空 = {empty_means}）：")], default=rule
             )
         except (EOFError, KeyboardInterrupt):
@@ -2937,7 +2970,7 @@ class Tui:
         if self._confirm_session is None:
             self._confirm_session = PromptSession()
         try:
-            return self._confirm_session.prompt(
+            return self._confirm_prompt(
                 [(theme.ptk("menu.title"), "  附加指示（回车跳过）：")]
             ).strip()
         except (EOFError, KeyboardInterrupt):
@@ -2958,7 +2991,7 @@ class Tui:
         if self._confirm_session is None:
             self._confirm_session = PromptSession()
         try:
-            return self._confirm_session.prompt(
+            return self._confirm_prompt(
                 [(theme.ptk("menu.title"), "  下一步该怎么做？（回车 = 仅拒绝）")]
             ).strip()
         except (EOFError, KeyboardInterrupt):
@@ -2981,7 +3014,7 @@ class Tui:
             if self.permissions.session_grant_label(name, args) is not None else ""
         )
         try:
-            answer = self._confirm_session.prompt(
+            answer = self._confirm_prompt(
                 [
                     (
                         theme.ptk("menu.title"),
@@ -3137,15 +3170,8 @@ class Tui:
         finally:
             attention.clear_title()
 
-    def _run_loop(self, agent: Agent) -> int:
-        from .cli import handle_slash, skill_prompt
-
-        self.agent = agent
-        #  空闲时到达的后台事件：打一行提示，不替用户开新的一轮
-        agent.on_notification = self._on_notification
-        self.sink.bash_timeout = agent.config.bash_timeout
-        self.sink.request_timeout = int(agent.config.request_timeout)
-        self.sink.workspace = Path(agent.config.workspace)
+    def _startup_notices(self, agent: Agent) -> None:
+        """进循环前打一次的提示：放开护栏 / 模式说明 / 按键速览 / 可展开的留底。"""
         if agent.config.unguarded:
             from . import guardrails
 
@@ -3172,6 +3198,17 @@ class Tui:
         #  resume 回放若折叠过工具输出，进循环前提一次 Ctrl-O——留底还在，
         #  这是它被 begin_turn 清掉之前唯一的展开窗口
         self._print_expand_hint()
+
+    def _run_loop(self, agent: Agent) -> int:
+        from .cli import handle_slash, skill_prompt
+
+        self.agent = agent
+        #  空闲时到达的后台事件：打一行提示，不替用户开新的一轮
+        agent.on_notification = self._on_notification
+        self.sink.bash_timeout = agent.config.bash_timeout
+        self.sink.request_timeout = int(agent.config.request_timeout)
+        self.sink.workspace = Path(agent.config.workspace)
+        self._startup_notices(agent)
 
         session = self._input_session()
         last_interrupt = 0.0
