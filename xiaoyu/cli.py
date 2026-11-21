@@ -97,6 +97,15 @@ SLASH_COMMANDS: dict[str, str] = {
     "/quit": "退出",
 }
 
+#  模型作答期间也能当场执行的命令（TUI 的运行期输入通道按这张表分流）。
+#  准入条件三条都要满足：只读会话状态、不向用户提问、不打网络——并且对参数
+#  不敏感（带不带参数都只是查看），所以按命令名判就够，不必再解析参数。
+#  不在表里的命令一律留到本轮结束，预填回输入行由人确认后再跑。
+MIDTURN_COMMANDS: frozenset[str] = frozenset(
+    {"/help", "/keys", "/tools", "/tasks", "/usage", "/context", "/perm"}
+)
+
+
 def effort_mismatch(agent: Agent, level: str) -> str:
     """当前模型登记过认哪几档推理深度、而这一档不在其中时，返回一句提醒；否则空串。
 

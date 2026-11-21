@@ -67,7 +67,8 @@ class TestSuggestionSelection(AgentTestCase):
                 session = mock.Mock()
                 session.prompt.side_effect = prompt
                 stack.enter_context(mock.patch.object(tui, "_input_session", return_value=session))
-                stack.enter_context(mock.patch("xiaoyu.tui.SteerPoller"))
+                #  只拦住读线程：类本身留真的，Tui 轮末要从它手里回收草稿与命令
+                stack.enter_context(mock.patch("xiaoyu.tui.SteerPoller.start"))
                 self.assertEqual(tui._run_loop(agent), 0)
         records = [json.loads(line) for line in log.path.read_text(encoding="utf-8", errors="replace").splitlines()]
         return {
