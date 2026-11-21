@@ -1251,9 +1251,13 @@ class TestRunningLine(unittest.TestCase):
         from xiaoyu import keys
         from xiaoyu.tui import _RunningLine
 
+        from xiaoyu import tui
+
         labels = {label for label, _ in keys.tip_parts()}
         accented: set[str] = set()
-        for _ in range(len(labels) + 1):
+        #  起点在进程内逐实例累加（_TIP_START），不一定从表头开始：
+        #  要转满整张轮播表（含没有按键的补充提示）才保证每条都见过
+        for _ in range(len(keys.tip_parts()) + len(tui._EXTRA_TIPS)):
             line = _RunningLine("bash")
             line.started = time.monotonic() - 5.0
             text = line.__rich__()
