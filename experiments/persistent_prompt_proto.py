@@ -72,7 +72,7 @@ STYLE = {
     "rule": "fg:ansibrightblack",
     "dim": "fg:ansibrightblack",
     "accent": "fg:ansicyan",
-    "prompt": "fg:ansicyan bold",
+    "mark": "fg:ansicyan bold",        # 不叫 prompt：库把整段提示文字都归在那个类下
     "mode": "fg:ansiyellow",
     "ask": "fg:ansiyellow",
     "ask.key": "fg:ansiyellow bold",
@@ -546,7 +546,7 @@ def run_ui(args: argparse.Namespace) -> int:
         if ask or running or steers:
             out.append(("", "\n"))
         out.append(("class:rule", "─" * cols + "\n"))
-        out.append(("class:prompt", f"{MARK_PROMPT} "))
+        out.append(("class:mark", f"{MARK_PROMPT} "))
         view["rows"] = sum(text.count("\n") for _, text in out)
         return FormattedText(out)
 
