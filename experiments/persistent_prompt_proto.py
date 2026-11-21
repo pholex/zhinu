@@ -1,0 +1,560 @@
+"""常驻输入区原型：模型作答期间输入框与状态行不消失。
+
+不调模型、不接 agent，只回答一个问题：在不进 alt-screen 的前提下，
+prompt_toolkit 能不能把「输入框 + 一行状态」贯穿整轮，同时正文照常落进
+终端原生 scrollback。数据源是脚本内置的假流式文本。
+
+    .venv/bin/python experiments/persistent_prompt_proto.py            # 手动体验
+    .venv/bin/python experiments/persistent_prompt_proto.py --selfcheck  # tmux 里自动验收
+
+做法（三条，缺一条就退回「时隐时现」）：
+
+1. 一个 PromptSession 从启动活到退出。回车不结束应用，只取走文本并清空
+   输入框——所以没有「提示符收起、再画出来」这一拍。
+2. 假 agent 跑在工作线程，保持同步写法；它只改共享状态，不碰终端。
+3. 界面线程按固定节拍把正文补打到输入区上方（进 scrollback，每个字符只落
+   一次）。成行的整行落；没成行但已经铺满一屏宽的部分按「软折行」落——
+   写满一行后多写一个字符让终端自己折行，所以复制出去仍是一整行、缩放时
+   终端也会替它重排。活区里只留最后不足一行的尾巴。
+4. 缩放自己接管：窗口变窄时终端会把活区里的宽行重排成多行，库自带的擦除
+   按旧行数回退、会漏擦留影；这里按新宽度算出多出来的行数再擦。
+
+验收对应五条判据：全程输入区不消失、缩放无残影、高速输出不丢键、
+退出后记录与预期逐字一致、多终端各过一遍（最后一条只能人工）。
+"""
+
+from __future__ import annotations
+
+import argparse
+import asyncio
+import itertools
+import os
+import shlex
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+from dataclasses import dataclass, field
+from pathlib import Path
+
+SAMPLE = """\
+先看结论：这次改动只动输入层，正文渲染路径不变。
+
+## 为什么要常驻
+
+输入框跟着提示符生灭的话，模型一跑它就没了，状态也跟着没了。把应用循环
+拉长到整个会话，底部这块才算真的「常驻」。下面是一段代码：
+
+```python
+def commit(lines: list[str]) -> None:
+    for line in lines:
+        write(line + "\\n")   # 每个字符只落一次
+```
+
+一行很长的正文用来看折行：{long}
+
+- 列表项一：English words mixed with 中文、全角标点，以及 emoji 👍。
+- 列表项二：`inline code` 与 **粗体** 标记原样保留。
+
+"""
+
+SPINNER = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
+MARK_STATUS = "▍状态"      # 自检靠这两个记号在屏幕上找状态行与输入行
+MARK_PROMPT = "❯"
+
+
+def sample_text(chars: int) -> str:
+    unit = SAMPLE.format(long="长行内容，" * 40)
+    out, n = [], 0
+    for i in itertools.count(1):
+        block = f"【第 {i} 段】\n{unit}"
+        out.append(block)
+        n += len(block)
+        if n >= chars:
+            break
+    return "".join(out)[:chars].rstrip("\n") + "\n【完】\n"
+
+
+@dataclass
+class Approval:
+    question: str
+    done: threading.Event = field(default_factory=threading.Event)
+    answer: str = ""
+
+
+@dataclass
+class Shared:
+    """工作线程写、界面线程读。所有字段都在 lock 下动。"""
+
+    lock: threading.Lock = field(default_factory=threading.Lock)
+    pending: list[str] = field(default_factory=list)   # 已成行、待补打
+    tail: str = ""                                      # 未成行的尾巴
+    tool: str = ""                                      # 进行中的工具，空串=没有
+    approval: Approval | None = None
+    steers: list[str] = field(default_factory=list)
+    running: bool = False
+    cancel: threading.Event = field(default_factory=threading.Event)
+    started: float = 0.0
+    emitted: int = 0
+    turns: int = 0
+
+    def feed(self, chunk: str) -> None:
+        with self.lock:
+            self.emitted += len(chunk)
+            *lines, self.tail = (self.tail + chunk).split("\n")
+            self.pending.extend(lines)
+
+    def line(self, text: str) -> None:
+        """整行直接入队（工具行、回显行），先把尾巴顶成一行。"""
+        with self.lock:
+            if self.tail:
+                self.pending.append(self.tail)
+                self.tail = ""
+            self.pending.append(text)
+
+
+def fake_turn(shared: Shared, *, chars: int, cps: int, approve: bool) -> None:
+    """一轮假作答：正文 → 工具 →（可选确认）→ 正文。全同步，像真 agent。"""
+    text = sample_text(chars)
+    half = text.find("\n", len(text) // 2) + 1
+    step = max(1, cps // 100)          # 每 10ms 吐一小块，近似逐 token
+    try:
+        for part, after in ((text[:half], True), (text[half:], False)):
+            for i in range(0, len(part), step):
+                if shared.cancel.is_set():
+                    shared.line("⎿ 已打断")
+                    return
+                shared.feed(part[i:i + step])
+                time.sleep(step / cps)
+            if not after:
+                break
+            with shared.lock:
+                shared.tool = "bash  sleep 1 && echo ok"
+            if approve:
+                ask = Approval("要运行 bash：sleep 1 && echo ok 吗？")
+                with shared.lock:
+                    shared.approval = ask
+                while not ask.done.wait(0.05):
+                    if shared.cancel.is_set():
+                        break
+                with shared.lock:
+                    shared.approval = None
+                if ask.answer != "y":
+                    with shared.lock:
+                        shared.tool = ""
+                    shared.line("● bash  已拒绝")
+                    continue
+            shared.cancel.wait(1.0)
+            with shared.lock:
+                shared.tool = ""
+            shared.line("● bash  sleep 1 && echo ok")
+            shared.line("  ⎿ ok")
+            for s in drain(shared):
+                shared.line(f"↳ 插话已送达：{s}")
+    finally:
+        for s in drain(shared):
+            shared.line(f"↳ 插话（轮末）：{s}")
+        with shared.lock:
+            if shared.tail:
+                shared.pending.append(shared.tail)
+                shared.tail = ""
+            shared.running = False
+
+
+def drain(shared: Shared) -> list[str]:
+    with shared.lock:
+        out, shared.steers = shared.steers, []
+    return out
+
+
+def split_rows(text: str, cols: int) -> tuple[list[str], str]:
+    """把超过一屏宽的文本切成若干「铺满的行」和不足一行的余下部分。
+
+    按终端的折行规则算：宽字符放不进行尾最后一格就整个挪到下一行。
+    只有余下部分确实非空时才切——铺满的行要靠「下一个字符」触发终端折行。
+    """
+    from prompt_toolkit.utils import get_cwidth
+
+    rows, start, width = [], 0, 0
+    for i, ch in enumerate(text):
+        w = get_cwidth(ch)
+        if width + w > cols:
+            rows.append(text[start:i])
+            start, width = i, 0
+        width += w
+    return rows, text[start:]
+
+
+def commit(app, data: str, *, sync: bool, extra_up: int = 0, cont: int = 0) -> None:
+    """擦掉输入区 → 写正文 → 重画输入区，攒成一次写出。
+
+    不用库自带的「挂起应用再打印」：那条路擦除、正文、重画是三次写出，
+    中间态肉眼可见；而且它的擦除是「回到输入区首行再清到屏末」，输入区
+    恰好从屏幕第一行开始时，有的终端复用器会把整屏当作「清屏」推进历史，
+    留下一帧输入区的残影。这里首行单独清行，其余行再清到屏末，绕开它。
+
+    cont 非零表示输入区首行是上一行软折下来的续行，行首那个字符（宽 cont 格）
+    已经落在终端里：这时不能从行首清——那会抹掉上一行的折行标记、把一个逻辑行
+    拆成两行——只从它后面清到屏末。
+
+    用到渲染器的私有成员（光标位置、上一帧、强制重画），正式实现时要么
+    收进一个渲染器子类，要么接受随库版本核对。
+    """
+    out, renderer = app.output, app.renderer
+    flush, out.flush = out.flush, lambda: None      # 攒到最后一次写出
+    try:
+        if sync:
+            out.write_raw("\x1b[?2026h")
+        pos = renderer._cursor_pos
+        out.write_raw("\r")
+        out.cursor_up(pos.y + extra_up)
+        if cont:
+            out.write_raw(f"\x1b[{cont}C\x1b[J\r")
+        else:
+            out.write_raw("\x1b[2K\x1b[1B\x1b[J\x1b[1A")
+        out.reset_attributes()
+        out.enable_autowrap()
+        out.write_raw(data)
+        renderer.reset()
+        app._request_absolute_cursor_position()
+        #  库在重画第一帧前会再从行首清一次屏；上面已经清过，而且那一下同样会
+        #  抹掉续行的折行标记，所以重画期间让它空转。
+        erase_down, out.erase_down = out.erase_down, lambda: None
+        try:
+            app._redraw()
+        finally:
+            out.erase_down = erase_down
+        if sync:
+            out.write_raw("\x1b[?2026l")
+    finally:
+        out.flush = flush
+        out.flush()
+
+
+def reflow_extra(app) -> int:
+    """窗口变窄后，输入区在光标之上多出了几行（终端把宽行重排成多行）。"""
+    renderer = app.renderer
+    screen, pos = renderer._last_screen, renderer._cursor_pos
+    if screen is None:
+        return 0
+    cols = max(1, app.output.get_size().columns)
+    extra = 0
+    for y in range(pos.y):
+        row = screen.data_buffer.get(y) or {}
+        width = max((x + c.width for x, c in row.items() if c.char.strip()), default=0)
+        extra += max(0, -(-width // cols) - 1)
+    return extra + pos.x // cols
+
+
+def run_ui(args: argparse.Namespace) -> int:
+    from prompt_toolkit import PromptSession
+    from prompt_toolkit.filters import Condition
+    from prompt_toolkit.formatted_text import FormattedText
+    from prompt_toolkit.key_binding import KeyBindings
+    from prompt_toolkit.utils import get_cwidth
+
+    shared = Shared()
+    transcript: list[str] = []          # 我们「打算」落进 scrollback 的每一行
+    stats = {"ticks": 0, "commits": 0, "max_lag_ms": 0.0, "max_commit_ms": 0.0}
+    last_ctrl_c = [0.0]
+    #  tail=活区里的尾巴；open=当前逻辑行已软折落下的前半；cont=续行行首字符的宽度
+    view = {"tail": "", "open": "", "cont": 0}
+    session: PromptSession[str] = PromptSession(erase_when_done=True)
+
+    def take() -> str:
+        """取走该落的正文，返回要写的字节；顺手记进预期记录。只在界面线程调。"""
+        cols = max(8, session.app.output.get_size().columns)
+        with shared.lock:
+            lines, shared.pending = shared.pending, []
+            rows, rest = split_rows(shared.tail, cols)
+            if rows:
+                shared.tail = rest
+            view["tail"] = shared.tail
+        data = ""
+        for line in lines:
+            transcript.append(view["open"] + line)
+            view["open"], view["cont"] = "", 0
+            data += line + "\x1b[K\r\n"
+        if rows:                        # 铺满的行 + 下一个字符触发折行，再回到行首
+            view["open"] += "".join(rows)
+            view["cont"] = get_cwidth(rest[0])
+            data += "".join(rows) + rest[0] + "\r"
+        return data
+
+    def on_resize() -> None:
+        commit(session.app, "", sync=args.sync, cont=view["cont"],
+               extra_up=reflow_extra(session.app))
+
+    session.app._on_resize = on_resize  # 接管缩放（见模块说明第 4 条）
+
+    def start_turn(text: str) -> None:
+        shared.cancel.clear()
+        with shared.lock:
+            shared.running = True
+            shared.started = time.monotonic()
+            shared.turns += 1
+        shared.line(f"{MARK_PROMPT} {text}")
+        threading.Thread(
+            target=fake_turn, name="fake-agent", daemon=True,
+            kwargs=dict(shared=shared, chars=args.chars, cps=args.cps, approve=args.approve),
+        ).start()
+
+    kb = KeyBindings()
+    asking = Condition(lambda: shared.approval is not None)
+
+    @kb.add("enter", filter=~asking)
+    def _(event):
+        buf = event.current_buffer
+        text = buf.text.strip()
+        if not text:
+            return
+        buf.append_to_history()
+        buf.reset()
+        if text in ("/exit", "/quit"):
+            event.app.exit(result="")
+        elif shared.running:
+            with shared.lock:
+                shared.steers.append(text)
+        else:
+            start_turn(text)
+
+    @kb.add("y", filter=asking)
+    @kb.add("n", filter=asking)
+    def _(event):
+        ask = shared.approval
+        if ask is not None:
+            ask.answer = event.key_sequence[0].key
+            ask.done.set()
+
+    @kb.add("<any>", filter=asking)
+    def _(event):                       # 确认挂起时吞掉其它键，不漏进输入框
+        pass
+
+    @kb.add("c-c")
+    def _(event):
+        if shared.running:
+            shared.cancel.set()
+        elif time.monotonic() - last_ctrl_c[0] < 1.5:
+            event.app.exit(result="")
+        else:
+            last_ctrl_c[0] = time.monotonic()
+            event.current_buffer.reset()
+
+    @kb.add("c-d")
+    def _(event):
+        event.app.exit(result="")
+
+    def message() -> FormattedText:
+        """输入行上方的活区：未成行尾巴、工具 spinner、确认、待送达插话。"""
+        with shared.lock:
+            tool, ask = shared.tool, shared.approval
+            steers = list(shared.steers)
+        tail = view["tail"]             # 取节拍时的快照，与已落正文同步切换
+        frame = SPINNER[int(time.monotonic() * 10) % len(SPINNER)]
+        out: list[tuple[str, str]] = []
+        if tail:
+            out.append(("", tail + "\n"))
+        if tool:
+            out.append(("fg:ansicyan", f"{frame} {tool}\n"))
+        if ask:
+            out.append(("fg:ansiyellow", f"? {ask.question}  [y] 允许  [n] 拒绝\n"))
+        for s in steers:
+            out.append(("fg:ansibrightblack", f"  待送达：{s}\n"))
+        out.append(("fg:ansibrightblack", "─" * 24 + "\n"))
+        out.append(("bold", f"{MARK_PROMPT} "))
+        return FormattedText(out)
+
+    def toolbar() -> FormattedText:
+        with shared.lock:
+            running, started, emitted, turns = (
+                shared.running, shared.started, shared.emitted, shared.turns)
+        if running:
+            state = f"作答中 {time.monotonic() - started:4.1f}s"
+        else:
+            state = "空闲"
+        return FormattedText([(
+            "", f" {MARK_STATUS}  demo-model · 第 {turns} 轮 · {state} · 已出 {emitted} 字 "
+                "· Enter 发送/插话 · Ctrl-C 打断 ")])
+
+    async def pump() -> None:
+        """界面线程的节拍：补打成行正文、驱动活区重画。"""
+        interval = 1.0 / args.hz
+        app = session.app
+        out = app.output
+        prev = time.monotonic()
+        was_running = False
+        while True:
+            await asyncio.sleep(interval)
+            now = time.monotonic()
+            stats["ticks"] += 1
+            stats["max_lag_ms"] = max(stats["max_lag_ms"], (now - prev - interval) * 1e3)
+            prev = now
+            running = shared.running
+            cont = view["cont"]         # 落笔前的状态：此刻首行是不是续行
+            data = take()
+            if data:
+                t0 = time.monotonic()
+                commit(app, data, sync=args.sync, cont=cont)
+                stats["commits"] += 1
+                stats["max_commit_ms"] = max(
+                    stats["max_commit_ms"], (time.monotonic() - t0) * 1e3)
+            elif running or was_running:
+                app.invalidate()
+            was_running = running
+
+    async def main() -> None:
+        task: asyncio.Task[None] | None = None
+
+        def pre_run() -> None:
+            nonlocal task
+            task = session.app.create_background_task(pump())
+            if args.auto:
+                asyncio.get_running_loop().call_later(0.3, start_turn, args.auto)
+
+        await session.prompt_async(
+            message, key_bindings=kb, bottom_toolbar=toolbar,
+            pre_run=pre_run)
+        if task is not None:
+            task.cancel()
+
+    asyncio.run(main())
+    shared.cancel.set()
+    with shared.lock:                   # 退出时还没落的直接打出来，记录不缺尾
+        rest, shared.pending = shared.pending, []
+        if shared.tail:
+            rest.append(shared.tail)
+            shared.tail = ""
+    for line in rest:
+        transcript.append(view["open"] + line)
+        view["open"] = ""
+        print(line)
+    if args.transcript_out:
+        Path(args.transcript_out).write_text(
+            "\n".join(transcript) + "\n", encoding="utf-8")
+    if args.stats_out:
+        Path(args.stats_out).write_text(
+            " ".join(f"{k}={v:.1f}" if isinstance(v, float) else f"{k}={v}"
+                     for k, v in stats.items()) + f" emitted={shared.emitted}\n",
+            encoding="utf-8")
+    return 0
+
+
+# --------------------------------------------------------------------------
+# 自检：在 tmux 里真跑一遍，按判据 1–4 给结论。判据 5（多终端）只能人工。
+# --------------------------------------------------------------------------
+
+def tmux(*argv: str) -> str:
+    done = subprocess.run(
+        ["tmux", "-L", "xy-proto", *argv], capture_output=True, check=False)
+    return done.stdout.decode("utf-8", errors="replace")
+
+
+def screen(session: str) -> str:
+    return tmux("capture-pane", "-p", "-t", session)
+
+
+def history(session: str) -> list[str]:
+    raw = tmux("capture-pane", "-p", "-J", "-S", "-", "-t", session)
+    return [line.rstrip() for line in raw.splitlines() if line.strip()]
+
+
+def selfcheck(args: argparse.Namespace) -> int:
+    work = Path(tempfile.mkdtemp(prefix="xy-proto-"))
+    want, stat = work / "transcript.txt", work / "stats.txt"
+    name = f"proto{os.getpid()}"
+    typed = "typed-while-streaming-0123456789"
+    cmd = " ".join(shlex.quote(p) for p in [
+        sys.executable, str(Path(__file__).resolve()),
+        "--chars", str(args.chars), "--cps", str(args.cps), "--hz", str(args.hz),
+        "--transcript-out", str(want), "--stats-out", str(stat),
+        *([] if args.sync else ["--no-sync"]),
+    ])
+    tmux("kill-server")
+    tmux("new-session", "-d", "-s", name, "-x", "100", "-y", "30", cmd)
+    tmux("set-option", "-t", name, "remain-on-exit", "on")
+    tmux("set-option", "-t", name, "history-limit", "50000")
+    time.sleep(1.5)
+    tmux("send-keys", "-t", name, "-l", "开始")
+    tmux("send-keys", "-t", name, "Enter")
+
+    deadline = time.monotonic() + args.chars / args.cps + 20
+    seen = missing = 0
+    widths = itertools.cycle([100, 72, 120, 60, 90] if args.resize else [100])
+    sent_typing = False
+    while time.monotonic() < deadline:
+        time.sleep(0.25)
+        view = screen(name)
+        if "空闲" in view and seen > 4:
+            break
+        seen += 1
+        if MARK_STATUS not in view or MARK_PROMPT not in view:
+            missing += 1
+            (work / f"missing-{seen}.txt").write_text(view, encoding="utf-8")
+        if args.resize and seen % 4 == 0:
+            tmux("resize-window", "-t", name, "-x", str(next(widths)), "-y", "30")
+        if not sent_typing and seen == 6:      # 流式中途逐键敲一行，轮末应原样送达
+            for ch in typed:
+                tmux("send-keys", "-t", name, "-l", ch)
+            tmux("send-keys", "-t", name, "Enter")
+            sent_typing = True
+    time.sleep(0.5)
+    tmux("send-keys", "-t", name, "-l", "/exit")
+    tmux("send-keys", "-t", name, "Enter")
+    for _ in range(40):
+        time.sleep(0.25)
+        if tmux("display-message", "-p", "-t", name, "#{pane_dead}").strip() == "1":
+            break
+    got = [ln for ln in history(name) if not ln.startswith("Pane is dead")]
+    if args.keep:
+        (work / "got.txt").write_text("\n".join(got) + "\n", encoding="utf-8")
+    tmux("kill-server")
+
+    if not want.exists():
+        print("FAIL 原型没有正常退出，未写出预期记录；末屏：\n" + "\n".join(got[-15:]))
+        return 1
+    expect = [ln.rstrip() for ln in want.read_text(encoding="utf-8").splitlines()
+              if ln.strip()]
+    extra = [ln for ln in got if ln not in set(expect)]
+    lost = [ln for ln in expect if ln not in set(got)]
+    exact = got == expect
+    keys_ok = any(typed in ln for ln in expect)
+    results = [
+        ("1 输入区与状态行全程在场", missing == 0, f"{seen} 次抽样中缺席 {missing} 次"),
+        ("2 scrollback 无残影" + ("（含缩放）" if args.resize else "（未缩放）"),
+         not extra, f"多出 {len(extra)} 行"),
+        ("3 流式期间敲键不丢", keys_ok, f"敲入 {len(typed)} 键，{'原样送达' if keys_ok else '未在记录中找到'}"),
+        ("4 留下的记录与预期逐行一致", exact,
+         f"预期 {len(expect)} 行，实得 {len(got)} 行，缺 {len(lost)} 行"),
+    ]
+    for title, ok, note in results:
+        print(f"{'PASS' if ok else 'FAIL'}  {title}：{note}")
+    print("统计  " + stat.read_text(encoding="utf-8").strip())
+    for label, rows in (("多出的行", extra), ("缺失的行", lost)):
+        for row in rows[:5]:
+            print(f"  {label}: {row[:90]}")
+    print(f"现场  {work}")
+    return 0 if all(ok for _, ok, _ in results) else 1
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    ap.add_argument("--chars", type=int, default=6000, help="每轮假正文的字符数")
+    ap.add_argument("--cps", type=int, default=400, help="每秒吐多少字符")
+    ap.add_argument("--hz", type=int, default=20, help="补打与重画的节拍")
+    ap.add_argument("--approve", action="store_true", help="工具前弹一次确认")
+    ap.add_argument("--auto", default="", help="启动后自动发这一句")
+    ap.add_argument("--no-sync", dest="sync", action="store_false",
+                    help="不用同步输出序列包裹补打")
+    ap.add_argument("--transcript-out", default="")
+    ap.add_argument("--stats-out", default="")
+    ap.add_argument("--selfcheck", action="store_true", help="在 tmux 里自动验收")
+    ap.add_argument("--keep", action="store_true", help="自检时把实得记录也留在现场目录")
+    ap.add_argument("--no-resize", dest="resize", action="store_false",
+                    help="自检时不缩放窗口")
+    args = ap.parse_args()
+    return selfcheck(args) if args.selfcheck else run_ui(args)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
