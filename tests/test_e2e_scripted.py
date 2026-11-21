@@ -108,6 +108,7 @@ class E2ECase(unittest.TestCase):
             "XIAOYU_ENABLE_ASKPASS": "0",
             #  轮末「接着问」是多发给辅助模型的一次请求，脚本化 provider 没给它排脚本
             "XIAOYU_SUGGESTIONS": "0",
+            "XIAOYU_LIVE_INPUT": "0",
             #  出厂起始档是 auto（工作区内改文件免确认），e2e 断言的是权限线协议，
             #  钉在确认档让每次写文件都走一遍 permission 请求；起始档本身由
             #  test_modes / test_user_config 锁

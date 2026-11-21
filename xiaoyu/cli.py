@@ -2472,7 +2472,15 @@ def make_frontend(permissions: Permissions, no_tui: bool = False):
             text_ask_questions,
             text_secret_prompt,
         )
-    front = tui.Tui(permissions)
+    front_class = tui.Tui
+    #  常驻输入区前端：默认关，XIAOYU_LIVE_INPUT=1 才用。Windows 的控制台没有它
+    #  依赖的那套光标与折行语义，保持旧前端
+    if sys.platform != "win32":
+        from . import tui_live
+
+        if tui_live.enabled():
+            front_class = tui_live.LiveTui
+    front = front_class(permissions)
     return front.confirm, front.sink, front.run, None, front.ask, front.secret_prompt
 
 

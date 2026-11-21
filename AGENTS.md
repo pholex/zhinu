@@ -62,7 +62,8 @@ id 精确到文件，在哪个目录跑都找得到；记录可能含用户隐�
   加依赖要有不得不加的理由并同步 `tests/wheel_smoke.py` 的计数。
 - 工具输出、配置、会话文件的解码一律有 `errors="replace"` 兜底；外部字节不裸抛
   `UnicodeDecodeError`（`tests_ai/test_encoding.md` 守着）。
-- 核心模块不 import `rich` / `prompt_toolkit`，TUI 只住在 `xiaoyu/tui.py`
+- 核心模块不 import `rich` / `prompt_toolkit`，TUI 只住在 `xiaoyu/tui.py` 与
+  `xiaoyu/tui_live.py`（常驻输入区前端，`XIAOYU_LIVE_INPUT=1` 才启用）
   （`tests_ai/test_layering.md` 守着）。
 - 新护栏先问能不能关、怎么关（`xiaoyu/guardrails.py` 一张表）；硬红线那层刻意无开关。
 - 改了 `.github/workflows/`：action 一律钉 commit SHA 并注释版本号。
