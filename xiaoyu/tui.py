@@ -3215,11 +3215,15 @@ class Tui:
         if agent.mode != modes.DEFAULT and not (
             agent.config.auto_approve and agent.mode == modes.AUTO
         ):
-            #  --mode auto 起手：提示符上的标记不解释"这一档会不会问你"，开场说一次
+            #  --mode auto 起手：提示符上的标记不解释"这一档会不会问你"，开场说一次。
+            #  auto 是出厂起始档，每次开场都在：用横幅小标题的强调色，是说明不是警报；
+            #  沙箱不可用的降级和 plan 档才用警告色——那两种是容易会错意的状态
+            ready = agent.sandbox_ready()
+            calm = agent.mode == modes.AUTO and ready
             self.console.print(
                 Text(
-                    modes.describe(agent.mode, sandbox_ready=agent.sandbox_ready()),
-                    style="status.warning",
+                    modes.describe(agent.mode, sandbox_ready=ready),
+                    style="banner.accent" if calm else "status.warning",
                 )
             )
             self._warned_no_sandbox = True

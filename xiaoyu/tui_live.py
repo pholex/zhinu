@@ -69,6 +69,9 @@ from .tui import NoticeCapture, Tui, search_select
 ENV_SWITCH = "XIAOYU_LIVE_INPUT"
 
 _SPINNER = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
+#  补打用户原话时的行首标记。选字的约束：占一格（不是东亚宽字符）、没有彩色
+#  表情的变体（否则各终端宽度与颜色都不由我们定）
+_SAID_MARK = "✽ "
 _TICK = 1 / 30
 
 # ---------------------------------------------------------------------------
@@ -906,8 +909,8 @@ class LiveTui(Tui):
         """输入行不留在原地了，把这一行补打到上方，scrollback 里才有「我说了什么」。
 
         回头翻记录时最先要找的就是「我在哪儿问的」：上方空一行把它和前面的输出
-        隔开；对模型说的话行首立一条强调色竖线、正文加粗（多行就每行一条，连成
-        一道边），命令（/、!、#）是对程序说的，保持原样不抢眼。
+        隔开；对模型说的话行首立一个强调色的花瓣星号、正文加粗（多行只标第一行，
+        其余缩进对齐），命令（/、!、#）是对程序说的，保持原样不抢眼。
         """
         writer = self._writer
         if writer is not None and not writer.ends_blank:
@@ -915,7 +918,8 @@ class LiveTui(Tui):
         said = keys.classify_input(text, literal=literal).kind == "send"
         if said:
             rows = [
-                Text.assemble(("▌ ", "text.accent"), (row, "bold")) for row in text.split("\n")
+                Text.assemble((_SAID_MARK if index == 0 else "  ", "text.accent"), (row, "bold"))
+                for index, row in enumerate(text.split("\n"))
             ]
             self.console.print(Text("\n").join(rows))
         else:
