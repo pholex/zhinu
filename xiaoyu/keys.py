@@ -285,7 +285,12 @@ def tips() -> list[str]:
     面的取舍标准不同，必须是两个字段。不另立一份提示文案，那又是一处会
     漂移的字符串。
     """
-    return [f"{item.label} {item.desc}" for item in BINDINGS if item.tip]
+    return [f"{label} {desc}" for label, desc in tip_parts()]
+
+
+def tip_parts() -> list[tuple[str, str]]:
+    """tips() 的拆开形态：(按键或前缀, 说明)。前端要给按键单独上色时用。"""
+    return [(item.label, item.desc) for item in BINDINGS if item.tip]
 
 
 def help_text() -> str:
