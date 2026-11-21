@@ -60,8 +60,24 @@ def commit(lines: list[str]) -> None:
 """
 
 SPINNER = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
-MARK_STATUS = "▍状态"      # 自检靠这两个记号在屏幕上找状态行与输入行
-MARK_PROMPT = "❯"
+MODEL = "demo-model"
+MARK_STATUS = MODEL         # 自检靠这两个记号在屏幕上找状态行与输入行
+MARK_PROMPT = "›"
+IDLE = "就绪"
+
+#  底部的配色：分隔线与说明文字压暗，提示符与 spinner 用强调色，状态行不反白。
+STYLE = {
+    "rule": "fg:ansibrightblack",
+    "dim": "fg:ansibrightblack",
+    "accent": "fg:ansicyan",
+    "prompt": "fg:ansicyan bold",
+    "mode": "fg:ansiyellow",
+    "ask": "fg:ansiyellow",
+    "ask.key": "fg:ansiyellow bold",
+    "placeholder": "fg:ansibrightblack italic",
+    "bottom-toolbar": "noreverse",
+    "bottom-toolbar.text": "noreverse",
+}
 
 
 def sample_text(chars: int) -> str:
@@ -232,6 +248,47 @@ def commit(app, data: str, *, sync: bool, extra_up: int = 0, cont: int = 0) -> N
         out.flush()
 
 
+def commit_in_place(app, data: str, rows: int, *, sync: bool, cont: int) -> None:
+    """不擦除的补打：正文直接盖在输入区最上面的 rows 行上，输入区整体下移。
+
+    `commit` 是「整块擦掉再重画」，每秒二十次，在不支持同步输出的终端上
+    底部会闪。这里不清屏：正文逐行覆盖旧内容（行尾清到行末），然后告诉
+    渲染器「屏幕上现在是旧的一帧去掉前 rows 行」，让它照常做差量重画——
+    没变的格子一个字节都不写，状态行自然就不闪了。
+    """
+    out, renderer = app.output, app.renderer
+    prev = renderer._last_screen
+    if prev is None:
+        commit(app, data, sync=sync, cont=cont)
+        return
+    flush, out.flush = out.flush, lambda: None
+    try:
+        if sync:
+            out.write_raw("\x1b[?2026h")
+        out.write_raw("\r")
+        out.cursor_up(renderer._cursor_pos.y)
+        out.reset_attributes()
+        out.enable_autowrap()
+        out.write_raw(data)
+        for name in ("data_buffer", "zero_width_escapes"):
+            old = getattr(prev, name)
+            new = type(old)(old.default_factory)
+            for y, row in old.items():
+                if y >= rows:
+                    new[y - rows] = row
+            setattr(prev, name, new)
+        prev.height = max(0, prev.height - rows)
+        renderer._cursor_pos = type(renderer._cursor_pos)(x=0, y=0)
+        renderer._last_style = None
+        app._request_absolute_cursor_position()
+        app._redraw()
+        if sync:
+            out.write_raw("\x1b[?2026l")
+    finally:
+        out.flush = flush
+        out.flush()
+
+
 def reflow_extra(app) -> int:
     """窗口变窄后，输入区在光标之上多出了几行（终端把宽行重排成多行）。"""
     renderer = app.renderer
@@ -252,6 +309,7 @@ def run_ui(args: argparse.Namespace) -> int:
     from prompt_toolkit.filters import Condition
     from prompt_toolkit.formatted_text import FormattedText
     from prompt_toolkit.key_binding import KeyBindings
+    from prompt_toolkit.styles import Style
     from prompt_toolkit.utils import get_cwidth
 
     shared = Shared()
@@ -259,28 +317,63 @@ def run_ui(args: argparse.Namespace) -> int:
     stats = {"ticks": 0, "commits": 0, "max_lag_ms": 0.0, "max_commit_ms": 0.0}
     last_ctrl_c = [0.0]
     #  tail=活区里的尾巴；open=当前逻辑行已软折落下的前半；cont=续行行首字符的宽度
-    view = {"tail": "", "open": "", "cont": 0}
-    session: PromptSession[str] = PromptSession(erase_when_done=True)
+    view = {"tail": "", "open": "", "cont": 0, "rows": 0}
+    session: PromptSession[str] = PromptSession(
+        erase_when_done=True, reserve_space_for_menu=0, style=Style.from_dict(STYLE))
 
-    def take() -> str:
-        """取走该落的正文，返回要写的字节；顺手记进预期记录。只在界面线程调。"""
-        cols = max(8, session.app.output.get_size().columns)
+    #  不向终端查询光标位置：库拿到「光标下方还剩几行」后会把输入区撑到屏幕
+    #  底部，屏幕没写满时输入行和下面的分隔线之间就隔着一片空白。不查，输入区
+    #  就按自身高度紧凑排布；顺带省掉每次补打一问一答的往返。
+    #  但库只在「高度已知」时才画下方那一栏，所以把查询换成直接报一个最小高度。
+    def height_known() -> None:
+        session.app.renderer._min_available_height = 1
+
+    session.app.renderer.request_absolute_cursor_position = height_known
+
+    def columns() -> int:
+        return max(8, session.app.output.get_size().columns)
+
+    def clip(text: str, cols: int) -> str:
+        """按显示宽度截断，超出时以省略号收尾。"""
+        if sum(get_cwidth(c) for c in text) <= cols:
+            return text
+        out, width = "", 0
+        for ch in text:
+            width += get_cwidth(ch)
+            if width > cols - 1:
+                break
+            out += ch
+        return out + "…"
+
+    def take() -> tuple[str, int]:
+        """取走该落的正文，返回（要写的字节，占了几行）；顺手记进预期记录。
+
+        只在界面线程调。每个物理行写完都清到行末，因为它是盖在旧内容上的。
+        """
+        cols = columns()
         with shared.lock:
             lines, shared.pending = shared.pending, []
             rows, rest = split_rows(shared.tail, cols)
             if rows:
                 shared.tail = rest
             view["tail"] = shared.tail
-        data = ""
+
+        def full(row: str) -> str:      # 铺满的行：差一格没满（宽字符挪走了）才需要清
+            return row if sum(get_cwidth(c) for c in row) >= cols else row + "\x1b[K"
+
+        data, used = "", 0
         for line in lines:
             transcript.append(view["open"] + line)
             view["open"], view["cont"] = "", 0
-            data += line + "\x1b[K\r\n"
+            wrapped, last = split_rows(line, cols)
+            data += "".join(full(r) for r in wrapped) + last + "\x1b[K\r\n"
+            used += len(wrapped) + 1
         if rows:                        # 铺满的行 + 下一个字符触发折行，再回到行首
             view["open"] += "".join(rows)
             view["cont"] = get_cwidth(rest[0])
-            data += "".join(rows) + rest[0] + "\r"
-        return data
+            data += "".join(full(r) for r in rows) + rest[0] + "\r"
+            used += len(rows)
+        return data, used
 
     def on_resize() -> None:
         commit(session.app, "", sync=args.sync, cont=view["cont"],
@@ -341,41 +434,78 @@ def run_ui(args: argparse.Namespace) -> int:
             last_ctrl_c[0] = time.monotonic()
             event.current_buffer.reset()
 
+    @kb.add("escape", eager=True, filter=Condition(lambda: shared.running))
+    def _(event):
+        shared.cancel.set()
+
     @kb.add("c-d")
     def _(event):
         event.app.exit(result="")
 
     def message() -> FormattedText:
-        """输入行上方的活区：未成行尾巴、工具 spinner、确认、待送达插话。"""
+        """输入行上方的活区，自上而下：未成行尾巴、空一行、进行中的事、分隔线。"""
         with shared.lock:
-            tool, ask = shared.tool, shared.approval
-            steers = list(shared.steers)
+            tool, ask, running = shared.tool, shared.approval, shared.running
+            steers, started = list(shared.steers), shared.started
         tail = view["tail"]             # 取节拍时的快照，与已落正文同步切换
+        cols = columns()
         frame = SPINNER[int(time.monotonic() * 10) % len(SPINNER)]
         out: list[tuple[str, str]] = []
-        if tail:
-            out.append(("", tail + "\n"))
-        if tool:
-            out.append(("fg:ansicyan", f"{frame} {tool}\n"))
+        out.append(("", tail + "\n"))  # 尾巴这一行常在（空着也占位），行数才稳定
+        if ask or running or steers:
+            out.append(("", "\n"))
         if ask:
-            out.append(("fg:ansiyellow", f"? {ask.question}  [y] 允许  [n] 拒绝\n"))
-        for s in steers:
-            out.append(("fg:ansibrightblack", f"  待送达：{s}\n"))
-        out.append(("fg:ansibrightblack", "─" * 24 + "\n"))
-        out.append(("bold", f"{MARK_PROMPT} "))
+            out.append(("class:ask", "▌ " + clip(ask.question, cols - 2) + "\n"))
+            out.append(("class:ask", "▌ "))
+            out.append(("class:ask.key", "y"))
+            out.append(("class:dim", " 允许 · "))
+            out.append(("class:ask.key", "n"))
+            out.append(("class:dim", " 拒绝\n"))
+        elif running:
+            #  一行说清「在干什么、干了多久、出了多少」：动词用强调色，括号里压暗
+            secs = int(time.monotonic() - started)
+            took = f"{secs // 60}m {secs % 60}s" if secs >= 60 else f"{secs}s"
+            with shared.lock:
+                emitted = shared.emitted
+            size = f"{emitted / 1000:.1f}k" if emitted >= 1000 else str(emitted)
+            doing = clip(tool or "作答中…", max(8, cols - 30))
+            out.append(("class:accent", f"{frame} {doing}"))
+            out.append(("class:dim", f" ({took} · ↓ {size} 字)\n"))
+        for text in steers:
+            out.append(("class:dim", clip(f"  ↳ 待送达：{text}", cols) + "\n"))
+        if ask or running or steers:
+            out.append(("", "\n"))
+        out.append(("class:rule", "─" * cols + "\n"))
+        out.append(("class:prompt", f"{MARK_PROMPT} "))
+        view["rows"] = sum(text.count("\n") for _, text in out)
         return FormattedText(out)
 
+    def placeholder() -> FormattedText:
+        if shared.approval is not None:
+            return FormattedText([("class:placeholder", "先回答上面的确认")])
+        hint = "继续输入可以插话" if shared.running else "输入消息，回车发送"
+        return FormattedText([("class:placeholder", hint)])
+
     def toolbar() -> FormattedText:
-        with shared.lock:
-            running, started, emitted, turns = (
-                shared.running, shared.started, shared.emitted, shared.turns)
-        if running:
-            state = f"作答中 {time.monotonic() - started:4.1f}s"
-        else:
-            state = "空闲"
-        return FormattedText([(
-            "", f" {MARK_STATUS}  demo-model · 第 {turns} 轮 · {state} · 已出 {emitted} 字 "
-                "· Enter 发送/插话 · Ctrl-C 打断 ")])
+        """输入行下方：分隔线 + 一行说明。左边是当前模式与此刻能按的键，右边是模型名。"""
+        cols = columns()
+        mode = "▸▸ 逐项确认" if args.approve else "▸▸ 自动放行"
+        keys = " (shift+tab 切换)" + (
+            " · esc 打断 · enter 插话" if shared.running else " · enter 发送 · ctrl-c ×2 退出")
+        width = lambda t: sum(get_cwidth(c) for c in t)
+        right = f"{MODEL} "
+        gap = cols - 2 - width(mode) - width(keys) - width(right)
+        if gap < 2:                     # 窄窗口：先丢按键说明，再丢模型名
+            keys = ""
+            gap = cols - 2 - width(mode) - width(right)
+            if gap < 2:
+                right, gap = "", 0
+        return FormattedText([
+            ("class:rule", "─" * cols + "\n"),
+            ("", "  "),
+            ("class:mode", mode),
+            ("class:dim", keys + " " * gap + right),
+        ])
 
     async def pump() -> None:
         """界面线程的节拍：补打成行正文、驱动活区重画。"""
@@ -384,6 +514,7 @@ def run_ui(args: argparse.Namespace) -> int:
         out = app.output
         prev = time.monotonic()
         was_running = False
+        tall = 0
         while True:
             await asyncio.sleep(interval)
             now = time.monotonic()
@@ -392,15 +523,23 @@ def run_ui(args: argparse.Namespace) -> int:
             prev = now
             running = shared.running
             cont = view["cont"]         # 落笔前的状态：此刻首行是不是续行
-            data = take()
+            data, used = take()
             if data:
                 t0 = time.monotonic()
-                commit(app, data, sync=args.sync, cont=cont)
+                if args.erase:
+                    commit(app, data, sync=args.sync, cont=cont)
+                else:
+                    commit_in_place(app, data, used, sync=args.sync, cont=cont)
                 stats["commits"] += 1
                 stats["max_commit_ms"] = max(
                     stats["max_commit_ms"], (time.monotonic() - t0) * 1e3)
             elif running or was_running:
                 app.invalidate()
+            #  活区变矮（一轮结束、确认答完）时库不会收回空出来的行，输入行和
+            #  下面的分隔线之间会留空。这种时刻很少，整块重画一次把高度归位。
+            if view["rows"] < tall:
+                commit(app, "", sync=args.sync, cont=view["cont"])
+            tall = view["rows"]
             was_running = running
 
     async def main() -> None:
@@ -413,7 +552,7 @@ def run_ui(args: argparse.Namespace) -> int:
                 asyncio.get_running_loop().call_later(0.3, start_turn, args.auto)
 
         await session.prompt_async(
-            message, key_bindings=kb, bottom_toolbar=toolbar,
+            message, key_bindings=kb, bottom_toolbar=toolbar, placeholder=placeholder,
             pre_run=pre_run)
         if task is not None:
             task.cancel()
@@ -485,7 +624,7 @@ def selfcheck(args: argparse.Namespace) -> int:
     while time.monotonic() < deadline:
         time.sleep(0.25)
         view = screen(name)
-        if "空闲" in view and seen > 4:
+        if IDLE in view and seen > 4:
             break
         seen += 1
         if MARK_STATUS not in view or MARK_PROMPT not in view:
@@ -546,6 +685,8 @@ def main() -> int:
     ap.add_argument("--auto", default="", help="启动后自动发这一句")
     ap.add_argument("--no-sync", dest="sync", action="store_false",
                     help="不用同步输出序列包裹补打")
+    ap.add_argument("--erase", action="store_true",
+                    help="补打改回「整块擦掉再重画」（对照用，会闪）")
     ap.add_argument("--transcript-out", default="")
     ap.add_argument("--stats-out", default="")
     ap.add_argument("--selfcheck", action="store_true", help="在 tmux 里自动验收")
