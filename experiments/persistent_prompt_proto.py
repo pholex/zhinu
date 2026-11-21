@@ -64,6 +64,8 @@ MODEL = "demo-model"
 MARK_STATUS = MODEL         # 自检靠这两个记号在屏幕上找状态行与输入行
 MARK_PROMPT = "›"
 IDLE = "就绪"
+DIFF = "+169 −37"           # 改动量是假数据；分支名启动时真读一次
+CONTEXT_CHARS = 20000       # 假设的上下文容量，只为让用量数字会动
 
 #  底部的配色：分隔线与说明文字压暗，提示符与 spinner 用强调色，状态行不反白。
 STYLE = {
@@ -316,6 +318,12 @@ def run_ui(args: argparse.Namespace) -> int:
     transcript: list[str] = []          # 我们「打算」落进 scrollback 的每一行
     stats = {"ticks": 0, "commits": 0, "max_lag_ms": 0.0, "max_commit_ms": 0.0}
     last_ctrl_c = [0.0]
+    try:
+        branch = subprocess.run(
+            ["git", "rev-parse", "--abbrev-ref", "HEAD"], capture_output=True, timeout=2,
+        ).stdout.decode("utf-8", errors="replace").strip() or "main"
+    except (OSError, subprocess.SubprocessError):
+        branch = "main"
     #  tail=活区里的尾巴；open=当前逻辑行已软折落下的前半；cont=续行行首字符的宽度
     view = {"tail": "", "open": "", "cont": 0, "rows": 0}
     session: PromptSession[str] = PromptSession(
@@ -487,24 +495,41 @@ def run_ui(args: argparse.Namespace) -> int:
         return FormattedText([("class:placeholder", hint)])
 
     def toolbar() -> FormattedText:
-        """输入行下方：分隔线 + 一行说明。左边是当前模式与此刻能按的键，右边是模型名。"""
+        """输入行下方：分隔线 + 一行说明。
+
+        左边是当前模式与此刻能按的键；右边是分支与改动量、上下文用量、模型名。
+        放不下时从最不要紧的丢起：按键说明 → 改动量 → 分支 → 模型名，
+        上下文用量留到最后。只占一行，不折行。
+        """
         cols = columns()
+        with shared.lock:
+            emitted = shared.emitted
+        used = min(99, emitted * 100 // CONTEXT_CHARS)     # 假数据：按已出字数折算
         mode = "▸▸ 逐项确认" if args.approve else "▸▸ 自动放行"
         keys = " (shift+tab 切换)" + (
             " · esc 打断 · enter 插话" if shared.running else " · enter 发送 · ctrl-c ×2 退出")
+        ctx = f"上下文 {used}%"
         width = lambda t: sum(get_cwidth(c) for c in t)
-        right = f"{MODEL} "
-        gap = cols - 2 - width(mode) - width(keys) - width(right)
-        if gap < 2:                     # 窄窗口：先丢按键说明，再丢模型名
-            keys = ""
-            gap = cols - 2 - width(mode) - width(right)
-            if gap < 2:
-                right, gap = "", 0
+        branch_name = clip(branch, 28)
+        for show_keys, git, show_model in (
+            (True, f"{branch_name} {DIFF}", True), (False, f"{branch_name} {DIFF}", True),
+            (False, branch_name, True), (False, "", True), (False, "", False),
+        ):
+            left = keys if show_keys else ""
+            before = (git + " · ") if git else ""
+            after = f" · {MODEL} " if show_model else " "
+            gap = cols - 2 - width(mode) - width(left) - width(before + ctx + after)
+            if gap >= 2:
+                break
+        else:
+            left, before, after, gap = "", "", "", max(0, cols - 2 - width(mode) - width(ctx))
         return FormattedText([
             ("class:rule", "─" * cols + "\n"),
             ("", "  "),
             ("class:mode", mode),
-            ("class:dim", keys + " " * gap + right),
+            ("class:dim", left + " " * gap + before),
+            ("class:ask" if used >= 70 else "class:dim", ctx),   # 用量吃紧时变色提醒
+            ("class:dim", after),
         ])
 
     async def pump() -> None:
@@ -624,7 +649,7 @@ def selfcheck(args: argparse.Namespace) -> int:
     while time.monotonic() < deadline:
         time.sleep(0.25)
         view = screen(name)
-        if IDLE in view and seen > 4:
+        if "enter 发送" in view and seen > 4:
             break
         seen += 1
         if MARK_STATUS not in view or MARK_PROMPT not in view:
