@@ -12,7 +12,7 @@
 
 **Requirements**:
 - 以上文件中不得出现任何对 `rich` 或 `prompt_toolkit` 的 import（顶层或函数内都不行）。
-  TUI 相关实现只允许住在 `xiaoyu/tui.py`（以及 `xiaoyu/theme.py` 等 tui 侧模块）。
+  TUI 相关实现只允许住在 `xiaoyu/tui.py`、`xiaoyu/tui_live.py`（以及 `xiaoyu/theme.py` 等 tui 侧模块）。
 - `xiaoyu/cli.py` 引用 TUI 时必须经由延迟导入 `tui` 模块并有缺依赖回退
   （找不到 tui 时退回明文 REPL 的路径要存在）。
 

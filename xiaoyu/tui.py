@@ -438,6 +438,35 @@ def _restyle_tabs(line: str, row: Text) -> Text | None:
 _TAB_SIZE = 4
 
 
+#  scrollback 里四种区块各自的行首标记：你说的话、模型的话、工具调用、一轮的小结。
+#  都占一格、都没有彩色表情变体（否则宽度与颜色不由我们定）。
+USER_MARK = "❯ "
+TEXT_MARK = "● "
+TOOL_MARK = "● "
+TURN_MARK = "✻ "
+
+
+def user_echo(text: str) -> Text:
+    """用户原话在 scrollback 里的样子：❯ 开头（与输入行的提示符同形），整段用
+    强调色、带底色——和模型的回答不同色，回翻时不靠细看就分得开。
+
+    多行只标第一行，其余缩进对齐——逐行都标的话，从屏幕上复制一段多行原话要
+    手动删好几个前缀。底色只到文字末尾、不铺满整行：打进 scrollback 的字改
+    不了，铺满得用空格补到当时的行宽，之后窗口一缩窄这一行就折成两行。
+    """
+    rows: list[Text] = []
+    for index, row in enumerate(text.split("\n")):
+        line = Text.assemble((USER_MARK if index == 0 else "  ", "text.accent"), (row, "text.accent"))
+        line.stylize("prompt.echo")
+        rows.append(line)
+    return Text("\n").join(rows)
+
+
+def turn_summary(stats: str) -> Text:
+    """一轮收尾的小结行。"""
+    return Text.assemble((TURN_MARK, "text.accent"), (stats, "text.secondary"))
+
+
 class _StreamStyler:
     """流式正文的行级轻渲染：每个字符只打一次、不重绘，scrollback 上永远稳定。
 
@@ -473,6 +502,10 @@ class _StreamStyler:
         self._code_lines: list[str] = []
         self._span = 0  # 行内代码打开时的反引号数，0 = 没打开
         self._strong = False
+        #  区块外形：一段正文第一行以 ● 开头，其余行缩进两格与它对齐。空行不补
+        #  缩进（不留行尾空格）
+        self._bol = True
+        self._marked = False
 
     # ---------- 入口 ----------
 
@@ -490,6 +523,8 @@ class _StreamStyler:
         self._code_lines = []
         self._span = 0
         self._strong = False
+        self._bol = True
+        self._marked = False
 
     # ---------- 状态机 ----------
 
@@ -641,6 +676,14 @@ class _StreamStyler:
         展成空格（Makefile / Go 的 tab 变空格就不是原文了），这里只借它把样式
         片段编成 ANSI 码，字符本身一个不动。旧式 Windows 控制台不认 ANSI 码，
         仍交给 rich 自己翻译（那里 tab 展开是可接受的代价）。"""
+        if text.plain == "\n":
+            self._bol = True
+        elif self._bol and text.plain:
+            self._bol = False
+            lead = Text("  " if self._marked else TEXT_MARK)
+            self._marked = True
+            lead.append_text(text)
+            text = lead
         if self.console.legacy_windows:
             self.console.print(text, end="", soft_wrap=True)
             return
@@ -765,6 +808,15 @@ class DedupedHistory(FileHistory):
         super().append_string(string)
 
 
+def _owns_signals() -> bool:
+    """当前线程能不能装信号处理器（只有主线程能）。
+
+    常驻输入区前端（tui_live）把主线程留给输入区，确认菜单与追问输入行改在
+    工作线程里跑；那里让 prompt_toolkit 接管 SIGINT 会直接抛错。
+    """
+    return threading.current_thread() is threading.main_thread()
+
+
 def _register(handlers: dict[str, Any], *categories: str) -> KeyBindings:
     """按绑定表注册一组按键。
 
@@ -840,11 +892,47 @@ def apply_theme(console: Console) -> None:
     setattr(console, _THEMED, True)
 
 
+class MenuHost:
+    """行内菜单住在哪儿、怎么收场。
+
+    菜单自己只管三样：按键、画什么、占几行；交给宿主去显示、等结果。默认宿主
+    为每个菜单起一个一次性的小应用，退出即擦除。常驻输入区前端换成自己的宿主，
+    把同一份按键与画面嵌进输入区里（`tui_live.LiveTui`）。
+    """
+
+    _application: Application | None = None
+
+    def run(self, bindings: KeyBindings, fragments: Callable[[], Any], height: int) -> Any:
+        window = Window(
+            FormattedTextControl(fragments, focusable=True, show_cursor=False),
+            height=height,
+            always_hide_cursor=True,
+        )
+        self._application = Application(
+            layout=Layout(window),
+            key_bindings=bindings,
+            full_screen=False,
+            erase_when_done=True,
+            style=Style.from_dict(theme.ptk_style()),
+        )
+        return self._application.run(handle_sigint=_owns_signals())
+
+    def finish(self, result: Any) -> None:
+        """菜单有了结果（None = 取消）。"""
+        assert self._application is not None
+        self._application.exit(result=result)
+
+    def above(self, action: Callable[[], None]) -> None:
+        """菜单挂着时往它上方打字（补打全文）。"""
+        run_in_terminal(action)
+
+
 def inline_select(
     title: str,
     options: list[tuple[Any, str, str]],
     amend: bool = True,
     expand: Callable[[], None] | None = None,
+    host: MenuHost | None = None,
 ) -> Any:
     """不进 alt-screen 的行内单选菜单（确认框与会话选择共用的通用件）。
 
@@ -860,6 +948,7 @@ def inline_select(
     取消返回 None。菜单退出即擦除（erase_when_done），决定由调用方回显
     一行定格进 scrollback。
     """
+    host = host or MenuHost()
     selected = 0
     expanded = False
 
@@ -872,16 +961,16 @@ def inline_select(
         selected = (selected + 1) % len(options)
 
     def _accept(event: Any) -> None:
-        event.app.exit(result=options[selected][0])
+        host.finish(options[selected][0])
 
     def _amend(event: Any) -> None:
         if amend:
-            event.app.exit(result=("amend", options[selected][0]))
+            host.finish(("amend", options[selected][0]))
         else:
-            event.app.exit(result=options[selected][0])
+            host.finish(options[selected][0])
 
     def _cancel(event: Any) -> None:
-        event.app.exit(result=None)
+        host.finish(None)
 
     def _expand(event: Any) -> None:
         #  一次性：全文已定格进 scrollback，再按只会重复倾倒同一坨
@@ -889,7 +978,7 @@ def inline_select(
         if expand is None or expanded:
             return
         expanded = True
-        run_in_terminal(expand)
+        host.above(expand)
 
     bindings = _register(
         {
@@ -908,7 +997,7 @@ def inline_select(
 
     def bind_choice(value: Any):
         def handler(event: Any) -> None:
-            event.app.exit(result=value)
+            host.finish(value)
 
         return handler
 
@@ -940,19 +1029,7 @@ def inline_select(
         rows.append(("class:menu-hint", f"    {hint}"))
         return rows
 
-    window = Window(
-        FormattedTextControl(fragments, focusable=True, show_cursor=False),
-        height=len(options) + 2,
-        always_hide_cursor=True,
-    )
-    application: Application = Application(
-        layout=Layout(window),
-        key_bindings=bindings,
-        full_screen=False,
-        erase_when_done=True,
-        style=Style.from_dict(theme.ptk_style()),
-    )
-    return application.run()
+    return host.run(bindings, fragments, len(options) + 2)
 
 
 def search_select(
@@ -1059,7 +1136,7 @@ def search_select(
         erase_when_done=True,
         style=Style.from_dict(theme.ptk_style()),
     )
-    return application.run()
+    return application.run(handle_sigint=_owns_signals())
 
 
 #  提问面板自动附加的自由输入项（模型不许自己造「其他」，
@@ -1075,6 +1152,7 @@ def question_select(
     checked: set[int] | None = None,
     selected: int = 0,
     cancel_index: int | None = None,
+    host: MenuHost | None = None,
 ) -> int | list[int] | None:
     """ask_user 的行内选择面板（inline 形态）。
 
@@ -1085,6 +1163,7 @@ def question_select(
     cancel_index 指向取消操作行，单选与多选下都立即取消，不作为答案提交。
     面板退出即擦除，答案由调用方回显一行定格进 scrollback（与确认框同一纪律）。
     """
+    host = host or MenuHost()
     marked: set[int] = set(checked or ())
     cursor = min(max(selected, 0), len(options) - 1)
 
@@ -1098,20 +1177,20 @@ def question_select(
 
     def _accept(event: Any) -> None:
         if cursor == cancel_index:
-            event.app.exit(result=None)
+            host.finish(None)
         elif multi:
-            event.app.exit(result=sorted(marked))
+            host.finish(sorted(marked))
         else:
-            event.app.exit(result=cursor)
+            host.finish(cursor)
 
     def _toggle(event: Any) -> None:
         if cursor == cancel_index:
-            event.app.exit(result=None)
+            host.finish(None)
         elif multi:
             marked.symmetric_difference_update({cursor})
 
     def _cancel(event: Any) -> None:
-        event.app.exit(result=None)
+        host.finish(None)
 
     bindings = _register(
         {
@@ -1133,11 +1212,11 @@ def question_select(
             nonlocal cursor
             cursor = index
             if index == cancel_index:
-                event.app.exit(result=None)
+                host.finish(None)
             elif multi:
                 marked.symmetric_difference_update({index})
             else:
-                event.app.exit(result=index)
+                host.finish(index)
 
         return handler
 
@@ -1166,22 +1245,15 @@ def question_select(
         return rows
 
     height = 2 + len(options) + sum(1 for _label, description in options if description)
-    window = Window(
-        FormattedTextControl(fragments, focusable=True, show_cursor=False),
-        height=height,
-        always_hide_cursor=True,
-    )
-    application: Application = Application(
-        layout=Layout(window),
-        key_bindings=bindings,
-        full_screen=False,
-        erase_when_done=True,
-        style=Style.from_dict(theme.ptk_style()),
-    )
-    return application.run()
+    return host.run(bindings, fragments, height)
 
 
-def ask_questions(questions: list[dict[str, Any]], console: Console) -> dict[str, str]:
+def ask_questions(
+    questions: list[dict[str, Any]],
+    console: Console,
+    host: MenuHost | None = None,
+    free_text: Callable[[str], str | None] | None = None,
+) -> dict[str, str]:
     """ask_user 工具的 TUI 侧交互：顺序逐题问，返回 {问题: 答案}。
 
     多题刻意**不做 Tab 分页**：行内面板 erase_when_done、一次一屏，
@@ -1192,6 +1264,9 @@ def ask_questions(questions: list[dict[str, Any]], console: Console) -> dict[str
     面板，已敲的草稿保留、下次进入预填。
     多选题勾了「其他」时，提交前先问自由输入，与勾选项合并成一个答案。
     面板上 Esc / Ctrl-C / 取消项 = 结束本轮并返回对话，已答部分交给工具层保留。
+
+    host / free_text 是前端的接缝：面板住在哪儿、自由输入那一行由谁来问
+    （草稿 → 文本，放弃返回 None）。不给就各起各的一次性输入。
     """
     answers: dict[str, str] = {}
     total = len(questions)
@@ -1200,11 +1275,16 @@ def ask_questions(questions: list[dict[str, Any]], console: Console) -> dict[str
     def prompt_other(draft: str) -> str | None:
         """自由输入一行；Esc/Ctrl-C/EOF → None（退回面板，草稿由调用方保留）。"""
         nonlocal session
+        if free_text is not None:
+            text = free_text(draft)
+            return None if text is None else text.strip()
         if session is None:
             session = PromptSession()
         try:
             return session.prompt(
-                [(theme.ptk("menu.title"), "  自由回答：")], default=draft
+                [(theme.ptk("menu.title"), "  自由回答：")],
+                default=draft,
+                handle_sigint=_owns_signals(),
             ).strip()
         except (EOFError, KeyboardInterrupt):
             print()
@@ -1232,7 +1312,7 @@ def ask_questions(questions: list[dict[str, Any]], console: Console) -> dict[str
             try:
                 result = question_select(
                     title, rows, multi=multi, checked=checked, selected=cursor,
-                    cancel_index=cancel_index,
+                    cancel_index=cancel_index, host=host,
                 )
             except Exception:  # noqa: BLE001 - 非常规终端起不了面板：退回文本问答，提问永远可用
                 from .cli import ask_one_text
@@ -1373,6 +1453,9 @@ class RichSink:
         self.on_safe_point: Callable[[], None] | None = None
         #  活区页脚来源（Tui 接线）：运行期输入行画在 spinner 下面
         self.live_footer: Callable[[], list[Text]] | None = None
+        #  活区指示的接手方（常驻输入区前端接线）：给了就不再起 rich 的 spinner，
+        #  而是把「正在画的那一行」交过去，由它画进自己的输入区；None = 收掉
+        self.activity: Callable[[Any | None], None] | None = None
 
     def emit(self, event: UIEvent) -> None:
         handler = self._handlers.get(type(event))
@@ -1402,6 +1485,12 @@ class RichSink:
         """确认框已把这次编辑的预览（diff / 新内容）打进 scrollback：完成行不再补。"""
         self._edit = None
 
+    def _gap(self) -> None:
+        """一个区块（一段正文、一次工具调用）开始前空一行。子 agent 的缩进输出
+        挂在父级的工具块里，不另起区块；非终端输出是给程序读的，也不加。"""
+        if self.verbose and not self.indent and self.console.is_terminal:
+            print()
+
     def _flush_text(self) -> None:
         """把行级渲染器攒着的半行打出去（TextEnd / 中断都要调：没有换行的末行
         不能跟着中断一起消失）。"""
@@ -1418,7 +1507,17 @@ class RichSink:
         管道/测试里也有确定值），不去问 shutil。"""
         return ui.budget(len(self.indent) + reserve, self.console.width)
 
+    def _start_status(self, line: Any) -> None:
+        if self.activity is not None:
+            self.activity(line)
+            return
+        self._status = self.console.status(line, spinner="dots")
+        with contextlib.suppress(Exception):
+            self._status.start()
+
     def _stop_status(self) -> None:
+        if self.activity is not None:
+            self.activity(None)
         if self._status is not None:
             with contextlib.suppress(Exception):
                 self._status.stop()
@@ -1449,12 +1548,9 @@ class RichSink:
         if not self.verbose or not self.console.is_terminal:
             return
         self._stop_status()
-        self._status = self.console.status(
-            _RunningLine(event.model, self.request_timeout, verb="思考中", footer=self.live_footer),
-            spinner="dots",
+        self._start_status(
+            _RunningLine(event.model, self.request_timeout, verb="思考中", footer=self.live_footer)
         )
-        with contextlib.suppress(Exception):
-            self._status.start()
 
     def _request_ended(self, event: RequestEnded) -> None:
         #  兜底：正常路径上活区早在首个正文/工具行时就收掉了，这里管的是
@@ -1475,9 +1571,7 @@ class RichSink:
             self._close_text()
             self._preparing_index = event.index
             self._running_line = _RunningLine(event.name, verb="生成参数中", footer=self.live_footer)
-            self._status = self.console.status(self._running_line, spinner="dots")
-            with contextlib.suppress(Exception):
-                self._status.start()
+            self._start_status(self._running_line)
         self._running_line.progress = ui.fit(render.preparation_text(event), width=self.console.width)
 
     def _text_delta(self, event: TextDelta) -> None:
@@ -1487,6 +1581,8 @@ class RichSink:
         self._flush_ro_group()
         if not self.verbose:
             return
+        if not self._text_open:
+            self._gap()
         self._text_open = True
         if not self._osc133_open and self.console.is_terminal:
             #  正文块起点的零宽锚点：终端把每段回复当可导航的"提示块"
@@ -1534,9 +1630,10 @@ class RichSink:
         preview = args_preview(
             event.name, event.args, len(self.indent) + len(event.name) + 3, self.console.width
         )
+        self._gap()
         self.console.print(
             Text.assemble(
-                (f"{self.indent}● {event.name}", "text.accent"),
+                (f"{self.indent}{TOOL_MARK}{event.name}", "text.accent"),
                 (f" {preview}", "text.secondary"),
             )
         )
@@ -1576,9 +1673,7 @@ class RichSink:
         self._stop_status()
         line = _RunningLine(event.name, self._timeout_for(event), footer=self.live_footer)
         self._running_line = line
-        self._status = self.console.status(line, spinner="dots")
-        with contextlib.suppress(Exception):
-            self._status.start()
+        self._start_status(line)
 
     def _tool_progress(self, event: ToolProgress) -> None:
         """工具自报的进度写进活区那一行（没有活区就丢：进度是可覆盖的状态，
@@ -2265,7 +2360,7 @@ class Tui:
         if get_app_or_none() is None:
             _print()
         else:
-            run_in_terminal(_print)
+            self._above(_print)
 
     def _take_image(self, data: bytes, source: str = "") -> str | None:
         """字节 → chip 文本；不合格时打一行原因并返回 None。
@@ -2360,6 +2455,46 @@ class Tui:
         else:
             buffer.complete_next()
 
+    def _hand_off(self, buffer: Any) -> None:
+        """回车落定之后把这一行交出去。默认是结束这次 prompt、由主循环接住；
+        常驻输入区前端改成「取走文本、输入行留在原地」。"""
+        buffer.validate_and_handle()
+
+    def _turn_tail(self, agent: Agent) -> None:
+        """一轮收尾的几行：还在跑的后台任务、小结、展开提示。有任何一行就先空
+        一行，和最后一段正文隔开。
+
+        still-running 状态行：inline 架构下轮次结束打一行即走，与明文 REPL 同一份
+        文案（cli.background_status）。
+        """
+        from .cli import background_status, turn_stats_line
+
+        rows: list[Text] = []
+        if note := background_status(agent):
+            rows.append(Text(note, style="text.secondary"))
+        if stats := turn_stats_line(agent, interactive=True):
+            rows.append(turn_summary(stats))
+        if rows or (self.sink.truncated and not self.sink.detail):
+            print()
+        for row in rows:
+            self.console.print(row)
+        self._print_expand_hint()
+
+    def _echo(self, text: str, literal: bool) -> None:
+        """输入行不留在原地，把这一行补打进 scrollback：回头翻记录时最先要找的
+        就是「我在哪儿问的」。对模型说的话是带底色的区块；命令（/、!、#）是对
+        程序说的，只留提示符与原文，不抢眼。"""
+        if keys.classify_input(text, literal=literal).kind == "send":
+            self.console.print(user_echo(text))
+        else:
+            body = text.replace("\n", "\n  ")
+            self.console.print(Text.assemble((USER_MARK, "prompt"), (body, "")))
+
+    def _above(self, action: Callable[[], None]) -> None:
+        """输入行挂着时往它上方打字。默认借 prompt_toolkit 把输入行让开再打；
+        常驻输入区前端的打印本来就落在输入区上方，直接打即可。"""
+        run_in_terminal(action)
+
     def _input_session(self) -> PromptSession:
         if self._session is None:
             history_dir = user_config_dir()
@@ -2386,6 +2521,8 @@ class Tui:
                 prompt_continuation=lambda width, line_number, is_soft_wrap: " " * width,
                 #  prompt_toolkit 自带的 Ctrl-X Ctrl-E：长指令拉到 $EDITOR 里改
                 enable_open_in_editor=True,
+                #  输入行提交后收走，原话由 _echo 补打成带底色的区块
+                erase_when_done=True,
             )
         return self._session
 
@@ -2421,7 +2558,7 @@ class Tui:
             if expanded != buffer.text:
                 buffer.text = expanded
                 buffer.cursor_position = len(expanded)
-            buffer.validate_and_handle()
+            self._hand_off(buffer)
 
         def _tab(event: Any) -> None:
             self._tab_complete(event.current_buffer)
@@ -2489,7 +2626,7 @@ class Tui:
                         )
                     )
 
-            run_in_terminal(_report)
+            self._above(_report)
 
         def _recall(event: Any) -> None:
             if self._last_input:
@@ -2512,7 +2649,7 @@ class Tui:
             ):
                 self._warned_no_sandbox = True
                 text = modes.describe(modes.AUTO, sandbox_ready=False)
-                run_in_terminal(
+                self._above(
                     lambda: self.console.print(Text(f"  {text}", style="status.warning"))
                 )
 
@@ -2543,7 +2680,7 @@ class Tui:
         fragments: list[tuple[str, str]] = []
         if mode.marker:
             fragments.append((theme.ptk(mode.style), f"{mode.marker} {mode.label} "))
-        fragments.append((theme.ptk("prompt"), "› "))
+        fragments.append((theme.ptk("prompt"), USER_MARK))
         return fragments
 
     def _live_footer(self) -> list[Text]:
@@ -2570,7 +2707,7 @@ class Tui:
             hint = "  Enter 送出 · Esc 清空"
             shown = _tail_fit(draft.replace("\n", " ⏎ "), max(8, width - len(hint) * 2))
             lines.append(
-                Text.assemble(("› ", "text.accent"), (shown, ""), ("▏", ""), (hint, "text.secondary"))
+Text.assemble((USER_MARK, "text.accent"), (shown, ""), ("▏", ""), (hint, "text.secondary"))
             )
         elif waiting:
             lines.append(Text("  Esc 撤回最后一条", style="text.secondary"))
@@ -2736,7 +2873,9 @@ class Tui:
         self.sink._stop_status()  # noqa: SLF001 - 同模块前端搭档
         attention.waiting(attention.WAITING_INPUT)
         try:
-            return ask_questions(questions, self.console)
+            return ask_questions(
+                questions, self.console, host=self._menu_host(), free_text=self._free_text()
+            )
         finally:
             attention.running()
             if self._poller is not None:
@@ -2760,14 +2899,12 @@ class Tui:
                     style="text.secondary",
                 )
             )
-            if self._confirm_session is None:
-                self._confirm_session = PromptSession()
             try:
-                return self._confirm_session.prompt(
+                return self._confirm_prompt(
                     [(theme.ptk("menu.title"), "  密码：")], is_password=True
                 )
             except (EOFError, KeyboardInterrupt):
-                print()
+                self._prompt_abandoned()
                 return None
         finally:
             attention.running()
@@ -2918,30 +3055,32 @@ class Tui:
             return f"要{verb} {base} 吗？"
         return f"允许执行 {name} 吗？"
 
+    def _confirm_prompt(self, message: Any, **kwargs: Any) -> str:
+        """确认流程里的单行追问（规则编辑、附言、拒绝理由、密码）共用的输入行。"""
+        if self._confirm_session is None:
+            self._confirm_session = PromptSession()
+        return self._confirm_session.prompt(message, handle_sigint=_owns_signals(), **kwargs)
+
     def _ask_rule(self, rule: str, empty_means: str = "仅本次允许") -> str | None:
         """「总是允许」/「以后都拒绝」的规则写入前可编辑（选项预填推导出的规则）。
         回车接受原文；置空 = 不写规则、只按本次的判定走；Esc/Ctrl-C = 取消。"""
-        if self._confirm_session is None:
-            self._confirm_session = PromptSession()
         try:
-            return self._confirm_session.prompt(
+            return self._confirm_prompt(
                 [(theme.ptk("menu.title"), f"  规则（可编辑，置空 = {empty_means}）：")], default=rule
             )
         except (EOFError, KeyboardInterrupt):
-            print()
+            self._prompt_abandoned()
             return None
 
     def _ask_note(self) -> str:
         """Tab 附言：批准的同时给模型一句
         指示，随这次 tool result 回灌。空输入 = 不附言。"""
-        if self._confirm_session is None:
-            self._confirm_session = PromptSession()
         try:
-            return self._confirm_session.prompt(
+            return self._confirm_prompt(
                 [(theme.ptk("menu.title"), "  附加指示（回车跳过）：")]
             ).strip()
         except (EOFError, KeyboardInterrupt):
-            print()
+            self._prompt_abandoned()
             return ""
 
     def _inline_select(
@@ -2951,18 +3090,28 @@ class Tui:
         expand: Callable[[], None] | None = None,
     ) -> Any:
         """确认框的行内单选：通用件 inline_select 的带附言（Tab）形态。"""
-        return inline_select(title, options, amend=True, expand=expand)
+        return inline_select(title, options, amend=True, expand=expand, host=self._menu_host())
+
+    def _menu_host(self) -> MenuHost | None:
+        """确认菜单与提问面板的宿主；None = 各起一个一次性的小应用。"""
+        return None
+
+    def _free_text(self) -> Callable[[str], str | None] | None:
+        """提问面板「其他」项的自由输入由谁来问；None = 面板自己起一行输入。"""
+        return None
+
+    def _prompt_abandoned(self) -> None:
+        """追问输入行被 Esc / Ctrl-C 放弃：光标还停在那一行上，换到下一行。"""
+        print()
 
     def _ask_reason(self) -> str:
         """拒绝之后追问一句"下一步怎么做"：拒绝即改指令，不让模型干猜。"""
-        if self._confirm_session is None:
-            self._confirm_session = PromptSession()
         try:
-            return self._confirm_session.prompt(
+            return self._confirm_prompt(
                 [(theme.ptk("menu.title"), "  下一步该怎么做？（回车 = 仅拒绝）")]
             ).strip()
         except (EOFError, KeyboardInterrupt):
-            print()
+            self._prompt_abandoned()
             return ""
 
     def _echo_verdict(self, text: str) -> None:
@@ -2972,8 +3121,6 @@ class Tui:
         """菜单起不来时的回退：与 cli.make_confirm 相同的文本问答语义。"""
         from .cli import GRANT_SESSION, interpret_confirm_answer
 
-        if self._confirm_session is None:
-            self._confirm_session = PromptSession()
         escalation = bool(ui.escalation_notice(args)) if name == "bash" else False
         verb = "升权执行" if escalation else "执行"
         session_option = (
@@ -2981,7 +3128,7 @@ class Tui:
             if self.permissions.session_grant_label(name, args) is not None else ""
         )
         try:
-            answer = self._confirm_session.prompt(
+            answer = self._confirm_prompt(
                 [
                     (
                         theme.ptk("menu.title"),
@@ -2990,7 +3137,7 @@ class Tui:
                 ]
             )
         except (EOFError, KeyboardInterrupt):
-            print()
+            self._prompt_abandoned()
             return False
 
         verdict = interpret_confirm_answer(answer)
@@ -3137,15 +3284,8 @@ class Tui:
         finally:
             attention.clear_title()
 
-    def _run_loop(self, agent: Agent) -> int:
-        from .cli import handle_slash, skill_prompt
-
-        self.agent = agent
-        #  空闲时到达的后台事件：打一行提示，不替用户开新的一轮
-        agent.on_notification = self._on_notification
-        self.sink.bash_timeout = agent.config.bash_timeout
-        self.sink.request_timeout = int(agent.config.request_timeout)
-        self.sink.workspace = Path(agent.config.workspace)
+    def _startup_notices(self, agent: Agent) -> None:
+        """进循环前打一次的提示：放开护栏 / 模式说明 / 按键速览 / 可展开的留底。"""
         if agent.config.unguarded:
             from . import guardrails
 
@@ -3159,11 +3299,15 @@ class Tui:
         if agent.mode != modes.DEFAULT and not (
             agent.config.auto_approve and agent.mode == modes.AUTO
         ):
-            #  --mode auto 起手：提示符上的标记不解释"这一档会不会问你"，开场说一次
+            #  --mode auto 起手：提示符上的标记不解释"这一档会不会问你"，开场说一次。
+            #  auto 是出厂起始档，每次开场都在：用横幅小标题的强调色，是说明不是警报；
+            #  沙箱不可用的降级和 plan 档才用警告色——那两种是容易会错意的状态
+            ready = agent.sandbox_ready()
+            calm = agent.mode == modes.AUTO and ready
             self.console.print(
                 Text(
-                    modes.describe(agent.mode, sandbox_ready=agent.sandbox_ready()),
-                    style="status.warning",
+                    modes.describe(agent.mode, sandbox_ready=ready),
+                    style="banner.accent" if calm else "status.warning",
                 )
             )
             self._warned_no_sandbox = True
@@ -3173,7 +3317,19 @@ class Tui:
         #  这是它被 begin_turn 清掉之前唯一的展开窗口
         self._print_expand_hint()
 
+    def _run_loop(self, agent: Agent) -> int:
+        from .cli import handle_slash, skill_prompt
+
+        self.agent = agent
+        #  空闲时到达的后台事件：打一行提示，不替用户开新的一轮
+        agent.on_notification = self._on_notification
+        self.sink.bash_timeout = agent.config.bash_timeout
+        self.sink.request_timeout = int(agent.config.request_timeout)
+        self.sink.workspace = Path(agent.config.workspace)
+        self._startup_notices(agent)
+
         session = self._input_session()
+        print()  # 开场提示与第一句话之间空一行（之后每轮收尾各自留了空行）
         last_interrupt = 0.0
         #  等待期敲的整行输入：预填进下一轮输入行，不自动提交
         queued = ""
@@ -3210,6 +3366,7 @@ class Tui:
             action = keys.classify_input(line, literal=literal)
             if action.kind == "empty":
                 continue
+            self._echo(line, literal)
             if action.kind == "usage":
                 self.console.print(Text(f"  {action.hint}", style="text.secondary"))
                 continue
@@ -3282,17 +3439,7 @@ class Tui:
                 #  敲了一半没按回车的草稿：和没赶上的插话一起预填回输入行
                 unsent = self._poller.draft.take()
                 self._poller = None
-            #  still-running 状态行：inline 架构没有常驻状态栏，
-            #  轮次结束打一行即走，与明文 REPL 同一份文案（cli.background_status）
-            from .cli import background_status
-
-            if note := background_status(agent):
-                self.console.print(Text(note, style="text.secondary"))
-            from .cli import turn_stats_line
-
-            if stats := turn_stats_line(agent, interactive=True):
-                self.console.print(Text(f"  {stats}", style="text.secondary"))
-            self._print_expand_hint()
+            self._turn_tail(agent)
             #  一轮收尾 = 回到"等人"：铃（opt-in）+ 状态钩子，把切去别处的人叫回来
             attention.waiting(attention.WAITING_INPUT)
             #  没赶上本轮的插话（模型收尾后才按的回车）+ 等待期敲的其余内容：

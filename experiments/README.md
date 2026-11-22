@@ -38,6 +38,7 @@ nohup bash -c "trap '' HUP; exec ./experiments/compaction_e2e.sh" >/tmp/run.log 
 | `compaction_e2e.sh` | 上下文压缩 + 便宜模型摘要，6 条显式判定 |
 | `edit_precision_e2e.sh` | 130 行文件定点改，用 diff 抓整文件重写 |
 | `fixtures/multihop_repo.py` | 4 层间接跳转 + 诱饵常量的仓库 |
+| `persistent_prompt_proto.py` | 常驻输入区原型：不调模型，`--selfcheck` 在 tmux 里按四条判据自动验收 |
 | `fixtures/versioned_modules.py` | 5 个大模块，各带一个 VERSION 常量 |
 | `standin_ab.py --arm 名字=引用 … --scenario …` | 替身运维环境里的版本对比：重启后停不停、连不上追不追、说不说话 |
 | `fixtures/standin_ops.py` | 替身环境：假机群 CLI、连上即断的假 ssh、立即返回的假 sleep |

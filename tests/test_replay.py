@@ -1,7 +1,7 @@
 """resume 回放（render.replay_transcript）的测试。
 
 锁住三件事：
-1. 历史消息 → 事件流的翻译规则：user 走 Notice「› …」、assistant 正文走
+1. 历史消息 → 事件流的翻译规则：user 走 Notice「❯ …」、assistant 正文走
    TextDelta/TextEnd、工具调用在结果处 pending→completed 成对补发；
 2. 边界：synthetic user 文案跳过、超长截断、坏参数 JSON 容错、
    没等到结果的调用不补发、空输入返回 0 且不打 header；
@@ -45,14 +45,14 @@ class TestReplayTranscript(unittest.TestCase):
             sink.kinds(),
             [
                 "notice",  # header
-                "notice",  # › 看一下 calc.py
+                "notice",  # ❯ 看一下 calc.py
                 "tool.pending", "tool.completed",
                 "text.delta", "text.end",
                 "notice",  # 收尾空行
             ],
         )
         self.assertEqual(sink.events[0].text, "── 回放 ──")
-        self.assertEqual(sink.events[1].text, "› 看一下 calc.py")
+        self.assertEqual(sink.events[1].text, "❯ 看一下 calc.py")
         pending = sink.events[2]
         self.assertIsInstance(pending, ToolPending)
         self.assertEqual(pending.name, "read_file")
@@ -99,7 +99,7 @@ class TestReplayTranscript(unittest.TestCase):
         self.assertEqual(len(delta.text.splitlines()), _REPLAY_TEXT_LINES)
         notices = [e.text for e in sink.events if isinstance(e, Notice)]
         self.assertTrue(any("…还有 10 行" in text for text in notices), notices)
-        user_echo = next(text for text in notices if text.startswith("› "))
+        user_echo = next(text for text in notices if text.startswith("❯ "))
         self.assertIn("…还有 2 行", user_echo)
 
     def test_orphan_call_without_result_is_not_replayed(self) -> None:
@@ -170,7 +170,7 @@ class TestReplayTranscript(unittest.TestCase):
             replay_transcript(messages, PlainSink(), header="── 回放 ──")
         out = buffer.getvalue()
         self.assertIn("── 回放 ──", out)
-        self.assertIn("› 看一下", out)
+        self.assertIn("❯ 看一下", out)
         self.assertIn("⚙ grep", out)
         self.assertIn("找到了", out)
 

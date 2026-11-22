@@ -272,6 +272,7 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="禁用增强交互界面（补全/历史/粘贴折叠），用明文 REPL",
     )
+    add_classic_flag(parser)
     parser.add_argument(
         "--trust",
         action="store_true",
@@ -292,6 +293,14 @@ def build_parser() -> argparse.ArgumentParser:
     add_output_format(parser)
     add_stats_flag(parser)
     return parser
+
+
+def add_classic_flag(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--classic",
+        action="store_true",
+        help="用原来的终端样式：输入行只在轮到你说话时出现（默认是常驻输入区）",
+    )
 
 
 def add_system_prompt_flags(parser: argparse.ArgumentParser) -> None:
@@ -1441,6 +1450,7 @@ def resume_command(argv: list[str]) -> int:
     )
     parser.add_argument("--yolo", action="store_true", help="不再逐个确认写文件和执行命令")
     parser.add_argument("--no-tui", dest="no_tui", action="store_true", help="用明文 REPL")
+    add_classic_flag(parser)
     parser.add_argument(
         "--model",
         default=None,
@@ -1615,7 +1625,7 @@ def resume_command(argv: list[str]) -> int:
             repl_fn, note, asker, secret_prompt = repl, None, None, None
         else:
             approver, sink, repl_fn, note, asker, secret_prompt = make_frontend(
-                permissions, args.no_tui
+                permissions, args.no_tui, args.classic
             )
         peer = register_peer(config, interactive=not prompt)
         agent = Agent(
@@ -1660,7 +1670,7 @@ def resume_command(argv: list[str]) -> int:
         if args.output_format == "text":
             print(ui.secondary(f"已恢复会话（{len(loaded)} 条消息，来自 {chosen.path.name}{forked}）"))
         return run_once(agent, prompt, args.output_format, output_schema)
-    print(build_banner(model_label(agent), str(config.workspace)))
+    print_banner(model_label(agent), str(config.workspace))
     print_update_notice()
     if budget_note := skills.budget_warning():
         print(ui.secondary(budget_note))
@@ -2442,12 +2452,24 @@ def _hint_keychain_leftover() -> None:
     )
 
 
-def make_frontend(permissions: Permissions, no_tui: bool = False):
+def print_banner(model: str, workspace: str) -> None:
+    """打开场横幅。常驻输入区前端接管了 stdout 时把它登记成「随宽度重算的块」：
+    窗口缩放后整屏重打，横幅按新宽度重新排，而不是把旧宽度的框折坏。"""
+    block = getattr(sys.stdout, "block", None)
+    if callable(block):
+        block(lambda: build_banner(model, workspace))
+    else:
+        print(build_banner(model, workspace))
+
+
+def make_frontend(permissions: Permissions, no_tui: bool = False, classic: bool = False):
     """选择交互前端，返回 (approver, sink, repl_fn, note, asker, secret_prompt)。
 
     TUI 条件：未被 --no-tui 禁用 + stdin/stdout 都是真实终端 + 装了可选依赖
     （prompt_toolkit/rich）。任一不满足退回明文 REPL——sink=None 表示用
     Agent 默认的 PlainSink。note 是给用户的一行提示（当前仅"可装 TUI"）。
+    TUI 有两个前端：默认是常驻输入区（tui_live），`classic` 或
+    `XIAOYU_LIVE_INPUT=0` 选原来那个（tui）。
     asker 是 ask_user 工具的提问通道：TUI 走行内面板，明文 REPL 走编号问答
     ——交互前端总有人在，提问永远可用；headless 才是 None（工具不进 schemas）。
     secret_prompt 是 sudo 要密码时的通道（见 askpass.py）：TUI 走遮罩输入框，
@@ -2472,7 +2494,17 @@ def make_frontend(permissions: Permissions, no_tui: bool = False):
             text_ask_questions,
             text_secret_prompt,
         )
-    front = tui.Tui(permissions)
+    front_class = tui.Tui
+    #  常驻输入区前端是默认；--classic 或 XIAOYU_LIVE_INPUT=0 回到原来的。
+    #  Windows 的控制台没有它依赖的那套光标与折行语义，一律用原来的
+    if sys.platform != "win32" and not classic:
+        from . import tui_live
+
+        if tui_live.enabled():
+            front_class = tui_live.LiveTui
+    front = front_class(permissions)
+    if begin := getattr(front, "begin_recording", None):
+        begin()
     return front.confirm, front.sink, front.run, None, front.ask, front.secret_prompt
 
 
@@ -2870,7 +2902,7 @@ def main(argv: list[str] | None = None) -> int:
             repl_fn, note, asker, secret_prompt = repl, None, None, None
         else:
             approver, sink, repl_fn, note, asker, secret_prompt = make_frontend(
-                permissions, args.no_tui
+                permissions, args.no_tui, args.classic
             )
         try:
             session_log, restored = open_session(config, args.session_id)
@@ -2938,7 +2970,7 @@ def main(argv: list[str] | None = None) -> int:
         if resumed and args.output_format == "text":
             print(ui.secondary(resumed))
         return run_once(agent, user_input, args.output_format, output_schema)
-    print(build_banner(model_label(agent), str(config.workspace)))
+    print_banner(model_label(agent), str(config.workspace))
     print_update_notice()
     if env_files:
         print(ui.secondary("已加载 " + ", ".join(str(p) for p in env_files)))
@@ -3421,7 +3453,7 @@ def _repl_loop(agent: Agent) -> int:
     while True:
         idle[0] = True
         try:
-            line = input(ui.prompt(f"{modes.prompt_prefix(agent.mode)}› "))
+            line = input(ui.prompt(f"{modes.prompt_prefix(agent.mode)}❯ "))
         except (EOFError, KeyboardInterrupt):
             print()
             return 0

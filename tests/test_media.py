@@ -742,8 +742,8 @@ class InjectedUserTextTest(unittest.TestCase):
                     seen.append(event.text)
 
         render.replay_transcript(self._history(), Sink())
-        user_lines = [t for t in seen if t.startswith("› ")]
-        self.assertEqual(user_lines, ["› 你好"])
+        user_lines = [t for t in seen if t.startswith("❯ ")]
+        self.assertEqual(user_lines, ["❯ 你好"])
 
     def test_turn_starts_skips_injected_user_entries(self):
         self.assertEqual(session_log.turn_starts(self._history(), frozenset()), [0])
