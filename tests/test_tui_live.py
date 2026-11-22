@@ -569,10 +569,19 @@ class InterruptibleIoTest(unittest.TestCase):
         #  流总时限记在上下文变量里，挪到辅助线程后还得查得到
         from xiaoyu.streaming import StreamLifetimeExceeded, check_deadline, stream_scope
 
+        import time
+
         agent = self.agent()
-        with stream_scope(1e-9):
+
+        def late_check() -> None:
+            #  等过时钟的粒度再查：Windows 上旧版解释器的单调时钟约 15 毫秒才走一格，
+            #  立刻查的话时限还没到
+            time.sleep(0.05)
+            check_deadline()
+
+        with stream_scope(0.001):
             with self.assertRaises(StreamLifetimeExceeded):
-                agent._blocking(check_deadline)
+                agent._blocking(late_check)
 
 
 if __name__ == "__main__":
