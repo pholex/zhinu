@@ -78,6 +78,11 @@ HISTORY_LINES = 5000
 #  既闪又慢
 _SETTLE = 0.12
 _TICK = 1 / 30
+#  作答中 Esc 是打断。终端把方向键、Alt 组合键也发成 Esc 开头的一串，所以单按 Esc
+#  要等一等才认：先等后面还有没有字节，再等它是不是某个组合键的开头。默认两段
+#  共 1.5 秒，打断慢得像没反应；作答期间各压到这么短。一次按键的字节是一起到
+#  的，这点时间够分辨
+_ESC_WAIT = 0.1
 
 # ---------------------------------------------------------------------------
 # 带转义序列的文本：宽度与折行
@@ -695,6 +700,7 @@ class LiveTui(Tui):
         #  作答期间敲的斜杠命令：工作线程在事件之间的安全点取走
         self._commands: collections.deque[str] = collections.deque()
         self._activity: Any | None = None
+        self._key_waits: tuple[float, float | None] | None = None
         self._last_interrupt = 0.0
         self._exit_code = 0
         #  底部那一行右侧的事实：分支与改动量、上下文用量。工作线程在回合之间刷新
@@ -738,6 +744,7 @@ class LiveTui(Tui):
         session.reserve_space_for_menu = 0
         app = session.app
         app.erase_when_done = True
+        app.before_render += self._tune_escape
         menu_open = Condition(lambda: self._panel is not None and self._panel.kind == "menu")
         #  菜单挂着时输入行的键全部停用，只剩菜单自己的；排在后面的优先
         bindings = merge_key_bindings(
@@ -1051,6 +1058,7 @@ class LiveTui(Tui):
         bindings.add("<sigint>")(interrupt)
         #  作答中 Esc 也是打断。不设成立即生效：终端把 Alt-Enter 发成 Esc 加回车，
         #  立即生效会把换行吃掉；代价是单按 Esc 要等组合键判定那一小会儿
+        #  （作答期间压短了，见 _ESC_WAIT）
         bindings.add(
             "escape",
             filter=Condition(lambda: self._busy == "turn" and self._panel is None),
@@ -1060,7 +1068,19 @@ class LiveTui(Tui):
     # ---- 主线程：跨线程来的事 ----
 
     def _set_activity(self, line: Any | None) -> None:
+        if line is not None:
+            #  这里打断键是 Esc，活动行与底部一行说的是同一个键
+            with contextlib.suppress(AttributeError):
+                line.interrupt_hint = "Esc 打断"
         self._activity = line
+
+    def _tune_escape(self, app: Any) -> None:
+        """每次重画前：Esc 此刻是打断就少等，否则用回原来的等法（Esc Esc 取回上一条、
+        手敲 Esc 再回车当换行，都靠那段较长的等待）。"""
+        if self._key_waits is None:
+            self._key_waits = (app.ttimeoutlen, app.timeoutlen)
+        quick = self._busy == "turn" and self._panel is None
+        app.ttimeoutlen, app.timeoutlen = (_ESC_WAIT, _ESC_WAIT) if quick else self._key_waits
 
     def _on_suggestions(self, items: list[str]) -> None:
         if self._busy == "turn":

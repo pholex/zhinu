@@ -328,6 +328,8 @@ class _RunningLine:
     _QUIET = 4.0  # 这之前不打扰
     _CYCLE = 8.0  # 每条提示停留多久
     _LONG = 30.0  # 这之后换成耗时/上限
+    #  怎么停下来。常驻输入区前端里打断键是 Esc，由它改写这一项
+    interrupt_hint = "Ctrl-C 中断"
 
     def __init__(
         self,
@@ -371,12 +373,12 @@ class _RunningLine:
         """(要提亮的按键, 其余文字)；没有按键可提亮时前一项为空。"""
         if elapsed >= self._LONG:
             budget = f"上限 {self.timeout}s · " if self.timeout else ""
-            return "", f"{budget}Ctrl-C 中断"
+            return "", f"{budget}{self.interrupt_hint}"
         if elapsed < self._QUIET:
-            return "", "Ctrl-C 中断"
+            return "", self.interrupt_hint
         rotation = [*keys.tip_parts(), *(("", tip) for tip in _EXTRA_TIPS)]
         if not rotation:
-            return "", "Ctrl-C 中断"
+            return "", self.interrupt_hint
         index = (self._tip_start + int((elapsed - self._QUIET) // self._CYCLE)) % len(rotation)
         return rotation[index]
 

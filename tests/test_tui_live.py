@@ -428,6 +428,52 @@ class PanelTest(unittest.TestCase):
         self.assertIsNone(front._panel)
 
 
+@unittest.skipUnless(HAVE_TUI, "没装 TUI 可选依赖")
+class EscapeTest(unittest.TestCase):
+    """作答中 Esc 是打断：认得快，提示里说的也是它。"""
+
+    def front(self):
+        from pathlib import Path
+
+        from rich.console import Console
+
+        from xiaoyu.permissions import Permissions
+        from xiaoyu.tui_live import LiveTui
+
+        with tempfile.TemporaryDirectory() as folder:
+            return LiveTui(Permissions(Path(folder)), console=Console(file=io.StringIO()))
+
+    def test_escape_is_recognised_quickly_only_while_it_interrupts(self) -> None:
+        from xiaoyu.tui_live import _ESC_WAIT
+
+        front = self.front()
+        app = SimpleNamespace(ttimeoutlen=0.5, timeoutlen=1.0)
+        front._tune_escape(app)
+        self.assertEqual((app.ttimeoutlen, app.timeoutlen), (0.5, 1.0))
+        front._busy = "turn"
+        front._tune_escape(app)
+        self.assertEqual((app.ttimeoutlen, app.timeoutlen), (_ESC_WAIT, _ESC_WAIT))
+        #  面板挂着时 Esc 是取消面板，不是打断
+        front._panel = SimpleNamespace(kind="menu")
+        front._tune_escape(app)
+        self.assertEqual((app.ttimeoutlen, app.timeoutlen), (0.5, 1.0))
+        front._panel = None
+        front._busy = "job"
+        front._tune_escape(app)
+        self.assertEqual((app.ttimeoutlen, app.timeoutlen), (0.5, 1.0))
+
+    def test_activity_line_names_the_same_key_as_the_footer(self) -> None:
+        from xiaoyu.tui import _RunningLine
+
+        self.assertIn("Ctrl-C", _RunningLine.interrupt_hint)
+        front = self.front()
+        line = SimpleNamespace()
+        front.sink.activity(line)
+        self.assertEqual(line.interrupt_hint, "Esc 打断")
+        front.sink.activity(None)
+        self.assertIsNone(front._activity)
+
+
 class InterruptibleIoTest(unittest.TestCase):
     """agent 在工作线程里跑时，打断要能打进卡在网络读上的那一刻（Agent._blocking）。"""
 
