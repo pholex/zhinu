@@ -447,7 +447,8 @@ TURN_MARK = "✻ "
 
 
 def user_echo(text: str) -> Text:
-    """用户原话在 scrollback 里的样子：❯ 开头（与输入行的提示符同形），带底色。
+    """用户原话在 scrollback 里的样子：❯ 开头（与输入行的提示符同形），整段用
+    强调色、带底色——和模型的回答不同色，回翻时不靠细看就分得开。
 
     多行只标第一行，其余缩进对齐——逐行都标的话，从屏幕上复制一段多行原话要
     手动删好几个前缀。底色只到文字末尾、不铺满整行：打进 scrollback 的字改
@@ -455,7 +456,7 @@ def user_echo(text: str) -> Text:
     """
     rows: list[Text] = []
     for index, row in enumerate(text.split("\n")):
-        line = Text.assemble((USER_MARK if index == 0 else "  ", "text.accent"), row)
+        line = Text.assemble((USER_MARK if index == 0 else "  ", "text.accent"), (row, "text.accent"))
         line.stylize("prompt.echo")
         rows.append(line)
     return Text("\n").join(rows)
