@@ -446,18 +446,16 @@ TOOL_MARK = "● "
 TURN_MARK = "✻ "
 
 
-def user_echo(text: str, width: int) -> Text:
-    """用户原话在 scrollback 里的样子：❯ 开头（与输入行的提示符同形），整行铺底色。
+def user_echo(text: str) -> Text:
+    """用户原话在 scrollback 里的样子：❯ 开头（与输入行的提示符同形），带底色。
 
     多行只标第一行，其余缩进对齐——逐行都标的话，从屏幕上复制一段多行原话要
-    手动删好几个前缀。底色铺到差一格满行：恰好写满一行再清行尾，部分终端会
-    抹掉最后一格。
+    手动删好几个前缀。底色只到文字末尾、不铺满整行：打进 scrollback 的字改
+    不了，铺满得用空格补到当时的行宽，之后窗口一缩窄这一行就折成两行。
     """
     rows: list[Text] = []
     for index, row in enumerate(text.split("\n")):
         line = Text.assemble((USER_MARK if index == 0 else "  ", "text.accent"), row)
-        span = max(1, width - 1)
-        line.append(" " * (-line.cell_len % span))
         line.stylize("prompt.echo")
         rows.append(line)
     return Text("\n").join(rows)
@@ -2486,7 +2484,7 @@ class Tui:
         就是「我在哪儿问的」。对模型说的话是带底色的区块；命令（/、!、#）是对
         程序说的，只留提示符与原文，不抢眼。"""
         if keys.classify_input(text, literal=literal).kind == "send":
-            self.console.print(user_echo(text, self.console.width))
+            self.console.print(user_echo(text))
         else:
             body = text.replace("\n", "\n  ")
             self.console.print(Text.assemble((USER_MARK, "prompt"), (body, "")))

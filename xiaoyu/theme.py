@@ -142,7 +142,7 @@ _DARK: dict[str, Style] = {
     "diff.removed.word": Style(base="white", on=52),
     #  交互件
     "prompt": Style(base="green"),
-    #  scrollback 里用户原话那一行的底色（整行铺满，回翻时一眼找到自己问的）
+    #  scrollback 里用户原话的底色（只到文字末尾，回翻时一眼找到自己问的）
     "prompt.echo": Style(on=236),
     "menu.title": Style(base="yellow"),
     "menu.selected": Style(base="cyan", bold=True),
