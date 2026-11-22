@@ -1173,6 +1173,10 @@ class Agent:
         #  库层嵌入用：宿主可从任意线程/协程调用 interrupt()，线程安全，
         #  不依赖 OS 信号。_consume_stream 在下一个 chunk 边界自己发现并收尾。
         self._interrupt_flag = threading.Event()
+        #  打断能不能打进「卡在网络读上」的那一刻（见 _blocking）。默认不开：靠
+        #  Ctrl-C 信号打断主线程的前端用不着；把 agent 放进工作线程跑、只能靠
+        #  interrupt() 打断的宿主（常驻输入区前端）自己打开
+        self.interruptible_io = False
         #  子 agent 用：问父级"你被打断了吗"。父级被打断时，在飞的子 agent 在自己的
         #  下一个检查点跟着停——不然父级要等它自己跑完才停得下来。
         #  只问不清：那是父级的标志，由父级在自己的轮次开头清
@@ -2768,6 +2772,123 @@ class Agent:
         if self.interrupt_requested():
             self._interrupt_flag.clear()
             raise Interrupted("宿主请求打断")
+
+    def _blocking(self, call: Callable[[], Any]) -> Any:
+        """做一次会卡在网络上的调用（发请求），卡住期间仍能被打断。
+
+        打断只是置标志位，卡在 socket 读上的线程看不到它：上游迟迟不回首个
+        chunk 时，interrupt() 要等读超时（可能几分钟）才生效。打开
+        `interruptible_io` 后，调用挪到辅助线程里做，本线程一边等结果一边看
+        标志；被打断就丢下那次调用直接抛 Interrupted——调用方的收尾会关掉流，
+        辅助线程的读随之出错退出。结果的交接在一把锁里做：要么调用方拿走，
+        要么当场关掉，不会有流落在两边都不管的缝里。
+        辅助线程带着本线程的上下文跑（流总时限记在上下文变量里）。
+        """
+        if not self.interruptible_io:
+            return call()
+        import contextvars
+
+        box: queue.SimpleQueue[tuple[bool, Any]] = queue.SimpleQueue()
+        handoff = threading.Lock()
+        abandoned = threading.Event()
+        context = contextvars.copy_context()
+
+        def run() -> None:
+            try:
+                value = context.run(call)
+            except BaseException as exc:  # noqa: BLE001 - 原样带回调用线程再抛
+                box.put((False, exc))
+                return
+            with handoff:
+                if not abandoned.is_set():
+                    box.put((True, value))
+                    return
+            self._discard(value)
+
+        def abandon() -> None:
+            with handoff:
+                abandoned.set()
+            #  锁放开后辅助线程不会再往里放；抢在打断前放进去的那份在这里收掉
+            try:
+                ok, value = box.get_nowait()
+            except queue.Empty:
+                return
+            if ok:
+                self._discard(value)
+
+        threading.Thread(target=run, name="blocking-io", daemon=True).start()
+        return self._await(box, abandon)
+
+    @staticmethod
+    def _discard(value: Any) -> None:
+        """关掉一份没人要的结果（晚到的流）。"""
+        close = getattr(value, "close", None)
+        if callable(close):
+            try:
+                close()
+            except Exception:  # noqa: BLE001 - 没人要的结果，关不掉也无处可报
+                pass
+
+    def _await(
+        self, box: queue.SimpleQueue[tuple[bool, Any]], abandon: Callable[[], None]
+    ) -> Any:
+        """等辅助线程交回结果，一边等一边看打断标志；被打断先 `abandon` 再抛。"""
+        while True:
+            try:
+                ok, value = box.get(timeout=0.1)
+            except queue.Empty:
+                if self.interrupt_requested():
+                    abandon()
+                    self._checkpoint()
+                continue
+            if ok:
+                return value
+            raise value
+
+    def _events_of(self, stream: Any) -> Any:
+        """逐个取流事件；`interruptible_io` 打开时每次取都能被打断。
+
+        一条流只起一个辅助线程，按调用方的节奏一次取一个（不抢读）：每个事件
+        起一个线程的话，几千个 chunk 的长回复就是几千次线程创建。
+        每次取都带上调用方当时的上下文。
+        """
+        if not self.interruptible_io:
+            return stream
+        import contextvars
+
+        done = object()
+
+        def events() -> Any:
+            asks: queue.SimpleQueue[contextvars.Context | None] = queue.SimpleQueue()
+            box: queue.SimpleQueue[tuple[bool, Any]] = queue.SimpleQueue()
+
+            def pump() -> None:
+                while True:
+                    context = asks.get()
+                    if context is None:
+                        return
+                    try:
+                        item = context.run(next, stream, done)
+                    except BaseException as exc:  # noqa: BLE001 - 原样带回调用线程再抛
+                        box.put((False, exc))
+                        return
+                    box.put((True, item))
+                    if item is done:
+                        return
+
+            threading.Thread(target=pump, name="stream-events", daemon=True).start()
+            try:
+                while True:
+                    asks.put(contextvars.copy_context())
+                    item = self._await(box, lambda: None)
+                    if item is done:
+                        return
+                    yield item
+            finally:
+                #  读完、被打断、调用方中途不读了，都让辅助线程在手头这次取完后退出
+                asks.put(None)
+
+        return events()
 
     def _sleep(self, seconds: float) -> None:
         """可被打断的等待（退避用）：打断到达时立刻醒来并抛 Interrupted。"""
@@ -5319,7 +5440,9 @@ class Agent:
             self._checkpoint()
             with stream_scope(self.config.stream_max_lifetime):
                 try:
-                    source = route.client.chat.completions.create(**request)
+                    source = self._blocking(
+                        lambda: route.client.chat.completions.create(**request)
+                    )
                 except Interrupted:
                     raise
                 except Exception:
@@ -5561,7 +5684,7 @@ class Agent:
         #  编号最大 ≠ 最近在写（带 id 的分片可以把写入点拉回旧格），续错格
         #  就是把 arguments 拼成一坨坏 JSON
         last_index: int | None = max(pending) if pending else None
-        for chunk in stream:
+        for chunk in self._events_of(stream):
             #  库层嵌入：宿主的 interrupt() 在这个边界被发现。抛
             #  Interrupted（KeyboardInterrupt 子类）复用 _stream_once 里
             #  现成的收尾分支——半截话入历史、残缺 tool_calls 丢弃。

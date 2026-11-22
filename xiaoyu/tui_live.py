@@ -722,6 +722,8 @@ class LiveTui(Tui):
         import asyncio
 
         self.agent = agent
+        #  agent 在工作线程里跑，Ctrl-C 到不了它：打断要能打进卡在网络上的那一刻
+        agent.interruptible_io = True
         agent.on_notification = self._on_notification
         self.sink.bash_timeout = agent.config.bash_timeout
         self.sink.request_timeout = int(agent.config.request_timeout)
@@ -1039,8 +1041,19 @@ class LiveTui(Tui):
             buffer.reset()
             self.console.print(Text(hint, style="text.secondary"))
 
+        def stop(event: Any) -> None:
+            agent = self.agent
+            if agent is not None:
+                agent.interrupt()
+
         bindings.add("c-c")(interrupt)
         bindings.add("<sigint>")(interrupt)
+        #  作答中 Esc 也是打断。不设成立即生效：终端把 Alt-Enter 发成 Esc 加回车，
+        #  立即生效会把换行吃掉；代价是单按 Esc 要等组合键判定那一小会儿
+        bindings.add(
+            "escape",
+            filter=Condition(lambda: self._busy == "turn" and self._panel is None),
+        )(stop)
         return bindings
 
     # ---- 主线程：跨线程来的事 ----
@@ -1256,7 +1269,7 @@ class LiveTui(Tui):
             hints = "" if panel.kind == "menu" else " · enter 确认 · esc 取消"
         else:
             hints = " (shift+tab 切换)" + (
-                " · ctrl-c 打断 · enter 插话"
+                " · esc 打断 · enter 插话"
                 if self._busy == "turn"
                 else " · enter 发送 · ctrl-c ×2 退出"
             )

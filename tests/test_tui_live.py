@@ -262,7 +262,7 @@ class SwitchTest(unittest.TestCase):
             self.assertEqual(_git_facts(folder), "")
 
     def test_frontend_keeps_the_table_driven_keys(self) -> None:
-        #  新前端只多出打断 / 退出两个键，其余按键仍来自按键表
+        #  新前端只多出打断 / 退出（Ctrl-C 与信号）和作答中的 Esc，其余按键仍来自按键表
         from pathlib import Path
 
         from rich.console import Console
@@ -273,7 +273,7 @@ class SwitchTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as folder:
             front = LiveTui(Permissions(Path(folder)), console=Console(file=io.StringIO()))
         extra = {binding.keys for binding in front._live_bindings().bindings}
-        self.assertEqual(len(extra), 2)
+        self.assertEqual(len(extra), 3)
         self.assertIsNotNone(front.sink.activity)
         self.assertIsNone(front.sink.live_footer)
 
@@ -389,6 +389,153 @@ class PanelTest(unittest.TestCase):
         front._menu_host().finish("once")
         self.assertEqual(panel.result, "once")
         self.assertIsNone(front._panel)
+
+
+class InterruptibleIoTest(unittest.TestCase):
+    """agent 在工作线程里跑时，打断要能打进卡在网络读上的那一刻（Agent._blocking）。"""
+
+    def agent(self, enabled: bool = True):
+        from xiaoyu.agent import Agent
+
+        agent = Agent.__new__(Agent)
+        agent._interrupt_flag = threading.Event()
+        agent._upstream_stop = None
+        agent.interruptible_io = enabled
+        return agent
+
+    def test_result_and_errors_come_back_to_the_caller(self) -> None:
+        agent = self.agent()
+        self.assertEqual(agent._blocking(lambda: 42), 42)
+        with self.assertRaises(ZeroDivisionError):
+            agent._blocking(lambda: 1 // 0)
+
+    def test_interrupt_reaches_a_call_stuck_on_the_network(self) -> None:
+        import time
+
+        from xiaoyu.errors import Interrupted
+
+        agent = self.agent()
+        release = threading.Event()
+        closed = threading.Event()
+        stream = SimpleNamespace(close=closed.set)
+
+        def stuck():
+            release.wait(10)
+            return stream
+
+        threading.Timer(0.15, agent._interrupt_flag.set).start()
+        started = time.monotonic()
+        with self.assertRaises(Interrupted):
+            agent._blocking(stuck)
+        self.assertLess(time.monotonic() - started, 2)
+        #  被丢下的那次调用晚一步拿到了流：没人要，自己关掉
+        release.set()
+        self.assertTrue(closed.wait(2))
+
+    def test_stream_events_keep_order_and_end(self) -> None:
+        agent = self.agent()
+        self.assertEqual(list(agent._events_of(iter("abc"))), ["a", "b", "c"])
+
+    def test_result_that_beats_the_interrupt_is_closed_not_leaked(self) -> None:
+        #  调用刚交回流、打断就到了：这份流调用方拿不到，得有人关
+        import time
+
+        from xiaoyu.errors import Interrupted
+
+        agent = self.agent()
+        release = threading.Event()
+        closed = threading.Event()
+        stream = SimpleNamespace(close=closed.set)
+
+        def stuck():
+            release.wait(10)
+            return stream
+
+        def requested() -> bool:
+            release.set()
+            time.sleep(0.05)
+            agent._interrupt_flag.set()
+            return True
+
+        agent.interrupt_requested = requested
+        with self.assertRaises(Interrupted):
+            agent._blocking(stuck)
+        self.assertTrue(closed.wait(2))
+
+    def test_one_helper_thread_serves_the_whole_stream(self) -> None:
+        agent = self.agent()
+
+        def stream():
+            for _ in range(5):
+                yield threading.current_thread()
+
+        readers = set(agent._events_of(stream()))
+        self.assertEqual(len(readers), 1)
+        reader = readers.pop()
+        self.assertIsNot(reader, threading.current_thread())
+        reader.join(2)
+        self.assertFalse(reader.is_alive())
+
+    def test_helper_thread_exits_when_the_caller_stops_reading(self) -> None:
+        agent = self.agent()
+
+        def stream():
+            while True:
+                yield threading.current_thread()
+
+        events = agent._events_of(stream())
+        reader = next(events)
+        events.close()
+        reader.join(2)
+        self.assertFalse(reader.is_alive())
+
+    def test_interrupt_reaches_a_stream_stuck_between_events(self) -> None:
+        import time
+
+        from xiaoyu.errors import Interrupted
+
+        agent = self.agent()
+        release = threading.Event()
+
+        def stream():
+            yield "a"
+            release.wait(10)
+
+        events = agent._events_of(stream())
+        self.assertEqual(next(events), "a")
+        threading.Timer(0.15, agent._interrupt_flag.set).start()
+        started = time.monotonic()
+        with self.assertRaises(Interrupted):
+            next(events)
+        self.assertLess(time.monotonic() - started, 2)
+        release.set()
+
+    def test_stream_errors_come_back_to_the_caller(self) -> None:
+        agent = self.agent()
+
+        def stream():
+            yield "a"
+            raise ZeroDivisionError
+
+        events = agent._events_of(stream())
+        self.assertEqual(next(events), "a")
+        with self.assertRaises(ZeroDivisionError):
+            next(events)
+
+    def test_off_by_default_is_a_plain_call(self) -> None:
+        agent = self.agent(enabled=False)
+        stream = iter("ab")
+        self.assertIs(agent._events_of(stream), stream)
+        self.assertEqual(agent._blocking(threading.current_thread), threading.current_thread())
+
+    def test_helper_thread_sees_the_callers_context(self) -> None:
+        #  流总时限记在上下文变量里，挪到辅助线程后还得查得到
+        from xiaoyu.streaming import StreamLifetimeExceeded, check_deadline, stream_scope
+
+        agent = self.agent()
+        with stream_scope(1e-9):
+            with self.assertRaises(StreamLifetimeExceeded):
+                agent._blocking(check_deadline)
 
 
 if __name__ == "__main__":
