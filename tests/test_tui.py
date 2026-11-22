@@ -1730,9 +1730,17 @@ class TestNextStepSuggest(unittest.TestCase):
 
 @unittest.skipUnless(HAS_TUI, "未安装 tui 可选依赖")
 class TestStreamStyler(unittest.TestCase):
-    """流式正文的行级轻渲染：每个字符只打一次；去掉样式码后与原文逐字一致。"""
+    """流式正文的行级轻渲染：每个字符只打一次；去掉样式码与区块外形（首行的 ●、
+    其余行的两格缩进）后与原文逐字一致。"""
 
     _ANSI = __import__("re").compile(r"\x1b\[[0-9;]*m")
+
+    @staticmethod
+    def blocked(text: str) -> str:
+        """原文套上区块外形之后该打出来的样子：空行不补缩进。"""
+        rows = text.split("\n")
+        shaped = ["● " + rows[0]] + [("  " + row) if row else "" for row in rows[1:]]
+        return "\n".join(shaped)
 
     def build(self):
         from rich.console import Console
@@ -1796,14 +1804,17 @@ class TestStreamStyler(unittest.TestCase):
         self.assertNotIn("133;B133;C", shown.replace(render.OSC133_TEXT_END, ""))
         self.assertEqual(raw.getvalue().count(render.OSC133_TEXT_END), 1)
         self.assertIn("现在执行：", self._ANSI.sub("", shown))
-        #  提前收过尾，流末的 TextEnd 不再多打空行
-        self.assertEqual(raw.getvalue().count("\n"), 1)
+        #  提前收过尾，流末的 TextEnd 不再多打空行：正文块前的空行、正文收尾的换行、
+        #  工具块前的空行，各一个
+        self.assertEqual(raw.getvalue().count("\n"), 3)
 
     def test_plain_text_survives_any_chunking(self) -> None:
         """分片边界落在哪都不该改变打出去的字符：标记符保留、不丢不重。"""
         for chunk in (1, 2, 3, 7, 1000):
             with self.subTest(chunk=chunk):
-                self.assertEqual(self._ANSI.sub("", self.stream(self.SAMPLE, chunk)), self.SAMPLE)
+                self.assertEqual(
+                    self._ANSI.sub("", self.stream(self.SAMPLE, chunk)), self.blocked(self.SAMPLE)
+                )
 
     def test_fenced_code_is_highlighted_and_fences_dimmed(self) -> None:
         out = self.stream(self.SAMPLE, 5)
@@ -1812,7 +1823,7 @@ class TestStreamStyler(unittest.TestCase):
         #  围栏内的行带语法样式码；围栏线本身只弱化
         self.assertIn("\x1b[", code)
         self.assertRegex(code, r"\x1b\[[0-9;]*m\s*return")
-        fence = next(line for line in lines if self._ANSI.sub("", line) == "```python")
+        fence = next(line for line in lines if self._ANSI.sub("", line) == "  ```python")
         self.assertIn("\x1b[2m", fence)
         #  多行字符串的续行按字符串着色：着色用的是整块上下文而不是孤立的一行
         more = next(line for line in lines if "more" in line)
@@ -1850,7 +1861,7 @@ class TestStreamStyler(unittest.TestCase):
     def test_unclosed_fence_and_partial_line_flush_on_end(self) -> None:
         """围栏没闭合 / 末行没换行：TextEnd 要把攒着的东西全打出来。"""
         text = "```sh\nls -la"
-        self.assertEqual(self._ANSI.sub("", self.stream(text, 3)), text)
+        self.assertEqual(self._ANSI.sub("", self.stream(text, 3)), self.blocked(text))
 
     def test_interrupt_flushes_pending_text(self) -> None:
         from xiaoyu.events import TextDelta
@@ -1859,7 +1870,7 @@ class TestStreamStyler(unittest.TestCase):
         with contextlib.redirect_stdout(io.StringIO()):
             sink.emit(TextDelta("半行 `co"))
             sink.interrupt()
-        self.assertEqual(self._ANSI.sub("", buffer.getvalue()), "半行 `co")
+        self.assertEqual(self._ANSI.sub("", buffer.getvalue()), "● 半行 `co")
 
     def test_non_terminal_console_prints_raw(self) -> None:
         """管道 / 非 tty：逐字节直出，连样式码都没有（与 test_delta_streams_to_stdout 同口径）。"""
@@ -1897,7 +1908,7 @@ class TestStreamStyler(unittest.TestCase):
 
         text = "```go\nfunc main() {\n\t中文 := 1\n\t\treturn \"s\"\n}\n```\n"
         out = self.stream(text, 6)
-        self.assertEqual(self._ANSI.sub("", out), text)
+        self.assertEqual(self._ANSI.sub("", out), self.blocked(text))
         console = Console(file=io.StringIO(), force_terminal=True)
         line = next(row for row in out.split("\n") if "return" in row)
         rendered = Text.from_ansi(line)

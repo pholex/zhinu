@@ -574,7 +574,7 @@ class MidturnCommandTest(unittest.TestCase):
 
         draft.text = "正在敲"
         lines = [line.plain for line in self.tui._live_footer()]
-        self.assertTrue(lines[-1].startswith("› 正在敲▏"), lines[-1])
+        self.assertTrue(lines[-1].startswith("❯ 正在敲▏"), lines[-1])
 
         #  整行模式：回显归终端，页脚不再画一遍草稿
         self.tui._poller.raw = False

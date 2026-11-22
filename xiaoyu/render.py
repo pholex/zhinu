@@ -77,7 +77,7 @@ def replay_transcript(
     resume 后 scrollback 里就有对话现场，不再只有一行"上次说到"。
 
     只用现有事件词汇，任何 sink 都能消费，不为回放另立协议：
-    - user → 一行 Notice「› …」（skip_user_texts 里的 harness 注入文案跳过）
+    - user → 一行 Notice「❯ …」（skip_user_texts 里的 harness 注入文案跳过）
     - assistant 正文 → TextDelta + TextEnd（超长截断，Notice 说明还藏多少）
     - 工具调用 → 撞到 tool 结果时把 ToolPending + ToolCompleted 成对补发，
       RichSink 的只读折叠组与 Ctrl-O 留底照常生效；没等到结果的调用
@@ -108,7 +108,7 @@ def replay_transcript(
                 notice("")  # 轮与轮之间空一行
             ensure_header()
             lines = text.rstrip("\n").splitlines() or [""]
-            shown = ["› " + lines[0]] + ["  " + line for line in lines[1:_REPLAY_USER_LINES]]
+            shown = ["❯ " + lines[0]] + ["  " + line for line in lines[1:_REPLAY_USER_LINES]]
             if len(lines) > _REPLAY_USER_LINES:
                 shown.append(f"  …还有 {len(lines) - _REPLAY_USER_LINES} 行")
             notice("\n".join(shown))

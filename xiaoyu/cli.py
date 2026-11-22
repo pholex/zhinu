@@ -3429,7 +3429,7 @@ def _repl_loop(agent: Agent) -> int:
     while True:
         idle[0] = True
         try:
-            line = input(ui.prompt(f"{modes.prompt_prefix(agent.mode)}› "))
+            line = input(ui.prompt(f"{modes.prompt_prefix(agent.mode)}❯ "))
         except (EOFError, KeyboardInterrupt):
             print()
             return 0

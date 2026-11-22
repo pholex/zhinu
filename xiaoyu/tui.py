@@ -438,6 +438,36 @@ def _restyle_tabs(line: str, row: Text) -> Text | None:
 _TAB_SIZE = 4
 
 
+#  scrollback 里四种区块各自的行首标记：你说的话、模型的话、工具调用、一轮的小结。
+#  都占一格、都没有彩色表情变体（否则宽度与颜色不由我们定）。
+USER_MARK = "❯ "
+TEXT_MARK = "● "
+TOOL_MARK = "● "
+TURN_MARK = "✻ "
+
+
+def user_echo(text: str, width: int) -> Text:
+    """用户原话在 scrollback 里的样子：❯ 开头（与输入行的提示符同形），整行铺底色。
+
+    多行只标第一行，其余缩进对齐——逐行都标的话，从屏幕上复制一段多行原话要
+    手动删好几个前缀。底色铺到差一格满行：恰好写满一行再清行尾，部分终端会
+    抹掉最后一格。
+    """
+    rows: list[Text] = []
+    for index, row in enumerate(text.split("\n")):
+        line = Text.assemble((USER_MARK if index == 0 else "  ", "text.accent"), row)
+        span = max(1, width - 1)
+        line.append(" " * (-line.cell_len % span))
+        line.stylize("prompt.echo")
+        rows.append(line)
+    return Text("\n").join(rows)
+
+
+def turn_summary(stats: str) -> Text:
+    """一轮收尾的小结行。"""
+    return Text.assemble((TURN_MARK, "text.accent"), (stats, "text.secondary"))
+
+
 class _StreamStyler:
     """流式正文的行级轻渲染：每个字符只打一次、不重绘，scrollback 上永远稳定。
 
@@ -473,6 +503,10 @@ class _StreamStyler:
         self._code_lines: list[str] = []
         self._span = 0  # 行内代码打开时的反引号数，0 = 没打开
         self._strong = False
+        #  区块外形：一段正文第一行以 ● 开头，其余行缩进两格与它对齐。空行不补
+        #  缩进（不留行尾空格）
+        self._bol = True
+        self._marked = False
 
     # ---------- 入口 ----------
 
@@ -490,6 +524,8 @@ class _StreamStyler:
         self._code_lines = []
         self._span = 0
         self._strong = False
+        self._bol = True
+        self._marked = False
 
     # ---------- 状态机 ----------
 
@@ -641,6 +677,14 @@ class _StreamStyler:
         展成空格（Makefile / Go 的 tab 变空格就不是原文了），这里只借它把样式
         片段编成 ANSI 码，字符本身一个不动。旧式 Windows 控制台不认 ANSI 码，
         仍交给 rich 自己翻译（那里 tab 展开是可接受的代价）。"""
+        if text.plain == "\n":
+            self._bol = True
+        elif self._bol and text.plain:
+            self._bol = False
+            lead = Text("  " if self._marked else TEXT_MARK)
+            self._marked = True
+            lead.append_text(text)
+            text = lead
         if self.console.legacy_windows:
             self.console.print(text, end="", soft_wrap=True)
             return
@@ -1442,6 +1486,12 @@ class RichSink:
         """确认框已把这次编辑的预览（diff / 新内容）打进 scrollback：完成行不再补。"""
         self._edit = None
 
+    def _gap(self) -> None:
+        """一个区块（一段正文、一次工具调用）开始前空一行。子 agent 的缩进输出
+        挂在父级的工具块里，不另起区块；非终端输出是给程序读的，也不加。"""
+        if self.verbose and not self.indent and self.console.is_terminal:
+            print()
+
     def _flush_text(self) -> None:
         """把行级渲染器攒着的半行打出去（TextEnd / 中断都要调：没有换行的末行
         不能跟着中断一起消失）。"""
@@ -1532,6 +1582,8 @@ class RichSink:
         self._flush_ro_group()
         if not self.verbose:
             return
+        if not self._text_open:
+            self._gap()
         self._text_open = True
         if not self._osc133_open and self.console.is_terminal:
             #  正文块起点的零宽锚点：终端把每段回复当可导航的"提示块"
@@ -1579,9 +1631,10 @@ class RichSink:
         preview = args_preview(
             event.name, event.args, len(self.indent) + len(event.name) + 3, self.console.width
         )
+        self._gap()
         self.console.print(
             Text.assemble(
-                (f"{self.indent}● {event.name}", "text.accent"),
+                (f"{self.indent}{TOOL_MARK}{event.name}", "text.accent"),
                 (f" {preview}", "text.secondary"),
             )
         )
@@ -2408,6 +2461,36 @@ class Tui:
         常驻输入区前端改成「取走文本、输入行留在原地」。"""
         buffer.validate_and_handle()
 
+    def _turn_tail(self, agent: Agent) -> None:
+        """一轮收尾的几行：还在跑的后台任务、小结、展开提示。有任何一行就先空
+        一行，和最后一段正文隔开。
+
+        still-running 状态行：inline 架构下轮次结束打一行即走，与明文 REPL 同一份
+        文案（cli.background_status）。
+        """
+        from .cli import background_status, turn_stats_line
+
+        rows: list[Text] = []
+        if note := background_status(agent):
+            rows.append(Text(note, style="text.secondary"))
+        if stats := turn_stats_line(agent, interactive=True):
+            rows.append(turn_summary(stats))
+        if rows or (self.sink.truncated and not self.sink.detail):
+            print()
+        for row in rows:
+            self.console.print(row)
+        self._print_expand_hint()
+
+    def _echo(self, text: str, literal: bool) -> None:
+        """输入行不留在原地，把这一行补打进 scrollback：回头翻记录时最先要找的
+        就是「我在哪儿问的」。对模型说的话是带底色的区块；命令（/、!、#）是对
+        程序说的，只留提示符与原文，不抢眼。"""
+        if keys.classify_input(text, literal=literal).kind == "send":
+            self.console.print(user_echo(text, self.console.width))
+        else:
+            body = text.replace("\n", "\n  ")
+            self.console.print(Text.assemble((USER_MARK, "prompt"), (body, "")))
+
     def _above(self, action: Callable[[], None]) -> None:
         """输入行挂着时往它上方打字。默认借 prompt_toolkit 把输入行让开再打；
         常驻输入区前端的打印本来就落在输入区上方，直接打即可。"""
@@ -2439,6 +2522,8 @@ class Tui:
                 prompt_continuation=lambda width, line_number, is_soft_wrap: " " * width,
                 #  prompt_toolkit 自带的 Ctrl-X Ctrl-E：长指令拉到 $EDITOR 里改
                 enable_open_in_editor=True,
+                #  输入行提交后收走，原话由 _echo 补打成带底色的区块
+                erase_when_done=True,
             )
         return self._session
 
@@ -2596,7 +2681,7 @@ class Tui:
         fragments: list[tuple[str, str]] = []
         if mode.marker:
             fragments.append((theme.ptk(mode.style), f"{mode.marker} {mode.label} "))
-        fragments.append((theme.ptk("prompt"), "› "))
+        fragments.append((theme.ptk("prompt"), USER_MARK))
         return fragments
 
     def _live_footer(self) -> list[Text]:
@@ -2623,7 +2708,7 @@ class Tui:
             hint = "  Enter 送出 · Esc 清空"
             shown = _tail_fit(draft.replace("\n", " ⏎ "), max(8, width - len(hint) * 2))
             lines.append(
-                Text.assemble(("› ", "text.accent"), (shown, ""), ("▏", ""), (hint, "text.secondary"))
+Text.assemble((USER_MARK, "text.accent"), (shown, ""), ("▏", ""), (hint, "text.secondary"))
             )
         elif waiting:
             lines.append(Text("  Esc 撤回最后一条", style="text.secondary"))
@@ -3245,6 +3330,7 @@ class Tui:
         self._startup_notices(agent)
 
         session = self._input_session()
+        print()  # 开场提示与第一句话之间空一行（之后每轮收尾各自留了空行）
         last_interrupt = 0.0
         #  等待期敲的整行输入：预填进下一轮输入行，不自动提交
         queued = ""
@@ -3281,6 +3367,7 @@ class Tui:
             action = keys.classify_input(line, literal=literal)
             if action.kind == "empty":
                 continue
+            self._echo(line, literal)
             if action.kind == "usage":
                 self.console.print(Text(f"  {action.hint}", style="text.secondary"))
                 continue
@@ -3353,17 +3440,7 @@ class Tui:
                 #  敲了一半没按回车的草稿：和没赶上的插话一起预填回输入行
                 unsent = self._poller.draft.take()
                 self._poller = None
-            #  still-running 状态行：inline 架构没有常驻状态栏，
-            #  轮次结束打一行即走，与明文 REPL 同一份文案（cli.background_status）
-            from .cli import background_status
-
-            if note := background_status(agent):
-                self.console.print(Text(note, style="text.secondary"))
-            from .cli import turn_stats_line
-
-            if stats := turn_stats_line(agent, interactive=True):
-                self.console.print(Text(f"  {stats}", style="text.secondary"))
-            self._print_expand_hint()
+            self._turn_tail(agent)
             #  一轮收尾 = 回到"等人"：铃（opt-in）+ 状态钩子，把切去别处的人叫回来
             attention.waiting(attention.WAITING_INPUT)
             #  没赶上本轮的插话（模型收尾后才按的回车）+ 等待期敲的其余内容：

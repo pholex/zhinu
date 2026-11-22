@@ -64,15 +64,11 @@ from rich.text import Text
 from . import attention, keys, modes, suggest, theme, ui
 from .agent import Agent
 from .errors import Interrupted
-from .tui import NoticeCapture, Tui, search_select
+from .tui import USER_MARK, NoticeCapture, Tui, search_select
 
 ENV_SWITCH = "XIAOYU_LIVE_INPUT"
 
 _SPINNER = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
-#  补打用户原话时的行首标记。选字的约束：占一格（不是东亚宽字符）、没有彩色
-#  表情的变体（否则各终端宽度与颜色都不由我们定）。多行只标第一行：逐行都标的
-#  话，从屏幕上复制一段多行原话要手动删好几个前缀
-_SAID_MARK = "✻ "
 _TICK = 1 / 30
 
 # ---------------------------------------------------------------------------
@@ -801,8 +797,6 @@ class LiveTui(Tui):
         return False
 
     def _turn(self, line: str) -> None:
-        from .cli import background_status, turn_stats_line
-
         agent = self.agent
         assert agent is not None
         self.sink.begin_turn()
@@ -828,11 +822,7 @@ class LiveTui(Tui):
             self._busy = "job"
             self._activity = None
             self._run_midturn_commands()
-        if note := background_status(agent):
-            self.console.print(Text(note, style="text.secondary"))
-        if stats := turn_stats_line(agent, interactive=True):
-            self.console.print(Text(f"  {stats}", style="text.secondary"))
-        self._print_expand_hint()
+        self._turn_tail(agent)
         attention.waiting(attention.WAITING_INPUT)
         #  没赶上本轮的插话与要等轮末的命令：填回输入行，不自动提交
         held, self._held_commands = self._held_commands, []
@@ -907,25 +897,11 @@ class LiveTui(Tui):
         self._jobs.put((text, literal))
 
     def _echo(self, text: str, literal: bool) -> None:
-        """输入行不留在原地了，把这一行补打到上方，scrollback 里才有「我说了什么」。
-
-        回头翻记录时最先要找的就是「我在哪儿问的」：上方空一行把它和前面的输出
-        隔开；对模型说的话行首立一个强调色的花瓣星号、正文加粗（多行只标第一行，
-        其余缩进对齐），命令（/、!、#）是对程序说的，保持原样不抢眼。
-        """
+        """同 `Tui._echo`；上方先空一行，把它和前面的输出隔开。"""
         writer = self._writer
         if writer is not None and not writer.ends_blank:
             print()
-        said = keys.classify_input(text, literal=literal).kind == "send"
-        if said:
-            rows = [
-                Text.assemble((_SAID_MARK if index == 0 else "  ", "text.accent"), (row, "bold"))
-                for index, row in enumerate(text.split("\n"))
-            ]
-            self.console.print(Text("\n").join(rows))
-        else:
-            body = text.replace("\n", "\n  ")
-            self.console.print(Text.assemble(("› ", "prompt"), (body, "")))
+        super()._echo(text, literal)
 
     def _above(self, action: Callable[[], None]) -> None:
         action()
@@ -1173,7 +1149,7 @@ class LiveTui(Tui):
         if panel is not None and panel.kind == "text":
             out.extend(panel.label)
         else:
-            out.append((theme.ptk("prompt"), "› "))
+            out.append((theme.ptk("prompt"), USER_MARK))
         return out
 
     def _live_placeholder(self) -> list[tuple[str, str]]:

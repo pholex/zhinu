@@ -341,7 +341,7 @@ class PanelTest(unittest.TestCase):
         front._open(panel)
         drawn = "".join(text for _style, text in front._live_message())
         self.assertIn("要执行这条命令吗？", drawn)
-        self.assertTrue(drawn.endswith("› "))
+        self.assertTrue(drawn.endswith("❯ "))
         front._hand_off(buffer)  # 回车归菜单管，漏到这里也不能把草稿当消息发出去
         self.assertEqual(buffer.text, "半截草稿")
         self.assertTrue(front._jobs.empty())
