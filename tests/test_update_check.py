@@ -321,7 +321,7 @@ class CliHookTest(UpdateCheckCase):
         #  横幅只在交互式启动时打印：提示跟着横幅走，就不会漏进 -p / --wire
         source = (Path(update_check.__file__).parent / "cli.py").read_text(encoding="utf-8")
         lines = source.splitlines()
-        banners = [index for index, line in enumerate(lines) if "print(build_banner(" in line]
+        banners = [index for index, line in enumerate(lines) if "print_banner(model_label(" in line]
         self.assertEqual(len(banners), 2)
         for index in banners:
             self.assertEqual(lines[index + 1].strip(), "print_update_notice()")

@@ -1660,7 +1660,7 @@ def resume_command(argv: list[str]) -> int:
         if args.output_format == "text":
             print(ui.secondary(f"已恢复会话（{len(loaded)} 条消息，来自 {chosen.path.name}{forked}）"))
         return run_once(agent, prompt, args.output_format, output_schema)
-    print(build_banner(model_label(agent), str(config.workspace)))
+    print_banner(model_label(agent), str(config.workspace))
     print_update_notice()
     if budget_note := skills.budget_warning():
         print(ui.secondary(budget_note))
@@ -2442,6 +2442,16 @@ def _hint_keychain_leftover() -> None:
     )
 
 
+def print_banner(model: str, workspace: str) -> None:
+    """打开场横幅。常驻输入区前端接管了 stdout 时把它登记成「随宽度重算的块」：
+    窗口缩放后整屏重打，横幅按新宽度重新排，而不是把旧宽度的框折坏。"""
+    block = getattr(sys.stdout, "block", None)
+    if callable(block):
+        block(lambda: build_banner(model, workspace))
+    else:
+        print(build_banner(model, workspace))
+
+
 def make_frontend(permissions: Permissions, no_tui: bool = False):
     """选择交互前端，返回 (approver, sink, repl_fn, note, asker, secret_prompt)。
 
@@ -2481,6 +2491,8 @@ def make_frontend(permissions: Permissions, no_tui: bool = False):
         if tui_live.enabled():
             front_class = tui_live.LiveTui
     front = front_class(permissions)
+    if begin := getattr(front, "begin_recording", None):
+        begin()
     return front.confirm, front.sink, front.run, None, front.ask, front.secret_prompt
 
 
@@ -2946,7 +2958,7 @@ def main(argv: list[str] | None = None) -> int:
         if resumed and args.output_format == "text":
             print(ui.secondary(resumed))
         return run_once(agent, user_input, args.output_format, output_schema)
-    print(build_banner(model_label(agent), str(config.workspace)))
+    print_banner(model_label(agent), str(config.workspace))
     print_update_notice()
     if env_files:
         print(ui.secondary("已加载 " + ", ".join(str(p) for p in env_files)))

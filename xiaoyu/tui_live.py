@@ -25,12 +25,12 @@
 - 对续行（上一行软折下来的行）从行首清除会抹掉上一行的折行标记，把一个逻辑行
   拆成两行；所以续行只从行首字符之后清。渲染器重画第一帧前自带的那次清屏同理，
   已经清过的场合让它空转。
-- 输入区自己画的行不画满整行（`_EDGE`）：画满的行在窗口缩窄时被终端折行，
-  iTerm2 会因此把上面的内容推出屏幕顶，推出去的输入区残行再也擦不到。
-- 缩放：窗口一变，终端就已经把屏上内容按新宽度重排了。每次重画前先看窗口大小，
-  变了就按同一套折行规则重算输入区的新起点再擦。空闲时缩放是干净的；流式输出
-  中途缩放可能弄花正在输出的那一段（复用过的行在部分终端里仍记着旧宽度，行数
-  无法推算），这是已知限制。
+- 缩放：窗口一变，终端就已经把屏上内容按自己的规则重排了，而各家规则不同
+  （iTerm2 缩窄时把内容往屏幕顶外推，推出去的输入区残行再也擦不到；终端复用器
+  记着被复用行的旧宽度），事后推算输入区挪到了哪儿是猜不准的。所以不猜：打出去
+  的内容都记在 `LiveWriter.history` 里，窗口大小稳定下来后清屏、连终端的历史
+  一起清掉，按新宽度从头重打，再画输入区（`LiveScreen.repaint`）。代价是启动前
+  的终端历史与超出记忆上限的早期输出在缩放后不再保留，缩放瞬间闪一下。
 
 用到 prompt_toolkit 渲染器的几个私有成员（光标位置、上一帧、强制重画），升级该库
 时要随版本核对；依赖版本在 pyproject 里是精确锁定的。
@@ -71,11 +71,11 @@ from .tui import USER_MARK, NoticeCapture, Tui, search_select
 ENV_SWITCH = "XIAOYU_LIVE_INPUT"
 
 _SPINNER = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
-#  输入区自己画的行（分隔线、底部一行）右侧留出的列数。画满整行的话，窗口每
-#  缩窄一点这些行就被终端折成两行；有的终端（iTerm2）会因此把上面的内容往屏幕
-#  顶外推，推出去的行光标够不着、擦不掉，拖动窗口时就一路留下分隔线。留出
-#  余量后，一次缩窄不超过这个数就不折行，行数不变，擦除位置不用猜。
-_EDGE = 8
+#  记住最近打出去的多少逻辑行（缩放后重打用）。超出的最早部分缩放后不再保留
+HISTORY_LINES = 5000
+#  窗口大小停止变化这么久才重打：拖动窗口时事件一串一串地来，每个都重打一遍
+#  既闪又慢
+_SETTLE = 0.12
 _TICK = 1 / 30
 
 # ---------------------------------------------------------------------------
@@ -174,6 +174,13 @@ def displayable(text: str) -> str:
     return "".join(out)
 
 
+def replayable(text: str) -> str:
+    """重打一行历史前的清洗：响铃只该响一次，不随每次缩放再响。"""
+    if "\x07" not in text:
+        return text
+    return "".join(chunk for chunk, escape in pieces(text) if escape or chunk != "\x07")
+
+
 # ---------------------------------------------------------------------------
 # 输出汇集
 # ---------------------------------------------------------------------------
@@ -187,6 +194,10 @@ class LiveWriter:
     打进来的整行（比如主线程的一句提示）排到那半行前面，不和它粘在一起。
     `passthrough` 打开时原样写到真正的 stdout：输入区还没起来、已经收起让位、
     或者已经退出。
+
+    不论哪种状态，写进来的字都记进 `history`（逻辑行，带样式码；`line` 是还没
+    写完的那一行，从行首起的全文）：窗口缩放后屏幕要靠它从头重打。条目也可以是
+    一个函数——横幅这类随窗口宽度变的块，重打时现算（`block`）。
     """
 
     encoding = "utf-8"
@@ -201,18 +212,44 @@ class LiveWriter:
         self._tail_owner: int | None = None
         #  最近落下的一整行是不是空行（要不要再空一行由调用方据此决定）
         self.ends_blank = True
+        self.history: collections.deque[Any] = collections.deque(maxlen=HISTORY_LINES)
+        self.line = ""
+
+    def _remember(self, text: str) -> None:
+        *done, self.line = (self.line + text).split("\n")
+        self.history.extend(done)
+
+    def break_line(self) -> None:
+        """没写完的那一行在屏上被强行收了尾（让位、退出）：记录里也就此断行。
+        调用方持锁。"""
+        if self.line:
+            self.history.append(self.line)
+            self.line = ""
+
+    def block(self, render: Callable[[], str]) -> None:
+        """打一个随窗口宽度变的块（横幅）：现在打一次，重打时按当时的宽度现算。"""
+        text = render()
+        with self.lock:
+            self.break_line()
+            self.history.append(render)
+        self.real.write(text + "\n")
+        self.real.flush()
 
     def write(self, text: str) -> int:
         if not text:
             return 0
         if self.passthrough:
+            with self.lock:
+                self._remember(text.replace("\r\n", "\n").replace("\r", ""))
             return self.real.write(text)
         text = text.replace("\r\n", "\n").replace("\r", "")
         me = threading.get_ident()
         with self.lock:
             if self.tail and self._tail_owner != me and text.endswith("\n"):
                 self.pending.extend(text[:-1].split("\n"))
+                self.history.extend(text[:-1].split("\n"))
                 return len(text)
+            self._remember(text)
             *lines, self.tail = (self.tail + text).split("\n")
             self.pending.extend(lines)
             if lines or self.tail:
@@ -225,7 +262,7 @@ class LiveWriter:
             self.real.flush()
 
     def isatty(self) -> bool:
-        return True
+        return bool(self.real.isatty())
 
     def fileno(self) -> int:
         return self.real.fileno()
@@ -238,6 +275,7 @@ class LiveWriter:
         with self.lock:
             lines, self.pending = self.pending, []
             tail, self.tail = self.tail, ""
+            self.break_line()
         for line in lines:
             self.real.write(line + "\n")
         if tail:
@@ -272,6 +310,8 @@ class LiveScreen:
         self.cont = 0
         self.tail = ""  # 上一拍取到的尾巴，首行照它画
         self.size: Any = None
+        #  窗口大小变了、还没重打：最近一次看到的大小，以及它是什么时候变成这样的
+        self._resizing: tuple[Any, float] | None = None
         self.active = False
         self._paused = False
         self._gate = threading.RLock()
@@ -310,10 +350,6 @@ class LiveScreen:
     def cols(self) -> int:
         return max(8, self.app.output.get_size().columns)
 
-    def span(self) -> int:
-        """输入区自己画的行能用的宽度（见 _EDGE）。"""
-        return max(8, self.cols() - _EDGE)
-
     # ---- 节拍 ----
 
     async def _pump(self) -> None:
@@ -333,8 +369,8 @@ class LiveScreen:
 
     def tick(self, final: bool = False) -> None:
         app = self.app
-        if app.output.get_size() != self.size:
-            app._redraw()  # noqa: SLF001 - 信号可能还在路上：落笔前先对齐窗口大小
+        if self._resized(force=final):
+            return
         cont = self.cont  # 落笔前的状态：此刻首行是不是续行
         data, used = self._take(final)
         if data:
@@ -360,6 +396,8 @@ class LiveScreen:
         loose = ""
         with writer.lock:
             lines, writer.pending = writer.pending, []
+            if final:
+                writer.break_line()
             if final and writer.tail:
                 lines.append(writer.tail)
                 writer.tail = ""
@@ -463,12 +501,14 @@ class LiveScreen:
         renderer.reset()
         app._request_absolute_cursor_position()  # noqa: SLF001
 
-    # ---- 渲染入口：缩放对齐 ----
+    # ---- 渲染入口与缩放 ----
 
     def _render(self, app: Any, layout: Any, is_done: bool = False) -> None:
         out = app.output
-        if not is_done and self.size is not None and out.get_size() != self.size:
-            self._resync()
+        if not is_done and (self._resizing is not None or out.get_size() != self.size):
+            #  窗口在变：屏上的东西已被终端重排，此刻往哪儿画都是猜。不画，等
+            #  大小稳定后整屏重打（tick → repaint）
+            return
         if app.renderer._last_screen is not None or is_done:  # noqa: SLF001
             self._plain_render(app, layout, is_done)
             return
@@ -480,40 +520,52 @@ class LiveScreen:
         finally:
             out.erase_down = erase_down
 
-    def _resync(self) -> None:
-        """窗口大小变了：按终端重排后的样子找到输入区的新起点，擦掉。
+    def _resized(self, force: bool = False) -> bool:
+        """窗口大小是不是正在变。变完（停了 `_SETTLE` 秒，或 force）就地整屏重打；
+        返回 True 表示这一拍别落笔。"""
+        size = self.app.output.get_size()
+        if self._resizing is None:
+            if size == self.size:
+                return False
+            self._resizing = (size, time.monotonic())
+        elif self._resizing[0] != size:
+            self._resizing = (size, time.monotonic())
+        if force or time.monotonic() - self._resizing[1] >= _SETTLE:
+            self.repaint()
+            return False
+        return True
 
-        终端把每个逻辑行按新宽度重新折行。输入区里的行各自是一个逻辑行，比新
-        窗口宽的会变成多行；首行若是续行，则连同上面已落下的部分一起重排。这里
-        用同一套折行规则重算：重排后落在最后一个物理行之前的字符都算已落下，
-        最后一行那一截留给首行继续画。
-        """
+    def repaint(self) -> None:
+        """清屏、连终端的历史一起清掉，把记住的内容按现在的宽度从头重打，再画
+        输入区。不依赖终端把旧内容重排成了什么样。"""
         app = self.app
-        self.size = app.output.get_size()
-        cols = max(8, self.size.columns)
-        screen, pos = app.renderer._last_screen, app.renderer._cursor_pos  # noqa: SLF001
-        if screen is None:
-            return
-        writer = self.writer
+        out, writer = app.output, self.writer
         with writer.lock:
-            shown = self.tail if writer.tail.startswith(self.tail) else ""
-            rows, last, active = split_rows(self.open + shown, cols)
-            above = sum(len(row) for row in rows)  # 重排后落在最后一行之前的字符数
-            moved = max(0, above - len(self.open))  # 其中原本还在尾巴里的
-            self.open += writer.tail[:moved]
-            writer.tail = writer.tail[moved:]
-            self.carry = len(self.open) - above
-            self.tail = writer.tail
-            self.lead = active
-            self.cont = first_cell(last)[1] if above and last else 0
-
-        def reflowed(y: int) -> int:
-            row = screen.data_buffer.get(y) or {}
-            width = max((x + c.width for x, c in row.items() if c.char.strip()), default=0)
-            return max(1, -(-width // cols))
-
-        up = 1 + sum(reflowed(y) for y in range(1, pos.y)) + pos.x // cols
-        self._erase(self.cont, up=up)
+            items = list(writer.history)
+            #  还没补打的整行已经在 history 里，随重打一起出；没写完的那一行整个
+            #  退回尾巴，按新宽度重新折
+            writer.pending = []
+            writer.tail = writer.line
+        self.open, self.carry, self.cont, self.lead, self.tail = "", 0, 0, "", ""
+        rows: list[str] = []
+        for item in items:
+            if callable(item):
+                try:
+                    item = str(item())
+                except Exception:  # noqa: BLE001 - 一个块重算失败不该挡住整屏重打
+                    continue
+            rows.extend(item.split("\n"))
+        body = "".join(replayable(row) + "\x1b[0m\r\n" for row in rows)
+        with self._batched():
+            out.write_raw("\x1b[H\x1b[2J\x1b[3J")
+            out.reset_attributes()
+            out.enable_autowrap()
+            out.write_raw(body)
+            app.renderer.reset()
+            app._request_absolute_cursor_position()  # noqa: SLF001
+            self.size = out.get_size()
+            self._resizing = None
+            app._redraw()  # noqa: SLF001
 
     # ---- 让位 ----
 
@@ -654,6 +706,18 @@ class LiveTui(Tui):
 
     # ---- 主循环 ----
 
+    def begin_recording(self) -> None:
+        """从现在起记下打到终端的每个字（横幅、开场提示都在进主循环之前打）。
+        输出不是终端就不接管：管道里没有缩放可言。"""
+        if self._writer is None and sys.stdout.isatty():
+            #  输入区与菜单自己的画面不归我们记：让 prompt_toolkit 先认准真正的
+            #  stdout（它的输出对象建一次就缓存），再接管
+            from prompt_toolkit.application.current import get_app_session
+
+            _ = get_app_session().output
+            self._writer = LiveWriter(sys.stdout)
+            sys.stdout = self._writer  # type: ignore[assignment]
+
     def _run_loop(self, agent: Agent) -> int:
         import asyncio
 
@@ -685,8 +749,10 @@ class LiveTui(Tui):
         style = Style.from_dict(
             {**theme.ptk_style(), "bottom-toolbar": "noreverse", "bottom-toolbar.text": "noreverse"}
         )
-        real = sys.stdout
-        writer = self._writer = LiveWriter(real)
+        #  开场就开始记的（begin_recording）接着用：横幅与开场提示也要能重打
+        writer = self._writer if self._writer is not None else LiveWriter(sys.stdout)
+        self._writer = writer
+        real = writer.real
         writer.ends_blank = False  # 开场提示刚打过，第一句话上方也要空一行
         screen = self._screen = LiveScreen(app, writer)
         screen.animate = lambda: self._busy is not None
@@ -1121,7 +1187,7 @@ class LiveTui(Tui):
     def _live_message(self) -> list[tuple[str, str]]:
         """输入行上方，自上而下：没成行的尾巴、进行中的事、待送达的话、分隔线。"""
         screen = self._screen
-        cols = screen.span() if screen is not None else 80
+        cols = screen.cols() if screen is not None else 80
         dim, accent = theme.ptk("text.secondary"), theme.ptk("text.accent")
         out: list[tuple[str, str]] = []
         #  这一行常在（空着也占位），输入区的行数才稳定
@@ -1179,7 +1245,7 @@ class LiveTui(Tui):
         用量留到最后。只占一行，不折行。
         """
         screen = self._screen
-        cols = screen.span() if screen is not None else 80
+        cols = screen.cols() if screen is not None else 80
         dim = theme.ptk("text.secondary")
         agent = self.agent
         mode = modes.get(agent.mode if agent is not None else modes.DEFAULT)

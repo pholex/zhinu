@@ -131,9 +131,50 @@ class LiveWriterTest(unittest.TestCase):
         self.assertFalse(writer.ends_blank)
 
     def test_looks_like_a_terminal_to_its_users(self) -> None:
+        from xiaoyu.tui_live import LiveWriter
+
+        class Terminal(io.StringIO):
+            def isatty(self) -> bool:
+                return True
+
+        self.assertTrue(LiveWriter(Terminal()).isatty())
         writer, _ = self.make()
-        self.assertTrue(writer.isatty())
+        self.assertFalse(writer.isatty())  # 真正的去处不是终端，就不冒充
         self.assertFalse(hasattr(writer, "buffer"))  # 有它的话别人会绕过 write 直写字节
+
+    def test_everything_written_is_remembered_as_logical_lines(self) -> None:
+        #  缩放后整屏重打靠这份记录：直写与攒着两种状态都要记，半行接得上
+        writer, _ = self.make()
+        writer.write("开场\n半")
+        writer.passthrough = False
+        writer.write("行\n正文")
+        self.assertEqual(list(writer.history), ["开场", "半行"])
+        self.assertEqual(writer.line, "正文")
+        with writer.lock:
+            writer.break_line()
+        self.assertEqual(list(writer.history), ["开场", "半行", "正文"])
+        self.assertEqual(writer.line, "")
+
+    def test_history_is_capped(self) -> None:
+        from xiaoyu import tui_live
+
+        writer, _ = self.make()
+        writer.write("x\n" * (tui_live.HISTORY_LINES + 10))
+        self.assertEqual(len(writer.history), tui_live.HISTORY_LINES)
+
+    def test_block_is_recomputed_on_replay(self) -> None:
+        writer, real = self.make()
+        widths = iter(["宽版横幅", "窄版横幅"])
+        writer.block(lambda: next(widths))
+        self.assertIn("宽版横幅", real.getvalue())
+        self.assertEqual(writer.history[-1](), "窄版横幅")
+
+    def test_replay_does_not_ring_the_bell_again(self) -> None:
+        from xiaoyu.tui_live import replayable
+
+        self.assertEqual(replayable("完成\x07"), "完成")
+        #  OSC 序列里作结束符的那个不是响铃，留着
+        self.assertEqual(replayable("\x1b]0;标题\x07正文"), "\x1b]0;标题\x07正文")
 
 
 @unittest.skipUnless(HAVE_TUI, "没装 TUI 可选依赖")
