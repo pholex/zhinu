@@ -1637,7 +1637,10 @@ class TestMakeFrontend(AgentTestCase):
         with mock.patch("sys.stdin") as fake_in, mock.patch("sys.stdout") as fake_out:
             fake_in.isatty.return_value = True
             fake_out.isatty.return_value = True
-            approver, sink, repl_fn, note, asker, secret = make_frontend(Permissions(self.root))
+            #  常驻输入区前端会接管 stdout，这里只看两个前端共有的那部分，用原来的
+            approver, sink, repl_fn, note, asker, secret = make_frontend(
+                Permissions(self.root), classic=True
+            )
         self.assertIsInstance(sink, RichSink)
         self.assertIsNone(note)
         self.assertEqual(secret.__name__, "secret_prompt")

@@ -1,4 +1,5 @@
-"""常驻输入区前端（可选，`XIAOYU_LIVE_INPUT=1`）：模型作答期间输入框与状态行不消失。
+"""常驻输入区前端（默认；`--classic` 或 `XIAOYU_LIVE_INPUT=0` 回到 `tui.py` 那一个）：
+模型作答期间输入框与状态行不消失。
 
 `tui.py` 的前端里，输入行只在「轮到你说话」时存在，模型一跑它就没了，运行期
 插话靠另一条线程逐键读。这里换一种占用终端的方式，渲染层、按键表、确认菜单
@@ -1333,8 +1334,9 @@ def _git_facts(workspace: str) -> str:
 
 
 def enabled(environ: Any = None) -> bool:
-    """用户有没有打开常驻输入区（默认关）。"""
+    """用不用常驻输入区（默认用）。`XIAOYU_LIVE_INPUT=0` 是长期关掉的写法，
+    单次关掉用 `--classic`（由调用方判）。"""
     import os
 
     flag = (environ if environ is not None else os.environ).get(ENV_SWITCH, "")
-    return flag.strip().lower() in ("1", "true", "yes", "on")
+    return flag.strip().lower() not in ("0", "false", "no", "off")

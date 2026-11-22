@@ -272,6 +272,7 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="禁用增强交互界面（补全/历史/粘贴折叠），用明文 REPL",
     )
+    add_classic_flag(parser)
     parser.add_argument(
         "--trust",
         action="store_true",
@@ -292,6 +293,14 @@ def build_parser() -> argparse.ArgumentParser:
     add_output_format(parser)
     add_stats_flag(parser)
     return parser
+
+
+def add_classic_flag(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--classic",
+        action="store_true",
+        help="用原来的终端样式：输入行只在轮到你说话时出现（默认是常驻输入区）",
+    )
 
 
 def add_system_prompt_flags(parser: argparse.ArgumentParser) -> None:
@@ -1441,6 +1450,7 @@ def resume_command(argv: list[str]) -> int:
     )
     parser.add_argument("--yolo", action="store_true", help="不再逐个确认写文件和执行命令")
     parser.add_argument("--no-tui", dest="no_tui", action="store_true", help="用明文 REPL")
+    add_classic_flag(parser)
     parser.add_argument(
         "--model",
         default=None,
@@ -1615,7 +1625,7 @@ def resume_command(argv: list[str]) -> int:
             repl_fn, note, asker, secret_prompt = repl, None, None, None
         else:
             approver, sink, repl_fn, note, asker, secret_prompt = make_frontend(
-                permissions, args.no_tui
+                permissions, args.no_tui, args.classic
             )
         peer = register_peer(config, interactive=not prompt)
         agent = Agent(
@@ -2452,12 +2462,14 @@ def print_banner(model: str, workspace: str) -> None:
         print(build_banner(model, workspace))
 
 
-def make_frontend(permissions: Permissions, no_tui: bool = False):
+def make_frontend(permissions: Permissions, no_tui: bool = False, classic: bool = False):
     """选择交互前端，返回 (approver, sink, repl_fn, note, asker, secret_prompt)。
 
     TUI 条件：未被 --no-tui 禁用 + stdin/stdout 都是真实终端 + 装了可选依赖
     （prompt_toolkit/rich）。任一不满足退回明文 REPL——sink=None 表示用
     Agent 默认的 PlainSink。note 是给用户的一行提示（当前仅"可装 TUI"）。
+    TUI 有两个前端：默认是常驻输入区（tui_live），`classic` 或
+    `XIAOYU_LIVE_INPUT=0` 选原来那个（tui）。
     asker 是 ask_user 工具的提问通道：TUI 走行内面板，明文 REPL 走编号问答
     ——交互前端总有人在，提问永远可用；headless 才是 None（工具不进 schemas）。
     secret_prompt 是 sudo 要密码时的通道（见 askpass.py）：TUI 走遮罩输入框，
@@ -2483,9 +2495,9 @@ def make_frontend(permissions: Permissions, no_tui: bool = False):
             text_secret_prompt,
         )
     front_class = tui.Tui
-    #  常驻输入区前端：默认关，XIAOYU_LIVE_INPUT=1 才用。Windows 的控制台没有它
-    #  依赖的那套光标与折行语义，保持旧前端
-    if sys.platform != "win32":
+    #  常驻输入区前端是默认；--classic 或 XIAOYU_LIVE_INPUT=0 回到原来的。
+    #  Windows 的控制台没有它依赖的那套光标与折行语义，一律用原来的
+    if sys.platform != "win32" and not classic:
         from . import tui_live
 
         if tui_live.enabled():
@@ -2890,7 +2902,7 @@ def main(argv: list[str] | None = None) -> int:
             repl_fn, note, asker, secret_prompt = repl, None, None, None
         else:
             approver, sink, repl_fn, note, asker, secret_prompt = make_frontend(
-                permissions, args.no_tui
+                permissions, args.no_tui, args.classic
             )
         try:
             session_log, restored = open_session(config, args.session_id)

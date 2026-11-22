@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import importlib.util
 import io
+import sys
 import tempfile
 import threading
 import unittest
@@ -247,13 +248,49 @@ class TakeTest(unittest.TestCase):
 
 @unittest.skipUnless(HAVE_TUI, "没装 TUI 可选依赖")
 class SwitchTest(unittest.TestCase):
-    def test_off_by_default(self) -> None:
+    def test_on_by_default(self) -> None:
         from xiaoyu.tui_live import enabled
 
-        self.assertFalse(enabled({}))
-        self.assertFalse(enabled({"XIAOYU_LIVE_INPUT": "0"}))
+        self.assertTrue(enabled({}))
         self.assertTrue(enabled({"XIAOYU_LIVE_INPUT": "1"}))
-        self.assertTrue(enabled({"XIAOYU_LIVE_INPUT": " On "}))
+        self.assertTrue(enabled({"XIAOYU_LIVE_INPUT": ""}))
+        self.assertFalse(enabled({"XIAOYU_LIVE_INPUT": "0"}))
+        self.assertFalse(enabled({"XIAOYU_LIVE_INPUT": " Off "}))
+
+    def frontend(self, environ: dict[str, str], **options: bool):
+        from pathlib import Path
+        from unittest import mock
+
+        from xiaoyu import terminal
+        from xiaoyu.cli import make_frontend
+        from xiaoyu.permissions import Permissions
+        from xiaoyu.tui_live import LiveTui
+
+        with tempfile.TemporaryDirectory() as folder, mock.patch(
+            "sys.stdin"
+        ) as fake_in, mock.patch("sys.stdout") as fake_out, mock.patch.object(
+            terminal, "autodetect"
+        ), mock.patch.object(LiveTui, "begin_recording"), mock.patch.dict(
+            "os.environ", environ
+        ):
+            fake_in.isatty.return_value = True
+            fake_out.isatty.return_value = True
+            _approver, _sink, run, *_rest = make_frontend(Permissions(Path(folder)), **options)
+        return run.__self__
+
+    @unittest.skipIf(sys.platform == "win32", "Windows 一律用原来的前端")
+    def test_cli_picks_the_live_frontend_unless_told_otherwise(self) -> None:
+        from xiaoyu.tui_live import LiveTui
+
+        self.assertIsInstance(self.frontend({"XIAOYU_LIVE_INPUT": ""}), LiveTui)
+        self.assertNotIsInstance(self.frontend({"XIAOYU_LIVE_INPUT": ""}, classic=True), LiveTui)
+        self.assertNotIsInstance(self.frontend({"XIAOYU_LIVE_INPUT": "0"}), LiveTui)
+
+    def test_classic_flag_is_on_both_entry_parsers(self) -> None:
+        from xiaoyu.cli import build_parser
+
+        self.assertFalse(build_parser().parse_args([]).classic)
+        self.assertTrue(build_parser().parse_args(["--classic"]).classic)
 
     def test_git_facts_outside_a_repository_is_empty(self) -> None:
         from xiaoyu.tui_live import _git_facts
