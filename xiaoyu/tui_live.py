@@ -25,6 +25,8 @@
 - 对续行（上一行软折下来的行）从行首清除会抹掉上一行的折行标记，把一个逻辑行
   拆成两行；所以续行只从行首字符之后清。渲染器重画第一帧前自带的那次清屏同理，
   已经清过的场合让它空转。
+- 输入区自己画的行不画满整行（`_EDGE`）：画满的行在窗口缩窄时被终端折行，
+  iTerm2 会因此把上面的内容推出屏幕顶，推出去的输入区残行再也擦不到。
 - 缩放：窗口一变，终端就已经把屏上内容按新宽度重排了。每次重画前先看窗口大小，
   变了就按同一套折行规则重算输入区的新起点再擦。空闲时缩放是干净的；流式输出
   中途缩放可能弄花正在输出的那一段（复用过的行在部分终端里仍记着旧宽度，行数
@@ -69,6 +71,11 @@ from .tui import USER_MARK, NoticeCapture, Tui, search_select
 ENV_SWITCH = "XIAOYU_LIVE_INPUT"
 
 _SPINNER = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
+#  输入区自己画的行（分隔线、底部一行）右侧留出的列数。画满整行的话，窗口每
+#  缩窄一点这些行就被终端折成两行；有的终端（iTerm2）会因此把上面的内容往屏幕
+#  顶外推，推出去的行光标够不着、擦不掉，拖动窗口时就一路留下分隔线。留出
+#  余量后，一次缩窄不超过这个数就不折行，行数不变，擦除位置不用猜。
+_EDGE = 8
 _TICK = 1 / 30
 
 # ---------------------------------------------------------------------------
@@ -302,6 +309,10 @@ class LiveScreen:
 
     def cols(self) -> int:
         return max(8, self.app.output.get_size().columns)
+
+    def span(self) -> int:
+        """输入区自己画的行能用的宽度（见 _EDGE）。"""
+        return max(8, self.cols() - _EDGE)
 
     # ---- 节拍 ----
 
@@ -1110,7 +1121,7 @@ class LiveTui(Tui):
     def _live_message(self) -> list[tuple[str, str]]:
         """输入行上方，自上而下：没成行的尾巴、进行中的事、待送达的话、分隔线。"""
         screen = self._screen
-        cols = screen.cols() if screen is not None else 80
+        cols = screen.span() if screen is not None else 80
         dim, accent = theme.ptk("text.secondary"), theme.ptk("text.accent")
         out: list[tuple[str, str]] = []
         #  这一行常在（空着也占位），输入区的行数才稳定
@@ -1168,7 +1179,7 @@ class LiveTui(Tui):
         用量留到最后。只占一行，不折行。
         """
         screen = self._screen
-        cols = screen.cols() if screen is not None else 80
+        cols = screen.span() if screen is not None else 80
         dim = theme.ptk("text.secondary")
         agent = self.agent
         mode = modes.get(agent.mode if agent is not None else modes.DEFAULT)
