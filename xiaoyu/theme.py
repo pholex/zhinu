@@ -142,6 +142,8 @@ _DARK: dict[str, Style] = {
     "diff.removed.word": Style(base="white", on=52),
     #  交互件
     "prompt": Style(base="green"),
+    #  scrollback 里用户原话那一行的底色（整行铺满，回翻时一眼找到自己问的）
+    "prompt.echo": Style(on=236),
     "menu.title": Style(base="yellow"),
     "menu.selected": Style(base="cyan", bold=True),
     "menu.hint": Style(dim=True),
@@ -173,6 +175,7 @@ _LIGHT: dict[str, Style] = {
     "diff.added.word": Style(color=22, on=194),
     "diff.removed.word": Style(color=52, on=224),
     "prompt": Style(color=28),
+    "prompt.echo": Style(on=254),
     "menu.title": Style(color=130),
     "menu.selected": Style(color=25, bold=True),
     "menu.hint": Style(color=240),

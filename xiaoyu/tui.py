@@ -446,17 +446,20 @@ TOOL_MARK = "● "
 TURN_MARK = "✻ "
 
 
-def user_echo(text: str) -> Text:
-    """用户原话在 scrollback 里的样子：❯ 开头（与输入行的提示符同形），正文加粗。
+def user_echo(text: str, width: int) -> Text:
+    """用户原话在 scrollback 里的样子：❯ 开头（与输入行的提示符同形），整行铺底色。
 
     多行只标第一行，其余缩进对齐——逐行都标的话，从屏幕上复制一段多行原话要
-    手动删好几个前缀。不铺整行底色：打进 scrollback 的字改不了，底色得用空格
-    铺到当时的行宽，之后窗口一缩窄，这一行就折成两行。
+    手动删好几个前缀。底色铺到差一格满行：恰好写满一行再清行尾，部分终端会
+    抹掉最后一格。
     """
-    rows = [
-        Text.assemble((USER_MARK if index == 0 else "  ", "text.accent"), (row, "bold"))
-        for index, row in enumerate(text.split("\n"))
-    ]
+    rows: list[Text] = []
+    for index, row in enumerate(text.split("\n")):
+        line = Text.assemble((USER_MARK if index == 0 else "  ", "text.accent"), row)
+        span = max(1, width - 1)
+        line.append(" " * (-line.cell_len % span))
+        line.stylize("prompt.echo")
+        rows.append(line)
     return Text("\n").join(rows)
 
 
@@ -2480,10 +2483,10 @@ class Tui:
 
     def _echo(self, text: str, literal: bool) -> None:
         """输入行不留在原地，把这一行补打进 scrollback：回头翻记录时最先要找的
-        就是「我在哪儿问的」。对模型说的话加粗、提示符用强调色；命令（/、!、#）
-        是对程序说的，只留提示符与原文，不抢眼。"""
+        就是「我在哪儿问的」。对模型说的话是带底色的区块；命令（/、!、#）是对
+        程序说的，只留提示符与原文，不抢眼。"""
         if keys.classify_input(text, literal=literal).kind == "send":
-            self.console.print(user_echo(text))
+            self.console.print(user_echo(text, self.console.width))
         else:
             body = text.replace("\n", "\n  ")
             self.console.print(Text.assemble((USER_MARK, "prompt"), (body, "")))
@@ -2519,7 +2522,7 @@ class Tui:
                 prompt_continuation=lambda width, line_number, is_soft_wrap: " " * width,
                 #  prompt_toolkit 自带的 Ctrl-X Ctrl-E：长指令拉到 $EDITOR 里改
                 enable_open_in_editor=True,
-                #  输入行提交后收走，原话由 _echo 补打成区块（多行只标第一行）
+                #  输入行提交后收走，原话由 _echo 补打成带底色的区块
                 erase_when_done=True,
             )
         return self._session
