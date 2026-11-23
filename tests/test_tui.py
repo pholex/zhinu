@@ -126,17 +126,21 @@ class TestRichSink(unittest.TestCase):
     }
 
     def test_successful_mcp_calls_fold_into_one_line_per_server(self) -> None:
-        from xiaoyu.events import TextDelta, TextEnd, ToolCompleted, ToolPending
+        from xiaoyu.events import RequestEnded, RequestStarted, TextDelta, TextEnd, ToolCompleted, ToolPending
 
         sink, buffer = self.build()
         for purpose in ("删除 0.87.1", "回读清单"):
+            #  一步一个模型请求：请求开始不能把攒着的折叠组落盘，否则永远是 ×1
+            sink.emit(RequestStarted("m"))
+            sink.emit(RequestEnded())
             sink.emit(ToolPending("use_tool", self.MCP_ARGS, purpose))
             sink.emit(ToolCompleted("use_tool", output="ok\n细节", ok=True, seconds=1.0))
+        sink.emit(RequestStarted("m"))
         self.assertEqual(buffer.getvalue(), "")  # 还在攒：一行都没落
         sink.emit(TextDelta("完成"))
         sink.emit(TextEnd())
         out = buffer.getvalue()
-        self.assertIn("⎿ chrome-devtools ×2", out)
+        self.assertIn("● chrome-devtools ×2", out)
         self.assertNotIn("evaluate_script", out)
         self.assertTrue(sink.truncated)
         #  每一步是什么、返回了什么都在留底里，Ctrl-O 能逐条看
@@ -155,8 +159,10 @@ class TestRichSink(unittest.TestCase):
         sink.emit(ToolPending("use_tool", self.MCP_ARGS, "删除 0.87.0"))
         sink.emit(ToolCompleted("use_tool", output="ERROR: 403\n详情", ok=False, seconds=0.1))
         out = buffer.getvalue()
-        #  先落前面攒的，再是出错这一步的调用行与错误，顺序不乱
-        self.assertLess(out.index("⎿ chrome-devtools ×1"), out.index("evaluate_script 删除 0.87.0"))
+        #  先落前面攒的（只有一条：原样一行，带耗时），再是出错这一步，顺序不乱
+        self.assertIn("● chrome-devtools·evaluate_script 查看清单 · 0.1s", out)
+        self.assertNotIn("×1", out)
+        self.assertLess(out.index("evaluate_script 查看清单"), out.index("evaluate_script 删除 0.87.0"))
         self.assertLess(out.index("evaluate_script 删除 0.87.0"), out.index("✗ ERROR: 403"))
         self.assertIn("详情", out)
 
@@ -187,7 +193,16 @@ class TestRichSink(unittest.TestCase):
         sink.emit(ToolPending("bash", {"command": "rm -rf build"}))
         sink.emit(ToolCompleted("bash", output="ok", ok=True, seconds=0.1))
         out = buffer.getvalue()
-        self.assertLess(out.index("⎿ chrome-devtools ×1"), out.index("● bash rm -rf build"))
+        self.assertLess(out.index("evaluate_script 查看清单"), out.index("● bash rm -rf build"))
+
+    def test_pretty_printed_json_result_is_summarised_not_a_lone_brace(self) -> None:
+        from xiaoyu.events import ToolCompleted, ToolPending
+
+        sink, buffer = self.build()
+        sink.emit(ToolPending("search_tool", {"query": "list pages"}))
+        output = '{\n  "results": [\n    {\n      "tool_name": "list_pages"\n    }\n  ]\n}'
+        sink.emit(ToolCompleted("search_tool", output=output, ok=True, seconds=0.0))
+        self.assertIn('⎿ { "results": [ { "tool_name": "list_pages"', buffer.getvalue())
 
     def test_purpose_line_stays_when_summary_is_the_command(self) -> None:
         from xiaoyu.events import ToolPending, ToolPurpose

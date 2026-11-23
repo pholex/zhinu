@@ -1410,8 +1410,9 @@ class RichSink:
         self._pending_ro = ""
         #  工具行的摘要已经是模型自述的目的：确认前那行「目的：」不再重复
         self._purpose_shown = ""
-        #  折叠组里的 MCP 调用：按 server 计数。成功的只进计数与留底，不各占一行
-        self._mcp_counts: dict[str, int] = {}
+        #  折叠组里已成功的 MCP 调用 (server, 调用行)：落盘时只有一条就原样打那一行，
+        #  多条按 server 计数；每条的输出都在留底里
+        self._mcp_done: list[tuple[str, Text]] = []
         #  正在进行、还没落笔的那次 MCP 调用 (server, 调用行)：成功就并进折叠组；
         #  要人确认、被拒绝、出错时先把调用行补打出来，照常单独成行
         self._held: tuple[str, Text] | None = None
@@ -1548,24 +1549,40 @@ class RichSink:
 
         折叠组里只收 ok 的只读调用；出错的不进组（错误必须展开可见）。
         """
-        if not self._ro_counts and not self._mcp_counts:
+        if self._ro_counts:
+            parts = [f"{_RO_TOOLS[name]} ×{count}" for name, count in self._ro_counts.items()]
+            self._ro_counts = {}
+            if not self.detail:
+                self.truncated = True
+            self.console.print(
+                Text(f"{self.indent}  ⎿ {' · '.join(parts)}", style="text.secondary")
+            )
+        done, self._mcp_done = self._mcp_done, []
+        if not done:
             return
-        parts = [f"{_RO_TOOLS[name]} ×{count}" for name, count in self._ro_counts.items()]
-        parts += [f"{server} ×{count}" for server, count in self._mcp_counts.items()]
-        self._ro_counts = {}
-        self._mcp_counts = {}
-        if not self.detail:
-            self.truncated = True
-        self.console.print(
-            Text(f"{self.indent}  ⎿ {' · '.join(parts)}", style="text.secondary")
-        )
+        #  MCP 这一行自己起头（和一次普通调用同样的记号），不挂在上一条调用下面：
+        #  挂着的话读起来像是上一条调用的结果
+        if len(done) == 1:
+            row = done[0][1]
+        else:
+            counts: dict[str, int] = {}
+            for server, _ in done:
+                counts[server] = counts.get(server, 0) + 1
+            row = Text.assemble(
+                (f"{self.indent}{TOOL_MARK}", "text.accent"),
+                (" · ".join(f"{server} ×{count}" for server, count in counts.items()), "text.accent"),
+            )
+        self.truncated = True
+        self._print_anchor(row)
+        self._tool_tail = True
 
     def _request_started(self, event: RequestStarted) -> None:
         """等模型的活区指示。补上"请求已发出、还没有任何输出"这段空白——
         以前这里什么都不画，用户无从判断它在干活还是卡死了。"""
         self._preparing_request = True
         self._preparing_index = None
-        self._flush_ro_group()
+        #  折叠组不在这里落盘：一步一个请求，在这儿落就永远并不成一行。
+        #  它等到下一段正文、下一条要单独成行的调用或一轮结束
         if not self.verbose or not self.console.is_terminal:
             return
         self._stop_status()
@@ -1753,8 +1770,9 @@ class RichSink:
         duration = f" · {event.seconds:.1f}s" if event.seconds >= 0.05 else ""
         if self._held is not None and event.ok and not self.detail:
             (server, anchor), self._held = self._held, None
-            self._mcp_counts[server] = self._mcp_counts.get(server, 0) + 1
-            self.folded.append((f"{anchor.plain.strip()}{duration}", lines))
+            anchor.append(duration, style="text.secondary")
+            self._mcp_done.append((server, anchor))
+            self.folded.append((anchor.plain.strip(), lines))
             return
         #  出错（或中途开了详情）：不进折叠组，调用行补打出来、结果照常展开
         self.release_held()
@@ -1776,7 +1794,9 @@ class RichSink:
             #  开头的引导语、空行、代码围栏不当摘要（每次都一样，等于没说），也不进
             #  留底；预算扣掉 "  ⎿ " 与耗时后缀，摘要才真的是一行
             at = ui.result_headline(lines)
-            summary = ui.preview(lines[at], self._budget(4 + len(duration) + len(counts)))
+            summary = ui.preview(
+                ui.result_summary(lines, at), self._budget(4 + len(duration) + len(counts))
+            )
             head.append(f"{summary}{counts}{duration}", style="text.secondary")
             rest: list[Any] = diff_rows if diff_rows else lines[at + 1 :]
             #  收尾的空行、围栏、来源标记同样不算"还有内容"

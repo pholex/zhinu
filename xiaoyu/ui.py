@@ -348,6 +348,15 @@ def result_headline(lines: list[str]) -> int:
     return 0
 
 
+def result_summary(lines: list[str], at: int) -> str:
+    """折叠行上的那句话。逐行排版的 JSON 第一行只有一个括号：把后面几行接上来，
+    压成一行后能看出里面是什么。"""
+    line = lines[at]
+    if line.strip() not in ("{", "["):
+        return line
+    return " ".join(part.strip() for part in lines[at : at + 12] if part.strip())
+
+
 #  升权档位 → 用户看得懂的一句后果。档位名本身（danger-full-access）对不熟
 #  沙箱的人只是个字符串，确认框里得把"批下去会怎样"写明白
 _ESCALATION_MEANING: dict[str, str] = {

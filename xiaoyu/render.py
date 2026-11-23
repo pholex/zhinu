@@ -270,7 +270,7 @@ class PlainSink:
 
     def _tool_completed(self, event: ToolCompleted) -> None:
         lines = event.output.split("\n")
-        first_line = lines[ui.result_headline(lines)]
+        first_line = ui.result_summary(lines, ui.result_headline(lines))
         print(self.indent + ui.secondary(f"  ↳ {ui.fit(first_line, self._reserve())}"))
 
     def _plan(self, event: PlanUpdated) -> None:
