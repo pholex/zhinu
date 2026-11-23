@@ -170,7 +170,7 @@ async with contextlib.aclosing(async_agent.stream("任务")) as events:
 | `RequestEnded` | `request.ended` | `duration_ms`、`ttft_ms`（首个 chunk 延迟；一个都没等到为 `null`）、`usage`（这次调用的 `prompt_tokens` / `completion_tokens` / `cached_tokens`；上游没回 usage 为 `{}`） |
 | `TextDelta` / `TextEnd` | `text.delta` / `text.end` | `text` |
 | `ToolPreparing` | `tool.preparing` | `name`, `index`, `argument_chars`, `path`, `purpose`（参数生成中的临时预览） |
-| `ToolPending` | `tool.pending` | `name`, `args` |
+| `ToolPending` | `tool.pending` | `name`, `args`, `purpose`（模型自述的调用目的；`args` 里不含它，没写时序列化结果里没有这个键） |
 | `ToolPurpose` | `tool.purpose` | `name`, `purpose` |
 | `ToolRunning` | `tool.running` | `name`, `args` |
 | `ToolProgress` | `tool.progress` | `name`, `message`, `progress`, `total`（running 与终态之间零到多次；目前只有 MCP 的 `notifications/progress` 会发；不在顶层导出面，按 `kind` 消费） |

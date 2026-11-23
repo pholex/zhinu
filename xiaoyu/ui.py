@@ -263,9 +263,98 @@ def tool_summary(name: str, args: object) -> str:
     pairs = [
         f"{key}={_summary_value(value)}"
         for key, value in args.items()
-        if not _CREDENTIAL_KEY.search(str(key)) and value not in (None, "", [], {})
+        if not _CREDENTIAL_KEY.search(str(key))
+        and key != _PURPOSE_KEY
+        and value not in (None, "", [], {})
     ]
     return " ".join(pairs)
+
+
+#  模型自述目的的参数名（与 tools.PURPOSE_PARAM 同值；ui 不反向 import tools）。
+#  历史消息里的参数还带着它，回放时不能当普通参数打成 键=值
+_PURPOSE_KEY = "__tool_use_purpose"
+
+
+def _tool_title(name: str) -> str:
+    """工具行上的名字：MCP 工具的 `mcp__server__tool` 写成 `server·tool`。"""
+    parts = name.split("__", 2)
+    if len(parts) == 3 and parts[0] == "mcp" and parts[1] and parts[2]:
+        return f"{parts[1]}·{parts[2]}"
+    return name
+
+
+def mcp_server(name: str, args: object) -> str:
+    """这次调用落到哪个 MCP server（经 use_tool 转发的看被调工具）；不是 MCP 返回空串。"""
+    if name == "use_tool" and isinstance(args, dict):
+        name = str(args.get("tool_name") or "").strip()
+    parts = name.split("__", 2)
+    if len(parts) == 3 and parts[0] == "mcp" and parts[1] and parts[2]:
+        return parts[1]
+    return ""
+
+
+def _summary_is_curated(name: str, args: dict) -> bool:
+    """这个工具的摘要是不是挑过的（命令、路径、查询词），而不是参数字典的平铺。"""
+    return (
+        name in _SUMMARY_FIELDS
+        or name == "apply_patch"
+        or (isinstance(args.get("path"), str) and bool(args["path"]))
+    )
+
+
+def tool_headline(name: str, args: object, purpose: str = "") -> tuple[str, str]:
+    """终端工具行的两段：(显示名, 一行摘要)。
+
+    - use_tool 只是转发壳，行上写被调的那个工具；
+    - 摘要挑过参数的工具（bash 的命令、文件工具的路径）照旧给参数——那是实际要
+      执行的东西，不能让模型的一句自述顶掉；
+    - 只能平铺 `键=值` 的工具（MCP、插件）有目的就给目的：一段脚本源码或一串
+      页面编号回答不了"这一步在干什么"，完整参数仍在确认框与会话记录里。
+    """
+    if not isinstance(args, dict):
+        return _tool_title(name), _summary_value(args)
+    if name == "use_tool":
+        inner = str(args.get("tool_name") or "").strip()
+        inner_args = args.get("tool_input")
+        if inner and isinstance(inner_args, dict):
+            name, args = inner, inner_args
+        elif inner:
+            name, args = inner, {}
+    purpose = " ".join(purpose.split())
+    if purpose and not _summary_is_curated(name, args):
+        return _tool_title(name), purpose
+    return _tool_title(name), tool_summary(name, args)
+
+
+#  结果行最多往下找几行：开头的引导语很短，找不到就老实用第一行
+_RESULT_SCAN = 4
+
+
+def result_headline(lines: list[str]) -> int:
+    """工具结果折叠成一行时该显示第几行。
+
+    跳过开头不带信息的行：空行、代码围栏、以冒号收尾的引导语（"… returned:"）。
+    这类输出的第一行每次都一样，折叠后等于什么都没说；真正的内容在下面。
+    找不到更好的就返回 0。
+    """
+    for index, line in enumerate(lines[:_RESULT_SCAN]):
+        text = line.strip()
+        #  外部来源标记是给模型看的包装（回放历史消息时还在），不是内容
+        if not text or text.startswith(("```", "<untrusted_content")):
+            continue
+        if text.endswith((":", "：")) and index + 1 < len(lines):
+            continue
+        return index
+    return 0
+
+
+def result_summary(lines: list[str], at: int) -> str:
+    """折叠行上的那句话。逐行排版的 JSON 第一行只有一个括号：把后面几行接上来，
+    压成一行后能看出里面是什么。"""
+    line = lines[at]
+    if line.strip() not in ("{", "["):
+        return line
+    return " ".join(part.strip() for part in lines[at : at + 12] if part.strip())
 
 
 #  升权档位 → 用户看得懂的一句后果。档位名本身（danger-full-access）对不熟

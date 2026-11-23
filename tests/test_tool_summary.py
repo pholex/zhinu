@@ -77,6 +77,64 @@ class ToolSummaryTest(unittest.TestCase):
         self.assertEqual(ui.tool_summary("x", "raw"), "raw")
 
 
+class TestToolHeadline(unittest.TestCase):
+    """终端工具行的 (显示名, 摘要)：转发壳不上屏，平铺参数让位给模型自述的目的。"""
+
+    SCRIPT = {"pageId": 8, "format": "function", "function": "async () => { const j = 1; }"}
+
+    def test_forwarded_mcp_call_shows_server_and_tool(self) -> None:
+        args = {"tool_name": "mcp__chrome-devtools__evaluate_script", "tool_input": self.SCRIPT}
+        label, summary = ui.tool_headline("use_tool", args)
+        self.assertEqual(label, "chrome-devtools·evaluate_script")
+        self.assertIn("pageId=8", summary)
+        self.assertNotIn("mcp__", summary)
+
+    def test_purpose_replaces_flattened_arguments(self) -> None:
+        args = {"tool_name": "mcp__chrome-devtools__evaluate_script", "tool_input": self.SCRIPT}
+        label, summary = ui.tool_headline("use_tool", args, "删除 0.87.1\n并回读清单")
+        self.assertEqual(label, "chrome-devtools·evaluate_script")
+        self.assertEqual(summary, "删除 0.87.1 并回读清单")
+
+    def test_purpose_never_hides_what_will_be_executed(self) -> None:
+        """命令、路径是实际要执行的东西：模型的一句自述不能顶掉它。"""
+        self.assertEqual(
+            ui.tool_headline("bash", {"command": "rm -rf build"}, "清理构建产物"),
+            ("bash", "rm -rf build"),
+        )
+        self.assertEqual(
+            ui.tool_headline("write_file", {"path": "a.py", "content": "x"}, "写入"),
+            ("write_file", "a.py"),
+        )
+        forwarded = {"tool_name": "bash", "tool_input": {"command": "ls"}}
+        self.assertEqual(ui.tool_headline("use_tool", forwarded, "看目录"), ("bash", "ls"))
+
+    def test_purpose_field_left_in_history_is_not_an_argument(self) -> None:
+        summary = ui.tool_summary("mcp__x__y", {"__tool_use_purpose": "说明", "id": 3})
+        self.assertEqual(summary, "id=3")
+
+    def test_non_mcp_names_are_left_alone(self) -> None:
+        self.assertEqual(ui.tool_headline("my__tool", {})[0], "my__tool")
+        self.assertEqual(ui.tool_headline("mcp__only", {})[0], "mcp__only")
+
+
+class TestResultHeadline(unittest.TestCase):
+    def test_skips_boilerplate_lead_in(self) -> None:
+        lines = ["Script ran on page and returned:", "```json", '{"status":200}', "```"]
+        self.assertEqual(ui.result_headline(lines), 2)
+        self.assertEqual(ui.result_headline(["", "结果：", "42"]), 2)
+        wrapped = ['<untrusted_content source="mcp__x__y">', "Script ran on page and returned:", "```json", "{}"]
+        self.assertEqual(ui.result_headline(wrapped), 3)
+
+    def test_ordinary_output_keeps_its_first_line(self) -> None:
+        self.assertEqual(ui.result_headline(["exit_status: 0", "stdout:", "x"]), 0)
+        self.assertEqual(ui.result_headline(["Successfully reloaded the page.", "## Pages"]), 0)
+
+    def test_falls_back_to_first_line(self) -> None:
+        self.assertEqual(ui.result_headline(["只有引导语："]), 0)
+        self.assertEqual(ui.result_headline([""]), 0)
+        self.assertEqual(ui.result_headline(["a:", "b:", "c:", "d:", "e"]), 0)
+
+
 if __name__ == "__main__":
     unittest.main()
 

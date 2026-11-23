@@ -141,6 +141,17 @@ class ToolPending(UIEvent):
     kind: ClassVar[str] = "tool.pending"
     name: str
     args: dict[str, Any]
+    #  模型自述的调用目的（只有需确认的工具才会被要求写，没写就是空串）。
+    #  args 里已经剥掉它；前端拿来当工具行的摘要
+    purpose: str = ""
+
+    def to_dict(self) -> dict[str, Any]:
+        #  没写目的就不出这个键：线上形态与加字段之前一致，老的消费方与录好的
+        #  事件流不受影响
+        fields = super().to_dict()
+        if not fields["purpose"]:
+            del fields["purpose"]
+        return fields
 
 
 @dataclass(frozen=True)
