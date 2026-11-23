@@ -474,6 +474,21 @@ class EscapeTest(unittest.TestCase):
         self.assertIsNone(front._activity)
 
 
+    def test_streaming_line_names_the_interrupt_key_too(self) -> None:
+        import time
+
+        front = self.front()
+        front._busy = "turn"
+        front._turn_started = time.monotonic()
+        shown = "".join(text for _style, text, *_rest in front._live_message())
+        self.assertIn("作答中…", shown)
+        self.assertIn("Esc 打断", shown)
+        #  面板挂着时 Esc 是取消面板，这一行不出现
+        front._panel = SimpleNamespace(kind="text", label=[])
+        shown = "".join(text for _style, text, *_rest in front._live_message())
+        self.assertNotIn("Esc 打断", shown)
+
+
 class InterruptibleIoTest(unittest.TestCase):
     """agent 在工作线程里跑时，打断要能打进卡在网络读上的那一刻（Agent._blocking）。"""
 
