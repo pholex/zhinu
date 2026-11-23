@@ -127,7 +127,7 @@ _DARK: dict[str, Style] = {
     "text.secondary": Style(dim=True),
     "text.heading": Style(bold=True),
     "text.accent": Style(base="cyan"),
-    #  流式正文的行级轻渲染：行内 `代码` 与 **粗体**（标记符本身走 text.secondary）
+    #  流式正文的 markdown 渲染：行内 `代码` 与 **粗体**（标记符已去掉）；表头用 text.strong
     "text.code": Style(color=215),
     "text.strong": Style(bold=True),
     #  状态

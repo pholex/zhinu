@@ -13,10 +13,11 @@ ImportError，cli 捕获后自动退回明文 REPL。
   Ctrl-O 开详情时回放上一轮被折叠的输出——"还有 N 行"是可兑现的承诺。
 - **agent 保持全同步**：流式输出发生在没有 prompt 挂起的时刻，
   不需要 patch_stdout、不需要线程（rich Status 自带的刷新线程只画活区一行）。
-- **流式正文不重绘，只做行级轻渲染**：inline 模式做 markdown 重绘会污染
-  scrollback，已滚出屏幕的内容也无法和最终渲染保持一致。所以每个字符只打一次：
-  代码围栏内按行语法着色，围栏外只给行内 `代码`、**粗体**、# 标题变色，
-  标记符保留原样只弱化——复制出去的文本与模型原文逐字一致（_StreamStyler）。
+- **流式正文不重绘，写完一行（一张表）就按版式打出去**：inline 模式做 markdown
+  重绘会污染 scrollback，已滚出屏幕的内容也无法和最终渲染保持一致。所以已打出的
+  字不再改：标题、列表符、引用、分隔线在行首定性后直接换成版式；行内 `代码`、
+  **粗体**攒到闭标记再去掉标记符着色；表格整张攒齐再排版；代码围栏内按行语法着色
+  （_StreamStyler）。
 
 核心交互三块：
 1. 工具调用渐进式披露：pending 一行锚点 → running 活区 spinner →
@@ -72,6 +73,7 @@ from __future__ import annotations
 import collections
 import contextlib
 import difflib
+import functools
 import io
 import itertools
 import os
@@ -473,41 +475,148 @@ def turn_summary(stats: str) -> Text:
     return Text.assemble((TURN_MARK, "text.accent"), (stats, "text.secondary"))
 
 
+@functools.lru_cache(maxsize=16)
+def _code_closer(run: int) -> re.Pattern[str]:
+    """长度恰为 run 的反引号串（前后不再挨着反引号）：行内代码的闭标记。"""
+    return re.compile(r"(?<!`)`{%d}(?!`)" % run)
+
+
+def _inline_pieces(head: str, complete: bool, base: str = "") -> tuple[list[tuple[str, str]], int]:
+    """一行（或一个单元格）的行内 markdown → [(文字, 样式)]，以及消费到哪。
+
+    闭合了的 `代码` 与 **粗体** 去掉标记符；没闭合的：行已完就照原文，行没完就停在
+    开标记处（返回的消费位置在那），等下一片。单个星号不算标记。
+    """
+    pieces: list[tuple[str, str]] = []
+    start = i = 0
+    n = len(head)
+
+    def plain(upto: int) -> None:
+        if upto > start:
+            pieces.append((head[start:upto], base))
+
+    while i < n:
+        ch = head[i]
+        if ch == "`":
+            j = i
+            while j < n and head[j] == "`":
+                j += 1
+            if j == n and not complete:
+                plain(i)
+                return pieces, i  # 反引号串可能被分片切成两半
+            close = _code_closer(j - i).search(head, j)
+            if close is not None:
+                plain(i)
+                content = head[j : close.start()]
+                #  CommonMark：两头各有一个空格（且不全是空格）时各去一个
+                if len(content) >= 2 and content[0] == content[-1] == " " and content.strip():
+                    content = content[1:-1]
+                pieces.append((content, "text.code"))
+                i = start = close.end()
+                continue
+            if not complete:
+                plain(i)
+                return pieces, i
+            i = j  # 到行尾也没闭合：照原文
+            continue
+        if ch == "*":
+            if i + 1 == n and not complete:
+                plain(i)
+                return pieces, i  # 可能是 ** 的前一半
+            if head[i + 1 : i + 2] == "*":
+                close = head.find("**", i + 3)
+                if close >= 0:
+                    plain(i)
+                    inner, _ = _inline_pieces(head[i + 2 : close], True, "text.strong")
+                    pieces.extend(inner)
+                    i = start = close + 2
+                    continue
+                if not complete:
+                    plain(i)
+                    return pieces, i
+                i += 2
+                continue
+        i += 1
+    plain(n)
+    return pieces, n
+
+
+def _inline_text(source: str) -> Text:
+    """一段完整的行内 markdown（表格单元格）渲染成 Text。"""
+    out = Text()
+    for text, style in _inline_pieces(source.strip(), True)[0]:
+        out.append(text, style or None)
+    return out
+
+
+def _table_cells(row: str) -> list[str]:
+    """表格的一行按 | 切成单元格（\\| 是字面的竖线），去掉两头的边框竖线。"""
+    body = row.strip()
+    if body.startswith("|"):
+        body = body[1:]
+    if body.endswith("|") and not body.endswith("\\|"):
+        body = body[:-1]
+    return [cell.strip().replace("\\|", "|") for cell in re.split(r"(?<!\\)\|", body)]
+
+
+def _cell_align(delimiter: str) -> str:
+    """分隔行的一格（:--- / :---: / ---:）→ 列的对齐方式。"""
+    cell = delimiter.strip()
+    if cell.startswith(":") and cell.endswith(":"):
+        return "center"
+    return "right" if cell.endswith(":") else "left"
+
+
 class _StreamStyler:
-    """流式正文的行级轻渲染：每个字符只打一次、不重绘，scrollback 上永远稳定。
+    """流式正文的 markdown 渲染：一行（或一张表）写完就按版式打出去，不回头重绘。
 
-    做的事（刻意少）：
-    - 代码围栏（``` / ~~~）内按行语法着色。着色拿整块已到的行做上下文（多行
-      字符串、块注释跨行时颜色才对），上限 _CODE_CONTEXT 行滑动窗口，成本有界；
-    - 围栏外：行内 `代码` 着 text.code、**粗体** 着 text.strong、# 标题整行
-      text.heading。标记符（反引号、星号、井号）**保留并弱化**而不是删掉——流式下
-      删了标记、后面发现没配对就改不回来；保留则复制出去的文本与模型原文逐字一致。
+    做的事：
+    - 代码围栏（``` / ~~~）内按行语法着色，围栏线弱化。着色拿整块已到的行做上下文
+      （多行字符串、块注释跨行时颜色才对），上限 _CODE_CONTEXT 行滑动窗口，成本有界；
+    - 标题去掉 `#`，整行加粗换色；`-` / `*` / `+` 列表项换成 `•`（缩进照旧）；
+      `>` 引用换成竖线；`---` 一类分隔线画成横线；
+    - 行内 `代码` 与 **粗体** 去掉标记符、整段着色。开标记之后的字攒到闭标记再打；
+      到行尾还没闭合就按原文打出（标记符不丢）；
+    - 表格整张攒齐（遇到非 `|` 行、空行或正文结束）再排版：列宽按中文字宽算，
+      太宽的列折行。第二行不是 `|---|` 分隔行的不当表格，原样打出。
 
-    不做：列表符替换、链接、表格、斜体（单星 / 下划线在中文与代码路径里误伤太多）、
-    跨行的行内标记（换行即重置行内状态）。
+    表格是唯一会整块攒着的东西，攒到 _TABLE_ROWS 行还没完就放弃排版、改为照原文
+    逐行打。复制出去的是渲染后的文字（没有 `**`、`#`），不再与模型原文逐字一致。
 
-    缓冲只在三处短暂发生：行首定性（最多攒到看清是不是围栏 / 标题，通常 1–3 个
-    字符）、反引号 / 星号串的末尾（分片可能把标记切成两半）、围栏内攒到换行
-    （代码行短，为的是整行一起着色）。其余字符到了就打，流式手感与裸 print 一致。
+    不做：斜体（单星 / 下划线在中文与代码路径里误伤太多）、链接、跨行的行内标记
+    （换行即重置）、有序列表的编号（原样保留）。
     """
 
     _FENCE = re.compile(r"^ {0,3}(`{3,}|~{3,})[ \t]*([\w+#.-]*)")
-    #  行首还可能长成围栏 / 标题的前缀：再等几个字符
+    #  行首还可能长成围栏的前缀：再等几个字符
     _MAYBE_FENCE = re.compile(r"^ {0,3}[`~]{1,2}$")
-    _HEADING = re.compile(r"^ {0,3}#{1,6} ")
+    _HEADING = re.compile(r"^ {0,3}#{1,6}[ \t]+")
     _MAYBE_HEADING = re.compile(r"^ {0,3}#{1,6}$")
+    #  分隔线要整行才认得出；行首只有这几个符号（与空白）时先等，"- " 与 "* " 也在
+    #  此列——多等一个字符才分得清是列表还是分隔线
+    _RULE = re.compile(r"^ {0,3}([-*_])(?:[ \t]*\1){2,}[ \t]*$")
+    _MAYBE_RULE = re.compile(r"^ {0,3}([-*_])(?:[ \t]*\1)*[ \t]*$")
+    #  行首只有列表符 / 引用符（还没看到后面的字）：再等一个字符才知道是不是
+    _MAYBE_MARK = re.compile(r"^[ \t]*(?:[-*+][ \t]*|>)$")
+    _BULLET = re.compile(r"^([ \t]*)[-*+][ \t]+(?=\S)")
+    _QUOTE = re.compile(r"^ {0,3}>[ \t]?")
+    _TABLE = re.compile(r"^ {0,3}\|")
+    _TABLE_DELIMITER = re.compile(r"^ {0,3}\|?[ \t]*:?-+:?[ \t]*(?:\|[ \t]*:?-+:?[ \t]*)*\|?[ \t]*$")
     _CODE_CONTEXT = 200
+    _TABLE_ROWS = 200
+    _RULE_WIDTH = 80
 
     def __init__(self, console: Console) -> None:
         self.console = console
         self._pending = ""
-        #  None = 行首未定性；"prose" / "heading" 两种行；围栏内看 _fence
+        #  None = 行首未定性；"prose" / "heading" / "table" 三种行；围栏内看 _fence
         self._kind: str | None = None
         self._fence: str | None = None  # 围栏标记（``` 或 ~~~，可更长）
         self._syntax: Syntax | None = None
         self._code_lines: list[str] = []
-        self._span = 0  # 行内代码打开时的反引号数，0 = 没打开
-        self._strong = False
+        #  攒着的表格行（原文）；_table_raw = 这张表太长、已放弃排版，余下照原文打
+        self._table: list[str] = []
+        self._table_raw = False
         #  区块外形：一段正文第一行以 ● 开头，其余行缩进两格与它对齐。空行不补
         #  缩进（不留行尾空格）
         self._bol = True
@@ -520,15 +629,15 @@ class _StreamStyler:
         self._drain(final=False)
 
     def finish(self) -> None:
-        """正文结束 / 中断：把攒着的半行按当前状态打出去，并复位。"""
+        """正文结束 / 中断：把攒着的半行、半张表按当前状态打出去，并复位。"""
         self._drain(final=True)
+        self._flush_table()
         self._pending = ""
         self._kind = None
         self._fence = None
         self._syntax = None
         self._code_lines = []
-        self._span = 0
-        self._strong = False
+        self._table_raw = False
         self._bol = True
         self._marked = False
 
@@ -546,22 +655,24 @@ class _StreamStyler:
             if self._kind is None:
                 if not self._classify(newline, final):
                     return
-                continue  # 定性后重新取行：围栏行已整行吃掉，prose / heading 走下面
+                continue  # 定性后重新取行：整行吃掉的已处理，其余走下面
             head = self._pending if newline < 0 else self._pending[:newline]
             complete = newline >= 0 or final
-            if self._kind == "heading":
-                self._emit(head, "text.heading")
-                consumed = len(head)
-            else:
-                consumed = self._prose(head, complete)
+            if self._kind == "table":
+                if not complete:
+                    return  # 表格行要整行
+                self._table_line(head)
+                self._pending = self._pending[newline + 1 :] if newline >= 0 else ""
+                self._kind = None
+                continue
+            base = "text.heading" if self._kind == "heading" else ""
+            consumed = self._prose(head, complete, base)
             if newline < 0:
                 self._pending = head[consumed:]
                 return
             self._pending = self._pending[newline + 1 :]
             self._emit("\n")
             self._kind = None
-            self._span = 0
-            self._strong = False
 
     def _split(self, newline: int) -> tuple[str, str]:
         if newline < 0:
@@ -569,21 +680,50 @@ class _StreamStyler:
         return self._pending[:newline], self._pending[newline + 1 :]
 
     def _classify(self, newline: int, final: bool) -> bool:
-        """行首定性。返回 False 表示还看不出来、要等更多字符。"""
+        """行首定性。返回 False 表示还看不出来、要等更多字符。行首标记（`#`、列表符、
+        `>`）在这里吃掉并换成版式，剩下的正文交给 _prose。"""
         head = self._pending if newline < 0 else self._pending[:newline]
         whole = newline >= 0 or final
+        if not whole and (
+            not head.strip()
+            or self._MAYBE_FENCE.match(head)
+            or self._MAYBE_HEADING.match(head)
+            or self._MAYBE_RULE.match(head)
+            or self._MAYBE_MARK.match(head)
+        ):
+            return False
+        if self._TABLE.match(head):
+            self._kind = "table"
+            return True
+        #  表格之后的第一行（空行、正文、任何别的）：表格到此为止
+        self._flush_table()
+        rest = "" if newline < 0 else self._pending[newline + 1 :]
         match = self._FENCE.match(head)
         if match is not None:
             if not whole:
                 return False  # 围栏行要整行（语言名在后面）
             self._emit(head, "text.secondary")
             self._emit("\n")
-            self._pending = "" if newline < 0 else self._pending[newline + 1 :]
+            self._pending = rest
             self._open_fence(match.group(1), match.group(2))
             return True
-        if not whole and (self._MAYBE_FENCE.match(head) or self._MAYBE_HEADING.match(head)):
-            return False
-        self._kind = "heading" if self._HEADING.match(head) else "prose"
+        if whole and self._RULE.match(head):
+            width = max(3, min(self.console.width - 2, self._RULE_WIDTH))
+            self._emit("─" * width, "text.secondary")
+            self._emit("\n")
+            self._pending = rest
+            return True
+        if match := self._HEADING.match(head):
+            self._pending = self._pending[match.end() :]
+            self._kind = "heading"
+            return True
+        if match := self._BULLET.match(head):
+            self._emit(match.group(1) + "• ")
+            self._pending = self._pending[match.end() :]
+        elif match := self._QUOTE.match(head):
+            self._emit("│ ", "text.secondary")
+            self._pending = self._pending[match.end() :]
+        self._kind = "prose"
         return True
 
     def _open_fence(self, marker: str, lang: str) -> None:
@@ -623,49 +763,87 @@ class _StreamStyler:
         if complete:
             self._emit("\n")
 
-    def _prose(self, head: str, complete: bool) -> int:
-        """围栏外的一行：边流边变色。返回消费了多少字符——行末的反引号 / 星号串
-        可能被分片切成两半，没看到串尾（且行没完）就留给下一片。"""
-        i, n = 0, len(head)
-        while i < n:
-            ch = head[i]
-            if ch == "`":
-                j = i
-                while j < n and head[j] == "`":
-                    j += 1
-                if j == n and not complete:
-                    break
-                run = j - i
-                if self._span == 0:
-                    self._span = run
-                    self._emit(head[i:j], "text.secondary")
-                elif self._span == run:
-                    self._span = 0
-                    self._emit(head[i:j], "text.secondary")
-                else:
-                    self._emit(head[i:j], "text.code")
-                i = j
-                continue
-            if ch == "*" and self._span == 0:
-                if i + 1 == n and not complete:
-                    break
-                if head[i + 1 : i + 2] == "*":
-                    self._strong = not self._strong
-                    self._emit("**", "text.secondary")
-                    i += 2
-                    continue
-            j = i + 1
-            while j < n and head[j] not in "`*":
-                j += 1
-            if self._span:
-                style = "text.code"
-            elif self._strong:
-                style = "text.strong"
-            else:
-                style = ""
-            self._emit(head[i:j], style)
-            i = j
-        return i
+    # ---------- 行内 ----------
+
+    def _prose(self, head: str, complete: bool, base: str = "") -> int:
+        """围栏外的一行：闭合了的行内标记去掉标记符着色，其余字到了就打。返回消费
+        了多少字符——开标记之后还没等到闭标记（且行没完）就停在开标记处，留给下一片。"""
+        pieces, consumed = _inline_pieces(head, complete, base)
+        for text, style in pieces:
+            self._emit(text, style)
+        return consumed
+
+    # ---------- 表格 ----------
+
+    def _table_line(self, line: str) -> None:
+        if self._table_raw:
+            self._raw_line(line)
+            return
+        self._table.append(line)
+        if len(self._table) > self._TABLE_ROWS:
+            #  太长：攒着的照原文打出去，余下的行到了就打
+            rows, self._table = self._table, []
+            self._table_raw = True
+            for row in rows:
+                self._raw_line(row)
+
+    def _raw_line(self, line: str) -> None:
+        self._prose(line, True)
+        self._emit("\n")
+
+    def _flush_table(self) -> None:
+        """攒着的表格行打出去：像表格就排版，不像就照原文。"""
+        rows, self._table = self._table, []
+        self._table_raw = False
+        if not rows:
+            return
+        rendered = self._render_table(rows) if len(rows) >= 2 and self._TABLE_DELIMITER.match(rows[1]) else None
+        if rendered is None:
+            for row in rows:
+                self._raw_line(row)
+            return
+        for line in rendered:
+            self._write(line)
+            self._emit("\n")
+
+    def _render_table(self, rows: list[str]) -> list[Text] | None:
+        from rich import box
+        from rich.table import Table
+
+        header = _table_cells(rows[0])
+        aligns = [_cell_align(cell) for cell in _table_cells(rows[1])]
+        if not header or len(aligns) != len(header):
+            return None
+        table = Table(
+            box=box.SIMPLE_HEAD,
+            show_edge=False,
+            pad_edge=False,
+            header_style="text.strong",
+            border_style="text.secondary",
+        )
+        for cell, align in zip(header, aligns):
+            table.add_column(_inline_text(cell), justify=align, overflow="fold")
+        for row in rows[2:]:
+            cells = _table_cells(row)[: len(header)]
+            cells += [""] * (len(header) - len(cells))
+            table.add_row(*(_inline_text(cell) for cell in cells))
+        #  内容缩进两格（与 ● 对齐），表宽要扣掉这两格
+        width = max(20, self.console.width - 2)
+        try:
+            lines = self.console.render_lines(table, self.console.options.update(width=width), pad=False)
+        except Exception:  # noqa: BLE001 - 排版失败退回原文，不能因样式而炸
+            return None
+        out: list[Text] = []
+        for segments in lines:
+            line = Text()
+            for segment in segments:
+                if not segment.control:
+                    line.append(segment.text, segment.style)
+            line.rstrip()
+            out.append(line)
+        while out and not out[-1].plain:
+            out.pop()
+        return out
 
     def _emit(self, text: str, style: str = "") -> None:
         if not text:

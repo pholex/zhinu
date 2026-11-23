@@ -1872,8 +1872,8 @@ class TestNextStepSuggest(unittest.TestCase):
 
 @unittest.skipUnless(HAS_TUI, "未安装 tui 可选依赖")
 class TestStreamStyler(unittest.TestCase):
-    """流式正文的行级轻渲染：每个字符只打一次；去掉样式码与区块外形（首行的 ●、
-    其余行的两格缩进）后与原文逐字一致。"""
+    """流式正文的 markdown 渲染：一行（或一张表）写完就按版式打出去、不回头重绘；
+    分片边界落在哪都不改变打出来的东西。"""
 
     _ANSI = __import__("re").compile(r"\x1b\[[0-9;]*m")
 
@@ -1950,13 +1950,142 @@ class TestStreamStyler(unittest.TestCase):
         #  工具块前的空行，各一个
         self.assertEqual(raw.getvalue().count("\n"), 3)
 
+    #  SAMPLE 渲染后的样子：标题去 #、闭合的行内标记去标记符，围栏照旧
+    SAMPLE_RENDERED = (
+        "标题行\n"
+        "先用 subprocess.run 跑一下，注意 2*3 这种星号不是粗体：\n"
+        "```python\n"
+        'def f():\n    """doc\n    more"""\n    return "s"\n'
+        "```\n"
+        "~~~\n"
+        "no lang here\n"
+        "~~~\n"
+        "\n"
+        "结尾没有换行"
+    )
+
+    def plain(self, text: str, chunk: int = 3) -> str:
+        return self._ANSI.sub("", self.stream(text, chunk))
+
     def test_plain_text_survives_any_chunking(self) -> None:
-        """分片边界落在哪都不该改变打出去的字符：标记符保留、不丢不重。"""
+        """分片边界落在哪都不该改变打出去的字符：不丢不重。"""
         for chunk in (1, 2, 3, 7, 1000):
             with self.subTest(chunk=chunk):
-                self.assertEqual(
-                    self._ANSI.sub("", self.stream(self.SAMPLE, chunk)), self.blocked(self.SAMPLE)
-                )
+                self.assertEqual(self.plain(self.SAMPLE, chunk), self.blocked(self.SAMPLE_RENDERED))
+
+    def test_block_markers_become_layout(self) -> None:
+        """列表符换成 •（缩进照旧，有序列表不动）、引用换成竖线、分隔线画成横线；
+        行首只露出一个标记符的分片也要等到看清再定。"""
+        text = (
+            "- 一\n"
+            "  * 二\n"
+            "      + 三\n"
+            "1. 有序不动\n"
+            "> 引用\n"
+            "---\n"
+            "-1 不是列表，**也不是粗体\n"
+        )
+        expected = (
+            "• 一\n"
+            "  • 二\n"
+            "      • 三\n"
+            "1. 有序不动\n"
+            "│ 引用\n"
+            + "─" * 78 + "\n"
+            "-1 不是列表，**也不是粗体\n"
+        )
+        for chunk in (1, 2, 1000):
+            with self.subTest(chunk=chunk):
+                self.assertEqual(self.plain(text, chunk), self.blocked(expected))
+
+    def test_unclosed_inline_markers_print_as_written(self) -> None:
+        """开标记到行尾都没闭合：原文照打，标记符不丢；下一行重新开始。"""
+        text = "前 `半个 **也半个\n下一行 **粗**\n"
+        self.assertEqual(self.plain(text, 1), self.blocked("前 `半个 **也半个\n下一行 粗\n"))
+
+    def test_text_after_an_open_marker_waits_for_the_close(self) -> None:
+        """开标记之后的字攒着（闭标记来了才知道怎么画）；之前的字照常先打。"""
+        from xiaoyu.events import TextDelta
+
+        sink, buffer = self.build()
+        with contextlib.redirect_stdout(io.StringIO()):
+            sink.emit(TextDelta("先打 **攒着"))
+            self.assertEqual(self._ANSI.sub("", buffer.getvalue()), "● 先打 ")
+            sink.emit(TextDelta("** 后面"))
+        self.assertEqual(self._ANSI.sub("", buffer.getvalue()), "● 先打 攒着 后面")
+
+    TABLE = (
+        "前言\n"
+        "| 版本 | 时间 | 文件 |\n"
+        "|:---|:---:|---:|\n"
+        "| **0.88.0** | 一小时前 | `a.whl` |\n"
+        "| 0.87.2 | 2 days ago | b \\| c |\n"
+        "\n"
+        "后记\n"
+    )
+
+    def test_table_is_laid_out_once_complete(self) -> None:
+        out = self.plain(self.TABLE, 3)
+        lines = out.split("\n")
+        header = next(line for line in lines if "版本" in line)
+        first = next(line for line in lines if "0.88.0" in line)
+        second = next(line for line in lines if "0.87.2" in line)
+        #  竖线与分隔行不见了，行内标记去掉了，\| 是字面竖线
+        self.assertNotIn("|---", out)
+        self.assertNotIn("**", out)
+        self.assertNotIn("`", out)
+        self.assertIn("b | c", second)
+        self.assertTrue(header.startswith("  版本"))
+        #  列按显示宽度对齐（中文占两格）：每一行第二列的起点在同一格
+        from rich.cells import cell_len
+
+        def column_at(line: str, text: str) -> int:
+            return cell_len(line[: line.index(text)])
+
+        self.assertEqual(column_at(first, "0.88.0"), column_at(second, "0.87.2"))
+        self.assertEqual(column_at(header, "版本"), column_at(first, "0.88.0"))
+        #  右对齐的第三列：右端对齐
+        self.assertEqual(
+            column_at(first, "a.whl") + cell_len("a.whl"), column_at(second, "b | c") + cell_len("b | c")
+        )
+        self.assertIn("─", out)
+        self.assertTrue(out.endswith("后记\n"))
+        #  分片切在哪都一样
+        self.assertEqual(self.plain(self.TABLE, 1), out)
+        self.assertEqual(self.plain(self.TABLE, 1000), out)
+
+    def test_pipe_lines_that_are_not_a_table_print_as_written(self) -> None:
+        text = "| 只是一行竖线开头的字\n| 第二行也不是分隔行\n结束\n"
+        self.assertEqual(self.plain(text, 2), self.blocked(text))
+
+    def test_table_at_end_of_text_is_flushed(self) -> None:
+        """正文以表格结尾（没有空行收尾）、或中途被打断：攒着的表格照样打出来。"""
+        from xiaoyu.events import TextDelta
+
+        out = self.plain("| a | b |\n|---|---|\n| 1 | 2 |", 4)
+        self.assertIn("1", out)
+        self.assertNotIn("|", out)
+        sink, buffer = self.build()
+        with contextlib.redirect_stdout(io.StringIO()):
+            sink.emit(TextDelta("| a | b |\n|---|---|\n| 1 | 2 |\n"))
+            self.assertEqual(buffer.getvalue(), "")  # 还在攒
+            sink.interrupt()
+        self.assertIn("1", self._ANSI.sub("", buffer.getvalue()))
+
+    def test_overlong_table_falls_back_to_raw_lines(self) -> None:
+        from xiaoyu import tui
+
+        rows = ["| a | b |", "|---|---|"] + [f"| {i} | x |" for i in range(tui._StreamStyler._TABLE_ROWS + 5)]
+        text = "\n".join(rows) + "\n"
+        self.assertEqual(self.plain(text, 50), self.blocked(text))
+
+    def test_wide_table_wraps_within_the_terminal(self) -> None:
+        text = "| 名字 | 说明 |\n|---|---|\n| x | " + "很长的说明" * 30 + " |\n"
+        out = self.plain(text, 1000)
+        from rich.cells import cell_len
+
+        self.assertTrue(all(cell_len(line) <= 80 for line in out.split("\n")))
+        self.assertGreater(out.count("\n"), 4)
 
     def test_fenced_code_is_highlighted_and_fences_dimmed(self) -> None:
         out = self.stream(self.SAMPLE, 5)
@@ -1978,10 +2107,14 @@ class TestStreamStyler(unittest.TestCase):
         lines = out.split("\n")
         heading = lines[0]
         self.assertIn("\x1b[1m", heading)  # 标题行加粗
+        self.assertNotIn("#", heading)
         prose = lines[1]
         plain = self._ANSI.sub("", prose)
-        self.assertIn("`subprocess.run`", plain)
-        self.assertIn("**注意**", plain)
+        #  闭合的行内标记去掉标记符
+        self.assertIn(" subprocess.run ", plain)
+        self.assertIn("，注意 2*3", plain)
+        self.assertNotIn("`", plain)
+        self.assertNotIn("**", plain)
         #  行内代码整段着色、粗体整段加粗（分片边界会把一段切成多个片段，按字符查
         #  样式而不是查样式码的位置）；单个星号（2*3）不触发任何样式切换
         from rich.console import Console
