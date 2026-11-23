@@ -96,6 +96,61 @@ class TestRichSink(unittest.TestCase):
         #  被折叠的行数与查看入口要有交代
         self.assertIn("还有 1 行", out)
 
+    def test_mcp_tool_line_shows_purpose_and_informative_result(self) -> None:
+        """MCP 调用的工具行写目的而不是脚本源码；结果行跳过每次都一样的引导语。"""
+        from xiaoyu.events import ToolCompleted, ToolPending, ToolPurpose
+
+        sink, buffer = self.build()
+        args = {
+            "tool_name": "mcp__chrome-devtools__evaluate_script",
+            "tool_input": {"pageId": 8, "function": "async () => { const v = 1; }"},
+        }
+        sink.emit(ToolPending("use_tool", args, "试删最旧的 0.87.0 并核对"))
+        sink.emit(ToolPurpose("use_tool", "试删最旧的 0.87.0 并核对"))
+        output = 'Script ran on page and returned:\n```json\n{"status":200}\n```'
+        sink.emit(ToolCompleted("use_tool", output=output, ok=True, seconds=1.2))
+        out = buffer.getvalue()
+        self.assertIn("● chrome-devtools·evaluate_script 试删最旧的 0.87.0 并核对", out)
+        self.assertNotIn("use_tool", out)
+        self.assertNotIn("async", out)
+        #  摘要已经是目的：确认前不再重复一行
+        self.assertNotIn("目的：", out)
+        #  收尾的围栏不算"还有内容"
+        self.assertIn('⎿ {"status":200} · 1.2s', out)
+        self.assertNotIn("还有", out)
+        self.assertNotIn("Script ran", out)
+
+    def test_purpose_line_stays_when_summary_is_the_command(self) -> None:
+        from xiaoyu.events import ToolPending, ToolPurpose
+
+        sink, buffer = self.build()
+        sink.emit(ToolPending("bash", {"command": "rm -rf build"}, "清理构建产物"))
+        sink.emit(ToolPurpose("bash", "清理构建产物"))
+        out = buffer.getvalue()
+        self.assertIn("● bash rm -rf build", out)
+        self.assertIn("目的：清理构建产物", out)
+
+    def test_consecutive_tool_calls_are_not_separated_by_blank_lines(self) -> None:
+        from unittest import mock
+
+        from xiaoyu.events import TextDelta, TextEnd, ToolCompleted, ToolPending
+
+        sink, _ = self.build()
+        with mock.patch.object(sink, "_gap") as gap:
+            sink.emit(ToolPending("bash", {"command": "a"}))
+            sink.emit(ToolCompleted("bash", output="ok", ok=True, seconds=0.1))
+            sink.emit(ToolPending("bash", {"command": "b"}))
+            self.assertEqual(gap.call_count, 1)  # 只有第一次调用前空行
+            sink.emit(ToolCompleted("bash", output="ERROR: 坏了\n细节", ok=False, seconds=0.1))
+            sink.emit(ToolPending("bash", {"command": "c"}))
+            self.assertEqual(gap.call_count, 2)  # 出错展开之后照常隔开
+            sink.emit(ToolCompleted("bash", output="ok", ok=True, seconds=0.1))
+            sink.emit(TextDelta("说一句"))
+            sink.emit(TextEnd())
+            before = gap.call_count
+            sink.emit(ToolPending("bash", {"command": "d"}))
+            self.assertEqual(gap.call_count, before + 1)  # 正文之后照常隔开
+
     def test_escape_sequences_never_reach_terminal(self) -> None:
         from xiaoyu.events import Notice, TextDelta, TextEnd, ToolCompleted, ToolPending
 

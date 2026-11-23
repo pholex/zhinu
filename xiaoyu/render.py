@@ -137,7 +137,10 @@ def replay_transcript(
                 name = str(record.get("name") or "tool")
             output = media.text_of(record.get("content"))
             ensure_header()
-            sink.emit(ToolPending(name, args))
+            #  历史里的参数还带着目的字段：拆出来走同一条展示规则
+            purpose = str(args.get(ui._PURPOSE_KEY) or "").strip()  # noqa: SLF001 - 同包
+            args = {key: value for key, value in args.items() if key != ui._PURPOSE_KEY}  # noqa: SLF001
+            sink.emit(ToolPending(name, args, purpose))
             sink.emit(
                 ToolCompleted(name, output=output, ok=not output.startswith("ERROR"), seconds=0.0)
             )
@@ -247,10 +250,13 @@ class PlainSink:
             print()
 
     def _tool_pending(self, event: ToolPending) -> None:
+        label, summary = ui.tool_headline(event.name, event.args, event.purpose)
+        #  摘要已经是目的时，确认前那行「目的：」不再重复
+        self._purpose_shown = event.purpose if summary == " ".join(event.purpose.split()) else ""
         print(
             self.indent
-            + ui.accent(f"⚙ {event.name}")
-            + ui.secondary(f" {args_preview(event.name, event.args, self._reserve(event.name))}")
+            + ui.accent(f"⚙ {label}")
+            + ui.secondary(f" {ui.fit(summary, self._reserve(label))}")
         )
 
     def _reserve(self, name: str = "") -> int:
@@ -258,10 +264,13 @@ class PlainSink:
         return len(self.indent) + len(name) + 4
 
     def _tool_purpose(self, event: ToolPurpose) -> None:
+        if event.purpose and event.purpose == getattr(self, "_purpose_shown", ""):
+            return
         print(self.indent + ui.secondary(f"  目的：{event.purpose}"))
 
     def _tool_completed(self, event: ToolCompleted) -> None:
-        first_line = event.output.split("\n", 1)[0]
+        lines = event.output.split("\n")
+        first_line = lines[ui.result_headline(lines)]
         print(self.indent + ui.secondary(f"  ↳ {ui.fit(first_line, self._reserve())}"))
 
     def _plan(self, event: PlanUpdated) -> None:

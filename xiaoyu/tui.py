@@ -386,6 +386,10 @@ class _RunningLine:
 #  连续的只读探索工具折叠成一行汇总：
 #  coding agent 一半调用是这类，逐条打印会把真正的正文和写操作淹掉
 _RO_TOOLS = {"read_file": "读文件", "grep": "搜索", "list_files": "列目录"}
+#  会在 scrollback 里另起一块内容的事件：出现过它们，下一次工具调用前照常空行
+#  工具结果末尾不带信息的行
+_RESULT_TRAILERS = ("", "```", "</untrusted_content>")
+_BLOCK_EVENTS = (TextDelta, ToolDenied, PlanUpdated, SteerAccepted, Notice, ArtifactsReady, Suggestions)
 
 #  标记 Console 已挂过语义主题，避免子 agent 共用 Console 时重复入栈
 _THEMED = "_xiaoyu_themed"
@@ -1404,6 +1408,11 @@ class RichSink:
         #  折叠组内只读调用的参数预览（顺序执行，pending→completed 严格配对，
         #  单格暂存即可）：回放时锚点行要能自报家门
         self._pending_ro = ""
+        #  工具行的摘要已经是模型自述的目的：确认前那行「目的：」不再重复
+        self._purpose_shown = ""
+        #  上一行是一条折叠成一行的工具结果：紧跟着的下一次调用不再空行隔开——
+        #  连着十几步操作时，空行占掉三分之一的屏幕
+        self._tool_tail = False
         #  编辑类工具 pending 时拍的快照 (路径, 改前, 改后)：完成时据此算 +N −M 与 diff。
         #  write_file 的"改前"要在工具动手之前读磁盘，所以必须在 pending 时取。
         #  确认框已经把 diff 预览打进 scrollback 的，note_previewed 会清掉它，不重复补
@@ -1461,6 +1470,8 @@ class RichSink:
 
     def emit(self, event: UIEvent) -> None:
         handler = self._handlers.get(type(event))
+        if isinstance(event, _BLOCK_EVENTS):
+            self._tool_tail = False
         if handler is not None:
             #  终端注入面：模型正文与工具输出可能夹带转义序列（见 ui.strip_controls）
             handler(render.sanitize_event(event))
@@ -1628,14 +1639,16 @@ class RichSink:
             return
         self._flush_ro_group()
         self._edit = self._edit_snapshot(event.name, event.args) if event.name in _EDIT_TOOLS else None
-        #  "● 工具名 " 之后才是参数预览，预算要把这一截先扣掉
-        preview = args_preview(
-            event.name, event.args, len(self.indent) + len(event.name) + 3, self.console.width
-        )
-        self._gap()
+        label, summary = ui.tool_headline(event.name, event.args, event.purpose)
+        self._purpose_shown = event.purpose if summary == " ".join(event.purpose.split()) else ""
+        #  "● 工具名 " 之后才是摘要，预算要把这一截先扣掉
+        preview = ui.fit(summary, len(self.indent) + len(label) + 3, self.console.width)
+        if not self._tool_tail:
+            self._gap()
+        self._tool_tail = False
         self.console.print(
             Text.assemble(
-                (f"{self.indent}{TOOL_MARK}{event.name}", "text.accent"),
+                (f"{self.indent}{TOOL_MARK}{label}", "text.accent"),
                 (f" {preview}", "text.secondary"),
             )
         )
@@ -1665,6 +1678,8 @@ class RichSink:
 
     def _tool_purpose(self, event: ToolPurpose) -> None:
         self._flush_ro_group()
+        if event.purpose and event.purpose == self._purpose_shown:
+            return
         self.console.print(Text(f"{self.indent}  目的：{event.purpose}", style="text.secondary"))
 
     def _tool_running(self, event: ToolRunning) -> None:
@@ -1717,10 +1732,15 @@ class RichSink:
             head = Text()
             head.append(f"{self.indent}  ")
             head.append("⎿ ", style="status.success")
-            #  预算扣掉 "  ⎿ " 与耗时后缀，摘要才真的是一行
-            summary = ui.preview(lines[0], self._budget(4 + len(duration) + len(counts)))
+            #  开头的引导语、空行、代码围栏不当摘要（每次都一样，等于没说），也不进
+            #  留底；预算扣掉 "  ⎿ " 与耗时后缀，摘要才真的是一行
+            at = ui.result_headline(lines)
+            summary = ui.preview(lines[at], self._budget(4 + len(duration) + len(counts)))
             head.append(f"{summary}{counts}{duration}", style="text.secondary")
-            rest: list[Any] = diff_rows if diff_rows else lines[1:]
+            rest: list[Any] = diff_rows if diff_rows else lines[at + 1 :]
+            #  收尾的空行、围栏、来源标记同样不算"还有内容"
+            while rest and not diff_rows and rest[-1].strip() in _RESULT_TRAILERS:
+                rest.pop()
             #  还有内容被折叠时说清藏了多少（…+N 行）；
             #  「怎么看」不在这里重复，攒到一轮收尾统一提一次
             if rest and not self.detail:
@@ -1730,6 +1750,8 @@ class RichSink:
             self.console.print(head)
             if self.detail and self.verbose:
                 self._expand(rest, None)
+            else:
+                self._tool_tail = True
         else:
             #  出错自动展开：错误详情是用户必须看的，不该藏在折叠行后面
             first = ui.preview(lines[0], self._budget(4 + len(duration)))

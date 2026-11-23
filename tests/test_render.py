@@ -265,6 +265,14 @@ class TestEventSerialization(unittest.TestCase):
             json.dumps(data, ensure_ascii=False)  # 不可序列化会抛
         self.assertEqual(len(kinds), len(samples), "kind 必须互不相同")
 
+    def test_pending_purpose_only_serialized_when_present(self) -> None:
+        """加了 purpose 字段，没写目的时线上形态与之前一致（老消费方、录好的事件流不变）。"""
+        self.assertEqual(
+            ToolPending("bash", {"command": "ls"}).to_dict(),
+            {"kind": "tool.pending", "name": "bash", "args": {"command": "ls"}},
+        )
+        self.assertEqual(ToolPending("bash", {}, "看目录").to_dict()["purpose"], "看目录")
+
 
 class TestPlainSink(unittest.TestCase):
     def render(self, sink: PlainSink, event: UIEvent) -> str:

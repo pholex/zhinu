@@ -6228,7 +6228,7 @@ class Agent:
                 "或者停下来向用户说明卡在哪里。",
             )
 
-        self.emit(ToolPending(name, args, tool_call_id=call.get("id", "")))
+        self.emit(ToolPending(name, args, purpose, tool_call_id=call.get("id", "")))
 
         #  权限判定的有序管线：
         #  deny 规则 → 会话授权/allow 规则 → 常规确认。
