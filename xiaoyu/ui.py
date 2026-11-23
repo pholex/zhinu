@@ -283,6 +283,16 @@ def _tool_title(name: str) -> str:
     return name
 
 
+def mcp_server(name: str, args: object) -> str:
+    """这次调用落到哪个 MCP server（经 use_tool 转发的看被调工具）；不是 MCP 返回空串。"""
+    if name == "use_tool" and isinstance(args, dict):
+        name = str(args.get("tool_name") or "").strip()
+    parts = name.split("__", 2)
+    if len(parts) == 3 and parts[0] == "mcp" and parts[1] and parts[2]:
+        return parts[1]
+    return ""
+
+
 def _summary_is_curated(name: str, args: dict) -> bool:
     """这个工具的摘要是不是挑过的（命令、路径、查询词），而不是参数字典的平铺。"""
     return (

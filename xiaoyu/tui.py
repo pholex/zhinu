@@ -1410,6 +1410,11 @@ class RichSink:
         self._pending_ro = ""
         #  工具行的摘要已经是模型自述的目的：确认前那行「目的：」不再重复
         self._purpose_shown = ""
+        #  折叠组里的 MCP 调用：按 server 计数。成功的只进计数与留底，不各占一行
+        self._mcp_counts: dict[str, int] = {}
+        #  正在进行、还没落笔的那次 MCP 调用 (server, 调用行)：成功就并进折叠组；
+        #  要人确认、被拒绝、出错时先把调用行补打出来，照常单独成行
+        self._held: tuple[str, Text] | None = None
         #  上一行是一条折叠成一行的工具结果：紧跟着的下一次调用不再空行隔开——
         #  连着十几步操作时，空行占掉三分之一的屏幕
         self._tool_tail = False
@@ -1492,6 +1497,7 @@ class RichSink:
         self._preparing_request = False
         self._edit = None
         self._flush_text()
+        self.release_held()
         self._flush_ro_group()
 
     def note_previewed(self) -> None:
@@ -1542,10 +1548,12 @@ class RichSink:
 
         折叠组里只收 ok 的只读调用；出错的不进组（错误必须展开可见）。
         """
-        if not self._ro_counts:
+        if not self._ro_counts and not self._mcp_counts:
             return
         parts = [f"{_RO_TOOLS[name]} ×{count}" for name, count in self._ro_counts.items()]
+        parts += [f"{server} ×{count}" for server, count in self._mcp_counts.items()]
         self._ro_counts = {}
+        self._mcp_counts = {}
         if not self.detail:
             self.truncated = True
         self.console.print(
@@ -1637,21 +1645,42 @@ class RichSink:
                 event.name, event.args, len(self.indent) + len(event.name) + 3, self.console.width
             )
             return
-        self._flush_ro_group()
+        server = "" if self.detail else ui.mcp_server(event.name, event.args)
+        if not server:
+            #  要单独成行的调用：前面攒着的折叠组先落盘（并进组的不打断它）
+            self._flush_ro_group()
         self._edit = self._edit_snapshot(event.name, event.args) if event.name in _EDIT_TOOLS else None
         label, summary = ui.tool_headline(event.name, event.args, event.purpose)
         self._purpose_shown = event.purpose if summary == " ".join(event.purpose.split()) else ""
         #  "● 工具名 " 之后才是摘要，预算要把这一截先扣掉
         preview = ui.fit(summary, len(self.indent) + len(label) + 3, self.console.width)
+        anchor = Text.assemble(
+            (f"{self.indent}{TOOL_MARK}{label}", "text.accent"),
+            (f" {preview}", "text.secondary"),
+        )
+        if server:
+            #  MCP 调用先不落笔：一串十几步的外部操作，每步一行会把正文挤出屏幕。
+            #  这一步在干什么由活区那行说（见 _tool_running），调用行进留底
+            self._held = (server, anchor)
+            return
+        self._print_anchor(anchor)
+
+    def _print_anchor(self, anchor: Text) -> None:
         if not self._tool_tail:
             self._gap()
         self._tool_tail = False
-        self.console.print(
-            Text.assemble(
-                (f"{self.indent}{TOOL_MARK}{label}", "text.accent"),
-                (f" {preview}", "text.secondary"),
-            )
-        )
+        self.console.print(anchor)
+
+    def release_held(self) -> None:
+        """把还没落笔的 MCP 调用行补打出来，这次调用改为单独成行。
+
+        要人确认之前必须调：确认框问的是"这一步"，它上方得先有这一步是什么。
+        """
+        held, self._held = self._held, None
+        if held is None:
+            return
+        self._flush_ro_group()
+        self._print_anchor(held[1])
 
     def _edit_snapshot(self, name: str, args: dict[str, Any]) -> tuple[str, str, str] | None:
         """编辑动手之前记下 (路径, 改前, 改后)。str_replace 两边都在参数里；
@@ -1677,6 +1706,7 @@ class RichSink:
         return (path, previous.replace("\r\n", "\n").replace("\r", "\n"), content)
 
     def _tool_purpose(self, event: ToolPurpose) -> None:
+        self.release_held()
         self._flush_ro_group()
         if event.purpose and event.purpose == self._purpose_shown:
             return
@@ -1688,7 +1718,11 @@ class RichSink:
         if not self.verbose or not self.console.is_terminal:
             return
         self._stop_status()
-        line = _RunningLine(event.name, self._timeout_for(event), footer=self.live_footer)
+        name = event.name
+        if self._held is not None:
+            #  调用行没落笔，活区这行就是它唯一露面的地方：写清是哪一步
+            name = ui.preview(self._held[1].plain.strip().removeprefix(TOOL_MARK.strip()).strip(), 60)
+        line = _RunningLine(name, self._timeout_for(event), footer=self.live_footer)
         self._running_line = line
         self._start_status(line)
 
@@ -1715,9 +1749,16 @@ class RichSink:
             anchor = f"● {event.name} {self._pending_ro}".rstrip()
             self.folded.append((anchor, event.output.split("\n")))
             return
-        self._flush_ro_group()
         lines = event.output.split("\n")
         duration = f" · {event.seconds:.1f}s" if event.seconds >= 0.05 else ""
+        if self._held is not None and event.ok and not self.detail:
+            (server, anchor), self._held = self._held, None
+            self._mcp_counts[server] = self._mcp_counts.get(server, 0) + 1
+            self.folded.append((f"{anchor.plain.strip()}{duration}", lines))
+            return
+        #  出错（或中途开了详情）：不进折叠组，调用行补打出来、结果照常展开
+        self.release_held()
+        self._flush_ro_group()
         edit, self._edit = self._edit, None
         if event.ok:
             #  没经确认框预览就放行的编辑：完成行带 +N −M，diff 当作这次调用的详情
@@ -1800,6 +1841,7 @@ class RichSink:
 
     def _tool_denied(self, event: ToolDenied) -> None:
         self._stop_status()
+        self.release_held()
         self._edit = None
         self._flush_ro_group()
         word = "命中 deny 规则被拦截" if event.by == "rule" else "被用户拒绝"
@@ -2875,6 +2917,8 @@ Text.assemble((USER_MARK, "text.accent"), (shown, ""), ("▏", ""), (hint, "text
         #  poller 不停手会把用户的选择按键当成插话吃掉
         if self._poller is not None:
             self._poller.pause()
+        #  这一步原本打算并进折叠行、还没落笔：问之前先把它是什么打出来
+        self.sink.release_held()
         #  审批挂起 = 轮次卡在等人：铃（opt-in）与状态钩子把切走的人叫回来
         attention.waiting(attention.WAITING_APPROVAL)
         try:

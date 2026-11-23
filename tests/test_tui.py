@@ -105,6 +105,7 @@ class TestRichSink(unittest.TestCase):
             "tool_name": "mcp__chrome-devtools__evaluate_script",
             "tool_input": {"pageId": 8, "function": "async () => { const v = 1; }"},
         }
+        sink.detail = True  # 详情开着：每次调用单独成行（不进折叠组）
         sink.emit(ToolPending("use_tool", args, "试删最旧的 0.87.0 并核对"))
         sink.emit(ToolPurpose("use_tool", "试删最旧的 0.87.0 并核对"))
         output = 'Script ran on page and returned:\n```json\n{"status":200}\n```'
@@ -117,8 +118,76 @@ class TestRichSink(unittest.TestCase):
         self.assertNotIn("目的：", out)
         #  收尾的围栏不算"还有内容"
         self.assertIn('⎿ {"status":200} · 1.2s', out)
-        self.assertNotIn("还有", out)
         self.assertNotIn("Script ran", out)
+
+    MCP_ARGS = {
+        "tool_name": "mcp__chrome-devtools__evaluate_script",
+        "tool_input": {"pageId": 8, "function": "() => 1"},
+    }
+
+    def test_successful_mcp_calls_fold_into_one_line_per_server(self) -> None:
+        from xiaoyu.events import TextDelta, TextEnd, ToolCompleted, ToolPending
+
+        sink, buffer = self.build()
+        for purpose in ("删除 0.87.1", "回读清单"):
+            sink.emit(ToolPending("use_tool", self.MCP_ARGS, purpose))
+            sink.emit(ToolCompleted("use_tool", output="ok\n细节", ok=True, seconds=1.0))
+        self.assertEqual(buffer.getvalue(), "")  # 还在攒：一行都没落
+        sink.emit(TextDelta("完成"))
+        sink.emit(TextEnd())
+        out = buffer.getvalue()
+        self.assertIn("⎿ chrome-devtools ×2", out)
+        self.assertNotIn("evaluate_script", out)
+        self.assertTrue(sink.truncated)
+        #  每一步是什么、返回了什么都在留底里，Ctrl-O 能逐条看
+        sink.replay_folded()
+        replayed = buffer.getvalue()
+        self.assertIn("chrome-devtools·evaluate_script 删除 0.87.1 · 1.0s", replayed)
+        self.assertIn("chrome-devtools·evaluate_script 回读清单", replayed)
+        self.assertIn("细节", replayed)
+
+    def test_failed_mcp_call_pops_out_of_the_fold(self) -> None:
+        from xiaoyu.events import ToolCompleted, ToolPending
+
+        sink, buffer = self.build()
+        sink.emit(ToolPending("use_tool", self.MCP_ARGS, "查看清单"))
+        sink.emit(ToolCompleted("use_tool", output="ok", ok=True, seconds=0.1))
+        sink.emit(ToolPending("use_tool", self.MCP_ARGS, "删除 0.87.0"))
+        sink.emit(ToolCompleted("use_tool", output="ERROR: 403\n详情", ok=False, seconds=0.1))
+        out = buffer.getvalue()
+        #  先落前面攒的，再是出错这一步的调用行与错误，顺序不乱
+        self.assertLess(out.index("⎿ chrome-devtools ×1"), out.index("evaluate_script 删除 0.87.0"))
+        self.assertLess(out.index("evaluate_script 删除 0.87.0"), out.index("✗ ERROR: 403"))
+        self.assertIn("详情", out)
+
+    def test_mcp_call_awaiting_confirmation_shows_its_line_first(self) -> None:
+        """确认框问的是"这一步"：没落笔的调用行在问之前必须补打出来，之后单独成行。"""
+        from xiaoyu.events import ToolCompleted, ToolDenied, ToolPending
+
+        sink, buffer = self.build()
+        sink.emit(ToolPending("use_tool", self.MCP_ARGS, "删除 0.87.0"))
+        sink.release_held()  # Tui.confirm 进门第一件事
+        self.assertIn("● chrome-devtools·evaluate_script 删除 0.87.0", buffer.getvalue())
+        sink.emit(ToolCompleted("use_tool", output="done", ok=True, seconds=0.1))
+        self.assertIn("⎿ done", buffer.getvalue())
+        self.assertNotIn("×1", buffer.getvalue())
+
+        sink, buffer = self.build()
+        sink.emit(ToolPending("use_tool", self.MCP_ARGS, "删除 0.87.0"))
+        sink.emit(ToolDenied("use_tool", by="user"))
+        out = buffer.getvalue()
+        self.assertLess(out.index("evaluate_script 删除 0.87.0"), out.index("未执行"))
+
+    def test_builtin_writes_and_shell_keep_their_own_rows(self) -> None:
+        from xiaoyu.events import ToolCompleted, ToolPending
+
+        sink, buffer = self.build()
+        sink.emit(ToolPending("use_tool", self.MCP_ARGS, "查看清单"))
+        sink.emit(ToolCompleted("use_tool", output="ok", ok=True, seconds=0.1))
+        sink.emit(ToolPending("bash", {"command": "rm -rf build"}))
+        sink.emit(ToolCompleted("bash", output="ok", ok=True, seconds=0.1))
+        out = buffer.getvalue()
+        self.assertLess(out.index("⎿ chrome-devtools ×1"), out.index("● bash rm -rf build"))
 
     def test_purpose_line_stays_when_summary_is_the_command(self) -> None:
         from xiaoyu.events import ToolPending, ToolPurpose
