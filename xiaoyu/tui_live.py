@@ -1241,7 +1241,10 @@ class LiveTui(Tui):
                 rows.append([(accent, f"{frame} "), *to_formatted_text(ANSI(line))])
         elif self._busy == "turn":
             took = int(time.monotonic() - self._turn_started)
-            rows.append([(accent, f"{frame} 作答中…"), (dim, f" ({_elapsed(took)})")])
+            #  正文在流的这几秒没有活动行对象可问，打断键自己说，和思考中、工具运行中一致
+            rows.append(
+                [(accent, f"{frame} 作答中…"), (dim, f" ({_elapsed(took)}) · Esc 打断")]
+            )
         agent = self.agent
         waiting = [f"待执行：{line}" for line in list(self._commands)]
         if agent is not None and self._busy == "turn":
