@@ -183,6 +183,20 @@ class McpCommandTest(unittest.TestCase):
         self.assertIn("cwd: ${env:HOME}/data", out)
         self.assertIn("只暴露 2 个工具", out)
 
+    def test_add_with_roots(self):
+        """--roots 落成声明里的 roots: true；远端 server 不收（不向远端报本机路径）。"""
+        self.assertEqual(self.run_cli("add", "plain", "npx", "pkg")[0], 0)
+        self.assertEqual(self.run_cli("add", "shots", "--roots", "npx", "pkg")[0], 0)
+        servers = self.project_file()["mcpServers"]
+        self.assertNotIn("roots", servers["plain"])
+        self.assertIs(servers["shots"]["roots"], True)
+        specs, problems = mcp.parse_server_mapping(servers)
+        self.assertEqual(problems, [])
+        self.assertEqual({spec.name: spec.roots for spec in specs}, {"plain": False, "shots": True})
+        _, out = self.run_cli("list")
+        self.assertIn("报工作目录为根", out)
+        self.assertEqual(self.run_cli("add", "gw", "--url", "https://x.example/mcp", "--roots")[0], 2)
+
     def test_add_rejects_cwd_for_remote_and_empty_tools(self):
         self.assertEqual(self.run_cli("add", "gw", "--url", "https://x.example/mcp", "--cwd", "/x")[0], 2)
         self.assertEqual(self.run_cli("add", "a", "--tools", " , ", "npx")[0], 2)

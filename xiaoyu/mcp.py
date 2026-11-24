@@ -301,6 +301,14 @@ class ServerSpec:
     #  与 trustToolChanges 是两条轴：那个信的是工具声明的变更，这个信的是工具
     #  返回的内容。网页与联网搜索没有对应开关：它们的来源不是用户能背书的。
     trust_content: bool = False
+    #  向这个 server 声明 roots 能力，并在它问 roots/list 时回它自己的工作目录
+    #  （声明了 cwd 就是 cwd，否则是继承来的当前目录）。默认关：规矩的 server 拿到
+    #  根之后会把"带路径的工具"放开到这个目录，而工具审批按工具名放行、不看路径
+    #  ——网页或远端内容就多了一条往工作区落文件的路，绕开文件工具自己的写入确认。
+    #  只对 stdio 生效：stdio server 本来就继承这个目录，回它不算新增信息；远端
+    #  server 拿到的却是一条本机路径，所以 HTTP 一律不声明。只回一个根、不发
+    #  list_changed：根在进程拉起时就定了。
+    roots: bool = False
     # SDK-owned OAuth provider. Credentials are evaluated for each request and
     # never written to the declaration/cache or included in dataclass repr.
     authorization: Callable[[], str] | None = field(default=None, repr=False, compare=False)
@@ -837,7 +845,15 @@ def parse_server_mapping(
             #  跨家抄配置很常见，≥1000 一律按毫秒解释——没人需要 17 分钟以上的工具超时。
             timeout /= 1000
         tools = tools_field(str(name), raw)
+        #  只认字面 true：写成路径列表之类的（以为能自己点名根目录）不能被当成"开"
+        roots = raw.get("roots") is True
+        if "roots" in raw and not isinstance(raw["roots"], bool):
+            problems.append(f"server {name!r}：roots 只认 true / false，已忽略（按关处理）")
         if remote:
+            if roots:
+                problems.append(
+                    f"server {name!r}：roots 只对 stdio server 生效（不向远端报本机路径），已忽略"
+                )
             if raw.get("cwd"):
                 problems.append(f"server {name!r}：cwd 只对 stdio server 有意义，已忽略")
             specs.append(
@@ -878,6 +894,7 @@ def parse_server_mapping(
                 tools=tools,
                 trust_tool_changes=bool(raw.get("trustToolChanges", False)),
                 trust_content=bool(raw.get("trustContent", False)),
+                roots=roots,
             )
         )
         if unresolved:
@@ -1958,7 +1975,7 @@ class McpServer:
                 "initialize",
                 {
                     "protocolVersion": protocol,
-                    "capabilities": {},
+                    "capabilities": {"roots": {"listChanged": False}} if self._offers_roots else {},
                     "clientInfo": {"name": "xiaoyu", "version": _version()},
                 },
                 timeout=INIT_TIMEOUT,
@@ -2331,15 +2348,31 @@ class McpServer:
         if callback is not None:
             callback()
 
-    def _answer_server_request(self, message: dict[str, Any]) -> None:
-        """server 反向发来的请求：ping 回 pong，其余一律 method-not-found。
+    @property
+    def _offers_roots(self) -> bool:
+        """是否向这个 server 声明 roots。HTTP 在这里再卡一次：解析时已经忽略并报过，
+        但宿主可以绕过解析直接构造 ServerSpec。"""
+        return self.spec.roots and not self.spec.is_http
 
-        不接 sampling/roots/elicitation——那是让 server 反过来使唤客户端的通道，
-        小羽不开放。不回错误响应会让规矩的 server 干等，所以要显式拒绝。
+    def _root(self) -> dict[str, str]:
+        """回给 server 的唯一一个根：它自己的工作目录，与 _spawn 给 Popen 的 cwd
+        同一个算法。realpath 之后再转 URI——server 多半拿 realpath 后的路径来比。"""
+        path = Path(os.path.expanduser(self.spec.cwd) if self.spec.cwd else os.getcwd()).resolve()
+        return {"uri": path.as_uri(), "name": path.name or str(path)}
+
+    def _answer_server_request(self, message: dict[str, Any]) -> None:
+        """server 反向发来的请求：ping 回 pong，声明里开了 roots 的 stdio server
+        问 roots/list 时回它自己的工作目录，其余一律 method-not-found。
+
+        不接 sampling/elicitation——那是让 server 反过来使唤客户端的通道，小羽
+        不开放。roots 只是回一条 server 本来就站在上面的路径，仍然默认关（理由见
+        ServerSpec.roots）。不回错误响应会让规矩的 server 干等，所以要显式拒绝。
         """
         method = message.get("method")
         if method == "ping":
             reply: dict[str, Any] = {"jsonrpc": "2.0", "id": message["id"], "result": {}}
+        elif method == "roots/list" and self._offers_roots:
+            reply = {"jsonrpc": "2.0", "id": message["id"], "result": {"roots": [self._root()]}}
         else:
             reply = {
                 "jsonrpc": "2.0",

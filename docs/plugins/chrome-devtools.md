@@ -60,6 +60,26 @@ xiaoyu mcp add chrome-devtools-test --scope user -- npx -y chrome-devtools-mcp@1
 指定 `--cwd /absolute/path/to/project`（放在 `-- npx` 前）。本次测试中，目录外的
 截图路径被上游拒绝，在服务工作目录内保存成功。这不是对所有文件访问的沙箱保证。
 
+### 截图等文件能写到哪儿（1.13.0 起有变化）
+
+上面一段是固定版本 `1.12.0` 的行为。`1.13.0` 起上游改成按 MCP roots 判定：客户端没有
+报根时，带 `filePath` 的工具**只许写系统临时目录**，其余路径（包括工作区内的相对路径）
+一律回 `Access denied: path … is not within any of the configured workspace roots`。
+注意 macOS 的系统临时目录是 `$TMPDIR`（形如 `/var/folders/…/T`），**不是 `/tmp`**。
+小羽默认不报根，所以用 `1.13.0` 及以上时：
+
+- **只是想看图**：不传 `filePath`，截图直接作为图片返回，最省事。
+- **要落盘、放哪儿都行**：写到 `$TMPDIR` 下。
+- **要落进固定目录**：在启动参数末尾加上游的 `--workspace /absolute/path`（可重复），
+  不需要小羽配合。
+- **要落进当前项目**：添加时带 `--roots`（放在 `-- npx` 前，等价于声明里
+  `"roots": true`），小羽把服务的工作目录报成根。它默认关是有理由的：工具审批按
+  工具名放行、不看路径，开了之后网页内容经这些工具写进项目的文件不过写入确认，
+  见[配置说明](../configuration.md)里的 `roots`。
+
+这一节用 `1.13.0` 发行包在隔离模式（macOS）实测：不报根时工作目录内的路径被拒，
+`--workspace` 与 `--roots` 各自放开后保存成功。`1.12.0` 没有 `--workspace` 参数。
+
 ## 已完成的验证：隔离模式
 
 通过小羽 MCP 客户端，在独立浏览器中打开临时本地测试网页，验证了：

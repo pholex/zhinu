@@ -116,7 +116,8 @@ graph 挂起 → 人从 REST `/permissions` 放行 → 恢复。状态判定用 
 - 方法只有五个：`initialize`、`notifications/*`（收下回 202）、`ping`、
   `tools/list`、`tools/call`。
 - 能力只报 `tools`。sampling / roots / resources / elicitation 都不做——与
-  client 侧（mcp.py）"不接反向使唤通道"同一纪律；审批走 REST 回路，不走
+  client 侧（mcp.py）"不接反向使唤通道"同一纪律（client 侧唯一的例外是逐
+  server 显式开启的 `roots`，见 configuration.md）；审批走 REST 回路，不走
   elicitation（主流客户端不支持，做了没人能用）。
 - 协议版本：2025-06-18 / 2025-03-26；JSON-RPC batch 不收（新 spec 已删除）。
 - `GET /mcp` / `DELETE /mcp` 回 405：无状态 server，没有常驻推送通道，也没有

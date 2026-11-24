@@ -552,9 +552,11 @@ class DeclarationSummaryTest(IsolatedConfigTest):
         write_json(
             src / "mcp.json",
             {"mcpServers": {"echo": {"command": "cat", "args": [], "trustContent": True,
-                                     "trustToolChanges": True, "inheritEnv": ["AWS_PROFILE"]}}},
+                                     "trustToolChanges": True, "roots": True,
+                                     "inheritEnv": ["AWS_PROFILE"]}}},
         )
         bundle = plugins.inspect_bundle(src)
+        self.assertNotIn("roots", bundle.mcp_servers["echo"])
         self.assertNotIn("trustContent", bundle.mcp_servers["echo"])
         self.assertNotIn("trustToolChanges", bundle.mcp_servers["echo"])
         #  inheritEnv 与 env 里写 ${VAR} 是同一件事，留着（确认时会列出来）

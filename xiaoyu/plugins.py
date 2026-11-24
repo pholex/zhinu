@@ -899,7 +899,8 @@ def same_servers(left: dict[str, Any], right: dict[str, Any]) -> bool:
 
 #  信任类开关：它们决定"这个 server 的输出/工具变更要不要再过人眼"，是用户对
 #  server 的判断。包自己写上等于被审查的一方给自己盖章，读声明时一律剥掉。
-SELF_TRUST_KEYS = ("trustContent", "trustToolChanges")
+#  roots 同理：它决定这个 server 的带路径工具能不能落进工作区。
+SELF_TRUST_KEYS = ("trustContent", "trustToolChanges", "roots")
 
 _ENV_REFERENCE = re.compile(r"\$\{(?:env:)?([A-Za-z_][A-Za-z0-9_]*)\}")
 _CONFIG_PLACEHOLDER = re.compile(r"\$\{user_config\.[^}]*\}")
