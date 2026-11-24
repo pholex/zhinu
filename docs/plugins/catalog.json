@@ -12,7 +12,7 @@
       "license": "Apache-2.0",
       "commit": "b1e35e3ab1774664dfc66a2cb813a392535fe160",
       "version": "1.13.0",
-      "artifact": "npm chrome-devtools-mcp@1.13.0；实测发行包，提交用于源码审查",
+      "artifact": "npm chrome-devtools-mcp@1.13.0；实测发行包，提交仅核对发布 tag 指向，未做源码审查",
       "guide": "chrome-devtools.md",
       "scope": [
         "连接正在使用的 Chrome、查看已有页面并复用登录态",
