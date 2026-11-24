@@ -10,9 +10,9 @@
       "maintainer": "ChromeDevTools",
       "repository": "https://github.com/ChromeDevTools/chrome-devtools-mcp",
       "license": "Apache-2.0",
-      "commit": "aade3be8f65d8afc941c97b498b9752ef562f181",
-      "version": "1.12.0",
-      "artifact": "npm chrome-devtools-mcp@1.12.0；实测发行包，提交用于源码审查",
+      "commit": "b1e35e3ab1774664dfc66a2cb813a392535fe160",
+      "version": "1.13.0",
+      "artifact": "npm chrome-devtools-mcp@1.13.0；实测发行包，提交用于源码审查",
       "guide": "chrome-devtools.md",
       "scope": [
         "连接正在使用的 Chrome、查看已有页面并复用登录态",
@@ -28,19 +28,19 @@
         "command": "npx",
         "args": [
           "-y",
-          "chrome-devtools-mcp@1.12.0",
+          "chrome-devtools-mcp@1.13.0",
           "--autoConnect",
           "--no-usage-statistics",
           "--no-performance-crux"
         ]
       },
       "verification": {
-        "date": "2026-11-03",
-        "xiaoyu_version": "0.78.0",
-        "xiaoyu_commit": "5a5ecd13664a2ffeb465abd1067122b4e1a4fcbd",
+        "date": "2026-11-24",
+        "xiaoyu_version": "0.89.0",
+        "xiaoyu_commit": "f402d1e3f91060a4c9efe6490a774d01b25df155",
         "platform": "macOS",
-        "node": "24.19.0",
-        "chrome": "156.0.8078.80",
+        "node": "24.22.2",
+        "chrome": "158.0.8127.37",
         "configuration": "临时用户配置、服务工作目录、无头浏览器资料；仅访问本地测试网页；未调用模型",
         "mcp_declaration_install_remove": "passed",
         "mcp_initialize_tools_list": "passed",
@@ -76,7 +76,7 @@
             "status": "passed"
           }
         ],
-        "file_boundary": "目录外截图路径被拒绝；服务工作目录内保存通过",
+        "file_boundary": "不报根时服务工作目录内外的截图路径均被拒绝，系统临时目录内保存通过；上游 --workspace 与小羽 roots 各自放开后工作目录内保存通过",
         "uninstall": "passed",
         "not_verified": [
           "性能 trace",
@@ -96,7 +96,7 @@
           "command": "npx",
           "args": [
             "-y",
-            "chrome-devtools-mcp@1.12.0",
+            "chrome-devtools-mcp@1.13.0",
             "--headless",
             "--isolated",
             "--no-usage-statistics",
@@ -111,14 +111,14 @@
             "command": "npx",
             "args": [
               "-y",
-              "chrome-devtools-mcp@1.12.0",
+              "chrome-devtools-mcp@1.13.0",
               "--autoConnect",
               "--no-usage-statistics",
               "--no-performance-crux"
             ]
           },
           "verification_status": "documentation_verified_runtime_pending",
-          "source": "https://github.com/ChromeDevTools/chrome-devtools-mcp/blob/aade3be8f65d8afc941c97b498b9752ef562f181/docs/advanced-usage.md#automatically-connecting-to-a-running-chrome-instance",
+          "source": "https://github.com/ChromeDevTools/chrome-devtools-mcp/blob/b1e35e3ab1774664dfc66a2cb813a392535fe160/docs/advanced-usage.md#automatically-connecting-to-a-running-chrome-instance",
           "profile_selection": "Chrome 判定的默认资料，不保证是前台窗口；可访问选中资料的全部窗口",
           "not_verified": [
             "当前用户资料自动连接",
@@ -132,7 +132,7 @@
             "command": "npx",
             "args": [
               "-y",
-              "chrome-devtools-mcp@1.12.0",
+              "chrome-devtools-mcp@1.13.0",
               "--headless",
               "--isolated",
               "--no-usage-statistics",
