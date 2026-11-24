@@ -91,7 +91,7 @@ xiaoyu send --retry <消息ID> zhinu-2     # 恢复到新会话后，显式重�
 xiaoyu memory --owner me --project my-project list --status pending # 查看记忆候选
 xiaoyu memory --owner me --project my-project recall '测试'         # 检索已确认的经验
 
-xiaoyu mcp add chrome-devtools --scope user npx -y chrome-devtools-mcp@1.12.0 --autoConnect --no-usage-statistics --no-performance-crux
+xiaoyu mcp add chrome-devtools --scope user npx -y chrome-devtools-mcp@1.13.0 --autoConnect --no-usage-statistics --no-performance-crux
 xiaoyu mcp list                         # 写的就是 .mcp.json / mcp.json
 xiaoyu mcp probe chrome-devtools        # 不经模型直接握手、列工具；--script 按脚本调用并逐步输出 JSON
 

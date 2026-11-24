@@ -1043,6 +1043,104 @@ class HttpBodyCapTest(_HttpServerCase):
         self.assertNotIn("TAIL-MARKER", out)
 
 
+_ROOTS_SERVER = textwrap.dedent(
+    """
+    import json, sys
+
+    def send(message):
+        sys.stdout.write(json.dumps(message) + "\\n")
+        sys.stdout.flush()
+
+    offered = None
+    for line in sys.stdin:
+        message = json.loads(line)
+        method, ident = message.get("method"), message.get("id")
+        if method == "initialize":
+            offered = message["params"]["capabilities"].get("roots")
+            send({"jsonrpc": "2.0", "id": ident, "result": {
+                "protocolVersion": message["params"]["protocolVersion"],
+                "capabilities": {"tools": {}}, "serverInfo": {"name": "r", "version": "1"}}})
+        elif method == "tools/list":
+            send({"jsonrpc": "2.0", "id": ident, "result": {"tools": [
+                {"name": "ask", "description": "ask roots", "inputSchema": {"type": "object"}}]}})
+        elif method == "tools/call":
+            #  反向问一次 roots/list，把客户端的原样答复（含错误）当工具结果带回去
+            send({"jsonrpc": "2.0", "id": 9001, "method": "roots/list"})
+            answer = json.loads(sys.stdin.readline())
+            answer.pop("jsonrpc", None)
+            answer["offered"] = offered
+            send({"jsonrpc": "2.0", "id": ident, "result": {
+                "content": [{"type": "text", "text": json.dumps(answer)}]}})
+    """
+)
+
+
+class RootsTest(unittest.TestCase):
+    """声明里的 roots：默认关；开了只对 stdio 报一个根（server 自己的工作目录）。"""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.workspace = Path(self.tmp.name).resolve()
+
+    def ask(self, **spec_fields) -> dict:
+        script = self.workspace / "roots_server.py"
+        script.write_text(_ROOTS_SERVER, encoding="utf-8")
+        spec = mcp.ServerSpec(
+            name="r", command=sys.executable, args=[str(script)], timeout=15.0, **spec_fields
+        )
+        server = mcp.McpServer(spec, log_path=self.workspace / "r.log")
+        self.addCleanup(server.close)
+        server.bootstrap()
+        return json.loads(server.call_tool("ask", {}))
+
+    def test_parsing_is_opt_in_and_stdio_only(self):
+        specs, problems = mcp.parse_server_mapping(
+            {
+                "on": {"command": "cmd", "roots": True},
+                "off": {"command": "cmd"},
+                "listed": {"command": "cmd", "roots": ["/somewhere"]},
+                "far": {"url": "https://example.com/mcp", "roots": True},
+            }
+        )
+        by_name = {spec.name: spec for spec in specs}
+        self.assertTrue(by_name["on"].roots)
+        self.assertFalse(by_name["off"].roots, "默认必须是关")
+        self.assertFalse(by_name["listed"].roots, "不是字面 true 就不能算开")
+        self.assertFalse(by_name["far"].roots, "远端 server 不报本机路径")
+        self.assertTrue(any("'listed'" in item and "roots" in item for item in problems), problems)
+        self.assertTrue(any("'far'" in item and "stdio" in item for item in problems), problems)
+
+    def test_default_declares_nothing_and_refuses_roots_list(self):
+        answer = self.ask()
+        self.assertIsNone(answer["offered"], "没开就不该在握手里声明 roots")
+        self.assertEqual(answer["error"]["code"], -32601)
+        self.assertNotIn("result", answer)
+
+    def test_opted_in_answers_the_servers_own_working_directory(self):
+        target = self.workspace / "site"
+        target.mkdir()
+        answer = self.ask(roots=True, cwd=str(target))
+        self.assertEqual(answer["offered"], {"listChanged": False})
+        self.assertEqual(answer["result"]["roots"], [{"uri": target.as_uri(), "name": "site"}])
+
+    def test_opted_in_without_cwd_answers_the_inherited_directory(self):
+        answer = self.ask(roots=True)
+        self.assertEqual(
+            [root["uri"] for root in answer["result"]["roots"]], [Path.cwd().resolve().as_uri()]
+        )
+
+    def test_http_spec_never_offers_roots_even_if_constructed_directly(self):
+        spec = mcp.ServerSpec(name="far", command="", url="https://example.com/mcp", roots=True)
+        server = mcp.McpServer(spec, log_path=self.workspace / "far.log")
+        self.addCleanup(server.close)
+        self.assertFalse(server._offers_roots)
+        sent: list[dict] = []
+        with mock.patch.object(server, "_send", side_effect=sent.append):
+            server._answer_server_request({"jsonrpc": "2.0", "id": 1, "method": "roots/list"})
+        self.assertEqual(sent[0]["error"]["code"], -32601)
+
+
 class LaunchSpecsTest(unittest.TestCase):
     """显式 specs 的 launch 入口（嵌入宿主/ACP client 下发的清单走这条）。"""
 

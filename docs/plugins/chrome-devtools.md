@@ -17,8 +17,8 @@
 
 ## 推荐：连接正在使用的 Chrome
 
-自动连接需要 **Chrome 144 或以上**、Node.js 和 npm/npx。本次隔离模式验证使用 Node 24.19.0、Chrome
-156.0.8078.80、macOS；固定包声明支持 Node `^20.19.0 || ^22.12.0 || >=23`，
+自动连接需要 **Chrome 144 或以上**、Node.js 和 npm/npx。本次隔离模式验证使用 Node 24.22.2、Chrome
+158.0.8127.37、macOS；固定包声明支持 Node `^20.19.0 || ^22.12.0 || >=23`，
 使用时优先选择仍受维护的 Node LTS。首次 npx 下载需要联网。
 
 1. 打开你平时使用的 Chrome，保留目标页面及登录状态。
@@ -27,7 +27,7 @@
 4. 小羽首次尝试连接时，在 Chrome 的连接对话框中选择允许。
 
 ```bash
-xiaoyu mcp add chrome-devtools --scope user -- npx -y chrome-devtools-mcp@1.12.0 --autoConnect --no-usage-statistics --no-performance-crux
+xiaoyu mcp add chrome-devtools --scope user -- npx -y chrome-devtools-mcp@1.13.0 --autoConnect --no-usage-statistics --no-performance-crux
 ```
 
 若已添加同名服务，核对原配置后在 `--scope user` 后加 `--force` 覆盖。
@@ -41,7 +41,7 @@ xiaoyu mcp add chrome-devtools --scope user -- npx -y chrome-devtools-mcp@1.12.0
 资料和 `list_pages` 结果。版本过旧或找不到连接时，检查版本、远程调试开关及 Chrome
 中的允许对话框。不要用新建临时资料替代这些步骤，那会失去想复用的登录状态。
 
-这条连接方式来自[上游连接指南](https://github.com/ChromeDevTools/chrome-devtools-mcp/blob/aade3be8f65d8afc941c97b498b9752ef562f181/docs/advanced-usage.md#automatically-connecting-to-a-running-chrome-instance)。
+这条连接方式来自[上游连接指南](https://github.com/ChromeDevTools/chrome-devtools-mcp/blob/b1e35e3ab1774664dfc66a2cb813a392535fe160/docs/advanced-usage.md#automatically-connecting-to-a-running-chrome-instance)。
 **本地尚未完成当前用户资料的自动连接与登录态复用实测**；下文通过的真实调用来自
 隔离模式，不能当作这条主路径已实测通过。修改指南不会自动修改你的 Chrome 设置。
 
@@ -50,15 +50,32 @@ xiaoyu mcp add chrome-devtools --scope user -- npx -y chrome-devtools-mcp@1.12.0
 需要从零验证页面、避免已有缓存或登录状态影响测试时，另配一个服务：
 
 ```bash
-xiaoyu mcp add chrome-devtools-test --scope user -- npx -y chrome-devtools-mcp@1.12.0 --headless --isolated --no-usage-statistics --no-performance-crux
+xiaoyu mcp add chrome-devtools-test --scope user -- npx -y chrome-devtools-mcp@1.13.0 --headless --isolated --no-usage-statistics --no-performance-crux
 ```
 
 它按需启动无头 Chrome，使用临时用户数据目录。这个名字与日常连接分开，便于按任务
 选择；不需要干净测试环境就不必添加。
 
-截图文件放在服务工作目录内；默认继承启动目录，需要固定路径时可在 MCP 添加参数中
-指定 `--cwd /absolute/path/to/project`（放在 `-- npx` 前）。本次测试中，目录外的
-截图路径被上游拒绝，在服务工作目录内保存成功。这不是对所有文件访问的沙箱保证。
+### 截图等文件能写到哪儿
+
+上游按 MCP roots 判定带 `filePath` 的工具能写哪些目录：客户端没有报根时，**只许写
+系统临时目录**，其余路径（包括服务工作目录内的相对路径）一律回
+`Access denied: path … is not within any of the configured workspace roots`。
+注意 macOS 的系统临时目录是 `$TMPDIR`（形如 `/var/folders/…/T`），**不是 `/tmp`**。
+小羽默认不报根，所以：
+
+- **只是想看图**：不传 `filePath`，截图直接作为图片返回，最省事。
+- **要落盘、放哪儿都行**：写到 `$TMPDIR` 下。
+- **要落进固定目录**：在启动参数末尾加上游的 `--workspace /absolute/path`（可重复），
+  不需要小羽配合。
+- **要落进当前项目**：添加时带 `--roots`（放在 `-- npx` 前，等价于声明里
+  `"roots": true`），小羽把服务的工作目录报成根。它默认关是有理由的：工具审批按
+  工具名放行、不看路径，开了之后网页内容经这些工具写进项目的文件不过写入确认，
+  见[配置说明](../configuration.md)里的 `roots`。
+
+本次测试中，不报根时服务工作目录内外的截图路径都被拒绝，系统临时目录内保存成功；
+`--workspace` 与 `--roots` 各自放开后，工作目录内保存成功。这不是对所有文件访问的
+沙箱保证。`1.12.0` 及更早版本按服务工作目录判定，也没有 `--workspace` 参数。
 
 ## 已完成的验证：隔离模式
 
@@ -83,7 +100,7 @@ xiaoyu mcp add chrome-devtools-test --scope user -- npx -y chrome-devtools-mcp@1
 
 ## 更新和卸载
 
-推荐固定 `1.12.0`，不使用 `@latest` 自动跟进未经验证的版本。升级时参考新验证记录，
+推荐固定 `1.13.0`，不使用 `@latest` 自动跟进未经验证的版本。升级时参考新验证记录，
 用新的版本重新执行添加命令并加 `--force`。固定包版本不锁定全部传递依赖。
 
 ```bash

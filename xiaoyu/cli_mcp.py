@@ -32,6 +32,7 @@ _MCP_ADD_FLAGS = {
     "-H": True,
     "--cwd": True,
     "--tools": True,
+    "--roots": False,
     "--force": False,
     "-f": False,
     "--help": False,
@@ -164,6 +165,11 @@ def mcp_add_command(argv: list[str]) -> int:
         metavar="名,名",
         help="只暴露这几个工具（逗号分隔；server 其余工具模型看不见也调不到）",
     )
+    parser.add_argument(
+        "--roots",
+        action="store_true",
+        help="向 stdio server 报它的工作目录作为根（默认不报）；它带路径的工具就能写进该目录",
+    )
     parser.add_argument("-f", "--force", action="store_true", help="同名声明已存在时覆盖")
     head, command_argv = split_mcp_command(argv)
     args = parser.parse_args(head)
@@ -171,6 +177,9 @@ def mcp_add_command(argv: list[str]) -> int:
     tools = [item.strip() for item in (args.tools or "").split(",") if item.strip()]
     if args.tools is not None and not tools:
         print(ui.error("--tools 至少要给一个工具名"), file=sys.stderr)
+        return 2
+    if args.url and args.roots:
+        print(ui.error("--roots 只对 stdio server 生效（不向远端报本机路径）"), file=sys.stderr)
         return 2
     if args.url and args.cwd:
         print(ui.error("--cwd 只对 stdio server 有意义（远端 server 没有本地进程）"), file=sys.stderr)
@@ -236,6 +245,8 @@ def mcp_add_command(argv: list[str]) -> int:
             entry["env"] = env
         if args.cwd:
             entry["cwd"] = args.cwd
+        if args.roots:
+            entry["roots"] = True
     if tools:
         entry["tools"] = tools
     if args.timeout is not None:
@@ -323,6 +334,8 @@ def mcp_list_command(argv: list[str]) -> int:
                 notes.append("env: " + ", ".join(raw["env"]))
             if raw.get("cwd"):
                 notes.append(f"cwd: {raw['cwd']}")
+            if raw.get("roots") is True:
+                notes.append("报工作目录为根")
             if isinstance(raw.get("tools"), list):
                 notes.append(f"只暴露 {len(raw['tools'])} 个工具")
             line = f"  {ui.accent(name)}  {ui.secondary('·')}  {argv_text}"
