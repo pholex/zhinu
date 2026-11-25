@@ -1055,6 +1055,12 @@ class TestSlashCommands(AgentTestCase):
         _, out = self.run_slash(agent, "/model grok-4.7")
         self.assertIn("已切换到 grok-4.7（网关）", out)
         self.assertNotIn("清单里没有", out)
+        #  全限定名：清单里是裸名，比对要用解析后的模型名，不能拿带前缀的原串
+        _, out = self.run_slash(agent, "/model gw/grok-4.7")
+        self.assertIn("已切换到 gw/grok-4.7（网关）", out)
+        self.assertNotIn("清单里没有", out)
+        _, out = self.run_slash(agent, "/model gw/grok")
+        self.assertIn("网关清单里没有 gw/grok", out)
         #  清单探不到：说明无法预检，仍切换
         agent.registry = Registry([Provider("gw", "", "", (), "网关")], clients={"gw": FakeClient([])})
         _, out = self.run_slash(agent, "/model whatever")
