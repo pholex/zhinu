@@ -480,7 +480,7 @@ class TestOrderAndKeys(ProviderTestCase):
         with isolated_env(env):
             registry = providers.build(config(base_url=""))
         self.assertEqual([p.name for p in registry.providers], ["anthropic", "openai"])
-        self.assertEqual(registry.resolve("gpt-6.1-sol").provider, "openai")
+        self.assertEqual(registry.resolve("gpt-6.2-sol").provider, "openai")
         self.assertEqual(registry.resolve("claude-opus-5-5").provider, "anthropic")
 
     def test_openai_client_speaks_responses_protocol(self) -> None:
@@ -491,7 +491,7 @@ class TestOrderAndKeys(ProviderTestCase):
         with isolated_env({"OPENAI_API_KEY": "oa", "ANTHROPIC_API_KEY": "an"}):
             registry = providers.build(config(base_url=""))
             self.assertEqual(
-                registry.client("openai").protocol_for("gpt-6.1-sol"), "responses"
+                registry.client("openai").protocol_for("gpt-6.2-sol"), "responses"
             )
             anthropic = registry.client("anthropic")
             self.assertEqual(anthropic.protocol_for("claude-opus-5-5"), "anthropic")
@@ -878,14 +878,15 @@ class TestEffortPerModel(ProviderTestCase):
         self.assertEqual(pick("none"), "low")
         self.assertEqual(pick(""), "")
 
-    def test_gpt_6_line_drops_minimal_and_astra_drops_none(self) -> None:
-        """实测：三兄弟都不认 minimal，astra 还不认 none——都就近落到 low。"""
+    def test_gpt_6_line_drops_minimal_and_only_luna_keeps_none(self) -> None:
+        """实测：三兄弟都不认 minimal，astra 与 6.2-sol 还不认 none——都就近落到 low。"""
         pick = lambda model, wanted: providers.effort_for("openai", model, wanted, self.ORDER)  # noqa: E731
-        for model in ("gpt-6-astra", "gpt-6.1-sol", "gpt-6-luna"):
+        for model in ("gpt-6.2-astra", "gpt-6.2-sol", "gpt-6-luna"):
             self.assertEqual(pick(model, "minimal"), "low")
             self.assertEqual(pick(model, "max"), "max")
-        self.assertEqual(pick("gpt-6-astra", "none"), "low")
-        self.assertEqual(pick("gpt-6.1-sol", "none"), "none")
+        self.assertEqual(pick("gpt-6.2-astra", "none"), "low")
+        self.assertEqual(pick("gpt-6.2-sol", "none"), "low")
+        self.assertEqual(pick("gpt-6-luna", "none"), "none")
 
     def test_unmeasured_routes_are_left_alone(self) -> None:
         for provider, model in (("zhipu", "glm-9"), ("deepseek", "deepseek-flash"),
