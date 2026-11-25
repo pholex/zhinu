@@ -47,7 +47,14 @@ class H(BaseHTTPRequestHandler):
         self.wfile.write(data)
     def log_message(self, *a):
         pass
-HTTPServer(("127.0.0.1", port), H).serve_forever()
+class S(HTTPServer):
+    # HTTPServer.server_bind 会 socket.getfqdn("127.0.0.1")：GitHub 的 macOS runner 上这次反查
+    # 能卡十几秒，期间还没 listen，用例就按 start_timeout 挂了。假 serve 用不着主机名
+    def server_bind(self):
+        import socketserver
+        socketserver.TCPServer.server_bind(self)
+        self.server_name, self.server_port = "127.0.0.1", port
+S(("127.0.0.1", port), H).serve_forever()
 '''
 
 EXT = "a" * 32
