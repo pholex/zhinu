@@ -3794,7 +3794,9 @@ def handle_slash(agent: Agent, line: str, select: Any = None) -> bool:
                             continue
                         if models is None:
                             print(ui.warning(f"{label}清单获取失败，无法预检模型名：{note}"))
-                        elif rest[0] not in models:
+                        elif route.model not in models:
+                            #  比对解析后的模型名：清单是裸名，`gateway/x` 原串
+                            #  永远不在里面，名字写对了也会误报
                             print(
                                 ui.warning(
                                     f"{label}清单里没有 {rest[0]}，请求很可能失败"
