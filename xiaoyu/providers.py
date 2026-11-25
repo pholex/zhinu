@@ -350,7 +350,9 @@ PRESETS: dict[str, Preset] = {
         #  实测：Responses 上 tool_call、收图（纯红）、加密 reasoning 回传均通；
         #  chat completions 带 tools 仍 400，与 5.6 同
         #  2026-11-09：sol 升级为 6.1，沿用原有协议与推理档位配置。
-        models=("gpt-6-astra", "gpt-6.1-sol", "gpt-6-luna"),
+        #  2026-11-25：astra / sol 升级为 6.2。实测 Responses 上 tool_call、收图（红/绿）均通；
+        #  6.2-sol 不再认 none（与 astra 同，只认 low~max），档位表随之收窄
+        models=("gpt-6.2-astra", "gpt-6.2-sol", "gpt-6-luna"),
         key_envs=("OPENAI_API_KEY",),
         label="直连 openai",
         #  ⚠️ 必须走 Responses：5.6 起（含 6 线）在 /v1/chat/completions 上带 tools 直接 400
@@ -359,10 +361,11 @@ PRESETS: dict[str, Preset] = {
         #  responses.py，内核与历史形态不变
         responses_models=(WILDCARD,),
         #  2026-09-29 逐档实测（Responses reasoning.effort）：三兄弟都不认 minimal，
-        #  astra 还不认 none（官方迁移指南：astra 用 low 代替 none）；low~max 全认
+        #  astra 还不认 none（官方迁移指南：astra 用 low 代替 none）；low~max 全认。
+        #  只有 luna 认 none（6.2-sol 起不认，见上）
         effort_levels=(
-            ("gpt-6-astra", ("low", "medium", "high", "xhigh", "max")),
-            ("gpt-6.1-sol", ("none", "low", "medium", "high", "xhigh", "max")),
+            ("gpt-6.2-astra", ("low", "medium", "high", "xhigh", "max")),
+            ("gpt-6.2-sol", ("low", "medium", "high", "xhigh", "max")),
             ("gpt-6-luna", ("none", "low", "medium", "high", "xhigh", "max")),
         ),
         #  2026-08-12 实测 5.6 三兄弟全部收图（红/绿两轮都答对），2026-09-29 在 6 线三兄弟上复测仍通
