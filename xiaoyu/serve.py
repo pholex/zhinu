@@ -258,10 +258,19 @@ class ServeConfig:
     tls_key: Path | None = None
     #  部署者声明已有容器 / VM 隔离；不创建沙箱，也不改变鉴权与其它护栏。
     environment: str = "host"
+    #  请求里没给 workspace 时会话落在哪。None = root 本身（历来如此）。必须在 root 之内；
+    #  Chrome 扩展经 native host 起的 serve 用它把"未选目录"的会话关进一个空目录，
+    #  root 只是上限（见 chrome_host.py）
+    default_workspace: Path | None = field(default=None, kw_only=True)
 
     def __post_init__(self) -> None:
         if self.environment not in ("host", "sandbox"):
             raise ValueError("environment 必须是 host 或 sandbox")
+        if self.default_workspace is not None:
+            self.default_workspace = Path(self.default_workspace).resolve()
+            root = Path(self.root).resolve()
+            if self.default_workspace != root and root not in self.default_workspace.parents:
+                raise ValueError(f"default_workspace 必须在 root（{root}）之内：{self.default_workspace}")
         if self.approval is None:
             self.approval = "allow_all" if self.environment == "sandbox" else "ask"
         #  只填未指定项：agent 对象经 replace 收紧到 ask / sandbox=True 时必须保留。
@@ -1373,7 +1382,7 @@ def create_app(cfg: ServeConfig):  # noqa: C901 - 路由表天然长，拆开反
     def resolve_workspace(raw: str) -> Path:
         """把请求里的 workspace 归一并锁进 root 之内。"""
         if not raw:
-            return cfg.root
+            return cfg.default_workspace or cfg.root
         candidate = Path(raw).expanduser()
         if not candidate.is_absolute():
             candidate = cfg.root / candidate

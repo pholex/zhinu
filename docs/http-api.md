@@ -515,7 +515,9 @@ Windows 为 `%APPDATA%\xiaoyu\serve\<root slug>\`；启动后 `GET /health` 的 
   `localhost` / `::1` / `host.docker.internal`）一律 `403`，防 DNS rebinding；带 `Origin` 的
   请求与 WebSocket 握手只放行本服务自己的 origin 和 `--cors-origin` 白名单，防跨站驱动会话。
   curl / n8n / SDK 这类不带 `Origin` 的客户端不受影响；经反代用别的主机名访问时请加 `--token`
-- 默认 `--workspace` 是 root，会话只能落在它或它的子目录里，越界 `400`。
+- 默认 `--workspace` 是 root，会话只能落在它或它的子目录里，越界 `400`。请求没给 workspace
+  时落在 root 本身，`--default-workspace` 可改成 root 之内的某个目录（Chrome 扩展经
+  `xiaoyu chrome install` 起的 serve 用它把未选目录的会话关进空目录）。
   嵌入宿主可提供 `ServeConfig.project_resolver(project_id, workspace, snapshot)`，由宿主
   把已登记项目解析成 `{project_id, workspace, folders}`。此时 `POST /session` 可传
   `project_id`，客户端不能直接指定任意附加目录；未知项目、与主目录不符的 workspace

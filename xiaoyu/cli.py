@@ -150,6 +150,8 @@ SUBCOMMANDS: tuple[tuple[tuple[str, ...], str, str, str], ...] = (
     (("mcp",), "cli_mcp.mcp_command", "mcp add|list|remove|probe", "管理 MCP server 声明；probe 不经模型直接探测一个 server"),
     (("term",), "cli_term.term_command", "term install|init|run|command|log|info",
      "shell 集成：term install 一条命令接入（连同 Tab 补全）；之后在自己的 shell 里 @x 提问，带上刚跑过的命令；@c 一句话换一条命令"),
+    (("chrome",), "cli_chrome.chrome_command", "chrome install|status|stop|uninstall",
+     "给 Chrome 扩展登记 native host：侧栏点一下就自动拉起并连上本机 serve"),
     (("plugin", "plugins"), "cli_plugin.plugin_command", "plugin add|list|update|remove",
      "装卸插件包（skills + MCP）"),
     (("serve",), "serve_command", "serve", "以 HTTP API 服务启动（需 [serve] 可选依赖）"),
@@ -2147,6 +2149,11 @@ def serve_command(argv: list[str]) -> int:
         help="root 工作区，默认当前目录。会话只能落在它或它的子目录里",
     )
     parser.add_argument(
+        "--default-workspace",
+        dest="default_workspace",
+        help="请求里没给 workspace 时会话落在哪，默认就是 root；必须在 root 之内",
+    )
+    parser.add_argument(
         "--token",
         default=os.environ.get("XIAOYU_SERVE_TOKEN", ""),
         help="Bearer token（也可用 XIAOYU_SERVE_TOKEN）。绑非回环地址时必填",
@@ -2260,6 +2267,15 @@ def serve_command(argv: list[str]) -> int:
     if not root.is_dir():
         print(ui.error(f"工作区不存在：{root}"), file=sys.stderr)
         return 2
+    default_workspace = None
+    if args.default_workspace:
+        default_workspace = Path(args.default_workspace).expanduser().resolve()
+        if not default_workspace.is_dir():
+            print(ui.error(f"--default-workspace 不存在：{default_workspace}"), file=sys.stderr)
+            return 2
+        if default_workspace != root and root not in default_workspace.parents:
+            print(ui.error(f"--default-workspace 必须在 root（{root}）之内：{default_workspace}"), file=sys.stderr)
+            return 2
     #  TLS 两件必须成对：只给一个起不了 https，静默退回 http 会让人以为已加密
     if bool(args.tls_cert) != bool(args.tls_key):
         print(ui.error("--tls-cert 与 --tls-key 必须一起给"), file=sys.stderr)
@@ -2302,6 +2318,7 @@ def serve_command(argv: list[str]) -> int:
         public_url=args.public_url,
         tls_cert=tls_cert,
         tls_key=tls_key,
+        default_workspace=default_workspace,
     )
     try:
         if args.print_openapi:

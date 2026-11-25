@@ -2,7 +2,8 @@
 
 `term log` / `term info` 在导入 cli 之前就拦下来走快路径：cli 一导入就把
 agent / tools 整套带进来（几百毫秒），而这两个子命令是给 shell 钩子和提示符
-用的，每条命令、每个提示符都可能调一次，等不起。其余一切照旧交给 cli.main。
+用的，每条命令、每个提示符都可能调一次，等不起。`chrome host` 同理（Chrome 每次
+连接拉起一次），且它的 stdout 是协议流，越少导入越少意外输出。其余一切照旧交给 cli.main。
 """
 
 from __future__ import annotations
@@ -12,6 +13,11 @@ import sys
 
 def main(argv: list[str] | None = None) -> int:
     argv = sys.argv[1:] if argv is None else argv
+    if len(argv) >= 2 and argv[0] == "chrome" and argv[1] == "host":
+        #  Chrome 每次连接都拉起一次，且 stdout 是协议流：不导入 cli（见 chrome_host）
+        from .chrome_host import host_main
+
+        return host_main(argv[2:])
     if len(argv) >= 2 and argv[0] == "term" and argv[1] in ("log", "info"):
         from .term import fast_command
 

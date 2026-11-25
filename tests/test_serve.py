@@ -657,6 +657,24 @@ class TestGuards(ServeCase):
         self.assertEqual(response.status_code, 200, response.text)
         self.assertEqual(response.json()["workspace"], str(self.root / "sub"))
 
+    def test_default_workspace_used_when_request_omits_it(self):
+        (self.root / "scratch").mkdir()
+        self.start("text: 无所谓\n", default_workspace=self.root / "scratch")
+        response = self.client.post("/session", json={})
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.json()["workspace"], str(self.root / "scratch"))
+        #  显式给的仍按原规则解析，root 仍是上限
+        (self.root / "repo").mkdir()
+        response = self.client.post("/session", json={"workspace": "repo"})
+        self.assertEqual(response.json()["workspace"], str(self.root / "repo"))
+        self.assertEqual(self.client.post("/session", json={"workspace": "/etc"}).status_code, 400)
+
+    def test_default_workspace_outside_root_rejected(self):
+        from xiaoyu.serve import ServeConfig
+
+        with self.assertRaises(ValueError):
+            ServeConfig(root=self.root, default_workspace=Path(self.tmp))
+
     def test_unknown_session_is_404(self):
         self.start("text: 无所谓\n")
         self.assertEqual(self.client.get("/session/sess-nope/status").status_code, 404)
