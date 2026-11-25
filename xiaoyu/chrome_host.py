@@ -44,9 +44,10 @@ START_TIMEOUT = 25.0
 STOP_GRACE = 5.0
 #  扩展 → host 的消息上限是 64 MB，host → 扩展 1 MB；这里只收 {type: ...} 这种小消息
 MAX_INCOMING = 64 * 1024
-#  已知的扩展 id（manifest 里钉了 key 的开发版、上架后的商店版）。`install` 默认登记
-#  这些，再加上 --extension-id 给的。钉 key 之前为空，只能显式给
-KNOWN_EXTENSION_IDS: tuple[str, ...] = ()
+#  已知的扩展 id：`install` 默认登记这些，再加上 --extension-id 给的。
+#  ljoc… = xiaoyu-chrome 开发版（manifest 的 key 钉死，从源码目录加载都是这个 id）；
+#  上架后商店分配的 id 另加一行
+KNOWN_EXTENSION_IDS: tuple[str, ...] = ("ljocofdloggcollnfkekijoncaonjnie",)
 
 
 # ---------- 路径 ----------

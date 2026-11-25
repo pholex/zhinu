@@ -121,7 +121,7 @@ def _install(argv: list[str]) -> int:
 def _status(argv: list[str]) -> int:
     cfg = ch.load_config()
     if cfg is None:
-        print(ui.warning("没安装：xiaoyu chrome install --extension-id <id>"))
+        print(ui.warning("没安装：xiaoyu chrome install"))
         return 1
     print(f"root {cfg.workspace} · 审批 {cfg.approval} · 扩展 {', '.join(cfg.extension_ids)}")
     launcher = ch.launcher_path()

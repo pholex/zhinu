@@ -34,7 +34,7 @@ xiaoyu serve                                       浏览器扩展
 本机用户不必手动起 serve、复制 token：跑一次
 
 ```bash
-xiaoyu chrome install --extension-id <扩展 id>   # id 在 chrome://extensions 的扩展卡片上
+xiaoyu chrome install        # 默认放行 xiaoyu-chrome；别的扩展加 --extension-id <id>（chrome://extensions 卡片上）
 ```
 
 它把 native messaging host `xiaoyu.chrome_host` 登记进本机已装的 Chromium 系浏览器

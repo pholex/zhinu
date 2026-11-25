@@ -153,7 +153,8 @@ class TestInstall(ChromeCase):
         manifest = json.loads(ch.manifest_file(dirs[0][1]).read_text(encoding="utf-8"))
         self.assertEqual(manifest["name"], ch.HOST_NAME)
         self.assertEqual(manifest["type"], "stdio")
-        self.assertEqual(manifest["allowed_origins"], [f"chrome-extension://{EXT}/"])
+        self.assertEqual(manifest["allowed_origins"],
+                         [f"chrome-extension://{i}/" for i in (*ch.KNOWN_EXTENSION_IDS, EXT)])
         self.assertEqual(manifest["path"], str(ch.launcher_path()))
         self.assertTrue(os.access(ch.launcher_path(), os.X_OK))
         self.assertIn("-m xiaoyu chrome host", ch.launcher_path().read_text(encoding="utf-8"))
@@ -170,13 +171,19 @@ class TestInstall(ChromeCase):
         self.run_cli("install", "--extension-id", EXT, "--approval", "allow_all")
         self.run_cli("install", "--extension-id", "b" * 32)
         cfg = ch.load_config()
-        self.assertEqual(cfg.extension_ids, [EXT, "b" * 32])
+        self.assertEqual(cfg.extension_ids, [*ch.KNOWN_EXTENSION_IDS, EXT, "b" * 32])
         self.assertEqual(cfg.approval, "allow_all")
 
     def test_install_needs_valid_extension_id(self):
-        self.assertEqual(self.run_cli("install"), 2)
         self.assertEqual(self.run_cli("install", "--extension-id", "not-an-id"), 2)
         self.assertIsNone(ch.load_config())
+
+    def test_install_defaults_to_known_extension_ids(self):
+        self.assertEqual(self.run_cli("install"), 0)
+        self.assertEqual(ch.load_config().extension_ids, list(ch.KNOWN_EXTENSION_IDS))
+        with mock.patch.object(ch, "KNOWN_EXTENSION_IDS", ()):
+            ch.config_path().unlink()
+            self.assertEqual(self.run_cli("install"), 2)
 
     def test_uninstall_removes_only_our_manifest(self):
         dirs = ch.browser_dirs()
