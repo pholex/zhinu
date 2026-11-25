@@ -76,6 +76,10 @@ class ChromeCase(unittest.TestCase):
         ports = mock.patch.object(ch, "PORT_RANGE", range(base, base + 10))
         ports.start()
         self.addCleanup(ports.stop)
+        #  假 serve 不需要 fastapi / uvicorn；CI 的单测环境不装 [serve]，别让依赖探测把用例挡在门外
+        deps = mock.patch.object(ch, "serve_deps_missing", return_value=False)
+        deps.start()
+        self.addCleanup(deps.stop)
         self.fake = self.tmp / "fake_serve.py"
         self.fake.write_text(FAKE_SERVE, encoding="utf-8")
         self.mode = "ok"
@@ -200,6 +204,15 @@ class TestInstall(ChromeCase):
 
 
 class TestEnsure(ChromeCase):
+    def test_missing_serve_deps_reported(self):
+        self.install_config()
+        with mock.patch.object(ch, "serve_deps_missing", return_value=True):
+            reply = ch.handle({"type": "ensure"})
+        self.assertFalse(reply["ok"])
+        self.assertEqual(reply["code"], "serve_unavailable")
+        self.assertIn("xiaoyu-agent[serve]", reply["message"])
+        self.assertIsNone(ch.load_state())
+
     def test_not_installed(self):
         with self.assertRaises(ch.HostError) as ctx:
             ch.ensure(argv_for=self.argv_for)
