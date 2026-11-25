@@ -29,6 +29,40 @@ xiaoyu serve                                       浏览器扩展
   `4409` 被更新的连接顶掉；`4410` 会话已关闭。后两种前面都有 `bye`——扩展收到 `bye` 或
   `error` 就别再重连，其它关闭才按断线重连
 
+## 本机免配置连接（native messaging）
+
+本机用户不必手动起 serve、复制 token：跑一次
+
+```bash
+xiaoyu chrome install        # 默认放行 xiaoyu-chrome；别的扩展加 --extension-id <id>（chrome://extensions 卡片上）
+```
+
+它把 native messaging host `xiaoyu.chrome_host` 登记进本机已装的 Chromium 系浏览器
+（Chrome / Edge / Brave / Arc 等，macOS 与 Linux），之后扩展调
+`chrome.runtime.sendNativeMessage("xiaoyu.chrome_host", {type: "ensure"})`，Chrome 拉起
+`xiaoyu chrome host`，它找到或拉起 serve 并回：
+
+```json
+{"ok": true, "baseUrl": "http://127.0.0.1:8420", "token": "…", "version": "0.91.0",
+ "started": true, "restarted": false}
+```
+
+失败回 `{"ok": false, "code": "…", "message": "…"}`，`code` 取 `not_installed`（没跑 install）、
+`serve_unavailable`（缺 `[serve]` 依赖）、`start_failed` / `start_timeout`（附 `log` 路径与 `detail`
+日志尾）、`no_port`、`unknown_type`。另有 `{type: "status"}` 只报状态、不拉起。扩展拿到
+`baseUrl` 与 `token` 之后照常走 REST / SSE / 本页的 WebSocket——host 只是启动器。
+
+- 起出来的 serve 绑 `127.0.0.1`，端口从 8420 往上找空闲的（你手动起的 serve 占着也不冲突），
+  token 每次拉起新生成，只在 0600 的状态文件和 serve 的环境变量里。之后常驻；小羽升级或
+  重跑 install 改了选项，下次连接时**直接重启**（正在跑的那一轮会断，会话清单落盘可恢复）
+- root 默认 `~`，审批默认 `ask`，都只能由 `install` 的命令行定（`--workspace` / `--approval`），
+  扩展发来的消息改不了
+- 扩展没给 workspace 的会话落在空目录 `<用户配置目录>/chrome/scratch`（serve 的
+  `--default-workspace`）：能操作浏览器、写临时文件，碰不到代码；要处理某个仓库就显式给 workspace
+- 浏览器拉起的进程读不到 `~/.zshrc` 里 export 的变量：API key 放进 `xiaoyu config` 写的用户级
+  `.env`。PATH 取 install 那一刻 shell 里的值
+- `xiaoyu chrome status` 看清单与 serve 状态，`stop` 停掉由扩展拉起的 serve，`uninstall` 全部撤掉
+
 ## 报文（JSON 文本帧）
 
 扩展 → 服务端：
